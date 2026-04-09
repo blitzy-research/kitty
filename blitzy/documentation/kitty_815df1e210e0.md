@@ -621,13 +621,17 @@ Even the discovery and launch mechanism for kittens depends on `kitty.utils`, wh
 # Source: kittens/tui/loop.py:19
 from kitty.fast_data_types import FILE_TRANSFER_CODE, close_tty, normal_tty, open_tty, parse_input_from_terminal, raw_tty
 ```
-The TUI event loop — used by every interactive kitten — directly imports six C functions for raw terminal I/O. These functions are defined in `kitty/data-types.c` lines 438-441:
-- `open_tty` — Opens a TTY file descriptor
-- `raw_tty` — Switches the terminal to raw mode (disabling line buffering and echo)
-- `normal_tty` — Restores the terminal to normal (cooked) mode
-- `close_tty` — Closes the TTY file descriptor
+The TUI event loop — used by every interactive kitten — directly imports five C functions and one constant for raw terminal I/O and file transfer support. The four TTY functions are registered in the module method table at `kitty/data-types.c` lines 438-441:
+- `open_tty` — Opens a TTY file descriptor (`kitty/data-types.c:438`)
+- `normal_tty` — Restores the terminal to normal (cooked) mode (`kitty/data-types.c:439`)
+- `raw_tty` — Switches the terminal to raw mode (disabling line buffering and echo) (`kitty/data-types.c:440`)
+- `close_tty` — Closes the TTY file descriptor (`kitty/data-types.c:441`)
+
+The input parser is defined in a separate C module, `kitty/kittens.c:104`:
 - `parse_input_from_terminal` — Parses raw terminal input bytes into structured key/mouse events
-- `FILE_TRANSFER_CODE` — A constant for the file transfer escape sequence
+
+The remaining symbol is an integer constant added to the module at `kitty/data-types.c:596`:
+- `FILE_TRANSFER_CODE` — An integer constant for the file transfer escape sequence
 
 **Path 3 — The TUI Handler (direct import):**
 ```python
