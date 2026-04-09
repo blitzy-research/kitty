@@ -292,7 +292,9 @@ Key methods:
 | `Get(key)` | `RLock` (read lock) | Returns value from map. Multiple goroutines can read concurrently. *(cache.go:25–30)* |
 | `Set(key, val)` | `RLock` (read lock) | Writes to map under read lock. *(cache.go:32–37)* |
 | `GetOrCreate(key, create)` | `RLock` for check, `Lock` for insert | Check-then-create pattern. On miss: creates value, acquires full `Lock`, inserts into map, pushes key to front of LRU list, and evicts the back element if over capacity. *(cache.go:39–58)* |
-| `MustGetOrCreate(key, create)` | Same as `GetOrCreate` | Infallible variant (no error return). *(cache.go:60–72)* |
+| `MustGetOrCreate(key, create)` | `RLock` for check, `Lock` for insert | Infallible variant (no error return). Unlike `GetOrCreate`, it does **not** call `lru.PushFront()` to track the entry in the LRU list and does **not** evict the oldest entry when capacity is exceeded. *(cache.go:60–72)* |
+
+**Unbounded cache growth via `MustGetOrCreate`:** Because `MustGetOrCreate` bypasses LRU list tracking and eviction, the two caches that use it — `mimetypes_cache` (populated by `mimetype_for_path()`) and `is_text_cache` (populated by `is_path_text()`) — can grow beyond the nominal 4096-entry capacity within a single diff session. Their entries are inserted into the `data` map but never added to the `lru` linked list, so the eviction check `self.lru.Len() > self.max_size` never triggers for these entries. In practice, this is unlikely to matter for typical diff sessions, but for very large directory comparisons with thousands of unique file paths, these two caches will consume proportionally more memory than the other five.
 
 **Notable design choice:** `Set()` uses `RLock` (read lock) rather than the exclusive `Lock`. This is safe in the diff kitten's specific usage pattern because `Set()` is only called from within `highlight_all()` after `Parallel()` completes — meaning writes happen sequentially from the goroutine pool, not concurrently with other writes to the same key. However, this would not be safe for general-purpose concurrent `Set()` calls on overlapping keys.
 
@@ -409,7 +411,7 @@ The diff kitten highlights source code using Chroma v2.14.0 (`github.com/alectho
 Style selection at lines 185–204:
 - Uses `conf.Pygments_style` to look up a Chroma style.
 - If set to `"default"`, uses a custom-registered default style defined at lines 26–71.
-- Falls back to `"monokai"` for dark backgrounds, or `"github-dark"`, or `styles.Fallback`.
+- Falls back to `"monokai"` when the background is dark **and** the foreground is not dark (i.e., `conf.Background.IsDark() && !conf.Foreground.IsDark()`), then tries `"github-dark"`, and ultimately falls back to `styles.Fallback`. *(Source: highlight.go:192–203)*
 
 Tokenization is performed via `lexer.Tokenise(nil, text)`. *(Source: highlight.go:205)*
 
@@ -486,7 +488,7 @@ The `render()` function at `kittens/diff/render.go:696–770` iterates over the 
 For each item from `collection.Apply()`:
 
 1. **Determine binary flag:** `is_binary := !is_path_text(path)`. For diff items, also checks the changed path. *(Source: render.go:706–709)*
-2. **Determine image flag:** `is_img := is_binary && is_image(path)` (or the changed path for diffs). *(Source: render.go:710)*
+2. **Determine image flag:** The expression at `render.go:710` is `is_img := is_binary && is_image(path) || (item_type == "diff" && is_image(changed_path))`. Due to Go's operator precedence (`&&` binds tighter than `||`), this evaluates as two independent conditions joined by `||`: **(a)** `is_binary && is_image(path)` — the file is binary and its path has an image MIME type, OR **(b)** `item_type == "diff" && is_image(changed_path)` — for diff items, the changed path has an image MIME type. Critically, the second condition does **not** require `is_binary` to be true — a diff item whose `changed_path` is an image will be classified as an image regardless of the binary status of the primary path. *(Source: render.go:710)*
 3. **Dispatch by item type and file category:**
 
 | Item Type | Binary? | Image? | Renderer |
