@@ -166,7 +166,7 @@ This is an inline conditional:
 - **If `to_network` is empty** (no `--to`, no `KITTY_LISTEN_ON`) → uses `do_tty_io` (TTY transport)
 - **If `to_network` is non-empty** → uses `do_socket_io` (socket transport)
 
-**TTY transport (`do_tty_io`):** Calls `do_chunked_io()` in `tools/cmd/at/tty_io.go:28`. This creates a `loop.Loop` (kitty's terminal event loop) and writes DCS escape sequences directly to the terminal. The kitty instance *running this terminal* parses the escape codes through its VT parser and dispatches them internally.  `Source: tools/cmd/at/tty_io.go:28-169`
+**TTY transport (`do_tty_io`):** Calls `do_chunked_io()` in `tools/cmd/at/tty_io.go:28`. This creates a `loop.Loop` (kitty's terminal event loop) and writes DCS escape sequences directly to the terminal. The kitty instance *running this terminal* parses the escape codes through its VT parser and dispatches them internally.  `Source: tools/cmd/at/tty_io.go:28-170`
 
 **Socket transport (`do_socket_io`):** In `tools/cmd/at/socket_io.go:163-184`:
 - If `to_network == "fd"` → wraps the file descriptor in a `net.Conn` via `net.FileConn()` (`Source: tools/cmd/at/socket_io.go:165-175`)
@@ -225,7 +225,7 @@ if network == "fd" {
 2. One end of the pair is passed to the child process as `KITTY_LISTEN_ON=fd:N`
 3. The other end is injected into the child monitor's talk thread via `inject_peer()` (`Source: kitty/child-monitor.c:248-280`)
 4. `inject_peer()` calls `add_peer_to_injection_queue()` which wakes up the talk loop to register the new peer (`Source: kitty/child-monitor.c:266-277`)
-5. The peer is marked as `is_remote_control_peer = true` and assigned a unique `peer_id` (`Source: kitty/child-monitor.c:1826`)
+5. The peer is marked as `is_remote_control_peer = true` (the assignment `p->is_remote_control_peer = is_remote_control_peer` occurs in `add_peer()` at `Source: kitty/child-monitor.c:1623`, called from the talk loop at line 1826 with `add_peer(fd, true)`) and assigned a unique `peer_id`
 
 This mechanism allows per-window remote control permissions — a child process can only control the kitty instance through its specific socket pair, and the peer_id links back to window-level authorization data in `boss.peer_data_map`.
 
@@ -363,7 +363,7 @@ r.parser.HandleDCS = func(data []byte) error {
 
 When no target address is known (running inside a kitty window without explicit `--to`), the TTY transport is used.
 
-**`do_tty_io` → `do_chunked_io()`** (`Source: tools/cmd/at/tty_io.go:28-169`):
+**`do_tty_io` → `do_chunked_io()`** (`Source: tools/cmd/at/tty_io.go:28-170`):
 
 The TTY transport uses kitty's terminal event loop (`loop.Loop`) with a state machine:
 
@@ -821,7 +821,9 @@ flowchart LR
     H --> I["KITTY_LISTEN_ON=unix:/tmp/..."]
     H --> J["KITTY_PUBLIC_KEY=1:..."]
     H --> K["KITTY_PID=12345"]
-    H --> L["KITTY_WINDOW_ID=1"]
+
+    G --> W["Window creation (tabs.py:491)"]
+    W --> L["KITTY_WINDOW_ID=1"]
 
     I --> M["Shell starts with env vars"]
     J --> M
@@ -856,7 +858,7 @@ Every remote control message — both request and response — is wrapped in a D
 
 **Wire format** (`Source: docs/rc_protocol.rst:6-8`):
 
-```
+```text
 <ESC>P@kitty-cmd<JSON object><ESC>\
 ```
 
@@ -953,7 +955,7 @@ def create_basic_command(name, payload=None, no_response=False, is_asynchronous=
 
 **On the wire (DCS-framed):**
 
-```
+```text
 \x1bP@kitty-cmd{"cmd":"ls","version":[0,35,2],"no_response":false,"kitty_window_id":1,"payload":{"all_env_vars":false}}\x1b\\
 ```
 
@@ -1205,7 +1207,8 @@ The following `log_error()` calls are present in the remote control code path. T
 | 70 | `"Ignoring encrypted rc command with unsupported protocol: {proto}"` | Encryption version mismatch |
 | 74 | `"Ignoring encrypted rc command without a public key"` | Encrypted command missing pubkey |
 | 82-84 | `"Ignoring encrypted rc command with timestamp...Could be an attempt at a replay attack"` | Timestamp > 5 minutes from current time |
-| 162 | `"There was an error using a custom RC auth function, blocking..."` | Custom auth script raised exception |
+| 102 | `"Failed to load cmd check function from {path} with error: {e}"` | Custom auth script load failure (e.g., missing `is_cmd_allowed` function or import error) |
+| 162 | `"There was an error using a custom RC auth function, blocking..."` | Custom auth script raised exception during execution |
 
 **In `kitty/boss.py`:**
 
@@ -1220,7 +1223,7 @@ The following `log_error()` calls are present in the remote control code path. T
 | Line | Message | Trigger |
 |------|---------|---------|
 | 1625 | `"Too many peers want to talk, ignoring one."` | Exceeds `PEER_LIMIT` (256) connections |
-| 1717 | `"Ignoring too large message from peer"` | Message exceeds 64KB buffer limit |
+| 1717 | `"Reading from peer failed: Ignoring too large message from peer"` (formatted via the `failed()` macro at line 1715 which prepends `"Reading from peer failed: "`) | Message exceeds 64KB buffer limit |
 
 ---
 
