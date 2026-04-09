@@ -5,6 +5,8 @@
 **Repository:** Kitty Terminal Emulator  
 **Document Type:** Technical Deep-Dive / Q&A Investigation
 
+> **Note:** Code snippets throughout this document omit `debug_input()` logging calls for clarity. The actual source functions contain these calls, but they do not affect the keyboard protocol behavior under analysis.
+
 ---
 
 ## Executive Summary
@@ -316,18 +318,13 @@ This `memmove` shifts slots 1–7 into positions 0–6, overwriting slot 0 (the 
 
 **Visual representation of eviction:**
 
-```
-Before push (stack full, 8 entries):
-  [0]=0x81  [1]=0x82  [2]=0x83  [3]=0x84  [4]=0x85  [5]=0x86  [6]=0x87  [7]=0x88
-   oldest                                                                  newest
-
-After memmove (shift left by 1, evicting oldest):
-  [0]=0x82  [1]=0x83  [2]=0x84  [3]=0x85  [4]=0x86  [5]=0x87  [6]=0x88  [7]=??
-   ↑ was slot 1                                                           freed
-
-After writing new value (flags=0x0F):
-  [0]=0x82  [1]=0x83  [2]=0x84  [3]=0x85  [4]=0x86  [5]=0x87  [6]=0x88  [7]=0x8F
-                                                                          newest
+```mermaid
+flowchart TD
+    A["<b>1. Stack Full — Before Push</b><br/>[0]=0x81 [1]=0x82 [2]=0x83 [3]=0x84<br/>[4]=0x85 [5]=0x86 [6]=0x87 [7]=0x88<br/><i>oldest → → → → → → → newest</i>"]
+    B["<b>2. After memmove — Oldest Evicted</b><br/>[0]=0x82 [1]=0x83 [2]=0x84 [3]=0x85<br/>[4]=0x86 [5]=0x87 [6]=0x88 [7]=??<br/><i>was slot[1] → → → → → → freed</i>"]
+    C["<b>3. After Write — New Entry Placed</b><br/>[0]=0x82 [1]=0x83 [2]=0x84 [3]=0x85<br/>[4]=0x86 [5]=0x87 [6]=0x88 [7]=0x8F<br/><i>oldest → → → → → → → newest</i>"]
+    A -->|"memmove(flags, flags+1, 7 bytes) — evicts [0]=0x81"| B
+    B -->|"flags[7] = 0x80 \| 0x0F — write new flags=15"| C
 ```
 
 **Verification from test:**
@@ -378,6 +375,7 @@ screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_scree
     }
     screen_history_scroll(self, SCROLL_FULL, false);
     self->is_dirty = true;
+    // ... (lines 1092-1094: grman->layers_dirty, clear_selection, check_for_active_animated_images — not keyboard-related)
 }
 ```
 
@@ -1002,7 +1000,7 @@ if (ev->cursor_key_mode && legacy_mode && !ev->mods.value) {
 }
 ```
 
-*Source: kitty/key_encoding.c:154-164*
+*Source: kitty/key_encoding.c:154-165*
 
 The condition requires **all three** to be true:
 1. `ev->cursor_key_mode` — DECCKM is enabled
