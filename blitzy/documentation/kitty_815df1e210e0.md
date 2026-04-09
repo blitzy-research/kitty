@@ -26,7 +26,7 @@ Three parameters control every aspect of the behavior discussed in this document
 | `scrollback_pager_history_size` | 0 (disabled) | `kitty/options/definition.py:406` | Maximum size in MB of the pager ring buffer (`PagerHistoryBuf.maximum_size`). Zero disables the pager ring buffer entirely. Maximum allowed is 4 GB. |
 | `SEGMENT_SIZE` | 2048 | `kitty/history.c:15` | Lines per segment — hardcoded, not user-configurable. Determines the granularity of lazy allocation. |
 
-> **Note:** Changes to `scrollback_lines` and `scrollback_pager_history_size` only affect newly created windows on config reload, not existing ones (Source: `kitty/options/definition.py:380–381,415–416`).
+> **Note:** Changes to `scrollback_lines` and `scrollback_pager_history_size` only affect newly created windows on config reload, not existing ones (Source: `kitty/options/definition.py:379–380,414–415`).
 
 ---
 
@@ -149,7 +149,7 @@ historybuf_add_line(HistoryBuf *self, const Line *line, ANSIBuf *as_ansi_buf) {
 }
 ```
 
-This is called by the `INDEX_UP` macro in `kitty/screen.c:1552–1564`:
+This is called by the `INDEX_UP` macro in `kitty/screen.c:1552–1567`:
 
 ```c
 #define INDEX_UP(add_to_history) \
@@ -243,15 +243,15 @@ With verified struct sizes (from `kitty/data-types.h`):
 | CPU cells | 80 × 2048 × 12 | 1,966,080 bytes |
 | GPU cells | 80 × 2048 × 20 | 3,276,800 bytes |
 | Line attrs | 2048 × 1 | 2,048 bytes |
-| **Total per segment** | | **5,244,928 bytes ≈ 5.0 MB** |
+| **Total per segment** | | **5,244,928 bytes ≈ 5.0 MiB** |
 
 | `scrollback_lines` | Segments needed (⌈lines/2048⌉) | Total memory at 80 cols |
 |--------------------|---------------------------------|-------------------------|
-| 2,000 (default) | 1 | ~5.0 MB |
-| 10,000 | 5 | ~25.0 MB |
-| 100,000 | 49 | ~245.0 MB |
+| 2,000 (default) | 1 | ~5.0 MiB |
+| 10,000 | 5 | ~25.0 MiB |
+| 100,000 | 49 | ~245.0 MiB |
 
-**At 200 columns**, the per-segment cost rises to ~13.1 MB. At 500 columns (ultra-wide), ~32.8 MB per segment.
+**At 200 columns**, the per-segment cost rises to ~12.5 MiB. At 500 columns (ultra-wide), ~31.3 MiB per segment.
 
 ### Segment Allocation Lifecycle Flowchart
 
@@ -471,7 +471,7 @@ When a new segment IS needed:
 
 1. **`realloc()` on the segments pointer array** — This array holds `HistoryBufSegment` values, each containing 3 pointers (24 bytes on 64-bit: `GPUCell*`, `CPUCell*`, `LineAttrs*` per `kitty/data-types.h:262–266`). Even with `scrollback_lines = 100,000` (49 segments), the array is only `49 × 24 = 1,176 bytes`. This `realloc()` is trivial.
 
-2. **`calloc()` for the segment data block** — This is the expensive part. At 80 columns, one segment is ~5.0 MB. The `calloc()` zeros this memory, which may trigger page faults on first access. However:
+2. **`calloc()` for the segment data block** — This is the expensive part. At 80 columns, one segment is ~5.0 MiB. The `calloc()` zeros this memory, which may trigger page faults on first access. However:
    - This cost occurs **once per 2048 lines**, not per line.
    - The number of segments is bounded: `⌈ynum / SEGMENT_SIZE⌉`. For `scrollback_lines = 10,000`, that is 5 total `calloc()` calls, ever.
    - After all segments are allocated, `segment_for()` never calls `add_segment()` again — it is pure zero-cost lookup forever after.
@@ -496,7 +496,7 @@ The copy operation (`ringbuf_copy()` at `3rdparty/ringbuf/ringbuf.c:358–394`) 
 |-------|-----------|------|--------|
 | `segment_for()` check | Every line access | Integer division + comparison | Negligible (branch predicted away) |
 | `add_segment()` — `realloc` on pointer array | Once per 2048 lines | ~1 KB realloc | Negligible |
-| `add_segment()` — `calloc` for segment data | Once per 2048 lines | ~5 MB calloc (at 80 cols) | Brief pause, amortized over 2048 lines |
+| `add_segment()` — `calloc` for segment data | Once per 2048 lines | ~5 MiB calloc (at 80 cols) | Brief pause, amortized over 2048 lines |
 | `pagerhist_extend()` | At most `max_size / 1MB` times | O(current_data_size) copy | Proportional to data size, infrequent |
 | `ringbuf_memcpy_into()` overflow | Every push after ring buffer is full | memcpy + tail pointer advance | Negligible (no allocation) |
 
@@ -506,7 +506,7 @@ The system has three unrecoverable error conditions:
 
 1. **`add_segment()` line 21:** `if (self->segments == NULL) fatal("Out of memory allocating new history buffer segment")` — the `realloc()` for the segments pointer array failed. This indicates severe system-wide memory exhaustion.
 
-2. **`add_segment()` line 26:** `if (!s->cpu_cells) fatal("Out of memory allocating new history buffer segment")` — the `calloc()` for the segment data block failed. For a 5 MB segment at 80 columns, this means the system cannot provide 5 MB of contiguous memory.
+2. **`add_segment()` line 26:** `if (!s->cpu_cells) fatal("Out of memory allocating new history buffer segment")` — the `calloc()` for the segment data block failed. For a ~5 MiB segment at 80 columns, this means the system cannot provide ~5 MiB of contiguous memory.
 
 3. **`segment_for()` line 40:** `if (UNLIKELY(seg_num >= self->num_segments)) fatal("Out of bounds access to history buffer line number: %u", y)` — the while loop in `segment_for()` exited without allocating enough segments. This indicates a logic error (should never happen with valid `ynum`).
 
@@ -665,7 +665,7 @@ if (data_received) {
 
 ```mermaid
 flowchart LR
-    subgraph IO ["I/O Path (child-monitor.c:1480)"]
+    subgraph IO ["I/O Path (child-monitor.c:1480–1571)"]
         direction TB
         DataIn["Data arrives from child process"]
         Parse["VT parser processes escape sequences"]
@@ -858,8 +858,8 @@ historybuf_rewrap(HistoryBuf *self, HistoryBuf *other, ANSIBuf *as_ansi_buf) {
 
 | Parameter | Effect Under Sustained Flood |
 |-----------|------------------------------|
-| `scrollback_lines = 2000` (default) | 1 segment, ~5 MB at 80 cols. Buffer fills after 2000 lines, then every push is a circular overwrite. Hot path is allocation-free. |
-| `scrollback_lines = 100000` | 49 segments, ~245 MB at 80 cols. 49 lazy `calloc` events over the first 100,000 lines, then purely circular. |
+| `scrollback_lines = 2000` (default) | 1 segment, ~5 MiB at 80 cols. Buffer fills after 2000 lines, then every push is a circular overwrite. Hot path is allocation-free. |
+| `scrollback_lines = 100000` | 49 segments, ~245 MiB at 80 cols. 49 lazy `calloc` events over the first 100,000 lines, then purely circular. |
 | `scrollback_pager_history_size = 0` (default) | Pager ring buffer disabled. `pagerhist_push()` returns immediately (null check at line 261). No serialization overhead on the hot path at all. |
 | `scrollback_pager_history_size = 100` (100 MB) | Ring buffer grows from 1 MB in ~100 steps up to 100 MB, then silently overwrites. At ~100 bytes/line, holds ~1 million lines of serialized ANSI text. |
 | `SEGMENT_SIZE = 2048` (hardcoded) | Segment allocation granularity. Larger values would mean fewer but bigger allocations; smaller values would mean more frequent but smaller ones. 2048 is a reasonable balance for cache-line alignment and allocation overhead. |
@@ -938,8 +938,8 @@ def handle_result(args, answer, target_window_id, boss):
     report.append(f"")
     report.append(f"=== Memory Estimate ===")
     report.append(f"Segments needed:        {num_segments}")
-    report.append(f"Per-segment size:       {seg_total / 1024 / 1024:.2f} MB")
-    report.append(f"Total estimate:         {total_mem / 1024 / 1024:.2f} MB")
+    report.append(f"Per-segment size:       {seg_total / 1024 / 1024:.2f} MiB")
+    report.append(f"Total estimate:         {total_mem / 1024 / 1024:.2f} MiB")
 
     # Print report
     print("\n".join(report))
@@ -1059,4 +1059,4 @@ The Python-exposed `HistoryBuf` API (from the method table at `kitty/history.c:5
 
 7. **The system minimizes allocation on the hot path.** Under steady-state flood conditions with a full buffer and `scrollback_pager_history_size == 0` (the default), the hot path is: modular arithmetic → `copy_line()` → pointer write. No `malloc`, no `realloc`, no serialization, no pager interaction. With `scrollback_pager_history_size > 0`, the hot path adds: `line_as_ansi()` → `ringbuf_memcpy_into()` (still no allocation if the ring buffer is at capacity).
 
-8. **OOM on the segmented scrollback is fatal.** The `fatal()` calls in `add_segment()` (Source: `kitty/history.c:21,26`) terminate the process. There is no graceful degradation — if the system cannot allocate a 5 MB segment, Kitty exits.
+8. **OOM on the segmented scrollback is fatal.** The `fatal()` calls in `add_segment()` (Source: `kitty/history.c:21,26`) terminate the process. There is no graceful degradation — if the system cannot allocate a ~5 MiB segment, Kitty exits.
