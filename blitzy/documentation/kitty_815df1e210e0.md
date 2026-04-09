@@ -164,7 +164,7 @@ Ligature control operates at two levels: a global `disable_ligatures` option and
 
 Source: `kitty/options/definition.py` L115–133
 
-**Rationale:** This option controls the `disable_ligature` boolean passed into `shape()`. When `disable_ligature` is `false`, the full feature list is passed to `hb_shape()` (all features including `-calt`). When `true`, `num_features` is decremented by 1, excluding the last `-calt` feature — which means `calt` is *not* disabled, so contextual alternates still apply. The other features (`-liga`, `-dlig`, or user-specified ones) remain active.
+**Rationale:** This option controls the `disable_ligature` boolean passed into `shape()`. When `disable_ligature` is `false` (normal rendering), `num_features` is decremented by 1, excluding the trailing `-calt` feature — which means `calt` is NOT disabled, so contextual alternates operate normally and ligatures form. When `disable_ligature` is `true` (ligature suppression), the full feature list including `-calt` is passed to `hb_shape()`, actively disabling `calt` and preventing ligatures.
 
 Source: `kitty/fonts.c:shape()` L811–813
 
@@ -234,10 +234,10 @@ The `shape()` function is the core shaping entry point. It:
 
 **Feature application logic:**
 
-- When `disable_ligature` is `false` (ligatures allowed): the full feature list is passed, including the trailing `-calt`. This means `calt` is *disabled*, preventing contextual alternates from forming ligatures.
-- When `disable_ligature` is `true` (ligatures suppressed at cursor): `num_features` is decremented by 1, *excluding* `-calt`. This means `calt` remains *enabled* — but the other disable features (`-liga`, `-dlig`) still suppress standard and discretionary ligatures.
+- When `disable_ligature` is `false` (ligatures allowed): `num_features` is decremented by 1, *excluding* the trailing `-calt`. This means `calt` remains *enabled*, allowing contextual alternates to form ligatures.
+- When `disable_ligature` is `true` (ligatures suppressed): the full feature list is passed, including `-calt`. This means `calt` is *disabled*, preventing contextual alternates from forming ligatures.
 
-**Rationale:** This seemingly inverted logic makes sense because the `disable_ligatures` option at the "cursor" level wants to break apart ligatures only where the cursor sits. The `-calt` feature controls contextual alternates, which is the OpenType feature most programming fonts use for their ligatures. Excluding `-calt` from the disable list allows `calt` to operate normally, producing the visual effect of "ligatures not suppressed."
+**Rationale:** The logic reads `if (num_features && !disable_ligature) num_features--`. The `!disable_ligature` expression means "should I allow ligatures?" When allowing (`false`), the last feature (`-calt`) is dropped from the disable list, letting `calt` operate and produce ligatures. When suppressing (`true`), all features including `-calt` stay in the list, disabling `calt` and preventing ligature formation. The `-calt` feature controls contextual alternates, which is the OpenType feature most programming fonts use for their ligatures.
 
 Source: `kitty/fonts.c:shape()` L786–820
 
@@ -252,14 +252,11 @@ Source: `kitty/fonts.c:shape()` L786–820
 Each terminal cell stores a base codepoint and up to three combining character indices:
 
 ```c
-typedef struct {
-    char_type ch;              // base codepoint (uint32_t)
-    hyperlink_id_type hyperlink_id;
-    combining_type cc_idx[3];  // up to 3 combining chars (uint16_t each)
-} CPUCell;
+// Key fields: ch (uint32_t base codepoint), cc_idx[3] (uint16_t combining char indices)
+typedef struct { char_type ch; hyperlink_id_type hyperlink_id; combining_type cc_idx[3]; } CPUCell;
 ```
 
-Combining characters are stored as indices into an internal marks table and resolved at shaping time via `codepoint_for_mark(cc_idx[i])`.
+The struct also contains `hyperlink_id`. Combining characters are stored as indices into an internal marks table and resolved at shaping time via `codepoint_for_mark(cc_idx[i])`.
 
 Source: `kitty/data-types.h` L223–228
 
@@ -375,7 +372,7 @@ Source: `kitty/fonts/fontconfig.py:FCScorer.score()` L122–138
 | Condition | Result |
 |-----------|--------|
 | ch == 0, space, en-space, tab, IMAGE_PLACEHOLDER | `BLANK_FONT` |
-| Box-drawing ranges (0x2500–0x259f, 0x2800–0x28ff, 0xe0b0–0xe0bf, 0xee00–0xee0b, 0x1fb00–0x1fbae) | `BOX_FONT` |
+| Box-drawing ranges (0x2500–0x2573, 0x2574–0x259f, 0x25d6–0x25d7, 0x25cb, 0x25dc–0x25e5, 0x2800–0x28ff, 0xe0b0–0xe0bf, 0xee00–0xee0b, 0x1fb00–0x1fbae) | `BOX_FONT` |
 | In `symbol_maps` | Corresponding symbol font index |
 | Main font (medium/bold/italic/bi based on attrs) has the glyph | Main font index |
 | Otherwise | `fallback_font()` |
@@ -453,29 +450,39 @@ Source: `kitty/debug_config.py:debug_config()` L231–292
 
 **2. `dump_font_debug()` — when `--debug-font-fallback` is set:**
 
-Prints the resolved font faces:
+Prints the resolved font faces using `identify_for_debug()` (compact `ps_name: path:index` format):
 
 ```
 Text fonts:
-  Normal: Face(family=... style=... ps_name=... path=...)
-  Bold: Face(family=... style=... ps_name=... path=...)
-  Italic: Face(family=... style=... ps_name=... path=...)
-  Bold-Italic: Face(family=... style=... ps_name=... path=...)
+  Normal: <ps_name>: <path>:<ttc_index>
+  Bold: <ps_name>: <path>:<ttc_index>
+  Italic: <ps_name>: <path>:<ttc_index>
+  Bold-Italic: <ps_name>: <path>:<ttc_index>
 Symbol map fonts:
-  Face(family=... style=... ps_name=... path=...)
+  <ps_name>: <path>:<ttc_index>
 ```
 
 Source: `kitty/fonts/render.py:dump_font_debug()` L161–170
 
-**3. `identify_for_debug()` — Face repr format:**
+**3. `identify_for_debug()` — debug identification format:**
 
-Each FreeType Face produces a debug string:
+Each FreeType Face has two string representations. The `identify_for_debug()` method (used by `debug_config()` and `dump_font_debug()`) returns a compact format:
 
 ```
-Face(family=<name> style=<style> ps_name=<ps> path=<path> ttc_index=<n> variant=<bool> named_instance=<bool> scalable=<bool> color=<bool>)
+<ps_name>: <path>:<ttc_index>
 ```
 
-Source: `kitty/freetype.c:repr()` L352–363
+Source: `kitty/freetype.c:identify_for_debug()` L738–743
+
+**4. `repr()` — full Face representation:**
+
+The Python `repr()` produces a verbose diagnostic string with all face attributes:
+
+```
+Face(family=<name> style=<style> ps_name=<ps> path=<path> ttc_index=<n> ...)
+```
+
+Source: `kitty/freetype.c:repr()` L351–364
 
 ---
 
@@ -574,13 +581,10 @@ In `init_ft_face()`:
 
 ```c
 TT_OS2 *os2 = (TT_OS2*)FT_Get_Sfnt_Table(face, FT_SFNT_OS2);
-if (os2 != NULL) {
-    self->strikethrough_position = os2->yStrikeoutPosition;
-    self->strikethrough_thickness = os2->yStrikeoutSize;
-}
+if (os2 != NULL) { self->strikethrough_position = os2->yStrikeoutPosition; /* + yStrikeoutSize */ }
 ```
 
-Source: `kitty/freetype.c:init_ft_face()` L212–234
+Source: `kitty/freetype.c:init_ft_face()` L211–234
 
 ---
 
@@ -628,12 +632,8 @@ Source: `kitty/fonts.c:calc_cell_metrics()` L398–399
 If baseline changed, underline and strikethrough positions are shifted by the same delta via `adjust_ypos()`:
 
 ```c
-if (baseline_before != baseline) {
-    int adjustment = baseline - baseline_before;
-    baseline = adjust_ypos(baseline_before, cell_height, adjustment);
-    underline_position = adjust_ypos(underline_position, cell_height, adjustment);
-    strikethrough_position = adjust_ypos(strikethrough_position, cell_height, adjustment);
-}
+if (baseline_before != baseline) { int adj = baseline - baseline_before;
+    baseline = adjust_ypos(baseline_before, cell_height, adj); /* same for ul, st */ }
 ```
 
 **Rationale:** Decorations are positioned relative to the baseline. When the baseline moves, decorations must move proportionally to maintain visual consistency.
@@ -714,13 +714,11 @@ Source: `kitty/fonts/render.py:prerender_function()` L364–396, `kitty/fonts.c`
 **SpriteMap struct:**
 
 ```c
-typedef struct {
-    unsigned int cell_width, cell_height;
-    int xnum, ynum, x, y, z, last_num_of_layers, last_ynum;
-    GLuint texture_id;
-    GLint max_texture_size, max_array_texture_layers;
-} SpriteMap;
+typedef struct { unsigned int cell_width, cell_height; int xnum, ynum, x, y, z;
+    GLuint texture_id; GLint max_texture_size, max_array_texture_layers; } SpriteMap;
 ```
+
+Additional fields include `last_num_of_layers` and `last_ynum` for reallocation tracking.
 
 Default initial values (`NEW_SPRITE_MAP`): `xnum=1, ynum=1, last_num_of_layers=1, last_ynum=-1`.
 
@@ -771,8 +769,7 @@ Computes the grid dimensions for the sprite atlas:
 ```c
 sprite_tracker->xnum = MIN(MAX(1u, max_texture_size / cell_width), (size_t)UINT16_MAX);
 sprite_tracker->max_y = MIN(MAX(1u, max_texture_size / cell_height), (size_t)UINT16_MAX);
-sprite_tracker->ynum = 1;
-sprite_tracker->x = 0; sprite_tracker->y = 0; sprite_tracker->z = 0;
+sprite_tracker->ynum = 1; // x, y, z all reset to 0
 ```
 
 | Parameter | Formula | Description |
@@ -795,10 +792,7 @@ Source: `kitty/fonts.c:sprite_tracker_set_layout()` L276–281
 **GPUSpriteTracker:**
 
 ```c
-typedef struct {
-    size_t max_y;
-    unsigned int x, y, z, xnum, ynum;
-} GPUSpriteTracker;
+typedef struct { size_t max_y; unsigned int x, y, z, xnum, ynum; } GPUSpriteTracker;
 ```
 
 This struct tracks the current write position in the 3D sprite atlas.
@@ -808,10 +802,9 @@ Source: `kitty/fonts.c` L35–38
 **`do_increment()` — position advancement:**
 
 ```c
-fg->sprite_tracker.x++;
-if (x >= xnum) { x = 0; y++; ynum = MIN(MAX(ynum, y + 1), max_y); }
-if (y >= max_y) { y = 0; z++; }
-if (z >= MIN(UINT16_MAX, max_array_len)) error = 2;  // out of texture space
+x++; if (x >= xnum) { x = 0; y++; }  // row overflow → next row
+if (y >= max_y) { y = 0; z++; }       // layer overflow → next z-layer
+if (z >= MIN(UINT16_MAX, max_array_len)) error = 2; // out of texture space
 ```
 
 **Total capacity:** `xnum × max_y × z_limit` sprite slots, where `z_limit = MIN(65535, max_array_len)`.
@@ -840,9 +833,7 @@ Creates a new `GL_TEXTURE_2D_ARRAY` texture with:
 **Dimensions:**
 
 ```c
-width = xnum * cell_width;
-height = ynum * cell_height;
-znum = z + 1;
+int width = xnum * cell_width, height = ynum * cell_height, znum = z + 1;
 glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_SRGB8_ALPHA8, width, height, znum);
 ```
 
@@ -893,13 +884,9 @@ Source: `kitty/shaders.c:send_sprite_to_gpu()` L146–156
 Called per OS window when `sprite_map` is NULL:
 
 ```c
-void send_prerendered_sprites_for_window(OSWindow *w) {
-    FontGroup *fg = (FontGroup*)w->fonts_data;
-    if (!fg->sprite_map) {
-        fg->sprite_map = alloc_sprite_map(fg->cell_width, fg->cell_height);
-        send_prerendered_sprites(fg);
-    }
-}
+FontGroup *fg = (FontGroup*)w->fonts_data;
+if (!fg->sprite_map) { fg->sprite_map = alloc_sprite_map(fg->cell_width, fg->cell_height);
+    send_prerendered_sprites(fg); }
 ```
 
 After this call completes:
@@ -963,7 +950,7 @@ The debug flags flow through the startup chain as follows:
 | 6 | `boss.start(window_id, startup_sessions)` | Starts the event loop |
 | 7 | `if args.debug_font_fallback: dump_font_debug()` | Prints resolved font info to stderr |
 
-Source: `kitty/main.py` L441–520 (`_main()`), L247–255 (`AppRunner.__call__()`), L220–229 (`_run_app()`)
+Source: `kitty/main.py` L441–520 (`_main()`), L263 (`run_app = AppRunner()`), L247–255 (`AppRunner.__call__()`), L220–229 (`_run_app()`)
 
 ---
 
@@ -978,10 +965,10 @@ Running under: <compositor>
 OpenGL: <version string>
 Frozen: False
 Fonts:
-  medium: Face(family=<name> style=Regular ps_name=<ps> path=<path> ...)
-  bold: Face(family=<name> style=Bold ps_name=<ps> path=<path> ...)
-  italic: Face(family=<name> style=Italic ps_name=<ps> path=<path> ...)
-  bi: Face(family=<name> style=Bold Italic ps_name=<ps> path=<path> ...)
+  medium: <ps_name>: <path>:<ttc_index>
+  bold: <ps_name>: <path>:<ttc_index>
+  italic: <ps_name>: <path>:<ttc_index>
+  bi: <ps_name>: <path>:<ttc_index>
 Paths:
   kitty: /usr/bin/kitty
   base dir: <path>
@@ -1002,12 +989,12 @@ Source: `kitty/debug_config.py:debug_config()` L231–292
 
 ```
 Text fonts:
-  Normal: Face(family=<name> style=Regular ps_name=<ps> path=<path> ttc_index=0 variant=False named_instance=False scalable=True color=False)
-  Bold: Face(family=<name> style=Bold ps_name=<ps> path=<path> ...)
-  Italic: Face(family=<name> style=Italic ps_name=<ps> path=<path> ...)
-  Bold-Italic: Face(family=<name> style=Bold Italic ps_name=<ps> path=<path> ...)
+  Normal: <ps_name>: <path>:<ttc_index>
+  Bold: <ps_name>: <path>:<ttc_index>
+  Italic: <ps_name>: <path>:<ttc_index>
+  Bold-Italic: <ps_name>: <path>:<ttc_index>
 Symbol map fonts:
-  Face(family=<name> ...)
+  <ps_name>: <path>:<ttc_index>
 ```
 
 Source: `kitty/fonts/render.py:dump_font_debug()` L161–170
@@ -1112,13 +1099,13 @@ flowchart TD
     K --> L{OPT&#40;force_ltr&#41;?}
     L -->|Yes| M[hb_buffer_set_direction&#40;LTR&#41;]
     L -->|No| N[Keep auto-detected direction]
-    M --> O[hb_shape&#40;font, buffer, features, num&#41;]
-    N --> O
-    O --> P{disable_ligature?}
-    P -->|Yes| Q[num_features-- &#40;exclude -calt&#41;]
-    P -->|No| R[Full feature list]
-    Q --> S[hb_buffer_get_glyph_infos&#40;&#41;]
-    R --> S
+    M --> P{!disable_ligature?}
+    N --> P
+    P -->|Yes| Q["num_features-- (exclude -calt, allow ligatures)"]
+    P -->|No| R["Full feature list incl. -calt (suppress ligatures)"]
+    Q --> O[hb_shape&#40;font, buffer, features, num&#41;]
+    R --> O
+    O --> S[hb_buffer_get_glyph_infos&#40;&#41;]
     S --> T[hb_buffer_get_glyph_positions&#40;&#41;]
     T --> U[Return shaped glyphs]
 ```
