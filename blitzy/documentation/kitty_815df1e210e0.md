@@ -30,12 +30,12 @@ This document answers six specific questions about how kitty's C code handles co
 | `kitty/child.py` | ~500 | Python `Child` class: `openpty()`, `fork()`, PTY master fd storage |
 | `kitty/child-monitor.c` | ~2016 | `ChildMonitor`: `io_loop()`, `read_bytes()`, `write_to_child()`, `do_parse()`, poll multiplexing |
 | `kitty/vt-parser.c` | ~1596 | VT parser state machine: `consume_input()`, `consume_normal()`, `consume_esc()`, `consume_csi()`, buffer management |
-| `kitty/vt-parser.h` | 39 | Parser and ParseData struct declarations, thread-safe API |
+| `kitty/vt-parser.h` | 38 | Parser and ParseData struct declarations, thread-safe API |
 | `kitty/simd-string.c` | ~250 | `utf8_decode_to_esc()` dispatch and scalar implementation |
-| `kitty/simd-string.h` | 59 | `UTF8Decoder` struct, SIMD variant declarations |
+| `kitty/simd-string.h` | 58 | `UTF8Decoder` struct, SIMD variant declarations |
 | `kitty/control-codes.h` | ~236 | ESC (0x1b), BEL, BS, HT, LF, CR and control byte constants |
-| `kitty/screen.h` | ~170 | Screen struct with `write_buf`, `write_buf_sz`, `write_buf_used`, `vt_parser` fields |
-| `kitty/constants.py` | ~190 | `shell_path` determination via `pwd.getpwuid().pw_shell` |
+| `kitty/screen.h` | ~289 | Screen struct with `write_buf`, `write_buf_sz`, `write_buf_used`, `vt_parser` fields |
+| `kitty/constants.py` | ~305 | `shell_path` determination via `pwd.getpwuid().pw_shell` |
 
 ---
 
@@ -50,7 +50,7 @@ The PTY pair is created in Python before dropping into C for the fork/exec:
 1. **`openpty()`** at `Source: kitty/child.py:170-175`:
    ```python
    def openpty() -> Tuple[int, int]:
-       master, slave = os.openpty()
+       master, slave = os.openpty()  # Note that master and slave are in blocking mode
        os.set_inheritable(slave, True)
        os.set_inheritable(master, False)
        fast_data_types.set_iutf8_fd(master, True)
@@ -612,7 +612,7 @@ The data flow from PTY read to parse is:
        self->read.sz += self->write.pending; self->write.pending = 0;
    } while (self->read.pos < self->read.sz);
    ```
-5. The ring buffer (`PS.buf[BUF_SZ]`, `Source: kitty/vt-parser.c:194`) holds up to 1 MiB of unprocessed data.
+5. The ring buffer (`PS.buf[BUF_SZ + BUF_EXTRA]`, `Source: kitty/vt-parser.c:194`) holds up to 1 MiB of usable unprocessed data, plus 64 bytes of `BUF_EXTRA` padding (`Source: kitty/vt-parser.c:20`) to ensure large-integer loads (e.g., AVX-512) do not read past the end of the buffer.
 
 ### VT Parser Dispatch Flow
 
