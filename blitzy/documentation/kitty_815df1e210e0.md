@@ -163,7 +163,7 @@ The combining character storage uses a compact indirection system that maps full
 ```c
 static char_type codepoint_for_mark(combining_type m) {
     static char_type map[6425] = { 0, 173, 768, 769, 770, ... };
-    if (LIKELY(m < arraysz(map))) return map[m];
+    if (m < arraysz(map)) return map[m];
     return 0;
 }
 ```
@@ -222,10 +222,8 @@ static inline index_type
 xlimit_for_line(const Line *line) {
     index_type xlimit = line->xnum;
     if (BLANK_CHAR == 0) {
-        while (xlimit > 0 && line->cpu_cells[xlimit - 1].ch == BLANK_CHAR)
-            xlimit--;
-        if (xlimit < line->xnum && xlimit > 0 &&
-            line->gpu_cells[xlimit-1].attrs.width == 2) xlimit++;
+        while (xlimit > 0 && (line->cpu_cells[xlimit - 1].ch) == BLANK_CHAR) xlimit--;
+        if (xlimit < line->xnum && line->gpu_cells[xlimit > 0 ? xlimit - 1 : xlimit].attrs.width == 2) xlimit++;
     }
     return xlimit;
 }
@@ -438,7 +436,7 @@ for (unsigned i = 0; i < arraysz(cell->cc_idx); i++) {
 The ZWJ is stored as mark index **1095** in `cc_idx[0]` of cell 0.
 
 *Mark index derivation (Source: `kitty/unicode-data.c:2912`):*
-`case 8203 ... 8207: return 1093 + c - 8203;` → for c=8205 (U+200D): `1093 + 8205 - 8203 = 1095`
+`case 8203: case 8204: case 8205: case 8206: case 8207: return 1093 + c - 8203;` → for c=8205 (U+200D): `1093 + 8205 - 8203 = 1095`
 
 **VS16/VS15 check (lines 679-700):** Not triggered because `ch` (0x200D) is neither 0xFE0F nor 0xFE0E.
 
@@ -579,7 +577,7 @@ The wide character is written starting at column 0, but its padding cell spills 
 
 **DECAWM OFF path (Source: `kitty/screen.c:826-827`):**
 
-`self->cursor->x = self->columns - char_width = 1 - 2`. Since `self->columns` is `index_type` (unsigned int, defined at Source: `kitty/data-types.h:55`) and `char_width` is `int`, the mixed-sign subtraction yields an unsigned underflow — a very large number. The subsequent cell write at this underflowed position would access memory far beyond the line buffer.
+`self->cursor->x = self->columns - char_width = 1 - 2`. Since `self->columns` is `index_type` (unsigned int, defined at Source: `kitty/data-types.h:65`) and `char_width` is `int`, the mixed-sign subtraction yields an unsigned underflow — a very large number. The subsequent cell write at this underflowed position would access memory far beyond the line buffer.
 
 > **Note:** This is an extreme edge case. Real terminal sizes of 1 column are virtually never encountered in practice, and the code does not include explicit guards for this scenario.
 
