@@ -341,7 +341,11 @@ Click to focus.
 | `bell` | Rings the terminal bell in the window | `kitty/window.py:1434-1442` |
 | `command` | Runs a custom command (with `%c` for cmdline, `%s` for exit status) | `kitty/window.py:1443-1449` |
 
-### Message B — Hold Mode Message
+### Message B — Hold Mode Messages
+
+There are **two distinct hold-related mechanisms** in Kitty's codebase. They are separate code paths and must not be conflated:
+
+#### Mechanism 1: `cmdline_for_hold()` → `run-shell` Kitten → Exec into Shell
 
 When the `hold` flag is set on a `Child` object (checked at `kitty/child.py:329`), the command is wrapped via `cmdline_for_hold()` at `kitty/utils.py:1192`:
 
@@ -355,18 +359,46 @@ def cmdline_for_hold(cmd: Sequence[str] = (), opts: Optional['Options'] = None) 
     return [kitten_exe(), 'run-shell', f'--shell={shell}', f'--shell-integration={ksi}', '--env=KITTY_HOLD=1'] + list(cmd)
 ```
 
-This wraps the command with the `kitten run-shell --env=KITTY_HOLD=1` mechanism. The `run-shell` kitten entry point at `tools/cmd/run_shell/main.go:26` first runs the command via `tui.RunCommandRestoringTerminalToSaneStateAfter(args)` (line 28), then proceeds to start a shell with `tui.RunShell(...)` (line 58).
+This constructs a command line invoking the `run-shell` kitten with `KITTY_HOLD=1` in the environment. The `run-shell` kitten entry point at `tools/cmd/run_shell/main.go:26` then proceeds as follows:
 
-After the program finishes, `HoldTillEnter()` in `tools/tui/hold.go:16` displays a green bold message:
+1. **Run the pre-shell command** (line 28): If args are provided, calls `tui.RunCommandRestoringTerminalToSaneStateAfter(args)` at `tools/tui/run.go:191`, which runs the command as a subprocess, waits for it to finish, and restores terminal state.
+2. **Set environment variables** (lines 30–44): Processes `--env` options, setting `KITTY_HOLD=1` in the environment.
+3. **Exec into the shell** (line 58): Calls `tui.RunShell(...)` at `tools/tui/run.go:148`, which ends with `unix.Exec(shell_binary, shell_cmd, env)` at line 185. This **replaces the entire Go process** with the shell via the `execve(2)` system call. `RunShell()` never returns.
+
+> **Critical distinction:** Because `unix.Exec()` replaces the process, `HoldTillEnter()` is **never called** in this path. The "hold" behavior comes from the shell itself staying alive as an interactive session. The `KITTY_HOLD=1` environment variable is purely informational — it is set in the environment (at `kitty/utils.py:1202`) so that user shell rc files (e.g., `.bashrc`) can detect it and customize behavior, but no Go or Python code in Kitty checks this variable.
+
+**What the user sees:** After the pre-shell command finishes, the user gets a normal interactive shell prompt. The window stays open because the shell is running interactively.
+
+#### Mechanism 2: `__hold_till_enter__` → `ExecAndHoldTillEnter()` → `HoldTillEnter()`
+
+This is a **separate entry point** that displays the "Press Enter or Esc to exit" message. It is registered as a hidden subcommand at `tools/cmd/tool/main.go:88–96`:
+
+```go
+// Source: tools/cmd/tool/main.go:88-96
+root.AddSubCommand(&cli.Command{
+    Name:            "__hold_till_enter__",
+    Hidden:          true,
+    OnlyArgsAllowed: true,
+    Run: func(cmd *cli.Command, args []string) (rc int, err error) {
+        tui.ExecAndHoldTillEnter(args)
+        return
+    },
+})
+```
+
+`ExecAndHoldTillEnter()` at `tools/tui/hold.go:44` runs a command as a subprocess (via `exec.Command` + `cmd.Run()` at lines 49–59), then calls `HoldTillEnter(true)` at line 64, which displays:
 
 ```go
 // Source: tools/tui/hold.go:26
 lp.QueueWriteString("\x1b[1;32mPress Enter or Esc to exit\x1b[m")
 ```
 
-The user sees: **Press Enter or Esc to exit** (displayed in green bold text).
+The user sees: **Press Enter or Esc to exit** (displayed in green bold text). The user can press Enter, Esc, Ctrl+C, or Ctrl+D to dismiss (line 35). After dismissal, `ExecAndHoldTillEnter()` exits with the command's original exit code (lines 65–71).
 
-The user can press Enter, Esc, Ctrl+C, or Ctrl+D to dismiss (line 35). After dismissal, `ExecAndHoldTillEnter()` at `tools/tui/hold.go:44` exits with the command's original exit code (lines 65–71).
+**This path is invoked by:**
+- `kitty/entry_points.py:hold()` (line 27–30): `os.execvp(kitten_exe(), ['kitten', '__hold_till_enter__'] + args[1:])` — used as the `+hold` entry point.
+- `kitty/utils.py:hold_till_enter()` (line 1031–1035): `subprocess.Popen([kitten_exe(), '__hold_till_enter__']).wait()` — used to show the hold message in error paths (e.g., when an editor cannot be found at `kitty/entry_points.py:90–91`).
+- Other callers: `icat` kitten (`kittens/icat/main.go:307`), `show_error` kitten (`tools/cmd/show_error/main.go:89`), and UI kittens on error (`tools/tui/ui_kitten.go:28`).
 
 ### Configuration Dependencies
 
@@ -469,11 +501,14 @@ def handle_cmd_end(self, exit_status: str = '') -> None:
        self.last_cmd_exit_status = 0
    ```
 
-3. **Calculate duration** (lines 1416–1417): Computes how long the command ran:
+3. **Reset start time and record end time** (lines 1411, 1416–1417):
    ```python
-   end_time = monotonic()
-   last_cmd_output_duration = end_time - self.last_cmd_output_start_time
+   self.last_cmd_output_start_time = 0.   # line 1411 — resets BEFORE calculation
+   ...
+   end_time = monotonic()                  # line 1416
+   last_cmd_output_duration = end_time - self.last_cmd_output_start_time  # line 1417
    ```
+   > **Important behavioral note:** Line 1411 resets `self.last_cmd_output_start_time` to `0.` *before* line 1417 computes `end_time - self.last_cmd_output_start_time`. Because `last_cmd_output_start_time` is already `0.0` at the point of subtraction, `last_cmd_output_duration` equals the current monotonic clock value (`end_time - 0.0 = end_time`), not the actual wall-clock duration of the command. This is the code's actual behavior — the "duration" value used for threshold comparison at line 1425 is effectively monotonic-time-since-boot rather than the true elapsed time of the command. The reset at line 1411 also serves as the guard for the early return at line 1409, preventing `handle_cmd_end` from processing the same command completion twice.
 
 4. **Notify watchers** (lines 1419–1420): Calls registered watchers with the `on_cmd_startstop` event:
    ```python
@@ -515,6 +550,8 @@ def cmd_output_marking(self, is_start: Optional[bool], cmdline: str = '') -> Non
 ```
 
 When `is_start` is `None` (from OSC 133;D, where `Py_None` is passed by `screen.c`), it falls through to the `else` branch and calls `self.handle_cmd_end(cmdline)` at line 1461. Note that in this context, `cmdline` is actually the **exit status string** (e.g., `"0"`), not a command line.
+
+> **Completeness note:** OSC 133;A (prompt start) passes `Py_False` as `is_start` (see `kitty/screen.c:2338`). Since `Py_False` is also falsy in Python, it too enters the `else` branch and calls `self.handle_cmd_end('')` with an empty string. However, this is effectively a **no-op**: `handle_cmd_end()` returns immediately at line 1409 because `self.last_cmd_output_start_time == 0.` — either no command was being tracked, or a prior `handle_cmd_end` call (from OSC 133;D) already reset it to `0.` at line 1411. This means the `else` branch is safe for both `None` (OSC 133;D) and `False` (OSC 133;A) values of `is_start`.
 
 ### Instance Attributes
 
