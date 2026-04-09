@@ -112,19 +112,23 @@ These options require building Kitty from source and enable additional compile-t
 | Build Command | Effect |
 |--------------|--------|
 | `make debug` | `python3 setup.py build --debug` — builds with debug symbols (Source: `Makefile:22-23`) |
-| `make debug-event-loop` | `python3 setup.py build --debug --extra-logging=event-loop` — enables `DEBUG_POLL_EVENTS` guard in `kitty/child-monitor.c:1550-1555`, printing poll event details (Source: `Makefile:25-26`) |
+| `make debug-event-loop` | `python3 setup.py build --debug --extra-logging=event-loop` — defines `DEBUG_EVENT_LOOP` at compile time, enabling the `EVDBG` macro in `kitty/child-monitor.c:29-31` which prints event loop diagnostics (Source: `Makefile:25-26`) |
 | `make asan` | `python3 setup.py build --debug --sanitize` — builds with AddressSanitizer and UndefinedBehaviorSanitizer (Source: `Makefile:29-30`) |
 
-The `--extra-logging=event-loop` build option (Source: `setup.py:1926-1933`) defines `DEBUG_POLL_EVENTS` at compile time. When active, every `poll()` return in the I/O thread prints which file descriptors have which events (`POLLIN`, `POLLOUT`, `POLLHUP`, etc.), providing visibility into the PTY I/O cycle:
+The `--extra-logging=event-loop` build option (Source: `setup.py:1926-1933`) generates the compiler flag `-DDEBUG_EVENT_LOOP` (via the format pattern `'-DDEBUG_{}'.format(el.upper().replace('-', '_'))` at Source: `setup.py:489`). This enables the `EVDBG` macro (Source: `kitty/child-monitor.c:29-31`), which prints timestamped event loop diagnostics at key points in the I/O and render cycles:
 
 ```c
-// Source: kitty/child-monitor.c:1550-1555
-#ifdef DEBUG_POLL_EVENTS
-for (i = 0; i < self->count + EXTRA_FDS; i++) {
-    P(POLLIN); P(POLLPRI); P(POLLOUT); P(POLLERR); P(POLLHUP); P(POLLNVAL);
-}
+// Source: kitty/child-monitor.c:29-31
+#ifdef DEBUG_EVENT_LOOP
+#define EVDBG(...) timed_debug_print(__VA_ARGS__)
+#else
+#define EVDBG(...)
 #endif
 ```
+
+`EVDBG` calls appear throughout `kitty/child-monitor.c` — for example, at the start of `render()` (Source: `kitty/child-monitor.c:872`), logging whether new input was read and whether animated image checks are active.
+
+> **Note:** A separate, independent compile-time define `DEBUG_POLL_EVENTS` (Source: `kitty/child-monitor.c:1550-1555`) also exists. It prints per-fd poll event details (`POLLIN`, `POLLOUT`, `POLLHUP`, etc.) after each `poll()` return. `DEBUG_POLL_EVENTS` is **not** enabled by any standard build target — it requires manually adding `-DDEBUG_POLL_EVENTS` to the compiler flags.
 
 The **`DUMP_COMMANDS` compile flag** (Source: `setup.py:721-722`) is not user-controlled at build time — it is always compiled into the `vt-parser-dump.c` translation unit, and the `--dump-commands` runtime flag selects which parser entry point to use.
 
@@ -163,9 +167,15 @@ After XKB resolution, the GLFW input normalization layer (`glfw/input.c`) proces
 2. Strips lock-key modifiers if `lockKeyMods` is disabled (Source: `glfw/input.c:349`)
 3. Invokes the registered keyboard callback: `window->callbacks.keyboard((GLFWwindow*) window, ev)` (Source: `glfw/input.c:350`)
 
-That callback is `key_callback()` in `kitty/glfw.c:430-441`, which serves as the bridge from the GLFW platform layer into Kitty's core engine. After updating modifier state and resetting the cursor blink timer, it calls `on_key_input(ev)` (Source: `kitty/glfw.c:439`).
+That callback is `key_callback()` in `kitty/glfw.c:430-442`, which serves as the bridge from the GLFW platform layer into Kitty's core engine. After updating modifier state and resetting the cursor blink timer, it calls `on_key_input(ev)` (Source: `kitty/glfw.c:439`).
 
-**Observable signal:** When `--debug-keyboard` is active, XKB-level debug output appears on STDERR before the `on_key_input:` line, showing the platform-level key resolution. The exact format of XKB debug messages varies by platform and locale, but they reliably appear before every `on_key_input:` log line.
+**Observable signal:** When `--debug-keyboard` is active, XKB-level debug output appears on STDERR before the `on_key_input:` line, showing the platform-level key resolution. A representative XKB debug output pattern for pressing the 'a' key on a Linux X11 system (Source: `glfw/xkb_glfw.c:875, 926-931`):
+
+```
+Press xkb_keycode: 0x26 clean_sym: a mods: noneglfw_key: 97 (a) xkb_key: 97 (a)
+```
+
+The format includes the XKB keycode (`xkb_keycode`), the resolved keysym (`clean_sym`), active modifiers, the GLFW key code (`glfw_key`), and the XKB symbol name. Exact values (keycode numbers, modifier labels) vary by platform, locale, and keymap configuration, but the overall structure reliably appears before every `on_key_input:` log line.
 
 **Summary of Phase 1 data flow:**
 
@@ -399,15 +409,15 @@ When rendering proceeds:
 
 The glyph cache (`kitty/glyph-cache.c`) manages the GPU texture atlas containing pre-rasterized glyph bitmaps. When a new character is drawn that is not yet in the atlas, it is rasterized and uploaded to the GPU texture.
 
-**Observable signal:** When `--debug-rendering` is active, the `debug_rendering(...)` macro (Source: `kitty/state.h:14`) emits timestamped rendering diagnostics to STDERR. Additionally, OpenGL error checking is enabled after every GL call, surfacing any GPU-side errors that would otherwise be silently ignored.
+**Observable signal (`--debug-rendering`, runtime flag):** When `--debug-rendering` is active, the `debug_rendering(...)` macro (Source: `kitty/state.h:14`) emits timestamped rendering diagnostics to STDERR. Additionally, OpenGL debug callbacks remain installed (Source: `kitty/gl.c:59`) rather than being removed, and GL version strings are printed (Source: `kitty/gl.c:72`). On Wayland, "No render frame received" messages appear when frame callbacks are delayed (Source: `kitty/child-monitor.c:822-828`). This flag surfaces GL-level errors and frame-timing anomalies.
 
-The `EVDBG` macro at the start of `render()` (Source: `kitty/child-monitor.c:872`) logs:
+**Observable signal (`DEBUG_EVENT_LOOP`, build-time flag):** Separately, the `EVDBG` macro at the start of `render()` (Source: `kitty/child-monitor.c:872`) logs:
 
 ```
 input_read: <0|1>, check_for_active_animated_images: <0|1>
 ```
 
-This message is **reliably repeatable** on every render cycle and confirms whether the render was triggered by new input or by a timer.
+This message requires a debug build with `DEBUG_EVENT_LOOP` enabled (e.g., `make debug-event-loop`), **not** the runtime `--debug-rendering` flag. When present, this output is **reliably repeatable** on every render cycle and confirms whether the render was triggered by new input or by a timer.
 
 ---
 
@@ -543,7 +553,7 @@ The screen model places the character 'a' at the current cursor position and adv
 
 `render()` is called. Since `input_read` is true (new data was parsed), rendering proceeds immediately without waiting for `repaint_delay`. The `draw_cells()` function produces a new GPU frame containing the character 'a' at the cursor position.
 
-**Observable signal:** With `--debug-rendering` active, the render cycle logs timing and state information to STDERR. The `EVDBG` output at the start of `render()` shows `input_read: 1`, confirming the render was triggered by new input.
+**Observable signal:** With `--debug-rendering` active, GL-level error checking and frame-timing diagnostics appear on STDERR. Separately, with a `DEBUG_EVENT_LOOP` build (e.g., `make debug-event-loop`), the `EVDBG` output at the start of `render()` shows `input_read: 1`, confirming the render was triggered by new input. Note that `EVDBG` requires the build-time `DEBUG_EVENT_LOOP` flag, not the runtime `--debug-rendering` flag.
 
 ---
 
@@ -631,7 +641,7 @@ flowchart TD
     B -->|"No"| D{"key_encoding_flags & 1?<br/>(disambiguate mode)"}
     D -->|"No: Legacy Mode"| E{"Has printable text?<br/>(send_text_standalone && has_text<br/>&& action is PRESS/REPEAT)"}
     E -->|"Yes"| F["Return SEND_TEXT_TO_CHILD<br/>Debug: sent key as text to child: a"]
-    E -->|"No"| G["encode_key() → legacy escape<br/>Debug: sent encoded key to child: ^[ O <char>"]
+    E -->|"No"| G["encode_key() → legacy escape<br/>Debug: sent encoded key to child: ^[ O &lt;char&gt;"]
     D -->|"Yes: Kitty Protocol"| H["encode_key() → CSI u sequence<br/>Debug: sent encoded key to child: ^[ [ 97 u"]
 ```
 
@@ -679,7 +689,7 @@ Every claim in this document is traceable to one of the following categories of 
 
 The analysis followed this process:
 
-1. **Identified all debug output gates** by searching for `debug_input`, `debug_rendering`, `debug_fonts`, `DUMP_COMMANDS`, and `DEBUG_POLL_EVENTS` in the C source files.
+1. **Identified all debug output gates** by searching for `debug_input`, `debug_rendering`, `debug_fonts`, `DUMP_COMMANDS`, `DEBUG_EVENT_LOOP`, and `DEBUG_POLL_EVENTS` in the C source files.
 2. **Traced the flag propagation chain** from CLI definition (`kitty/cli.py`) through Python startup (`kitty/main.py`) to C initialization (`kitty/glfw.c`) and runtime gating (`kitty/state.h`).
 3. **Mapped debug format strings to pipeline stages** by examining each `debug(...)` call in `kitty/keys.c` and correlating it with the function's position in the call chain.
 4. **Verified the VT parser dump mechanism** by examining the `DUMP_COMMANDS` preprocessor guards in `kitty/vt-parser.c` and the `DumpCommands` class in `kitty/boss.py`.
@@ -700,7 +710,7 @@ No cleanup is needed as no temporary artifacts were created.
 
 | Phase | Key Source Files | Debug Channel |
 |-------|-----------------|---------------|
-| Platform Input Reception | `glfw/input.c:306-352`, `glfw/xkb_glfw.c:864`, `kitty/glfw.c:430-441` | `--debug-keyboard` |
+| Platform Input Reception | `glfw/input.c:306-352`, `glfw/xkb_glfw.c:864`, `kitty/glfw.c:430-442` | `--debug-keyboard` |
 | Key Processing and Encoding | `kitty/keys.c:166-272`, `kitty/keys.py:154`, `kitty/key_encoding.c:414-440`, `kitty/boss.py:1408-1409` | `--debug-keyboard` |
 | PTY Transit | `kitty/child-monitor.c:372-377` (write queue), `kitty/child-monitor.c:1442-1450` (write), `kitty/child-monitor.c:1531` (read) | `strace` |
 | VT Parsing and Screen Update | `kitty/vt-parser.c:1375-1497`, `kitty/screen.c`, `kitty/boss.py:232-253` | `--dump-commands` |
@@ -714,7 +724,8 @@ No cleanup is needed as no temporary artifacts were created.
 | `debug_rendering()` macro | `kitty/state.h:14` | Gates rendering debug output on `global_state.debug_rendering` |
 | `debug_fonts()` macro | `kitty/state.h:16` | Gates font fallback debug output on `global_state.debug_font_fallback` |
 | `DUMP_COMMANDS` define | `setup.py:721-722` | Enables VT parser command dumping in `vt-parser-dump.c` |
-| `DEBUG_POLL_EVENTS` define | `kitty/child-monitor.c:1550-1555` | Enables poll event logging (build-time only) |
+| `DEBUG_EVENT_LOOP` define | `kitty/child-monitor.c:29-31` | Enables `EVDBG` macro for event loop diagnostics; enabled by `make debug-event-loop` |
+| `DEBUG_POLL_EVENTS` define | `kitty/child-monitor.c:1550-1555` | Enables per-fd poll event logging (build-time only; requires manual `-DDEBUG_POLL_EVENTS` — not enabled by any standard build target) |
 | `DumpCommands` class | `kitty/boss.py:232-253` | Python callback that formats `--dump-commands` output |
 | `GLFW_DEBUG_KEYBOARD` hint | `glfw/glfw3.h:1159`, `kitty/glfw.c:1444` | Activates GLFW platform-level key debug output |
 
