@@ -296,7 +296,7 @@ Key methods:
 
 **Unbounded cache growth via `MustGetOrCreate`:** Because `MustGetOrCreate` bypasses LRU list tracking and eviction, the two caches that use it — `mimetypes_cache` (populated by `mimetype_for_path()`) and `is_text_cache` (populated by `is_path_text()`) — can grow beyond the nominal 4096-entry capacity within a single diff session. Their entries are inserted into the `data` map but never added to the `lru` linked list, so the eviction check `self.lru.Len() > self.max_size` never triggers for these entries. In practice, this is unlikely to matter for typical diff sessions, but for very large directory comparisons with thousands of unique file paths, these two caches will consume proportionally more memory than the other five.
 
-**Notable design choice:** `Set()` uses `RLock` (read lock) rather than the exclusive `Lock`. This is safe in the diff kitten's specific usage pattern because `Set()` is only called from within `highlight_all()` after `Parallel()` completes — meaning writes happen sequentially from the goroutine pool, not concurrently with other writes to the same key. However, this would not be safe for general-purpose concurrent `Set()` calls on overlapping keys.
+**Notable design choice:** `Set()` uses `RLock` (read lock) rather than the exclusive `Lock`. Within `highlight_all()`, `Set()` is called concurrently from multiple goroutines inside the `Parallel()` worker function — each worker goroutine calls `highlighted_lines_cache.Set(path, ...)` as it finishes highlighting a file *(highlight.go:224, inside the `func(nums <-chan int)` closure)*. Because `RLock` permits concurrent acquisition by multiple goroutines, this does not serialize writes to the underlying Go map, which constitutes a potential data race. In practice, the race rarely manifests because `highlight_file()` is computationally expensive (tokenizing, styling, and formatting entire file contents), making it unlikely for two goroutines to complete their work and call `Set()` at the exact same instant. However, this is technically unsafe per Go's memory model — for fully correct concurrent write support, `Set()` should use the exclusive `Lock` instead of `RLock`.
 
 **Rationale:** The LRU uses Go's `container/list` (doubly-linked list) for O(1) eviction. The `sync.RWMutex` allows concurrent reads with exclusive writes, which is the optimal concurrency pattern for a read-heavy cache. The 4096 capacity is generous enough to avoid eviction during typical diff sessions (most sessions involve far fewer than 4096 unique file paths).
 
@@ -311,7 +311,7 @@ flowchart LR
     DC --> ITC["is_text_cache\n(text/binary flag)"]
     MC["mimetypes_cache\n(MIME type)"] --> ITC
     MC --> II["is_image()\nclassification"]
-    LC --> HLC["highlighted_lines_cache\n(syntax-highlighted lines)"]
+    DC --> HLC["highlighted_lines_cache\n(syntax-highlighted lines)"]
     SC["size_cache\n(file size)"] -.->|independent| SC
 ```
 
