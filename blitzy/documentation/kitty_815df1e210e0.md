@@ -425,7 +425,7 @@ The SSH kitten uses POSIX shared memory (SHM) as a secure IPC channel between th
 #### Go-side (primary path)
 
 `Source: tools/utils/shm/shm_syscall.go:145-176` (macOS/FreeBSD)
-`Source: tools/utils/shm/shm_fs.go` (Linux/NetBSD/OpenBSD)
+`Source: tools/utils/shm/shm_fs.go` (Linux/NetBSD/OpenBSD/DragonFly BSD)
 
 `CreateTemp(pattern, size)` creates a new SHM object:
 - On **syscall platforms** (macOS, FreeBSD): calls `shm_open()` with `O_CREAT|O_EXCL|O_RDWR` and permissions `0600` (line 162 of `shm_syscall.go`)
@@ -800,6 +800,8 @@ flowchart TD
     C --> M
 ```
 
+> **Note:** The flowchart above places the `use_kitty_askpass` check inside the `share_connections=true` branch for visual simplicity. In the actual code (`main.go:648-651`), the askpass check runs **independently** of `share_connections`. When `share_connections=false` and askpass is enabled with SSH ≥ 8.4, `need_to_request_data` is still set to `false` by `set_askpass()` — the flowchart's `share_connections=No → need_to_request_data=true` path does not account for this edge case. The decision matrix table above is accurate for all cases.
+
 #### `run_control_master()`
 
 `Source: kittens/ssh/main.go:666-680`
@@ -851,6 +853,7 @@ The SSH kitten implements a custom askpass handler that uses shared memory for I
 `Source: kittens/ssh/askpass.go:24-35`
 
 ```go
+// Simplified — error handling omitted for brevity (see askpass.go:24-35 for full implementation)
 func trigger_ask(name string) {
     term, _ := tty.OpenControllingTerm()
     term.WriteString("\x1bP@kitty-ask|" + name + "\x1b\\")
@@ -885,26 +888,25 @@ The DCS format is `\033P@kitty-ask|<shm_name>\033\\`. Kitty intercepts this esca
 
 The tarball is a gzip-compressed tar archive containing:
 
-```
-<archive.tar.gz>
-├── data.sh                              # Serialized environment variables
-├── bootstrap-utils.sh                   # Shell bootstrap utilities (sh path only)
-├── home/
-│   ├── .terminfo/
-│   │   ├── kitty.terminfo               # Terminfo source file
-│   │   └── x/
-│   │       └── xterm-kitty              # Compiled terminfo entry
-│   └── <remote_dir>/                    # Default: .local/share/kitty-ssh-kitten
-│       ├── shell-integration/           # Shell integration scripts
-│       │   ├── bash/                    # Bash integration files
-│       │   ├── zsh/                     # Zsh integration files
-│       │   └── fish/                    # Fish integration files
-│       └── kitty/                       # (if remote_kitty != no)
-│           ├── version                  # Kitty version string
-│           └── bin/
-│               ├── kitty                # Kitty binary
-│               └── kitten               # Kitten binary
-└── root/                                # Files with absolute paths (from copy directives)
+```mermaid
+graph TD
+    A["archive.tar.gz"] --> B["data.sh<br/><i>Serialized environment variables</i>"]
+    A --> C["bootstrap-utils.sh<br/><i>Shell utilities (sh path only)</i>"]
+    A --> D["home/"]
+    A --> E["root/<br/><i>Files with absolute paths<br/>(from copy directives)</i>"]
+    D --> F[".terminfo/"]
+    D --> G["&lt;remote_dir&gt;/<br/><i>Default: .local/share/kitty-ssh-kitten</i>"]
+    F --> H["kitty.terminfo<br/><i>Terminfo source file</i>"]
+    F --> I["x/xterm-kitty<br/><i>Compiled terminfo entry</i>"]
+    G --> J["shell-integration/"]
+    G --> K["kitty/<br/><i>(if remote_kitty != no)</i>"]
+    J --> L["bash/"]
+    J --> M["zsh/"]
+    J --> N["fish/"]
+    K --> O["version<br/><i>Kitty version string</i>"]
+    K --> P["bin/"]
+    P --> Q["kitty<br/><i>Kitty binary</i>"]
+    P --> R["kitten<br/><i>Kitten binary</i>"]
 ```
 
 | Component | Source | Condition | Purpose |
