@@ -409,7 +409,9 @@ def write_base64_data(self, b: bytes) -> None:
 
 The `max_size` is derived from `get_options().clipboard_max_size` (in MB) at `clipboard.py:247`.
 
-> **Rationale:** The `max_size` check prevents a malicious or buggy child process from consuming arbitrary disk space via clipboard writes. Once exceeded, the `max_size_exceeded` flag causes all subsequent `write_base64_data()` calls to be silently dropped, effectively truncating the clipboard content.
+> **Rationale:** The `max_size` check is intended to prevent a malicious or buggy child process from consuming arbitrary disk space via clipboard writes. Once exceeded, the `max_size_exceeded` flag causes all subsequent `write_base64_data()` calls to be silently dropped, effectively truncating the clipboard content.
+>
+> **Note on effective limit:** At `clipboard.py:247`, `self.max_size` is set to `get_options().clipboard_max_size * 1024 * 1024`, converting the configuration value (in MB) to bytes (e.g., 512 MB → 536,870,912 bytes). However, the comparison at `clipboard.py:321` applies `self.max_size * 1024 * 1024` again, multiplying the already-in-bytes value by 1,048,576. The effective limit therefore becomes `clipboard_max_size × 1024⁴` bytes — approximately 512 TB with the default 512 MB configuration. The intent is to prevent unbounded growth, but the double-multiplication renders the effective threshold very large, making this check practically ineffective as a guard against excessive disk usage.
 
 ### Chunked Response Delivery
 
@@ -495,7 +497,7 @@ Thread names are set via `set_thread_name()` (`threading.h:25-37`):
 
 ### Mutex Hierarchy
 
-Three distinct mutex domains protect shared state between threads:
+Four distinct mutex domains protect shared state between threads (three on the data path, one for the talk message queue):
 
 **1. `children_lock` — Global child array protection**
 
@@ -1149,7 +1151,7 @@ During paused rendering, screen updates are deferred — but clipboard data stil
 | Question | Concise Answer |
 |----------|---------------|
 | **Q1: Data transfer pathway** | Clipboard data traverses a 12-step round-trip: child PTY → I/O thread `read_bytes()` → VT parser buffer → main thread `run_worker()` → `consume_input()` → `dispatch_osc()` → C `clipboard_control()` → Python `Window.clipboard_control()` → `ClipboardRequestManager` → (for reads) `fulfill_read_request()` → `send_escape_code_to_child()` → `schedule_write_to_child()` → I/O thread `write_to_child()` → child PTY. |
-| **Q2: Concurrency model** | Three threads (Main, I/O `KittyChildMon`, Talk `KittyPeerMon`) coordinate through three mutex domains (`children_lock`, per-screen `write_buf_lock`, per-parser `lock`) with strict ordering (`children_lock` → `write_buf_lock`). Wakeup coalescing via `input_delay` reduces expensive main-loop wakeups. |
+| **Q2: Concurrency model** | Three threads (Main, I/O `KittyChildMon`, Talk `KittyPeerMon`) coordinate through four mutex domains (`children_lock`, per-screen `write_buf_lock`, per-parser `lock`, `talk_lock`) with strict ordering (`children_lock` → `write_buf_lock`). Wakeup coalescing via `input_delay` reduces expensive main-loop wakeups. |
 | **Q3: Scrollback impact** | Yes, expensive `as_text()` operations block the main thread, delaying `parse_input()` for ALL children including kitten overlays. The I/O thread continues operating, and the kitten's internal process event loop is unaffected. VT parser buffers can fill to 1 MB per parser during blocking. |
 | **Q4: Ownership boundaries** | Python refcounts are managed exclusively on the main thread (under GIL). `Tempfile` uses a 16 MB rollover threshold from BytesIO to TemporaryFile. Chunker closures capture `Tempfile` references, creating deferred-read ownership that persists beyond `WriteRequest` lifetime. `write_buf` has a 100 MB cap. |
 | **Q5: Race conditions** | The VT parser's lock-release-relock in `run_worker()` is intentional, using `write.pending` as the synchronization mechanism. The GIL prevents Python-level data races on clipboard operations. `input_delay` coalescing creates deliberate latency, not races. The main concern is GIL + C mutex interaction causing main-thread blocking proportional to I/O thread write speed. |
