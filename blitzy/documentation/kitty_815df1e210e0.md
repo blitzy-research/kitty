@@ -429,7 +429,7 @@ This stage is triggered during `create_os_window()` (Phase 5) after DPI is deter
 
 **load_fonts_data()**
 
-Source: `kitty/fonts.c:1529-1533`
+Source: `kitty/fonts.c:1530-1533`
 
 ```c
 FONTS_DATA_HANDLE load_fonts_data(double font_sz_in_pts, double dpi_x, double dpi_y) {
@@ -921,7 +921,7 @@ Before any terminal content can be rendered, kitty pre-renders a set of special 
 
 **send_prerendered_sprites_for_window()**
 
-Source: `kitty/fonts.c:1520-1527`
+Source: `kitty/fonts.c:1521-1527`
 
 ```c
 void send_prerendered_sprites_for_window(OSWindow *w) {
@@ -939,7 +939,7 @@ The sprite map is allocated lazily — only on the first window using a given fo
 
 **send_prerendered_sprites()**
 
-Source: `kitty/fonts.c:1449-1473`
+Source: `kitty/fonts.c:1450-1473`
 
 1. **Lines 1453–1457:** First sprite is a **blank cell** — a fully transparent cell used for empty cells.
 
@@ -1277,7 +1277,7 @@ Kitty's text rendering pipeline converts font files into GPU-cached glyph sprite
    - Layout: `xnum × max_y × z` grid, where z represents texture array layers
 
 7. **Pre-rendered Special Sprites** — Underlines, strikethroughs, cursors, and missing glyph placeholders are pre-rendered before any content.
-   - Source: `kitty/fonts.c:1449-1473`, `kitty/fonts/render.py:284-321`
+   - Source: `kitty/fonts.c:1450-1473`, `kitty/fonts/render.py:284-321`
 
 8. **GPU Shader Rendering** — Cell program shaders composite glyph sprites with colors, decorations, and effects.
    - Source: `kitty/shaders.py:147-204` — Four cell program variants handle different rendering phases.
@@ -1300,7 +1300,7 @@ Kitty's text rendering pipeline converts font files into GPU-cached glyph sprite
 | `kitty/main.py` | `_main()` (441), `init_glfw()` (95), `init_glfw_module()` (90), `AppRunner.__call__()` (247), `_run_app()` (202), `load_all_shaders()` (82), `set_locale()` (424), `setup_environment()` (403), `main()` (524) | Main startup orchestrator |
 | `kitty/glfw.c` | `glfw_init()` (1431), `create_os_window()` (1107), `get_window_content_scale()` (823), `dpi_from_scale()` (812), `get_window_dpi()` (838), `update_os_window_viewport()` (130) | GLFW initialization, OS window creation, DPI detection |
 | `kitty/gl.c` | `gl_init()` (52), `gl_version_string()` (42), `update_surface_size()` (80) | OpenGL context initialization via GLAD |
-| `kitty/fonts.c` | `initialize_font_group()` (1495), `calc_cell_metrics()` (373), `load_fonts_data()` (1529), `font_group_for()` (204), `sprite_tracker_set_layout()` (276), `send_prerendered_sprites()` (1449), `send_prerendered_sprites_for_window()` (1520) | Font group management, cell metrics, sprite atlas |
+| `kitty/fonts.c` | `initialize_font_group()` (1495), `calc_cell_metrics()` (373), `load_fonts_data()` (1530), `font_group_for()` (204), `sprite_tracker_set_layout()` (276), `send_prerendered_sprites()` (1450), `send_prerendered_sprites_for_window()` (1521) | Font group management, cell metrics, sprite atlas |
 | `kitty/freetype.c` | `cell_metrics()` (387), `calc_cell_width()` (374), `calc_cell_height()` (141), `font_units_to_pixels_y()` (92), `font_units_to_pixels_x()` (97), `set_size_for_face()` (190), `set_font_size()` (155) | FreeType cell calculations, font unit conversion |
 | `kitty/fonts/render.py` | `set_font_family()` (173), `create_symbol_map()` (139), `render_special()` (284), `descriptor_for_idx()` (157) | Python font orchestration, pre-render callbacks |
 | `kitty/fonts/common.py` | `get_font_files()` | Font file resolution via system font APIs |
