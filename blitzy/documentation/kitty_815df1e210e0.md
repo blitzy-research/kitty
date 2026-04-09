@@ -25,8 +25,8 @@ Each question is answered in the sections that follow, with full code citations 
 
 | File | Lines | Role |
 |------|-------|------|
-| `kitty/search_query_parser.py` | 1–297 (full file) | **Primary investigation target** — complete tokenizer, recursive-descent parser, AST node classes, and public API |
-| `kitty_tests/search_query_parser.py` | 1–31 (full file) | Behavioral specification via unit tests |
+| `kitty/search_query_parser.py` | 1–296 (full file) | **Primary investigation target** — complete tokenizer, recursive-descent parser, AST node classes, and public API |
+| `kitty_tests/search_query_parser.py` | 1–30 (full file) | Behavioral specification via unit tests |
 | `kitty/boss.py` | 471–531 | Parser consumers: `match_windows()` and `match_tabs()` |
 | `kitty/rc/base.py` | 87–165 | Canonical match option definitions (`MATCH_WINDOW_OPTION`, `MATCH_TAB_OPTION`) |
 | `kitty/window.py` | 784–833 | `Window.matches_query()` — per-field matching logic |
@@ -47,7 +47,7 @@ Each question is answered in the sections that follow, with full code citations 
 
 ### Module Location and Public API
 
-The parser lives at `kitty/search_query_parser.py` (297 lines). It exposes two public functions:
+The parser lives at `kitty/search_query_parser.py` (296 lines). It exposes two public functions:
 
 **`build_tree()`** (lines 281–289) — Parses a query string into an Abstract Syntax Tree (AST) of `SearchTreeNode` objects. It is decorated with `@lru_cache(maxsize=64)` so that repeated identical queries reuse a cached parse tree.
 
@@ -85,7 +85,7 @@ The `lex_scanner()` function (lines 120–128) uses Python's `re.Scanner` to spl
 |-----------|--------------|---------|
 | `OPCODE` | `[()]` | Parentheses for grouping |
 | `WORD` | `@.+?:[^")\s]+` or `[^"()\s]+` | Unquoted terms (e.g., `id:1`, `or`, `and`, `not`) |
-| `QUOTED_WORD` | `".*?((?<!\\)")"` | Double-quoted strings (e.g., `"my window"`) |
+| `QUOTED_WORD` | `".*?((?<!\\)")` | Double-quoted strings (e.g., `"my window"`) |
 | (whitespace) | `\s+` | Silently consumed — **this is key**: spaces are token separators, not operators |
 
 The `TokenType` enum is defined at lines 30–34, with an additional `EOF` type for end-of-input.
@@ -565,8 +565,8 @@ All source citations in this document reference the following files and line ran
 
 | File | Lines | Content |
 |------|-------|---------|
-| `kitty/search_query_parser.py` | 1–297 | Full parser implementation: tokenizer, recursive-descent parser, AST nodes, `build_tree()`, `search()` |
-| `kitty_tests/search_query_parser.py` | 1–31 | Unit tests for the parser (`TestSQP.test_search_query_parser`) |
+| `kitty/search_query_parser.py` | 1–296 | Full parser implementation: tokenizer, recursive-descent parser, AST nodes, `build_tree()`, `search()` |
+| `kitty_tests/search_query_parser.py` | 1–30 | Unit tests for the parser (`TestSQP.test_search_query_parser`) |
 | `kitty/boss.py` | 471–496 | `Boss.match_windows()` — parser consumer with window locations and `get_matches` callback |
 | `kitty/boss.py` | 505–531 | `Boss.match_tabs()` — parser consumer with tab locations and `get_matches` callback |
 | `kitty/rc/base.py` | 87–130 | `MATCH_WINDOW_OPTION` — canonical description of all window match fields |
