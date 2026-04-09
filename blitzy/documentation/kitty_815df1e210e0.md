@@ -772,8 +772,8 @@ The `ynum` field of the destination's line view is repurposed to store the last 
    - Copy chunk: `src_x=0`, `dest_x=2`, `num = MIN(5, 1) = 1` → copy `F` to dest line 1
    - `dest_x=3`, `src_x=1`
    - `dest_x >= 3` → `next_dest_line(true)` (dest line 1 marked as continued) → dest_y=2, dest_x=0
-   - Copy chunk: `src_x=1`, `dest_x=0`, `num = MIN(4, 3) = 1` → copy `G` to dest line 2
-   - `dest_x=1`, `src_x=2` = `src_x_limit` → exit inner loop
+   - Copy chunk: `src_x=1`, `dest_x=0`, `num = MIN(4, 3) = 3` → copy `G` + 2 trailing blanks to dest line 2 (3 cells copied, only `G` is meaningful content)
+   - `dest_x=3`, `src_x=4` ≥ `src_x_limit` (2) → exit inner loop
 5. **src_y=2:** `src_y >= src_limit (2)` → exit outer loop. `!src_line_is_continued` is true but `src_y (2) >= src_limit (2)` → no next_dest_line.
 6. `dest->line->ynum = 2`
 
