@@ -64,7 +64,7 @@ This investigation employs the following methodology:
 
 ### 2.1 The Compilation Pipeline
 
-Kitty's build system is orchestrated entirely through `setup.py`, a 2,173-line Python script that serves as the central build coordinator. The `Makefile` provides convenience wrappers that delegate to `setup.py`.
+Kitty's build system is orchestrated entirely through `setup.py`, a 2,172-line Python script that serves as the central build coordinator. The `Makefile` provides convenience wrappers that delegate to `setup.py`.
 
 #### The `build()` Entry Point
 
@@ -376,20 +376,22 @@ Source: `kitty/data-types.c:538-574`
 
 #### ALL-OR-NOTHING Initialization Pattern
 
-> **CRITICAL ARCHITECTURAL POINT:** Every sub-initializer follows the pattern `if (!init_X(m)) return NULL;`. This means that if **any single** `init_*()` call fails, `PyInit_fast_data_types()` returns `NULL` and the **entire module fails to load**. There is no way to load a subset of functionality.
+> **CRITICAL ARCHITECTURAL POINT:** Of the 33 sub-initializers, 32 follow the error-checked pattern `if (!init_X(m)) return NULL;`. The sole exception is `init_monotonic()` (Source: `data-types.c:538`), which is called as a void function without error checking and without the module parameter `m`. For the remaining 32, if **any single** `init_*()` call fails, `PyInit_fast_data_types()` returns `NULL` and the **entire module fails to load**. There is no way to load a subset of functionality.
 
 ```c
-if (!init_logging(m)) return NULL;
+init_monotonic();                           // Exception: void call, no error check, no module param
+
+if (!init_logging(m)) return NULL;          // All subsequent 32 sub-initializers follow this pattern
 if (!init_LineBuf(m)) return NULL;
 if (!init_HistoryBuf(m)) return NULL;
 if (!init_Line(m)) return NULL;
 if (!init_Cursor(m)) return NULL;
-// ... (every single one follows this pattern)
+// ... (all 32 follow this error-checked pattern)
 if (!init_crypto_library(m)) return NULL;
 if (!init_systemd_module(m)) return NULL;
 ```
 
-Source: `kitty/data-types.c:540-574`
+Source: `kitty/data-types.c:538-574`
 
 **Thinking:** This all-or-nothing pattern is a performance optimization for the runtime case — by initializing everything upfront in a single module, Python only needs to load one `.so` file and all types/functions are immediately available. The trade-off is that there is zero granularity: you cannot, for example, load just the `Cursor` and `Screen` types without also initializing the crypto library, the systemd module, and all platform-specific backends. This design choice has profound implications for test isolation, as documented in Section 5.
 
@@ -689,7 +691,7 @@ Source: `kitty_tests/main.py:297-331`
 
 ### 3.2 Test Infrastructure (`kitty_tests/__init__.py`)
 
-The `kitty_tests/__init__.py` file (Source: `kitty_tests/__init__.py:1-415`) provides the foundational test infrastructure that every test module depends on.
+The `kitty_tests/__init__.py` file (Source: `kitty_tests/__init__.py:1-414`) provides the foundational test infrastructure that every test module depends on.
 
 #### Critical Module-Level Imports
 
@@ -1395,17 +1397,24 @@ The following table maps sub-initializers to the specific test modules that cons
 
 **Question:** Which test modules could *theoretically* run without compiled C extensions, if the base harness import chain were somehow satisfied?
 
-The following test modules perform no direct imports from `fast_data_types` at module level and use only pure Python functionality in their test methods:
+Only **2** test modules have no non-BaseTest dependency on `fast_data_types` — meaning their module-level imports (beyond `BaseTest`) do not trigger `fast_data_types` loading, and their test methods either use only pure Python or defer imports to pure Python modules:
 
 | Module | What It Tests | Why It Could Theoretically Work |
 |---|---|---|
-| `search_query_parser.py` | Pure Python `kitty.search_query_parser` module | All imports (`kitty.search_query_parser.ParseException`, `search`) are deferred inside test methods. Source: `kitty_tests/search_query_parser.py:11` |
-| `tui.py` | Pure Python `kittens.tui.line_edit.LineEdit` | All imports (`kittens.tui.line_edit.LineEdit`) are deferred inside test methods. Source: `kitty_tests/tui.py:11` |
-| `clipboard.py` | `kitty.clipboard.WriteRequest` (pure Python class) | Only imports `WriteRequest` at module level. Source: `kitty_tests/clipboard.py:5` |
-| `open_actions.py` | URL/MIME action matching | Only imports `kitty.utils.get_editor` at module level. Source: `kitty_tests/open_actions.py:8` |
-| `completion.py` | Kitten CLI completion | Only imports `kitty.constants.kitten_exe` at module level. Tests use subprocess calls. Source: `kitty_tests/completion.py:11` |
+| `search_query_parser.py` | Pure Python `kitty.search_query_parser` module | All imports (`kitty.search_query_parser.ParseException`, `search`) are deferred inside test methods. The target module `kitty/search_query_parser.py` has zero `fast_data_types` imports. Source: `kitty_tests/search_query_parser.py:11` |
+| `completion.py` | Kitten CLI completion | Only imports `kitty.constants.kitten_exe` at module level. `kitty/constants.py` has **no** module-level `fast_data_types` imports (all three references at lines 154, 170, and 304 are inside function bodies). Tests use `subprocess.run()` to invoke the Go-compiled `kitten` binary. Source: `kitty_tests/completion.py:11` |
 
-**Thinking:** These 5 modules test pure Python functionality that does not inherently require C extensions. Their test methods use string parsing, subprocess invocation, or pure Python data structures. In a hypothetical architecture where `BaseTest` could be loaded without `fast_data_types`, these modules would likely pass their tests without the compiled extension.
+#### Why Other Transitive-Only Modules Are NOT Theoretically Isolatable
+
+Several other test modules initially appear to be candidates for theoretical isolation because they have no *direct* `fast_data_types` imports. However, closer inspection of their non-BaseTest module-level import targets reveals additional `fast_data_types` dependencies:
+
+| Module | Apparent Simplicity | Why It Is NOT Isolatable |
+|---|---|---|
+| `clipboard.py` | Imports `kitty.clipboard.WriteRequest` at module level | `kitty/clipboard.py` line 13 has a module-level `from .fast_data_types import (ESC_OSC, GLFW_CLIPBOARD, ...)`. Importing `kitty.clipboard` triggers `fast_data_types` loading. Source: `kitty/clipboard.py:13` |
+| `open_actions.py` | Imports `kitty.utils.get_editor` at module level | `kitty/utils.py` line 45 has a module-level `from .fast_data_types import WINDOW_FULLSCREEN, ...`. Importing `kitty.utils` triggers `fast_data_types` loading. Source: `kitty/utils.py:45` |
+| `tui.py` | Defers `kittens.tui.line_edit.LineEdit` inside test method | `kittens/tui/line_edit.py` line 6 has a module-level `from kitty.fast_data_types import truncate_point_for_length, wcswidth`. When the test method executes the deferred import, it triggers `fast_data_types` loading, preventing the test from running. Source: `kittens/tui/line_edit.py:6` |
+
+**Thinking:** The critical distinction is between *module import success* and *test execution success*. For `clipboard.py` and `open_actions.py`, even the module-level import would fail because their non-BaseTest import targets (`kitty.clipboard`, `kitty.utils`) have module-level `fast_data_types` dependencies. For `tui.py`, the module can import successfully (only `BaseTest` is needed at module level), but its test method `test_line_edit()` would fail when executing the deferred `from kittens.tui.line_edit import LineEdit`, because that module has a module-level `fast_data_types` import. Only `search_query_parser.py` and `completion.py` have import chains that are fully free of `fast_data_types` at every level.
 
 **However, this is purely theoretical.** In practice, it is impossible because:
 
