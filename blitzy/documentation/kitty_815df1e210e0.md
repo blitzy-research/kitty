@@ -59,7 +59,7 @@ seq 1 1000000
 for i in $(seq 1 50); do kitty @ resize-os-window --width $((80 + i)) --height 24; done
 
 # Tab switching — exercises Tab/Window lifecycle and render target switching
-for i in $(seq 1 10); do kitty @ new-tab; done
+for i in $(seq 1 10); do kitty @ launch --type=tab --keep-focus; done
 for i in $(seq 1 100); do kitty @ focus-tab --match index:$((i % 10)); done
 ```
 
@@ -84,13 +84,13 @@ Source: `kitty/data-types.c:524-574`, extern declarations at lines 476-510
 
 | # | Subsystem | Init Function | Source File | Responsibility |
 |---|-----------|---------------|-------------|----------------|
-| 1 | Logging | `init_logging(m)` | `kitty/log-utils.c` | Centralized log routing to stderr |
+| 1 | Logging | `init_logging(m)` | `kitty/logging.c` | Centralized log routing to stderr |
 | 2 | LineBuf | `init_LineBuf(m)` | `kitty/line-buf.c` | Circular buffer of terminal lines (the visible screen grid) |
 | 3 | HistoryBuf | `init_HistoryBuf(m)` | `kitty/history.c` | Scrollback buffer storage (ring buffer of past lines) |
 | 4 | Line | `init_Line(m)` | `kitty/line.c` | Single terminal line: array of cells with attributes |
 | 5 | Cursor | `init_Cursor(m)` | `kitty/cursor.c` | Cursor state: position, shape (block/beam/underline), color |
 | 6 | Shlex | `init_Shlex(m)` | `kitty/shlex.c` | Shell-style lexing for config file parsing |
-| 7 | Parser | `init_Parser(m)` | `kitty/parser.c` | VT terminal escape sequence parser (the core byte-stream interpreter) |
+| 7 | Parser | `init_Parser(m)` | `kitty/vt-parser.c` | VT terminal escape sequence parser (the core byte-stream interpreter) |
 | 8 | DiskCache | `init_DiskCache(m)` | `kitty/disk-cache.c` | On-disk caching for scrollback paging beyond RAM limits |
 | 9 | ChildMonitor | `init_child_monitor(m)` | `kitty/child-monitor.c` | Child process I/O multiplexing and thread orchestration |
 | 10 | ColorProfile | `init_ColorProfile(m)` | `kitty/colors.c` | 256-color + 24-bit true-color palette management |
@@ -108,10 +108,10 @@ Source: `kitty/data-types.c:524-574`, extern declarations at lines 476-510
 | 21 | FreeType | `init_freetype_library(m)` | `kitty/freetype.c` | Font rasterization via FreeType library |
 | 22 | FontConfig | `init_fontconfig_library(m)` | `kitty/fontconfig.c` | Font discovery via FontConfig library |
 | 23 | Desktop | `init_desktop(m)` | `kitty/desktop.c` | Desktop integration (notifications, file manager) |
-| 24 | FreeType UI Text | `init_freetype_render_ui_text(m)` | `kitty/freetype-render-ui-text.c` | UI text rendering (tab bar, window titles) |
+| 24 | FreeType UI Text | `init_freetype_render_ui_text(m)` | `kitty/freetype_render_ui_text.c` | UI text rendering (tab bar, window titles) |
 | | **macOS-only (lines 560-563):** | | | |
 | 21m | macOS Process Info | `init_macos_process_info(m)` | `kitty/macos_process_info.c` | macOS process information queries |
-| 22m | CoreText | `init_CoreText(m)` | `kitty/core_text.c` | Font rasterization via macOS CoreText |
+| 22m | CoreText | `init_CoreText(m)` | `kitty/core_text.m` | Font rasterization via macOS CoreText |
 | 23m | Cocoa | `init_cocoa(m)` | `kitty/cocoa_window.m` | macOS Cocoa window management |
 | | **Cross-platform (lines 570-574):** | | | |
 | 25 | Fonts | `init_fonts(m)` | `kitty/fonts.c` | Font selection, glyph caching, HarfBuzz text shaping |
@@ -395,7 +395,8 @@ pstree -p $$
 # Verify the kitten binary is NOT a Python script
 file $(which kitten)
 # Expected: "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=..., stripped"
-# Note: "statically linked" confirms CGO_ENABLED=0; "Go BuildID" confirms it's a Go binary
+# Note: "statically linked" appears for cross-compiled builds where CGO_ENABLED=0;
+#        native builds may be dynamically linked. "Go BuildID" confirms it's a Go binary.
 ```
 
 **Rationale**: The `pstree` output proves that `kitten` is a **separate OS process** (its own PID), not a thread or module inside the kitty process. The `file` output proves it is a **statically linked Go binary** — not a Python script, not a dynamically linked C program.
@@ -413,7 +414,7 @@ Key build parameters:
 | Build command | `go build -v tools/cmd` | 1148, 1163 | Compiles the Go source at `tools/cmd/main.go` |
 | Source entry point | `tools/cmd/main.go` | 1163 | Go `main()` function (line 14 of that file) |
 | Version embedding | `-X kitty.VCSRevision={vcs_rev}` | 1151 | Bakes the git revision into the binary |
-| Cross-platform builds | `CGO_ENABLED=0` | 1173 | Produces a **fully static** Go binary with zero C dependencies |
+| Cross-platform builds | `CGO_ENABLED=0` | 1173 | Set **only for cross-compilation** (inside `if for_platform:` block); produces a fully static Go binary with zero C dependencies. Native builds may use cgo. |
 | Release builds | `-ldflags -s -w` | 1157-1158 | `-s` strips the symbol table, `-w` strips DWARF debug info |
 
 **Inspection commands**:
@@ -427,8 +428,9 @@ file $(which kitten)
 # Verify no shared library dependencies (static Go binary)
 ldd $(which kitten)
 # Expected: "not a dynamic executable"
-# Rationale: CGO_ENABLED=0 at setup.py:1173 ensures pure Go compilation with no cgo,
-#            producing a fully static binary that does not link against libc or any .so files.
+# Rationale: For cross-platform builds, CGO_ENABLED=0 at setup.py:1173 (inside the
+#            `if for_platform:` block) ensures pure Go compilation with no cgo, producing
+#            a fully static binary. Native builds may use cgo and link against system libraries.
 
 # Examine Go-specific symbols (only possible if NOT stripped — i.e., debug build)
 go tool nm $(which kitten) | grep "main\.\|simdstring\.\|icat\."
@@ -629,12 +631,12 @@ Based solely on runtime artifacts (loaded modules, thread names, process boundar
 | GPU rendering (shader compilation, draw calls) | C | `draw_cells()`, `send_cell_data_to_gpu()` make OpenGL calls on main thread | `kitty/shaders.c:970, 1009` |
 | GLSL shaders (executed on GPU) | GLSL | 12 `.glsl` files compiled at runtime by `init_shaders()` | `kitty/*.glsl` |
 | Child process I/O (PTY read/write, poll) | C | `io_loop()` runs in `KittyChildMon` thread | `kitty/child-monitor.c:1481` |
-| Font rasterization | C | FreeType/CoreText bindings registered as C extension subsystems | `kitty/freetype.c` or `kitty/core_text.c` |
+| Font rasterization | C | FreeType/CoreText bindings registered as C extension subsystems | `kitty/freetype.c` or `kitty/core_text.m` |
 | Text shaping | C | HarfBuzz integration via `init_fonts()` | `kitty/fonts.c` |
 | Window system abstraction | C | `init_glfw()` — GLFW compiled and linked as C code | `kitty/glfw.c` |
 | Application lifecycle, configuration | Python | `Boss` class, options parsing, session management — Python source files | `kitty/boss.py`, `kitty/main.py` |
 | Startup orchestration | Python | `main()` → `_main()` → `init_glfw()` → `run_app()` → `load_all_shaders()` → `Boss()` | `kitty/main.py:226,441,514,524` |
-| Remote control command dispatch | Python | 41 Python modules in `kitty/rc/`, each implementing one command | `kitty/rc/ls.py`, etc. |
+| Remote control command dispatch | Python | 40 Python command modules in `kitty/rc/` (plus `__init__.py` package initializer) | `kitty/rc/ls.py`, etc. |
 | Kitten resolution and execution | Python | `kittens/runner.py` resolves names; `entry_points.py` calls `os.execl()` | `kittens/runner.py:110-133`, `kitty/entry_points.py:10-12` |
 | Configuration file parsing | Python | Options types defined in Python; C `Shlex` assists with lexing | `kitty/options/` |
 | CLI tools (kitten binary) | Go | Separate statically linked process; `file` shows "Go BuildID" | `tools/cmd/main.go:14-35` |
