@@ -129,7 +129,7 @@ cat /proc/$KITTY_PID/maps | grep '\.so' | awk '{print $NF}' | sort -u
 
 Expected output (Linux, on an X11 system) would include:
 
-```
+```text
 /usr/lib/python3.xx/lib-dynload/...
 /path/to/kitty/fast_data_types.so    # The C extension containing all 25+ subsystems
 /usr/lib/x86_64-linux-gnu/libpython3.xx.so.1.0
@@ -190,7 +190,7 @@ ps -eLf | grep $KITTY_PID
 
 Expected output under **idle** conditions (3 threads if remote control is enabled):
 
-```
+```text
 UID        PID   PPID   LWP  C NLWP STIME TTY      TIME     CMD
 user      1234      1  1234  0    3 12:00 ?        00:00:00 kitty          # Main thread
 user      1234      1  1235  0    3 12:00 ?        00:00:00 kitty          # KittyChildMon (I/O)
@@ -245,7 +245,7 @@ flowchart TD
     end
 
     subgraph TalkThread["Talk Thread (KittyPeerMon)"]
-        PollPeer["poll() on peer FDs<br/>child-monitor.c:1820"] --> HandleRC["Handle kitty @<br/>remote control"]
+        PollPeer["poll() on peer FDs<br/>child-monitor.c:1850"] --> HandleRC["Handle kitty @<br/>remote control"]
         HandleRC --> WakeMain2["Wakeup main loop"]
     end
 
@@ -304,8 +304,8 @@ Additional remote control inspection:
 # Capture the current screen content of window id 1
 kitty @ get-text --match id:1
 
-# Get the number of lines in the scrollback buffer
-kitty @ scroll-window --amount 0
+# Capture full scrollback content (all lines, not just the visible screen)
+kitty @ get-text --extent all --match id:1
 ```
 
 **Note**: Remote control requires `allow_remote_control=yes` in `kitty.conf` or the `--allow-remote-control` CLI flag. The Talk thread (`KittyPeerMon`) must be running to handle these commands.
@@ -480,6 +480,14 @@ nm /path/to/kitty/fast_data_types.so | grep -i "PyInit\|init_"
 # Attempt 4: readelf for ELF section headers
 readelf -s /path/to/kitten | grep "main\."
 # Error: readelf: command not found
+
+# Attempt 5: perf for CPU stack sampling
+perf record -g -p $KITTY_PID -- sleep 5
+# Error: perf: command not found
+
+# Attempt 6: objdump for disassembly and section listing
+objdump -d /path/to/kitty/fast_data_types.so | head -50
+# Error: objdump: command not found
 ```
 
 **Fallback: `/proc`-based inspection** (always available on Linux, even in containers):
@@ -524,7 +532,7 @@ nm kitty/fast_data_types.so | grep -i "PyInit\|init_"
 
 Expected output (derived from the extern declarations at lines 476-510):
 
-```
+```text
 T PyInit_fast_data_types
 T init_LineBuf
 T init_HistoryBuf
@@ -571,7 +579,7 @@ go tool nm kitten | grep "main\.\|simdstring\.\|icat\."
 
 Expected symbols:
 
-```
+```text
 T main.main
 T kitty/tools/cmd/tool.KittyToolEntryPoints
 T kitty/tools/simdstring.init
@@ -625,7 +633,7 @@ Based solely on runtime artifacts (loaded modules, thread names, process boundar
 | Text shaping | C | HarfBuzz integration via `init_fonts()` | `kitty/fonts.c` |
 | Window system abstraction | C | `init_glfw()` — GLFW compiled and linked as C code | `kitty/glfw.c` |
 | Application lifecycle, configuration | Python | `Boss` class, options parsing, session management — Python source files | `kitty/boss.py`, `kitty/main.py` |
-| Startup orchestration | Python | `main()` → `init_glfw()` → `load_shader_programs()` → `Boss()` | `kitty/main.py:82-98` |
+| Startup orchestration | Python | `main()` → `_main()` → `init_glfw()` → `run_app()` → `load_all_shaders()` → `Boss()` | `kitty/main.py:226,441,514,524` |
 | Remote control command dispatch | Python | 41 Python modules in `kitty/rc/`, each implementing one command | `kitty/rc/ls.py`, etc. |
 | Kitten resolution and execution | Python | `kittens/runner.py` resolves names; `entry_points.py` calls `os.execl()` | `kittens/runner.py:110-133`, `kitty/entry_points.py:10-12` |
 | Configuration file parsing | Python | Options types defined in Python; C `Shlex` assists with lexing | `kitty/options/` |
@@ -724,7 +732,7 @@ The C-side SIMD is initialized in `init_simd()` at `kitty/simd-string.c:193-249`
 - **Runtime CPU detection** (x86): Uses `__builtin_cpu_supports("sse4.2")` and `__builtin_cpu_supports("avx2")` at line 198.
 - **ARM (aarch64)**: Unconditionally sets `has_sse4_2 = true; has_avx2 = true` (lines 218-219) because the **SIMDe** (SIMD Everywhere) portability library transpiles x86 intrinsics to equivalent ARM NEON instructions.
 - **SIMDe library**: `#include <simde/x86/avx2.h>` and `#include <simde/arm/neon.h>` at `kitty/simd-string-impl.h:36-37`. This allows writing SSE4.2/AVX2 intrinsics that compile to native NEON on ARM.
-- **Scalar fallback**: `find_either_of_two_bytes_scalar()` at `kitty/simd-string.c:20-26` — a simple byte-by-byte loop.
+- **Scalar fallback**: `find_either_of_two_bytes_scalar()` at `kitty/simd-string.c:20-26` (return type at L20, function name and parameters at L21, body L22-25, closing brace L26) — a simple byte-by-byte loop.
 - **Function pointer dispatch**: The function pointer `find_either_of_two_bytes_impl` starts pointing to `find_either_of_two_bytes_scalar`, then gets upgraded to the widest available SIMD path at init time (lines 231-246):
   - If AVX2: upgraded to `find_either_of_two_bytes_256` (from `kitty/simd-string-256.c`)
   - Else if SSE4.2: upgraded to `find_either_of_two_bytes_128` (from `kitty/simd-string-128.c`)
