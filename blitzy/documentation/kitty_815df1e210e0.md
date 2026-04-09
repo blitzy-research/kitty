@@ -57,7 +57,7 @@ DISPLAY=:99 KITTY_INSTALLATION_DIR="$(pwd)" ./kitty/launcher/kitty \
 | Tool | Command | Purpose |
 |------|---------|---------|
 | strace | `strace -f -e trace=read,write,poll,ioctl -p $PID` | System call tracing for inter-thread communication, PTY (pseudoterminal) I/O, and poll timeout observation |
-| gdb | `gdb -batch -p $PID -ex "set pagination off" -ex "thread apply all bt 15" -ex "detach"` | Thread backtraces revealing the call chain from GLFW (Graphics Library Framework) event loop through C extensions to Python dispatch |
+| gdb | `gdb -batch -p $PID -ex "set pagination off" -ex "thread apply all bt 15" -ex "detach"` | Thread backtraces revealing the call chain from GLFW (a cross-platform windowing library, [glfw.org](https://www.glfw.org)) event loop through C extensions to Python dispatch |
 | /proc thread names | `cat /proc/$PID/task/$TID/comm` | Thread name enumeration — identifies the role of each TID (Thread ID) |
 | /proc memory maps | `cat /proc/$PID/maps` | Shared library mapping — reveals which `.so` files are loaded and their address ranges |
 | xdotool | `xdotool key --window $WINID <key>` | X11 input injection for keyboard simulation |
@@ -103,7 +103,7 @@ The following is raw output from a single keypress ('a') captured by the `--debu
 
 **Analysis of the log:**
 - Line 1 (`Press`): The GLFW platform layer in `glfw-x11.so` receives the raw X11 key event. The XKB subsystem (via `libxkbcommon.so`) translates keycode `0x26` into the symbol `a`, applies compose processing (`composed_sym: a`), and generates the text `a`. This is the **entry point** of the input pipeline.
-- Line 2 (`on_key_input`): The C function `on_key_input` in `fast_data_types.so` receives the fully decoded event. The `state: 0` indicates IME state `GLFW_IME_NONE` (normal key processing). The outcome `sent key as text to child: a` proves the key was encoded and queued for writing to the child PTY.
+- Line 2 (`on_key_input`): The C function `on_key_input` in `fast_data_types.so` receives the fully decoded event. The `state: 0` indicates IME (Input Method Editor — a system component for composing complex characters, e.g., CJK input) state `GLFW_IME_NONE` (normal key processing). The outcome `sent key as text to child: a` proves the key was encoded and queued for writing to the child PTY.
 - Line 3-4 (`Release`): The key release event follows the same path but is discarded with `ignoring as keyboard mode does not support encoding this event` — the default keyboard mode does not encode release events.
 
 ### 2.4 Evidence: Shortcut Handling
@@ -118,7 +118,7 @@ KeyPress matched action: new_tab, handled as shortcut
 
 **Analysis:** The same `on_key_input` function is entered, but instead of `sent key as text to child`, the output reads `matched action: new_tab, handled as shortcut`. This proves that the shortcut-matching logic is invoked **before** encoding, and when a match is found, the key is consumed without reaching the child process.
 
-*Source: kitty/keys.c:226-234 — the `dispatch_possible_special_key` macro calls Python, and if consumed returns True, triggering the "handled as shortcut" path.*
+*Source: kitty/keys.c:226-234 — the `dispatch_key_event(dispatch_possible_special_key)` macro expansion calls Python's `dispatch_possible_special_key` method on the Boss object, and if consumed returns True, triggering the "handled as shortcut" path.*
 
 ### 2.5 Evidence: Strace Write Correlation
 
@@ -148,14 +148,16 @@ Based on the combined evidence from debug-keyboard logs, strace output, and gdb 
    - If no active window exists → `"no active window, ignoring"` (never observed during normal operation)
    - If IME state is not `GLFW_IME_NONE` → handle IME event and return
    - If action is PRESS or REPEAT → call `dispatch_possible_special_key` (crosses into Python) → if consumed: `"handled as shortcut"` and return
+   - If action is RELEASE and the previous press was handled as a shortcut → `"ignoring release event for previous press that was handled as shortcut"` (observed in debug log as the release counterpart to shortcut keystrokes)
+   - If the screen is scrolled back (`screen->scrolled_by > 0`) and the key would produce text → scroll back to the bottom before encoding, ensuring the user sees current output when typing
    - If not consumed → encode via `encode_glfw_key_event()` → call `schedule_write_to_child()`
-   *Source: kitty/keys.c:166-273*
+   *Source: kitty/keys.c:166-275*
 
 4. **`schedule_write_to_child()`**: Copies the encoded key data into `screen->write_buf` under mutex protection, then calls `wakeup_io_loop()`. The strace evidence shows this as the `write(6, ...)` to the eventfd wakeup descriptor.
    *Source: kitty/child-monitor.c:323-377*
 
-5. **`io_loop()` → `write_to_child()`**: The KittyChildMon I/O thread wakes from its `poll()` call (observed in strace as `poll([{fd=6, events=POLLIN}, ...]` returning), reads the wakeup eventfd, detects `POLLOUT` on the PTY fd, and calls `write()` to deliver the key data. The strace evidence shows `12073 write(8, "a", 1) = 1`.
-   *Source: kitty/child-monitor.c:1481-1570, 1443-1477*
+5. **`io_loop()` → `write_to_child()`**: The KittyChildMon I/O thread wakes from its `poll()` call (observed in strace as `poll([{fd=6, events=POLLIN}, ...]` returning — where POLLIN is the poll flag indicating data is available to read), reads the wakeup eventfd, detects `POLLOUT` (poll flag indicating the fd is ready for writing) on the PTY fd, and calls `write()` to deliver the key data. The strace evidence shows `12073 write(8, "a", 1) = 1`.
+   *Source: kitty/child-monitor.c:1481-1580, 1443-1477*
 
 ### 2.7 Mermaid Sequence Diagram: Keystroke Lifecycle
 
@@ -193,7 +195,7 @@ Runtime observation proves that Kitty's input routing is a **5-stage pipeline** 
 - **Main thread** (TID 12007): Stages 1-4 — from X11 event reception through GLFW, key callback, shortcut check (Python), encoding (C), to buffer queuing and wakeup
 - **I/O thread** (TID 12073): Stage 5 — dequeuing from the write buffer and writing to the PTY master fd
 
-The **active window** is determined by `active_window()` in the C state layer, which returns the window at the intersection of the current OS window's active tab and that tab's active window index. Input **always** flows to this single active window — there is no multi-target dispatch.
+The **active window** is determined by `active_window()` (defined in `kitty/keys.c:106`, using the global state structure from `kitty/state.c`), which returns the window at the intersection of the current OS window's active tab and that tab's active window index. Input **always** flows to this single active window — there is no multi-target dispatch.
 
 ---
 
@@ -237,6 +239,9 @@ Based on the debug log output, strace thread correlation, and gdb stack analysis
    *Source: kitty/boss.py:1651-1659*
 
 4. **`Window.focus_changed()`** (Python): This method has several observable effects:
+
+   > **Note:** The following guard condition and structural details are correlated from source code; the behavioral effects (focus propagation, watcher invocation, screen state update) are confirmed by runtime observation.
+
    - Checks guard conditions: `self.destroyed`, `self.ignore_focus_changes`, and whether focus state actually changed
    - Calls watchers via `call_watchers(weakref.ref(self), 'on_focus_change', {'focused': focused})`
    - Executes registered `actions_on_focus_change` callbacks
@@ -453,9 +458,11 @@ flowchart TB
     end
 
     KEY_CB -->|"schedule_write_to_child"| WRITE_BUF
+    CHILDREN_MUTEX -.->|"protects"| WRITE_BUF
     WRITE_BUF -->|"wakeup_io_loop"| WAKEUP_IO
     WAKEUP_IO -->|"drain eventfd"| IO_POLL
     IO_POLL -->|"POLLOUT on PTY"| WRITE_CHILD
+    IO_POLL -->|"POLLIN on PTY"| READ_BYTES
     READ_BYTES -->|"data_received"| WAKEUP_MAIN
     WAKEUP_MAIN -->|"wakeup_main_loop"| PROCESS_GS
 ```
@@ -484,7 +491,7 @@ The following experimental procedure was performed:
 2. Inject a keystroke 'a' → confirm it routes to the initial window
 3. Create a new tab via `ctrl+shift+t`
 4. Inject a keystroke 'x' → confirm it routes to the new tab's window
-5. Close the tab via `ctrl+shift+w`
+5. Close the window (which closes the tab since it is the only window in it) via `ctrl+shift+w`
 6. **Immediately** inject a keystroke 'y' → observe where it routes
 7. Analyze the debug log for any error messages
 
@@ -515,7 +522,7 @@ The debug log at timestamp `[49.616]` shows `sent key as text to child: y` — t
 This proves:
 1. When `close_window` executes, it removes the tab/window from the state hierarchy
 2. The state management layer immediately updates `active_tab` and/or `active_window` indices to point to a surviving window
-3. By the time the next keystroke arrives (527ms later at 49.616 vs 49.088), `active_window()` already returns the surviving window from the original tab
+3. By the time the next keystroke arrives (528ms later at 49.616 vs 49.088), `active_window()` already returns the surviving window from the original tab
 4. Input **seamlessly reroutes** to the surviving active window — there is no "gap" period where input would be lost
 
 ### 5.5 Evidence: Strace Confirmation
