@@ -111,6 +111,7 @@ def main() -> None:
         import traceback
         tb = traceback.format_exc()
         log_error(tb)
+        raise SystemExit(1)
 ```
 
 > **Rationale:** The entry point dispatch is deliberately simple — a dictionary lookup. This keeps startup overhead minimal for the common case (no recognized first argument = launch GUI). The `namespaced()` function (lines 138–148) provides extensibility for subcommands via the `+` prefix convention.
@@ -270,6 +271,8 @@ Source: `kitty/constants.py:207-217`
 def is_wayland(opts=None):
     if is_macos:
         return False
+    if opts is None:
+        return bool(getattr(is_wayland, 'ans'))
     if opts.linux_display_server == 'auto':
         ans = detect_if_wayland_ok()
     else:
@@ -437,7 +440,7 @@ FONTS_DATA_HANDLE load_fonts_data(double font_sz_in_pts, double dpi_x, double dp
 
 **font_group_for() — Font Group Lookup/Creation**
 
-Source: `kitty/fonts.c:203-218`
+Source: `kitty/fonts.c:204-218`
 
 Searches existing font groups for a matching `(font_sz, dpi_x, dpi_y)` tuple. If none found, creates a new `FontGroup` and calls `initialize_font_group()`.
 
@@ -569,11 +572,11 @@ This converts the font size in points to 26.6 fixed-point (`pts * 64`) and passe
 Source: `kitty/fonts.c:276-281`
 
 ```c
-static void sprite_tracker_set_layout(GPUSpriteTracker *st, unsigned int cell_width, unsigned int cell_height) {
-    st->xnum = MIN(MAX(1u, max_texture_size / cell_width), (size_t)UINT16_MAX);
-    st->max_y = MIN(MAX(1u, max_texture_size / cell_height), (size_t)UINT16_MAX);
-    st->ynum = 1;
-    st->x = 0; st->y = 0; st->z = 0;
+static void sprite_tracker_set_layout(GPUSpriteTracker *sprite_tracker, unsigned int cell_width, unsigned int cell_height) {
+    sprite_tracker->xnum = MIN(MAX(1u, max_texture_size / cell_width), (size_t)UINT16_MAX);
+    sprite_tracker->max_y = MIN(MAX(1u, max_texture_size / cell_height), (size_t)UINT16_MAX);
+    sprite_tracker->ynum = 1;
+    sprite_tracker->x = 0; sprite_tracker->y = 0; sprite_tracker->z = 0;
 }
 ```
 
@@ -1297,13 +1300,13 @@ Kitty's text rendering pipeline converts font files into GPU-cached glyph sprite
 | `kitty/main.py` | `_main()` (441), `init_glfw()` (95), `init_glfw_module()` (90), `AppRunner.__call__()` (247), `_run_app()` (202), `load_all_shaders()` (82), `set_locale()` (424), `setup_environment()` (403), `main()` (524) | Main startup orchestrator |
 | `kitty/glfw.c` | `glfw_init()` (1431), `create_os_window()` (1107), `get_window_content_scale()` (823), `dpi_from_scale()` (812), `get_window_dpi()` (838), `update_os_window_viewport()` (130) | GLFW initialization, OS window creation, DPI detection |
 | `kitty/gl.c` | `gl_init()` (52), `gl_version_string()` (42), `update_surface_size()` (80) | OpenGL context initialization via GLAD |
-| `kitty/fonts.c` | `initialize_font_group()` (1495), `calc_cell_metrics()` (373), `load_fonts_data()` (1529), `font_group_for()` (203), `sprite_tracker_set_layout()` (276), `send_prerendered_sprites()` (1449), `send_prerendered_sprites_for_window()` (1520) | Font group management, cell metrics, sprite atlas |
+| `kitty/fonts.c` | `initialize_font_group()` (1495), `calc_cell_metrics()` (373), `load_fonts_data()` (1529), `font_group_for()` (204), `sprite_tracker_set_layout()` (276), `send_prerendered_sprites()` (1449), `send_prerendered_sprites_for_window()` (1520) | Font group management, cell metrics, sprite atlas |
 | `kitty/freetype.c` | `cell_metrics()` (387), `calc_cell_width()` (374), `calc_cell_height()` (141), `font_units_to_pixels_y()` (92), `font_units_to_pixels_x()` (97), `set_size_for_face()` (190), `set_font_size()` (155) | FreeType cell calculations, font unit conversion |
 | `kitty/fonts/render.py` | `set_font_family()` (173), `create_symbol_map()` (139), `render_special()` (284), `descriptor_for_idx()` (157) | Python font orchestration, pre-render callbacks |
 | `kitty/fonts/common.py` | `get_font_files()` | Font file resolution via system font APIs |
 | `kitty/shaders.py` | `Program.__init__()` (48), `Program._load_sources()` (61), `Program.compile()` (87), `LoadShaderPrograms.__call__()` (147) | GLSL shader source loading and compilation |
 | `kitty/shaders.c` | Shader program enum definitions | C-level shader program management |
-| `kitty/state.h` | `GlobalState` (259), `OSWindow` (216), `Options` structs | Global state and OS window structure definitions |
+| `kitty/state.h` | `GlobalState` (258), `OSWindow` (216), `Options` structs | Global state and OS window structure definitions |
 | `kitty/data-types.h` | `OPENGL_REQUIRED_VERSION_MAJOR/MINOR` (20–25), `GLSL_VERSION` (26), `FONTS_DATA_HEAD` (347) | OpenGL/GLSL version constants, font data structure |
 | `kitty/os_window_size.py` | `initial_window_size_func()` (54), `edge_spacing()` (40) | Window dimension calculation from cell metrics |
 | `kitty/constants.py` | `is_wayland()` (207), `detect_if_wayland_ok()` (196), `glfw_path()` (191) | Backend detection, platform constants |
