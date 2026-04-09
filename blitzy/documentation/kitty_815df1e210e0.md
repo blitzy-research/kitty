@@ -103,8 +103,7 @@ The `EntryPoint` function adds `"choose-fonts"` as a subcommand with `"choose_fo
 
 ```go
 ans := root.AddSubCommand(&cli.Command{
-    Name: "choose-fonts",
-    ...
+    Name: "choose-fonts", ...
 })
 ```
 
@@ -132,10 +131,7 @@ This route goes through the Python entry point system:
 
    ```python
    def resolved_kitten(k: str) -> str:
-       ans = aliases.get(k, k)
-       head, tail = os.path.split(ans)
-       tail = tail.replace('-', '_')
-       return os.path.join(head, tail)
+       ... # normalizes hyphens to underscores in kitten names
    ```
 
    > Source: `kittens/runner.py:23-27`
@@ -160,20 +156,11 @@ The `EntryPoint` function is the top-level registration site for the `choose-fon
 
 ```go
 func EntryPoint(root *cli.Command) {
-    ans := root.AddSubCommand(&cli.Command{
-        Name:             "choose-fonts",
-        ShortDescription: "Choose the fonts used in kitty",
-        Run: func(cmd *cli.Command, args []string) (rc int, err error) {
-            opts := Options{}
-            if err = cmd.GetOptionValues(&opts); err != nil {
-                return 1, err
-            }
-            return main(&opts)
-        },
-    })
+    ans := root.AddSubCommand(&cli.Command{Name: "choose-fonts", ...})
+    ...
 ```
 
-> Source: `kittens/choose_fonts/main.go:74-84`
+> Source: `kittens/choose_fonts/main.go:74-84` (see full function at lines 74–98)
 
 It is called from the central CLI tree assembly in `tools/cmd/tool/main.go`:
 
@@ -195,12 +182,7 @@ The sole option for this kitten is `--reload-in`:
 
 ```go
 ans.Add(cli.OptionSpec{
-    Name:    "--reload-in",
-    Dest:    "Reload_in",
-    Type:    "choices",
-    Choices: "parent, all, none",
-    Default: "parent",
-    Help: `By default, this kitten will signal only the parent kitty instance ...`,
+    Name: "--reload-in", Choices: "parent, all, none", Default: "parent", ...
 })
 ```
 
@@ -276,11 +258,7 @@ The `handler` struct stores `opts` as a field:
 
 ```go
 type handler struct {
-    opts *Options
-    lp   *loop.Loop
-    // ... other fields ...
-    final_pane final_pane
-    // ...
+    opts *Options  // plus lp, final_pane, and other fields
 }
 ```
 
@@ -292,10 +270,7 @@ The `final_pane` struct holds a back-reference to the handler:
 
 ```go
 type final_pane struct {
-    handler  *handler
-    settings faces_settings
-    family   string
-    lp       *loop.Loop
+    handler *handler; settings faces_settings; ...
 }
 ```
 
@@ -305,11 +280,8 @@ When the user presses Enter in the final pane, `opts.Reload_in` is read via the 
 
 ```go
 switch self.handler.opts.Reload_in {
-case "parent":
-    config.ReloadConfigInKitty(true)
-case "all":
-    config.ReloadConfigInKitty(false)
-}
+case "parent": config.ReloadConfigInKitty(true)
+case "all":    config.ReloadConfigInKitty(false)
 ```
 
 > Source: `kittens/choose_fonts/final.go:87-92`
@@ -365,12 +337,7 @@ The selected font settings are serialized into a multi-line string:
 
 ```go
 func (self faces_settings) serialized() string {
-    return strings.Join([]string{
-        "font_family      " + self.font_family,
-        "bold_font        " + self.bold_font,
-        "italic_font      " + self.italic_font,
-        "bold_italic_font " + self.bold_italic_font,
-    }, "\n")
+    return strings.Join([]string{"font_family " + self.font_family, ...}, "\n")
 }
 ```
 
@@ -390,13 +357,9 @@ bold_italic_font auto
 The Enter key handler in `on_key_event()` creates a `Patcher` and calls `Patch()`:
 
 ```go
-if event.MatchesPressOrRepeat("enter") {
-    event.Handled = true
-    patcher := config.Patcher{Write_backup: true}
-    path := filepath.Join(utils.ConfigDir(), "kitty.conf")
-    updated, err := patcher.Patch(path, "KITTY_FONTS",
-        self.settings.serialized(),
-        "font_family", "bold_font", "italic_font", "bold_italic_font")
+patcher := config.Patcher{Write_backup: true}
+path := filepath.Join(utils.ConfigDir(), "kitty.conf")
+updated, err := patcher.Patch(path, "KITTY_FONTS", self.settings.serialized(), ...)
 ```
 
 > Source: `kittens/choose_fonts/final.go:78-82`
@@ -459,11 +422,9 @@ bold_italic_font auto
 If a sentinel block already exists in the file, it is replaced in-place:
 
 ```go
-pat = utils.MustCompile(fmt.Sprintf(`(?ms)^# BEGIN_%s.+?# END_%s`, sentinel, sentinel))
+pat = utils.MustCompile(fmt.Sprintf(`(?ms)^# BEGIN_%s.+?# END_%s`, ...))
 ntext := pat.ReplaceAllStringFunc(text, func(string) string {
-    replaced = true
-    return addition
-})
+    replaced = true; return addition })
 ```
 
 > Source: `tools/config/api.go:328-334`
@@ -472,10 +433,7 @@ If no existing sentinel block is found, the new block is appended to the end of 
 
 ```go
 if !replaced {
-    if text != "" {
-        text += "\n\n"
-    }
-    ntext = text + addition
+    ... // append newlines if needed, then: ntext = text + addition
 }
 ```
 
@@ -483,7 +441,7 @@ if !replaced {
 
 ### `kitty.conf` Modification Details
 
-The config file path is resolved via:
+The `kitty.conf` path is resolved via:
 
 ```go
 path := filepath.Join(utils.ConfigDir(), "kitty.conf")
@@ -526,11 +484,8 @@ If the file content changed AND the original file had content, a `.bak` backup i
 
 ```go
 if !bytes.Equal(raw, nraw) {
-    if len(raw) > 0 && self.Write_backup {
-        _ = os.WriteFile(backup_path+".bak", raw, self.Mode)
-    }
+    _ = os.WriteFile(backup_path+".bak", raw, self.Mode) // write backup
     return true, utils.AtomicUpdateFile(path, nraw, self.Mode)
-}
 ```
 
 > Source: `tools/config/api.go:342-348`
@@ -543,16 +498,11 @@ Note: the backup path uses the original (pre-symlink-resolution) path, while the
 
 ### SIGUSR1 Reload Signal Dispatch
 
-After the config file is updated, the kitten optionally signals kitty to reload:
+After `kitty.conf` is updated, the kitten optionally signals kitty to reload:
 
 ```go
 if updated {
-    switch self.handler.opts.Reload_in {
-    case "parent":
-        config.ReloadConfigInKitty(true)
-    case "all":
-        config.ReloadConfigInKitty(false)
-    }
+    switch self.handler.opts.Reload_in { ... }  // "parent" or "all"
 }
 ```
 
@@ -563,13 +513,9 @@ The `ReloadConfigInKitty` function in `tools/config/api.go`:
 **When `in_parent_only=true` (default, `--reload-in parent`):**
 
 ```go
-if pid, err := strconv.Atoi(os.Getenv("KITTY_PID")); err == nil {
-    if p, err := process.NewProcess(int32(pid)); err == nil {
-        if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
-            return p.SendSignal(unix.SIGUSR1)
-        }
-    }
-}
+pid, _ := strconv.Atoi(os.Getenv("KITTY_PID"))
+p, _ := process.NewProcess(int32(pid))
+... // verify is_kitty_gui_cmdline, then p.SendSignal(unix.SIGUSR1)
 ```
 
 1. Reads the `KITTY_PID` environment variable (set by kitty for child processes)
@@ -582,12 +528,8 @@ if pid, err := strconv.Atoi(os.Getenv("KITTY_PID")); err == nil {
 **When `in_parent_only=false` (`--reload-in all`):**
 
 ```go
-if all, err := process.Processes(); err == nil {
-    for _, p := range all {
-        if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
-            _ = p.SendSignal(unix.SIGUSR1)
-        }
-    }
+for _, p := range all {  // iterate all system processes
+    ... // filter for kitty GUI processes, send SIGUSR1 to each
 }
 ```
 
@@ -602,18 +544,13 @@ Uses `github.com/shirou/gopsutil/v3/process` for process enumeration and `golang
 When kitty receives `SIGUSR1`, it calls `load_config_file()` which reloads the configuration:
 
 ```python
-def load_config_file(self, *paths: str, apply_overrides: bool = True, ...) -> None:
-    from .config import load_config
-    old_opts = get_options()
-    prev_paths = old_opts.all_config_paths or default_config_paths(self.args.config)
-    paths = paths or prev_paths
-    # ... loads and applies new config ...
-    self.apply_new_options(opts)
+def load_config_file(self, *paths: str, ...) -> None:
+    ... # reloads config from disk and applies via self.apply_new_options(opts)
 ```
 
 > Source: `kitty/boss.py:2691-2704`
 
-**Rationale:** The Enter-key flow is designed for safety and atomicity. The Patcher first comments out existing font directives to prevent conflicts, then writes a clearly delimited sentinel block that can be found and replaced on subsequent runs. The backup file provides a safety net. The atomic update (`utils.AtomicUpdateFile`) ensures the config file is never left in a partially-written state. The SIGUSR1 signal triggers a live reload so the user sees the new font immediately without restarting kitty.
+**Rationale:** The Enter-key flow is designed for safety and atomicity. The Patcher first comments out existing font directives to prevent conflicts, then writes a clearly delimited sentinel block that can be found and replaced on subsequent runs. The backup file provides a safety net. The atomic update (`utils.AtomicUpdateFile`) ensures `kitty.conf` is never left in a partially-written state. The SIGUSR1 signal triggers a live reload so the user sees the new font immediately without restarting kitty.
 
 ---
 
@@ -690,14 +627,12 @@ The following procedure demonstrates that `choose-fonts` persistently modifies `
 ```bash
 tmpdir=$(mktemp -d)
 echo "# Empty test config" > "$tmpdir/kitty.conf"
-echo "--- Before ---"
-cat "$tmpdir/kitty.conf"
+cat "$tmpdir/kitty.conf"  # verify initial content
 ```
 
 Expected output:
 
 ```
---- Before ---
 # Empty test config
 ```
 
@@ -721,7 +656,7 @@ Navigate the TUI:
 3. Review the face previews, then press **Enter** to proceed to the final pane
 4. At the final pane, press **Enter** to apply
 
-**Step 4 — Inspect the modified config file:**
+**Step 4 — Inspect the modified `kitty.conf`:**
 
 ```bash
 cat "$tmpdir/kitty.conf"
@@ -779,24 +714,15 @@ rm -rf "$tmpdir"
 ```conf
 font_family monospace
 bold_font auto
-font_size 12.0
-background #1e1e2e
+font_size 12.0  # ... other settings like background ...
 ```
 
 **After running `kitten choose-fonts` and selecting "Fira Code":**
 
 ```conf
-# font_family monospace
-# bold_font auto
-font_size 12.0
-background #1e1e2e
-
-# BEGIN_KITTY_FONTS
-font_family      family="Fira Code"
-bold_font        auto
-italic_font      auto
-bold_italic_font auto
-# END_KITTY_FONTS
+# font_family monospace  # ← commented out by Patcher
+... # unchanged settings preserved (font_size, background, etc.)
+# BEGIN_KITTY_FONTS ... # END_KITTY_FONTS  # ← sentinel block appended
 ```
 
 Observe:
@@ -827,10 +753,9 @@ k.cmd = exec.Command(exe, "+runpy",
 The Go process creates stdin/stdout pipes to communicate with the Python backend:
 
 ```go
-k.r, k.to, err = os.Pipe()  // Go writes to k.to → Python reads from stdin
-k.cmd.Stdin = k.r
-k.from, k.w, err = os.Pipe() // Python writes to stdout → Go reads from k.from
-k.cmd.Stdout = k.w
+k.r, k.to, err = os.Pipe()   // Go → Python (stdin)
+k.from, k.w, err = os.Pipe() // Python → Go (stdout)
+... // pipes assigned to k.cmd.Stdin and k.cmd.Stdout
 ```
 
 > Source: `kittens/choose_fonts/backend.go:44-52`
@@ -846,11 +771,9 @@ k.cmd.Stdout = k.w
 **Go side — sending queries:**
 
 ```go
-func (k *kitty_font_backend_type) query(action string, cmd map[string]any, result any) error {
-    cmd["action"] = action
-    k.send(cmd)       // JSON-encode and write to pipe
-    k.json_decoder.Decode(result)  // Read JSON response
-}
+cmd["action"] = action
+k.send(cmd)                   // JSON-encode and write to pipe
+k.json_decoder.Decode(result) // read JSON response from Python
 ```
 
 > Source: `kittens/choose_fonts/backend.go:100-131`
@@ -860,15 +783,7 @@ func (k *kitty_font_backend_type) query(action string, cmd map[string]any, resul
 ```python
 def main() -> None:
     for line in sys.stdin.buffer:
-        cmd = json.loads(line)
-        action = cmd.get('action', '')
-        if action == 'list_monospaced_fonts':
-            send_to_kitten({'fonts': create_family_groups(),
-                           'resolved_faces': resolved_faces(opts)})
-        elif action == 'read_variable_data':
-            # ... returns variable font data ...
-        elif action == 'render_family_samples':
-            # ... renders preview bitmaps to RGBA temp files ...
+        cmd = json.loads(line)  # dispatch on cmd["action"]
 ```
 
 > Source: `kittens/choose_fonts/backend.py:150-168`
@@ -888,12 +803,8 @@ def main() -> None:
 The handler has an explicit `State` enum and an implicit `final_pane` state:
 
 ```go
-type State int
-
 const (
-    SCANNING_FAMILIES State = iota  // 0
-    LISTING_FAMILIES                // 1
-    CHOOSING_FACES                  // 2
+    SCANNING_FAMILIES State = iota  // then LISTING_FAMILIES, CHOOSING_FACES
 )
 ```
 
@@ -948,17 +859,9 @@ stateDiagram-v2
 In addition to pressing Enter (persist to `kitty.conf`), the final pane supports pressing `s` or `S` to write the font settings to STDOUT instead:
 
 ```go
-func (self *final_pane) on_text(text string, from_key_event bool, in_bracketed_paste bool) (err error) {
-    if from_key_event {
-        switch text {
-        case "s", "S":
-            output_on_exit = self.settings.serialized() + "\n"
-            self.lp.Quit(0)
-            return
-        }
-    }
-    return
-}
+case "s", "S":
+    output_on_exit = self.settings.serialized() + "\n"
+    self.lp.Quit(0)
 ```
 
 > Source: `kittens/choose_fonts/final.go:101-111`
@@ -979,7 +882,7 @@ if output_on_exit != "" {
 kitten choose-fonts > my_font_settings.conf
 ```
 
-Or appending to a specific config file:
+Or appending to a specific `kitty.conf`:
 
 ```bash
 kitten choose-fonts >> /path/to/custom/kitty.conf
@@ -1043,7 +946,7 @@ flowchart TD
 
 1. **`choose-fonts` is a Go-native kitten with a Python companion backend process.** The Go side handles the TUI and config patching; the Python side handles font enumeration and rendering via platform-specific APIs (fontconfig on Linux, CoreText on macOS). They communicate via newline-delimited JSON over stdin/stdout pipes.
 
-2. **Font selection modifies `kitty.conf` on disk using a sentinel block pattern — changes are permanent.** The `# BEGIN_KITTY_FONTS ... # END_KITTY_FONTS` block is written to the config file via `config.Patcher.Patch()`, which uses atomic file updates for safety. The change survives across kitty restarts.
+2. **Font selection modifies `kitty.conf` on disk using a sentinel block pattern — changes are permanent.** The `# BEGIN_KITTY_FONTS ... # END_KITTY_FONTS` block is written to `kitty.conf` via `config.Patcher.Patch()`, which uses atomic file updates for safety. The change survives across kitty restarts.
 
 3. **The `--reload-in` option controls whether and how many kitty instances reload after changes.** The default (`parent`) signals only the parent kitty process via `SIGUSR1`. Setting it to `all` signals every running kitty GUI process. Setting it to `none` skips the signal entirely.
 
