@@ -190,9 +190,10 @@ After GLFW initializes, the `AppRunner.__call__()` method sets up fonts:
 | 3 | 251 | `set_font_family(opts)` | Resolves fonts, loads faces, pre-renders special glyphs |
 
 `set_font_family()` (`Source: kitty/fonts/render.py`) is the critical call:
-- On **Linux**: Uses FontConfig for font discovery (`Source: kitty/fonts/render.py:37` — `from .fontconfig import font_for_family`)
-- On **macOS**: Uses CoreText (`Source: kitty/fonts/render.py:35` — `from .core_text import font_for_family`)
-- The platform selection is in `Source: kitty/fonts/common.py`, branching on `is_macos`
+- On **macOS**: Uses CoreText via an aliased import (`Source: kitty/fonts/render.py:35` — `from .core_text import font_for_family as font_for_family_macos`)
+- On **Linux**: Uses FontConfig via an aliased import (`Source: kitty/fonts/render.py:37` — `from .fontconfig import font_for_family as font_for_family_fontconfig`)
+- A wrapper function `font_for_family()` (`Source: kitty/fonts/render.py:43-46`) dispatches to the correct platform-specific variant based on `is_macos`
+- Additional platform-specific font infrastructure (scorers, matchers, font maps) is imported in `Source: kitty/fonts/common.py`, also branching on `is_macos`
 - The function resolves font families, loads font faces via FreeType (`kitty/freetype.c`), creates symbol maps, pre-renders special glyphs (underlines, cursors, box-drawing characters), and registers everything via `set_font_data()`
 
 ### 1.5 OS Window Creation and Shader Compilation
@@ -409,8 +410,8 @@ On a first launch with no `kitty.conf` file, all settings come from the defaults
 | `font_family` | `'monospace'` | 35 | System's default monospace font is used |
 | `font_size` | `11.0` | 59 | 11-point font size |
 | `remember_window_size` | `yes` | 982 | Persists window size between sessions |
-| `initial_window_width` | `640` | 994 | Width in cells (80 cells at default cell width) |
-| `initial_window_height` | `400` | 998 | Height in cells (24 cells at default cell height) |
+| `initial_window_width` | `640` | 994 | Width in pixels (values without a `'c'` suffix default to pixels per `kitty/options/utils.py:593`) |
+| `initial_window_height` | `400` | 998 | Height in pixels (values without a `'c'` suffix default to pixels per `kitty/options/utils.py:593`) |
 | `startup_session` | `'none'` | 3083 | No session file — single tab with default shell |
 | `term` | `'xterm-kitty'` | 3242 | TERM environment variable value |
 | `shell_integration` | `'enabled'` | 3141 | Shell integration is active by default |
@@ -418,7 +419,7 @@ On a first launch with no `kitty.conf` file, all settings come from the defaults
 | `background` | `#000000` | 1464 | Black background |
 | `scrollback_lines` | `2000` | 372 | 2000 lines of scrollback history |
 
-**Thinking:** The `initial_window_width` of 640 and `initial_window_height` of 400 use cells as the unit. The actual pixel size depends on the font's cell dimensions, DPI, and edge spacing — computed by `initial_window_size_func()`.
+**Thinking:** The `initial_window_width` of 640 and `initial_window_height` of 400 use pixels as the unit (values without a `'c'` suffix default to pixels per `kitty/options/utils.py:593`). These pixel values are used directly by `initial_window_size_func()`. If a user appends a `'c'` suffix (e.g., `80c`), the value is interpreted as cells and the actual pixel size is computed from cell dimensions, DPI, and edge spacing.
 
 ### 2.4 Cached Window Size and `remember_window_size`
 
@@ -436,7 +437,7 @@ Window size persistence uses a JSON cache file:
 **Size function** (`Source: kitty/os_window_size.py:54-101` — `initial_window_size_func()`):
 
 - If `remember_window_size=yes` AND cached `'window-size'` key exists: uses the remembered dimensions, sanitized to the 20–50000 pixel range (line 37: `max(20, min(ans, 50000))`)
-- Otherwise: computes pixel size from `initial_window_width/height` using cell dimensions, DPI, and edge spacing. For `cells` unit: `width = cell_width * w / xscale + (dpi_x / 72) * spacing + 1` (lines 87-91)
+- Otherwise: uses `initial_window_width/height` directly as pixel values (`width = w`, `height = h` at `os_window_size.py:92,98`). If the value had a `'c'` suffix (cells unit), the cells formula would apply instead: `width = cell_width * w / xscale + (dpi_x / 72) * spacing + 1` (lines 87-91)
 
 On **first launch** with no cache, the fallback path always executes.
 
@@ -454,7 +455,7 @@ CLI `--override` (or `-o`) flags transform `name=value` into config-compatible `
 
 - **Config parse errors:** Bad lines are accumulated and shown via `boss.show_bad_config_lines(bad_lines, boss.misc_config_errors)` (`Source: kitty/main.py:230-232`).
 
-- **Font selection logging:** When `--debug-font-fallback` is used, `dump_font_debug()` is called after `_run_app()` returns (`Source: kitty/main.py:228-229`).
+- **Font selection logging:** When `--debug-font-fallback` is used, `dump_font_debug()` is called inside `_run_app()`, after `boss.start()` completes but before `child_monitor.main_loop()` (`Source: kitty/main.py:228-229`).
 
 ### Configuration Cascade Diagram
 
@@ -743,7 +744,7 @@ The **cursor** is drawn as a pre-rendered sprite. Cursor shapes are rasterized d
 
 ### 4.5 Layout and Border System
 
-**Borders** (`Source: kitty/borders.py:68-80` — `Borders.__call__()`):
+**Borders** (`Source: kitty/borders.py:74-80` — `Borders.__call__()`):
 
 The `Borders` class handles drawing of all border geometry:
 - Default background fill
@@ -765,7 +766,7 @@ The `Borders` class handles drawing of all border geometry:
 | Flag | Source | Effect |
 |------|--------|--------|
 | `--debug-rendering` | `kitty/main.py:91, 249` | Enables GPU rendering diagnostic output through `init_glfw_module()` and `set_options()` |
-| `--debug-font-fallback` | `kitty/main.py:228-229` | Enables font fallback diagnostic logging; calls `dump_font_debug()` after `_run_app()` |
+| `--debug-font-fallback` | `kitty/main.py:228-229` | Enables font fallback diagnostic logging; calls `dump_font_debug()` inside `_run_app()`, after `boss.start()` but before `child_monitor.main_loop()` |
 | `--debug-config` | `kitty/debug_config.py` | Prints version, uname, font info (from `current_fonts()`), OpenGL version (from `opengl_version_string()`), all non-default options |
 
 **Observable startup evidence confirming the display system is active:**
