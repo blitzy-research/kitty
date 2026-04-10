@@ -172,7 +172,7 @@ Source: `kitty/fonts.c:shape()` L811–813
 
 Allows specifying arbitrary OpenType features per PostScript name:
 
-```
+```conf
 font_features FiraCode-Retina +zero +onum
 ```
 
@@ -452,7 +452,7 @@ Source: `kitty/debug_config.py:debug_config()` L231–292
 
 Prints the resolved font faces using `identify_for_debug()` (compact `ps_name: path:index` format):
 
-```
+```text
 Text fonts:
   Normal: <ps_name>: <path>:<ttc_index>
   Bold: <ps_name>: <path>:<ttc_index>
@@ -468,7 +468,7 @@ Source: `kitty/fonts/render.py:dump_font_debug()` L161–170
 
 Each FreeType Face has two string representations. The `identify_for_debug()` method (used by `debug_config()` and `dump_font_debug()`) returns a compact format:
 
-```
+```text
 <ps_name>: <path>:<ttc_index>
 ```
 
@@ -478,7 +478,7 @@ Source: `kitty/freetype.c:identify_for_debug()` L738–743
 
 The Python `repr()` produces a verbose diagnostic string with all face attributes:
 
-```
+```text
 Face(family=<name> style=<style> ps_name=<ps> path=<path> ttc_index=<n> ...)
 ```
 
@@ -659,7 +659,7 @@ Source: `kitty/fonts.c:calc_cell_metrics()` L418–421
 
 Configurable adjustments per the `modify_font` option in `kitty.conf`:
 
-```
+```conf
 modify_font underline_position -2
 modify_font underline_thickness 150%
 modify_font cell_width 80%
@@ -914,7 +914,7 @@ Source: `kitty/fonts.c:send_prerendered_sprites_for_window()` L1520–1527
 
 **`--debug-rendering` / `--debug-gl`:**
 
-```
+```text
 --debug-rendering --debug-gl
 type=bool-set
 ```
@@ -925,7 +925,7 @@ Source: `kitty/cli.py` L989–993
 
 **`--debug-font-fallback`:**
 
-```
+```text
 --debug-font-fallback
 type=bool-set
 ```
@@ -958,7 +958,7 @@ Source: `kitty/main.py` L441–520 (`_main()`), L263 (`run_app = AppRunner()`), 
 
 **`debug_config()` output:**
 
-```
+```text
 kitty <version> created by Kovid Goyal
 Linux <hostname> <kernel> ...
 Running under: <compositor>
@@ -987,7 +987,7 @@ Source: `kitty/debug_config.py:debug_config()` L231–292
 
 **`dump_font_debug()` output (with `--debug-font-fallback`):**
 
-```
+```text
 Text fonts:
   Normal: <ps_name>: <path>:<ttc_index>
   Bold: <ps_name>: <path>:<ttc_index>
@@ -1003,13 +1003,13 @@ Source: `kitty/fonts/render.py:dump_font_debug()` L161–170
 
 When a character triggers fallback font loading:
 
-```
+```text
 U+<hex> [U+<hex> ...] [bold] [italic] [emoji_presentation] Face(family=<name> style=<style> ...)
 ```
 
 If the selected font does not contain the required glyphs:
 
-```
+```text
 The font chosen by the OS for the text: U+<hex> [U+<hex> ...] is Face(...) but it does not actually contain glyphs for that text
 ```
 
