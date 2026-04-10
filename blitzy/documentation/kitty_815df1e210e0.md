@@ -19,10 +19,14 @@
 - [1. Introduction](#1-introduction)
   - [1.1 Questions Under Investigation](#11-questions-under-investigation)
   - [1.2 Scope and Methodology](#12-scope-and-methodology)
+  - [1.3 Key Terminology](#13-key-terminology)
+  - [1.4 Document Structure](#14-document-structure)
 - [2. Architecture Overview](#2-architecture-overview)
   - [2.1 The Three-Thread Model](#21-the-three-thread-model)
   - [2.2 Buffer Locations and Capacities](#22-buffer-locations-and-capacities)
   - [2.3 Thread Architecture Diagram](#23-thread-architecture-diagram)
+  - [2.4 Data Flow Under Normal Conditions vs. Pressure](#24-data-flow-under-normal-conditions-vs-pressure)
+  - [2.5 Interaction Map Between Subsystems](#25-interaction-map-between-subsystems)
 - [3. VT Parser Buffer and Input Backpressure](#3-vt-parser-buffer-and-input-backpressure)
   - [3.1 The 1 MB Ring Buffer](#31-the-1-mb-ring-buffer)
   - [3.2 input_delay Threshold and Early Flush](#32-input_delay-threshold-and-early-flush)
@@ -53,12 +57,19 @@
 - [8. Animation Frame Pressure](#8-animation-frame-pressure)
   - [8.1 Animation Frame Scanning](#81-animation-frame-scanning)
   - [8.2 Interaction with Render Timing](#82-interaction-with-render-timing)
+  - [8.3 Animation Storage and Eviction Interaction](#83-animation-storage-and-eviction-interaction)
 - [9. Runtime Observability](#9-runtime-observability)
   - [9.1 Silent Adaptations](#91-silent-adaptations)
   - [9.2 Observable Side Effects](#92-observable-side-effects)
   - [9.3 Characterization Summary](#93-characterization-summary)
+  - [9.4 Diagnostic Approaches](#94-diagnostic-approaches)
+  - [9.5 Pressure Escalation Timeline](#95-pressure-escalation-timeline)
+  - [9.6 Comparison: Input Path vs. Output Path Pressure](#96-comparison-input-path-vs-output-path-pressure)
 - [10. Code Location Reference Table](#10-code-location-reference-table)
 - [11. Constants Catalog](#11-constants-catalog)
+  - [11.1 Constants Relationships and Derived Values](#111-constants-relationships-and-derived-values)
+  - [11.2 Configuration Tunability](#112-configuration-tunability)
+  - [11.3 Cross-Subsystem Constant Dependencies](#113-cross-subsystem-constant-dependencies)
 - [12. Summary — Answers to the Six Questions](#12-summary--answers-to-the-six-questions)
   - [12.1 R-01 — Graphics Ingestion Under Load](#121-r-01--graphics-ingestion-under-load)
   - [12.2 R-02 — Buffer, Pause, and Throttle Decisions](#122-r-02--buffer-pause-and-throttle-decisions)
@@ -66,6 +77,11 @@
   - [12.4 R-04 — Code Locations](#124-r-04--code-locations)
   - [12.5 R-05 — Runtime Observability](#125-r-05--runtime-observability)
   - [12.6 R-06 — Adaptation vs. Visibility](#126-r-06--adaptation-vs-visibility)
+  - [12.7 Design Philosophy and Architectural Insights](#127-design-philosophy-and-architectural-insights)
+  - [12.8 End-to-End Scenario: What Happens When You `cat` a Large Image](#128-end-to-end-scenario-what-happens-when-you-cat-a-large-image)
+  - [12.9 Frequently Misunderstood Aspects](#129-frequently-misunderstood-aspects)
+  - [12.10 Comparison With Alternative Approaches](#1210-comparison-with-alternative-approaches)
+  - [12.11 Conclusion](#1211-conclusion)
 
 ---
 
@@ -922,7 +938,7 @@ For **shared memory transmission** (`'s'`):
 ```
 `Source: kitty/graphics.c:521`
 
-This is `400,000,000` bytes (~400 MB). For direct transmission, if the accumulated payload plus the new chunk exceeds this limit *and* the format is not PNG, the command is aborted:
+This is `400,000,000` bytes (~400 MB). For direct transmission, if the accumulated payload plus the new chunk exceeds this limit *or* the format is not PNG, the command is aborted:
 
 ```c
 if (load_data->buf_used + g->payload_sz > MAX_DATA_SZ || data_fmt != PNG)
@@ -959,57 +975,104 @@ enum FORMATS { RGB=24, RGBA=32, PNG=100 };
 
 **Image decompression in `process_image_data()`:**
 
-After all chunks are received, the complete payload is decompressed if needed:
+After all chunks are received, the complete payload is decompressed if needed. The function's actual signature receives `transmission_type` and `data_fmt` rather than raw payload pointers — it retrieves the accumulated data from `self->currently_loading` internally via the `IB` macro:
 
 ```c
 static Image*
-process_image_data(GraphicsManager *self, Image *img, const GraphicsCommand *g,
-                   unsigned char *payload, const size_t payload_sz) {
-    bool needs_processing = g->compressed || g->format == PNG;
-    // ...
-    if (g->compressed) {
-        if (g->compressed == 'z') {
-            if (!inflate_zlib(&load_data, payload, payload_sz)) {
-                ABRT("ENOMEM", "Failed to decompress zlib image data");
-            }
-        } else {
-            ABRT("EINVAL", "Unknown compression type");
+process_image_data(GraphicsManager *self, Image* img, const GraphicsCommand *g,
+                   const unsigned char transmission_type, const uint32_t data_fmt) {
+    bool needs_processing = g->compressed || data_fmt == PNG;
+    if (needs_processing) {
+        uint8_t *buf; size_t bufsz;
+#define IB { if (self->currently_loading.buf) { buf = self->currently_loading.buf; \
+             bufsz = self->currently_loading.buf_used; } \
+        else { buf = self->currently_loading.mapped_file; \
+               bufsz = self->currently_loading.mapped_file_sz; } }
+        switch(g->compressed) {
+            case 'z':
+                IB;
+                if (!inflate_zlib(&self->currently_loading, buf, bufsz)) {
+                    self->currently_loading.loading_completed_successfully = false;
+                    return NULL;
+                }
+                break;
+            case 0: break;
+            default:
+                ABRT("EINVAL", "Unknown image compression: %c", g->compressed);
         }
-    }
-    // ...
-    if (g->format == PNG) {
-        if (!inflate_png(&load_data, payload, payload_sz)) {
-            ABRT("ENOMEM", "Failed to decode PNG image data");
+        switch(data_fmt) {
+            case PNG:
+                IB;
+                if (!inflate_png(&self->currently_loading, buf, bufsz)) {
+                    self->currently_loading.loading_completed_successfully = false;
+                    return NULL;
+                }
+                break;
+            default: break;
         }
+#undef IB
+        // ... data assignment, size validation, mapped file cleanup ...
+    } else {
+        // For uncompressed data: validate size and assign data pointer
+        // from either buf (direct) or mapped_file (file/shm)
     }
-    // ...
+    return img;
 }
 ```
 `Source: kitty/graphics.c:579-628`
+
+Key details visible in the actual implementation:
+
+- The `IB` macro selects the data source: `self->currently_loading.buf` (for direct transmission) or `self->currently_loading.mapped_file` (for file/shm transmission). The function does **not** receive payload data as a parameter — it accesses it through the manager's loading state.
+- Decompression uses `switch` statements, not `if` chains: `switch(g->compressed)` dispatches zlib (`'z'`), then `switch(data_fmt)` dispatches PNG.
+- On zlib or PNG decompression failure, the function sets `self->currently_loading.loading_completed_successfully = false` and returns `NULL` — it does **not** call `ABRT()`. This means decompression failures are handled silently by the caller rather than generating an error response directly.
+- The `ABRT` macro is only used for an unrecognized compression type (`default` case in the compression `switch`).
 
 The decompression step is significant for pressure analysis:
 - **zlib inflation** can expand data by 2-10× depending on compression ratio, potentially requiring significant temporary memory
 - **PNG decoding** involves both decompression and pixel format conversion, which is CPU-intensive
 - Both operations happen on the main thread, blocking further parsing while they execute
 
-**GPU upload after processing:**
+**Dimension validation in `handle_add_command()`:**
 
-After decompression, the pixel data is uploaded to the GPU:
+Before any loading begins, `handle_add_command()` validates image dimensions against the hard limit:
 
 ```c
-static bool
-upload_to_gpu(GraphicsManager *self, Image *img, const GraphicsCommand *g,
-              const unsigned char *data, const size_t data_sz) {
-    if (g->width > MAX_IMAGE_DIMENSION || g->height > MAX_IMAGE_DIMENSION) {
-        set_command_failed_response("EINVAL", "Image too large");
-        return false;
+if (g->data_width > MAX_IMAGE_DIMENSION || g->data_height > MAX_IMAGE_DIMENSION)
+    ABRT("EINVAL", "Image too large");
+```
+`Source: kitty/graphics.c:695`
+
+This check runs early in the add-command path — before `initialize_load_data()` or `load_image_data()` are called. Images exceeding 10,000 pixels in either dimension are rejected immediately with an `EINVAL` error response, preventing any resource allocation for oversized images.
+
+**GPU upload after processing:**
+
+After decompression, the pixel data is uploaded to the GPU. The function receives opacity and alignment flags derived from the image format during `initialize_load_data()` — it does not re-examine the `GraphicsCommand`:
+
+```c
+static void
+upload_to_gpu(GraphicsManager *self, Image *img, const bool is_opaque,
+              const bool is_4byte_aligned, const uint8_t *data) {
+    if (!self->context_made_current_for_this_command) {
+        if (!self->window_id) return;
+        if (!make_window_context_current(self->window_id)) return;
+        self->context_made_current_for_this_command = true;
     }
-    // ... texture upload ...
+    if (img->texture)
+        send_image_to_gpu(&img->texture->id, data, img->width, img->height,
+                          is_opaque, is_4byte_aligned, true, REPEAT_CLAMP);
 }
 ```
-`Source: kitty/graphics.c:677-684`
+`Source: kitty/graphics.c:676-684`
 
-The GPU upload is the final bottleneck in the ingestion pipeline. The `MAX_IMAGE_DIMENSION` check (10,000 px, `Source: kitty/graphics.c:674`) prevents excessively large textures from being created.
+Key details of the actual implementation:
+
+- The return type is `void`, not `bool` — the function does not report success or failure to its caller.
+- Parameters are `is_opaque` and `is_4byte_aligned` (booleans derived from the image format during loading), not the `GraphicsCommand` or data size. The raw pixel `data` pointer and image dimensions (`img->width`, `img->height`) are passed directly.
+- The function lazily makes the OpenGL context current on first use per command via `make_window_context_current()`. If the window has been destroyed (`!self->window_id`), the upload silently returns without error.
+- The actual GPU transfer happens via `send_image_to_gpu()`, which creates or updates a GL texture.
+
+The GPU upload is the final bottleneck in the ingestion pipeline. The `MAX_IMAGE_DIMENSION` check (10,000 px, `Source: kitty/graphics.c:674`) in `handle_add_command()` prevents excessively large textures from reaching this stage.
 
 **Data ownership and lifecycle:**
 
@@ -2473,7 +2536,7 @@ The following table provides a comprehensive reference to every mechanism discus
 | Handle add command | `kitty/graphics.c` | `handle_add_command()` | (called at 2175) | Processes image addition |
 | Load image data | `kitty/graphics.c` | `load_image_data()` | 525-577 | Chunked payload loading (direct/file/shm) |
 | Process image data | `kitty/graphics.c` | `process_image_data()` | 579-628 | Decompression (zlib, PNG) |
-| Upload to GPU | `kitty/graphics.c` | `upload_to_gpu()` | 677-684 | Sends pixel data to GPU texture |
+| Upload to GPU | `kitty/graphics.c` | `upload_to_gpu()` | 676-684 | Sends pixel data to GPU texture via `send_image_to_gpu()` (void return, params: is_opaque, is_4byte_aligned, data) |
 | Max graphics data size | `kitty/graphics.c` | `MAX_DATA_SZ` | 521 | 400 MB limit for payload data |
 | Max image dimension | `kitty/graphics.c` | `MAX_IMAGE_DIMENSION` | 674 | 10,000 px max width or height |
 | Default storage limit | `kitty/graphics.c` | `DEFAULT_STORAGE_LIMIT` | 25 | 320 MB default graphics quota |
@@ -2905,7 +2968,7 @@ To make this analysis concrete, let's trace exactly what happens when a user run
 18. If `g->more`: return — wait for more chunks
 19. If `!g->more`: `loading_completed_successfully = true` (`Source: kitty/graphics.c:543`)
 20. `process_image_data()` decodes the PNG: inflate → pixel format conversion (`Source: kitty/graphics.c:598-603`)
-21. `upload_to_gpu()` creates a GL texture and uploads pixel data (`Source: kitty/graphics.c:677`)
+21. `upload_to_gpu()` lazily makes the GL context current and calls `send_image_to_gpu()` to create/update a texture with the pixel data (`Source: kitty/graphics.c:676-684`)
 22. `apply_storage_quota()` checks if the 320 MB limit is exceeded (`Source: kitty/graphics.c:2184`)
 23. If over quota: evict old images (unreferenced first, then oldest by atime)
 
