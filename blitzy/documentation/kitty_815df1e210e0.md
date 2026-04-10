@@ -205,8 +205,14 @@ The `fd:` protocol enables **per-window remote control** without requiring a glo
 |----------|---------|---------|
 | `unix:` | `"unix"` | `unix:/tmp/mykitty-12345` |
 | `tcp:` | `"tcp"` or `"ip"` | `tcp:localhost:12345` |
-| `tcp6:` | `"tcp6"` | `tcp6:[::1]:12345` |
+| `tcp4:` | `"tcp4"` or `"ip"` | `tcp4:localhost:12345` |
+| `tcp6:` | `"tcp6"` or `"ip"` | `tcp6:[::1]:12345` |
+| `ip:` | `"ip"` | `ip:192.168.1.1:12345` |
+| `ip4:` | `"ip4"` | `ip4:192.168.1.1:12345` |
+| `ip6:` | `"ip6"` | `ip6:[::1]:12345` |
 | `fd:` | `"fd"` | `fd:7` |
+
+> **Note:** For `tcp:`, `tcp4:`, and `tcp6:` protocols, if the address portion is a valid IP address, the network is resolved to `"ip"` (`Source: tools/utils/sockets.go:27-32`). For `ip:`, `ip4:`, and `ip6:` protocols, the address must be a valid IP address or an error is returned (`Source: tools/utils/sockets.go:34-39`). The `tcp4:`, `ip:`, `ip4:`, and `ip6:` schemes are uncommon in remote control usage but are fully supported by the parser.
 
 For `fd:`, the address part is parsed as an integer file descriptor (`Source: tools/utils/sockets.go:41-46`):
 
