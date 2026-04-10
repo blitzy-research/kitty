@@ -772,9 +772,10 @@ It inserts `-O check` into the SSH command and runs it. If the exit code is 0, t
 
 The following matrix shows all possible states and the resulting behavior:
 
-| `share_connections` | Askpass Supported | Master Alive | `need_to_request_data` | Behavior |
+| `share_connections` | Askpass Supported (SSH ≥ 8.4) | Master Alive | `need_to_request_data` | Behavior |
 |---|---|---|---|---|
-| `false` | — | — | `true` | No ControlMaster; bootstrap requests data via DCS |
+| `false` | `false` | — | `true` | No ControlMaster; bootstrap requests data via DCS |
+| `false` | `true` | — | `false` | No ControlMaster; data sent proactively (askpass handles auth) |
 | `true` | `true` | alive | `false` | Reuse connection; data sent proactively |
 | `true` | `true` | dead | `false` | New connection; ControlMaster=auto creates master; data sent proactively |
 | `true` | `false` | alive | `false` | Reuse connection; bootstrap skips data request |
@@ -800,7 +801,7 @@ flowchart TD
     C --> M
 ```
 
-> **Note:** The flowchart above places the `use_kitty_askpass` check inside the `share_connections=true` branch for visual simplicity. In the actual code (`main.go:648-651`), the askpass check runs **independently** of `share_connections`. When `share_connections=false` and askpass is enabled with SSH ≥ 8.4, `need_to_request_data` is still set to `false` by `set_askpass()` — the flowchart's `share_connections=No → need_to_request_data=true` path does not account for this edge case. The decision matrix table above is accurate for all cases.
+> **Note:** The flowchart above places the `use_kitty_askpass` check inside the `share_connections=true` branch for visual simplicity. In the actual code (`main.go:648-651`), the askpass check runs **independently** of `share_connections`. When `share_connections=false` and askpass is enabled with SSH ≥ 8.4, `need_to_request_data` is still set to `false` by `set_askpass()` — the flowchart's `share_connections=No → need_to_request_data=true` path does not account for this edge case. The corrected decision matrix table above includes both `share_connections=false` rows to cover this case accurately.
 
 #### `run_control_master()`
 
