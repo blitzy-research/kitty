@@ -131,10 +131,7 @@ Source: `docs/build.rst:97-121`
 The standard build workflow is straightforward because `./dev.sh build` downloads pre-built binaries for major dependencies:
 
 ```bash
-# Clone the repository
 git clone https://github.com/kovidgoyal/kitty.git && cd kitty
-
-# Build kitty (compiles C extensions, Go kittens, and Python components)
 ./dev.sh build
 ```
 
@@ -226,21 +223,14 @@ When you run `kitten ssh user@host`, the SSH kitten:
 1. **Parses the destination** — extracts username and hostname from the SSH URL
    Source: `kittens/ssh/main.go:46-60` — `get_destination()` function
 2. **Establishes the SSH connection** — invokes the system `ssh` binary with enhanced options
-3. **Deploys kitten binary** — transfers a compressed tarball (using archive/tar and gzip, as imported at `kittens/ssh/main.go:6-7`) containing the kitten binary and shell integration scripts to the remote host
+3. **Deploys kitten binary** — transfers a compressed tarball (using `archive/tar` and `compress/gzip`, as imported at `kittens/ssh/main.go:6,8`) containing the kitten binary and shell integration scripts to the remote host
 4. **Sets up shell integration** — configures the remote shell to recognize kitty-specific features, including the terminfo database
 
 The SSH kitten can be configured via `~/.config/kitty/ssh.conf`:
 
 ```conf
-# Copy dotfiles to remote host
 copy .zshrc .vimrc .vim
-
-# Set environment variables on remote
-env SOME_VAR=x
-
-# Per-hostname settings
 hostname someserver-*
-copy env-files
 env SOMETHING=else
 ```
 
@@ -296,12 +286,8 @@ Source: `kittens/transfer/main.go:46`
 The `main()` function routes execution based on `opts.Direction`:
 
 ```go
-switch opts.Direction {
-case "send", "download":
-    err, rc = send_main(opts, args)
-default:
-    err, rc = receive_main(opts, args)
-}
+case "send", "download": err, rc = send_main(opts, args)
+default:                  err, rc = receive_main(opts, args)
 ```
 
 Source: `kittens/transfer/main.go:57-62`
@@ -313,8 +299,7 @@ Source: `kittens/transfer/main.go:57-62`
 Before dispatching, `main()` reads the bypass password if provided:
 
 ```go
-if opts.PermissionsBypass != "" {
-    val, err := read_bypass(opts.PermissionsBypass)
+val, err := read_bypass(opts.PermissionsBypass)
 ```
 
 Source: `kittens/transfer/main.go:47-53`
@@ -346,23 +331,7 @@ Source: `kittens/transfer/main.go:69-71`
 
 Before the transfer begins, the sender discovers all files to be transferred. The `files_for_send()` function scans the specified paths and produces a list of `File` structs:
 
-```go
-type File struct {
-    file_size              int64
-    file_type              FileType
-    compression_capable    bool
-    rsync_capable          bool
-    local_path             string
-    expanded_local_path    string
-    remote_path            string
-    // ... rsync fields ...
-    differ                 *rsync.Differ
-    delta_loader           func() error
-    deltabuf               *bytes.Buffer
-    state                  FileState
-    ttype                  TransmissionType
-}
-```
+The `File` struct tracks per-file state including `file_size`, `file_type`, `rsync_capable`, `compression_capable`, and rsync delta fields (`differ *rsync.Differ`, `delta_loader func() error`, `deltabuf *bytes.Buffer`), plus `state FileState` and `ttype TransmissionType`.
 
 Source: `kittens/transfer/send.go:83-108`
 
@@ -479,25 +448,7 @@ Source: `docs/file-transfer-protocol.rst:582-601`
 
 The Go struct that models a transfer command is defined at `kittens/transfer/ftc.go:120-138`:
 
-```go
-type FileTransmissionCommand struct {
-    Action      Action           `json:"ac,omitempty"`
-    Compression Compression      `json:"zip,omitempty"`
-    Ftype       FileType         `json:"ft,omitempty"`
-    Ttype       TransmissionType `json:"tt,omitempty"`
-    Quiet       QuietLevel       `json:"q,omitempty"`
-    Id          string           `json:"id,omitempty"`
-    File_id     string           `json:"fid,omitempty"`
-    Bypass      string           `json:"pw,omitempty" encoding:"base64"`
-    Name        string           `json:"n,omitempty" encoding:"base64"`
-    Status      string           `json:"st,omitempty" encoding:"base64"`
-    Parent      string           `json:"pr,omitempty"`
-    Mtime       time.Duration    `json:"mod,omitempty"`
-    Permissions fs.FileMode      `json:"prm,omitempty"`
-    Size        int64            `json:"sz,omitempty" default:"-1"`
-    Data        []byte           `json:"d,omitempty"`
-}
-```
+The struct has 15 fields including `Action`, `Compression`, `Ftype`, `Ttype`, `Quiet`, `Id`, `File_id`, `Bypass`, `Name`, `Status`, `Parent`, `Mtime`, `Permissions`, `Size`, and `Data []byte`. Each field carries JSON tags mapping to wire abbreviations (e.g., `json:"ac,omitempty"`) and optional `encoding:"base64"` tags on `Bypass`, `Name`, and `Status`.
 
 Source: `kittens/transfer/ftc.go:120-138`
 
@@ -529,9 +480,7 @@ Source: `kittens/transfer/ftc.go:167-170`
 **Safe string sanitization:** The `safe_string()` function strips any character not matching `[0-9a-zA-Z_:./@-]`:
 
 ```go
-var safe_string_pat = sync.OnceValue(func() *regexp.Regexp {
-    return regexp.MustCompile(`[^0-9a-zA-Z_:./@-]`)
-})
+regexp.MustCompile(`[^0-9a-zA-Z_:./@-]`)
 ```
 
 Source: `kittens/transfer/ftc.go:155-161`
@@ -553,15 +502,8 @@ action=send id=test name=somefile size=3 data=01 02 03
 Let us trace through `Serialize()` step by step for this command:
 
 ```go
-ftc := FileTransmissionCommand{
-    Action: Action_send,        // enum → "send"
-    Id:     "test",             // safe_string → "test" (already safe)
-    Name:   "somefile",         // encoding:"base64" → base64("somefile") = "c29tZWZpbGU"
-    Size:   3,                  // int64 → "3"
-    Data:   []byte{0x01, 0x02, 0x03},  // []byte → base64([01,02,03]) = "AQID"
-}
-result := ftc.Serialize(true)
-// Result: "5113;ac=send;id=test;n=c29tZWZpbGU;sz=3;d=AQID"
+ftc := FileTransmissionCommand{Action: Action_send, Id: "test", Name: "somefile", Size: 3, Data: []byte{0x01, 0x02, 0x03}}
+result := ftc.Serialize(true) // → "5113;ac=send;id=test;n=c29tZWZpbGU;sz=3;d=AQID"
 ```
 
 **Step-by-step encoding:**
@@ -597,22 +539,10 @@ Source: `kittens/transfer/ftc.go:244-288`
 
 #### Sender Side
 
-1. **`send_loop()`** creates a `SendHandler` with a `SendManager` containing a random `request_id`:
-   ```go
-   manager: &SendManager{
-       request_id: random_id(), files: files, bypass: opts.PermissionsBypass, use_rsync: opts.TransmitDeltas,
-   },
-   ```
+1. **`send_loop()`** creates a `SendHandler` with a `SendManager` containing `request_id: random_id()`.
    Source: `kittens/transfer/send.go:1208-1210`
 
-2. **`random_id()`** generates a process-ID-prefixed hex identifier:
-   ```go
-   func random_id() string {
-       bytes := []byte{0, 0}
-       rand.Read(bytes)
-       return fmt.Sprintf("%x%s", os.Getpid(), hex.EncodeToString(bytes))
-   }
-   ```
+2. **`random_id()`** generates a PID-prefixed hex identifier via `fmt.Sprintf("%x%s", os.Getpid(), hex.EncodeToString(bytes))`.
    Source: `kittens/transfer/utils.go:76-80`
 
 3. **`SendManager.initialize()`** constructs the OSC prefix and suffix:
@@ -622,12 +552,7 @@ Source: `kittens/transfer/ftc.go:244-288`
    ```
    Source: `kittens/transfer/send.go:384-385`
 
-4. **`SendManager.start_transfer()`** sends the initial handshake command:
-   ```go
-   func (self *SendManager) start_transfer() string {
-       return FileTransmissionCommand{Action: Action_send, Bypass: self.bypass}.Serialize()
-   }
-   ```
+4. **`SendManager.start_transfer()`** serializes the initial handshake: `FileTransmissionCommand{Action: Action_send, Bypass: self.bypass}.Serialize()`.
    Source: `kittens/transfer/send.go:363-365`
 
 #### Receiver Side
@@ -699,12 +624,7 @@ sequenceDiagram
 
 On the Python terminal-emulator side, the `FileTransmission` class at `kitty/file_transmission.py:803` manages all active transfer sessions:
 
-```python
-class FileTransmission:
-    def __init__(self, window_id: int):
-        self.active_receives: Dict[str, ActiveReceive] = {}
-        self.active_sends: Dict[str, ActiveSend] = {}
-```
+The class manages concurrent sessions via `self.active_receives: Dict[str, ActiveReceive]` and `self.active_sends: Dict[str, ActiveSend]` dicts, keyed by session `request_id`.
 
 Source: `kitty/file_transmission.py:803-808`
 
@@ -735,25 +655,7 @@ Source: `kitty/file_transmission.py:803-808`
 
 The Python side has its own `FileTransmissionCommand` as a Python dataclass at `kitty/file_transmission.py:251-268`:
 
-```python
-@dataclass
-class FileTransmissionCommand:
-    action: Action = field(default=Action.invalid, metadata={'sname': 'ac'})
-    compression: Compression = field(default=Compression.none, metadata={'sname': 'zip'})
-    ftype: FileType = field(default=FileType.regular, metadata={'sname': 'ft'})
-    ttype: TransmissionType = field(default=TransmissionType.simple, metadata={'sname': 'tt'})
-    id: str = ''
-    file_id: str = field(default='', metadata={'sname': 'fid'})
-    bypass: str = field(default='', metadata={'base64': True, 'sname': 'pw'})
-    quiet: int = field(default=0, metadata={'sname': 'q'})
-    mtime: int = field(default=-1, metadata={'sname': 'mod'})
-    permissions: int = field(default=-1, metadata={'sname': 'prm'})
-    size: int = field(default=-1, metadata={'sname': 'sz'})
-    name: str = field(default='', metadata={'base64': True, 'sname': 'n'})
-    status: str = field(default='', metadata={'base64': True, 'sname': 'st'})
-    parent: str = field(default='', metadata={'sname': 'pr'})
-    data: bytes = field(default=b'', repr=False, metadata={'sname': 'd'})
-```
+The Python dataclass mirrors the Go struct with 15 fields. Key pattern: `metadata={'sname': 'ac'}` maps to Go's `json:"ac,omitempty"`, and `metadata={'base64': True}` maps to Go's `encoding:"base64"`.
 
 Source: `kitty/file_transmission.py:251-268`
 
@@ -772,17 +674,7 @@ Source: `kitty/file_transmission.py:293-326`
 
 The bypass mechanism uses X25519 public key encryption (not the SHA256 scheme from the protocol spec).
 
-```go
-func encode_bypass(request_id string, bypass string) (string, error) {
-    q := request_id + ";" + bypass
-    if pkey_encoded := os.Getenv("KITTY_PUBLIC_KEY"); pkey_encoded != "" {
-        encryption_protocol, pubkey, err := crypto.DecodePublicKey(pkey_encoded)
-        // ... encrypt q with pubkey ...
-        return fmt.Sprintf("kitty-1:%s", utils.UnsafeBytesToString(encrypted)), nil
-    }
-    return "", fmt.Errorf("KITTY_PUBLIC_KEY env var not set, cannot transmit password securely")
-}
-```
+The function concatenates `request_id + ";" + bypass`, reads `KITTY_PUBLIC_KEY` from the environment, and encrypts via `crypto.Encrypt_data()`, returning `"kitty-1:" + encrypted_data`.
 
 Source: `kittens/transfer/utils.go:37-51`
 
@@ -799,23 +691,7 @@ Source: `kittens/transfer/utils.go:37-51`
 
 The terminal emulator verifies bypass data in `check_bypass()` at `kitty/file_transmission.py:557-580`:
 
-```python
-def check_bypass(password: str, request_id: str, bypass_data: str) -> bool:
-    protocol, sep, bypass_data = bypass_data.partition(':')
-    if protocol == 'kitty-1':
-        # X25519 + AES-GCM decryption
-        pcmd = json.loads(bypass_data)
-        ekey = get_boss().encryption_key
-        d = AES256GCMDecrypt(ekey.derive_secret(b85decode(pcmd['pubkey'])), ...)
-        data = d.add_data_to_be_decrypted(b85decode(pcmd['encrypted']), True)
-        timestamp, sep, payload = data.decode('utf-8').partition(':')
-        delta = time_ns() - int(timestamp)
-        if abs(delta) > 5 * 60 * 1e9:  # 5-minute window
-            return False
-        return payload == f'{request_id};{password}'
-    elif protocol == 'sha256':
-        return (encode_bypass(request_id, password) == bypass_data) if password else False
-```
+The function partitions `bypass_data` on `:` to determine the protocol. For `kitty-1:`, it performs X25519+AES-GCM decryption with a 5-minute timestamp window (`abs(delta) > 5 * 60 * 1e9`). For `sha256:`, it falls back to simple SHA256 hash comparison.
 
 Source: `kitty/file_transmission.py:557-580`
 
@@ -851,17 +727,7 @@ Source: `docs/kittens/transfer.rst:72-74`
 
 Each file being transferred has a `FileState` that tracks its progress:
 
-```go
-type FileState int
-
-const (
-    WAITING_FOR_START FileState = iota  // 0
-    WAITING_FOR_DATA                     // 1
-    TRANSMITTING                         // 2
-    FINISHED                             // 3
-    ACKNOWLEDGED                         // 4
-)
-```
+The five states are: `WAITING_FOR_START`(0) → `WAITING_FOR_DATA`(1) → `TRANSMITTING`(2) → `FINISHED`(3) → `ACKNOWLEDGED`(4).
 
 Source: `kittens/transfer/send.go:35-43`
 
@@ -892,31 +758,13 @@ stateDiagram-v2
 
 The overall send session has its own state:
 
-```go
-type SendState int
-
-const (
-    SEND_WAITING_FOR_PERMISSION SendState = iota  // 0
-    SEND_PERMISSION_GRANTED                        // 1
-    SEND_PERMISSION_DENIED                         // 2
-    SEND_CANCELED                                  // 3
-)
-```
+`SendState` has 4 values: `SEND_WAITING_FOR_PERMISSION` (0), `SEND_PERMISSION_GRANTED` (1), `SEND_PERMISSION_DENIED` (2), `SEND_CANCELED` (3).
 
 Source: `kittens/transfer/send.go:277-284`
 
 ### 6.3 Receiver State Machine
 
-```go
-type state int
-
-const (
-    state_waiting_for_permission    state = iota  // 0
-    state_waiting_for_file_metadata               // 1
-    state_transferring                             // 2
-    state_canceled                                 // 3
-)
-```
+The four states are: `state_waiting_for_permission`(0) → `state_waiting_for_file_metadata`(1) → `state_transferring`(2) → `state_canceled`(3).
 
 Source: `kittens/transfer/receive.go:34-41`
 
@@ -955,11 +803,7 @@ stateDiagram-v2
 The `BlockHash` struct represents one block's signature in the rsync signature:
 
 ```go
-type BlockHash struct {
-    Index      uint64
-    WeakHash   uint32
-    StrongHash uint64
-}
+type BlockHash struct { Index uint64; WeakHash uint32; StrongHash uint64 }
 const BlockHashSize = 20
 ```
 
@@ -973,14 +817,7 @@ Source: `tools/rsync/algorithm.go:177-183`
 | 8 | 4 | uint32 | `WeakHash` | Rolling checksum (fast, collision-prone) |
 | 12 | 8 | uint64 | `StrongHash` | XXH3-64 hash (collision-resistant) |
 
-**Serialization** writes fields in order using little-endian encoding:
-```go
-func (self BlockHash) Serialize(output []byte) {
-    bin.PutUint64(output, self.Index)
-    bin.PutUint32(output[8:], self.WeakHash)
-    bin.PutUint64(output[12:], self.StrongHash)
-}
-```
+**Serialization** writes `Index`, `WeakHash`, `StrongHash` in order using little-endian encoding via `bin.PutUint64`/`bin.PutUint32`.
 
 Source: `tools/rsync/algorithm.go:186-190`
 
@@ -996,14 +833,7 @@ The signature begins with a 12-byte header that describes the algorithm paramete
 | 6 | 2 | uint16 | `weak_hash_type` | 0 | Rsync rolling checksum |
 | 8 | 4 | uint32 | `block_size` | `√file_size` | Bytes per block |
 
-**Written** in `Patcher.CreateSignatureIterator()`:
-```go
-bin.PutUint16(b[:], 0)                           // version
-bin.PutUint16(b[2:], uint16(self.Checksum_type))  // checksum_type
-bin.PutUint16(b[4:], uint16(self.Strong_hash_type)) // strong_hash_type
-bin.PutUint16(b[6:], uint16(self.Weak_hash_type))   // weak_hash_type
-bin.PutUint32(b[8:], uint32(self.rsync.BlockSize))   // block_size
-```
+**Written** in `Patcher.CreateSignatureIterator()` using `bin.PutUint16`/`bin.PutUint32` to serialize version, `Checksum_type`, `Strong_hash_type`, `Weak_hash_type`, and `BlockSize` in order.
 
 Source: `tools/rsync/api.go:205-209`
 
@@ -1013,16 +843,7 @@ Source: `tools/rsync/api.go:205-209`
 
 Operations are the units of the delta stream. Each starts with a 1-byte type discriminator:
 
-```go
-type OpType byte
-
-const (
-    OpBlock      OpType = iota  // 0
-    OpData                       // 1
-    OpHash                       // 2
-    OpBlockRange                 // 3
-)
-```
+`OpType` is a single byte: `OpBlock` (0), `OpData` (1), `OpHash` (2), `OpBlockRange` (3).
 
 Source: `tools/rsync/algorithm.go:31-38`
 
@@ -1059,15 +880,7 @@ Source: `tools/rsync/algorithm.go:31-38`
 
 Source: `tools/rsync/algorithm.go:96-125`
 
-**`Operation` struct:**
-```go
-type Operation struct {
-    Type          OpType
-    BlockIndex    uint64
-    BlockIndexEnd uint64
-    Data          []byte
-}
-```
+**`Operation` struct:** Contains `Type OpType`, `BlockIndex uint64`, `BlockIndexEnd uint64`, and `Data []byte`.
 
 Source: `tools/rsync/algorithm.go:72-77`
 
@@ -1075,37 +888,14 @@ Source: `tools/rsync/algorithm.go:72-77`
 
 #### 7.2.1 Low-Level: `signature_iterator`
 
-The `signature_iterator` struct generates one `BlockHash` per call:
-
-```go
-type signature_iterator struct {
-    hasher hash.Hash64
-    buffer []byte
-    src    io.Reader
-    rc     rolling_checksum
-    index  uint64
-}
-```
+The `signature_iterator` struct (fields: `hasher hash.Hash64`, `buffer []byte`, `src io.Reader`, `rc rolling_checksum`, `index uint64`) generates one `BlockHash` per `next()` call.
 
 Source: `tools/rsync/algorithm.go:238-244`
 
-The `next()` method at `tools/rsync/algorithm.go:247-265`:
-1. Reads one `block_size` chunk from source
-2. Computes `WeakHash` via `rolling_checksum.full(data)`
-3. Computes `StrongHash` via xxh3_64 hasher
-4. Returns `BlockHash{Index, WeakHash, StrongHash}` with incrementing index
+The `next()` method reads one `block_size` chunk, computes `WeakHash` via `rc.full(data)`, computes `StrongHash` via `hasher.Sum64()`, and returns `BlockHash{Index, WeakHash, StrongHash}` with incrementing index.
 
 ```go
-func (self *signature_iterator) next() (ans BlockHash, err error) {
-    n, err := io.ReadAtLeast(self.src, self.buffer, cap(self.buffer))
-    // ... handle EOF/short read ...
-    b := self.buffer[:n]
-    self.hasher.Reset()
-    self.hasher.Write(b)
-    ans = BlockHash{Index: self.index, WeakHash: self.rc.full(b), StrongHash: self.hasher.Sum64()}
-    self.index++
-    return
-}
+ans = BlockHash{Index: self.index, WeakHash: self.rc.full(b), StrongHash: self.hasher.Sum64()}
 ```
 
 Source: `tools/rsync/algorithm.go:247-264`
@@ -1142,46 +932,19 @@ Source: `tools/rsync/api.go:270-277`
 
 The rolling checksum enables O(1) per-byte window sliding, which is the key efficiency insight of the rsync algorithm.
 
-```go
-type rolling_checksum struct {
-    alpha, beta, val, l           uint32
-    first_byte_of_previous_window uint32
-}
-```
+Fields: `alpha`, `beta`, `val`, `l` (all `uint32`), and `first_byte_of_previous_window uint32`.
 
 Source: `tools/rsync/algorithm.go:336-339`
 
-**Full computation** (for initial window):
-
-```go
-func (self *rolling_checksum) full(data []byte) uint32 {
-    var alpha, beta uint32
-    self.l = uint32(len(data))
-    for i, b := range data {
-        alpha += uint32(b)
-        beta += (self.l - uint32(i)) * uint32(b)
-    }
-    self.first_byte_of_previous_window = uint32(data[0])
-    self.alpha = alpha % _M
-    self.beta = beta % _M
-    self.val = self.alpha + _M*self.beta
-    return self.val
-}
-```
+**Full computation** (`full(data)`) computes `alpha` = sum of bytes, `beta` = weighted sum, then `val = alpha + _M*beta` where `_M = 1 << 16`.
 
 Source: `tools/rsync/algorithm.go:341-353`
 
-Where `_M = 1 << 16` (65536).
-
-**Rolling update** (slide window by one byte):
+**Rolling update** (`add_one_byte(first_byte, last_byte)`) adjusts alpha/beta in O(1) by subtracting the outgoing byte's contribution and adding the incoming byte:
 
 ```go
-func (self *rolling_checksum) add_one_byte(first_byte, last_byte byte) {
-    self.alpha = (self.alpha - self.first_byte_of_previous_window + uint32(last_byte)) % _M
-    self.beta = (self.beta - (self.l)*self.first_byte_of_previous_window + self.alpha) % _M
-    self.val = self.alpha + _M*self.beta
-    self.first_byte_of_previous_window = uint32(first_byte)
-}
+self.alpha = (self.alpha - self.first_byte_of_previous_window + uint32(last_byte)) % _M
+self.beta = (self.beta - (self.l)*self.first_byte_of_previous_window + self.alpha) % _M
 ```
 
 Source: `tools/rsync/algorithm.go:355-360`
@@ -1194,44 +957,14 @@ Source: `tools/rsync/algorithm.go:355-360`
 
 The `diff` struct at `tools/rsync/algorithm.go:362-378` is the core delta computation engine:
 
-```go
-type diff struct {
-    buffer       []byte
-    op_write_buf [32]byte
-    hash_lookup  map[uint32][]BlockHash  // weak hash → matching blocks
-    source       io.Reader               // actual file to diff
-    hasher       hash.Hash64             // for strong hash
-    checksummer  hash.Hash               // for file integrity
-    output       io.Writer               // delta output stream
-
-    window, data      struct{ pos, sz int }
-    block_size        int
-    finished, written bool
-    rc                rolling_checksum
-    pending_op        *Operation
-}
-```
+Key fields: `hash_lookup map[uint32][]BlockHash` (weak hash → matching blocks), `source io.Reader`, `hasher hash.Hash64`, `checksummer hash.Hash`, `rc rolling_checksum`, and `pending_op *Operation` for combining consecutive block operations.
 
 Source: `tools/rsync/algorithm.go:362-378`
 
-**Initialization** in `rsync.CreateDiff()`:
+**Initialization** in `rsync.CreateDiff()` builds the `hash_lookup` map from the signature, keyed by `WeakHash`:
 
 ```go
-func (r *rsync) CreateDiff(source io.Reader, signature []BlockHash, output io.Writer) func() error {
-    ans := &diff{
-        block_size:  r.BlockSize,
-        buffer:      make([]byte, 0, (r.BlockSize * DataSizeMultiple)),
-        hash_lookup: make(map[uint32][]BlockHash, len(signature)),
-        source:      source,
-        hasher:      r.hasher_constructor(),
-        checksummer: r.checksummer_constructor(),
-        output:      output,
-    }
-    for _, h := range signature {
-        ans.hash_lookup[h.WeakHash] = append(ans.hash_lookup[h.WeakHash], h)
-    }
-    return ans.Next
-}
+ans.hash_lookup[h.WeakHash] = append(ans.hash_lookup[h.WeakHash], h)
 ```
 
 Source: `tools/rsync/algorithm.go:614-627`
@@ -1242,14 +975,7 @@ Source: `tools/rsync/algorithm.go:614-627`
 
 The heart of delta computation at `tools/rsync/algorithm.go:533-569`:
 
-```
-For each byte position in the source file:
-  1. Compute rolling checksum for current window
-  2. Look up weak hash in hash_lookup
-  3. If found: compute strong hash and verify
-  4. If strong match: emit OpBlock (block unchanged)
-  5. If no match: accumulate byte as data for OpData
-```
+For each byte position: compute rolling checksum → look up weak hash in `hash_lookup` → if found, compute strong hash and verify → on match emit `OpBlock`; on miss accumulate byte for `OpData`.
 
 **Detailed flow:**
 
@@ -1259,23 +985,10 @@ For each byte position in the source file:
 2. **Subsequent calls** (`window.sz > 0`): Slide window by 1 byte using `rc.add_one_byte()`
    Source: `algorithm.go:541-543`
 
-3. **Hash lookup**: Check `hash_lookup[rc.val]` for weak hash match:
-   ```go
-   if hh, ok := self.hash_lookup[self.rc.val]; ok {
-       block_index, found_hash = find_hash(hh, self.hash(self.buffer[...]))
-   }
-   ```
+3. **Hash lookup**: Checks `self.hash_lookup[self.rc.val]` for weak match, then verifies via `find_hash()` with strong hash.
    Source: `algorithm.go:556-558`
 
-4. **On match**: Send accumulated data as `OpData`, then enqueue `OpBlock`:
-   ```go
-   if found_hash {
-       self.send_data()
-       self.enqueue(Operation{Type: OpBlock, BlockIndex: block_index})
-       self.window.pos += self.window.sz
-       self.window.sz = 0
-   }
-   ```
+4. **On match**: Sends accumulated data as `OpData`, then enqueues `Operation{Type: OpBlock, BlockIndex: block_index}` and resets the window.
    Source: `algorithm.go:559-567`
 
 5. **On finish**: Send remaining data + `OpHash` checksum:
@@ -1285,32 +998,7 @@ For each byte position in the source file:
 
 Consecutive `OpBlock` operations with adjacent indices are merged into `OpBlockRange`:
 
-```go
-func (self *diff) enqueue(op Operation) (err error) {
-    switch op.Type {
-    case OpBlock:
-        if self.pending_op != nil {
-            switch self.pending_op.Type {
-            case OpBlock:
-                if self.pending_op.BlockIndex+1 == op.BlockIndex {
-                    self.pending_op = &Operation{
-                        Type: OpBlockRange,
-                        BlockIndex: self.pending_op.BlockIndex,
-                        BlockIndexEnd: op.BlockIndex,
-                    }
-                    return
-                }
-            case OpBlockRange:
-                if self.pending_op.BlockIndexEnd+1 == op.BlockIndex {
-                    self.pending_op.BlockIndexEnd = op.BlockIndex
-                    return
-                }
-            }
-        }
-        self.pending_op = &op
-    }
-}
-```
+When an `OpBlock` arrives and the pending operation is also an `OpBlock` with `BlockIndex+1 == op.BlockIndex`, the two are merged into an `OpBlockRange`. If the pending operation is already an `OpBlockRange` with consecutive end index, it is extended by incrementing `BlockIndexEnd`.
 
 Source: `tools/rsync/algorithm.go:400-434`
 
@@ -1398,26 +1086,7 @@ flowchart TD
 
 `rsync.ApplyDelta()` at `tools/rsync/algorithm.go:275-325` reconstructs the file from the delta and the original:
 
-```go
-func (r *rsync) ApplyDelta(output io.Writer, target io.ReadSeeker, op Operation) error {
-    switch op.Type {
-    case OpBlockRange:
-        for i := op.BlockIndex; i <= op.BlockIndexEnd; i++ {
-            write_block(Operation{Type: OpBlock, BlockIndex: i})
-        }
-    case OpBlock:
-        target.Seek(int64(r.BlockSize * int(op.BlockIndex)), io.SeekStart)
-        io.ReadAtLeast(target, buffer, r.BlockSize)
-        write(block)
-    case OpData:
-        write(op.Data)
-    case OpHash:
-        actual := r.checksummer.Sum(nil)
-        if !bytes.Equal(actual, op.Data) { return error }
-        r.checksum_done = true
-    }
-}
-```
+`ApplyDelta` dispatches on `op.Type`: `OpBlock` seeks to `block_index * block_size` in the original file and copies the block to output; `OpBlockRange` iterates and applies each block in the range; `OpData` writes new content directly; `OpHash` verifies the XXH3-128 checksum of the entire reconstructed file.
 
 Source: `tools/rsync/algorithm.go:275-325`
 
@@ -1442,45 +1111,29 @@ The `tools/rsync/api.go` file provides the high-level streaming API that the tra
 
 #### 7.6.1 `Api`, `Differ`, and `Patcher` Structs
 
-```go
-type Api struct {
-    rsync          rsync
-    header_done    bool
-    checksum_done  bool
-}
+`Api` holds the shared rsync engine, accumulated signature, and hash type configuration:
 
-type Differ struct {
-    Api
-    buf                    []byte
-    signature              []BlockHash
-    finished_signature     bool
-}
+Fields: `rsync rsync`, `signature []BlockHash`, `Checksum_type ChecksumType`, `Strong_hash_type StrongHashType`, `Weak_hash_type WeakHashType`.
 
-type Patcher struct {
-    Api
-    buf                    []byte
-    expected_input_size    int64
-}
-```
+Source: `tools/rsync/api.go:47-54`
 
-Source: `tools/rsync/api.go:47-68`
+`Differ` embeds `Api` and adds a buffer for incrementally received signature data:
 
-**Design rationale:** Both `Differ` and `Patcher` embed the `Api` struct for shared functionality (signature header parsing, hash type configuration). The `Differ` accumulates signature data incrementally, while the `Patcher` generates signature data and applies delta operations.
+Fields: `Api` (embedded), `unconsumed_signature_data []byte`.
+
+Source: `tools/rsync/api.go:56-59`
+
+`Patcher` embeds `Api` and tracks delta processing state — including I/O streams and data accounting:
+
+Fields: `Api` (embedded), `unconsumed_delta_data []byte`, `expected_input_size_for_signature_generation int64`, `delta_output io.Writer`, `delta_input io.ReadSeeker`, `total_data_in_delta int`.
+
+Source: `tools/rsync/api.go:61-68`
+
+**Design rationale:** Both `Differ` and `Patcher` embed the `Api` struct for shared functionality (signature header parsing, hash type configuration). The `Differ` buffers incoming signature data in `unconsumed_signature_data` until complete blocks can be parsed. The `Patcher` manages bidirectional I/O through `delta_output`/`delta_input` and tracks `total_data_in_delta` for statistics reporting.
 
 #### 7.6.2 `NewPatcher()` — Initializing the Receiver-Side API
 
-```go
-func NewPatcher(expected_input_size int64) *Patcher {
-    ans := Patcher{expected_input_size: expected_input_size}
-    sz := int(expected_input_size)
-    bs := int(math.Round(math.Sqrt(float64(sz))))
-    if bs < 1 { bs = 1 }
-    bs = min(bs, MaxBlockSize)
-    ans.rsync.BlockSize = bs
-    // ... initialize hashers ...
-    return &ans
-}
-```
+`NewPatcher` computes `block_size = min(round(√file_size), MaxBlockSize)` and initializes the rsync engine with the appropriate hashers.
 
 Source: `tools/rsync/api.go:270-287`
 
@@ -1524,28 +1177,11 @@ After all signature data is received:
 
 On the receiver side, delta data is processed incrementally:
 
-```go
-func (self *Patcher) UpdateDelta(data []byte) error {
-    self.buf = append(self.buf, data...)
-    for {
-        op, n := Unserialize(self.buf)
-        if n <= 0 { break }
-        self.buf = self.buf[n:]
-        self.rsync.ApplyDelta(output, target, op)
-    }
-}
-```
+`UpdateDelta(data)` appends incoming bytes to `unconsumed_delta_data`, then loops: unserializing `Operation` objects and calling `ApplyDelta()` for each until no complete operation remains in the buffer.
 
 Source: `tools/rsync/api.go:167-175`
 
-After all delta data:
-
-```go
-func (self *Patcher) FinishDelta() error {
-    if len(self.buf) > 0 { return error }  // leftover bytes
-    if !self.checksum_done { return error } // no OpHash received
-}
-```
+`FinishDelta()` verifies no leftover bytes remain in the buffer and that an `OpHash` checksum was received and verified.
 
 Source: `tools/rsync/api.go:178-192`
 
@@ -1566,16 +1202,8 @@ Source: `kittens/transfer/send.go:131`
 
 Source: `kittens/transfer/send.go:772-791`
 
-**Delta calculation** — `start_delta_calculation()`:
-```go
-func (self *File) start_delta_calculation() (err error) {
-    self.state = TRANSMITTING
-    self.actual_file, err = os.Open(self.expanded_local_path)
-    self.deltabuf = bytes.NewBuffer(make([]byte, 0, 32+rsync.DataSizeMultiple*self.differ.BlockSize()))
-    self.delta_loader = self.differ.CreateDelta(self.actual_file, self.deltabuf)
-    return nil
-}
-```
+**Delta calculation** — `start_delta_calculation()` transitions state to `TRANSMITTING`, opens the actual file, allocates a delta buffer, and calls `self.differ.CreateDelta(actual_file, deltabuf)` to create the `delta_loader` function.
+
 Source: `kittens/transfer/send.go:759-769`
 
 **Chunk transmission** — `next_chunk()`:
@@ -1586,15 +1214,8 @@ Source: `kittens/transfer/send.go:915-981`
 
 #### 7.6.2 Receiver Side (`receive.go`)
 
-**Signature generation** — `request_files()`:
-```go
-read_signature := self.use_rsync && f.ftype == FileType_regular
-if read_signature {
-    if s, err := os.Lstat(f.expanded_local_path); err == nil {
-        read_signature = s.Size() > 4096
-    }
-}
-```
+**Signature generation** — `request_files()` enables rsync when `use_rsync && f.ftype == FileType_regular` and the existing local file is larger than 4096 bytes (checked via `os.Lstat()`).
+
 Source: `kittens/transfer/receive.go:404-410`
 
 When rsync is enabled and the file exists and is > 4096 bytes:
@@ -1606,14 +1227,8 @@ When rsync is enabled and the file exists and is > 4096 bytes:
 
 Source: `kittens/transfer/receive.go:416-436`
 
-**Delta patching** — `patch_file` struct:
-```go
-type patch_file struct {
-    path      string
-    src, temp *os.File
-    p         *rsync.Patcher
-}
-```
+**Delta patching** — The `patch_file` struct holds `path string`, `src` and `temp *os.File`, and `p *rsync.Patcher`.
+
 Source: `kittens/transfer/receive.go:69-73`
 
 - `write(data)` → `patcher.UpdateDelta(data)` — applies delta operations
@@ -1621,14 +1236,8 @@ Source: `kittens/transfer/receive.go:69-73`
 
 Source: `kittens/transfer/receive.go:83-105`
 
-**`new_patch_file()`** creates a temp file for output:
-```go
-func new_patch_file(path string, p *rsync.Patcher) (ans *patch_file, err error) {
-    ans.src, _ = os.Open(path)           // original file for reading
-    ans.temp, _ = os.CreateTemp(...)     // temp file for patched output
-    ans.p.StartDelta(ans.temp, ans.src)  // configure patcher
-}
-```
+**`new_patch_file()`** opens the original file for reading, creates a temp file via `os.CreateTemp()` for patched output, and calls `patcher.StartDelta(temp, src)` to configure the I/O streams.
+
 Source: `kittens/transfer/receive.go:107-122`
 
 ### 7.7 Complete Rsync Delta Transfer Sequence
@@ -1685,21 +1294,7 @@ sequenceDiagram
 
 File data is split into 4096-byte chunks before serialization:
 
-```go
-func split_for_transfer(data []byte, file_id string, mark_last bool, callback func(*FileTransmissionCommand)) {
-    const chunk_size = 4096
-    for len(data) > 0 {
-        chunk := data
-        if len(chunk) > chunk_size {
-            chunk = data[:chunk_size]
-        }
-        data = data[len(chunk):]
-        callback(&FileTransmissionCommand{
-            Action:  utils.IfElse(mark_last && len(data) == 0, Action_end_data, Action_data),
-            File_id: file_id, Data: chunk})
-    }
-}
-```
+`split_for_transfer()` iterates over the input `data` in `4096`-byte chunks, invoking a callback with a `FileTransmissionCommand{Action: Action_data, File_id: file_id, Data: chunk}` for each. The final chunk uses `Action_end_data` when `mark_last` is true.
 
 Source: `kittens/transfer/ftc.go:326-338`
 
@@ -1783,41 +1378,9 @@ Transfer data is multiplexed with regular terminal output through OSC escape seq
 
 Both sender and receiver use identical demultiplexing logic in their event loops.
 
-**Sender's event loop** at `kittens/transfer/send.go:1223-1237`:
-```go
-ftc_code := strconv.Itoa(kitty.FileTransferCode)
-lp.OnEscapeCode = func(et loop.EscapeCodeType, payload []byte) error {
-    if et == loop.OSC {
-        if idx := bytes.IndexByte(payload, ';'); idx > 0 {
-            if utils.UnsafeBytesToString(payload[:idx]) == ftc_code {
-                ftc, err := NewFileTransmissionCommand(utils.UnsafeBytesToString(payload[idx+1:]))
-                // ... handle ftc ...
-            }
-        }
-    }
-    return nil
-}
-```
+**Sender's event loop** at `kittens/transfer/send.go:1223-1237` and **receiver's event loop** at `kittens/transfer/receive.go:1120-1134` use identical demultiplexing logic: the `lp.OnEscapeCode` callback checks `et == loop.OSC`, extracts the code number before the first `';'`, compares it to `ftc_code` (= `"5113"`), and parses the remainder via `NewFileTransmissionCommand(payload[idx+1:])`.
 
-Source: `kittens/transfer/send.go:1223-1237`
-
-**Receiver's event loop** at `kittens/transfer/receive.go:1120-1134`:
-```go
-ftc_code := strconv.Itoa(kitty.FileTransferCode)
-lp.OnEscapeCode = func(et loop.EscapeCodeType, payload []byte) error {
-    if et == loop.OSC {
-        if idx := bytes.IndexByte(payload, ';'); idx > 0 {
-            if utils.UnsafeBytesToString(payload[:idx]) == ftc_code {
-                ftc, err := NewFileTransmissionCommand(utils.UnsafeBytesToString(payload[idx+1:]))
-                // ... handle ftc ...
-            }
-        }
-    }
-    return nil
-}
-```
-
-Source: `kittens/transfer/receive.go:1120-1134`
+Source: `kittens/transfer/send.go:1223-1237`, `kittens/transfer/receive.go:1120-1134`
 
 **Demultiplexing steps:**
 1. The terminal loop's escape code parser identifies an OSC escape code
@@ -1837,13 +1400,7 @@ On the terminal emulator side, `kitty/file_transmission.py` handles the protocol
 
 The `FileTransmission` class at `kitty/file_transmission.py:803-810` manages all active transfer sessions for a window:
 
-```python
-class FileTransmission:
-    def __init__(self, window_id: int):
-        self.active_receives: Dict[str, ActiveReceive] = {}  # kitten→terminal
-        self.active_sends: Dict[str, ActiveSend] = {}        # terminal→kitten
-        self.pending_receive_responses: Deque[FileTransmissionCommand] = deque()
-```
+`FileTransmission.__init__()` initializes `active_receives` and `active_sends` dicts (keyed by request ID) plus a `pending_receive_responses` deque for queued outgoing commands.
 
 Source: `kitty/file_transmission.py:803-810`
 
@@ -1855,15 +1412,7 @@ Source: `kitty/file_transmission.py:858-879`
 
 When a kitten sends `action=send`, the terminal creates an `ActiveReceive` session:
 
-```python
-class ActiveReceive:
-    def __init__(self, request_id: str, quiet: int, bypass: str):
-        self.files: Dict[str, DestFile] = {}
-        self.bypass_ok: Optional[bool] = None
-        self.send_acknowledgements = quiet < 1
-        self.send_errors = quiet < 2
-        self.pending_files_to_transmit_signature_of: Deque[Tuple[PatchFile, str]] = deque()
-```
+`ActiveReceive.__init__()` initializes a `files` dict of `DestFile` objects, a `bypass_ok` flag, quiet-level-derived booleans (`send_acknowledgements`, `send_errors`), and a `pending_files_to_transmit_signature_of` deque for rsync signature generation.
 
 Source: `kitty/file_transmission.py:583-599`
 
@@ -1879,14 +1428,7 @@ Key operations:
 
 Each incoming file is wrapped in a `DestFile` at `kitty/file_transmission.py:441-554`:
 
-```python
-class DestFile:
-    def __init__(self, ftc: FileTransmissionCommand):
-        self.name = ftc.name
-        self.ttype = ftc.ttype
-        self.decompressor = ZlibDecompressor() if ftc.compression is Compression.zlib else IdentityDecompressor()
-        self.actual_file: Union[PatchFile, IO[bytes], None] = None
-```
+`DestFile.__init__()` extracts `name` and `ttype` from the incoming `FileTransmissionCommand`, selects a `ZlibDecompressor` or `IdentityDecompressor` based on `ftc.compression`, and initializes `actual_file` (which may later become a `PatchFile` for rsync mode).
 
 Source: `kitty/file_transmission.py:441-467`
 
@@ -1901,14 +1443,7 @@ Source: `kitty/file_transmission.py:510-554`
 
 For rsync-mode transfers, the `PatchFile` at `kitty/file_transmission.py:377-438` wraps the Python rsync `Patcher`:
 
-```python
-class PatchFile:
-    def __init__(self, path: str, expected_size: int):
-        from kittens.transfer.rsync import Patcher
-        self.patcher = Patcher(expected_size)
-        self.block_buffer = memoryview(bytearray(self.patcher.block_size))
-        self.signature_done = False
-```
+`PatchFile.__init__()` imports the C-extension `Patcher`, creates it with `expected_size`, allocates a `block_buffer` of `patcher.block_size` bytes for signature generation, and sets `signature_done = False`.
 
 Source: `kitty/file_transmission.py:377-387`
 
@@ -1924,14 +1459,7 @@ Key methods:
 
 When a kitten sends `action=receive`, the terminal creates an `ActiveSend`:
 
-```python
-class ActiveSend:
-    def __init__(self, request_id: str, quiet: int, bypass: str, num_of_args: int):
-        self.file_specs: List[Tuple[str, str]] = []
-        self.queued_files_map: Dict[str, SourceFile] = {}
-        self.active_file: Optional[SourceFile] = None
-        self.pending_chunks: Deque[FileTransmissionCommand] = deque()
-```
+`ActiveSend.__init__()` initializes `file_specs` for path patterns, `queued_files_map` of `SourceFile` objects, an `active_file` pointer, and a `pending_chunks` deque for outgoing data commands.
 
 Source: `kitty/file_transmission.py:714-732`
 
@@ -1951,13 +1479,7 @@ The send workflow:
 
 Each outgoing file is wrapped in a `SourceFile` at `kitty/file_transmission.py:647-711`:
 
-```python
-class SourceFile:
-    def __init__(self, ftc: FileTransmissionCommand):
-        self.ttype = ftc.ttype
-        self.waiting_for_signature = True if self.ttype is TransmissionType.rsync else False
-        self.differ = rsync.Differ() if self.waiting_for_signature else None
-```
+`SourceFile.__init__()` sets `ttype` from the command, and for rsync mode sets `waiting_for_signature = True` and creates a `rsync.Differ()` instance; for simple mode, `differ` is `None`.
 
 Source: `kitty/file_transmission.py:647-669`
 
@@ -2007,14 +1529,8 @@ Source: `docs/file-transfer-protocol.rst:199-206`
 The protocol spec does not define a "resume" action type. The defined actions are: `send`, `file`, `data`, `end_data`, `receive`, `cancel`, `status`, `finish`.
 Source: `docs/file-transfer-protocol.rst:561`
 
-**Evidence 2 — Random session IDs:** The `request_id` is randomly generated per session via `random_id()`:
-```go
-func random_id() string {
-    bytes := []byte{0, 0}
-    rand.Read(bytes)
-    return fmt.Sprintf("%x%s", os.Getpid(), hex.EncodeToString(bytes))
-}
-```
+**Evidence 2 — Random session IDs:** The `request_id` is randomly generated per session via `random_id()`, which combines `os.Getpid()` with 2 random bytes via `rand.Read()` — producing a unique-per-invocation hex string with no mechanism for reuse.
+
 Source: `kittens/transfer/utils.go:76-80`
 
 There is no mechanism to reuse a previous session ID, and no persistent storage of session state.
@@ -2054,20 +1570,7 @@ To rigorously verify the absence of resumption support, the following searches w
 | `resume` | `docs/file-transfer-protocol.rst` | No mention of resumption mechanism |
 | `restart` | `docs/file-transfer-protocol.rst` | No restart protocol defined |
 
-**SendManager fields** at `kittens/transfer/send.go:344-361` — no field stores progress to disk:
-```
-type SendManager struct {
-    state              SendState
-    request_id         string
-    bypass             string
-    files              []*File
-    fid_map            map[string]*File
-    prefix, suffix     string
-    use_rsync          bool
-    progress_tracker   ProgressTracker
-    // ... no persistent storage fields
-}
-```
+**SendManager fields** at `kittens/transfer/send.go:344-361` include `state`, `request_id`, `bypass`, `files`, `fid_map`, `prefix`/`suffix`, `use_rsync`, and `progress_tracker` — all in-memory with no fields for disk-persisted state.
 
 Source: `kittens/transfer/send.go:344-361`
 
@@ -2105,13 +1608,7 @@ Source: `kittens/transfer/receive.go`
 
 The compression heuristic at `kittens/transfer/utils.go:88-107` determines whether a file benefits from compression:
 
-```go
-func should_be_compressed(path, strategy string) bool {
-    if strategy == "always" { return true }
-    if strategy == "never"  { return false }
-    // ... heuristic ...
-}
-```
+`should_be_compressed()` first checks for explicit `"always"` or `"never"` strategy overrides, then falls through to a heuristic based on file extension and MIME type.
 
 Source: `kittens/transfer/utils.go:88-94`
 
@@ -2139,26 +1636,9 @@ When compression is enabled, the transfer uses RFC 1950 ZLIB compression:
 
 Source: `kittens/transfer/send.go:945-953`
 
-**Receiver side** (Python, `DestFile`):
-```python
-self.decompressor = ZlibDecompressor() if ftc.compression is Compression.zlib else IdentityDecompressor()
-```
-Source: `kitty/file_transmission.py:463`
+**Receiver side** (Python, `DestFile`): selects `ZlibDecompressor()` or `IdentityDecompressor()` based on `ftc.compression`. The `ZlibDecompressor` wraps `zlib.decompressobj(wbits=0)` (auto-detecting stream format), calling `decompress(data)` on each chunk and `flush()` on the final chunk.
 
-The `ZlibDecompressor` at `kitty/file_transmission.py:364-374`:
-```python
-class ZlibDecompressor:
-    def __init__(self):
-        self.d = zlib.decompressobj(wbits=0)
-    def __call__(self, data, is_last=False):
-        ans = self.d.decompress(data)
-        if is_last:
-            ans += self.d.flush()
-        return ans
-```
-Source: `kitty/file_transmission.py:364-374`
-
-**Note:** `wbits=0` means the decompressor auto-detects the stream format.
+Source: `kitty/file_transmission.py:364-374`, `kitty/file_transmission.py:463`
 
 ### 10.3 Compression and Rsync Interaction
 
@@ -2210,14 +1690,7 @@ To demonstrate the efficiency of rsync-style delta transfer:
 
 The `print_rsync_stats()` function at `kittens/transfer/utils.go:109-114` produces:
 
-```go
-func print_rsync_stats(total_bytes, delta_bytes, signature_bytes int64) {
-    fmt.Println("Rsync stats:")
-    fmt.Printf("  Delta size: %s Signature size: %s\n", humanize.Size(delta_bytes), humanize.Size(signature_bytes))
-    frac := float64(delta_bytes+signature_bytes) / float64(utils.Max(1, total_bytes))
-    fmt.Printf("  Transmitted: %s of a total of %s (%.1f%%)\n", humanize.Size(delta_bytes+signature_bytes), humanize.Size(total_bytes), frac*100)
-}
-```
+`print_rsync_stats(total_bytes, delta_bytes, signature_bytes)` prints human-readable sizes for delta and signature, then computes `(delta_bytes+signature_bytes)/total_bytes` as the transmission efficiency percentage.
 
 Source: `kittens/transfer/utils.go:109-114`
 
@@ -2230,21 +1703,7 @@ Rsync stats:
 
 ### 11.3 Rsync Stats Tracking
 
-**Sender side** (in `send_loop()`):
-```go
-p := handler.manager.progress_tracker
-if handler.manager.has_rsync && p.total_transferred+int64(p.signature_bytes) > 0 && lp.ExitCode() == 0 {
-    var tsf int64
-    for _, f := range files {
-        if f.ttype == TransmissionType_rsync {
-            tsf += f.file_size
-        }
-    }
-    if tsf > 0 {
-        print_rsync_stats(tsf, p.total_transferred, int64(p.signature_bytes))
-    }
-}
-```
+**Sender side** (in `send_loop()` at `kittens/transfer/send.go:1251-1261`): after a successful transfer (`ExitCode() == 0`), sums `file_size` for all files with `TransmissionType_rsync`, then calls `print_rsync_stats(tsf, p.total_transferred, int64(p.signature_bytes))`.
 
 Source: `kittens/transfer/send.go:1251-1261`
 
@@ -2252,20 +1711,7 @@ Source: `kittens/transfer/send.go:1251-1261`
 - `p.signature_bytes` tracks total signature bytes received
 - Only counts files that used `TransmissionType_rsync`
 
-**Receiver side** (in `receive_loop()`):
-```go
-var tsf, dsz, ssz int64
-for _, f := range handler.manager.files {
-    if f.expect_diff {
-        tsf += f.expected_size
-        dsz += f.received_bytes
-        ssz += f.sent_bytes
-    }
-}
-if tsf > 0 && dsz+ssz > 0 && rc == 0 {
-    print_rsync_stats(tsf, dsz, ssz)
-}
-```
+**Receiver side** (in `receive_loop()` at `kittens/transfer/receive.go:1154-1168`): sums `expected_size`, `received_bytes` (delta data), and `sent_bytes` (signature data) for all files where `expect_diff == true`, then calls `print_rsync_stats(tsf, dsz, ssz)`.
 
 Source: `kittens/transfer/receive.go:1154-1168`
 
@@ -2296,11 +1742,7 @@ The delta efficiency comes from the two-level hash matching:
 
 **Setup:**
 ```bash
-# Create a 100 KB text file
 dd if=/dev/urandom bs=1024 count=100 | base64 > /tmp/testfile.txt
-
-# Verify size (should be > 4096 bytes for rsync_capable)
-ls -la /tmp/testfile.txt
 ```
 
 **First transfer** (no existing file on remote → simple transfer):
@@ -2332,12 +1774,7 @@ kitty +kitten transfer --transmit-deltas /tmp/testfile.txt remote:/tmp/testfile.
    - Remaining ~313 blocks → emitted as `OpBlock` / `OpBlockRange` (compact)
 6. Delta total ≈ ~1-2 KB of `OpData` + ~100 bytes of `OpBlock/OpBlockRange` overhead + 16-byte `OpHash`
 
-**Expected stats:**
-```
-Rsync stats:
-  Delta size: ~2 KB Signature size: ~6 KB
-  Transmitted: ~8 KB of a total of 100 KB (8.0%)
-```
+**Expected stats:** `Delta size: ~2 KB  Signature size: ~6 KB` / `Transmitted: ~8 KB of a total of 100 KB (8.0%)`
 
 **Note:** An actual SSH-based demonstration requires a running kitty terminal with SSH access configured. The above describes the expected procedure and cites the code paths that produce the efficiency metrics. The exact numbers depend on file content, block size, and the position of modifications.
 
@@ -2380,27 +1817,17 @@ Delta transfer adds overhead compared to simple transfer in these scenarios:
 
 The delta stream consists of a sequence of serialized `Operation` objects followed by a final `OpHash`:
 
-```
-[OpBlock|OpData|OpBlockRange]* OpHash
-```
+The delta stream is a sequence `[OpBlock|OpData|OpBlockRange]* OpHash`.
 
 For the worked example (100 KB file, 1 KB modified in the middle):
 
-```
-OpBlockRange(start=0, count=152)      // First ~152 blocks are unchanged (152 × 316 ≈ 48,032 bytes)
-                                       // 13 bytes: type(1) + start(8) + count(4)
-
-OpData(size=1024)                      // Modified region: 1024 bytes of new data
-                                       // 5 + 1024 bytes: type(1) + size(4) + payload(1024)
-
-OpBlockRange(start=156, count=160)     // Remaining ~161 blocks are unchanged
-                                       // 13 bytes
-
-OpHash(size=16)                        // XXH3-128 file integrity checksum
-                                       // 19 bytes: type(1) + size(2) + hash(16)
-
-Total delta: 13 + 1029 + 13 + 19 = ~1,074 bytes
-```
+| Operation | Meaning | Wire Size |
+|-----------|---------|-----------|
+| `OpBlockRange(start=0, count=152)` | First ~152 unchanged blocks (≈48 KB) | 13 bytes |
+| `OpData(size=1024)` | Modified 1 KB region | 1,029 bytes |
+| `OpBlockRange(start=156, count=160)` | Remaining ~161 unchanged blocks | 13 bytes |
+| `OpHash(size=16)` | XXH3-128 file integrity checksum | 19 bytes |
+| **Total delta** | | **~1,074 bytes** |
 
 Compare this to the full file transfer: 100,000 bytes. The delta achieves approximately **1%** data transmission for a **1%** file modification — exactly the expected behavior for an rsync-style delta.
 
@@ -2430,23 +1857,9 @@ The file transfer protocol operates over TTY devices, which means any software r
 
 All string values in the protocol (except base64-encoded ones) are sanitized through `safe_string()`:
 
-**Go implementation:**
-```go
-var safe_string_pat = sync.OnceValue(func() *regexp.Regexp {
-    return regexp.MustCompile(`[^0-9a-zA-Z_:./@-]`)
-})
-func safe_string(s string) string {
-    return safe_string_pat().ReplaceAllLiteralString(s, "")
-}
-```
-Source: `kittens/transfer/ftc.go:155-161`
+**Go implementation** uses `regexp.MustCompile("[^0-9a-zA-Z_:./@-]")` with `ReplaceAllLiteralString(s, "")` — cached via `sync.OnceValue`. Source: `kittens/transfer/ftc.go:155-161`
 
-**Python implementation:**
-```python
-def safe_string(x: str) -> str:
-    return safe_string_pat().sub('', x)
-```
-Source: `kitty/file_transmission.py:38-39`
+**Python implementation** uses an equivalent `safe_string_pat().sub('', x)`. Source: `kitty/file_transmission.py:38-39`
 
 Both implementations strip any character not matching `[0-9a-zA-Z_:./@-]`. This prevents injection of semicolons (which delimit key-value pairs) or escape sequences into string values.
 
@@ -2474,20 +1887,7 @@ Both `send_loop()` and `receive_loop()` use kitty's terminal I/O loop (`loop.Loo
 
 **The `send_loop()` event loop** at `kittens/transfer/send.go:1198-1270`:
 
-```go
-lp, err := loop.New(loop.NoAlternateScreen, loop.NoRestoreColors, ...)
-// ...
-lp.OnInitialize = func() (string, error) {
-    handler.manager.initialize(handler)
-    return handler.manager.start_transfer(), nil
-}
-lp.OnEscapeCode = func(et loop.EscapeCodeType, payload []byte) error {
-    // ... demultiplex OSC 5113 ...
-}
-lp.OnWriteComplete = func(completed_write_id loop.IdType, has_pending_writes bool) error {
-    return handler.on_writing_finished(completed_write_id)
-}
-```
+The loop is created with `loop.New(loop.NoAlternateScreen, loop.NoRestoreColors, ...)` and wires three callbacks: `OnInitialize` triggers `manager.initialize()` + `start_transfer()`; `OnEscapeCode` demultiplexes OSC 5113 commands; `OnWriteComplete` triggers the next chunk via `on_writing_finished()`.
 
 Source: `kittens/transfer/send.go:1198-1245`
 
@@ -2510,15 +1910,8 @@ Source: `kittens/transfer/send.go:1245`
 Both sender and receiver track transfer progress:
 
 **Sender** (`ProgressTracker` at `kittens/transfer/send.go:295-305`):
-```go
-type ProgressTracker struct {
-    total_transferred  int64
-    signature_bytes    int
-    total_bytes_to_transfer int64
-    active_file        *File
-    done               bool
-}
-```
+
+The `ProgressTracker` struct has 10 fields tracking transfer progress: `total_size_of_all_files`, `total_bytes_to_transfer`, `active_file *File`, `total_transferred`, `transfers []*Transfer`, `transfered_stats_amt`, `transfered_stats_interval time.Duration`, `started_at time.Time`, `signature_bytes int`, and `total_reported_progress`.
 
 Source: `kittens/transfer/send.go:295-305`
 
@@ -2693,9 +2086,9 @@ The protocol supports three quiet levels that control terminal output during tra
 |-------|----------|----------|
 | 0 | `Quiet_none` | Full output: progress bars, file names, transfer stats |
 | 1 | `Quiet_acknowledgements` | Suppress per-file acknowledgement messages |
-| 2 | `Quiet_all` | Suppress all output except errors |
+| 2 | `Quiet_errors` | Suppress all output except errors |
 
-Source: `kittens/transfer/ftc.go:71-76`
+Source: `kittens/transfer/ftc.go:109-118`
 
 In the protocol wire format, this maps to the `q` key:
 - `q=0` or absent → full output
@@ -2976,13 +2369,8 @@ When transferring files, the protocol preserves metadata:
 - Determines file type from stat result
 
 **Receiver side** (`DestFile.apply_metadata()` at `kitty/file_transmission.py:489-501`):
-```python
-def apply_metadata(self, is_symlink: bool = False) -> None:
-    if self.permissions != FileTransmissionCommand.permissions:
-        os.chmod(self.name, self.permissions, follow_symlinks=is_symlink)
-    if self.mtime != FileTransmissionCommand.mtime:
-        os.utime(self.name, ns=(self.mtime, self.mtime), follow_symlinks=is_symlink)
-```
+
+Applies permissions via `os.chmod()` and modification time via `os.utime()`, comparing against `FileTransmissionCommand` defaults to skip unchanged values. The actual implementation handles symlink edge cases with `suppress(NotImplementedError)` guards and explicit `follow_symlinks=False` parameters on both `os.chmod` and `os.utime` when `is_symlink=True`.
 
 Source: `kitty/file_transmission.py:489-501`
 
