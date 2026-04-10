@@ -82,10 +82,11 @@ Kitty additionally requires an OpenGL context. Xvfb alone does not provide hardw
    ```
    The `glfw_path()` function (`Source: kitty/constants.py:191-193`) constructs the path to the platform-specific shared library (e.g., `glfw-x11.so`). Under Xvfb without a hardware GPU or Mesa software rendering, EGL/GLX context creation (`glfw/x11_init.c`) will fail, producing the `GLFW initialization failed` error.
 
-3. **Debug flags for diagnosis:** Kitty provides diagnostic flags (`Source: kitty/cli.py`):
+3. **Debug flags for diagnosis:** Kitty provides CLI diagnostic flags (`Source: kitty/cli.py:989, 1002`):
    - `--debug-rendering` — GPU rendering diagnostic output
    - `--debug-font-fallback` — Font fallback diagnostic logging
-   - `--debug-config` — Prints effective configuration, OpenGL version, and font info
+
+   Additionally, the `debug_config` action (triggered at runtime by the `kitty_mod+f6` keyboard shortcut, `Source: kitty/options/definition.py:4256`) calls `Boss.debug_config()` (`Source: kitty/boss.py:3060`), which invokes `debug_config()` from `kitty/debug_config.py` to print effective configuration, OpenGL version, and font info.
 
 **Conclusion:** Even without a successful launch, the startup sequence can be fully and reliably traced through code analysis, which is the approach taken in this document.
 
@@ -449,7 +450,7 @@ CLI `--override` (or `-o`) flags transform `name=value` into config-compatible `
 
 ### 2.6 Observable Evidence of Config Application
 
-- **`--debug-config` flag:** Calls `debug_config(opts)` from `kitty/debug_config.py`, which outputs: version, `uname`, font info (face name, size, metrics), OpenGL version string, loaded config file paths, all option values that differ from defaults, and selected environment variables.
+- **`debug_config` action (`kitty_mod+f6` keyboard shortcut, `Source: kitty/options/definition.py:4256`):** Invokes `Boss.debug_config()` (`Source: kitty/boss.py:3060`), which calls `debug_config(opts)` from `kitty/debug_config.py`, outputting: version, `uname`, font info (face name, size, metrics), OpenGL version string, loaded config file paths, all option values that differ from defaults, and selected environment variables.
 
 - **Missing `kitty.conf`:** If the config file does not exist, `prepare_config_file_for_editing()` (`Source: kitty/config.py:79-86`) creates it populated with `commented_out_default_config()` — a fully commented-out copy of all defaults.
 
@@ -679,7 +680,7 @@ The font pipeline involves three layers:
    - Box-drawing characters (`Source: kitty/fonts/box_drawing.py:render_box_char`)
 
 **Observable evidence:**
-- The font name and style are visible in `--debug-config` output (via `current_fonts()` in `kitty/debug_config.py`)
+- The font name and style are visible in the `debug_config` action output (triggered via `kitty_mod+f6`, which calls `current_fonts()` in `kitty/debug_config.py`)
 - With `--debug-font-fallback`, fallback font selection is logged showing which fonts were tried and selected
 - The text in the terminal window is rendered with the correct font — this is direct visual proof
 
@@ -767,7 +768,7 @@ The `Borders` class handles drawing of all border geometry:
 |------|--------|--------|
 | `--debug-rendering` | `kitty/main.py:91, 249` | Enables GPU rendering diagnostic output through `init_glfw_module()` and `set_options()` |
 | `--debug-font-fallback` | `kitty/main.py:228-229` | Enables font fallback diagnostic logging; calls `dump_font_debug()` inside `_run_app()`, after `boss.start()` but before `child_monitor.main_loop()` |
-| `--debug-config` | `kitty/debug_config.py` | Prints version, uname, font info (from `current_fonts()`), OpenGL version (from `opengl_version_string()`), all non-default options |
+| `debug_config` action (`kitty_mod+f6`) | `kitty/boss.py:3060`, `kitty/debug_config.py:231`, `kitty/options/definition.py:4256` | Keyboard shortcut action (not a CLI flag); prints version, uname, font info (from `current_fonts()`), OpenGL version (from `opengl_version_string()`), all non-default options |
 
 **Observable startup evidence confirming the display system is active:**
 
@@ -817,7 +818,7 @@ This investigation traced the complete startup lifecycle of the Kitty terminal e
 
 **Q3 — Terminal-to-Shell Communication:** Kitty allocates a PTY pair, assembles 9+ environment variables (TERM, COLORTERM, TERMINFO, etc.), modifies the environment for shell integration (ZDOTDIR redirect for Zsh, ENV injection for Bash, XDG_DATA_DIRS for Fish), spawns the child via a C-level `spawn()` call, and synchronizes startup via a ready-pipe that blocks the child until `mark_terminal_ready()` closes the pipe. First bytes flow through the VT parser into the screen model, triggering a GPU render cycle.
 
-**Q4 — Display System Evidence:** The display system is confirmed active by: font resolution via FontConfig/CoreText, FreeType glyph rasterization, glyph atlas GPU upload, successful compilation of 10 GLSL shader programs, multi-pass cell rendering (background → decorations → foreground), and the visual appearance of the shell prompt with correct fonts, colors, and cursor position. Debug flags `--debug-rendering`, `--debug-font-fallback`, and `--debug-config` provide additional log-level evidence.
+**Q4 — Display System Evidence:** The display system is confirmed active by: font resolution via FontConfig/CoreText, FreeType glyph rasterization, glyph atlas GPU upload, successful compilation of 10 GLSL shader programs, multi-pass cell rendering (background → decorations → foreground), and the visual appearance of the shell prompt with correct fonts, colors, and cursor position. CLI debug flags `--debug-rendering` and `--debug-font-fallback`, along with the `debug_config` keyboard shortcut action (`kitty_mod+f6`), provide additional log-level evidence.
 
 ### Source File Reference Table
 
