@@ -115,7 +115,8 @@ Kitty supports three display backends — Cocoa (macOS), Wayland, and X11 — ea
   - Returns `False` immediately on macOS (line 209)
   - When called with `opts=None`, returns the cached result from a previous call (line 211)
   - When `opts.linux_display_server == 'auto'`: calls `detect_if_wayland_ok()` (line 213)
-  - When `opts.linux_display_server == 'wayland'`: returns `True` unconditionally (line 215)
+  - When `opts.linux_display_server == 'wayland'`: the `else` branch (line 214) evaluates the expression `opts.linux_display_server == 'wayland'` to `True` (line 215)
+  - Otherwise (e.g., `'x11'`): the same `else` branch evaluates the expression to `False`, so returns `False` (line 215)
   - Caches the result via `setattr(is_wayland, 'ans', ans)` (line 216)
 
 - **`glfw_path()`** (lines 191–193): Constructs the filesystem path to the platform-specific GLFW shared library:
@@ -488,7 +489,7 @@ This section synthesizes the complete pipeline from display detection to the fin
 
 ### 6.1 Pipeline Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │ 1. DPI Detection                                                │
 │    get_window_content_scale() → dpi_from_scale()                │
@@ -681,7 +682,7 @@ When the first window's sprites need to be rendered, the sprite atlas is allocat
 
 ### 9.1 Ordered Step List
 
-```
+```text
  1. Native C launcher → CPython embedding → Python entry
        kitty/launcher/main.c → set_kitty_run_data()
 
@@ -733,19 +734,18 @@ When the first window's sprites need to be rendered, the sprite atlas is allocat
           load_all_shaders()
        l. Platform config values                      (line 1246)
        m. sRGB framebuffer validation                 (lines 1247-1249)
+       n. Sprite map allocation + pre-rendered sprites (line 1273)
+          send_prerendered_sprites_for_window()       (fonts.c:1520-1527)
+          ├── alloc_sprite_map()                      (shaders.c:51-69)
+          │   ├── GL_MAX_TEXTURE_SIZE query
+          │   └── GL_MAX_ARRAY_TEXTURE_LAYERS query
+          └── send_prerendered_sprites()              (fonts.c:1450-1473)
 
- 9. Sprite map allocation + pre-rendered sprites
-       send_prerendered_sprites_for_window()          (fonts.c:1520-1527)
-       ├── alloc_sprite_map()                         (shaders.c:51-69)
-       │   ├── GL_MAX_TEXTURE_SIZE query
-       │   └── GL_MAX_ARRAY_TEXTURE_LAYERS query
-       └── send_prerendered_sprites()                 (fonts.c:1450-1473)
-
-10. Boss creation and startup
+ 9. Boss creation and startup
        Boss(opts, args, ...)   → line 226
        boss.start(window_id)   → line 227
 
-11. Event loop entry
+10. Event loop entry
        boss.child_monitor.main_loop()  → line 234
        (native C event loop in kitty/child-monitor.c)
 ```
@@ -790,7 +790,7 @@ flowchart TD
 
 ### 9.3 Subsystem Dependency Relationships
 
-```
+```text
 Signal Masking ─── must happen BEFORE ───→ GLFW Init (starts threads)
 GLFW Init ──────── must happen BEFORE ───→ Window Creation (needs GL context)
 Font Family Res ── must happen BEFORE ───→ Font Loading (needs callbacks)
@@ -830,7 +830,7 @@ All of above ───── must happen BEFORE ───→ Boss + Event Loop
 
 ### 11.1 Architecture Overview
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         PYTHON LAYER                                 │
 │                                                                      │
@@ -908,7 +908,7 @@ All of above ───── must happen BEFORE ───→ Boss + Event Loop
 
 The following diagram shows which subsystems must initialize before others, with the data values they produce and consume:
 
-```
+```text
                     ┌─────────────┐
                     │  CLI Parsing │
                     │  + Config    │
