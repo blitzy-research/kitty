@@ -62,85 +62,28 @@ This section documents the complete end-to-end path a keyboard event takes from 
 
 ### 2.1 High-Level Call-Path Diagram
 
-```
-OS Display Server (X11/Wayland/macOS)
-  │
-  ▼
-GLFW Vendored Fork (glfw/*.c)
-  │  Platform-specific event translation
-  │  (glfw/x11_window.c, glfw/wl_window.c, glfw/cocoa_window.m)
-  │
-  ▼
-key_callback(GLFWwindow *w, GLFWkeyevent *ev)     [kitty/glfw.c:429-442]
-  │
-  ├─ set_callback_window(w)                         [kitty/glfw.c:196]
-  │    └─ global_state.callback_os_window = os_window_for_glfw_window(w)
-  │
-  ├─ is_window_ready_for_callbacks()                [kitty/glfw.c:202]
-  │    └─ Guards: num_tabs > 0 AND num_windows > 0
-  │
-  ├─ Guard: !ev->fake_event_on_focus_change         [kitty/glfw.c:439]
-  │
-  ▼
-on_key_input(GLFWkeyevent *ev)                      [kitty/keys.c:166]
-  │
-  ├─ active_window()                                [kitty/keys.c:106-111]
-  │    └─ C struct index: callback_os_window→tabs[active_tab]→windows[active_window]
-  │
-  ├─ NULL guard: if (!w) return                     [kitty/keys.c:182]
-  │
-  ├─ IME state machine (switch on ev->ime_state)    [kitty/keys.c:187-216]
-  │    ├─ GLFW_IME_COMMIT_TEXT → schedule_write_to_child() directly
-  │    ├─ GLFW_IME_PREEDIT_CHANGED → screen overlay update
-  │    └─ GLFW_IME_NONE → falls through to shortcut dispatch
-  │
-  ├─ ┌─────────────── C → Python Boundary ───────────────┐
-  │  │ dispatch_key_event macro                           │  [kitty/keys.c:218-225]
-  │  │   ke = convert_glfw_key_event_to_python(ev)        │
-  │  │   ret = PyObject_CallMethod(boss,                  │
-  │  │         "dispatch_possible_special_key", "O", ke)  │
-  │  │   consumed = (ret == Py_True)                      │
-  │  │   w = window_for_window_id(active_window_id)       │  // re-lookup!
-  │  └────────────────────────────────────────────────────┘
-  │
-  │  Python-side:
-  │  ├─ Boss.dispatch_possible_special_key(ev)       [kitty/boss.py:1408]
-  │  │    └─ self.mappings.dispatch_possible_special_key(ev)
-  │  │
-  │  └─ Mappings.dispatch_possible_special_key(ev)   [kitty/keys.py:154]
-  │       ├─ get_shortcut(mode.keymap, ev)            [kitty/keys.py:40-47]
-  │       │    ├─ Try: SingleKey(mods, False, ev.key)
-  │       │    ├─ Try: SingleKey(mods & ~SHIFT, False, ev.shifted_key)
-  │       │    └─ Try: SingleKey(mods, True, ev.native_key)
-  │       │
-  │       ├─ If matched → self.combine(action)  → returns True (consumed)
-  │       └─ If no match → returns False (not consumed)
-  │
-  ├─ If consumed: return (key was shortcut)         [kitty/keys.c:230-233]
-  │
-  ├─ encode_glfw_key_event(ev, ...)                  [kitty/key_encoding.c:414]
-  │    └─ Encodes keystroke into byte sequence per active keyboard protocol
-  │       (legacy / CSI u / Kitty keyboard protocol)
-  │
-  └─ schedule_write_to_child(w->id, 1, buf, size)   [kitty/child-monitor.c:372]
-       │
-       ├─ children_mutex(lock)
-       ├─ Find Child by window ID (linear scan)
-       ├─ screen_mutex(lock, write)
-       ├─ memcpy → screen->write_buf                 [kitty/child-monitor.c:354]
-       ├─ wakeup_io_loop()                           [kitty/child-monitor.c:363]
-       ├─ screen_mutex(unlock, write)
-       └─ children_mutex(unlock)
-            │
-            ▼
-       I/O Thread: io_loop()                         [kitty/child-monitor.c:1480]
-            │
-            ├─ poll() with POLLOUT set for child fd  [kitty/child-monitor.c:1503]
-            └─ write_to_child(fd, screen)             [kitty/child-monitor.c:1443]
-                 └─ write(fd, screen->write_buf, ...)
-                      │
-                      ▼
-                 Child Process PTY (shell / program)
+```mermaid
+graph TD
+    A["OS Display Server<br/>(X11 / Wayland / macOS)"] -->|"platform event"| B["GLFW Vendored Fork<br/>glfw/*.c<br/>(x11_window.c, wl_window.c, cocoa_window.m)"]
+    B -->|"key_callback()"| C["kitty/glfw.c:429-442<br/>set_callback_window(w)<br/>stores OSWindow* in global_state.callback_os_window"]
+    C -->|"guards pass:<br/>is_window_ready_for_callbacks()<br/>!ev->fake_event_on_focus_change"| D["kitty/keys.c:166<br/>on_key_input(ev)"]
+    D -->|"active_window()<br/>C struct index O(1)"| E{"NULL guard<br/>keys.c:182"}
+    E -->|"w == NULL"| F["Input silently dropped<br/>debug log only"]
+    E -->|"w != NULL"| G["IME State Machine<br/>keys.c:187-216"]
+    G -->|"IME_COMMIT_TEXT"| H["schedule_write_to_child()<br/>directly (bypass shortcuts)"]
+    G -->|"IME_NONE<br/>(normal key)"| I["C → Python Boundary<br/>keys.c:218-225<br/>PyObject_CallMethod(boss,<br/>'dispatch_possible_special_key')"]
+    I -->|"Python side"| J["Boss.dispatch_possible_special_key()<br/>boss.py:1408"]
+    J --> K["Mappings.dispatch_possible_special_key()<br/>keys.py:154"]
+    K --> L["get_shortcut() 3-way lookup<br/>keys.py:40-47<br/>1. SingleKey(mods, False, ev.key)<br/>2. SingleKey(mods & ~SHIFT, False, ev.shifted_key)<br/>3. SingleKey(mods, True, ev.native_key)"]
+    L -->|"consumed=True"| M["Action Executed<br/>(tab switch, copy, etc.)"]
+    L -->|"consumed=False<br/>(return to C)"| N["kitty/key_encoding.c:414<br/>encode_glfw_key_event()<br/>legacy / CSI u / Kitty protocol"]
+    N -->|"encoded bytes"| O["kitty/child-monitor.c:372<br/>schedule_write_to_child()<br/>children_mutex + screen_mutex<br/>memcpy → screen->write_buf"]
+    O -->|"wakeup_io_loop()"| P["I/O Thread: io_loop()<br/>child-monitor.c:1480<br/>poll() detects POLLOUT"]
+    P -->|"write_to_child()<br/>child-monitor.c:1443"| Q["Child Process PTY<br/>(shell / program)"]
+
+    R["Child Process Output"] -->|"PTY read"| S["I/O Thread<br/>read_bytes() child-monitor.c:1337"]
+    S -->|"VT parser buffer"| T["Main Thread<br/>parse_input()"]
+    T -->|"screen state update"| U["GPU Renderer<br/>render()"]
 ```
 
 ### 2.2 Step-by-Step Detailed Walkthrough
@@ -153,7 +96,7 @@ on_key_input(GLFWkeyevent *ev)                      [kitty/keys.c:166]
 - **Wayland**: `glfw/wl_window.c` — The Wayland input seat handler converts `wl_keyboard` events via XKB keymap resolution (`glfw/xkb_glfw.c`).
 - **macOS**: `glfw/cocoa_window.m` — Cocoa `NSEvent` objects are translated into `GLFWkeyevent`.
 
-The `GLFWkeyevent` struct carries these fields **[Source Code Analysis, kitty/keys.c:19-24]**:
+The `GLFWkeyevent` struct (defined in `glfw/glfw3.h:1273-1301`) carries these fields **[Source Code Analysis, glfw/glfw3.h:1273-1301]** (note: the Python wrapper `PyKeyEvent` referencing these fields is defined in `kitty/keys.c:19-24`):
 - `key` (uint32_t) — Translated key code
 - `shifted_key` (uint32_t) — Key code with shift applied
 - `alternate_key` (uint32_t) — Alternative key representation
@@ -372,18 +315,21 @@ The function (defined as a macro at lines 323-369):
 
 **[Source Code Analysis, kitty/state.h]** Kitty organizes its window hierarchy as a four-level tree:
 
-```
-GlobalState (singleton)
-├── OSWindow[0]  (is_focused=true, last_focused_counter=42)
-│   ├── Tab[0]  (active)
-│   │   ├── Window[0]
-│   │   └── Window[1] ← active_window → receives all keyboard input
-│   └── Tab[1]
-│       ├── Window[2]
-│       └── Window[3]
-└── OSWindow[1]  (is_focused=false, last_focused_counter=37)
-    └── Tab[0]
-        └── Window[4]
+```mermaid
+graph TD
+    GS["GlobalState<br/>(singleton)"] --> OSW0["OSWindow[0]<br/>is_focused=true<br/>last_focused_counter=42"]
+    GS --> OSW1["OSWindow[1]<br/>is_focused=false<br/>last_focused_counter=37"]
+    OSW0 -->|"active_tab=0"| T0["Tab[0] (active)"]
+    OSW0 --> T1["Tab[1]"]
+    T0 --> W0["Window[0]"]
+    T0 -->|"active_window=1"| W1["Window[1] ← receives input"]
+    T1 --> W2["Window[2]"]
+    T1 --> W3["Window[3]"]
+    OSW1 -->|"active_tab=0"| T2["Tab[0]"]
+    T2 -->|"active_window=0"| W4["Window[4]"]
+
+    style W1 fill:#4CAF50,color:#fff
+    style OSW0 fill:#2196F3,color:#fff
 ```
 
 #### Data Structures (from `kitty/state.h`)
@@ -1324,26 +1270,41 @@ def mark_window_for_close(self, q=None):
         self.child_monitor.mark_for_close(window.id)
 ```
 
-This calls into C to mark the child for removal.
+This calls the Python-callable wrapper `mark_for_close()` (child-monitor.c:568), which in turn calls the C function `mark_child_for_close()`.
 
 #### Step 2: Mark in C
 
-`mark_child_for_removal()` in `kitty/child-monitor.c` (lines 1386-1395):
+`mark_child_for_close()` in `kitty/child-monitor.c` (lines 541-563):
 ```c
-static void
-mark_child_for_removal(ChildMonitor *self, pid_t pid) {
+static bool
+mark_child_for_close(ChildMonitor *self, id_type window_id) {
+    bool found = false;
     children_mutex(lock);
     for (size_t i = 0; i < self->count; i++) {
-        if (children[i].pid == pid) {
-            children[i].needs_removal = true;     // line 1390
+        if (children[i].id == window_id) {         // line 545 — lookup by window ID
+            children[i].needs_removal = true;       // line 546
+            found = true;
             break;
         }
     }
+    if (!found) {                                   // line 551 — also check add_queue
+        for (size_t i = 0; i < add_queue_count; i++) {
+            if (add_queue[i].id == window_id) {
+                add_queue[i].needs_removal = true;
+                found = true;
+                break;
+            }
+        }
+    }
     children_mutex(unlock);
+    wakeup_io_loop(self, false);                    // line 562 — wake I/O thread
+    return found;
 }
 ```
 
-The `needs_removal` flag is set under `children_mutex`.
+The `needs_removal` flag is set under `children_mutex`. Note that this function takes `id_type window_id` (not `pid_t pid`) and searches by `children[i].id == window_id`, matching the Python call `self.child_monitor.mark_for_close(window.id)`. It also checks the `add_queue` for children that have been queued for addition but not yet added to the main array, and calls `wakeup_io_loop()` to ensure the I/O thread processes the removal promptly.
+
+**Important distinction**: A separate function `mark_child_for_removal()` (lines 1386-1395) also exists in `child-monitor.c`, but it takes `pid_t pid` and is called from `reap_children()` when `SIGCHLD` fires — it is part of the signal-driven child death path, not the user-initiated window close path.
 
 #### Step 3: I/O Thread Removes Child
 
@@ -1352,8 +1313,10 @@ The `needs_removal` flag is set under `children_mutex`.
 static void
 remove_children(ChildMonitor *self) {
     if (self->count > 0) {
+        size_t count = 0;                          // line 1315 — tracks removals
         for (ssize_t i = self->count - 1; i >= 0; i--) {
             if (children[i].needs_removal) {
+                count++;                           // line 1318 — increment removal count
                 cleanup_child(i);                  // Close fd, send SIGHUP
                 remove_queue[remove_queue_count] = children[i];
                 remove_queue_count++;
@@ -1370,7 +1333,7 @@ remove_children(ChildMonitor *self) {
                 }
             }
         }
-        self->count -= count;
+        self->count -= count;                      // line 1331 — adjust total count
     }
 }
 ```
@@ -1477,41 +1440,38 @@ The `last_focused_counter` mechanism (lines 531) ensures that focus can be corre
 
 ### 10.2 Architecture Summary
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         MAIN THREAD                                 │
-│                                                                     │
-│  GLFW Event Loop                                                    │
-│    ├── key_callback() ──► on_key_input()                           │
-│    │     ├── active_window()  [C struct index, O(1)]               │
-│    │     ├── PyObject_CallMethod("dispatch_possible_special_key")   │
-│    │     │     └── Python: get_shortcut() → 3-way lookup           │
-│    │     ├── encode_glfw_key_event() [C key encoding]              │
-│    │     └── schedule_write_to_child() ──► write_buf + wakeup      │
-│    │                                                                │
-│    ├── window_focus_callback() ──► call_boss(on_focus)             │
-│    │     └── Python: Boss.on_focus() → Window.focus_changed()      │
-│    │                                                                │
-│    ├── cursor_pos_callback() ──► mouse_event()                     │
-│    │     └── focus_follows_mouse → call_boss(switch_focus_to)      │
-│    │                                                                │
-│    ├── parse_input() ──► VT parser for ALL children                │
-│    └── render() ──► GPU draw for ALL visible windows               │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                     I/O THREAD (KittyChildMon)                      │
-│                                                                     │
-│  io_loop():                                                         │
-│    ├── remove_children() / add_children()  [under children_mutex]  │
-│    ├── poll(ALL child fds + wakeup + signal)                       │
-│    ├── read_bytes() for POLLIN children    [focus-independent]     │
-│    ├── write_to_child() for POLLOUT children                       │
-│    └── wakeup_main_loop() after input_delay expires                │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                     TALK THREAD                                     │
-│    Unix domain socket for remote control commands                   │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph MAIN["MAIN THREAD"]
+        direction TB
+        GLFW["GLFW Event Loop"]
+        KC["key_callback()"] -->|"on_key_input()"| AW["active_window()<br/>C struct index, O(1)"]
+        AW --> PY["PyObject_CallMethod<br/>dispatch_possible_special_key<br/>(C → Python boundary)"]
+        PY -->|"Python: get_shortcut()<br/>3-way lookup"| ENC["encode_glfw_key_event()<br/>C key encoding"]
+        ENC --> SWC["schedule_write_to_child()<br/>write_buf + wakeup"]
+        WFC["window_focus_callback()"] -->|"call_boss(on_focus)"| BF["Python: Boss.on_focus()<br/>→ Window.focus_changed()"]
+        CPC["cursor_pos_callback()"] -->|"mouse_event()"| FFM["focus_follows_mouse<br/>→ call_boss(switch_focus_to)"]
+        PI["parse_input()"] -->|"VT parser"| ALL_CH["ALL children"]
+        REN["render()"] -->|"GPU draw"| ALL_WIN["ALL visible windows"]
+    end
+
+    subgraph IO["I/O THREAD (KittyChildMon)"]
+        direction TB
+        IOLOOP["io_loop()"]
+        RC["remove_children() / add_children()<br/>under children_mutex"]
+        POLL["poll(ALL child fds + wakeup + signal)"]
+        RB["read_bytes() for POLLIN children<br/>(focus-independent)"]
+        WTC["write_to_child() for POLLOUT children"]
+        WML["wakeup_main_loop()<br/>after input_delay expires"]
+        IOLOOP --> RC --> POLL --> RB --> WTC --> WML
+    end
+
+    subgraph TALK["TALK THREAD"]
+        UDS["Unix domain socket<br/>for remote control commands"]
+    end
+
+    SWC -->|"screen->write_buf<br/>(mutex protected)"| IOLOOP
+    WML -->|"wakeup"| PI
 ```
 
 ### 10.3 Key Design Properties
