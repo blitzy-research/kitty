@@ -172,6 +172,8 @@ The central artifact connecting Python and C is `kitty/fast_data_types.so` — a
 #include "monotonic.h"
 ```
 
+> *Note: The above excerpt shows only the project-internal includes. System headers (`sys/socket.h`, `sys/types.h`, `unistd.h`) and internal utility headers (`cleanup.h`, `safe-wrappers.h`) are omitted for focus.*
+
 These are just the top-level includes. The build system (`setup.py`) compiles **49 `.c` files** from the `kitty/` directory into this single `.so`:
 
 | C Source File | Purpose |
@@ -260,6 +262,7 @@ $ ldd kitty/fast_data_types.so
   libcrypto.so.3         => /lib/x86_64-linux-gnu/libcrypto.so.3
   libz.so.1              => /lib/x86_64-linux-gnu/libz.so.1
   libc.so.6              => /lib/x86_64-linux-gnu/libc.so.6
+  libexpat.so.1          => /lib/x86_64-linux-gnu/libexpat.so.1
   libfreetype.so.6       => /lib/x86_64-linux-gnu/libfreetype.so.6
   libglib-2.0.so.0       => /lib/x86_64-linux-gnu/libglib-2.0.so.0
   libgraphite2.so.3      => /lib/x86_64-linux-gnu/libgraphite2.so.3
@@ -308,7 +311,7 @@ $ nm -D kitty/fast_data_types.so | grep 'hb_'
   U hb_buffer_get_glyph_positions
   U hb_shape
   U hb_ft_font_create
-  # ... (20 HarfBuzz symbols total)
+  # ... (22 HarfBuzz symbols total)
 
 $ nm -D kitty/fast_data_types.so | grep 'FT_'
   U FT_Init_FreeType
@@ -322,7 +325,7 @@ $ nm -D kitty/fast_data_types.so | grep 'png_'
   U png_create_read_struct
   U png_read_image
   U png_get_image_width
-  # ... (15 libpng symbols)
+  # ... (25 libpng symbols total)
 ```
 
 #### 2.2.4 GLFW Backend Dependencies
@@ -361,6 +364,21 @@ static void check_for_gl_error(...) {
 ```
 
 This means that in a running kitty process with a display server, `libGL.so`, `libEGL.so`, or Mesa libraries (`libgallium.so`, `swrast_dri.so`) would appear in `/proc/PID/maps`, loaded on-demand by GLAD.
+
+#### 2.2.6 Notable Absence: Fontconfig
+
+Similarly, `libfontconfig.so` does not appear as a direct NEEDED dependency despite Kitty using Fontconfig for font discovery on Linux. This is because `kitty/fontconfig.c` also uses runtime `dlopen` — analogous to the GLAD approach for OpenGL:
+
+**[SOURCE-INFORMED]** From `kitty/fontconfig.c`:
+
+```c
+#include <dlfcn.h>                                    // line 12
+static void* libfontconfig_handle = NULL;             // line 20
+// ...
+libfontconfig_handle = dlopen(libnames[i], RTLD_LAZY); // line 91
+```
+
+Fontconfig is loaded dynamically at runtime via `dlopen()`, iterating over a list of possible library names until one is found. This means `libfontconfig.so` would appear in `/proc/PID/maps` at runtime (after font subsystem initialization) but not in static `readelf -d` or `ldd` output. The `dlclose()` call at line 134 indicates the library handle is also properly released during cleanup.
 
 ### 2.3 Kitten Binary Dependencies
 
@@ -411,7 +429,7 @@ typedef struct {
 } ChildMonitor;
 ```
 
-The three threads are:
+The 2–3 threads are (the Talk thread is only created when remote control is enabled via `--listen-on` or single-instance mode):
 
 #### Thread 1: Main Thread (Rendering + Event Loop)
 
@@ -447,7 +465,7 @@ The `render_os_window()` function (lines 832–868) calls:
 - `make_os_window_context_current(w)` — Activate the OpenGL context
 - `prepare_to_render_os_window(w, ...)` — Update screen data for rendering
 - `render_prepared_os_window(w, ...)` — Execute the OpenGL rendering pipeline
-- `swap_window_buffers()` — Present the frame
+  - which internally calls `swap_window_buffers()` (line 810) — Present the frame
 
 **All of these are C functions. The Main thread spends its rendering time in C, not Python.**
 
@@ -757,24 +775,29 @@ kitty(PID_A)───zsh(PID_B)───kitten(PID_B')
 
 ### 5.4 Contrast: Python Kittens Run In-Process
 
-**[SOURCE-INFORMED]** From `kittens/runner.py` lines 46–65:
+**[SOURCE-INFORMED]** From `kittens/runner.py` lines 46–65 (simplified for clarity — the actual source includes a `with preserve_sys_path():` context manager, `sys.path.insert(0, ...)` path manipulation, and explicit `lambda *a, **kw: None` defaults):
 
 ```python
 def import_kitten_main_module(config_dir: str, kitten: str) -> Dict[str, Any]:
     if kitten.endswith('.py'):
-        # Custom kitten: exec() the Python file
-        path = path_to_custom_kitten(config_dir, kitten)
-        with open(path) as f:
-            src = f.read()
-        code = compile(src, path, 'exec')
-        g = {'__name__': 'kitten'}
-        exec(code, g)
-        return {'start': g['main'], 'end': g.get('handle_result', ...)}
+        with preserve_sys_path():
+            path = path_to_custom_kitten(config_dir, kitten)
+            if os.path.dirname(path):
+                sys.path.insert(0, os.path.dirname(path))
+            with open(path) as f:
+                src = f.read()
+            code = compile(src, path, 'exec')
+            g = {'__name__': 'kitten'}
+            exec(code, g)
+            hr = g.get('handle_result', lambda *a, **kw: None)
+        return {'start': g['main'], 'end': hr}
 
-    # Built-in kitten: importlib
     kitten = resolved_kitten(kitten)
     m = importlib.import_module(f'kittens.{kitten}.main')
-    return {'start': getattr(m, 'main'), 'end': getattr(m, 'handle_result', ...)}
+    return {
+        'start': getattr(m, 'main'),
+        'end': getattr(m, 'handle_result', lambda *a, **k: None),
+    }
 ```
 
 Python-based kittens (those with Python `main.py` in their package) are loaded via `importlib.import_module()` and run **within the kitty process**. They share the same Python interpreter, the same `fast_data_types` C extension, and the same process memory.
@@ -807,6 +830,7 @@ import (
 ```
 
 Supporting files:
+- `cli_generated.go` — Auto-generated CLI argument definitions
 - `native.go` — Native Go image decoding (PNG, JPEG, GIF, WebP, TIFF, BMP)
 - `detect.go` — Terminal graphics capability probing via escape sequences
 - `transmit.go` — Graphics protocol data transmission (shared memory, files, or direct)
@@ -868,13 +892,31 @@ reading kitty/launcher/kitten: no symbol section
 
 However, Go runtime evidence is still available via `strings` and the `.go.buildinfo` section:
 
+**[OBSERVED]** A raw `strings | grep 'runtime\.'` produces garbled entries first (due to partial string matches in the stripped binary):
+
 ```bash
 $ strings kitty/launcher/kitten | grep 'runtime\.' | head -10
 runtime.
+runtime.H9
+runtime.H9
+runtime.H9
+runtime.H9
+runtime.H
+runtime.H
+runtime.H9
+runtime.H92
+runtime.1
+```
+
+Filtering for clean Go runtime symbols with a tighter pattern reveals the actual Go runtime function names:
+
+```bash
+$ strings kitty/launcher/kitten | grep -E '^runtime\.[a-z]' | head -10
 runtime.cmpstring
 runtime.memequal
 runtime.memequal_varlen
 runtime.init
+runtime.init.func2
 runtime.sigdelset
 runtime.memhash8
 runtime.memhash16
@@ -882,35 +924,47 @@ runtime.memhash128
 runtime.memhash_varlen
 ```
 
-**[OBSERVED]** The `.go.buildinfo` section reveals the full dependency graph:
+These are unmistakably Go runtime internal functions — `runtime.cmpstring`, `runtime.memequal`, `runtime.memhash*` — confirming a Go runtime is embedded in the binary despite symbol stripping.
+
+**[OBSERVED]** The raw `readelf -p .go.buildinfo` output contains `^I` tab characters, `\n` literal escapes, and hash checksums that make it difficult to read directly. Using `go version -m` provides cleaner, structured output:
 
 ```bash
-$ readelf -p .go.buildinfo kitty/launcher/kitten
-  path  kitty/tools/cmd
-  mod   kitty  (devel)
-  dep   github.com/ALTree/bigfloat          v0.2.0
-  dep   github.com/alecthomas/chroma/v2     v2.14.0
-  dep   github.com/bmatcuk/doublestar/v4    v4.6.1
-  dep   github.com/dlclark/regexp2          v1.11.0
-  dep   github.com/edwvee/exiffix           v0.0.0-20240229...
-  dep   github.com/google/uuid              v1.6.0
-  dep   github.com/kovidgoyal/imaging       v1.6.3
-  dep   github.com/seancfoley/ipaddress-go  v1.6.0
-  dep   github.com/shirou/gopsutil/v3       v3.24.5
-  dep   github.com/zeebo/xxh3              v1.0.2
-  dep   golang.org/x/exp                    v0.0.0-20230801...
-  dep   golang.org/x/image                  v0.17.0
-  dep   golang.org/x/sys                    v0.21.0
-  dep   howett.net/plist                     v1.0.1
-  # ... (plus indirect dependencies)
-  build  -ldflags="-X kitty.VCSRevision=815df1e210e0..."
+$ go version -m kitty/launcher/kitten
+kitty/launcher/kitten: go1.22.10
+	path	kitty/tools/cmd
+	mod	kitty	(devel)
+	dep	github.com/ALTree/bigfloat	v0.2.0
+	dep	github.com/alecthomas/chroma/v2	v2.14.0
+	dep	github.com/bmatcuk/doublestar/v4	v4.6.1
+	dep	github.com/disintegration/imaging	v1.6.2
+	dep	github.com/dlclark/regexp2	v1.11.0
+	dep	github.com/edwvee/exiffix	v0.0.0-20240229113213-0dbb146775be
+	dep	github.com/google/uuid	v1.6.0
+	dep	github.com/klauspost/cpuid/v2	v2.2.5
+	dep	github.com/kovidgoyal/imaging	v1.6.3
+	dep	github.com/rwcarlsen/goexif	v0.0.0-20190401172101-9e8deecbddbd
+	dep	github.com/seancfoley/bintree	v1.3.1
+	dep	github.com/seancfoley/ipaddress-go	v1.6.0
+	dep	github.com/shirou/gopsutil/v3	v3.24.5
+	dep	github.com/tklauser/go-sysconf	v0.3.12
+	dep	github.com/tklauser/numcpus	v0.6.1
+	dep	github.com/zeebo/xxh3	v1.0.2
+	dep	golang.org/x/exp	v0.0.0-20230801115018-d63ba01acd4b
+	dep	golang.org/x/image	v0.17.0
+	dep	golang.org/x/sys	v0.21.0
+	dep	howett.net/plist	v1.0.1
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-ldflags="-X kitty.VCSRevision=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 -s -w"
+	build	CGO_ENABLED=1
 ```
 
 This confirms:
 1. The binary was built from `kitty/tools/cmd` (the Go entry point)
 2. Go version `go1.22.10` was used
-3. All 15 direct dependencies from `go.mod` are embedded
-4. The ldflags include the VCS revision for version tracking
+3. 14 of 15 direct dependencies from `go.mod` are embedded (`github.com/google/go-cmp` is test-only and excluded from the binary), plus 6 indirect dependencies (disintegration/imaging, klauspost/cpuid/v2, rwcarlsen/goexif, seancfoley/bintree, tklauser/go-sysconf, tklauser/numcpus)
+4. The ldflags include `-s -w` (strip symbols/DWARF) and the VCS revision for version tracking
+5. `CGO_ENABLED=1` confirms external linking mode (explaining the `libc.so.6` dependency)
 
 **[OBSERVED]** Kitty-specific Go packages embedded in the binary:
 
@@ -925,18 +979,20 @@ kitty/kittens/ask
 kitty/tools/rsync
 kitty/tools/config
 kitty/tools/themes
-kitty/tools/cmd/at       # ← Remote control client
+kitty/tools/cmd/at
 kitty/kittens/diff
-kitty/kittens/icat       # ← Image display
+kitty/kittens/icat
 kitty/kittens/hints
-kitty/tools/tui/graphics  # ← Graphics protocol
-kitty/kittens/transfer
-kitty/tools/utils/images  # ← Image processing
-kitty/tools/tui/readline
-kitty/tools/crypto        # ← Encryption
+kitty/tools/tui/sgr
+kitty/tools/tui/loop
+kitty/tools/wcswidth
+kitty/kittens/themes
+kitty/tools/utils/shm
+kitty/tools/cli/markup
+kitty/kittens/show_key
 ```
 
-This reveals the full scope of Go functionality: CLI tools, kittens (icat, diff, ssh, hints, themes, transfer, clipboard, show_key, ask), TUI framework, crypto, and remote control client.
+This reveals the full scope of Go functionality: CLI tools, kittens (icat, diff, ssh, hints, themes, transfer, show_key, ask), TUI framework (sgr, loop, graphics), shared utilities (wcswidth, shm), crypto, and remote control client (`cmd/at`).
 
 ### 6.4 Build System Evidence
 
@@ -1024,16 +1080,26 @@ GLFW initialization failed
 
 ```bash
 $ strace -f -e trace=write,read -c kitty/launcher/kitten --version 2>&1
+strace: Process 44785 attached
+strace: Process 44786 attached
+strace: Process 44787 attached
+strace: Process 44788 attached
+strace: Process 44789 attached
+strace: Process 44790 attached
+strace: Process 44791 attached
+strace: Process 44792 attached
+strace: Process 44793 attached
+strace: Process 44794 attached
 kitten 0.35.2 created by Kovid Goyal
 % time     seconds  usecs/call     calls    errors syscall
 ------ ----------- ----------- --------- --------- ----------------
-  0.00    0.000000           0         3         0 read
-100.00    0.000111           7        15         0 write
+100.00    0.000223          22        10           read
+  0.00    0.000000           0         1           write
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.000111                    18         0 total
+100.00    0.000223          20        11           total
 ```
 
-This is minimal because `--version` exits immediately. In a full icat session, the write calls would dominate (graphics protocol escape sequences being sent to the terminal).
+**Analysis**: The 10 `strace: Process ... attached` messages are notable — they reveal that the Go runtime immediately spawns multiple OS threads (goroutine scheduler threads) even for a trivial `--version` invocation. This is characteristic of the Go runtime, which creates threads for its garbage collector, timer management, and goroutine scheduling. The `read` calls dominate (10 reads vs 1 write) because the Go runtime performs thread setup reads before the single `write` that outputs the version string. In a full icat session, the write calls would dominate (graphics protocol escape sequences being sent to the terminal).
 
 #### Method 3: Symbol Table of `fast_data_types.so`
 
@@ -1057,10 +1123,10 @@ The key exported symbol is `PyInit_fast_data_types` at address `0x29860` — thi
 
 ```bash
 $ nm -D kitty/fast_data_types.so | grep 'U ' | grep -E 'hb_|FT_|png_|EVP_|cms' | wc -l
-68
+104
 ```
 
-There are **68 undefined symbols** (imported functions) from HarfBuzz, FreeType, libpng, OpenSSL, and lcms2 alone. These are the rendering-adjacent library functions that the C layer calls directly.
+There are **104 undefined symbols** (imported functions) from HarfBuzz (22), FreeType (25), libpng (25), OpenSSL (26), and lcms2 (6). These are the rendering-adjacent library functions that the C layer calls directly.
 
 ### 7.2 SIMD Evidence
 
@@ -1167,7 +1233,7 @@ Based on the runtime artifacts collected — binary inspection, library linkage,
 
 **Evidence Chain:**
 - `ldd kitty/fast_data_types.so` shows direct linkage to libharfbuzz, libfreetype, libpng, liblcms2, libcrypto
-- `nm -D` reveals 68+ imported symbols from these rendering libraries
+- `nm -D` reveals 104 imported symbols from these rendering libraries (hb_=22, FT_=25, png_=25, EVP_=26, cms=6)
 - Thread creation in C (`pthread_create` at lines 286, 291 of `child-monitor.c`)
 - Rendering loop entirely in C (`render()` → `render_os_window()` → OpenGL calls)
 - The `.so` file is 1.5 MB — orders of magnitude larger than the 36 KB launcher
@@ -1190,7 +1256,7 @@ Based on the runtime artifacts collected — binary inspection, library linkage,
 - `file kitty/launcher/kitten` shows `Go BuildID` — definitively a Go binary
 - `ldd` shows only `libc.so.6` — no Python, no rendering libraries
 - `strings` reveal `runtime.main`, `kitty/tools/*`, `kitty/kittens/*` Go packages
-- `.go.buildinfo` shows 15 Go dependencies, built from `kitty/tools/cmd`
+- `go version -m` shows 14 direct + 6 indirect Go dependencies embedded, built from `kitty/tools/cmd`
 - The binary is 15 MB — self-contained with the entire Go runtime
 - Kitten process runs as separate PID (via `os.execl`)
 
@@ -1211,7 +1277,7 @@ Based on the runtime artifacts collected — binary inspection, library linkage,
 │  ┌──────────▼───────────────────────────┐   │
 │  │         C Layer                       │   │
 │  │  fast_data_types.so (49 .c files)     │   │
-│  │  ├─ child-monitor.c (3 threads)       │   │
+│  │  ├─ child-monitor.c (2–3 threads)     │   │
 │  │  ├─ vt-parser.c (SIMD-accelerated)    │   │
 │  │  ├─ screen.c, line.c, line-buf.c      │   │
 │  │  ├─ shaders.c + 13 .glsl files        │   │
@@ -1342,7 +1408,7 @@ $ ls -la kitty/launcher/kitten
 
 The Go `kitten` binary requires only `libc.so.6` at runtime. It can be:
 - **Copied to any compatible Linux system** and executed immediately, with no installation of Python, FreeType, HarfBuzz, or OpenGL
-- **Cross-compiled** for different platforms — `setup.py` line 1202 shows: `build_static_kittens(args, launcher_dir, args.dir_for_static_binaries, for_platform=(os_, arch))`
+- **Cross-compiled** for different platforms — `setup.py` line 1203 shows: `build_static_kittens(args, launcher_dir, args.dir_for_static_binaries, for_platform=(os_, arch))`
 - **Distributed independently** — a user can download just the `kitten` binary to get CLI tools (icat, diff, ssh kitten, etc.) without installing the full kitty application
 
 The Go runtime embedded in the binary provides:
@@ -1496,6 +1562,7 @@ $ ldd kitty/fast_data_types.so
   libcrypto.so.3 => /lib/x86_64-linux-gnu/libcrypto.so.3
   libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1
   libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
+  libexpat.so.1 => /lib/x86_64-linux-gnu/libexpat.so.1
   libfreetype.so.6 => /lib/x86_64-linux-gnu/libfreetype.so.6
   libglib-2.0.so.0 => /lib/x86_64-linux-gnu/libglib-2.0.so.0
   libgraphite2.so.3 => /lib/x86_64-linux-gnu/libgraphite2.so.3
@@ -1546,7 +1613,7 @@ $ nm -D kitty/fast_data_types.so | grep 'hb_'
   U hb_buffer_get_glyph_positions
   U hb_shape
   U hb_ft_font_create
-  # ... (20 total)
+  # ... (22 total)
 
 # FreeType symbols (glyph rasterization)
 $ nm -D kitty/fast_data_types.so | grep 'FT_'
@@ -1565,7 +1632,7 @@ $ nm -D kitty/fast_data_types.so | grep 'png_'
   U png_read_image
   U png_get_image_width
   U png_get_image_height
-  # ... (15 total)
+  # ... (25 total)
 
 # OpenSSL symbols (encryption)
 $ nm -D kitty/fast_data_types.so | grep 'EVP_'
@@ -1579,8 +1646,13 @@ $ nm -D kitty/fast_data_types.so | grep 'EVP_'
 
 # lcms2 symbols (color management)
 $ nm -D kitty/fast_data_types.so | grep 'cms'
+  U cmsCloseProfile
   U cmsCreateTransform
   U cmsCreate_sRGBProfile
+  U cmsDeleteTransform
+  U cmsDoTransform
+  U cmsOpenProfileFromMem
+  # (6 total)
 
 # Kitten binary — stripped, no standard symbols
 $ nm kitty/launcher/kitten
@@ -1590,11 +1662,26 @@ $ go tool nm kitty/launcher/kitten
 reading kitty/launcher/kitten: no symbol section
 
 # Go runtime strings (proves Go binary)
+# Raw grep produces garbled entries first due to partial matches in stripped binary:
 $ strings kitty/launcher/kitten | grep 'runtime\.' | head -10
 runtime.
+runtime.H9
+runtime.H9
+runtime.H9
+runtime.H9
+runtime.H
+runtime.H
+runtime.H9
+runtime.H92
+runtime.1
+
+# Filtered for clean Go runtime function names:
+$ strings kitty/launcher/kitten | grep -E '^runtime\.[a-z]' | head -10
 runtime.cmpstring
 runtime.memequal
+runtime.memequal_varlen
 runtime.init
+runtime.init.func2
 runtime.sigdelset
 runtime.memhash8
 runtime.memhash16
@@ -1616,23 +1703,45 @@ kitty/tools/cmd/at
 kitty/kittens/diff
 kitty/kittens/icat
 kitty/kittens/hints
-kitty/tools/tui/graphics
-kitty/kittens/transfer
-kitty/tools/utils/images
-kitty/tools/tui/readline
-kitty/tools/crypto
+kitty/tools/tui/sgr
+kitty/tools/tui/loop
+kitty/tools/wcswidth
+kitty/kittens/themes
+kitty/tools/utils/shm
+kitty/tools/cli/markup
+kitty/kittens/show_key
 
-# Go buildinfo section
-$ readelf -p .go.buildinfo kitty/launcher/kitten
-  path  kitty/tools/cmd
-  mod   kitty  (devel)
-  dep   github.com/ALTree/bigfloat          v0.2.0
-  dep   github.com/alecthomas/chroma/v2     v2.14.0
-  dep   github.com/kovidgoyal/imaging       v1.6.3
-  dep   golang.org/x/image                  v0.17.0
-  dep   golang.org/x/sys                    v0.21.0
-  # ... (15 direct + indirect dependencies)
-  build  -ldflags="-X kitty.VCSRevision=815df1e210e0..."
+# Go build info (using go version -m for readable output; raw readelf -p .go.buildinfo
+# contains ^I tab chars and hash checksums that are difficult to read)
+$ go version -m kitty/launcher/kitten
+kitty/launcher/kitten: go1.22.10
+	path	kitty/tools/cmd
+	mod	kitty	(devel)
+	dep	github.com/ALTree/bigfloat	v0.2.0
+	dep	github.com/alecthomas/chroma/v2	v2.14.0
+	dep	github.com/bmatcuk/doublestar/v4	v4.6.1
+	dep	github.com/disintegration/imaging	v1.6.2
+	dep	github.com/dlclark/regexp2	v1.11.0
+	dep	github.com/edwvee/exiffix	v0.0.0-20240229113213-0dbb146775be
+	dep	github.com/google/uuid	v1.6.0
+	dep	github.com/klauspost/cpuid/v2	v2.2.5
+	dep	github.com/kovidgoyal/imaging	v1.6.3
+	dep	github.com/rwcarlsen/goexif	v0.0.0-20190401172101-9e8deecbddbd
+	dep	github.com/seancfoley/bintree	v1.3.1
+	dep	github.com/seancfoley/ipaddress-go	v1.6.0
+	dep	github.com/shirou/gopsutil/v3	v3.24.5
+	dep	github.com/tklauser/go-sysconf	v0.3.12
+	dep	github.com/tklauser/numcpus	v0.6.1
+	dep	github.com/zeebo/xxh3	v1.0.2
+	dep	golang.org/x/exp	v0.0.0-20230801115018-d63ba01acd4b
+	dep	golang.org/x/image	v0.17.0
+	dep	golang.org/x/sys	v0.21.0
+	dep	howett.net/plist	v1.0.1
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-ldflags="-X kitty.VCSRevision=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 -s -w"
+	build	CGO_ENABLED=1
+  # (14 direct deps + 6 indirect deps; google/go-cmp is test-only, excluded from binary)
 
 # Go version embedded
 $ strings kitty/launcher/kitten | grep 'go1\.'
@@ -1687,14 +1796,26 @@ GLFW initialization failed
 
 ```bash
 $ strace -f -e trace=write,read -c kitty/launcher/kitten --version 2>&1
+strace: Process 44785 attached
+strace: Process 44786 attached
+strace: Process 44787 attached
+strace: Process 44788 attached
+strace: Process 44789 attached
+strace: Process 44790 attached
+strace: Process 44791 attached
+strace: Process 44792 attached
+strace: Process 44793 attached
+strace: Process 44794 attached
 kitten 0.35.2 created by Kovid Goyal
 % time     seconds  usecs/call     calls    errors syscall
 ------ ----------- ----------- --------- --------- ----------------
-  0.00    0.000000           0         3         0 read
-100.00    0.000111           7        15         0 write
+100.00    0.000223          22        10           read
+  0.00    0.000000           0         1           write
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.000111                    18         0 total
+100.00    0.000223          20        11           total
 ```
+
+> *Note: The 10 "Process ... attached" messages confirm the Go runtime spawns multiple OS threads (goroutine scheduler, GC, timers) even for a trivial invocation. PIDs will vary between runs.*
 
 ### A.8 Remote Control Commands (Could Not Execute)
 
@@ -1770,7 +1891,7 @@ $ for i in $(seq 1 100); do
 
 | Language | Process Model | Responsibilities | Key Evidence |
 |---|---|---|---|
-| **C** (49 files, 1.5 MB .so) | In-process (extension module) | VT parsing, OpenGL rendering, font rasterization, GPU glyph cache, SIMD string ops, threading, platform windowing | `ldd` shows libharfbuzz/libfreetype/libpng linkage; `nm -D` shows 68+ imported rendering symbols; `pthread_create` in source |
+| **C** (49 files, 1.5 MB .so) | In-process (extension module) | VT parsing, OpenGL rendering, font rasterization, GPU glyph cache, SIMD string ops, threading, platform windowing | `ldd` shows libharfbuzz/libfreetype/libpng linkage; `nm -D` shows 104 imported rendering symbols; `pthread_create` in source |
 | **Python** (orchestration layer) | In-process (interpreter) | Startup, config, window/tab management, RC dispatch, kitten framework, shader loading | `sys.setswitchinterval(1000.0)` proves single thread; `ldd kitty` shows libpython; entry_points.py routes all dispatch |
 | **Go** (15 MB binary) | Separate process | CLI tools, kittens (icat, diff, ssh, etc.), RC client, shell completion | `file` shows Go BuildID; `ldd` shows only libc; `strings` reveal Go runtime and kitty packages; `os.execl` in entry_points.py |
 
@@ -1778,6 +1899,6 @@ $ for i in $(seq 1 100); do
 
 1. **C and Python share one process** — C runs as Python extension modules (`fast_data_types.so`), called through the CPython C API.
 2. **Go always runs as a separate process** — invoked via `os.execl`/`os.execvp`, communicating via escape sequences or UNIX sockets.
-3. **The three C threads (Main/IO/Talk) are created in C** — Python never creates threads; `sys.setswitchinterval(1000.0)` confirms single-Python-thread design.
+3. **The 2–3 C threads (Main/IO, and optionally Talk when RC is enabled) are created in C** — Python never creates threads; `sys.setswitchinterval(1000.0)` confirms single-Python-thread design.
 4. **The rendering hot path is entirely C** — from VT parsing (with SIMD) through OpenGL rendering, never touching Python.
 5. **The Go layer trades rendering capability for portability** — the 15 MB standalone binary carries its own runtime but has zero rendering libraries.
