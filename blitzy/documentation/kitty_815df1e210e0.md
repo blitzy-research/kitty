@@ -554,25 +554,57 @@ On Linux, this is **29 subsystem initializers** chained together. On macOS, it i
 
 #### Survivor Analysis — What Works Without It
 
-Attempting to import Python modules with the C extension removed reveals that only **5 out of 109** modules can load:
+Attempting to import every Python module in `kitty/` with the C extension removed reveals that **20 out of 109** modules can load. They fall into three categories:
 
-| Module | Result | Why It Survives |
-|--------|--------|----------------|
-| `kitty.types` | ✅ SUCCESS | Pure Python type definitions, no native imports |
-| `kitty.constants` | ✅ SUCCESS | App metadata and path utilities, deferred native use |
-| `kitty.short_uuid` | ✅ SUCCESS | Pure Python UUID generation |
-| `kitty.guess_mime_type` | ✅ SUCCESS | Pure Python MIME detection |
-| `kitty.key_names` | ✅ SUCCESS | Pure Python key name mappings |
-| `kitty.utils` | ❌ FAIL | Imports `Color`, `wcswidth`, `monotonic` from `fast_data_types` |
+**Category 1 — Empty `__init__.py` package markers (5 modules, 0 lines each):**
+
+| Module | Lines | Why It Survives |
+|--------|-------|----------------|
+| `kitty` | 0 | Empty package `__init__.py` |
+| `kitty.conf` | 0 | Empty package `__init__.py` |
+| `kitty.layout` | 0 | Empty package `__init__.py` |
+| `kitty.options` | 0 | Empty package `__init__.py` |
+| `kitty.rc` | 0 | Empty package `__init__.py` |
+
+**Category 2 — Pure-Python utility modules (5 modules):**
+
+| Module | Lines | Why It Survives |
+|--------|-------|----------------|
+| `kitty.types` | 222 | Pure Python type definitions — no native imports at module level |
+| `kitty.constants` | 305 | App metadata and path utilities — deferred native use only |
+| `kitty.short_uuid` | 65 | Pure Python UUID generation — stdlib only |
+| `kitty.guess_mime_type` | 104 | Pure Python MIME detection — stdlib only |
+| `kitty.key_names` | 96 | Pure Python key name mappings — no imports beyond stdlib |
+
+**Category 3 — Non-trivial pure-Python modules that avoid top-level native imports (10 modules):**
+
+| Module | Lines | Why It Survives |
+|--------|-------|----------------|
+| `kitty.typing` | 24 | Runtime type aliases all set to `None` — no real imports |
+| `kitty.cli_stub` | 89 | Stub `CLIOptions` classes — pure Python, no native deps |
+| `kitty.choose_entry` | 25 | Regex-based marker selection for hints — imports only `kitty.cli_stub` and `kitty.typing` |
+| `kitty.entry_points` | 197 | CLI dispatch — all heavy imports are deferred inside function bodies |
+| `kitty.client` | 290 | Command replay utility — uses only stdlib (`sys`, `contextlib`) |
+| `kitty.fonts` | 191 | Font package init — pure Python enums and types, imports `kitty.types` and `kitty.typing` only |
+| `kitty.fonts.box_drawing` | 1,346 | Pure Python Unicode box/line drawing algorithms — `math`, `functools`, no native deps |
+| `kitty.multiprocessing` | 92 | Multiprocessing monkeypatch — uses `kitty.constants` (which also survives) |
+| `kitty.search_query_parser` | 296 | Pure Python search query parser — depends only on `kitty.types` |
+| `kitty.window_list` | 442 | Window list management — depends only on `kitty.types` and `kitty.typing` |
+
+**Representative failures (89 modules fail):**
+
+| Module | Result | Why It Fails |
+|--------|--------|-------------|
+| `kitty.utils` | ❌ FAIL | Top-level imports `Color`, `wcswidth`, `monotonic` from `fast_data_types` |
 | `kitty.cli` | ❌ FAIL | Imports via `kitty.conf.utils` → `fast_data_types.Color` |
-| `kitty.rgb` | ❌ FAIL | Imports `Color` from `fast_data_types` |
-| `kitty.marks` | ❌ FAIL | Imports via dependency chain |
-| `kitty.key_encoding` | ❌ FAIL | Direct import from `fast_data_types` |
-| `kitty.boss` | ❌ FAIL | Heavy consumer of `fast_data_types` types |
-| `kitty.window` | ❌ FAIL | Direct import from `fast_data_types` |
-| `kitty.tabs` | ❌ FAIL | Direct import from `fast_data_types` |
+| `kitty.rgb` | ❌ FAIL | Top-level import of `Color` from `fast_data_types` |
+| `kitty.marks` | ❌ FAIL | Imports via transitive dependency chain to `fast_data_types` |
+| `kitty.key_encoding` | ❌ FAIL | Direct top-level import from `fast_data_types` |
+| `kitty.boss` | ❌ FAIL | Heavy consumer of `fast_data_types` types and functions |
+| `kitty.window` | ❌ FAIL | Direct top-level import from `fast_data_types` |
+| `kitty.tabs` | ❌ FAIL | Direct top-level import from `fast_data_types` |
 
-**104 out of 109 Python modules (95.4%) cannot load without the C extension.** The 5 survivors are pure utility modules with no terminal functionality.
+**89 out of 109 Python modules (81.7%) cannot load without the C extension.** The 20 survivors are either empty package markers, pure utility modules, or modules that carefully defer their native imports. Notably, even the largest survivor — `kitty.fonts.box_drawing` at 1,346 lines — performs only pure-Python mathematical operations for rendering Unicode box-drawing characters and has no terminal functionality on its own. None of the 20 survivors can display a terminal, process input, or render anything.
 
 ### Analysis
 
@@ -580,7 +612,7 @@ Attempting to import Python modules with the C extension removed reveals that on
 
 1. **One import gives access to everything** — A Python module only needs one import to access screen management, font rendering, color handling, input processing, and more. This simplifies the Python API surface.
 
-2. **One failure breaks everything** — If the `.so` is missing, misconfigured, or compiled for the wrong Python version, 95% of the application immediately fails. There is no graceful degradation.
+2. **One failure breaks everything** — If the `.so` is missing, misconfigured, or compiled for the wrong Python version, over 80% of Python modules immediately fail to load. The 20 modules that survive are either empty package markers or pure utility modules with no terminal functionality. There is no graceful degradation.
 
 3. **All C subsystems initialize together** — The 29 `init_*` calls in `PyInit_fast_data_types()` mean that loading the module initializes the VT parser, the font system, the OpenGL bindings, the cryptography library, and everything else in one shot. This is efficient (one module load, one initialization sequence) but creates an all-or-nothing dependency.
 
@@ -588,7 +620,7 @@ The module name itself — `fast_data_types` — reflects its origin: it started
 
 ### Conclusion
 
-**`fast_data_types` is the single architectural chokepoint binding Python to C.** It wraps 29 C subsystems, 22 Python-visible classes, and hundreds of functions into one monolithic module that 46 out of 109 Python files (42%) import directly. Without it, only 5 Python modules (4.6%) can load — none of which can display a terminal, process input, or render anything. Its absence causes near-total system failure because it is not one dependency among many; it is the *only* dependency that matters. It is simultaneously kitty's greatest architectural strength (single, clean integration point) and its single point of failure.
+**`fast_data_types` is the single architectural chokepoint binding Python to C.** It wraps 29 C subsystems, 22 Python-visible classes, and hundreds of functions into one monolithic module that 46 out of 109 Python files (42%) import directly. Without it, only 20 Python modules (18.3%) can load — and those are either empty package markers, pure utility modules, or modules that carefully defer all native imports. None of the survivors can display a terminal, process input, or render anything. Its absence causes near-total system failure because it is not one dependency among many; it is the *only* dependency that matters. It is simultaneously kitty's greatest architectural strength (single, clean integration point) and its single point of failure.
 
 ---
 
