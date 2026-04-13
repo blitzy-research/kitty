@@ -461,7 +461,7 @@ The type stub at `kitty/fast_data_types.pyi` (1,635 lines) defines 22 classes ex
 |-------|------------------|---------|
 | `FontConfigPattern` † | `kitty/fontconfig.c` | Font matching pattern (Linux) |
 | `Face` | `kitty/freetype.c` | FreeType font face wrapper |
-| `CoreTextFont` | `kitty/core_text.m` | CoreText font descriptor (macOS) |
+| `CoreTextFont` † | `kitty/core_text.m` | CoreText font descriptor (macOS) |
 | `CTFace` | `kitty/core_text.m` | CoreText font face wrapper (macOS) |
 | `Color` | `kitty/colors.c` | RGB color value type |
 | `ColorProfile` | `kitty/colors.c` | Terminal color palette manager |
@@ -482,7 +482,7 @@ The type stub at `kitty/fast_data_types.pyi` (1,635 lines) defines 22 classes ex
 | `Shlex` | `kitty/shlex.c` | Shell-style lexer |
 | `SingleKey` | `kitty/keys.c` | Keyboard shortcut descriptor |
 
-> † `CurrentFonts`, `FontConfigPattern`, and `OSWindowSize` are Python-side TypedDicts defined only in `kitty/fast_data_types.pyi`. They describe data structures returned by C functions but do not have `PyTypeObject` definitions in their related C files. The other 19 classes (e.g., `Screen`, `Line`, `ChildMonitor`) are C-defined types with full `PyTypeObject` struct definitions in their respective C source files.
+> † `CoreTextFont`, `CurrentFonts`, `FontConfigPattern`, and `OSWindowSize` are Python-side TypedDicts defined only in `kitty/fast_data_types.pyi`. They describe data structures returned by C functions but do not have `PyTypeObject` definitions in their related C files. The other 18 classes (e.g., `Screen`, `Line`, `ChildMonitor`) are C-defined types with full `PyTypeObject` struct definitions in their respective C source files.
 
 Beyond these 22 classes, the module exposes **hundreds of module-level functions** covering rendering, input handling, I/O management, cryptography, font operations, and more.
 
