@@ -645,7 +645,7 @@ Kitty includes a throughput benchmark tool at `tools/cmd/benchmark/main.go`:
 
 **Usage:**
 ```bash
-kitten @ benchmark --with-scrollback
+kitten __benchmark__ --with-scrollback
 ```
 
 **Key flags** (from `tools/cmd/benchmark/main.go:25-29`):
@@ -668,10 +668,10 @@ kitten @ benchmark --with-scrollback
 **Measuring with vs. without scrollback:**
 ```bash
 # Without scrollback (uses alternate screen — no history buffer overhead):
-kitten @ benchmark
+kitten __benchmark__
 
 # With scrollback (stays in main screen — exercises history buffer):
-kitten @ benchmark --with-scrollback
+kitten __benchmark__ --with-scrollback
 ```
 
 The difference in throughput between these two modes indicates the overhead of history buffer operations (line copy, segment allocation, optional pager history encoding).
