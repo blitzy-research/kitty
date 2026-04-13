@@ -1149,7 +1149,7 @@ ls "$TEST_KITTY_DIR/kitty.conf.bak"
 # kitty.conf.bak contains the original file before patching
 ```
 
-The backup creation is confirmed by `tools/config/api.go:343-344`:
+The backup creation is confirmed by `tools/config/api.go:343-345`:
 ```go
 if len(raw) > 0 && self.Write_backup {
     _ = os.WriteFile(backup_path+".bak", raw, self.Mode)
@@ -1205,7 +1205,7 @@ leaving the codebase completely unchanged.
 | Step | Expected outcome | Evidence |
 |------|------------------|----------|
 | After pressing Enter | `kitty.conf` contains `# BEGIN_KITTY_FONTS` block | `tools/config/api.go:328-340` |
-| After pressing Enter | `kitty.conf.bak` backup exists | `tools/config/api.go:343-344` |
+| After pressing Enter | `kitty.conf.bak` backup exists | `tools/config/api.go:343-345` |
 | After pressing Enter | Font changes immediately in running kitty | `tools/config/api.go:352-371` → SIGUSR1 |
 | After restart | Same font is loaded from config | `kitty/main.py:494` → `load_config()` |
 | After cleanup | No files remain, codebase unchanged | Manual `rm -rf` |
