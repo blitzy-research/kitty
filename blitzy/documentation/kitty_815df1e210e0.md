@@ -230,7 +230,7 @@ if args.action == 'test':
 
 This **replaces the current process** (`os.execl`) with the built kitty launcher, passing `+launch` and `test.py` as arguments. The `+launch` flag tells the kitty launcher to execute a Python script rather than start the terminal emulator.
 
-**Evidence**: `test.py` (14 lines) then takes over:
+**Evidence**: `test.py` (13 lines) then takes over:
 
 ```python
 # test.py lines 1-13
@@ -592,7 +592,7 @@ Two test modules depend on `kittens/transfer/rsync.so`, each with different impo
 from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc
 ```
 
-This is a **module-level import** that executes when `file_transmission.py` is imported during test discovery. If `rsync.so` is missing, the module fails to import immediately, and all 7 tests in `file_transmission.py` fail with `ImportError`.
+This is a **module-level import** that executes when `file_transmission.py` is imported during test discovery. If `rsync.so` is missing, the module fails to import immediately, and all 6 tests in `file_transmission.py` fail with `ImportError`.
 
 Line 14 also imports from the rsync kitten's pure-Python utilities:
 ```python
@@ -675,13 +675,13 @@ All 22 Python test modules are classified into categories based on their extensi
 | 1 | `screen.py` | 36 | Direct FDT | Yes (line 4) | No |
 | 2 | `graphics.py` | 19 | Direct FDT | Yes (line 14) | No |
 | 3 | `datatypes.py` | 18 | Direct FDT | Yes (lines 9, 22, 578) | No |
-| 4 | `parser.py` | 17 | Direct FDT | Yes (line 8) | No |
+| 4 | `parser.py` | 16 | Direct FDT | Yes (line 8) | No |
 | 5 | `check_build.py` | 9 | Direct FDT + rsync | Yes (line 29, function-level) | Yes (line 30, function-level) |
 | 6 | `fonts.py` | 8 | Direct FDT | Yes (line 11) | No |
 | 7 | `ssh.py` | 8 | Direct FDT | Yes (line 16) | No |
-| 8 | `file_transmission.py` | 7 | Inherited FDT + rsync | No (only inherited) | Yes (line 13, module-level) |
+| 8 | `file_transmission.py` | 6 | Inherited FDT + rsync | No (only inherited) | Yes (line 13, module-level) |
 | 9 | `keys.py` | 3 | Direct FDT | Yes (line 6) | No |
-| 10 | `shell_integration.py` | 3 | Direct FDT | Yes (line 16) | No |
+| 10 | `shell_integration.py` | 6 | Direct FDT | Yes (line 16) | No |
 | 11 | `layout.py` | 3 | Inherited-only | No | No |
 | 12 | `glfw.py` | 2 | Inherited-only | No | No |
 | 13 | `tui.py` | 2 | Inherited-only | No | No |
@@ -996,7 +996,7 @@ The following observations were made during actual build execution:
 
 #### Parallel Compilation
 
-Compilation commands are sorted by source file size in descending order (lines 110-113, 119) before being dispatched to `parallel_run()` (line 120). This ensures the largest (and typically slowest) files begin compiling first, optimizing overall build time across all CPU cores.
+Compilation commands are sorted by source file size in descending order (lines 110-113, 119) before being dispatched to `parallel_run()` (line 120). This ensures the largest files begin compiling first, optimizing overall build time across all CPU cores.
 
 #### Platform-Conditional File Exclusion
 
@@ -1098,12 +1098,12 @@ flowchart TD
         SCREEN["screen.py (36 tests)"]
         GRAPHICS["graphics.py (19 tests)"]
         DATATYPES["datatypes.py (18 tests)"]
-        PARSER["parser.py (17 tests)"]
+        PARSER["parser.py (16 tests)"]
         CHECKBUILD["check_build.py (9 tests)"]
         FONTS["fonts.py (8 tests)"]
         SSH["ssh.py (8 tests)"]
         KEYS["keys.py (3 tests)"]
-        SHELL["shell_integration.py (3 tests)"]
+        SHELL["shell_integration.py (6 tests)"]
         CRYPTO["crypto.py (1 test)"]
         MOUSE["mouse.py (1 test)"]
         OPTIONS["options.py (1 test)"]
@@ -1122,7 +1122,7 @@ flowchart TD
     end
 
     subgraph RsyncDeps["rsync.so Dependents"]
-        FTRANS["file_transmission.py (7 tests)\nMODULE-LEVEL import (hard)"]
+        FTRANS["file_transmission.py (6 tests)\nMODULE-LEVEL import (hard)"]
         CHECKBUILD2["check_build.py\nFUNCTION-LEVEL import (lazy)"]
     end
 
@@ -1152,7 +1152,7 @@ python3 setup.py test
   │         │
   │         ▼ ── process replaced ──
   │
-  test.py                                  [14 lines, shebang: #!./kitty/launcher/kitty +launch]
+  test.py                                  [13 lines, shebang: #!./kitty/launcher/kitty +launch]
   │    └─ importlib.import_module('kitty_tests.main')
   │    └─ m.main()
   │         │
