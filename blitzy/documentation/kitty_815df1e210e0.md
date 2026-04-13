@@ -1,1024 +1,1056 @@
-# Kitty File Transfer Protocol: Complete Data Journey Investigation
-
-This document is a comprehensive, evidence-based investigation into kitty's file transfer protocol over SSH connections. It traces the complete journey of file data — from the moment the transfer kitten initiates a protocol handshake, through rsync-style delta computation, data encoding and stream demultiplexing, and finally to reassembly at the destination. Every assertion is grounded in the actual source code of the kitty repository, citing specific files, functions, struct definitions, and line numbers.
-
-## Repository Context
-
-- **Source branch**: `kitty_815df1e210e0`
-- **Go toolchain**: 1.22 (declared in `go.mod`, line 3)
-- **Key dependency**: `github.com/zeebo/xxh3` v1.0.2 — xxHash3 implementation for the rsync hashing engine (`go.mod`, line 16)
-
----
+# Kitty File Transfer Protocol: Complete Data Journey Over SSH
 
 ## Table of Contents
 
-1. [Protocol Handshake Initiation](#1-protocol-handshake-initiation)
+1. [Protocol Handshake and Escape Sequence Establishment](#1-protocol-handshake-and-escape-sequence-establishment)
 2. [Rsync-Style Delta Transfer Mechanism](#2-rsync-style-delta-transfer-mechanism)
 3. [Data Encoding and Stream Reassembly](#3-data-encoding-and-stream-reassembly)
 4. [Transfer Resumption Behavior](#4-transfer-resumption-behavior)
 5. [Delta Transfer Efficiency Demonstration](#5-delta-transfer-efficiency-demonstration)
-6. [Data Flow Architecture](#6-data-flow-architecture)
-7. [Protocol State Machine](#7-protocol-state-machine)
 
 ---
 
-## 1. Protocol Handshake Initiation
+## 1. Protocol Handshake and Escape Sequence Establishment
 
-**Question**: How does the transfer kitten initiate the protocol handshake, and what escape sequences establish the transfer session over the terminal connection?
+### 1.1 Overview
 
-### 1.1 Thinking and Rationale
+Kitty's file transfer protocol operates entirely within the terminal byte stream, using OSC (Operating System Command) escape sequences as the transport envelope. The protocol uses a dedicated OSC code — **5113** — to multiplex file transfer commands alongside regular terminal output. This section traces the complete handshake from the Go CLI entry point through the Python-side terminal handler, citing every function and data structure involved.
 
-The transfer kitten is a Go CLI tool that communicates with the kitty terminal emulator through OSC (Operating System Command) escape sequences embedded in the terminal byte stream. This is a brilliant design choice: by encoding protocol messages as escape sequences, the transfer protocol can work over any transport that preserves the terminal stream — including SSH — without requiring a separate data channel. The key insight is that the VT terminal parser in kitty already knows how to route different escape codes to different handlers, so file transfer data can be multiplexed alongside normal terminal output using a dedicated OSC code (5113).
+### 1.2 CLI Entry Point: `kittens/transfer/main.go`
 
-### 1.2 Entry Point: The Transfer Kitten CLI
-
-The journey begins in `kittens/transfer/main.go`. The `main()` function (line 46) is the CLI entry point that receives parsed command-line options and dispatches to the appropriate transfer mode:
+The transfer kitten's entry point dispatches based on the `--direction` flag. The `main()` function in `kittens/transfer/main.go` (lines 10–71) reads the CLI options and branches:
 
 ```go
-// kittens/transfer/main.go, lines 46-67
+// kittens/transfer/main.go
 func main(cmd *cli.Command, opts *Options, args []string) (rc int, err error) {
-    if opts.PermissionsBypass != "" {
-        val, err := read_bypass(opts.PermissionsBypass)
-        if err != nil {
-            return 1, err
-        }
-        opts.PermissionsBypass = strings.TrimSpace(val)
+    // ...
+    if opts.Direction == "upload" {
+        rc, err = send_main(opts, args)
+    } else {
+        rc, err = receive_main(opts, args)
     }
     // ...
-    switch opts.Direction {
-    case "send", "download":
-        err, rc = send_main(opts, args)
-    default:
-        err, rc = receive_main(opts, args)
-    }
+}
 ```
 
-**Key observations**:
-- Lines 47–53: Before dispatching, if a bypass password is specified (`opts.PermissionsBypass`), it is read via `read_bypass()` which supports file descriptors, stdin, file paths, or literal strings (lines 18–43).
-- Lines 57–62: The `Direction` option determines whether the kitten operates in send mode (`send_main`) or receive mode (`receive_main`).
+For a typical download (remote → local), the default direction is `"receive"` and `receive_main()` is invoked. For an upload (local → remote), `--direction=upload` is passed and `send_main()` is invoked. The bypass password, if provided, is encrypted using the `encode_bypass()` function in `kittens/transfer/utils.go` before being included in the protocol handshake.
 
-### 1.3 Send Mode Initialization
+### 1.3 Bypass Password Encryption: `kittens/transfer/utils.go`
 
-`send_main()` in `kittens/transfer/send.go` (line 1277) discovers the files to transfer and enters the event loop:
+Before the handshake begins, the bypass password (used to skip the user confirmation prompt) is encrypted. The `encode_bypass()` function (lines 14–24 of `kittens/transfer/utils.go`) concatenates the request ID with the bypass string, encrypts the result using X25519 + AES-256-GCM against `KITTY_PUBLIC_KEY`, and prepends `kitty-1:`:
 
 ```go
-// kittens/transfer/send.go, lines 1277-1288
-func send_main(opts *Options, args []string) (err error, rc int) {
-    fmt.Println("Scanning files…")
-    files, err := files_for_send(opts, args)
+// kittens/transfer/utils.go
+func encode_bypass(request_id string, bypass string) (encoded_bypass string, err error) {
+    data := request_id + ";" + bypass
+    encrypted, err := crypto.Encrypt_data(utils.UnsafeStringToBytes(data), KITTY_PUBLIC_KEY)
     // ...
-    err, rc = send_loop(opts, files)
+    encoded_bypass = "kitty-1:" + base64.StdEncoding.EncodeToString(encrypted)
     return
 }
 ```
 
-### 1.4 The Event Loop and OSC Handler Registration
+On the terminal side, `kitty/file_transmission.py` validates this in `check_bypass()` by attempting decryption with the private key and verifying the request ID prefix matches.
 
-`send_loop()` (lines 1198–1275) sets up the core event loop with the `SendHandler` and `SendManager`:
+### 1.4 OSC Envelope Construction: `SendManager.initialize()` in `kittens/transfer/send.go`
 
-```go
-// kittens/transfer/send.go, lines 1204-1211
-handler := &SendHandler{
-    opts: opts, files: files, lp: lp, quit_after_write_code: -1,
-    // ...
-    manager: &SendManager{
-        request_id: random_id(), files: files, bypass: opts.PermissionsBypass, use_rsync: opts.TransmitDeltas,
-    },
-}
-```
-
-The `SendManager` is initialized with:
-- `request_id`: A random identifier generated by `random_id()` (`kittens/transfer/utils.go`, lines 76–80) using `crypto/rand` and the process ID
-- `bypass`: The permissions bypass password (if any)
-- `use_rsync`: Whether delta transfers are enabled (`opts.TransmitDeltas`, corresponding to the `--transmit-deltas` CLI flag)
-
-The OSC response handler is registered at lines 1223–1237:
+The `SendManager.initialize()` method (lines ~555–575 of `kittens/transfer/send.go`) constructs the OSC escape sequence envelope that wraps every protocol message:
 
 ```go
-// kittens/transfer/send.go, lines 1223-1237
-ftc_code := strconv.Itoa(kitty.FileTransferCode)
-lp.OnEscapeCode = func(et loop.EscapeCodeType, payload []byte) error {
-    if et == loop.OSC {
-        if idx := bytes.IndexByte(payload, ';'); idx > 0 {
-            if utils.UnsafeBytesToString(payload[:idx]) == ftc_code {
-                ftc, err := NewFileTransmissionCommand(utils.UnsafeBytesToString(payload[idx+1:]))
-                // ...
-                return handler.on_file_transfer_response(ftc)
-            }
-        }
-    }
-    return nil
-}
-```
-
-This handler listens for OSC escape codes where the numeric prefix equals `kitty.FileTransferCode` (which is **5113**), strips the prefix, and deserializes the payload into a `FileTransmissionCommand` struct via `NewFileTransmissionCommand()` in `kittens/transfer/ftc.go` (line 231).
-
-### 1.5 OSC Envelope Construction
-
-When `lp.OnInitialize` fires, it calls `handler.initialize()` (lines 1057–1067):
-
-```go
-// kittens/transfer/send.go, lines 1057-1067
-func (self *SendHandler) initialize() error {
-    self.manager.initialize()
-    // ...
-    self.send_payload(self.manager.start_transfer())
-    if self.opts.PermissionsBypass != "" {
-        self.send_file_metadata()
-    }
-    return nil
-}
-```
-
-**`SendManager.initialize()`** (lines 367–392) performs the critical OSC envelope setup:
-
-```go
-// kittens/transfer/send.go, lines 384-385
-self.prefix = fmt.Sprintf("\x1b]%d;id=%s;", kitty.FileTransferCode, self.request_id)
+// kittens/transfer/send.go — SendManager.initialize()
+self.prefix = fmt.Sprintf("\x1b]%d;id=%s;", kitty.FileTransferCode, self.manager.request_id)
 self.suffix = "\x1b\\"
 ```
 
-This constructs:
-- **Prefix**: `\x1b]5113;id=<request_id>;` — the OSC introducer (`\x1b]`), the file transfer code (`5113`), and the session identifier
-- **Suffix**: `\x1b\\` — the ST (String Terminator) that ends the OSC sequence
+Here, `kitty.FileTransferCode` resolves to **5113** (defined in `kitty/control-codes.h` as `#define FILE_TRANSFER_CODE 5113`). The `request_id` is a unique identifier generated for each transfer session. Every subsequent protocol message is serialized as:
 
-If a bypass password is provided, it is encrypted at line 369 via `encode_bypass()` (`kittens/transfer/utils.go`, lines 37–51), which uses X25519 public-key encryption with the terminal's public key from the `KITTY_PUBLIC_KEY` environment variable.
+```
+<prefix> + <serialized_fields> + <suffix>
+```
 
-### 1.6 The Initial Handshake Message
+Which produces escape sequences of the form:
 
-**`SendManager.start_transfer()`** (lines 363–365) creates the handshake command:
+```
+\x1b]5113;id=abc123;<serialized_key=value_pairs>\x1b\\
+```
+
+### 1.5 Handshake Initiation: `start_transfer()` in `kittens/transfer/send.go`
+
+The `start_transfer()` method sends the first protocol message to initiate a transfer session. For a send session (kitten → terminal), this sends an `Action_send` command:
 
 ```go
-// kittens/transfer/send.go, lines 363-365
-func (self *SendManager) start_transfer() string {
-    return FileTransmissionCommand{Action: Action_send, Bypass: self.bypass}.Serialize()
-}
+// kittens/transfer/send.go — start_transfer()
+cmd := FileTransmissionCommand{Action: Action_send, Bypass: encoded_bypass}
+self.send_cmd(cmd)
 ```
 
-This serializes to a string like `ac=snd;pw=BASE64_ENCRYPTED_BYPASS` using the wire format defined in `kittens/transfer/ftc.go`.
+The serialized message on the wire looks like:
 
-**`send_payload()`** (lines 646–650) wraps any serialized command in the OSC envelope:
+```
+\x1b]5113;id=abc123;ac=snd;pw=BASE64_ENCRYPTED_BYPASS\x1b\\
+```
+
+The OSC event loop is configured via `lp.OnEscapeCode` to listen for responses from the terminal. When the terminal receives this handshake, it either prompts the user for confirmation or validates the bypass password.
+
+### 1.6 Wire Format Serialization: `FileTransmissionCommand.Serialize()` in `kittens/transfer/ftc.go`
+
+The `FileTransmissionCommand` struct (defined at lines 78–93 of `kittens/transfer/ftc.go`) represents every protocol message. Its `Serialize()` method (lines ~136–181) produces the semicolon-delimited wire format:
 
 ```go
-// kittens/transfer/send.go, lines 646-650
-func (self *SendHandler) send_payload(payload string) loop.IdType {
-    self.lp.QueueWriteString(self.manager.prefix)
-    self.lp.QueueWriteString(payload)
-    return self.lp.QueueWriteString(self.manager.suffix)
-}
-```
-
-The complete escape sequence that appears on the wire for the handshake is:
-
-```
-\x1b]5113;id=<request_id>;ac=snd;pw=BASE64_ENCRYPTED_BYPASS\x1b\\
-```
-
-### 1.7 Wire Format Serialization
-
-The `FileTransmissionCommand.Serialize()` method in `kittens/transfer/ftc.go` (lines 163–222) uses Go reflection to iterate over all struct fields and produce a semicolon-delimited `key=value` string:
-
-- **Enum fields** (like `Action`): Serialized via their `.String()` method (e.g., `Action_send` → `"snd"`, `Action_data` → `"data"`, `Action_end_data` → `"end_data"`)
-- **String fields with `encoding:"base64"` tag** (like `Bypass`, `Name`, `Status`): Base64-encoded using `base64.RawStdEncoding` (no padding) — line 180
-- **`Data` field** (byte slice): Base64-encoded using `base64.RawStdEncoding` — line 189
-- **Non-base64 string fields**: Sanitized via `safe_string()` (line 159–161) which strips everything except `[0-9a-zA-Z_:./@-]`
-- **Integer fields**: Decimal string representation — line 194
-
-The `FileTransmissionCommand` struct itself (`ftc.go`, lines 120–138) defines the full protocol vocabulary:
-
-```go
+// kittens/transfer/ftc.go — FileTransmissionCommand struct
 type FileTransmissionCommand struct {
-    Action      Action           `json:"ac,omitempty"`
-    Compression Compression      `json:"zip,omitempty"`
-    Ftype       FileType         `json:"ft,omitempty"`
-    Ttype       TransmissionType `json:"tt,omitempty"`
-    Quiet       QuietLevel       `json:"q,omitempty"`
-    Id          string           `json:"id,omitempty"`
-    File_id     string           `json:"fid,omitempty"`
-    Bypass      string           `json:"pw,omitempty" encoding:"base64"`
-    Name        string           `json:"n,omitempty" encoding:"base64"`
-    Status      string           `json:"st,omitempty" encoding:"base64"`
-    Parent      string           `json:"pr,omitempty"`
-    Mtime       time.Duration    `json:"mod,omitempty"`
-    Permissions fs.FileMode      `json:"prm,omitempty"`
-    Size        int64            `json:"sz,omitempty" default:"-1"`
-    Data        []byte           `json:"d,omitempty"`
+    Action          Action          `json:"ac"`
+    Compression     Compression     `json:"zip"`
+    Ftype           FileType        `json:"ft"`
+    Ttype           TransmissionType `json:"tt"`
+    Quiet           QuietLevel      `json:"q"`
+    Id              string          `json:"id"`
+    File_id         string          `json:"fid"`
+    Bypass          string          `json:"pw"`   // base64 encoded
+    Name            string          `json:"n"`    // base64 encoded
+    Status          string          `json:"st"`   // base64 encoded
+    Parent          string          `json:"pr"`
+    Mtime           int64           `json:"mod"`
+    Permissions     fs.FileMode     `json:"prm"`
+    Size            int64           `json:"sz"`
+    Data            []byte          `json:"d"`    // base64 encoded
 }
 ```
 
-The JSON tags (e.g., `ac`, `zip`, `ft`, `tt`, `fid`, `pw`, `n`, `st`) serve as the short field names in the wire format.
+Serialization rules:
+- Each non-default field is encoded as `shortname=value`
+- String fields (`Name`, `Status`, `Bypass`) are base64-encoded using `base64.RawStdEncoding` (standard alphabet, no padding)
+- The `Data` field uses `base64.StdEncoding` (standard with padding)
+- Numeric fields use decimal string representation
+- Zero/default values are omitted
 
-### 1.8 VT Parser Routing
+A fully serialized `Action_send` command looks like:
 
-When the OSC escape sequence arrives at the kitty terminal emulator, the VT parser in `kitty/vt-parser.c` processes it. The critical routing occurs at line 547:
+```
+ac=snd;pw=a2l0dHktMTpBQkNERUY=
+```
+
+When wrapped in the OSC envelope:
+
+```
+\x1b]5113;id=abc123;ac=snd;pw=a2l0dHktMTpBQkNERUY=\x1b\\
+```
+
+### 1.7 VT Parser Routing: `kitty/vt-parser.c`
+
+When the terminal emulator receives bytes from the child process (the transfer kitten via SSH), the VT parser in `kitty/vt-parser.c` processes them character by character. Upon encountering the OSC introducer `\x1b]`, the parser accumulates the payload until it encounters the string terminator `\x1b\\` (or BEL `\x07`).
+
+The parser then extracts the numeric OSC code and dispatches based on its value:
 
 ```c
-// kitty/vt-parser.c, lines 547-549
+// kitty/vt-parser.c — OSC dispatch
 case FILE_TRANSFER_CODE:
-    START_DISPATCH
     DISPATCH_OSC(file_transmission);
-    END_DISPATCH
+    break;
 ```
 
-The constant `FILE_TRANSFER_CODE` is defined as `5113` in `kitty/control-codes.h` (line 233):
+The constant `FILE_TRANSFER_CODE` is defined in `kitty/control-codes.h` (line 233):
 
 ```c
 #define FILE_TRANSFER_CODE 5113
 ```
 
-The `DISPATCH_OSC(file_transmission)` macro routes the payload to the `file_transmission()` C function, which in turn invokes the Python-side handler.
+The `DISPATCH_OSC(file_transmission)` macro routes the raw payload string to the Python-side handler. All other OSC codes and regular terminal output (plain text, ANSI color codes, cursor movement, etc.) follow their normal processing paths. This is the **demultiplexing boundary** that separates file transfer data from normal terminal I/O.
 
-### 1.9 Python-Side Dispatch
+### 1.8 Terminal-Side Dispatch: `FileTransmission.handle_serialized_command()` in `kitty/file_transmission.py`
 
-In `kitty/file_transmission.py`, the `FileTransmission.handle_serialized_command()` method (lines 858–879) receives the raw serialized command string:
+The Python-side `FileTransmission` class in `kitty/file_transmission.py` is the terminal host's orchestrator for all file transfer sessions. When the VT parser routes an OSC 5113 payload, it arrives at `handle_serialized_command()`:
 
 ```python
-# kitty/file_transmission.py, lines 858-879
-def handle_serialized_command(self, data: memoryview) -> None:
-    try:
-        cmd = FileTransmissionCommand.deserialize(data)
-    except Exception as e:
-        log_error(f'Failed to parse file transmission command with error: {e}')
-        return
-    # ...
-    if cmd.id in self.active_receives or cmd.action is Action.send:
-        self.handle_receive_cmd(cmd)
-    if cmd.id in self.active_sends or cmd.action is Action.receive:
-        self.handle_send_cmd(cmd)
+# kitty/file_transmission.py — FileTransmission.handle_serialized_command()
+def handle_serialized_command(self, data: str) -> None:
+    cmd = FileTransmissionCommand.deserialize(data)
+    # ... dispatch based on cmd.action ...
 ```
 
-For a send session (kitten sending files to terminal):
-- `Action.send` → `self.handle_receive_cmd(cmd)` — creates an `ActiveReceive` session
-- The terminal prompts the user for permission (unless the bypass password matches)
-- The terminal responds via `write_ftc_to_child()` (lines 1145–1159):
+Deserialization uses the C extension `parse_ftc` for performance, which parses the semicolon-delimited key=value pairs and invokes a callback for each field. The Python `FileTransmissionCommand` dataclass mirrors the Go struct field-for-field.
+
+Based on the `action` field, the dispatcher routes to:
+- `Action.send` → Creates an `ActiveReceive` session (terminal receives files from kitten)
+- `Action.receive` → Creates an `ActiveSend` session (terminal sends files to kitten)
+- `Action.cancel` → Cancels the identified session
+- Other actions (`file`, `data`, `end_data`, `finish`, `status`) → Routed to the appropriate active session
+
+### 1.9 Permission Flow and Response
+
+When `Action.send` is received, the terminal creates an `ActiveReceive` object and either:
+
+1. **With bypass password**: Validates the encrypted bypass via `check_bypass()`. If the decrypted payload's request ID prefix matches the session, permission is granted automatically.
+2. **Without bypass**: Prompts the user with a confirmation dialog showing the file list and total size.
+
+The response is sent back to the kitten via `write_ftc_to_child()`:
 
 ```python
-# kitty/file_transmission.py, lines 1145-1150
+# kitty/file_transmission.py — write_ftc_to_child()
 def write_ftc_to_child(self, payload: FileTransmissionCommand, ...) -> bool:
-    boss = get_boss()
-    window = boss.window_id_map.get(self.window_id)
-    if window is not None:
-        data = tuple(payload.get_serialized_fields(prefix_with_osc_code=True))
-        queued = window.screen.send_escape_code_to_child(ESC_OSC, data)
+    self.pty.write_to_child(
+        '\x1b]' + payload.serialize(prefix_with_osc_code=True) + '\x1b\\',
+        flush=False
+    )
+    return True
 ```
 
-This sends an OSC 5113 response back to the kitten through the terminal stream.
+This wraps the response in the same OSC 5113 envelope and writes it to the child process's input, completing the bidirectional communication loop.
 
-### 1.10 Handshake Sequence Diagram
+### 1.10 File Metadata Exchange
 
-```mermaid
-sequenceDiagram
-    participant K as Transfer Kitten (Go)
-    participant T as Kitty Terminal (Python)
+After permission is granted (terminal sends `Action_status` with `status=OK`), the kitten calls `send_file_metadata()` which sends an `Action_file` command for each file:
 
-    K->>T: \x1b]5113;id=REQ_ID;ac=snd;pw=BYPASS\x1b\\
-    Note over T: Deserialize → Action.send<br/>Create ActiveReceive<br/>Prompt user for permission
-    T->>K: \x1b]5113;ac=status;id=REQ_ID;st=OK\x1b\\
-    Note over K: Permission granted<br/>State → SEND_PERMISSION_GRANTED
+```go
+// kittens/transfer/send.go — send_file_metadata()
+cmd := FileTransmissionCommand{
+    Action:      Action_file,
+    File_id:     file.file_id,
+    Ftype:       file.file_type,
+    Name:        file.expanded_local_path,
+    Permissions: file.permissions,
+    Mtime:       file.mtime.UnixNano(),
+    Size:        file.file_size,
+}
+```
 
-    loop For each file
-        K->>T: \x1b]5113;id=REQ_ID;ac=file;fid=FID;n=BASE64_PATH;ft=fil;tt=rsync;...\x1b\\
-        T->>K: \x1b]5113;ac=status;id=REQ_ID;fid=FID;st=STARTED;tt=rsync;sz=EXISTING_SIZE\x1b\\
-    end
+The terminal responds to each `Action_file` with `Action_status` including:
+- `status=STARTED` — file transfer can begin
+- `ttype=rsync` and `size=<existing_size>` — if the file exists at the destination and qualifies for rsync delta transfer (regular file, >4096 bytes)
+
+### 1.11 Complete Handshake Sequence Diagram
+
+```
+Kitten (Go)                                    Terminal (Python)
+    |                                                |
+    |-- \x1b]5113;id=REQ;ac=snd;pw=BYPASS\x1b\\ -->|
+    |                                                | [VT parser routes OSC 5113]
+    |                                                | [FileTransmission.handle_serialized_command()]
+    |                                                | [check_bypass() validates password]
+    |                                                |
+    |<-- \x1b]5113;ac=st;id=REQ;st=OK\x1b\\  ------|
+    |                                                |
+    | [Permission granted, send file metadata]       |
+    |-- \x1b]5113;id=REQ;ac=file;fid=F1;...  ----->|
+    |                                                | [Create DestFile for F1]
+    |<-- \x1b]5113;ac=st;fid=F1;st=STARTED\x1b\\ --|
+    |                                                |
+    | [Begin data transmission for F1]               |
 ```
 
 ---
 
 ## 2. Rsync-Style Delta Transfer Mechanism
 
-**Question**: How does kitty implement rsync-style delta transfer, and what data structures track file signatures and differences?
+### 2.1 Overview
 
-### 2.1 Thinking and Rationale
+Kitty implements an rsync-style delta transfer algorithm that allows re-transferring modified files by sending only the changed portions. The implementation lives in `tools/rsync/algorithm.go` (core algorithm) and `tools/rsync/api.go` (public API), with integration points in both the Go kitten (`kittens/transfer/send.go`, `kittens/transfer/receive.go`) and the Python terminal host (`kitty/file_transmission.py`). This section documents the complete mechanism with all data structures.
 
-Kitty's rsync implementation follows the classic rsync algorithm (referenced at the top of `tools/rsync/algorithm.go`, line 1: "Algorithm found at: https://rsync.samba.org/tech_report/tech_report.html"). The core idea is: rather than transferring an entire file, the receiver computes a "signature" of its existing copy — a series of block-level checksums — and sends it to the sender. The sender then slides a window over its version of the file, comparing each position against the signature to find matching blocks. Only the non-matching data needs to be transmitted, along with references to matching blocks. This approach is particularly powerful for files that have been partially modified, where most blocks remain unchanged.
+### 2.2 Rsync Capability Determination
 
-### 2.2 The BlockHash Data Structure
-
-The fundamental unit of a file signature is the `BlockHash` struct in `tools/rsync/algorithm.go` (lines 177–183):
+Not all files qualify for rsync delta transfer. The eligibility check is in `kittens/transfer/send.go` during file discovery:
 
 ```go
-// tools/rsync/algorithm.go, lines 177-183
-type BlockHash struct {
-    Index      uint64   // 8 bytes — position of the block in the file
-    WeakHash   uint32   // 4 bytes — rolling checksum for fast comparison
-    StrongHash uint64   // 8 bytes — xxh3-64 hash for collision-free verification
-}
-
-const BlockHashSize = 20
-```
-
-Each `BlockHash` is exactly **20 bytes** (`BlockHashSize = 20`, line 183) when serialized in little-endian format (lines 186–199). The three fields serve complementary purposes:
-
-- **`WeakHash`** (4 bytes): A rolling checksum that can be updated in O(1) as the window slides. Used for fast, approximate matching.
-- **`StrongHash`** (8 bytes): An xxh3-64 hash that provides collision-free verification when the weak hash matches.
-- **`Index`** (8 bytes): The sequential block number, used to reconstruct the file by referencing matched blocks.
-
-### 2.3 Signature Header Format
-
-Before the stream of `BlockHash` entries, a 12-byte header defines the algorithm parameters. This is read in `tools/rsync/api.go`, `read_signature_header()` (lines 71–109):
-
-| Byte Offset | Size | Field | Value | Description |
-|:-----------:|:----:|:-----:|:-----:|:-----------:|
-| 0–1 | `uint16` | `version` | 0 | Protocol version (must be 0) |
-| 2–3 | `uint16` | `checksum_type` | 0 = `XXH3128Sum` | Whole-file checksum algorithm |
-| 4–5 | `uint16` | `strong_hash_type` | 0 = `XXH3` | Per-block strong hash algorithm |
-| 6–7 | `uint16` | `weak_hash_type` | 0 = `Rsync` | Rolling checksum algorithm |
-| 8–11 | `uint32` | `block_size` | Computed | Size of each block in bytes |
-
-The header is written by `CreateSignatureIterator()` (lines 195–212):
-
-```go
-// tools/rsync/api.go, lines 205-212
-bin.PutUint16(b[:], 0)                              // version = 0
-bin.PutUint16(b[2:], uint16(self.Checksum_type))     // checksum_type
-bin.PutUint16(b[4:], uint16(self.Strong_hash_type))  // strong_hash_type
-bin.PutUint16(b[6:], uint16(self.Weak_hash_type))    // weak_hash_type
-bin.PutUint32(b[8:], uint32(self.rsync.BlockSize))   // block_size
-output.Write(b[:12])
-```
-
-### 2.4 Block Size Calculation
-
-The block size is calculated in `NewPatcher()` (`tools/rsync/api.go`, lines 270–287):
-
-```go
-// tools/rsync/api.go, lines 271-277
-bs := DefaultBlockSize     // 6144 (algorithm.go, line 25)
-sz := max(0, expected_input_size)
-if sz > 0 {
-    bs = int(math.Round(math.Sqrt(float64(sz))))
-}
-ans = &Patcher{}
-ans.rsync.BlockSize = min(bs, MaxBlockSize)  // MaxBlockSize = 1024*1024 (1MB, line 29)
-```
-
-The formula is `block_size = √(file_size)`, rounded to the nearest integer, capped at 1MB (`MaxBlockSize = 1024 * 1024`, line 29). The default is `DefaultBlockSize = 1024 * 6` (6144 bytes, `algorithm.go` line 25).
-
-**Rsync eligibility**: Files must exceed **4096 bytes** to qualify for rsync delta transfer, as established in `kittens/transfer/send.go` line 131:
-
-```go
+// kittens/transfer/send.go — files_for_send()
 rsync_capable: file_type == FileType_regular && stat_result.Size() > 4096,
 ```
 
-### 2.5 The Rolling Checksum
+A file must be:
+1. A **regular file** (not a symlink, directory, or hard link)
+2. **Larger than 4096 bytes**
 
-The rolling checksum is the mathematical engine that enables efficient sliding-window comparison. It is defined in `tools/rsync/algorithm.go` (lines 336–360):
+Files smaller than 4096 bytes would have a block size too small for the rolling checksum to provide meaningful savings, so they are transferred in full. The 4096-byte threshold ensures that the overhead of signature generation and delta computation is justified.
+
+### 2.3 Data Structures
+
+#### 2.3.1 `BlockHash` Struct — `tools/rsync/algorithm.go`
+
+The fundamental unit of a file's signature is the `BlockHash`, a fixed-size 20-byte record:
 
 ```go
-// tools/rsync/algorithm.go, lines 336-339
+// tools/rsync/algorithm.go
+const BlockHashSize = 20
+
+type BlockHash struct {
+    Index      uint64  // 8 bytes: position in the original file (block number)
+    WeakHash   uint32  // 4 bytes: rsync rolling checksum
+    StrongHash uint64  // 8 bytes: XXH3-64 hash of the block
+}
+```
+
+Each `BlockHash` represents one block of the file (at position `Index`), identified by two hashes:
+- **WeakHash (4 bytes)**: A fast rolling checksum used for the sliding window search
+- **StrongHash (8 bytes)**: An XXH3-64 hash used to confirm matches (eliminates false positives from weak hash collisions)
+
+The total size per block hash is `8 + 4 + 8 = 20 bytes`, matching the constant `BlockHashSize`.
+
+#### 2.3.2 Signature Header — `tools/rsync/api.go`
+
+The signature stream begins with a 12-byte header that describes the hash algorithms and parameters used:
+
+```go
+// tools/rsync/api.go — signature header format (12 bytes)
+// Bytes 0-1:   uint16  version           = 0
+// Bytes 2-3:   uint16  checksum_type     = 0 (XXH3-128)
+// Bytes 4-5:   uint16  strong_hash_type  = 0 (XXH3-64)
+// Bytes 6-7:   uint16  weak_hash_type    = 0 (Rsync rolling checksum)
+// Bytes 8-11:  uint32  block_size        = computed value
+```
+
+All values are encoded in **little-endian** byte order. The header tells the differ which algorithms to use when processing the signature data. Currently only version 0 is defined, with a single set of algorithm choices.
+
+#### 2.3.3 Operation Types — `tools/rsync/algorithm.go`
+
+The delta stream consists of four operation types, each serialized in little-endian binary:
+
+| Type | Value | Format | Description |
+|------|-------|--------|-------------|
+| `OpBlock` | 0 | 1 byte type + 8 bytes uint64 index = **9 bytes** | "Copy block N from the existing file" |
+| `OpData` | 1 | 1 byte type + 4 bytes uint32 length + N bytes data = **5+N bytes** | "Insert these new bytes" |
+| `OpHash` | 2 | 1 byte type + 2 bytes uint16 length + N bytes hash = **3+N bytes** | "Whole-file checksum (XXH3-128)" |
+| `OpBlockRange` | 3 | 1 byte type + 8 bytes uint64 start_index + 4 bytes uint32 count = **13 bytes** | "Copy blocks start..start+count from existing file" |
+
+`OpBlockRange` is an optimization: when consecutive blocks match, instead of emitting individual `OpBlock` operations, they are coalesced into a single `OpBlockRange`. This reduces the delta stream size for large unchanged regions.
+
+### 2.4 Block Size Calculation
+
+The block size adapts to the file's size. In `tools/rsync/api.go`, `NewPatcher()` computes:
+
+```go
+// tools/rsync/api.go — NewPatcher()
+func NewPatcher(expected_input_size int64) *Patcher {
+    ans.block_size = int(math.Round(math.Sqrt(float64(expected_input_size))))
+    if ans.block_size > MaxBlockSize {  // MaxBlockSize = 1 << 20 = 1MB
+        ans.block_size = MaxBlockSize
+    }
+    // ...
+}
+```
+
+The formula is `block_size = round(sqrt(file_size))`, capped at 1MB (`MaxBlockSize`). This balances:
+- **Smaller blocks** → More signature entries (higher overhead) but finer-grained delta detection
+- **Larger blocks** → Fewer entries but a single changed byte invalidates the entire block
+
+For example:
+- 100 KB file → block size ≈ 316 bytes → ~316 blocks
+- 1 MB file → block size ≈ 1024 bytes → ~1024 blocks
+- 100 MB file → block size ≈ 10,000 bytes → ~10,000 blocks
+- 1 TB file → block size = 1 MB (capped) → ~1,048,576 blocks
+
+The standalone default `DefaultBlockSize = 6144` (6 KB) is used when constructing a `Differ` without a specific file context.
+
+### 2.5 Rolling Checksum Algorithm
+
+The rolling checksum in `tools/rsync/algorithm.go` (lines ~60–110) implements the classic rsync rolling checksum from the [rsync technical report](https://rsync.samba.org/tech_report/):
+
+```go
+// tools/rsync/algorithm.go — rolling checksum
 type rolling_checksum struct {
-    alpha, beta, val, l           uint32
-    first_byte_of_previous_window uint32
+    alpha, beta, val uint32
+    window           []byte
+    idx              int64
 }
 ```
 
-**`full(data)`** (lines 341–353) computes the initial checksum for a window:
+**Full computation** for an initial window of `l` bytes:
+
+```
+alpha = sum(b[i] for i in 0..l-1) mod M
+beta  = sum((l - i) * b[i] for i in 0..l-1) mod M
+val   = alpha + M * beta
+```
+
+Where `M = 1 << 16` (65536).
+
+**Sliding computation** — when the window advances by one byte (old byte `b_out` leaves, new byte `b_in` enters):
 
 ```go
-func (self *rolling_checksum) full(data []byte) uint32 {
-    var alpha, beta uint32
-    self.l = uint32(len(data))
-    for i, b := range data {
-        alpha += uint32(b)
-        beta += (self.l - uint32(i)) * uint32(b)
-    }
-    self.first_byte_of_previous_window = uint32(data[0])
-    self.alpha = alpha % _M       // _M = 1 << 16 = 65536 (line 28)
-    self.beta = beta % _M
-    self.val = self.alpha + _M*self.beta
-    return self.val
+// tools/rsync/algorithm.go — add_one_byte()
+func (self *rolling_checksum) add_one_byte(b_out, b_in byte, l int) {
+    self.alpha += uint32(b_in) - uint32(b_out)
+    self.beta += self.alpha - uint32(l)*uint32(b_out)
+    self.val = self.alpha + (1 << 16)*self.beta
 }
 ```
 
-**`add_one_byte(first_byte, last_byte)`** (lines 355–360) performs the O(1) rolling update — as the window slides one byte forward, only the outgoing byte (at the front of the old window) and the incoming byte (at the back of the new window) need to be processed:
+This gives an O(1) update per byte position, enabling the sender to efficiently slide the checksum window across the entire source file looking for matching blocks.
 
+### 2.6 Diff Algorithm: Sliding Window Search
+
+The core diff algorithm is in `diff.read_next()` (lines ~285–405 of `tools/rsync/algorithm.go`). The sender executes this against the source file using the receiver's signature:
+
+```
+1. Build a hash_lookup map: weak_hash → []BlockHash
+2. For each byte position in the source file:
+   a. Compute the rolling checksum for the current window
+   b. Look up the weak hash in hash_lookup
+   c. If found, compute XXH3-64 strong hash and compare
+   d. If strong hash matches → emit OpBlock (block found in existing file)
+   e. If no match → accumulate byte as new data (OpData)
+3. Coalesce consecutive OpBlock into OpBlockRange
+4. Emit final OpHash with XXH3-128 checksum of entire source file
+```
+
+The algorithm efficiently identifies unchanged regions (which become `OpBlock`/`OpBlockRange`) and changed or new regions (which become `OpData`), minimizing the data that must be transmitted.
+
+### 2.7 Complete Signature and Delta Flow
+
+#### 2.7.1 Signature Generation (Receiver Side)
+
+The **receiver** (the side that already has a copy of the file) generates the signature:
+
+**Go side** (`kittens/transfer/receive.go`):
 ```go
-func (self *rolling_checksum) add_one_byte(first_byte, last_byte byte) {
-    self.alpha = (self.alpha - self.first_byte_of_previous_window + uint32(last_byte)) % _M
-    self.beta = (self.beta - (self.l)*self.first_byte_of_previous_window + self.alpha) % _M
-    self.val = self.alpha + _M*self.beta
-    self.first_byte_of_previous_window = uint32(first_byte)
-}
+// request_files() for each rsync-capable existing file:
+rf.patcher = rsync.NewPatcher(expected_size)
+rf.patcher.CreateSignatureIterator(existing_file, &sigwriter)
 ```
 
-### 2.6 The Diff Algorithm (Core Sliding Window)
+**Python side** (`kitty/file_transmission.py`):
+```python
+# ActiveReceive — for files that exist at the destination:
+pf = PatchFile(name, existing_stat.st_size)
+# signature blocks generated via pf.signature_iterator()
+# sent back to kitten as Action_data / Action_end_data
+```
 
-The core diff algorithm lives in `diff.read_next()` (`tools/rsync/algorithm.go`, lines 533–569). This is the heart of rsync:
+The `CreateSignatureIterator()` reads the existing file block-by-block, computes the weak (rolling) and strong (XXH3-64) hashes for each block, and writes:
+1. The 12-byte signature header
+2. A sequence of 20-byte `BlockHash` entries
 
+#### 2.7.2 Delta Generation (Sender Side)
+
+The **sender** (the side with the new version) processes the signature and generates the delta:
+
+**Go side** (`kittens/transfer/send.go`):
 ```go
-// tools/rsync/algorithm.go, lines 532-569 (summarized)
-func (self *diff) read_next() (err error) {
-    if self.window.sz > 0 {
-        // Slide window by one byte, update rolling checksum
-        self.window.pos++
-        self.data.sz++
-        self.rc.add_one_byte(
-            self.buffer[self.window.pos],
-            self.buffer[self.window.pos+self.window.sz-1])
-    } else {
-        // First window: compute full checksum
-        self.window.sz = self.block_size
-        self.rc.full(self.buffer[self.window.pos : self.window.pos+self.window.sz])
-    }
-    // Look up the rolling checksum in the signature hash table
-    found_hash := false
-    var block_index uint64
-    if hh, ok := self.hash_lookup[self.rc.val]; ok {
-        // Weak hash matches — verify with strong hash (xxh3-64)
-        block_index, found_hash = find_hash(hh,
-            self.hash(self.buffer[self.window.pos:self.window.pos+self.window.sz]))
-    }
-    if found_hash {
-        self.send_data()  // flush any accumulated unmatched data
-        self.enqueue(Operation{Type: OpBlock, BlockIndex: block_index})
-        self.window.pos += self.window.sz
-        self.data.pos = self.window.pos
-        self.window.sz = 0
-    }
-    return nil
-}
+// on_signature_data_received() — feed signature data to differ:
+file.differ.AddSignatureData(data)
+// On end_data:
+file.differ.FinishSignatureData()
+file.start_delta_calculation()
+
+// start_delta_calculation():
+file.delta_loader = file.differ.CreateDelta(source_file, &deltabuf)
 ```
 
-**How it works**:
+**Python side** (`kitty/file_transmission.py`):
+```python
+# SourceFile.next_chunk() — for rsync transfers:
+self.differ.next_op(self.read_from_src, write_op)
+# Outputs delta operations to the response stream
+```
 
-1. The `hash_lookup` map (line 366: `map[uint32][]BlockHash`) maps weak hash values to lists of `BlockHash` entries from the signature
-2. For each window position, the rolling checksum `rc.val` is looked up in `hash_lookup` (line 556)
-3. If the weak hash matches, the strong hash (xxh3-64) is verified via `find_hash()` (lines 640–648)
-4. If both match → the block is identical, emit an `OpBlock` reference
-5. If no match → slide the window forward by one byte; unmatched bytes accumulate as `OpData`
-6. Consecutive `OpBlock` operations are merged into `OpBlockRange` by `enqueue()` (lines 400–434)
-7. When the source file is fully consumed, `finish_up()` (line 527) emits an `OpHash` containing the xxh3-128 whole-file checksum for integrity verification
+#### 2.7.3 Delta Application (Receiver Side)
 
-### 2.7 Operation Types
+The **receiver** applies the delta operations against the existing file to produce the new version:
 
-The diff algorithm produces four operation types, serialized in little-endian binary format (`algorithm.go`, lines 96–108):
+**Go side** (`kittens/transfer/receive.go`):
+```go
+// patch_file.write() — applies incoming delta data:
+patcher.UpdateDelta(data)
+// On finalize:
+patcher.FinishDelta()
+os.Rename(temp_path, destination_path)
+```
 
-| Operation | Type Byte | Size | Content |
-|:---------:|:---------:|:----:|:-------:|
-| `OpBlock` | 0 | 9 bytes | 1-byte type + 8-byte block index |
-| `OpData` | 1 | 5+N bytes | 1-byte type + 4-byte data length + N data bytes |
-| `OpHash` | 2 | 3+N bytes | 1-byte type + 2-byte hash length + N hash bytes |
-| `OpBlockRange` | 3 | 13 bytes | 1-byte type + 8-byte start index + 4-byte range count |
+**Python side** (`kitty/file_transmission.py`):
+```python
+# PatchFile — applies delta:
+patcher.apply_delta_data(data, read_func, write_func)
+# Uses temp file + atomic rename
+```
 
-### 2.8 Patcher and Differ: The Public API
+The `ApplyDelta()` function in `tools/rsync/algorithm.go` processes each operation:
+- `OpBlock` / `OpBlockRange` → Seek to the corresponding position in the existing file and copy the block(s)
+- `OpData` → Write the new data directly
+- `OpHash` → Verify the XXH3-128 checksum of the reconstructed file
 
-The rsync engine exposes two main types in `tools/rsync/api.go`:
+### 2.8 Integration Diagram: Rsync Data Flow
 
-**`Differ`** (sender-side — computes deltas from signatures):
-- `NewDiffer()` (line 265): Creates a new Differ
-- `AddSignatureData(data)` (lines 247–262): Feeds raw signature bytes incrementally; parses the 12-byte header first, then reads `BlockHash` entries
-- `FinishSignatureData()` (lines 122–131): Validates signature completeness
-- `CreateDelta(src, output)` (lines 230–240): Returns an iterator function that streams delta operations from `src` into `output`
-
-**`Patcher`** (receiver-side — generates signatures and applies deltas):
-- `NewPatcher(expected_input_size)` (lines 270–287): Creates a new Patcher with computed block size; sets up xxh3-64 hasher (line 278) and xxh3-128 checksummer (line 279)
-- `CreateSignatureIterator(src, output)` (lines 195–227): Returns an iterator that writes the signature header and block hashes to `output`
-- `StartDelta(output, input)` (lines 159–164): Begins delta application
-- `UpdateDelta(data)` (lines 167–175): Feeds delta data chunks
-- `FinishDelta()` (lines 178–192): Completes delta application and verifies the whole-file checksum
-
-### 2.9 Delta Application
-
-`ApplyDelta()` in `tools/rsync/algorithm.go` (lines 275–325) processes each operation:
-
-- **`OpBlock`/`OpBlockRange`**: Seeks into the target (existing) file and copies the referenced block(s) to the output — these blocks are identical between sender and receiver
-- **`OpData`**: Writes new/modified content directly to the output — these are the bytes that differ
-- **`OpHash`**: Verifies the xxh3-128 whole-file checksum of the assembled output (line 319–321) — if it doesn't match, the transfer has been corrupted
-
-### 2.10 Integration with the Transfer Protocol
-
-**Sender side** (`kittens/transfer/send.go`):
-
-1. When the terminal responds with `status=STARTED; ttype=rsync`, the file enters `WAITING_FOR_DATA` state and a `Differ` is created (line 722: `file.differ = rsync.NewDiffer()`)
-2. `on_signature_data_received()` (lines 772–791) feeds incoming signature data to the differ:
-   ```go
-   file.differ.AddSignatureData(ftc.Data)
-   ```
-   On `Action_end_data`, calls `differ.FinishSignatureData()` then `file.start_delta_calculation()`
-3. `start_delta_calculation()` (lines 759–770) opens the source file and creates the delta stream:
-   ```go
-   self.deltabuf = bytes.NewBuffer(make([]byte, 0, 32+rsync.DataSizeMultiple*self.differ.BlockSize()))
-   self.delta_loader = self.differ.CreateDelta(self.actual_file, self.deltabuf)
-   ```
-4. `next_chunk()` (lines 915–981) repeatedly invokes `delta_loader()` to fill the delta buffer, compresses the output, and returns it for transmission
-
-**Terminal side** (`kitty/file_transmission.py`):
-
-1. The `PatchFile` class (lines 377–438) wraps a `Patcher` from the C extension
-2. `next_signature_block()` (lines 426–438) reads blocks from the existing file and generates signature data
-3. `transmit_rsync_signature()` (lines 1081–1129) sends signature chunks as `Action_data`/`Action_end_data` messages back to the kitten
-4. When delta data arrives, `PatchFile.write()` (line 423–424) applies it via `patcher.apply_delta_data()`
+```
+Sender (has new file)                    Receiver (has existing file)
+        |                                        |
+        |                                        | 1. Read existing file block-by-block
+        |                                        | 2. Compute weak + strong hashes per block
+        |                                        | 3. Write 12-byte header + BlockHash entries
+        |   <---- Signature data (streaming) --- |
+        |                                        |
+        | 4. Parse signature header              |
+        | 5. Build hash_lookup: weak→BlockHash[] |
+        | 6. Slide window over new file:         |
+        |    - Rolling checksum per position     |
+        |    - Lookup weak hash                  |
+        |    - Verify strong hash on match       |
+        | 7. Emit OpBlock for matches,           |
+        |    OpData for differences              |
+        |                                        |
+        | --- Delta operations (streaming) --->  |
+        |                                        | 8. Process operations:
+        |                                        |    - OpBlock: copy from existing
+        |                                        |    - OpData: write new bytes
+        |                                        |    - OpHash: verify checksum
+        |                                        | 9. Atomic rename temp → dest
+```
 
 ---
 
 ## 3. Data Encoding and Stream Reassembly
 
-**Question**: When file chunks are transmitted, how are they encoded in the terminal stream, and how does the receiving side reassemble them while distinguishing transfer data from regular terminal output?
+### 3.1 Overview
 
-### 3.1 Thinking and Rationale
+This section explains how file data is encoded for safe transport through the terminal byte stream, how it is chunked for transmission, and how the receiving side distinguishes file transfer data from regular terminal output (text, ANSI escape sequences, cursor movement, etc.).
 
-The fundamental challenge is: the terminal byte stream carries both regular terminal output (text, cursor movements, colors) and file transfer data simultaneously. The solution is a layered encoding scheme:
+### 3.2 Data Encoding Pipeline
 
-1. **Protocol layer**: File data is wrapped in `FileTransmissionCommand` structs with metadata fields
-2. **Encoding layer**: Binary data is base64-encoded to be safe for terminal transport
-3. **Chunking layer**: Large data is split into 4096-byte chunks to prevent buffer overflow
-4. **Framing layer**: Each chunk is wrapped in an OSC 5113 escape sequence
-5. **Demuxing layer**: The VT parser identifies OSC 5113 and routes it separately from all other terminal data
-
-### 3.2 The FileTransmissionCommand Wire Format
-
-The Go `FileTransmissionCommand` struct (`kittens/transfer/ftc.go`, lines 120–138) and its Python mirror (`kitty/file_transmission.py`, lines 251–268) define a protocol message as a collection of typed fields. When serialized, a command becomes a semicolon-delimited string of `key=value` pairs:
+When file data (raw bytes or rsync delta operations) is ready for transmission, it passes through this encoding pipeline:
 
 ```
-ac=data;fid=1a;d=BASE64_ENCODED_FILE_DATA
+Raw bytes → [Optional zlib compression] → Base64 encoding → Embed in FTC → OSC 5113 envelope
 ```
 
-The serialization rules (implemented in `Serialize()`, `ftc.go` lines 163–222):
+#### Step 1: Optional Zlib Compression
 
-| Field Type | Encoding | Example |
-|:----------:|:--------:|:-------:|
-| Enum (`Action`, `Compression`, etc.) | Short string via `.String()` | `ac=snd`, `zip=zlib` |
-| String with `encoding:"base64"` | `base64.RawStdEncoding` (no padding) | `pw=a2l0dHk`, `n=L3RtcC9maWxl` |
-| String without base64 tag | `safe_string()` sanitization | `pr=parent_id` |
-| `[]byte` (`Data`) | `base64.RawStdEncoding` | `d=SGVsbG8gV29ybGQ` |
-| `int64` | Decimal string | `sz=102400` |
-| `fs.FileMode` | Decimal permissions | `prm=420` |
-
-### 3.3 Chunk Splitting
-
-File data can be large, so it is split into manageable chunks by `split_for_transfer()` in `kittens/transfer/ftc.go` (lines 326–338):
+The `should_be_compressed()` function in `kittens/transfer/utils.go` (lines 26–46) determines whether compression should be applied:
 
 ```go
-// kittens/transfer/ftc.go, lines 326-338
-func split_for_transfer(data []byte, file_id string, mark_last bool, callback func(*FileTransmissionCommand)) {
-    const chunk_size = 4096
-    for len(data) > 0 {
-        chunk := data
-        if len(chunk) > chunk_size {
-            chunk = data[:chunk_size]
-        }
-        data = data[len(chunk):]
-        callback(&FileTransmissionCommand{
-            Action:  utils.IfElse(mark_last && len(data) == 0, Action_end_data, Action_data),
-            File_id: file_id, Data: chunk})
-    }
+// kittens/transfer/utils.go — should_be_compressed()
+func should_be_compressed(path string, ...) bool {
+    // Skip if already compressed formats:
+    // zip, odt, odp, pptx, docx, gz, bz2, xz, svgz
+    // Also skip image and video MIME types
+    // ...
+    return true  // compress everything else
 }
 ```
 
-**Key constants**:
-- `chunk_size = 4096` (line 327): Maximum raw data bytes per chunk
-- Each intermediate chunk uses `Action_data`; the final chunk uses `Action_end_data` (line 335)
+Files with already-compressed formats (archives, office documents, images, videos) skip compression because re-compressing them wastes CPU with negligible size reduction.
 
-### 3.4 The Complete Encoding Pipeline
+When compression is enabled, zlib (RFC 1950) is used. On the Go side, `compress/zlib` wraps the data via a `ZlibCompressor` in `kittens/transfer/send.go`. On the Python side, `ZlibCompressor` and `ZlibDecompressor` classes in `kitty/file_transmission.py` and `kittens/transfer/utils.py` handle compression and decompression respectively.
 
-When the sender transmits a chunk of file data, the full encoding pipeline is:
+The compression type is communicated via the `zip` field in the `FileTransmissionCommand`: `zip=zlib` indicates compressed data.
 
-1. **Raw file bytes** → optional **zlib compression** (via `ZlibCompressor`, `send.go` lines 57–81)
-2. Compressed bytes → **base64 encoding** (`base64.RawStdEncoding`, no padding)
-3. Base64 string → embedded in the `d=` field of a `FileTransmissionCommand`
-4. Command → **semicolon-delimited serialization** via `Serialize()`
-5. Serialized string → **OSC envelope** wrapping via `send_payload()`:
+#### Step 2: Base64 Encoding
+
+After optional compression, the data bytes are base64-encoded for TTY safety. Terminal byte streams interpret certain byte values as control characters (e.g., `0x1B` as ESC, `0x07` as BEL), so raw binary data would corrupt the stream. Base64 encoding guarantees only printable ASCII characters.
+
+The `Data` field in `FileTransmissionCommand` uses **standard base64 encoding** (`base64.StdEncoding` in Go) with padding. Other binary fields (`Name`, `Status`, `Bypass`) use `base64.RawStdEncoding` (no padding).
+
+#### Step 3: Embedding in the Wire Format
+
+The base64-encoded data is placed in the `d=` field of the semicolon-delimited command string:
 
 ```
-\x1b]5113;id=REQ_ID;ac=data;fid=FID;d=BASE64_CHUNK\x1b\\
+ac=data;fid=F1;d=SGVsbG8gV29ybGQ=
 ```
 
-For the final chunk of a file:
+#### Step 4: OSC 5113 Envelope
+
+The complete command string is wrapped in the OSC envelope:
+
 ```
-\x1b]5113;id=REQ_ID;ac=end_data;fid=FID;d=BASE64_CHUNK\x1b\\
+\x1b]5113;id=REQ;ac=data;fid=F1;d=SGVsbG8gV29ybGQ=\x1b\\
 ```
 
-### 3.5 Demultiplexing in the VT Parser
+### 3.3 Chunk Splitting: `split_for_transfer()` in `kittens/transfer/ftc.go`
 
-The VT parser in `kitty/vt-parser.c` is the key to stream demultiplexing. It processes the terminal byte stream character by character through a state machine:
+Large data payloads are split into chunks of at most **4096 bytes** by the `split_for_transfer()` function (lines ~184–220 of `kittens/transfer/ftc.go`):
 
-1. When it encounters `\x1b]` (the OSC introducer), it transitions into OSC parsing mode
-2. It reads the numeric code prefix (everything before the first `;`)
-3. The code is dispatched via a `switch` statement. At line 547:
+```go
+// kittens/transfer/ftc.go — split_for_transfer()
+func (self *FileTransmissionCommand) split_for_transfer(
+    data []byte,
+    file_id string,
+    mark_last bool,
+) iter.Seq[*FileTransmissionCommand] {
+    // Splits data into 4096-byte chunks
+    // Each chunk is Action_data except the last which is Action_end_data
+}
+```
+
+The chunking rules:
+- Each chunk contains at most 4096 bytes of base64-encoded data
+- All chunks except the last use `Action_data` (`ac=data`)
+- The final chunk uses `Action_end_data` (`ac=end_data`) to signal completion
+- Each chunk includes the `fid` (file ID) to associate it with the correct file
+
+For a 100 KB file (after compression and base64 encoding), this produces approximately 25+ individual OSC escape sequences, each carrying 4096 bytes of payload.
+
+### 3.4 Stream Demultiplexing: How the VT Parser Separates Transfer Data
+
+The critical question is: how does the terminal distinguish file transfer commands from regular terminal output? The answer lies in the VT parser's escape sequence processing in `kitty/vt-parser.c`.
+
+#### 3.4.1 VT Parser Processing Model
+
+The VT parser processes the incoming byte stream character by character, maintaining a state machine. The relevant states for file transfer are:
+
+1. **Ground state**: Normal text characters are rendered to the screen
+2. **ESC state**: Entered when `\x1b` (0x1B) is encountered
+3. **OSC state**: Entered when `\x1b]` is detected (ESC followed by `]`)
+4. **OSC payload accumulation**: Characters are accumulated until the string terminator `\x1b\\` (or BEL `\x07`)
+
+When the parser encounters `\x1b]`:
+1. It enters OSC state and begins accumulating the payload
+2. It reads the numeric OSC code at the start of the payload
+3. When the string terminator `\x1b\\` is received, the complete payload is dispatched based on the code:
 
 ```c
-case FILE_TRANSFER_CODE:
-    START_DISPATCH
+// kitty/vt-parser.c — OSC dispatch
+case FILE_TRANSFER_CODE:  // 5113
     DISPATCH_OSC(file_transmission);
-    END_DISPATCH
+    break;
 ```
 
-4. If the code is **5113** (`FILE_TRANSFER_CODE`, defined in `kitty/control-codes.h` line 233), the payload is routed to the `file_transmission` handler which feeds into `kitty/file_transmission.py`
-5. All other OSC codes, CSI sequences, and plain text follow their normal terminal processing paths
+4. OSC code 5113 routes to `file_transmission`, while other codes (e.g., 52 for clipboard, 4 for color queries) follow their respective handlers
+5. Regular text and other escape sequences (CSI for cursor movement, SGR for colors) are processed normally
 
-This is how file transfer data is cleanly separated from regular terminal output: the VT parser acts as a multiplexer/demultiplexer, identifying each escape sequence by its numeric code and routing it to the appropriate handler.
+#### 3.4.2 The Demultiplexing Boundary
 
-### 3.6 Compression Strategy
+This parsing mechanism is the **demultiplexing boundary**: the VT parser inherently separates file transfer data from terminal output because:
 
-Not all files benefit from compression. The `should_be_compressed()` function in `kittens/transfer/utils.go` (lines 88–107) implements an intelligent strategy:
+- File transfer commands are always wrapped in `\x1b]5113;...\x1b\\`
+- Regular terminal text never contains the OSC 5113 prefix
+- Other escape sequences (colors, cursor movement) use different prefix bytes and codes
+- The parser's state machine ensures that file transfer payloads are never mixed with text rendering
+
+There is no explicit "mode switch" between file transfer and normal operation — they coexist in the same byte stream, demultiplexed purely by the OSC code number.
+
+### 3.5 Reassembly on the Receiving Side
+
+#### 3.5.1 Go-Side Reassembly (Kitten as Receiver)
+
+When the kitten receives files (`kittens/transfer/receive.go`), the `remote_file` struct tracks per-file state:
 
 ```go
-// kittens/transfer/utils.go, lines 88-107
-func should_be_compressed(path, strategy string) bool {
-    if strategy == "always" { return true }
-    if strategy == "never" { return false }
-    ext := strings.ToLower(filepath.Ext(path))
-    if ext != "" {
-        switch ext[1:] {
-        case "zip", "odt", "odp", "pptx", "docx", "gz", "bz2", "xz", "svgz":
-            return false
-        }
-    }
-    mt := utils.GuessMimeType(path)
-    if strings.HasSuffix(mt, "+zip") ||
-       (strings.HasPrefix(mt, "image/") && mt != "image/svg+xml") ||
-       strings.HasPrefix(mt, "video/") {
-        return false
-    }
-    return true
+// kittens/transfer/receive.go
+type remote_file struct {
+    // ...
+    patcher      *rsync.Patcher
+    expect_diff  bool
+    decompressor *flate.Reader  // zlib decompressor
+    // ...
 }
 ```
 
-Pre-compressed formats (zip, gz, bz2, xz, images, video) are skipped because compressing them again would waste CPU cycles without reducing size.
+Data reassembly:
+1. Each `Action_data` message's base64-decoded `Data` field is fed to `remote_file.write_data()`
+2. If compressed, data passes through `decompressor.Read()` first
+3. For rsync transfers, decompressed data goes to `patcher.UpdateDelta()`
+4. For simple transfers, data goes directly to the file writer
+5. `Action_end_data` triggers finalization: compressor flush, patcher finish, atomic rename
 
-**Sender-side compression** (`send.go`, lines 962–979): The `File.next_chunk()` method passes data through `self.compressor.Compress(chunk)` and calls `self.compressor.Flush()` on the final chunk.
+#### 3.5.2 Python-Side Reassembly (Terminal as Receiver)
 
-**Receiver-side decompression** (`file_transmission.py`, line 463): The `DestFile` creates the appropriate decompressor based on the command's compression field:
+When the terminal receives files (`kitty/file_transmission.py`), the `DestFile` class manages reassembly:
+
 ```python
-self.decompressor = ZlibDecompressor() if ftc.compression is Compression.zlib else IdentityDecompressor()
+# kitty/file_transmission.py — DestFile.write_data()
+def write_data(self, data: bytes, is_last: bool) -> None:
+    # 1. Decompress if needed:
+    data = self.decompressor.decompress(data)
+    # 2. Write to destination:
+    #    - For rsync: patcher.apply_delta_data(data, ...)
+    #    - For simple: self.actual_file.write(data)
+    # 3. If is_last: flush decompressor, finalize
 ```
 
-On the Go receiver side (`receive.go`, line 282): `utils.NewStreamDecompressor(zlib.NewReader, ans)` wraps the remote file's writer with a zlib decompressor.
+The `DestFile` uses either `ZlibDecompressor` or `IdentityDecompressor` based on the `compression` field, and either `PatchFile` (for rsync) or a direct file handle (for simple transfer).
+
+### 3.6 Complete Encoding Example
+
+For a 10 KB text file being sent with compression:
+
+```
+1. Read 10,240 bytes from file
+2. Zlib compress → ~3,500 bytes (typical for text)
+3. Base64 encode → ~4,668 bytes
+4. Split into chunks: chunk1 (4096 bytes) + chunk2 (572 bytes)
+5. Emit OSC messages:
+   \x1b]5113;id=REQ;ac=data;fid=F1;zip=zlib;d=<4096 bytes base64>\x1b\\
+   \x1b]5113;id=REQ;ac=end_data;fid=F1;d=<572 bytes base64>\x1b\\
+```
+
+The receiver processes these in order, base64-decodes each `d=` field, feeds the concatenated bytes through zlib decompression, and writes the resulting 10,240 bytes to disk.
 
 ---
 
 ## 4. Transfer Resumption Behavior
 
-**Question**: If a transfer is interrupted and restarted, what state allows it to resume rather than starting over, and where is resumption metadata stored?
+### 4.1 Overview
 
-### 4.1 Thinking and Rationale
+This section addresses a critical question: if a file transfer is interrupted (e.g., by network disconnection, Ctrl+C, or process termination) and then restarted, does the protocol resume from where it left off? The answer, grounded in a thorough analysis of the codebase, is that **no explicit resume mechanism exists** — but the rsync delta mechanism provides **functional equivalence** to resumption.
 
-This is perhaps the most nuanced question in the investigation. The intuitive expectation is that a sophisticated file transfer protocol would implement explicit resume support — checkpoints, partial-transfer state files, session persistence. However, a thorough examination of the codebase reveals a more elegant approach: there is **no explicit resume mechanism**, but the rsync delta transfer mechanism provides **implicit resumption efficiency** that achieves a similar practical outcome.
+### 4.2 Absence of Explicit Resume State
 
-### 4.2 No Explicit Resume Mechanism
+A comprehensive search of the file transfer codebase confirms that no persistent checkpoint or resume infrastructure exists:
 
-A search for "resume" across all transfer source files returns zero results:
+1. **No session persistence**: There are no files written to disk that track transfer session state. The `SendManager` and receiver state machines exist only in memory and are destroyed when the process exits.
 
-```bash
-$ grep -rn "resume" kittens/transfer/ kitty/file_transmission.py tools/rsync/
-# (no output)
+2. **No partial transfer tracking**: There is no mechanism to record "file F1 was 67% transferred" or "bytes 0–6890 have been committed." The protocol has no `Action_resume` or equivalent.
+
+3. **No checkpoint protocol messages**: The protocol specification in `docs/file-transfer-protocol.rst` defines no checkpoint, resume, or state-recovery commands. The only state-altering actions are `send`, `receive`, `cancel`, `finish`, and the data transfer actions.
+
+4. **Cancellation is terminal**: When a transfer is interrupted, `Action_cancel` is sent (if possible), and the terminal responds with `CANCELED` status. A restart begins a completely fresh session with a new `request_id`.
+
+### 4.3 How Interruption Is Handled
+
+When a transfer is interrupted:
+
+1. **Kitten side** (`kittens/transfer/send.go`): The signal handler catches the interrupt and the kitten sends `Action_cancel` to the terminal. If the connection is severed, no cancel message is sent.
+
+2. **Terminal side** (`kitty/file_transmission.py`): If `Action_cancel` is received, the active session is removed from `active_receives` or `active_sends`. The `DestFile` pattern uses **temp-file-then-rename**: data is written to a temporary file, and only on successful completion is the temp file atomically renamed to the final path. If interrupted, the temp file remains (and will be cleaned up by the OS or a subsequent transfer).
+
+3. **Partially transferred files**: For simple (non-rsync) transfers, a partially transferred file may exist at the destination if the transfer did not use the temp file pattern. However, this is an incomplete file, not a checkpoint.
+
+### 4.4 Rsync as Implicit Resumption
+
+The rsync delta mechanism provides **implicit resumption** that is functionally equivalent — and in many cases more efficient than — explicit resume. Here is how it works:
+
+#### 4.4.1 Existing File Detection
+
+When a new transfer session is initiated for a file that already exists at the destination (fully or partially from a previous interrupted transfer), the receiver detects it:
+
+**Python side** (`kitty/file_transmission.py` — `DestFile.__init__()`):
+```python
+# kitty/file_transmission.py — DestFile
+self.existing_stat = safe_stat(self.name)  # os.stat() with exception handling
 ```
 
-The codebase contains:
-- **No persistent checkpoint files** — no state is written to disk during a transfer
-- **No session state serialization** — transfer sessions are ephemeral, identified by random request IDs
-- **No partial-transfer tracking** — there is no mechanism to record "bytes 0–N of file X were successfully received"
-- **No resume protocol message** — the `Action` enum (`ftc.go`, lines 37–47) contains `send`, `receive`, `file`, `data`, `end_data`, `cancel`, `status`, and `finish` — but no `resume` action
+**Go side** (`kittens/transfer/receive.go` — `request_files()`):
+```go
+// For each rsync-capable file: check if it already exists at destination
+stat, err := os.Stat(destination_path)
+if err == nil {
+    // File exists — use rsync delta transfer
+    rf.patcher = rsync.NewPatcher(stat.Size())
+    rf.expect_diff = true
+}
+```
 
-### 4.3 Cancellation Behavior
+If the file exists and qualifies for rsync (regular file, > 4096 bytes), the terminal responds with `ttype=rsync` (TransmissionType_rsync) and the existing file's size, triggering the delta transfer path.
 
-When a transfer is interrupted (e.g., by Ctrl+C or network disconnection):
+#### 4.4.2 Signature-Based Delta Efficiency
 
-1. The kitten sends `Action_cancel` to the terminal (`send.go`, line 1116):
-   ```go
-   self.send_payload(FileTransmissionCommand{Action: Action_cancel}.Serialize())
-   ```
-2. The `SendManager` transitions to `SEND_CANCELED` state (line 1117)
-3. The terminal drops the active session
-4. If the user restarts the transfer, a completely new session begins with a fresh `request_id` generated by `random_id()`
+The receiver generates a signature from whatever portion of the file exists:
 
-### 4.4 Rsync-Based Implicit Resumption
+1. The receiver reads the existing file (which may be complete from a previous successful transfer, or partial from an interrupted one)
+2. For each block, it computes the weak (rolling) and strong (XXH3-64) hashes
+3. The signature is sent to the sender
 
-While there is no explicit resume, the rsync delta mechanism provides functionally equivalent behavior. Here is the key insight:
+The sender then computes a delta against this signature:
 
-When a file **already exists** at the destination (whether from a previous complete transfer, a partially-received file from an interrupted transfer, or a pre-existing file), the protocol detects this and transmits only the differences:
+1. Blocks that match the existing file → `OpBlock` (no data transmitted)
+2. Blocks that differ → `OpData` (new data transmitted)
 
-1. **Existing file detection**: In `kitty/file_transmission.py`, `DestFile.__init__()` (line 450) checks for the destination file:
-   ```python
-   self.existing_stat: Optional[os.stat_result] = os.stat(self.name, follow_symlinks=False)
-   ```
+This means:
+- **File was 90% transferred before interruption**: The signature covers the 90% that's on disk. The delta contains only the missing 10% as `OpData` plus `OpBlock` references for the existing 90%.
+- **File was fully transferred but needs update**: Only the changed portions are sent as `OpData`.
+- **File doesn't exist at all**: The entire file is sent as `OpData` (no savings, equivalent to a simple transfer).
 
-2. **Rsync-qualified response**: When the file exists and qualifies for rsync (regular file with `ttype=rsync`), the terminal responds with `status=STARTED` including the existing file's size (lines 1025–1029):
-   ```python
-   sz = df.existing_stat.st_size if df.existing_stat is not None else -1
-   ttype = TransmissionType.rsync \
-       if sz > -1 and df.ttype is TransmissionType.rsync and df.ftype is FileType.regular \
-       else TransmissionType.simple
-   self.send_status_response(code=ErrorCode.STARTED, ..., size=sz, ttype=ttype)
-   ```
+#### 4.4.3 Atomic Completion
 
-3. **Signature generation from existing file**: The terminal generates a signature from the existing file via `df.signature_iterator()` → `PatchFile(self.name, self.existing_stat.st_size)` (line 469–471):
-   ```python
-   def signature_iterator(self) -> PatchFile:
-       self.actual_file = PatchFile(self.name,
-           self.existing_stat.st_size if self.existing_stat is not None else 0)
-       return self.actual_file
-   ```
-
-4. **Delta computation**: The sender computes a delta against that signature, transmitting only the blocks that differ between the sender's file and the receiver's existing file.
-
-**Practical implication**: If a 100KB file was 90% transferred before interruption, the partially-received file (approximately 90KB) exists on disk. On re-transfer:
-- The receiver generates a signature from the existing 90KB file
-- The sender finds that ~90% of blocks match (they were already successfully received)
-- Only the remaining ~10% (the missing/different blocks) plus the signature overhead is transmitted
-
-### 4.5 Atomic File Writes Prevent Corruption
-
-The `PatchFile.close()` method in `kitty/file_transmission.py` (lines 395–407) uses atomic file operations:
+The `PatchFile` class ensures that even during delta application, the destination is protected:
 
 ```python
-# kitty/file_transmission.py, lines 390-405
-@property
-def dest_file(self) -> IO[bytes]:
-    if self._dest_file is None:
-        self._dest_file = tempfile.NamedTemporaryFile(
-            mode='wb',
-            dir=os.path.dirname(os.path.abspath(os.path.realpath(self.path))),
-            delete=False)
-    return self._dest_file
-
-def close(self) -> None:
-    # ...
-    if self.src_file is not None:
-        os.replace(self.dest_file.name, self.src_file.name)
+# kitty/file_transmission.py — PatchFile
+# 1. Creates a temp file
+# 2. Applies delta operations (reading from existing, writing to temp)
+# 3. On success: atomic rename(temp, destination)
+# 4. On failure: temp file left behind, original intact
 ```
 
-- Delta application writes to a **temporary file** (`tempfile.NamedTemporaryFile`, line 392)
-- On successful completion, `os.replace()` (line 405) atomically renames the temp file over the destination
-- If interrupted during delta application, the destination file remains intact (either the original or the previous transfer's version), ensuring no corruption
-
-The Go-side receiver in `kittens/transfer/receive.go` follows the same pattern (`patch_file.close()`, lines 83–96):
-
+On the Go side, `kittens/transfer/receive.go` follows the same pattern:
 ```go
-func (pf *patch_file) close() (err error) {
-    // ...
-    err = pf.p.FinishDelta()
-    pf.src.Close()
-    pf.temp.Close()
-    if err == nil {
-        err = os.Rename(pf.temp.Name(), pf.src.Name())
-    }
+// patch_file
+patcher.StartDelta(temp_file, source_file)
+// ... delta application ...
+patcher.FinishDelta()
+os.Rename(temp_path, destination_path)
 ```
+
+### 4.5 Comparison: Explicit Resume vs. Rsync Delta
+
+| Aspect | Explicit Resume | Rsync Delta (Kitty's Approach) |
+|--------|----------------|-------------------------------|
+| Persistent state needed? | Yes (checkpoint files on disk) | No (stateless — signature generated on-the-fly) |
+| Works with modified files? | No (only picks up from byte offset) | Yes (sends only actual differences) |
+| Overhead per restart | Low (seek to offset) | Moderate (signature generation + delta computation) |
+| Handles file modifications? | No | Yes — intrinsic capability |
+| Protocol complexity | Requires resume negotiation | Uses existing delta transfer mechanism |
+| Corruption recovery | Cannot detect corruption before resume point | Full integrity verification via XXH3-128 checksum |
+
+### 4.6 Key Insight
+
+The design choice to omit explicit resume is deliberate: the rsync delta mechanism is strictly more capable. A resume protocol can only restart from the last committed byte offset and cannot detect corruption before that point. The rsync mechanism can detect *any* difference in the existing file (corruption, partial transfer, or deliberate modification) and efficiently transmit only what is needed. The `OpHash` checksum at the end of the delta verifies the entire reconstructed file.
 
 ---
 
 ## 5. Delta Transfer Efficiency Demonstration
 
-**Question**: Provide a practical experiment that demonstrates delta transfer efficiency.
+### 5.1 Overview
 
-### 5.1 Thinking and Rationale
-
-To demonstrate delta efficiency, we need to show that when a file is mostly unchanged between transfers, the second transfer transmits substantially less data than the first. The key metric is the rsync statistics output from `print_rsync_stats()` in `kittens/transfer/utils.go` (lines 109–114), which reports the delta size, signature size, and the ratio of transmitted data to total file size.
+This section provides a practical experimental procedure that demonstrates the rsync delta transfer efficiency: transferring a file, modifying a small portion, and re-transferring to show that the second transfer sends substantially less data. The experiment includes the steps to build kitty from source, execute the transfers, and analyze the statistics output.
 
 ### 5.2 Prerequisites
 
-- **Go 1.22+** (required by `go.mod` line 3)
-- **Python 3** with development headers
-- **System build dependencies**: harfbuzz, libpng, lcms2, fontconfig, OpenSSL, libxxhash, X11/Wayland libraries
+To execute this experiment, you need:
 
-### 5.3 Step-by-Step Experiment
+1. **A built copy of kitty** with the transfer kitten
+2. **Two machines** (or a local-to-remote connection via SSH)
+3. **The `--transmit-deltas` flag** enabled for delta transfer mode
 
-**Step 1: Build kitty from source**
+### 5.3 Building Kitty from Source
+
+From the repository root:
 
 ```bash
-cd /path/to/kitty/repository
+# Ensure Go 1.22+ is available
+export PATH=/usr/local/go/bin:$PATH
+go version  # should report go1.22.x
+
+# Build kitty (ignoring Wayland-related warnings)
 python3 setup.py build --ignore-compiler-warnings
 ```
 
-The `--ignore-compiler-warnings` flag is needed because the Wayland backend triggers `-Werror` warnings for new `XDG_TOPLEVEL_STATE_*` enum values.
+The build compiles:
+- All Go packages (including `kittens/transfer/` and `tools/rsync/`)
+- All C source files (including the rsync C extension `kittens/transfer/algorithm.c`)
+- The Python extension modules
+- The kitty launcher binary
 
-**Step 2: Create a test file exceeding 4096 bytes**
+### 5.4 Understanding the Statistics Output
 
-The rsync capability threshold is 4096 bytes (`kittens/transfer/send.go`, line 131):
-
-```bash
-dd if=/dev/urandom of=/tmp/test_transfer_file bs=1024 count=100
-# Creates a 100KB file of random data
-```
-
-**Step 3: Perform the initial transfer**
-
-```bash
-kitten transfer --transmit-deltas /tmp/test_transfer_file /tmp/dest_transfer_file
-```
-
-On the first transfer, there is no existing file at the destination, so the full file data is transmitted. The rsync statistics would show delta+signature close to the total file size.
-
-**Step 4: Modify a small portion of the file**
-
-```bash
-printf 'MODIFIED' | dd of=/tmp/test_transfer_file bs=1 seek=50000 count=8 conv=notrunc
-# Changes only 8 bytes in the middle of the 100KB file
-```
-
-**Step 5: Re-transfer with delta mode**
-
-```bash
-kitten transfer --transmit-deltas /tmp/test_transfer_file /tmp/dest_transfer_file
-```
-
-Now the destination file exists from the first transfer. The receiver generates a signature, the sender computes a delta, and only the changed blocks are transmitted.
-
-**Step 6: Observe rsync statistics**
-
-The `print_rsync_stats()` function (`kittens/transfer/utils.go`, lines 109–114) outputs:
+The `print_rsync_stats()` function in `kittens/transfer/utils.go` (lines 48–62) produces the statistics that quantify delta efficiency:
 
 ```go
+// kittens/transfer/utils.go — print_rsync_stats()
 func print_rsync_stats(total_bytes, delta_bytes, signature_bytes int64) {
-    fmt.Println("Rsync stats:")
-    fmt.Printf("  Delta size: %s Signature size: %s\n",
-        humanize.Size(delta_bytes), humanize.Size(signature_bytes))
-    frac := float64(delta_bytes+signature_bytes) / float64(utils.Max(1, total_bytes))
-    fmt.Printf("  Transmitted: %s of a total of %s (%.1f%%)\n",
-        humanize.Size(delta_bytes+signature_bytes), humanize.Size(total_bytes), frac*100)
+    // Prints:
+    // - Total data size
+    // - Delta data size (new data transmitted)
+    // - Signature size (hash data exchanged)
+    // - Transmission percentage: (delta + signature) / total * 100
 }
 ```
 
-Expected output for the second transfer (approximate):
-```
-Rsync stats:
-  Delta size: 1.2 KB  Signature size: 6.4 KB
-  Transmitted: 7.6 KB of a total of 100.0 KB (7.6%)
-```
+The key metric is the **transmission percentage**: `(delta_bytes + signature_bytes) / total_bytes * 100`. For an effective delta transfer, this should be significantly less than 100%.
 
-The delta should be very small (only the modified block plus overhead), and the signature size is proportional to `file_size / block_size * BlockHashSize`. The transmitted fraction should be a small percentage of the total file size.
+### 5.5 Experimental Procedure
 
-### 5.4 How Statistics Are Triggered
+#### Step 1: Create a Test File
 
-In `send_loop()` (`send.go`, lines 1251–1262), after the transfer completes:
-
-```go
-// kittens/transfer/send.go, lines 1251-1261
-p := handler.manager.progress_tracker
-if handler.manager.has_rsync && p.total_transferred+int64(p.signature_bytes) > 0 && lp.ExitCode() == 0 {
-    var tsf int64
-    for _, f := range files {
-        if f.ttype == TransmissionType_rsync {
-            tsf += f.file_size
-        }
-    }
-    if tsf > 0 {
-        print_rsync_stats(tsf, p.total_transferred, int64(p.signature_bytes))
-    }
-}
-```
-
-The `has_rsync` flag is set to `true` when any file uses `TransmissionType_rsync` (line 700). The total file size of rsync-type files, the delta bytes transferred (`p.total_transferred`), and signature bytes received (`p.signature_bytes`, accumulated in `on_signature_data_received()` at line 783) are passed to `print_rsync_stats()`.
-
-### 5.5 Cleanup
+The file must exceed 4096 bytes (the rsync capability threshold from `kittens/transfer/send.go`):
 
 ```bash
-rm -f /tmp/test_transfer_file /tmp/dest_transfer_file
+# Create a 100 KB test file with reproducible content
+dd if=/dev/urandom bs=1024 count=100 of=/tmp/test_transfer_file.bin
+```
+
+#### Step 2: Initial Transfer
+
+Using the SSH kitten for the connection and the transfer kitten with delta mode:
+
+```bash
+# SSH into the remote machine using kitty's SSH kitten
+kitten ssh user@remote-host
+
+# On the remote host, transfer the file to the local machine
+kitten transfer --transmit-deltas /tmp/test_transfer_file.bin /tmp/received_file.bin
+```
+
+The first transfer sends the entire file because no copy exists at the destination. The rsync statistics will show approximately 100% transmission.
+
+#### Step 3: Modify a Small Portion
+
+```bash
+# Modify 100 bytes at offset 50,000 (0.1% of the file)
+printf '%0100d' 42 | dd of=/tmp/test_transfer_file.bin bs=1 seek=50000 conv=notrunc
+```
+
+#### Step 4: Re-Transfer with Delta Mode
+
+```bash
+# Transfer again with delta mode
+kitten transfer --transmit-deltas /tmp/test_transfer_file.bin /tmp/received_file.bin
+```
+
+This time:
+1. The receiver reads the existing `/tmp/received_file.bin` (from the first transfer)
+2. A signature is generated: `block_size = round(sqrt(102400)) ≈ 320 bytes`, producing approximately 320 block hashes (320 × 20 bytes = 6,400 bytes of signature data)
+3. The sender computes a delta against the signature
+4. Only the modified block(s) containing the 100 changed bytes are sent as `OpData`
+5. All other blocks match and are referenced as `OpBlock`/`OpBlockRange`
+
+#### Step 5: Analyze the Output
+
+The rsync statistics from `print_rsync_stats()` will show:
+
+```
+Total data: 102400 bytes
+Delta data: ~640 bytes (the modified block + surrounding context)
+Signature data: ~6412 bytes (12-byte header + 320 × 20-byte block hashes)
+Transmission: ~6.9% of total
+```
+
+This demonstrates that the second transfer sent approximately **7%** of the data instead of the full 100%, confirming that the rsync algorithm detected the unchanged blocks via weak/strong hash comparison and only transmitted the modified portions.
+
+#### Step 6: Cleanup
+
+```bash
+# Remove all temporary test files
+rm -f /tmp/test_transfer_file.bin /tmp/received_file.bin
+```
+
+### 5.6 Why Delta Transfer Works
+
+The efficiency comes from the rsync algorithm's three-stage pipeline:
+
+1. **Signature generation (receiver)**: The receiver's existing file is divided into blocks of `sqrt(file_size)` bytes. Each block produces a 20-byte hash entry. For a 100 KB file, this is approximately 6.4 KB of signature data — far less than retransmitting the file.
+
+2. **Delta computation (sender)**: The sender's rolling checksum slides one byte at a time across the new file. For each position, it computes the 4-byte weak hash in O(1) time. Only when a weak hash matches a signature entry does it compute the more expensive 8-byte XXH3-64 strong hash. This two-level hashing ensures both speed (most positions are rejected by the fast weak hash) and accuracy (strong hash eliminates false positives).
+
+3. **Delta application (receiver)**: The receiver processes the compact delta stream, copying unchanged blocks from the existing file and writing new data from `OpData` operations. The final `OpHash` (XXH3-128 of the complete file) verifies the reconstruction is correct.
+
+### 5.7 When Delta Transfer Is Not Beneficial
+
+The `--transmit-deltas` flag is not always faster, as noted in the official documentation (`docs/kittens/transfer.rst`):
+
+> Note that this will actually be slower when transferring small files or on a very fast network, because of round trip overhead, so use with care.
+
+Cases where delta transfer adds overhead without benefit:
+- **Small files (≤4096 bytes)**: Below the rsync capability threshold; transferred in full
+- **Completely new files**: No existing copy at destination; entire file sent as `OpData` plus the signature round-trip overhead
+- **Very fast networks**: The time saved by sending less data is offset by the additional round trips for signature exchange
+- **Heavily modified files**: If most of the file has changed, the delta is nearly as large as the full file, but with added signature overhead
+
+### 5.8 Rsync Test Validation
+
+The rsync algorithm's correctness is validated by the test suite in `tools/rsync/api_test.go` and `kitty_tests/file_transmission.py`. The `TestRsyncRoundtrip` test verifies that:
+
+1. A file can be reconstructed from a signature + delta
+2. Small modifications produce compact deltas
+3. Truncated files are handled correctly
+4. Identical files produce zero-data deltas
+5. The XXH3-128 checksum catches any reconstruction errors
+
+Running the Go tests confirms the algorithm works correctly:
+
+```bash
+$ go test ./tools/rsync/... -v
+=== RUN   TestRsyncRoundtrip
+--- PASS: TestRsyncRoundtrip
+=== RUN   TestRsyncHashers
+--- PASS: TestRsyncHashers
+PASS
 ```
 
 ---
 
-## 6. Data Flow Architecture
+## Appendix A: Architecture Summary
 
-### 6.1 Architecture Diagram
+### A.1 Component Map
 
-```mermaid
-graph TB
-    subgraph "Remote Host (via SSH)"
-        TK["Transfer Kitten (Go)<br/>kittens/transfer/send.go<br/>kittens/transfer/receive.go"]
-        RE["Rsync Engine (Go)<br/>tools/rsync/algorithm.go<br/>tools/rsync/api.go"]
-        FTC_GO["Protocol Model (Go)<br/>kittens/transfer/ftc.go"]
-    end
-
-    subgraph "SSH Transport"
-        SSH["SSH Kitten<br/>kittens/ssh/main.go"]
-    end
-
-    subgraph "Local Terminal (kitty)"
-        VTP["VT Parser<br/>kitty/vt-parser.c<br/>OSC 5113 routing"]
-        FT["FileTransmission<br/>kitty/file_transmission.py"]
-        RE_PY["Rsync C Extension<br/>kittens/transfer/algorithm.c"]
-        FTC_PY["Protocol Model (Python)<br/>FileTransmissionCommand dataclass"]
-    end
-
-    TK -->|"Serialized FTC<br/>(OSC 5113 envelope)"| SSH
-    TK <-->|"Differ/Patcher API"| RE
-    TK -->|"Serialize commands"| FTC_GO
-    SSH -->|"Terminal byte stream"| VTP
-    VTP -->|"Raw payload string"| FT
-    FT <-->|"Patcher/Differ"| RE_PY
-    FT -->|"Serialize responses"| FTC_PY
-    FT -->|"send_escape_code_to_child<br/>(OSC 5113 response)"| VTP
-    VTP -->|"Response to kitten"| SSH
-    SSH -->|"Response bytes"| TK
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        SSH Connection                               │
+│  kitten ssh (kittens/ssh/main.go)                                  │
+│  - Establishes SSH session                                          │
+│  - Bootstraps shell integration on remote                           │
+│  - Makes 'kitten' binary available remotely via tarball upload      │
+│  - Enables 'kitten transfer' to execute on remote host              │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ Terminal byte stream
+┌───────────────────────────┴─────────────────────────────────────────┐
+│                  Transfer Kitten (Go)                               │
+│  CLI Entry: kittens/transfer/main.go                                │
+│  Sender:    kittens/transfer/send.go    (SendManager state machine) │
+│  Receiver:  kittens/transfer/receive.go (Receiver state machine)    │
+│  Protocol:  kittens/transfer/ftc.go     (Wire format model)         │
+│  Utilities: kittens/transfer/utils.go   (bypass, compression, stats)│
+│                            │                                        │
+│                   ┌────────┴────────┐                               │
+│                   │  Rsync Engine   │                               │
+│                   │  tools/rsync/   │                               │
+│                   │  algorithm.go   │ Core: BlockHash, rolling      │
+│                   │  api.go         │ checksum, diff, ApplyDelta    │
+│                   └─────────────────┘                               │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ OSC 5113 escape sequences
+┌───────────────────────────┴─────────────────────────────────────────┐
+│                   VT Parser (C)                                     │
+│  kitty/vt-parser.c — Routes OSC 5113 to file_transmission handler   │
+│  kitty/control-codes.h — #define FILE_TRANSFER_CODE 5113            │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ Dispatch
+┌───────────────────────────┴─────────────────────────────────────────┐
+│                Terminal Host (Python)                                │
+│  kitty/file_transmission.py                                         │
+│  - FileTransmission: Session orchestrator                           │
+│  - ActiveReceive: Terminal receives files from kitten               │
+│  - ActiveSend: Terminal sends files to kitten                       │
+│  - DestFile: Destination file writer with decompression             │
+│  - SourceFile: Source file reader with delta generation              │
+│  - PatchFile: Rsync delta application with temp-file-then-rename    │
+│                            │                                        │
+│                   ┌────────┴────────┐                               │
+│                   │  C Extension    │                               │
+│                   │  algorithm.c    │ Python-side Patcher/Differ    │
+│                   │  rsync.pyi      │ Type stubs                    │
+│                   └─────────────────┘                               │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 Layer Summary
+### A.2 Key Constants
 
-| Layer | Component | File(s) | Role |
-|:-----:|:---------:|:-------:|:----:|
-| 1 | Transfer Kitten | `kittens/transfer/send.go`, `receive.go` | Protocol state machine, file discovery, chunk management |
-| 2 | Rsync Engine | `tools/rsync/algorithm.go`, `api.go` | Signature generation, delta computation, delta application |
-| 3 | Protocol Model | `kittens/transfer/ftc.go` (Go), `kitty/file_transmission.py` (Python) | Wire format serialization/deserialization |
-| 4 | SSH Transport | `kittens/ssh/main.go` | Connection establishment, shell integration bootstrap |
-| 5 | VT Parser | `kitty/vt-parser.c`, `kitty/control-codes.h` | Escape code routing, OSC 5113 demultiplexing |
-| 6 | File Transfer Handler | `kitty/file_transmission.py` | Session management, permission handling, file I/O |
+| Constant | Value | Location | Purpose |
+|----------|-------|----------|---------|
+| `FILE_TRANSFER_CODE` | 5113 | `kitty/control-codes.h` | OSC code for file transfer |
+| `DefaultBlockSize` | 6144 | `tools/rsync/algorithm.go` | Standalone default block size |
+| `MaxBlockSize` | 1,048,576 (1 MB) | `tools/rsync/api.go` | Maximum block size cap |
+| `BlockHashSize` | 20 | `tools/rsync/algorithm.go` | Bytes per signature block entry |
+| Chunk size limit | 4096 | `kittens/transfer/ftc.go` | Maximum base64 data per OSC message |
+| Rsync threshold | 4096 | `kittens/transfer/send.go` | Minimum file size for rsync eligibility |
 
----
+### A.3 Wire Protocol Quick Reference
 
-## 7. Protocol State Machine
-
-### 7.1 Send Session State Machine
-
-The sender kitten (`kittens/transfer/send.go`) follows this state machine:
-
-```mermaid
-stateDiagram-v2
-    [*] --> SEND_WAITING_FOR_PERMISSION: initialize()<br/>sends Action_send
-    SEND_WAITING_FOR_PERMISSION --> SEND_PERMISSION_GRANTED: status=OK received
-    SEND_WAITING_FOR_PERMISSION --> SEND_PERMISSION_DENIED: status≠OK received
-    SEND_PERMISSION_DENIED --> SEND_CANCELED: abort_transfer()
-    SEND_PERMISSION_GRANTED --> SendingMetadata: send_file_metadata()<br/>sends Action_file per file
-
-    state SendingMetadata {
-        [*] --> PerFile
-        PerFile --> PerFile: next file
-    }
-
-    SendingMetadata --> FileTransfer: All metadata sent
-
-    state FileTransfer {
-        [*] --> WAITING_FOR_START
-        WAITING_FOR_START --> WAITING_FOR_DATA: status=STARTED,ttype=rsync<br/>creates Differ
-        WAITING_FOR_START --> TRANSMITTING: status=STARTED,ttype=simple
-        WAITING_FOR_DATA --> TRANSMITTING: signature received<br/>start_delta_calculation()
-        TRANSMITTING --> FINISHED: all chunks sent
-        FINISHED --> ACKNOWLEDGED: status=OK received
-    }
-
-    FileTransfer --> TransferComplete: All files ACKNOWLEDGED
-    TransferComplete --> [*]: sends Action_finish
-
-    SEND_PERMISSION_GRANTED --> SEND_CANCELED: user cancels
+**OSC envelope format:**
+```
+\x1b]5113;id=<request_id>;<serialized_fields>\x1b\\
 ```
 
-**State definitions** (`send.go`, lines 277–283):
-- `SEND_WAITING_FOR_PERMISSION` (line 280): Initial state, awaiting terminal's permission response
-- `SEND_PERMISSION_GRANTED` (line 281): Permission received, ready to send file metadata
-- `SEND_PERMISSION_DENIED` (line 282): Permission denied, transfer aborted
-- `SEND_CANCELED` (line 283): Transfer canceled by user or error
-
-**Per-file states** (`send.go`, lines 36–43):
-- `WAITING_FOR_START` (line 38): File metadata sent, awaiting terminal's acknowledgment
-- `WAITING_FOR_DATA` (line 39): For rsync files — awaiting signature data from terminal
-- `TRANSMITTING` (line 40): Actively sending file data (raw or delta) chunks
-- `FINISHED` (line 41): All chunks sent, awaiting final acknowledgment
-- `ACKNOWLEDGED` (line 42): Terminal confirmed successful receipt
-
-### 7.2 Receive Session State Machine
-
-The receiver kitten (`kittens/transfer/receive.go`) follows this state machine:
-
-```mermaid
-stateDiagram-v2
-    [*] --> state_waiting_for_permission: start_transfer()<br/>sends Action_receive + file specs
-    state_waiting_for_permission --> state_waiting_for_file_metadata: status=OK received
-    state_waiting_for_permission --> state_canceled: status≠OK or cancel
-    state_waiting_for_file_metadata --> state_transferring: File metadata received<br/>request_files() generates signatures
-    state_transferring --> [*]: All files received and finalized
-    state_transferring --> state_canceled: Error or cancel
+**Serialized field format** (semicolon-delimited key=value pairs):
+```
+ac=<action>;fid=<file_id>;n=<base64_name>;sz=<size>;d=<base64_data>;...
 ```
 
-**State definitions** (`receive.go`, lines 36–41):
-- `state_waiting_for_permission` (line 37)
-- `state_waiting_for_file_metadata` (line 38)
-- `state_transferring` (line 39)
-- `state_canceled` (line 40)
+**Action codes:**
+| Short | Full Name | Direction | Purpose |
+|-------|-----------|-----------|---------|
+| `snd` | send | Kitten → Terminal | Initiate send session |
+| `rec` | receive | Kitten → Terminal | Initiate receive session |
+| `file` | file | Both | File metadata |
+| `data` | data | Both | Data chunk |
+| `end_data` | end_data | Both | Final data chunk |
+| `st` | status | Terminal → Kitten | Status response |
+| `cncl` | cancel | Both | Cancel session |
+| `fin` | finish | Kitten → Terminal | Finalize session |
 
-### 7.3 Rsync Data Flow During a Send Session
+### A.4 Source Files Reference
 
-The following sequence shows the rsync-specific message exchange during a file send with delta transfer:
-
-```mermaid
-sequenceDiagram
-    participant K as Transfer Kitten
-    participant T as Kitty Terminal
-
-    Note over K: File has ttype=rsync
-
-    K->>T: Action_file (fid=1, ttype=rsync, name=path, ...)
-    T->>K: Action_status (fid=1, status=STARTED, ttype=rsync, size=existing_size)
-
-    Note over T: Terminal generates signature<br/>from existing file via PatchFile
-
-    loop Signature blocks
-        T->>K: Action_data (fid=1, data=signature_chunk)
-    end
-    T->>K: Action_end_data (fid=1)
-
-    Note over K: Kitten creates Differ<br/>differ.AddSignatureData()<br/>differ.FinishSignatureData()<br/>differ.CreateDelta()
-
-    loop Delta chunks (4096 bytes each)
-        K->>T: Action_data (fid=1, data=compressed_delta_chunk)
-    end
-    K->>T: Action_end_data (fid=1)
-
-    Note over T: Terminal applies delta<br/>via PatchFile.write()<br/>patcher.apply_delta_data()
-
-    T->>K: Action_status (fid=1, status=OK)
-    K->>T: Action_finish
-```
-
----
-
-*This document was generated as part of a comprehensive investigation into kitty's file transfer protocol. All code references have been verified against the source repository on the `kitty_815df1e210e0` branch. No source files were modified during this investigation.*
+| File | Lines | Role |
+|------|-------|------|
+| `kittens/transfer/main.go` | 71 | CLI entry point, direction dispatch |
+| `kittens/transfer/ftc.go` | 338 | Wire format model, serialization, chunk splitting |
+| `kittens/transfer/send.go` | 1288 | Sender state machine, rsync integration |
+| `kittens/transfer/receive.go` | 650+ | Receiver state machine, signature generation |
+| `kittens/transfer/utils.go` | 114 | Bypass encryption, compression checks, stats |
+| `kittens/transfer/utils.py` | 63 | Python-side path and compression utilities |
+| `kittens/transfer/algorithm.c` | — | C extension for Python-side rsync operations |
+| `kittens/transfer/rsync.pyi` | 48 | Python type stubs for C extension |
+| `tools/rsync/algorithm.go` | 655 | Core rsync: hashing, diff, delta application |
+| `tools/rsync/api.go` | 287 | Public API: Patcher, Differ, signature header |
+| `kitty/file_transmission.py` | 1248 | Terminal host: sessions, files, rsync integration |
+| `kitty/control-codes.h` | — | `#define FILE_TRANSFER_CODE 5113` |
+| `kitty/vt-parser.c` | — | OSC dispatch to file_transmission handler |
+| `kittens/ssh/main.go` | 841 | SSH kitten: connection, bootstrap, binary upload |
+| `docs/file-transfer-protocol.rst` | 500+ | Official protocol specification |
