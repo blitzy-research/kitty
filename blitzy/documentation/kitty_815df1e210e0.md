@@ -15,7 +15,7 @@ Every claim in this document is traced to specific source file locations within 
   - [B.1 Default Macros (LineBuf Specialization)](#b1-default-macros-linebuf-specialization)
   - [B.2 HistoryBuf Specialization](#b2-historybuf-specialization)
   - [B.3 Critical Difference: Buffer Overflow Handling](#b3-critical-difference-buffer-overflow-handling)
-- [C. Screen ↔ Scrollback Interaction During Resize](#c-screen--scrollback-interaction-during-resize)
+- [C. Screen-Scrollback Interaction During Resize](#c-screen-scrollback-interaction-during-resize)
   - [C.1 `screen_resize()` Phase-by-Phase](#c1-screen_resize-phase-by-phase)
   - [C.2 Resize Pipeline Diagram](#c2-resize-pipeline-diagram)
 - [D. Line Continuation State Propagation](#d-line-continuation-state-propagation)
@@ -292,7 +292,7 @@ This is the most complex macro. It:
 2. If the destination buffer is full (`dest_y >= dest->ynum - 1`):
    - Scrolls the buffer up by one line via `linebuf_index(dest, 0, dest->ynum - 1)` (`kitty/line-buf.c:316–327`), which rotates the `line_map[]` array
    - If a `historybuf` is provided, pushes the bottom line (which is about to be overwritten) to the history buffer via `historybuf_add_line()` (`kitty/history.c:286–291`)
-   - Clears the new bottom line via `linebuf_clear_line()` (`kitty/line-buf.c:299–305`), which internally uses `clear_chars_in_line()` from `kitty/lineops.h:32–39` to zero out all CPU and GPU cells
+   - Clears the new bottom line via `linebuf_clear_line()` (`kitty/line-buf.c:299–305`), which internally uses `clear_chars_in_line()` from `kitty/lineops.h:30–37` to zero out all CPU and GPU cells
 3. If the buffer is not full, simply increments `dest_y`
 4. Initializes the new destination line and copies source line attributes
 
@@ -354,9 +354,9 @@ The fundamental architectural difference between the two specializations lies in
 
 ---
 
-## C. Screen ↔ Scrollback Interaction During Resize
+## C. Screen-Scrollback Interaction During Resize
 
-The `screen_resize()` function in `kitty/screen.c:345–463` orchestrates the complete resize pipeline, coordinating reflow of both the visible screen buffer (`LineBuf`) and the scrollback history buffer (`HistoryBuf`). The `Screen` struct that owns these buffers is defined in `kitty/screen.h:38–170`, containing `main_linebuf`, `alt_linebuf`, `historybuf`, cursor objects, savepoints, `prompt_settings`, and the `paused_rendering` state.
+The `screen_resize()` function in `kitty/screen.c:345–463` orchestrates the complete resize pipeline, coordinating reflow of both the visible screen buffer (`LineBuf`) and the scrollback history buffer (`HistoryBuf`). The `Screen` struct that owns these buffers is defined in `kitty/screen.h:88–170`, containing `main_linebuf`, `alt_linebuf`, `historybuf`, cursor objects, savepoints, `prompt_settings`, and the `paused_rendering` state.
 
 ### C.1 `screen_resize()` Phase-by-Phase
 
@@ -410,7 +410,7 @@ if (is_main) {
 `prevent_current_prompt_from_rewrapping()` (`kitty/screen.c:302–343`) scans backwards from `cursor->y` looking for `PROMPT_START` or `SECONDARY_PROMPT` markers in `LineAttrs.prompt_kind` (`kitty/data-types.h:230,236`). If found:
 - All lines from the prompt through the end of the screen are copied into `prompt_copy`
 - These lines are blanked in the main buffer
-- A fake space character is inserted at `cursor->x` on lines at or below the cursor to prevent "beyond content" detection during rewrap
+- A fake space character is inserted at position 0 (`cpu_cells[0]`) on lines from the prompt start through the cursor line (`y <= cursor->y`) to prevent "beyond content" detection during rewrap
 - The function is gated by `self->prompt_settings.redraws_prompts_at_all` (`kitty/screen.c:305`)
 
 This mechanism prevents the shell prompt from being reflowed, which would confuse the shell's own redraw logic (particularly visible with zsh right-side prompts).
@@ -477,7 +477,19 @@ if (is_main && OPT(scrollback_fill_enlarged_window)) {
 
 When `scrollback_fill_enlarged_window` is enabled and the main screen is active, this loop fills newly available space at the top of an enlarged window by popping lines from the history buffer (`historybuf_pop_line()` at `kitty/history.c:293–300`). Each popped line is inserted at the top via `INDEX_DOWN` (reverse scroll, `kitty/screen.c:289–299`) followed by `linebuf_copy_line_to()`. The cursor position and savepoint are adjusted to maintain relative positioning.
 
-**Phase 10: Prompt Restore** (`kitty/screen.c:444–461`)
+**Phase 10: Dummy Char Cleanup** (`kitty/screen.c:439–443`)
+
+```c
+if (dummy_output_inserted && self->cursor->y < self->lines) {
+    linebuf_init_line(self->linebuf, self->cursor->y);
+    self->linebuf->line->cpu_cells[0].ch = 0;
+    self->cursor->x = 0;
+}
+```
+
+If a dummy `'<'` character was inserted in Phase 1, it is cleared and the cursor is reset to x=0.
+
+**Phase 11: Prompt Restore** (`kitty/screen.c:444–461`)
 
 ```c
 if (num_of_prompt_lines) {
@@ -495,18 +507,6 @@ if (num_of_prompt_lines) {
 
 The saved prompt lines are copied back to prevent flickering during shell redraw. The copy starts at `cursor->y - num_of_prompt_lines_above_cursor`, placing the prompt at the correct position relative to the new cursor.
 
-**Phase 11: Dummy Char Cleanup** (`kitty/screen.c:439–443`)
-
-```c
-if (dummy_output_inserted && self->cursor->y < self->lines) {
-    linebuf_init_line(self->linebuf, self->cursor->y);
-    self->linebuf->line->cpu_cells[0].ch = 0;
-    self->cursor->x = 0;
-}
-```
-
-If a dummy `'<'` character was inserted in Phase 1, it is cleared and the cursor is reset to x=0.
-
 ### C.2 Resize Pipeline Diagram
 
 ```mermaid
@@ -520,8 +520,8 @@ flowchart TD
     AltLB --> Finalize["Phase 7: Finalize<br/>Update dimensions, tabstops<br/>Clear selections, clamp cursors"]
     Finalize --> Beyond["Phase 8: Beyond-Content<br/>Adjust cursor if past content"]
     Beyond --> Fill["Phase 9: Scrollback Fill<br/>Pop history → fill top<br/>(if scrollback_fill_enlarged_window)"]
-    Fill --> DummyClean["Phase 11: Dummy Cleanup"]
-    DummyClean --> PromptRestore["Phase 10: Prompt Restore<br/>Copy saved prompt lines back"]
+    Fill --> DummyClean["Phase 10: Dummy Cleanup"]
+    DummyClean --> PromptRestore["Phase 11: Prompt Restore<br/>Copy saved prompt lines back"]
 ```
 
 ---
@@ -977,7 +977,7 @@ The test file `kitty_tests/screen.py` contains three test methods that exercise 
 ### `test_resize()` (`kitty_tests/screen.py:280–306`)
 
 Tests basic width and height changes:
-- **Width reduction** (5→10 columns): Draws 5 lines of 5 characters each, resizes to 10 columns. Verifies that lines are joined: `'0'*5 + '1'*5` on a single row.
+- **Width increase** (5→10 columns): Draws 5 lines of 5 characters each, resizes to 10 columns. Verifies that lines are joined: `'0'*5 + '1'*5` on a single row.
 - **Dramatic narrowing** (10→1): Resizes to 1 column. Verifies content is preserved in history: `'3\n3\n3\n3\n3\n2'`.
 - **Width reduction then expansion**: Draws content at 5 columns, resizes to 3, then verifies that drawing new content and resizing back to 7 produces correct results: `'xxx\nxx\nbb\n\n'`.
 
