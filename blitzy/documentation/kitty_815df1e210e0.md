@@ -354,7 +354,7 @@ This is the most important architectural detail regarding font fallback in kitty
 6. **Deduplication:** Before creating a new face, existing fallback faces are checked via `iter_fallback_faces()` and `face_equals_descriptor()` (lines 478–479). If a match is found, the existing index is returned to avoid duplicate face loading.
 7. **Face creation:** If no existing face matches, `face_from_descriptor()` creates a new face from the matched descriptor (line 481).
 
-**Note:** FontConfig is dynamically loaded at runtime via `dlopen("libfontconfig.so")` (`kitty/fontconfig.c`, lines 19–20), not statically linked. This means FontConfig symbols are loaded through function pointers stored in the `dynamically_loaded_fc_symbol` struct (lines 45+).
+**Note:** FontConfig is dynamically loaded at runtime via `dlopen("libfontconfig.so")` (`kitty/fontconfig.c`, line 91; handle declared at line 20), not statically linked. This means FontConfig symbols are loaded through function pointers stored in the `dynamically_loaded_fc_symbol` struct (lines 45+).
 
 #### macOS (CoreText)
 
@@ -982,7 +982,7 @@ If `--debug-font-fallback` is set, the loaded font information is printed to std
 |---|---|---|---|
 | **HarfBuzz** | ≥ 1.5 | Enforced at build time by `setup.py`: `at_least_version('harfbuzz', 1, 5)` | OpenType text shaping: ligatures, mark attachment, script/direction detection |
 | **FreeType** | System library | Linked via `setup.py` build system | Glyph rasterization, cell metric computation, font face loading |
-| **FontConfig** | System library | Dynamically loaded via `dlopen("libfontconfig.so")` in `kitty/fontconfig.c` (line 20) | Linux font discovery, matching, and fallback face creation |
+| **FontConfig** | System library | Dynamically loaded via `dlopen("libfontconfig.so")` in `kitty/fontconfig.c` (line 91) | Linux font discovery, matching, and fallback face creation |
 | **CoreText** | System framework | macOS system framework | macOS font discovery, matching, and fallback via `CTFontCreateForString` |
 | **OpenGL** | ≥ 3.1 (Linux) / ≥ 3.3 (macOS) | `kitty/data-types.h` lines 20–24 | GPU rendering: `GL_TEXTURE_2D_ARRAY`, `GL_SRGB8_ALPHA8`, sprite atlas |
 | **GLSL** | 140 | `kitty/data-types.h` line 26: `#define GLSL_VERSION 140` | Shader language version for cell/fragment shaders |
