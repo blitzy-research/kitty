@@ -141,7 +141,7 @@ The number of segments required for a given `scrollback_lines` setting is `ceil(
 | 10,000 | 5 (10240 ≥ 10000) | ~25.0 MB | ~41.3 MB | ~62.5 MB |
 | 50,000 | 25 (51200 ≥ 50000) | ~125 MB | ~206 MB | ~313 MB |
 | 100,000 | 49 (100352 ≥ 100000) | ~245 MB | ~404 MB | ~613 MB |
-| 500,000 | 245 (501760 ≥ 500000) | ~1,225 MB ≈ 1.2 GB | ~2.0 GB | ~3.1 GB |
+| 500,000 | 245 (501760 ≥ 500000) | ~1,225 MB ≈ 1.2 GB | ~2.0 GB | ~3.0 GB |
 
 **Negative (Infinite) Scrollback:** The `scrollback_lines()` parser in `kitty/options/utils.py:557-561` converts any negative value to `2^32 - 1` (4,294,967,295):
 
@@ -348,13 +348,13 @@ if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_
 
 This means: when the user is scrolled back (`scrolled_by > 0`) and new lines are added to the history buffer, `scrolled_by` is automatically incremented by the number of new lines added. This **keeps the user's view position stable** — the visible content doesn't shift even as new lines are pushed into the history above the viewport.
 
-The `history_line_added_count` is captured at line 2756 and represents how many lines were added to history since the last render cycle. After the adjustment, it is reset via `screen_reset_dirty()` at line 2759.
+The `history_line_added_count` is captured into a local variable at line 2756, representing how many lines were added to history since the last render cycle. The screen's dirty state is then reset via `screen_reset_dirty()` at line 2759 before the `scrolled_by` adjustment at line 2761 — the captured local variable is unaffected by the reset, so both operations work independently.
 
 ### 2.5 Pause Rendering Mechanism
 
 `screen_pause_rendering()` at `kitty/screen.c:2506-2544` provides a mechanism for applications to freeze the visual state while performing rapid updates:
 
-- **Activation:** Triggered by the DCS escape sequence `\x1b[?2026h` (Synchronized Updates protocol)
+- **Activation:** Triggered by the CSI private mode set sequence `\x1b[?2026h` (Synchronized Updates protocol)
 - **Behavior when paused** (`paused_rendering.expires_at` is set):
   - A snapshot of the current screen state is captured: line buffer, cursor, color profile, selections (lines 2524-2542)
   - The renderer uses this snapshot instead of the live state (`cell_prepare_to_render()` checks `screen->paused_rendering.expires_at` at line 416)
