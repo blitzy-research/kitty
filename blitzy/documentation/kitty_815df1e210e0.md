@@ -96,10 +96,11 @@ typedef enum { LIGA_FEATURE, DLIG_FEATURE, CALT_FEATURE } HBFeature;  // line 45
 **Key observations:**
 
 - **Single global buffer:** A single `hb_buffer_t` is created once and reused for all shaping operations across all font groups and windows. This avoids per-shape allocation overhead.
-- **Three default feature slots:** The `hb_features[3]` array holds three HarfBuzz OpenType feature tags:
-  - Index 0 (`LIGA_FEATURE`): Standard ligatures (`liga`)
-  - Index 1 (`DLIG_FEATURE`): Discretionary ligatures (`dlig`)
-  - Index 2 (`CALT_FEATURE`): Contextual alternates (`calt`)
+- **Three default feature slots:** The `hb_features[3]` array holds three HarfBuzz OpenType **disable** feature tags, initialized at module load time (`kitty/fonts.c`, lines 1755–1757) with the minus prefix (`-`) indicating suppression:
+  - Index 0 (`LIGA_FEATURE`): `-liga` — disables standard ligatures
+  - Index 1 (`DLIG_FEATURE`): `-dlig` — disables discretionary ligatures
+  - Index 2 (`CALT_FEATURE`): `-calt` — disables contextual alternates
+  These are created via `create_feature("-liga", LIGA_FEATURE)`, `create_feature("-dlig", DLIG_FEATURE)`, `create_feature("-calt", CALT_FEATURE)`. The disable semantics are critical to understanding the shaping pipeline: features are selectively included or excluded from the `hb_shape()` call to control which OpenType features are suppressed.
 - **Shape buffer:** A 4096-element `char_type` (UTF-32) array serves as the staging area for codepoints before they are passed to `hb_buffer_add_utf32()`.
 
 ### 1.3 Per-Font Feature Application
@@ -110,15 +111,20 @@ When a `Font` struct is initialized, the feature set is determined as follows:
 
 **Case 1 — Custom `font_features` configuration exists for this font** (lines 299–316):
 
-If the `font_feature_settings` Python dict (populated from the user's `font_features` config option) contains an entry matching the font's PostScript name, those features are loaded into a newly-allocated `hb_feature_t` array. The **CALT feature is always appended as the last element** (line 314: `memcpy(f->ffs_hb_features + len, &hb_features[CALT_FEATURE], sizeof(hb_feature_t))`). This means CALT (contextual alternates) is unconditionally enabled for every font.
+If the `font_feature_settings` Python dict (populated from the user's `font_features` config option) contains an entry matching the font's PostScript name, those features are loaded into a newly-allocated `hb_feature_t` array. The **`-calt` disable feature is always appended as the last element** (line 314: `memcpy(f->ffs_hb_features + len, &hb_features[CALT_FEATURE], sizeof(hb_feature_t))`). This ensures the `-calt` entry is always available at the tail of the feature array for the `num_features--` mechanism in `shape()` (see Section 1.5).
 
 **Case 2 — No custom features** (lines 318–326):
 
 If no custom features exist for the font, a default feature set is constructed:
-- **CALT is always enabled** (line 325: `memcpy(f->ffs_hb_features + f->num_ffs_hb_features++, &hb_features[CALT_FEATURE], sizeof(hb_feature_t))`)
-- **LIGA and DLIG are additionally enabled only for NimbusMonoPS fonts** (lines 321–323): The condition `strstr(psname, "NimbusMonoPS-") == psname` checks if the PostScript name starts with `"NimbusMonoPS-"`. Only for this specific font family are standard and discretionary ligatures enabled by default.
+- **`-calt` is always appended as the last feature** (line 325: `memcpy(f->ffs_hb_features + f->num_ffs_hb_features++, &hb_features[CALT_FEATURE], sizeof(hb_feature_t))`)
+- **For NimbusMonoPS fonts, `-liga` and `-dlig` are additionally prepended** (lines 321–323): The condition `strstr(psname, "NimbusMonoPS-") == psname` checks if the PostScript name starts with `"NimbusMonoPS-"`. For this specific font family, the disable features for standard ligatures (`-liga`) and discretionary ligatures (`-dlig`) are added before `-calt`. This means NimbusMonoPS has a feature array of `[-liga, -dlig, -calt]` (3 features), while other fonts have just `[-calt]` (1 feature).
 
-**Rationale:** Most monospace fonts do not have ligature features, and enabling LIGA/DLIG globally could cause unexpected behavior. NimbusMonoPS is special-cased because it is a common system monospace font that benefits from ligature support.
+**Rationale:** NimbusMonoPS is a common system monospace font that contains OpenType ligature tables. In a terminal context, standard and discretionary ligatures can cause unexpected character combining, so kitty specifically disables them for this font via the `-liga` and `-dlig` features. For other monospace fonts that typically lack ligature tables, only the `-calt` entry is needed (and it is removed from the shaping call by default — see Section 1.5).
+
+**Net effect at shaping time** (combining this with the `num_features--` logic in `shape()`):
+- **For most fonts** (feature array = `[-calt]`): When `disable_ligature` is false (default), `num_features--` reduces the count from 1 to 0, so **no disable features are passed** to `hb_shape()` — all OpenType features (liga, dlig, calt) remain active.
+- **For NimbusMonoPS** (feature array = `[-liga, -dlig, -calt]`): When `disable_ligature` is false, `num_features--` reduces the count from 3 to 2, so `-liga` and `-dlig` are passed (disabling standard and discretionary ligatures) while `-calt` is excluded (keeping contextual alternates active).
+- **When `disable_ligature` is true** (for any font): `num_features` is NOT decremented, so the full feature array (including `-calt`) is passed to `hb_shape()`, disabling all listed features.
 
 ### 1.4 HarfBuzz Buffer Loading
 
@@ -152,7 +158,7 @@ The `shape()` function orchestrates the complete shaping pipeline:
 
 2. **Determine feature count:** `size_t num_features = fobj->num_ffs_hb_features` gets the per-font feature count (line 811).
 
-3. **Ligature suppression:** When `disable_ligature` is true, `num_features` is decremented by 1 (line 812: `if (num_features && !disable_ligature) num_features--`). Since the **last feature is always CALT** (contextual alternates), this effectively disables CALT for that shaping run. Note the logic: when `disable_ligature` is false, `num_features` is decremented (the `-calt` feature, which disables CALT, is excluded), meaning CALT remains active. When `disable_ligature` is true, the full feature array including the `-calt` entry is used, actually disabling CALT.
+3. **Ligature suppression:** When `disable_ligature` is **false**, `num_features` is decremented by 1 (line 812: `if (num_features && !disable_ligature) num_features--`). Since the **last feature is always `-calt`** (the disable-contextual-alternates directive), removing it from the shaping call keeps CALT active. When `disable_ligature` is **true**, `!disable_ligature` evaluates to false, so the decrement does NOT happen — the full feature array including the `-calt` entry is passed to `hb_shape()`, which disables contextual alternates (and any other disable features in the array, such as `-liga` and `-dlig` for NimbusMonoPS).
 
 4. **Execute shaping:** `hb_shape(font, harfbuzz_buffer, fobj->ffs_hb_features, num_features)` (line 813) performs the actual OpenType shaping, applying GSUB (glyph substitution) and GPOS (glyph positioning) tables.
 
@@ -233,7 +239,7 @@ The `--debug-font-fallback` CLI flag is defined as a `bool-set` type, meaning it
 
 ### 2.2 `dump_font_debug()` Output Format
 
-**Source:** `kitty/fonts/render.py:dump_font_debug()`, lines 161–170
+**Source:** `kitty/fonts/render.py:dump_font_debug()`, lines 159–168
 
 This function provides a snapshot of the currently loaded fonts at startup:
 
@@ -907,17 +913,21 @@ The complete startup sequence from application entry to GPU-ready font rendering
 
 ### Step 2: Font System Initialization
 
-**Source:** `kitty/main.py:run_app()` (line 247–249)
+**Source:** `kitty/main.py:run_app()` (lines 247–260)
 
 ```python
 def __call__(self, opts, args, bad_lines=(), talk_fd=-1):
     set_scale(opts.box_drawing_scale)
     set_options(opts, is_wayland(), args.debug_rendering, args.debug_font_fallback)
-    set_font_family(opts)
-    _run_app(opts, args, bad_lines, talk_fd)
+    try:
+        set_font_family(opts)
+        _run_app(opts, args, bad_lines, talk_fd)
+    finally:
+        set_options(None)
+        free_font_data()
 ```
 
-`set_options()` propagates debug flags to the C global state. `set_font_family()` initializes the font pipeline.
+`set_options()` propagates debug flags to the C global state. `set_font_family()` initializes the font pipeline. The `try/finally` block ensures cleanup: `set_options(None)` clears the global options reference and `free_font_data()` releases all font resources (FreeType faces, HarfBuzz fonts, glyph caches) regardless of whether the application exits normally or via an exception.
 
 ### Step 3: Font File Resolution
 
