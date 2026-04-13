@@ -41,14 +41,14 @@ Next, the executable path is resolved via `read_exe_path()`. On Linux, this read
 if (!safe_realpath("/proc/self/exe", exe, buf_sz)) { ... }
 ```
 
-On macOS, `_NSGetExecutablePath()` is used instead (line 232); on FreeBSD, `sysctl()` (line 242). The investigation environment is Linux, so the `/proc/self/exe` branch applies.
+On macOS, `_NSGetExecutablePath()` is used instead (line 232); on FreeBSD, `sysctl()` (line 244). The investigation environment is Linux, so the `/proc/self/exe` branch applies.
 
 The launcher then delegates to the `kitten` binary for `@`-prefixed commands and wrapped kittens via `delegate_to_kitten_if_possible()` (line 452). Fast command-line parsing for `--version` and `--single-instance` occurs in `handle_fast_commandline()` (line 453). If `--single-instance` is set, `single_instance_main()` is invoked (line 436), which communicates via a Unix domain socket defined in `kitty/launcher/single-instance.c`. The `CLIOptions` struct is declared in `kitty/launcher/launcher.h` (lines 12–16).
 
 Finally, the Python runtime is bootstrapped via `run_embedded()` (line 464). For source builds (the `#else` branch at line 174), this:
 
 1. Initializes a `PyPreConfig` with `utf8_mode = 1` and `coerce_c_locale = 1` (lines 184–186).
-2. Sets `optimization_level = 2` and `parse_argv = 0` on the `PyConfig` (lines 194–195).
+2. Sets `parse_argv = 0` (line 194) and `optimization_level = 2` (line 195) on the `PyConfig`.
 3. Calls `Py_InitializeFromConfig()` (line 211).
 4. Sets `sys.kitty_run_data` via `set_kitty_run_data()` (line 214), which creates a Python dict with `bundle_exe_dir`, optional `from_source` flag, `lc_ctype_before_python`, and `extensions_dir` (lines 52–77).
 
@@ -401,7 +401,7 @@ The write end is non-inheritable (line 284), the read end is inheritable (line 2
 10. **Shell integration injection** (lines 265–267):
 
 ```python
-if 'disabled' not in opts.shell_integration:
+if not self.should_run_via_run_shell_kitten and 'disabled' not in opts.shell_integration:
     from .shell_integration import modify_shell_environ
     modify_shell_environ(opts, env, self.argv)
 ```
