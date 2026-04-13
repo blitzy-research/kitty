@@ -106,7 +106,7 @@ shell_prompt_marking(Screen *self, char *buf) {
 
 - **`A` (Prompt Start)**: Sets `prompt_kind = PROMPT_START` on the current line's attributes (lines 2332–2339). Parses optional sub-parameters via `parse_prompt_mark()` (line 2316): `;k=s` sets `SECONDARY_PROMPT`, `;redraw=0` clears the redraw flag, `;special_key=1` enables special key cursor movement. Fires `CALLBACK("cmd_output_marking", "O", Py_False)`.
 - **`B` (Prompt End / Command Start)**: **NOT HANDLED** — there is no `case 'B':` in the switch statement. The `B` marker is silently ignored. This is explicitly noted in the zsh integration code at `shell-integration/zsh/kitty-integration`, lines 222–224:
-  ```
+  ```text
   # the following two lines are commented out as currently kitty doesn't use B prompt marking
   # and hooking zle widgets in ZSH is a total minefield
   ```
@@ -229,7 +229,7 @@ flowchart LR
 
 The standard test payload contains all four OSC 133 markers plus visible text:
 
-```
+```text
 \x1b]133;A\x07              (A marker: prompt start)
 \x1b]133;B\x07              (B marker: prompt end — silently ignored)
 \x1b]133;C;cmdline=echo\ hi\x07  (C marker: output start with cmdline)
@@ -264,7 +264,7 @@ some text                    (visible text)
 
 The D marker has a fixed-length frame plus a variable-length exit code string:
 
-```
+```text
 Frame:     ESC  ]  1  3  3  ;  D  ;  BEL
 Bytes:     0x1B ]  1  3  3  ;  D  ;  0x07
                                       ^
@@ -355,7 +355,7 @@ The value `99` traverses four distinct layers:
 
 **QED**: The value `99` traversed the complete path:
 
-```
+```text
 Raw bytes "\x1b]133;D;99\x07"
   → VT parser identifies OSC 133, extracts "D;99"
     → C function shell_prompt_marking: buf[1]==';', exit_status = buf+2 = "99"
