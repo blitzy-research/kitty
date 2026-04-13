@@ -43,7 +43,7 @@ All counts obtained via `find` and `wc -l` against the source tree:
 | Language | File Count | Lines of Code | Location |
 |----------|-----------|---------------|----------|
 | C source files | 49 | 35,155 | `kitty/*.c` (excluding `kitty/launcher/`) |
-| C header files | 50 | 24,807 | `kitty/*.h` |
+| C header files | 50 | 24,807 | `kitty/**/*.h` (including subdirectories) |
 | Python files | 109 | 39,355 | `kitty/**/*.py` (including subdirectories) |
 | GLSL shaders | 13 | 696 | `kitty/*.glsl` |
 | Go source files | 255 | 49,211 | `tools/**/*.go` |
@@ -236,6 +236,8 @@ def read_kitty_resource(name: str, package_name: str = 'kitty') -> bytes:
     from importlib.resources import files
     return (files(package_name) / name).read_bytes()
 ```
+
+> *Simplified for clarity; the actual implementation at `kitty/constants.py:241–250` includes a Python 3.9 compatibility fallback using `importlib.resources.read_binary()` with a `sys.version_info[:2] < (3, 10)` version check.*
 
 ### Analysis
 
@@ -449,19 +451,21 @@ kitty/window.py
 
 That is 46 out of 109 Python files — **42% of all Python modules** have a direct import dependency on this single C extension.
 
+> **Note:** `kitty/types.py` appears in the above list because `grep` finds references to `fast_data_types` in its source code. However, all of these references are inside `if TYPE_CHECKING:` blocks or function-level deferred imports, which do not execute at module load time. This is why `kitty.types` successfully loads without the C extension in the [Survivor Analysis](#survivor-analysis--what-works-without-it) below — its `fast_data_types` references are purely for static type-checking, not runtime imports.
+
 #### 22 Python-Visible Classes
 
 The type stub at `kitty/fast_data_types.pyi` (1,635 lines) defines 22 classes exposed to Python:
 
-| Class | C Source | Purpose |
-|-------|----------|---------|
-| `FontConfigPattern` | `kitty/fontconfig.c` | Font matching pattern (Linux) |
+| Class | Related C Source | Purpose |
+|-------|------------------|---------|
+| `FontConfigPattern` † | `kitty/fontconfig.c` | Font matching pattern (Linux) |
 | `Face` | `kitty/freetype.c` | FreeType font face wrapper |
 | `CoreTextFont` | `kitty/core_text.m` | CoreText font descriptor (macOS) |
 | `CTFace` | `kitty/core_text.m` | CoreText font face wrapper (macOS) |
 | `Color` | `kitty/colors.c` | RGB color value type |
 | `ColorProfile` | `kitty/colors.c` | Terminal color palette manager |
-| `CurrentFonts` | `kitty/fonts.c` | Active font configuration |
+| `CurrentFonts` † | `kitty/fonts.c` | Active font configuration |
 | `Region` | `kitty/state.c` | Screen region descriptor |
 | `Line` | `kitty/line.c` | Single terminal line (row of cells) |
 | `HistoryBuf` | `kitty/history.c` | Scrollback ring buffer |
@@ -470,13 +474,15 @@ The type stub at `kitty/fast_data_types.pyi` (1,635 lines) defines 22 classes ex
 | `Screen` | `kitty/screen.c` | Full terminal screen model |
 | `ChildMonitor` | `kitty/child-monitor.c` | PTY I/O multiplexer and main loop |
 | `KeyEvent` | `kitty/keys.c` | Keyboard event descriptor |
-| `OSWindowSize` | `kitty/state.c` | OS window dimensions |
+| `OSWindowSize` † | `kitty/state.c` | OS window dimensions |
 | `Secret` | `kitty/crypto.c` | Secure secret storage |
 | `EllipticCurveKey` | `kitty/crypto.c` | EC key for remote control auth |
 | `AES256GCMEncrypt` | `kitty/crypto.c` | AES-GCM encryption context |
 | `AES256GCMDecrypt` | `kitty/crypto.c` | AES-GCM decryption context |
-| `Shlex` | `kitty/data-types.c` | Shell-style lexer |
+| `Shlex` | `kitty/shlex.c` | Shell-style lexer |
 | `SingleKey` | `kitty/keys.c` | Keyboard shortcut descriptor |
+
+> † `CurrentFonts`, `FontConfigPattern`, and `OSWindowSize` are Python-side TypedDicts defined only in `kitty/fast_data_types.pyi`. They describe data structures returned by C functions but do not have `PyTypeObject` definitions in their related C files. The other 19 classes (e.g., `Screen`, `Line`, `ChildMonitor`) are C-defined types with full `PyTypeObject` struct definitions in their respective C source files.
 
 Beyond these 22 classes, the module exposes **hundreds of module-level functions** covering rendering, input handling, I/O management, cryptography, font operations, and more.
 
@@ -485,7 +491,7 @@ Beyond these 22 classes, the module exposes **hundreds of module-level functions
 The module initialization function in `kitty/data-types.c` (lines 524–612) chains initialization of every C subsystem into one Python module. The full sequence:
 
 ```c
-// kitty/data-types.c lines 524-574
+// kitty/data-types.c lines 524-612
 
 EXPORTED PyMODINIT_FUNC
 PyInit_fast_data_types(void) {
@@ -544,7 +550,7 @@ PyInit_fast_data_types(void) {
 }
 ```
 
-On Linux, this is **25 subsystem initializers** chained together. On macOS, it is 24 (different platform-specific set). Every single one must succeed, or the entire module fails to load.
+On Linux, this is **29 subsystem initializers** chained together. On macOS, it is 28 (different platform-specific set). Every single one must succeed, or the entire module fails to load.
 
 #### Survivor Analysis — What Works Without It
 
@@ -576,13 +582,13 @@ Attempting to import Python modules with the C extension removed reveals that on
 
 2. **One failure breaks everything** — If the `.so` is missing, misconfigured, or compiled for the wrong Python version, 95% of the application immediately fails. There is no graceful degradation.
 
-3. **All C subsystems initialize together** — The 25 `init_*` calls in `PyInit_fast_data_types()` mean that loading the module initializes the VT parser, the font system, the OpenGL bindings, the cryptography library, and everything else in one shot. This is efficient (one module load, one initialization sequence) but creates an all-or-nothing dependency.
+3. **All C subsystems initialize together** — The 29 `init_*` calls in `PyInit_fast_data_types()` mean that loading the module initializes the VT parser, the font system, the OpenGL bindings, the cryptography library, and everything else in one shot. This is efficient (one module load, one initialization sequence) but creates an all-or-nothing dependency.
 
 The module name itself — `fast_data_types` — reflects its origin: it started as a way to expose performance-critical data types (Screen, Line, LineBuf) to Python. Over time, it grew to encompass every C subsystem, becoming the universal bridge between the two languages.
 
 ### Conclusion
 
-**`fast_data_types` is the single architectural chokepoint binding Python to C.** It wraps 25+ C subsystems, 22 Python-visible classes, and hundreds of functions into one monolithic module that 46 out of 109 Python files (42%) import directly. Without it, only 5 Python modules (4.6%) can load — none of which can display a terminal, process input, or render anything. Its absence causes near-total system failure because it is not one dependency among many; it is the *only* dependency that matters. It is simultaneously kitty's greatest architectural strength (single, clean integration point) and its single point of failure.
+**`fast_data_types` is the single architectural chokepoint binding Python to C.** It wraps 29 C subsystems, 22 Python-visible classes, and hundreds of functions into one monolithic module that 46 out of 109 Python files (42%) import directly. Without it, only 5 Python modules (4.6%) can load — none of which can display a terminal, process input, or render anything. Its absence causes near-total system failure because it is not one dependency among many; it is the *only* dependency that matters. It is simultaneously kitty's greatest architectural strength (single, clean integration point) and its single point of failure.
 
 ---
 
@@ -602,7 +608,7 @@ The deeper question is *where* the dependency enters. Is it in each kitten indiv
 
 #### Kitten Directory Inventory
 
-The `kittens/` directory contains 19 kitten subpackages plus the shared `tui/` framework:
+The `kittens/` directory contains 18 kitten subpackages plus the shared `tui/` framework:
 
 ```
 ask/               broadcast/         choose_fonts/
@@ -753,7 +759,7 @@ flowchart TD
     C --> D["kitty/entry_points.py:main()<br/>Python: CLI dispatch"]
     D --> E["kitty/main.py:main()<br/>Python: app startup"]
     E --> F["from .fast_data_types import ...<br/>Loads compiled C extension"]
-    F --> G["kitty/data-types.c:PyInit_fast_data_types()<br/>C: initializes 25+ subsystems"]
+    F --> G["kitty/data-types.c:PyInit_fast_data_types()<br/>C: initializes 29 subsystems"]
     G --> H["init_glfw, init_shaders, init_fonts<br/>C: windowing, GPU, fonts"]
     H --> I["GLSL shaders compiled on GPU<br/>via load_shader_programs()"]
     I --> J["boss.child_monitor.main_loop()<br/>C: three-thread event loop"]
