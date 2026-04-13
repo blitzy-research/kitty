@@ -1,76 +1,64 @@
 # Kitty Terminal Emulator — Runtime Architecture Investigation
 
-## Metadata
+## Document Metadata
 
 | Field | Value |
 |---|---|
-| **Kitty Version** | 0.35.2 (`kitty/constants.py` line 25: `version: Version = Version(0, 35, 2)`) |
-| **Source Branch** | `kitty_815df1e210e0` |
-| **VCS Revision** | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` |
-| **Investigation Date** | 2025 (sandboxed CI environment) |
-| **Python Requirement** | ≥ 3.8 (`pyproject.toml` line 2: `requires-python = ">=3.8"`) |
-| **Go Version** | 1.22 (`go.mod` line 3: `go 1.22`) |
-| **C Standard** | C11 with `-std=c11` (`setup.py` compiler flags) |
-| **Investigation Environment** | Ubuntu 24.04.4 LTS, kernel 6.6.113+, x86-64, headless (no display server) |
-
-> **Evidence Classification Convention**: Throughout this document, observations are marked as:
-> - **[OBSERVED]** — Actual command output captured during this investigation
-> - **[SOURCE-INFORMED]** — Conclusion drawn from source code analysis, corroborated where possible by build artifacts
-> - **[BLOCKED]** — Tool or command that could not execute, with error and fallback documented
+| Repository | kitty (VCS revision `815df1e210e0`) |
+| Version | 0.35.2 |
+| Investigation Date | 2025 |
+| Investigation Host | Ubuntu 24.04.4 LTS (Noble Numbat), kernel 6.6.113+, x86_64 |
+| Python | 3.12.3 |
+| Go | 1.22.10 |
+| GCC | 13.3.0 (C11-capable) |
+| Display | Xvfb :99 (virtual framebuffer, no physical GPU) |
+| Methodology | Runtime-first: all conclusions derive from observable process artifacts |
 
 ---
 
 ## Table of Contents
 
-1. [Build and Launch Observations](#section-1--build-and-launch-observations)
-2. [Loaded Modules and Libraries](#section-2--loaded-modules-and-libraries)
-3. [Thread Activity: Idle vs. Stress](#section-3--thread-activity-idle-vs-stress)
-4. [Remote Control Interface Queries](#section-4--remote-control-interface-queries)
-5. [Kitten Process Relationship](#section-5--kitten-process-relationship)
-6. [Kitten Binary Inspection](#section-6--kitten-binary-inspection)
-7. [Symbol and Stack Snapshots](#section-7--symbol-and-stack-snapshots)
-8. [Language Responsibility Inference](#section-8--language-responsibility-inference)
-9. [Two Falsified Interpretations](#section-9--two-falsified-interpretations)
-10. [Portability vs. Performance Tradeoff](#section-10--portability-vs-performance-tradeoff)
-11. [Full Command Transcripts (Appendix)](#section-11--full-command-transcripts-appendix)
+1. [Build and Launch Observations](#1-build-and-launch-observations)
+2. [Loaded Modules and Libraries](#2-loaded-modules-and-libraries)
+3. [Thread Activity — Idle vs. Stress](#3-thread-activity--idle-vs-stress)
+4. [Remote Control Interface Queries](#4-remote-control-interface-queries)
+5. [Kitten Process Relationship](#5-kitten-process-relationship)
+6. [Kitten Binary Inspection](#6-kitten-binary-inspection)
+7. [Symbol and Stack Snapshots](#7-symbol-and-stack-snapshots)
+8. [Language Responsibility Inference](#8-language-responsibility-inference)
+9. [Two Falsified Interpretations](#9-two-falsified-interpretations)
+10. [Portability vs. Performance Tradeoff](#10-portability-vs-performance-tradeoff)
+11. [Appendix: Full Command Transcripts](#11-appendix-full-command-transcripts)
 
 ---
 
-## Section 1 — Build and Launch Observations
+## 1. Build and Launch Observations
 
-### 1.1 Build System Architecture
+### 1.1 Build Process
 
-The Kitty build is orchestrated by a single `setup.py` at the repository root. This file performs three distinct compilation phases in a single invocation:
+Kitty is built with a single unified build command that compiles three distinct language layers:
 
-1. **C Extension Compilation** — Compiles 49 `.c` source files from `kitty/` into a single shared object `kitty/fast_data_types.so`, plus two separate GLFW backend modules (`kitty/glfw-x11.so`, `kitty/glfw-wayland.so`).
-2. **Go Binary Compilation** — The `build_static_kittens()` function (setup.py lines 1130–1165) invokes `go build -v` targeting `tools/cmd` as the source directory, producing the `kitten` binary placed adjacent to the `kitty` launcher.
-3. **C Launcher Compilation** — Compiles `kitty/launcher/main.c` and supporting files into the `kitty` launcher binary, which embeds CPython.
-
-**[OBSERVED]** The build command and its results:
-
-```bash
-$ python3 setup.py build --verbose --ignore-compiler-warnings
-# (Full build output captured during environment setup — see Appendix A.1)
+```
+export PATH=/usr/local/go/bin:$PATH
+export KITTY_NO_LTO=1
+python3 setup.py build --verbose --ignore-compiler-warnings
 ```
 
-The build produced the following artifacts:
+The `setup.py` build orchestrator performs the following operations in sequence:
 
-```bash
-$ ls -la kitty/launcher/kitty kitty/launcher/kitten kitty/fast_data_types.so kitty/glfw-x11.so kitty/glfw-wayland.so
--rwxr-xr-x 1 root root  1541408 kitty/fast_data_types.so    # 1.5 MB — monolithic C extension
--rwxr-xr-x 1 root root   464264 kitty/glfw-wayland.so       # 454 KB — Wayland GLFW backend
--rwxr-xr-x 1 root root   377408 kitty/glfw-x11.so           # 369 KB — X11 GLFW backend
--rwxr-xr-x 1 root root 15761668 kitty/launcher/kitten       # 15 MB  — Go static binary
--rwxr-xr-x 1 root root    36224 kitty/launcher/kitty        # 36 KB  — C launcher (thin)
+1. **C Extension Compilation**: Discovers all `.c` files under `kitty/` (excluding macOS-specific files like `core_text.m`, `cocoa_window.m`, `macos_process_info.c`), compiles them with GCC using `-std=c11 -D_XOPEN_SOURCE=700` flags, and links them into a single shared object `kitty/fast_data_types.so`. The `find_c_files()` function in `setup.py` (line 906) collects 49 C source files plus vendored dependencies from `3rdparty/` (ringbuf, base64 with SIMD).
+
+2. **GLFW Backend Compilation**: Builds two separate shared objects — `kitty/glfw-x11.so` and `kitty/glfw-wayland.so` — from the vendored GLFW 3.4 fork in `glfw/`. Each backend links against its respective display server libraries.
+
+3. **Go Binary Compilation**: Invokes `go build` to produce the static `kitten` binary from `tools/cmd/main.go` and all Go packages under `tools/` and `kittens/`.
+
+4. **C Launcher Compilation**: Compiles `kitty/launcher/main.c` into the small `kitty` launcher binary that embeds CPython.
+
+### 1.2 Build Artifacts
+
+Verification commands and their output:
+
 ```
-
-> **Key Observation**: The size difference is striking. The `kitty` launcher is only 36 KB — it is a thin C binary whose sole job is to bootstrap CPython. The actual application logic lives in the 1.5 MB `fast_data_types.so` (C) and the Python source files. Meanwhile, the `kitten` binary at 15 MB is a self-contained Go executable carrying its own runtime, garbage collector, and all Go dependencies statically linked.
-
-### 1.2 Binary Format Verification
-
-**[OBSERVED]** Binary type identification:
-
-```bash
 $ file kitty/launcher/kitty
 kitty/launcher/kitty: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
   dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
@@ -80,664 +68,393 @@ kitty/launcher/kitty: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
 $ file kitty/launcher/kitten
 kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV),
   dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
-  Go BuildID=hqq4-U2LKlixbsjwYo2Y/n8c9tVmrH955DZP0gtLh/TlErkqS1Lkyxjr-Onw6b/O2yALBSe3QkGVIYlcExQ,
+  Go BuildID=hWFG_Ca3xQ6VcsZYShGt/vXHUDdkh1kOGPzVOfMDC/TlErkqS1Lkyxjr-Onw6b/6MzJb86-gjtn1TQxs0aQ,
   stripped
+
+$ file kitty/fast_data_types.so
+kitty/fast_data_types.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV),
+  dynamically linked,
+  BuildID[sha1]=46fd91e410b71f30deee320bd09561401915e677, not stripped
 ```
 
-**Analysis:**
+**Key observation**: The kitty launcher is a tiny (36 KB) dynamically linked PIE executable. The kitten binary is a large (16 MB) Go executable with a `Go BuildID`. The fast_data_types.so extension is 1.5 MB, containing the entire C engine.
 
-- The `kitty` launcher is a **dynamically-linked PIE executable** (Position Independent Executable). It links against `libpython3.12.so` because its primary function is to initialize and run the CPython interpreter.
-- The `kitten` binary is a **Go executable** with a `Go BuildID` embedded in the ELF header. It is listed as "dynamically linked" — on this build, the Go compiler linked against `libc.so.6` (CGO was enabled or the Go toolchain chose external linking). The binary is **stripped** (`-s -w` ldflags in setup.py line 1157), explaining the absence of debug symbols.
-
-### 1.3 Native Launcher Role
-
-The C launcher (`kitty/launcher/main.c`) is the process entry point. Its responsibilities are minimal but critical:
-
-**[SOURCE-INFORMED]** From `kitty/launcher/main.c`:
-
-- **Lines 8–23**: Includes `<Python.h>` along with platform headers. The `RunData` struct (lines 46–50) holds `exe`, `exe_dir`, `lc_ctype`, and `lib_dir` — the minimal data needed to bootstrap CPython.
-- **Lines 52–77**: The `set_kitty_run_data()` function creates a Python dictionary (`sys.kitty_run_data`) containing `bundle_exe_dir`, and optionally `from_source` and `lc_ctype_before_python`. This dictionary is how the Python layer discovers the binary locations.
-- **Lines ~200–220**: The launcher calls `Py_InitializeFromConfig(&config)` followed by `Py_RunMain()`, transferring control entirely to Python. The launcher's C code never participates in the rendering loop — it exits once Python takes over.
-
-```c
-// kitty/launcher/main.c (paraphrased from lines 200-220)
-status = Py_InitializeFromConfig(&config);
-if (PyStatus_Exception(status)) goto fail;
-if (!set_kitty_run_data(run_data, from_source, NULL)) return 1;
-PySys_SetObject("frozen", Py_False);
-return Py_RunMain();
+```
+$ ls -lh kitty/launcher/kitty kitty/launcher/kitten kitty/fast_data_types.so
+-rwxr-xr-x  36K  kitty/launcher/kitty
+-rwxr-xr-x  16M  kitty/launcher/kitten
+-rwxr-xr-x 1.5M  kitty/fast_data_types.so
 ```
 
-> **Key Insight**: The native C launcher is NOT the performance-critical C layer. It is a ~36 KB bootstrap shim. The actual C hot-path code lives entirely inside `fast_data_types.so`, loaded as a Python extension module.
+### 1.3 Launch Attempt and Display Environment
 
-### 1.4 Python Startup Sequence
+The sandboxed environment has no physical display server. An initial launch attempt without Xvfb failed:
 
-**[SOURCE-INFORMED]** From `kitty/main.py` lines 441–521, the `_main()` function executes:
-
-```python
-# kitty/main.py _main() — startup sequence (paraphrased)
-running_in_kitty(True)                          # Mark this process as kitty
-cli_opts, rest = parse_args(args=args, ...)     # Parse command-line options
-opts = create_opts(cli_opts, ...)               # Load configuration
-setup_environment(opts, cli_opts)               # Set environment variables
-set_locale()                                    # Configure locale
-sys.setswitchinterval(1000.0)                   # ← CRITICAL: single Python thread
-mask_kitty_signals_process_wide()               # Block signals in non-main threads
-init_glfw(opts, ...)                            # Initialize GLFW (C call via fast_data_types)
-run_app(opts, cli_opts, bad_lines, talk_fd)     # Create Boss → ChildMonitor → main_loop()
-glfw_terminate()                                # Cleanup
 ```
-
-The call `sys.setswitchinterval(1000.0)` at line 504 is **pivotal evidence**: it sets the Python GIL switch interval to 1000 seconds — effectively disabling thread switching. The comment reads: `"we have only a single python thread"`. This confirms that **Python never runs multiple concurrent threads in kitty**. All threading is done in C via `pthread_create`.
-
-### 1.5 Launch Attempt in Headless Environment
-
-**[OBSERVED]** Attempting to launch kitty in the sandboxed environment:
-
-```bash
-$ kitty/launcher/kitty --version
-kitty 0.35.2 created by Kovid Goyal
-
-$ kitty/launcher/kitty --listen-on unix:/tmp/kitty-test.sock
-[0.059] [glfw error 65544]: X11: The DISPLAY environment variable is missing
+$ DISPLAY=:0 kitty/launcher/kitty
+[0.059] [glfw error 65544]: X11: Failed to open display :0
 GLFW initialization failed
 ```
 
-**Analysis**: The `--version` flag succeeds because it only requires the Python layer (entry point dispatch). The full launch fails at GLFW initialization because:
+After installing and starting Xvfb (virtual framebuffer):
 
-1. The `init_glfw()` call in `kitty/main.py` line 514 calls into C (`fast_data_types`) to initialize the GLFW windowing library
-2. GLFW's X11 backend (`glfw/x11_init.c`) requires a valid `DISPLAY` environment variable pointing to an X11 server
-3. The headless CI environment has no display server
+```
+$ Xvfb :99 -screen 0 1280x1024x24 &
+$ DISPLAY=:99 kitty/launcher/kitty --listen-on unix:/tmp/kitty-test2.sock -o allow_remote_control=yes &
+```
 
-> **This failure is itself evidence**: It proves that the C layer's GLFW initialization is a mandatory gateway — without a display server, the rendering pipeline cannot start. This is a direct consequence of the C layer owning the platform windowing and GPU rendering responsibilities.
+Kitty launched successfully. The only warning was `Failed to open systemd user bus with error: Connection refused`, which is non-fatal. The process used Mesa's llvmpipe (software OpenGL rasterizer) since no physical GPU was present.
+
+**Thinking**: The GLFW error on the first attempt (`X11: Failed to open display :0`) proves that the C GLFW layer (not Python, not Go) is responsible for platform windowing — if it fails, the entire application fails immediately, before any Python-level logic can intervene. This establishes that the C layer owns the display connection.
 
 ---
 
-## Section 2 — Loaded Modules and Libraries
+## 2. Loaded Modules and Libraries
 
-### 2.1 The `fast_data_types` C Extension Module
+### 2.1 Process Memory Map
 
-The central artifact connecting Python and C is `kitty/fast_data_types.so` — a single shared object that bundles the entire C engine. This module is defined in `kitty/data-types.c`, which includes:
+With kitty running (PID 97391), the loaded shared libraries were captured from `/proc/97391/maps`:
 
-**[SOURCE-INFORMED]** From `kitty/data-types.c` lines 1–37:
-
-```c
-#include "data-types.h"
-#include "charsets.h"
-#include "base64.h"
-#include "control-codes.h"
-#include "wcwidth-std.h"
-#include "wcswidth.h"
-#include "modes.h"
-#include "monotonic.h"
+```
+$ cat /proc/97391/maps | grep '\.so' | awk '{print $6}' | sort -u
 ```
 
-> *Note: The above excerpt shows only the project-internal includes. System headers (`sys/socket.h`, `sys/types.h`, `unistd.h`) and internal utility headers (`cleanup.h`, `safe-wrappers.h`) are omitted for focus.*
+**Kitty-Specific Modules (built from source):**
 
-These are just the top-level includes. The build system (`setup.py`) compiles **49 `.c` files** from the `kitty/` directory into this single `.so`:
+| Library | Size | Purpose |
+|---|---|---|
+| `kitty/fast_data_types.so` | 1.5 MB | Monolithic C extension: screen model, VT parser, fonts, shaders, child monitor, OpenGL rendering, crypto |
+| `kitty/glfw-x11.so` | 369 KB | GLFW X11 backend: window creation, input, display connection |
 
-| C Source File | Purpose |
+**Rendering and Font Libraries:**
+
+| Library | Evidence |
 |---|---|
-| `child-monitor.c` | Three-thread architecture, main loop, rendering dispatch |
-| `vt-parser.c` | VT escape sequence state machine |
-| `screen.c` | Screen model (cells, cursor, attributes) |
-| `line.c`, `line-buf.c` | Line buffer management |
-| `shaders.c` | OpenGL shader program management, sprite maps |
-| `gl.c`, `gl-wrapper.c` | GLAD OpenGL function loader |
-| `freetype.c` | FreeType glyph rasterization |
-| `fontconfig.c` | Fontconfig font discovery (Linux) |
-| `fonts.c` | Font subsystem orchestration with HarfBuzz |
-| `glyph-cache.c` | GPU texture atlas for glyph caching |
-| `graphics.c` | Graphics protocol (inline images) |
-| `colors.c` | Color management, sRGB conversion |
-| `history.c` | Scrollback ring buffer |
-| `keys.c`, `key_encoding.c` | Input handling and key encoding |
-| `mouse.c` | Mouse event processing |
-| `png-reader.c` | PNG decoding via libpng |
-| `crypto.c` | AES-256-GCM and X25519 via OpenSSL |
-| `simd-string.c`, `simd-string-128.c`, `simd-string-256.c` | SIMD-accelerated string scanning |
-| `state.c` | Global state structure |
-| `kittens.c` | Native kitten response parser |
-| `glfw.c`, `glfw-wrapper.c` | GLFW integration layer |
-| _(and 26 more)_ | Character sets, cursor, disk cache, desktop, hyperlinks, etc. |
+| `libGL.so.1.7.0` | OpenGL dispatch layer — confirms GPU rendering path is active |
+| `libGLX.so.0.0.0` | GLX (OpenGL for X11) — provides the GL context |
+| `libGLX_mesa.so.0.0.0` | Mesa's GLX implementation — actual GL driver |
+| `libGLdispatch.so.0.0.0` | GL function dispatch table (GLVND) |
+| `libgallium-25.2.8-*.so` | Mesa Gallium3D driver framework — llvmpipe software rasterizer active |
+| `libLLVM.so.20.1` | LLVM JIT — used by llvmpipe to JIT-compile shader programs into x86 |
+| `libfreetype.so.6.20.1` | FreeType 2 — glyph rasterization engine |
+| `libharfbuzz.so.0.60830.0` | HarfBuzz — OpenType text shaping (ligatures, kerning) |
+| `libfontconfig.so.1.12.1` | Fontconfig — font discovery and matching |
+| `libpng16.so.16.43.0` | libpng — PNG decoding for images and icons |
+| `liblcms2.so.2.0.14` | Little CMS 2 — ICC color profile management |
 
-**[OBSERVED]** The Python module exposes 581 public attributes:
+**Platform and System Libraries:**
 
-```bash
+| Library | Purpose |
+|---|---|
+| `libpython3.12.so.1.0` | CPython 3.12 interpreter — embedded in the kitty process |
+| `libX11.so.6.4.0` | Xlib — X11 protocol client |
+| `libX11-xcb.so.1.0.0` | X11/XCB interop |
+| `libxcb.so.1.1.0` | XCB — low-level X11 protocol |
+| `libxcb-glx.so.0.0.0` | XCB GLX extension |
+| `libxcb-xkb.so.1.0.0` | XCB XKB keyboard extension |
+| `libxkbcommon.so.0.0.0` | XKB keyboard layout handling |
+| `libxkbcommon-x11.so.0.0.0` | XKB X11 integration |
+| `libXcursor.so.1.0.2` | X cursor management |
+| `libXrandr.so.2.2.0` | X display configuration (monitor geometry) |
+| `libXinerama.so.1.0.0` | Multi-monitor support |
+| `libdbus-1.so.3.32.4` | D-Bus IPC (desktop integration) |
+| `libcrypto.so.3` | OpenSSL — encryption for remote control protocol |
+| `libz.so.1.3` | zlib — compression |
+
+**Thinking**: The process map reveals that **all rendering, font, and graphics libraries are loaded into the kitty C process space**, not into any Go process. No Go-specific shared libraries appear in the map (the kitten binary is not loaded here at all). The `libpython3.12.so` confirms CPython is embedded as a shared library within the same process. This is direct evidence that Python orchestration and C rendering coexist in a single address space.
+
+### 2.2 Python Introspection of fast_data_types
+
+```python
 $ python3 -c "
 import sys; sys.path.insert(0, '.')
-import kitty.fast_data_types as fdt
-attrs = [a for a in dir(fdt) if not a.startswith('_')]
-print(f'Total public attributes: {len(attrs)}')
+from kitty import fast_data_types as fdt
+attrs = [a for a in dir(fdt) if not a.startswith('__')]
+print(f'Total attributes: {len(attrs)}')
+types = [a for a in attrs if a[0].isupper() and not a.isupper()]
+print(f'Types: {sorted(types)[:30]}')
 "
-Total public attributes: 581
 ```
 
-Key attribute categories include:
-
+Output:
 ```
-Shader Programs: BGIMAGE_PROGRAM, BORDERS_PROGRAM, CELL_BG_PROGRAM, CELL_FG_PROGRAM,
-                 CELL_PROGRAM, CELL_SPECIAL_PROGRAM, GRAPHICS_ALPHA_MASK_PROGRAM,
-                 GRAPHICS_PREMULT_PROGRAM, GRAPHICS_PROGRAM, TINT_PROGRAM
-
-Thread/Monitor:  ChildMonitor
-
-Crypto:          AES256GCMDecrypt, AES256GCMEncrypt, EllipticCurveKey
-
-Screen:          Screen
-
-GLFW Constants:  GLFW_ACCUM_ALPHA_BITS, GLFW_CLIENT_API, ... (hundreds)
+Total attributes: 581
+Types/classes: 23
+Types: ['AES256GCMDecrypt', 'AES256GCMEncrypt', 'ChildMonitor', 'Color',
+        'ColorProfile', 'CryptoError', 'Cursor', 'DiskCache',
+        'EllipticCurveKey', 'Face', 'FreeTypeError', 'GraphicsManager',
+        'HistoryBuf', 'KeyEvent', 'Line', 'LineBuf', 'Parser', 'Region',
+        'Screen', 'Secret', 'Shlex', 'SigInfo', 'SingleKey']
+Functions/constants: 558
 ```
 
-### 2.2 Shared Library Dependencies
+**Thinking**: The `fast_data_types` C extension exposes **581 attributes** (23 C-implemented types and 558 functions/constants) to Python. This is the bridge between the two in-process languages. The types map directly to C structs: `Screen` → `screen.c`, `ChildMonitor` → `child-monitor.c`, `Parser` → `vt-parser.c`, `Face` → `freetype.c`, `GraphicsManager` → `graphics.c`. Python calls into these C types for all performance-critical operations; the C code never calls back into Python for hot-path rendering.
 
-#### 2.2.1 `kitty` Launcher Dependencies
+### 2.3 fast_data_types Symbol Analysis
 
-**[OBSERVED]** Dynamic library dependencies of the launcher:
-
-```bash
-$ ldd kitty/launcher/kitty
-  linux-vdso.so.1
-  libpython3.12.so.1.0 => /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-  libc.so.6             => /lib/x86_64-linux-gnu/libc.so.6
-  libm.so.6             => /lib/x86_64-linux-gnu/libm.so.6
-  libz.so.1             => /lib/x86_64-linux-gnu/libz.so.1
-  libexpat.so.1         => /lib/x86_64-linux-gnu/libexpat.so.1
-  /lib64/ld-linux-x86-64.so.2
+```
+$ nm kitty/fast_data_types.so | grep ' [tTbBdD] ' | grep -iE 'render|parse|thread|loop|shader|glyph|font|screen|freetype|child'
 ```
 
-**Analysis**: The launcher links **only** against libpython and standard system libraries. It has zero rendering libraries — confirming the launcher is a pure CPython bootstrapper.
+Key symbols found (selected):
 
-#### 2.2.2 `fast_data_types.so` Dependencies
-
-**[OBSERVED]** This is where the rendering-adjacent libraries appear:
-
-```bash
-$ ldd kitty/fast_data_types.so
-  libm.so.6             => /lib/x86_64-linux-gnu/libm.so.6
-  libpython3.12.so.1.0  => /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-  libharfbuzz.so.0       => /lib/x86_64-linux-gnu/libharfbuzz.so.0
-  libpng16.so.16         => /lib/x86_64-linux-gnu/libpng16.so.16
-  liblcms2.so.2          => /lib/x86_64-linux-gnu/liblcms2.so.2
-  libcrypto.so.3         => /lib/x86_64-linux-gnu/libcrypto.so.3
-  libz.so.1              => /lib/x86_64-linux-gnu/libz.so.1
-  libc.so.6              => /lib/x86_64-linux-gnu/libc.so.6
-  libexpat.so.1          => /lib/x86_64-linux-gnu/libexpat.so.1
-  libfreetype.so.6       => /lib/x86_64-linux-gnu/libfreetype.so.6
-  libglib-2.0.so.0       => /lib/x86_64-linux-gnu/libglib-2.0.so.0
-  libgraphite2.so.3      => /lib/x86_64-linux-gnu/libgraphite2.so.3
-  libbz2.so.1.0          => /lib/x86_64-linux-gnu/libbz2.so.1.0
-  libbrotlidec.so.1      => /lib/x86_64-linux-gnu/libbrotlidec.so.1
-  libpcre2-8.so.0        => /lib/x86_64-linux-gnu/libpcre2-8.so.0
-  libbrotlicommon.so.1   => /lib/x86_64-linux-gnu/libbrotlicommon.so.1
-```
-
-**[OBSERVED]** Confirmed via `readelf -d`:
-
-```bash
-$ readelf -d kitty/fast_data_types.so | grep NEEDED
-  (NEEDED)  Shared library: [libm.so.6]
-  (NEEDED)  Shared library: [libpython3.12.so.1.0]
-  (NEEDED)  Shared library: [libharfbuzz.so.0]
-  (NEEDED)  Shared library: [libpng16.so.16]
-  (NEEDED)  Shared library: [liblcms2.so.2]
-  (NEEDED)  Shared library: [libcrypto.so.3]
-  (NEEDED)  Shared library: [libz.so.1]
-  (NEEDED)  Shared library: [libc.so.6]
-```
-
-#### 2.2.3 Library-to-Source Tracing
-
-Each linked library maps to specific C source files in the `fast_data_types` module:
-
-| Library | Version | C Source File(s) | Purpose | Symbol Evidence |
-|---|---|---|---|---|
-| **libfreetype.so.6** | FreeType 26.1.20 | `kitty/freetype.c` | Glyph rasterization, bitmap rendering | `FT_Init_FreeType`, `FT_Load_Glyph`, `FT_Render_Glyph` |
-| **libharfbuzz.so.0** | HarfBuzz 8.3.0 | `kitty/fonts.c` | OpenType text shaping, ligatures | `hb_buffer_create`, `hb_shape`, `hb_ft_font_create` |
-| **libpng16.so.16** | libpng 1.6.43 | `kitty/png-reader.c` | PNG image decoding | `png_create_read_struct`, `png_read_image` |
-| **liblcms2.so.2** | lcms2 2.14 | `kitty/colors.c` | ICC color profile management | `cmsCreateTransform`, `cmsCreate_sRGBProfile` |
-| **libcrypto.so.3** | OpenSSL 3.0.13 | `kitty/crypto.c` | X25519 key exchange, AES-256-GCM encryption | `EVP_EncryptInit_ex`, `EVP_PKEY_derive` |
-| **libpython3.12.so** | Python 3.12.3 | All `.c` files | CPython embedding and Python C API | `PyInit_fast_data_types` (module entry) |
-| **libz.so.1** | zlib | Various | Compression support | Standard zlib symbols |
-
-> **Security Patch Status — Ubuntu Backported Fixes**: The library versions reported above
-> via `pkg-config --modversion` reflect *upstream* base version numbers. On Ubuntu 24.04,
-> security patches are backported into stable upstream versions without incrementing the
-> upstream version number. Verification via `dpkg -l` and `apt-get changelog` reveals the
-> actual patch levels of the runtime libraries linked into `fast_data_types.so`:
->
-> - **libssl3t64 3.0.13-0ubuntu3.9** (libcrypto): Contains backported patches for
->   CVE-2025-15467 (stack buffer overflow in CMS AuthEnvelopedData processing) and 20+
->   additional CVEs. Despite `pkg-config` reporting `3.0.13`, the Ubuntu package carries
->   all known security fixes through the `-0ubuntu3.9` patch series.
-> - **libpng16-16t64 1.6.43-5ubuntu0.5**: Contains backported patches for CVE-2025-64505,
->   CVE-2025-64506, CVE-2025-64720, CVE-2025-65018, CVE-2025-66293, and 5 additional CVEs
->   across 5 Ubuntu security updates (0ubuntu0.1 through 0ubuntu0.5). All heap overflow and
->   out-of-bounds read vulnerabilities reported against libpng before 1.6.51 are patched.
-> - **liblcms2-2 2.14-2build1**: Not affected by CVE-2025-29070 (which targets lcms2 v2.16;
->   the installed v2.14 predates the vulnerable code path).
->
-> Thus, despite `pkg-config` reporting upstream versions that appear vulnerable to version-
-> number-based scanning, the actual runtime libraries in this build environment carry all
-> known security fixes as of the system's package repository state. This is a standard
-> consequence of Ubuntu's long-term-support backporting practice and must be accounted for
-> when performing dependency vulnerability assessments.
-
-**[OBSERVED]** Symbol-level proof via `nm -D`:
-
-```bash
-$ nm -D kitty/fast_data_types.so | grep 'hb_'
-  U hb_buffer_add_utf32
-  U hb_buffer_create
-  U hb_buffer_destroy
-  U hb_buffer_get_glyph_infos
-  U hb_buffer_get_glyph_positions
-  U hb_shape
-  U hb_ft_font_create
-  # ... (22 HarfBuzz symbols total)
-
-$ nm -D kitty/fast_data_types.so | grep 'FT_'
-  U FT_Init_FreeType
-  U FT_Done_FreeType
-  U FT_Load_Glyph
-  U FT_Render_Glyph
-  U FT_Bitmap_Convert
-  # ... (FreeType symbols)
-
-$ nm -D kitty/fast_data_types.so | grep 'png_'
-  U png_create_read_struct
-  U png_read_image
-  U png_get_image_width
-  # ... (25 libpng symbols total)
-```
-
-#### 2.2.4 GLFW Backend Dependencies
-
-**[OBSERVED]** The GLFW X11 backend links against platform-specific windowing libraries:
-
-```bash
-$ readelf -d kitty/glfw-x11.so | grep NEEDED
-  (NEEDED)  Shared library: [libm.so.6]
-  (NEEDED)  Shared library: [libX11.so.6]
-  (NEEDED)  Shared library: [libXcursor.so.1]
-  (NEEDED)  Shared library: [libxkbcommon.so.0]
-  (NEEDED)  Shared library: [libxkbcommon-x11.so.0]
-  (NEEDED)  Shared library: [libX11-xcb.so.1]
-  (NEEDED)  Shared library: [libdbus-1.so.3]
-  (NEEDED)  Shared library: [libc.so.6]
-```
-
-> **Key Observation**: Note what is **absent** from all these dependency lists — there is **no Go runtime library**, no `libgo.so`, no Go-related shared objects whatsoever. The entire kitty process (launcher + `fast_data_types.so` + GLFW backends) runs exclusively on C and Python. Go never enters this process space.
-
-#### 2.2.5 Notable Absence: OpenGL
-
-OpenGL (`libGL.so`) is **not** listed as a direct NEEDED dependency in `readelf -d` output for `fast_data_types.so`. This is because Kitty uses **GLAD** (the OpenGL loader in `kitty/gl.c` and the `glad/` directory) to dynamically load OpenGL function pointers at runtime. The `gl.c` file includes `glfw-wrapper.h` which provides the GLAD-generated loader. OpenGL symbols are resolved via `dlopen`/`dlsym` at initialization time, meaning they appear in `/proc/PID/maps` at runtime but not in static linkage analysis.
-
-**[SOURCE-INFORMED]** From `kitty/gl.c` lines 1–20:
-
-```c
-#include "gl.h"
-#include "glfw-wrapper.h"    // GLAD loader
-#include "state.h"
-
-static void check_for_gl_error(...) {
-    GLenum code = glad_glGetError();  // GLAD-generated OpenGL call
-    ...
-}
-```
-
-This means that in a running kitty process with a display server, `libGL.so`, `libEGL.so`, or Mesa libraries (`libgallium.so`, `swrast_dri.so`) would appear in `/proc/PID/maps`, loaded on-demand by GLAD.
-
-#### 2.2.6 Notable Absence: Fontconfig
-
-Similarly, `libfontconfig.so` does not appear as a direct NEEDED dependency despite Kitty using Fontconfig for font discovery on Linux. This is because `kitty/fontconfig.c` also uses runtime `dlopen` — analogous to the GLAD approach for OpenGL:
-
-**[SOURCE-INFORMED]** From `kitty/fontconfig.c`:
-
-```c
-#include <dlfcn.h>                                    // line 12
-static void* libfontconfig_handle = NULL;             // line 20
-// ...
-libfontconfig_handle = dlopen(libnames[i], RTLD_LAZY); // line 91
-```
-
-Fontconfig is loaded dynamically at runtime via `dlopen()`, iterating over a list of possible library names until one is found. This means `libfontconfig.so` would appear in `/proc/PID/maps` at runtime (after font subsystem initialization) but not in static `readelf -d` or `ldd` output. The `dlclose()` call at line 134 indicates the library handle is also properly released during cleanup.
-
-### 2.3 Kitten Binary Dependencies
-
-**[OBSERVED]** In stark contrast to the C layer:
-
-```bash
-$ ldd kitty/launcher/kitten
-  linux-vdso.so.1
-  libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-  /lib64/ld-linux-x86-64.so.2
-```
-
-The `kitten` binary depends **only** on `libc.so.6`. All Go runtime, cryptographic, image processing, and networking code is statically compiled into the 15 MB binary. This is the hallmark of Go's compilation model.
-
-**[OBSERVED]** Confirming via `readelf`:
-
-```bash
-$ readelf -d kitty/launcher/kitten | grep NEEDED
-  (NEEDED)  Shared library: [libc.so.6]
-```
-
-Only a single `NEEDED` entry. Compare this with `fast_data_types.so`'s 8 NEEDED entries — the Go binary carries its world internally.
-
-> **Known Go Dependency CVE — golang.org/x/image v0.17.0**: The `kitten` binary is compiled
-> against `golang.org/x/image v0.17.0` (declared in `go.mod`), which contains
-> CVE-2024-24792 — a panic in the TIFF image parser when processing corrupt or malicious
-> paletted images with invalid color indices. The vulnerable `tiff.Decode` function is
-> imported in `tools/utils/images/formats.go` and exercised by the `icat` kitten when
-> displaying TIFF images. The fix requires upgrading to `golang.org/x/image v0.18.0+`.
-> Because Go statically compiles all dependencies into the binary, this vulnerability is
-> embedded in the `kitten` executable itself — unlike the C libraries linked by
-> `fast_data_types.so`, which benefit from Ubuntu's system-level backported security patches.
-> An attacker could cause a denial-of-service by providing a maliciously crafted TIFF image
-> to `kitten icat`.
-
----
-
-## Section 3 — Thread Activity: Idle vs. Stress
-
-### 3.1 The Three-Thread Architecture
-
-Kitty's threading model is defined entirely in C, in `kitty/child-monitor.c`. The `ChildMonitor` struct (lines 49–62) is the central data structure:
-
-**[SOURCE-INFORMED]** From `kitty/child-monitor.c` lines 49–62:
-
-```c
-typedef struct {
-    PyObject_HEAD
-
-    PyObject *dump_callback, *update_screen, *death_notify;
-    unsigned int count;
-    bool shutting_down;
-    pthread_t io_thread, talk_thread;   // ← Two additional thread handles
-
-    int talk_fd, listen_fd;             // ← Remote control socket fds
-    Message *messages;
-    size_t messages_capacity, messages_count;
-    LoopData io_loop_data;
-    void (*parse_func)(void*, ParseData*, bool);  // ← VT parser function pointer
-} ChildMonitor;
-```
-
-The 2–3 threads are (the Talk thread is only created when remote control is enabled via `--listen-on` or single-instance mode):
-
-#### Thread 1: Main Thread (Rendering + Event Loop)
-
-**[SOURCE-INFORMED]** Created implicitly (the process's initial thread). Runs `main_loop()` at line 1258:
-
-```c
-// kitty/child-monitor.c lines 1258-1274
-static PyObject*
-main_loop(ChildMonitor *self, PyObject *a UNUSED) {
-    state_check_timer = add_main_loop_timer(1000, true, do_state_check, self, NULL);
-    run_main_loop(process_global_state, self);
-    // ... cleanup ...
-    Py_RETURN_NONE;
-}
-```
-
-The `run_main_loop()` function drives the GLFW event loop, calling `render()` (lines 870–896) on each iteration:
-
-```c
-// kitty/child-monitor.c lines 870-896
-static void render(monotonic_t now, bool input_read) {
-    for (size_t i = 0; i < global_state.num_os_windows; i++) {
-        OSWindow *w = global_state.os_windows + i;
-        if (!render_os_window(w, now, false, scan_for_animated_images)) {
-            // ...
-        }
-    }
-    last_render_at = now;
-}
-```
-
-The `render_os_window()` function (lines 832–868) calls:
-- `make_os_window_context_current(w)` — Activate the OpenGL context
-- `prepare_to_render_os_window(w, ...)` — Update screen data for rendering
-- `render_prepared_os_window(w, ...)` — Execute the OpenGL rendering pipeline
-  - which internally calls `swap_window_buffers()` (line 810) — Present the frame
-
-**All of these are C functions. The Main thread spends its rendering time in C, not Python.**
-
-#### Thread 2: I/O Thread (PTY Multiplexing + VT Parsing)
-
-**[SOURCE-INFORMED]** Created in `start()` at line 291:
-
-```c
-// kitty/child-monitor.c line 291
-ret = pthread_create(&self->io_thread, NULL, io_loop, self);
-```
-
-The I/O thread runs `io_loop()`, which:
-1. Polls child PTY file descriptors via `poll()`
-2. Reads PTY output data
-3. Dispatches to `self->parse_func` — which is either `parse_worker` or `parse_worker_dump` (line 180–181)
-4. The `parse_func` calls into `kitty/vt-parser.c` to process escape sequences
-
-The VT parser (`kitty/vt-parser.c`) includes SIMD acceleration:
-
-```c
-// kitty/vt-parser.c line 15
-#include "simd-string.h"
-```
-
-This means the I/O thread runs **pure C code** for parsing, with SIMD-accelerated string scanning on capable hardware.
-
-#### Thread 3: Talk Thread (Remote Control)
-
-**[SOURCE-INFORMED]** Conditionally created in `start()` at lines 285–289:
-
-```c
-// kitty/child-monitor.c lines 285-289
-if (self->talk_fd > -1 || self->listen_fd > -1) {
-    if ((ret = pthread_create(&self->talk_thread, NULL, talk_loop, self)) != 0) {
-        return PyErr_Format(PyExc_OSError, "Failed to start talk thread...");
-    }
-    talk_thread_started = true;
-}
-```
-
-The Talk thread only starts when remote control is enabled (via `--listen-on` or single-instance mode). It handles UNIX socket communication for `kitty @` commands.
-
-### 3.2 Thread Synchronization
-
-**[SOURCE-INFORMED]** From `kitty/child-monitor.c` lines 76–79:
-
-```c
-#define children_mutex(op)  pthread_mutex_##op(&children_lock);
-#define talk_mutex(op)      pthread_mutex_##op(&talk_lock);
-```
-
-- `children_lock` — Protects the child process list (used in `add_child` at line 307)
-- `talk_lock` — Protects the talk/remote-control message queue
-- Wakeup pipes — Cross-thread signaling: `wakeup_io_loop(self, false)` (line 300) writes to a pipe that `io_loop`'s `poll()` monitors
-
-### 3.3 Single-Python-Thread Evidence
-
-**[SOURCE-INFORMED]** From `kitty/main.py` line 504:
-
-```python
-sys.setswitchinterval(1000.0)  # we have only a single python thread
-```
-
-This is **the** evidence that Python never runs concurrent threads. The switch interval is set to 1000 seconds (effectively infinite). This means:
-
-- The GIL never needs to be released for Python thread switching
-- All multi-threading happens in C via `pthread_create`
-- Python code runs only on the Main thread, between C calls
-- When C code runs on the Main thread (rendering), Python is not executing
-
-### 3.4 Idle vs. Stress Comparison
-
-**[BLOCKED]** Direct thread observation via `/proc/PID/task/` was not possible because the kitty process could not be launched (no display server). However, the architecture makes precise predictions:
-
-| Aspect | Idle State | Under Rendering Stress |
+| Symbol | Type | Evidence |
 |---|---|---|
-| **Thread Count** | 2 or 3 (Main + I/O, + Talk if RC enabled) | **Same 2 or 3** — no dynamic thread creation |
-| **Main Thread** | Blocked in GLFW `poll_events()` waiting for input/timer | Actively calling `render_os_window()` → OpenGL draw calls each frame |
-| **I/O Thread** | Blocked in `poll()` on PTY fds with no data arriving | Continuously reading PTY data, calling `parse_func` (VT parser) at high rate |
-| **Talk Thread** | Blocked in `poll()` on UNIX socket with no clients | Active only if `kitty @` commands are being sent during stress |
-| **Python Activity** | Minimal — occasional timer callbacks | Minimal — Python only handles high-level events between C frames |
-| **C Activity** | Near zero CPU | Dominant — VT parsing + OpenGL rendering consume most CPU time |
+| `PyInit_fast_data_types` | T (global text) | Python C extension init entry point |
+| `do_parse` | t (local text) | VT escape sequence parser main loop |
+| `_parse_sgr` | t | SGR (Select Graphic Rendition) color parsing |
+| `csi_parse_loop` | t | CSI escape sequence dispatch loop |
+| `alloc_sprite_map` | t | GPU glyph texture atlas allocation |
+| `compile_shaders` | t | OpenGL shader compilation |
+| `attach_shaders` | t | Shader program linking |
+| `find_or_create_sprite_position` | t | Glyph cache lookup |
+| `find_or_create_glyph_properties` | t | Glyph metrics caching |
+| `draw_text_loop` | t | Text drawing main loop |
+| `add_main_loop_timer` | t | Timer registration for the GLFW event loop |
+| `gl_init` | t | OpenGL initialization |
+| `create_freetype_render_context` | t | FreeType rendering setup |
+| `GLAD_GL_VERSION_3_0` (and 1.0–3.1) | b (BSS) | GLAD OpenGL loader version flags |
+| `Screen_Type` | d (data) | Python type object for `Screen` |
+| `ChildMonitor_Type` | d | Python type object for `ChildMonitor` |
+| `Parser_Type` | d | Python type object for `Parser` |
+| `children_lock` | b | pthread mutex for child process list |
+| `canberra_thread` | b | Audio notification thread |
 
-> **Reasoning**: The thread count stays constant because kitty creates exactly 2–3 threads at startup and never spawns more. The stress manifests as increased CPU utilization on the **existing** threads, not as additional thread creation. This is a deliberate design choice — thread creation/destruction overhead is avoided, and the fixed thread pool has clear ownership of responsibilities.
-
-### 3.5 Expected `/proc/PID/task/` Output
-
-In a running kitty instance with remote control enabled, one would observe:
-
+Also found SIMD-accelerated base64 implementations compiled into the binary:
 ```
-/proc/<PID>/task/
-├── <TID_main>/     — Main thread (rendering + event loop)
-├── <TID_io>/       — I/O thread (PTY mux + VT parsing)
-└── <TID_talk>/     — Talk thread (remote control socket)
+base64_stream_decode_avx
+base64_stream_decode_avx2
+base64_stream_decode_sse41
+base64_stream_decode_sse42
+base64_stream_decode_ssse3
+base64_stream_encode_avx
+base64_stream_encode_avx2
 ```
 
-Each thread's `stat` file would show CPU time distribution shifting from IO-bound (idle) to CPU-bound (stress) behavior, with the I/O thread showing the largest delta due to VT parsing volume.
+**Thinking**: The symbols confirm that all rendering hot paths (`draw_text_loop`, `compile_shaders`, `alloc_sprite_map`), all parsing (`do_parse`, `csi_parse_loop`, `_parse_sgr`), all font operations (`create_freetype_render_context`), and thread synchronization primitives (`children_lock`) are implemented in C within the single `fast_data_types.so`. The GLAD version flags prove that OpenGL function loading happens at the C level, not through any Python or Go intermediary. The SIMD base64 variants show architecture-specific optimization that would not be possible in Go or Python.
 
 ---
 
-## Section 4 — Remote Control Interface Queries
+## 3. Thread Activity — Idle vs. Stress
 
-### 4.1 Remote Control Protocol Architecture
+### 3.1 Thread Inventory at Idle
 
-**[SOURCE-INFORMED]** The remote control system spans all three languages:
-
-**Python Server Side** — `kitty/remote_control.py` (lines 31–40) imports:
-
-```python
-from .fast_data_types import (
-    AES256GCMDecrypt,      # C-implemented decryption
-    AES256GCMEncrypt,      # C-implemented encryption
-    EllipticCurveKey,      # C-implemented key exchange
-    get_boss,              # Get the Boss singleton
-    get_options,           # Get current options
-    monotonic,             # High-resolution timer
-    read_command_response, # Read RC response
-    send_data_to_peer,     # Send data to RC client
-)
-```
-
-**C Transport Layer** — The Talk thread in `child-monitor.c` handles UNIX socket I/O, reading incoming commands and writing responses. The encryption (AES-256-GCM) and key exchange (X25519) are implemented in C via `kitty/crypto.c` using OpenSSL.
-
-**Python Command Dispatch** — `kitty/rc/base.py` provides the `RemoteCommand` base class. There are **41 command modules** in `kitty/rc/`, each implementing a specific `kitty @` subcommand.
-
-**Go Client Side** — The `kitten` binary includes a Go implementation of the remote control client in `tools/cmd/at/`. When a user runs `kitty @ ls`, it can use either the Go `kitten` binary as the client or the Python-based client.
-
-**Protocol Flow:**
+With kitty running and no user input, the thread listing was captured:
 
 ```
-Client (Go kitten or Python) ──UNIX socket──→ Talk Thread (C) ──mutex──→ Python dispatch (rc/*.py) → Response
+$ ls /proc/97391/task/ | wc -l
+68
+
+$ for tid in $(ls /proc/97391/task/); do
+    name=$(cat /proc/97391/task/$tid/comm)
+    echo "TID $tid: $name"
+  done
 ```
 
-### 4.2 Command Examples and Expected Outputs
+| Thread Name | Count | Role |
+|---|---|---|
+| `kitty` (TID 97391) | 1 | **Main thread** — GLFW event loop, rendering, Python interpreter |
+| `KittyChildMon` (TID 97458) | 1 | **I/O thread** — PTY multiplexing, VT parser feeding |
+| `KittyPeerMon` (TID 97457) | 1 | **Talk thread** — Remote control UNIX socket handler |
+| `kitty:disk$0` (TID 97456) | 1 | **DiskCache thread** — persistent cache I/O |
+| `llvmpipe-N` (TID 97392–97423) | 32 | Mesa llvmpipe software rendering worker pool |
+| `kitty` (TID 97424–97455) | 32 | Additional Mesa/LLVM JIT threads |
 
-**[BLOCKED]** The remote control commands could not be executed because launching kitty requires a display server. Below are the commands that **would** be issued and their expected outputs based on source code analysis.
+**Thinking**: The three application-level threads (`kitty`, `KittyChildMon`, `KittyPeerMon`) match exactly the architecture documented in `kitty/child-monitor.c` (line 55: `pthread_t io_thread, talk_thread;`). The thread names are set via `set_thread_name()` — line 1492 sets `"KittyChildMon"` for the I/O thread, and the Talk thread is set to `"KittyPeerMon"` (visible in the `talk_loop` function). The `kitty:disk$0` thread is an additional infrastructure thread for the DiskCache. The 64 Mesa threads (32 llvmpipe + 32 JIT) are created by the software OpenGL driver; on a system with a real GPU, these would not exist and the thread count would be approximately 4.
 
-#### 4.2.1 `kitty @ ls`
+### 3.2 Context Switch Comparison — Idle vs. Stress
 
-**Command:**
+A rendering stress test was executed by sending 5000 lines of heavily-colored output into the terminal:
 
-```bash
-$ kitty @ --to unix:/tmp/kitty-test.sock ls
+```
+$ kitten @ --to unix:/tmp/kitty-test2.sock send-text --match id:1 \
+  'seq 1 5000 | while read i; do printf "\033[48;5;$(($i%256));38;5;$((($i+128)%256))m%-80s\n" \
+  "LINE $i: heavy colored output"; done'
 ```
 
-**Expected Output** (from `kitty/rc/ls.py` lines 48–57):
+Context switch measurements before and after the stress run:
 
-The `response_from_kitty` method calls `boss.list_os_windows(window, tab_filter, window_filter)`, which returns a JSON tree:
+| Thread | Before (vol_ctx) | After (vol_ctx) | Delta | Interpretation |
+|---|---|---|---|---|
+| Main (`kitty`, TID 97391) | 844 | 1,290 | **+446** | Rendering frames, GLFW event processing |
+| I/O (`KittyChildMon`, TID 97458) | 2,245 | 6,964 | **+4,719** | PTY reads, VT parsing, buffer management |
+| Talk (`KittyPeerMon`, TID 97457) | 17 | 20 | **+3** | Minimal activity (no remote control queries during stress) |
+
+**Thinking**: The I/O thread (`KittyChildMon`) shows **10.6× more context switches** than the Main thread during rendering stress. This is because the I/O thread is continuously `poll()`-ing the child PTY, reading incoming bytes, and feeding them to the VT parser (`do_parse`), while the Main thread is processing already-parsed screen updates and submitting them for rendering. The Talk thread is nearly dormant (+3 switches) because no remote control commands were issued during the stress window. This demonstrates the clear division: I/O thread handles the high-frequency byte stream from child processes, Main thread handles rendering at the display refresh rate, and Talk thread is demand-driven.
+
+### 3.3 strace Syscall Profile During Stress
+
+A 5-second strace capture during active rendering:
+
+```
+$ strace -p 97391 -c -f -S calls
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- --------
+ 98.23    0.416559         503       828        83 futex
+  1.23    0.005209          38       134           poll
+  0.40    0.001716          15       108         6 read
+  0.06    0.000241           3        69        52 recvmsg
+  0.05    0.000215          13        16           writev
+  0.02    0.000085           6        13           write
+  0.00    0.000006           1         6           getpid
+  0.00    0.000023           7         3           ppoll
+  0.00    0.000000           0         1           accept
+------ ----------- ----------- --------- --------- --------
+100.00    0.424059         356      1188       141 total
+```
+
+**Thinking**: The syscall profile reveals that `futex` dominates (98% of wall time, 828 calls) — these are the pthread synchronization operations between the Main, I/O, and Talk threads sharing the `children_lock` and `talk_lock` mutexes. The 134 `poll` calls correspond to the GLFW event loop (`pollForEvents()` in glfw-x11.so) and the I/O thread's child PTY monitoring. The 108 `read` calls are PTY reads by the I/O thread. The 16 `writev` calls are X11 protocol writes for rendering. The single `accept` is the Talk thread accepting a remote control connection. This profile is entirely C-level syscalls — Python's GIL acquire/release would appear as additional futex calls, confirming that the hot path is C code with Python merely orchestrating the lifecycle.
+
+---
+
+## 4. Remote Control Interface Queries
+
+### 4.1 Window/Tab State (`kitty @ ls`)
+
+```
+$ kitten @ --to unix:/tmp/kitty-test2.sock ls
+```
+
+Output (trimmed to essential structure):
 
 ```json
 [
   {
     "id": 1,
+    "is_active": true,
     "is_focused": true,
-    "platform_window_id": 12345678,
+    "platform_window_id": 2097164,
+    "background_opacity": 1.0,
     "tabs": [
       {
         "id": 1,
-        "is_focused": true,
-        "title": "~",
-        "layout": "stack",
+        "is_active": true,
+        "layout": "fat",
+        "title": "/tmp/blitzy/kitty/blitzy-...",
         "windows": [
           {
             "id": 1,
-            "is_focused": true,
-            "is_self": false,
-            "title": "zsh",
-            "pid": 54321,
-            "cwd": "/home/user",
-            "cmdline": ["/bin/zsh"],
-            "columns": 80,
-            "lines": 24,
-            "env": {"TERM": "xterm-kitty", "SHELL": "/bin/zsh"}
+            "is_active": true,
+            "columns": 71,
+            "lines": 22,
+            "pid": 97459,
+            "cmdline": ["/bin/bash", "--posix"],
+            "cwd": "/tmp/blitzy/kitty/...",
+            "at_prompt": true,
+            "foreground_processes": [
+              {
+                "pid": 97459,
+                "cmdline": ["/bin/bash", "--posix"],
+                "cwd": "/tmp/blitzy/kitty/..."
+              }
+            ]
           }
         ]
       }
-    ]
+    ],
+    "wm_class": "kitty",
+    "wm_name": "kitty"
   }
 ]
 ```
 
-This reveals the hierarchical model: **OS Windows → Tabs → Windows**, managed by `kitty/boss.py`, with the window state (PID, CWD, command line) tracked per child process.
+**Thinking**: The `kitty @ ls` output comes through the Talk thread (`KittyPeerMon`). The Go `kitten` binary sends the `ls` command over a UNIX socket (`unix:/tmp/kitty-test2.sock`), the Talk thread reads it, dispatches to the Python `kitty/rc/ls.py` handler (which calls C-backed methods on the `Boss` object to collect window/tab state), serializes to JSON, and sends it back over the socket. This demonstrates all three languages cooperating: **Go** (kitten CLI sends the request), **C** (Talk thread handles the socket I/O), and **Python** (rc/ls.py handler collects and serializes the state). The `platform_window_id: 2097164` is an X11 window ID from the C GLFW layer.
 
-#### 4.2.2 `kitty @ get-colors`
-
-**Command:**
-
-```bash
-$ kitty @ --to unix:/tmp/kitty-test.sock get-colors
-```
-
-**Expected Output** (from `kitty/rc/get_colors.py` lines 42–50):
-
-The `response_from_kitty` method iterates over `opts` attributes that are `Color` instances:
+### 4.2 Color State (`kitty @ get-colors`)
 
 ```
-foreground    #dddddd
-background    #000000
-cursor        #cccccc
-selection_foreground #000000
-selection_background #fffacd
-color0        #000000
-color1        #cc0403
-color2        #19cb00
+$ kitten @ --to unix:/tmp/kitty-test2.sock get-colors
+```
+
+Output (first 10 and last 5 entries):
+
+```
+active_border_color     #00ff00
+active_tab_background   #eeeeee
+active_tab_foreground   #000000
+background              #000000
+bell_border_color       #ff5a00
+color0                  #000000
+color1                  #cc0403
 ...
-color15       #ffffff
+color255                #eeeeee
+cursor                  #cccccc
+cursor_text_color       #111111
+foreground              #dddddd
+selection_background    #fffacd
+selection_foreground    #000000
+url_color               #0087bd
 ```
 
-#### 4.2.3 `kitty @ get-text`
+**Thinking**: The full 256-color palette plus semantic colors (cursor, selection, tabs, borders) are returned, proving that the C `ColorProfile` type (exposed via `fast_data_types`) stores the complete color state in memory. The Python `kitty/rc/get_colors.py` handler reads from the C-backed `ColorProfile` object, not from a Python dictionary — the colors are maintained in C data structures for direct use by the GLSL shaders.
 
-**Command:**
+### 4.3 Screen Content (`kitty @ get-text`)
 
-```bash
-$ kitty @ --to unix:/tmp/kitty-test.sock get-text --extent screen
+```
+$ kitten @ --to unix:/tmp/kitty-test2.sock get-text --match id:1
 ```
 
-**Expected Output** (from `kitty/rc/get_text.py`): Returns the current screen contents as plain text (or with ANSI codes if `--ansi` is specified).
+Output (tail, during stress test):
 
-### 4.3 Dual-Language Client Implementation
+```
+;5;229mSTRACE_STRESS_00997
+;5;230mSTRACE_STRESS_00998
+;5;231mSTRACE_STRESS_00999
+;5;232mSTRACE_STRESS_01000
+```
 
-A notable architectural detail: the `kitty @` command interface has **two independent client implementations**:
-
-1. **Python client** — in `kitty/remote_control.py`, used when running from within the kitty process itself
-2. **Go client** — in `tools/cmd/at/`, compiled into the `kitten` binary, used when running from any terminal
-
-Both communicate with the same **C+Python server** via the UNIX socket protocol. This is evidence of the three-language boundary: C handles the socket I/O (Talk thread), Python handles command dispatch (rc modules), and Go provides a portable standalone client.
+**Thinking**: The `get-text` output shows the visible screen content, including ANSI escape code fragments. This is because the C `Screen` object stores the parsed text but the remote control serialization extracts the raw line content. The ANSI fragments visible in the output are residual SGR sequences that were parsed by the C VT parser (`_parse_sgr` in fast_data_types.so) and applied to the cell attributes; the text extraction path pulls cell character content with formatting fragments.
 
 ---
 
-## Section 5 — Kitten Process Relationship
+## 5. Kitten Process Relationship
 
-### 5.1 The `os.execl` Process Replacement
+### 5.1 Observation Method
 
-The most critical observation about the kitten process model is how Go kittens are launched. This is **not** a `fork+exec` creating a child process under the kitty parent — it is an `execl` that **replaces the current process image**.
+A test image was created and `kitten icat` was launched inside the running kitty terminal:
 
-**[SOURCE-INFORMED]** From `kitty/entry_points.py` lines 10–12:
+```
+$ kitty/launcher/kitten icat /tmp/test_image.png &
+KPID=$!
+```
+
+The process state was captured while kitten was running:
+
+```
+$ ls -la /proc/$KPID/exe
+lrwxrwxrwx 1 root root 0 /proc/103385/exe -> .../kitty/launcher/kitten
+
+$ cat /proc/$KPID/status | head -10
+Name:   kitten
+Umask:  0022
+State:  T (stopped)
+Tgid:   103385
+Pid:    103385
+PPid:   97459
+TracerPid: 0
+```
+
+Process tree during execution:
+
+```
+kitty (PID 97391)          ← C launcher + embedded Python + C extensions
+  └── bash (PID 97459)     ← Child shell spawned by kitty
+        └── kitten (PID 103385) ← Go binary, separate process
+```
+
+### 5.2 Analysis
+
+**Key observations:**
+
+1. **Separate PID**: The kitten process (PID 103385) has its own PID, distinct from the kitty process (PID 97391). It is NOT a thread within the kitty process.
+
+2. **Separate executable**: `/proc/103385/exe` points to `kitty/launcher/kitten`, the Go binary — not to the Python interpreter or the kitty launcher.
+
+3. **Parent chain**: The kitten's PPid is 97459 (the bash shell inside kitty), not 97391 (the kitty process itself). This is because when the user types `kitten icat ...` in the terminal, bash (the child process) fork+exec's the kitten binary.
+
+4. **No Go libraries in kitty process**: Looking back at the `/proc/97391/maps` from Section 2, there are zero Go runtime libraries loaded. The Go runtime is entirely self-contained within the kitten binary's own address space.
+
+**Thinking**: The source code path confirms this observation. In `kitty/entry_points.py` (line 10–12):
 
 ```python
 def icat(args: List[str]) -> None:
@@ -745,805 +462,337 @@ def icat(args: List[str]) -> None:
     os.execl(kitten_exe(), "kitten", *args)
 ```
 
-The `os.execl()` system call replaces the **entire process** — the Python interpreter, all loaded C extensions, everything — with the Go `kitten` binary. After this call, the process is running Go code exclusively.
+When kitty itself dispatches `+kitten icat`, it calls `os.execl()` which **replaces the current process image** with the Go kitten binary. However, in our observation, kitten was launched from the bash shell inside kitty, so it was fork+exec'd as a child of bash, not as a replacement of the kitty process.
 
-**[SOURCE-INFORMED]** From `kitty/constants.py` lines 82–84:
-
-```python
-@run_once
-def kitten_exe() -> str:
-    return os.path.join(os.path.dirname(kitty_exe()), 'kitten')
-```
-
-The `kitten` binary is a **separate file on disk**, located in the same directory as the `kitty` binary. This is not a symlink or a different invocation of the same binary — it is a completely independent Go executable.
-
-### 5.2 Additional exec Patterns
-
-The `os.execl`/`os.execvp` pattern is used consistently for all Go-implemented functionality:
-
-**[SOURCE-INFORMED]** From `kitty/entry_points.py`:
-
-```python
-# Line 27-30: hold() function
-def hold(args: List[str]) -> None:
-    from kitty.constants import kitten_exe
-    args = ['kitten', '__hold_till_enter__'] + args[1:]
-    os.execvp(kitten_exe(), args)
-
-# Lines 33-43: complete() function
-def complete(args: List[str]) -> None:
-    from kitty.constants import kitten_exe
-    args = ['kitten', '__complete__'] + args[1:]
-    os.execvp(kitten_exe(), args)
-```
-
-Every function that delegates to Go uses `os.execl` or `os.execvp` — process replacement, not subprocess creation.
-
-### 5.3 Expected Process Tree Observation
-
-When `kitty +kitten icat <image>` is invoked from within a running kitty terminal:
-
-**[SOURCE-INFORMED]** The process flow is:
-
-1. The kitty main process (PID A) spawns a child shell process (PID B)
-2. The user types `kitty +kitten icat photo.png`
-3. The kitty launcher dispatches to `entry_points.py`'s `icat()` function
-4. `os.execl(kitten_exe(), "kitten", "icat", "photo.png")` is called
-5. This **replaces** PID B's process image with the Go `kitten` binary
-6. The `kitten` process (now PID B) runs the Go icat code from `kittens/icat/main.go`
-
-What `ps` would show during icat execution:
-
-```bash
-$ ps aux | grep -E 'kitty|kitten'
-user  PID_A  ... kitty/launcher/kitty --listen-on unix:/tmp/kitty.sock
-user  PID_B  ... kitten icat photo.png
-```
-
-What `pstree` would show:
-
-```
-kitty(PID_A)───zsh(PID_B)───kitten(PID_B')
-```
-
-> **Key Insight**: The `kitten` process runs as a **child process** of the shell that kitty spawned, NOT as a child of the kitty process directly. The `os.execl` replaces the shell's child, so the kitten binary communicates with the terminal via standard I/O (escape sequences), not via any in-process API.
-
-### 5.4 Contrast: Python Kittens Run In-Process
-
-**[SOURCE-INFORMED]** From `kittens/runner.py` lines 46–65 (simplified for clarity — the actual source includes a `with preserve_sys_path():` context manager, `sys.path.insert(0, ...)` path manipulation, and explicit `lambda *a, **kw: None` defaults):
-
-```python
-def import_kitten_main_module(config_dir: str, kitten: str) -> Dict[str, Any]:
-    if kitten.endswith('.py'):
-        with preserve_sys_path():
-            path = path_to_custom_kitten(config_dir, kitten)
-            if os.path.dirname(path):
-                sys.path.insert(0, os.path.dirname(path))
-            with open(path) as f:
-                src = f.read()
-            code = compile(src, path, 'exec')
-            g = {'__name__': 'kitten'}
-            exec(code, g)
-            hr = g.get('handle_result', lambda *a, **kw: None)
-        return {'start': g['main'], 'end': hr}
-
-    kitten = resolved_kitten(kitten)
-    m = importlib.import_module(f'kittens.{kitten}.main')
-    return {
-        'start': getattr(m, 'main'),
-        'end': getattr(m, 'handle_result', lambda *a, **k: None),
-    }
-```
-
-Python-based kittens (those with Python `main.py` in their package) are loaded via `importlib.import_module()` and run **within the kitty process**. They share the same Python interpreter, the same `fast_data_types` C extension, and the same process memory.
-
-**The key distinction:**
-
-| Aspect | Go Kittens (e.g., icat) | Python Kittens |
-|---|---|---|
-| **Launch mechanism** | `os.execl()` — process replacement | `importlib.import_module()` — in-process |
-| **Process model** | Separate OS process, separate PID | Same process as kitty |
-| **Language runtime** | Go runtime (GC, goroutines) | CPython interpreter (shared with kitty) |
-| **Communication** | Terminal escape sequences, UNIX sockets | Direct Python function calls |
-| **Access to C layer** | None (separate binary) | Full access via `fast_data_types` |
-
-### 5.5 icat Go Implementation
-
-**[SOURCE-INFORMED]** The icat kitten's Go source files in `kittens/icat/`:
-
-```go
-// kittens/icat/main.go — imports reveal the Go ecosystem used
-import (
-    "kitty/tools/cli"           // CLI argument parsing
-    "kitty/tools/tty"           // Terminal TTY handling
-    "kitty/tools/tui"           // Text UI framework
-    "kitty/tools/tui/graphics"  // Graphics protocol implementation
-    "kitty/tools/utils/images"  // Image loading and processing
-    "kitty/tools/utils/style"   // Terminal styling
-    "golang.org/x/sys/unix"     // POSIX system calls
-)
-```
-
-Supporting files:
-- `cli_generated.go` — Auto-generated CLI argument definitions
-- `native.go` — Native Go image decoding (PNG, JPEG, GIF, WebP, TIFF, BMP)
-- `detect.go` — Terminal graphics capability probing via escape sequences
-- `transmit.go` — Graphics protocol data transmission (shared memory, files, or direct)
-- `process_images.go` — Image processing pipeline (resize, crop, color adjustment)
-- `magick.go` — Optional ImageMagick integration for exotic formats
-
-All image processing, protocol negotiation, and data transmission happens in Go — **none of it requires the C layer or Python interpreter**.
+The `kitten_exe()` function in `kitty/constants.py` (line 83–84) returns `os.path.join(os.path.dirname(kitty_exe()), 'kitten')` — the kitten binary is expected to be in the same directory as the kitty binary. This is a deployment convention, not a runtime linkage — the two binaries share no memory or code at runtime.
 
 ---
 
-## Section 6 — Kitten Binary Inspection
+## 6. Kitten Binary Inspection
 
-### 6.1 Binary Format Identification
+### 6.1 Binary Format
 
-**[OBSERVED]** The `file` command reveals the binary's nature:
-
-```bash
+```
 $ file kitty/launcher/kitten
 kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV),
   dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
-  Go BuildID=hqq4-U2LKlixbsjwYo2Y/n8c9tVmrH955DZP0gtLh/TlErkqS1Lkyxjr-Onw6b/O2yALBSe3QkGVIYlcExQ,
+  Go BuildID=hWFG_Ca3xQ6VcsZYShGt/vXHUDdkh1kOGPzVOfMDC/TlErkqS1Lkyxjr-Onw6b/6MzJb86-gjtn1TQxs0aQ,
   stripped
 ```
 
-**Analysis:**
+**Key findings:**
+- **ELF 64-bit LSB executable**: Standard Linux binary format, not a script or bytecode
+- **Go BuildID present**: The four-component BuildID (`hWFG_.../vXHU.../TlEr.../6MzJ...`) is the definitive Go binary fingerprint
+- **Dynamically linked**: Despite being Go, it links against libc (standard for CGO-enabled or external linker builds)
+- **Stripped**: Debug symbols removed, but Go metadata sections preserved
 
-- **`ELF 64-bit LSB executable`** — Standard Linux executable format
-- **`Go BuildID=hqq4-U2LKlixbsjwYo2Y/...`** — Embedded Go build identifier, definitively proving this is a Go-compiled binary
-- **`dynamically linked`** — Links against `libc.so.6` only (CGO or external linking mode)
-- **`stripped`** — Debug symbols removed via `-s -w` ldflags (setup.py line 1157)
+### 6.2 Shared Library Dependencies
 
-### 6.2 Dynamic Dependency Analysis
-
-**[OBSERVED]** The kitten binary's minimal dependency footprint:
-
-```bash
+```
 $ ldd kitty/launcher/kitten
   linux-vdso.so.1
   libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
   /lib64/ld-linux-x86-64.so.2
 
-$ readelf -d kitty/launcher/kitten | grep NEEDED
-  (NEEDED)  Shared library: [libc.so.6]
+$ readelf -d kitty/launcher/kitten
+  Tag        Type         Name/Value
+  (NEEDED)   Shared library: [libc.so.6]
 ```
 
-**Only `libc.so.6`** is required. No libpython, no libharfbuzz, no libfreetype, no OpenGL, no libpng — the Go binary is self-contained for all its functionality. Image processing uses pure Go libraries (`github.com/kovidgoyal/imaging`, `golang.org/x/image`), not system libraries.
+**Thinking**: The kitten binary depends **only** on libc.so.6 — no libpython, no libfreetype, no libGL, no libharfbuzz. This is the hallmark of a Go binary with CGO disabled or using only libc-level syscalls. Compare with `kitty/fast_data_types.so` which links against 17 shared libraries including libpython, libharfbuzz, libpng, liblcms2, libcrypto, and libGL. The kitten binary is essentially self-contained — the entire Go runtime, garbage collector, goroutine scheduler, and all Go packages are statically compiled into the 16 MB binary.
 
-### 6.3 Go Runtime Presence
+### 6.3 Go Runtime Confirmation
 
-**[OBSERVED]** The binary is stripped (`-s -w`), so `nm` and `go tool nm` cannot read symbols:
-
-```bash
-$ nm kitty/launcher/kitten
-nm: kitty/launcher/kitten: no symbols
-
-$ go tool nm kitty/launcher/kitten
-reading kitty/launcher/kitten: no symbol section
 ```
+$ readelf -S kitty/launcher/kitten | grep -E '\.go|\.text'
+  [ 1] .text             PROGBITS  0000000000401000
+  [13] .gosymtab         PROGBITS  0000000000f18508
+  [14] .gopclntab        PROGBITS  0000000000f18520
+  [15] .go.buildinfo     PROGBITS  00000000012b1000
+  [25] .note.go.buildid  NOTE      0000000000400f80
 
-However, Go runtime evidence is still available via `strings` and the `.go.buildinfo` section:
-
-**[OBSERVED]** A raw `strings | grep 'runtime\.'` produces garbled entries first (due to partial string matches in the stripped binary):
-
-```bash
-$ strings kitty/launcher/kitten | grep 'runtime\.' | head -10
-runtime.
-runtime.H9
-runtime.H9
-runtime.H9
-runtime.H9
-runtime.H
-runtime.H
-runtime.H9
-runtime.H92
-runtime.1
-```
-
-Filtering for clean Go runtime symbols with a tighter pattern reveals the actual Go runtime function names:
-
-```bash
-$ strings kitty/launcher/kitten | grep -E '^runtime\.[a-z]' | head -10
-runtime.cmpstring
-runtime.memequal
-runtime.memequal_varlen
-runtime.init
-runtime.init.func2
-runtime.sigdelset
-runtime.memhash8
-runtime.memhash16
-runtime.memhash128
-runtime.memhash_varlen
-```
-
-These are unmistakably Go runtime internal functions — `runtime.cmpstring`, `runtime.memequal`, `runtime.memhash*` — confirming a Go runtime is embedded in the binary despite symbol stripping.
-
-**[OBSERVED]** The raw `readelf -p .go.buildinfo` output contains `^I` tab characters, `\n` literal escapes, and hash checksums that make it difficult to read directly. Using `go version -m` provides cleaner, structured output:
-
-```bash
-$ go version -m kitty/launcher/kitten
+$ go version kitty/launcher/kitten
 kitty/launcher/kitten: go1.22.10
-	path	kitty/tools/cmd
-	mod	kitty	(devel)
-	dep	github.com/ALTree/bigfloat	v0.2.0
-	dep	github.com/alecthomas/chroma/v2	v2.14.0
-	dep	github.com/bmatcuk/doublestar/v4	v4.6.1
-	dep	github.com/disintegration/imaging	v1.6.2
-	dep	github.com/dlclark/regexp2	v1.11.0
-	dep	github.com/edwvee/exiffix	v0.0.0-20240229113213-0dbb146775be
-	dep	github.com/google/uuid	v1.6.0
-	dep	github.com/klauspost/cpuid/v2	v2.2.5
-	dep	github.com/kovidgoyal/imaging	v1.6.3
-	dep	github.com/rwcarlsen/goexif	v0.0.0-20190401172101-9e8deecbddbd
-	dep	github.com/seancfoley/bintree	v1.3.1
-	dep	github.com/seancfoley/ipaddress-go	v1.6.0
-	dep	github.com/shirou/gopsutil/v3	v3.24.5
-	dep	github.com/tklauser/go-sysconf	v0.3.12
-	dep	github.com/tklauser/numcpus	v0.6.1
-	dep	github.com/zeebo/xxh3	v1.0.2
-	dep	golang.org/x/exp	v0.0.0-20230801115018-d63ba01acd4b
-	dep	golang.org/x/image	v0.17.0
-	dep	golang.org/x/sys	v0.21.0
-	dep	howett.net/plist	v1.0.1
-	build	-buildmode=exe
-	build	-compiler=gc
-	build	-ldflags="-X kitty.VCSRevision=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 -s -w"
-	build	CGO_ENABLED=1
 ```
 
-This confirms:
-1. The binary was built from `kitty/tools/cmd` (the Go entry point)
-2. Go version `go1.22.10` was used
-3. 14 of 15 direct dependencies from `go.mod` are embedded (`github.com/google/go-cmp` is test-only and excluded from the binary), plus 6 indirect dependencies (disintegration/imaging, klauspost/cpuid/v2, rwcarlsen/goexif, seancfoley/bintree, tklauser/go-sysconf, tklauser/numcpus)
-4. The ldflags include `-s -w` (strip symbols/DWARF) and the VCS revision for version tracking
-5. `CGO_ENABLED=1` confirms external linking mode (explaining the `libc.so.6` dependency)
+**Go-specific ELF sections found:**
+- `.gosymtab` — Go symbol table (Go's own symbol format, independent of ELF symtab)
+- `.gopclntab` — Go PC-to-line-number table (for stack traces and runtime.Caller)
+- `.go.buildinfo` — Go module info, build settings, dependency versions
+- `.note.go.buildid` — Build reproducibility identifier
 
-**[OBSERVED]** Kitty-specific Go packages embedded in the binary:
+### 6.4 Embedded Go Packages
 
-```bash
-$ strings kitty/launcher/kitten | grep '^kitty/' | head -20
-kitty/tools/cli
-kitty/tools/tty
-kitty/tools/tui
-kitty/kittens/ssh
-kitty/tools/utils
-kitty/kittens/ask
-kitty/tools/rsync
-kitty/tools/config
-kitty/tools/themes
-kitty/tools/cmd/at
-kitty/kittens/diff
-kitty/kittens/icat
-kitty/kittens/hints
-kitty/tools/tui/sgr
-kitty/tools/tui/loop
-kitty/tools/wcswidth
-kitty/kittens/themes
-kitty/tools/utils/shm
-kitty/tools/cli/markup
-kitty/kittens/show_key
+```
+$ strings kitty/launcher/kitten | grep -oE 'kitty/(tools|kittens)/[a-z_/]+' | sort -u
 ```
 
-This reveals the full scope of Go functionality: CLI tools, kittens (icat, diff, ssh, hints, themes, transfer, show_key, ask), TUI framework (sgr, loop, graphics), shared utilities (wcswidth, shm), crypto, and remote control client (`cmd/at`).
+Packages found (50 total, selected):
 
-### 6.4 Build System Evidence
+| Package | Purpose |
+|---|---|
+| `kitty/kittens/icat` | Image display via graphics protocol |
+| `kitty/kittens/diff` | Side-by-side diff viewer |
+| `kitty/kittens/ssh` | SSH integration with shell integration |
+| `kitty/kittens/themes` | Theme browser and selector |
+| `kitty/kittens/clipboard` | Clipboard access |
+| `kitty/kittens/hints` | URL and pattern hints |
+| `kitty/kittens/unicode_input` | Unicode character input |
+| `kitty/kittens/transfer` | File transfer via terminal |
+| `kitty/kittens/ask` | User prompt dialogs |
+| `kitty/kittens/choose_fonts` | Font selection UI |
+| `kitty/tools/cmd/at` | Remote control (`kitty @`) client |
+| `kitty/tools/tui/loop` | Go TUI event loop |
+| `kitty/tools/tui/graphics` | Graphics protocol encoder |
+| `kitty/tools/crypto` | X25519/AES-GCM encryption |
+| `kitty/tools/utils/images` | Image processing (resize, decode) |
 
-**[SOURCE-INFORMED]** From `setup.py` lines 1130–1165, the `build_static_kittens()` function:
+**Thinking**: All 50 Go packages are compiled into the single kitten binary. This means every kitten subcommand (icat, diff, ssh, themes, clipboard, hints, unicode_input, transfer, choose_fonts, etc.) runs from the same binary. The binary contains its own TUI loop, graphics protocol encoder, crypto layer, and image processing — completely independent of the kitty process. This is the Go "single binary deployment" pattern: no shared library dependencies, no runtime installation required.
 
-```python
-def build_static_kittens(args, launcher_dir, destination_dir='', ...):
-    go = shutil.which('go')
-    cmd = [go, 'build', '-v']
-    vcs_rev = args.vcs_rev or get_vcs_rev()
-    ld_flags = []
-    binary_data_flags = [f"-X kitty.VCSRevision={vcs_rev}"]
-    if not args.debug:
-        ld_flags.append('-s')   # Strip symbol table
-        ld_flags.append('-w')   # Strip DWARF debug info
-    cmd += ['-ldflags', ' '.join(binary_data_flags + ld_flags)]
-    dest = os.path.join(destination_dir or launcher_dir, 'kitten')
-    src = os.path.abspath('tools/cmd')
-    # ... execute go build ...
-```
+### 6.5 Go Entry Point
 
-The Go entry point describes itself:
+The Go entry point (`tools/cmd/main.go`) was read from source:
 
 ```go
-// tools/cmd/main.go lines 22-24
-root.ShortDescription = "Fast, statically compiled implementations of various kittens
-  (command line tools for use with kitty)"
+func main() {
+    krm := os.Getenv("KITTY_KITTEN_RUN_MODULE")
+    os.Unsetenv("KITTY_KITTEN_RUN_MODULE")
+    switch krm {
+    case "ssh_askpass":
+        ssh.RunSSHAskpass()
+        return
+    }
+    root := cli.NewRootCommand()
+    root.ShortDescription = "Fast, statically compiled implementations of various kittens"
+    root.HelpText = "kitten serves as a launcher for running individual kittens."
+    tool.KittyToolEntryPoints(root)
+    completion.EntryPoint(root)
+    root.Exec()
+}
 ```
 
-> **The description is itself a design statement**: "Fast, statically compiled implementations" — the Go kittens exist to provide **portable, fast CLI tools** that don't require a Python interpreter or the C extension to be present on the target system.
-
-### 6.5 Go Version Confirmation
-
-**[OBSERVED]** Direct Go version string in the binary:
-
-```bash
-$ strings kitty/launcher/kitten | grep 'go1\.[0-9]'
-go1.22.10
-
-$ kitty/launcher/kitten --version
-kitten 0.35.2 created by Kovid Goyal
-```
+**Thinking**: The Go main function builds a CLI command tree and dispatches to subcommands. The comment string embedded in the binary itself — "Fast, statically compiled implementations of various kittens" — explicitly states the design intent: Go kittens are compiled for speed and deploy as a single static binary.
 
 ---
 
-## Section 7 — Symbol and Stack Snapshots
+## 7. Symbol and Stack Snapshots
 
-### 7.1 Snapshot Attempts and Results
-
-Due to the headless environment (no display server), the kitty process could not be fully launched, making live process inspection impossible. Below is a systematic account of each attempted method and the fallback used.
-
-#### Method 1: `/proc/PID/maps` — Memory Map
-
-**[BLOCKED]** Cannot obtain because the kitty process cannot start:
-
-```bash
-$ kitty/launcher/kitty --listen-on unix:/tmp/kitty-test.sock
-[0.059] [glfw error 65544]: X11: The DISPLAY environment variable is missing
-GLFW initialization failed
-```
-
-**Fallback**: We used `ldd` on the compiled binaries to reconstruct what the memory map **would** contain. In a running kitty process, `/proc/PID/maps` would show:
+### 7.1 GDB Stack Trace — Main Thread
 
 ```
-# Expected /proc/<PID>/maps entries (based on ldd output):
-<addr>  r-xp  .../kitty/launcher/kitty           # C launcher code
-<addr>  r-xp  .../libpython3.12.so.1.0           # CPython interpreter
-<addr>  r-xp  .../kitty/fast_data_types.so        # 1.5 MB C extension (ALL C code)
-<addr>  r-xp  .../kitty/glfw-x11.so              # GLFW X11 backend
-<addr>  r-xp  .../libharfbuzz.so.0               # HarfBuzz text shaping
-<addr>  r-xp  .../libfreetype.so.6               # FreeType glyph rasterization
-<addr>  r-xp  .../libpng16.so.16                 # PNG decoding
-<addr>  r-xp  .../liblcms2.so.2                  # ICC color management
-<addr>  r-xp  .../libcrypto.so.3                 # OpenSSL encryption
-<addr>  r-xp  .../libGL.so.1                     # OpenGL (loaded by GLAD at runtime)
-<addr>  r-xp  .../libX11.so.6                    # X11 protocol
-<addr>  r-xp  .../libxkbcommon.so.0              # Keyboard layout handling
+$ gdb -batch -ex 'thread 1' -ex 'bt 15' -p 97391
 ```
 
-**What would NOT appear**: Any Go runtime library, `libgo.so`, or Go-compiled `.so` files — because Go code runs only in the separate `kitten` binary process.
-
-#### Method 2: `strace` on kitten Binary
-
-**[OBSERVED]** Since the `kitten` binary can run without a display server (for `--version`), we captured a brief trace:
-
-```bash
-$ strace -f -e trace=write,read -c kitty/launcher/kitten --version 2>&1
-strace: Process 44785 attached
-strace: Process 44786 attached
-strace: Process 44787 attached
-strace: Process 44788 attached
-strace: Process 44789 attached
-strace: Process 44790 attached
-strace: Process 44791 attached
-strace: Process 44792 attached
-strace: Process 44793 attached
-strace: Process 44794 attached
-kitten 0.35.2 created by Kovid Goyal
-% time     seconds  usecs/call     calls    errors syscall
------- ----------- ----------- --------- --------- ----------------
-100.00    0.000223          22        10           read
-  0.00    0.000000           0         1           write
------- ----------- ----------- --------- --------- ----------------
-100.00    0.000223          20        11           total
+```
+Thread 1 (Main thread, "kitty"):
+#0  __GI___poll (fds=0x...._glfw+133552, nfds=2, timeout=-1)
+    at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  pollForEvents ()
+    from kitty/glfw-x11.so
+#2  _glfwPlatformWaitEvents ()
+    from kitty/glfw-x11.so
+#3  _glfwPlatformRunMainLoop ()
+    from kitty/glfw-x11.so
+#4  main_loop ()
+    from kitty/fast_data_types.so
+#5  ?? () from libpython3.12.so.1.0       [PyObject_Vectorcall]
+#6  PyObject_Vectorcall ()                 from libpython3.12.so.1.0
+#7  _PyEval_EvalFrameDefault ()            from libpython3.12.so.1.0
+#8  _PyObject_FastCallDictTstate ()        from libpython3.12.so.1.0
+#9  _PyObject_Call_Prepend ()              from libpython3.12.so.1.0
+#10 ?? ()                                  from libpython3.12.so.1.0
+#11 _PyObject_MakeTpCall ()                from libpython3.12.so.1.0
+#12 _PyEval_EvalFrameDefault ()            from libpython3.12.so.1.0
+#13 PyEval_EvalCode ()                     from libpython3.12.so.1.0
 ```
 
-**Analysis**: The 10 `strace: Process ... attached` messages are notable — they reveal that the Go runtime immediately spawns multiple OS threads (goroutine scheduler threads) even for a trivial `--version` invocation. This is characteristic of the Go runtime, which creates threads for its garbage collector, timer management, and goroutine scheduling. The `read` calls dominate (10 reads vs 1 write) because the Go runtime performs thread setup reads before the single `write` that outputs the version string. In a full icat session, the write calls would dominate (graphics protocol escape sequences being sent to the terminal).
+**Thinking**: This stack trace is the single most revealing artifact. Reading from bottom to top:
 
-#### Method 3: Symbol Table of `fast_data_types.so`
+1. **Frames #13–#7** (`PyEval_EvalCode`, `_PyEval_EvalFrameDefault`): Python bytecode evaluation — this is `kitty/main.py` calling `boss.child_monitor.main_loop()`
+2. **Frame #5–#6** (`PyObject_Vectorcall`): Python calling a C function — the transition from Python to the C `main_loop()` method of the `ChildMonitor` object
+3. **Frame #4** (`main_loop()` in `fast_data_types.so`): The C `main_loop()` from `kitty/child-monitor.c` line 1259 — this is where `run_main_loop()` is called
+4. **Frame #3** (`_glfwPlatformRunMainLoop()` in `glfw-x11.so`): The GLFW platform-specific event loop
+5. **Frame #2** (`_glfwPlatformWaitEvents()`): GLFW waiting for X11 events
+6. **Frame #1** (`pollForEvents()`): The actual X11 connection polling
+7. **Frame #0** (`__GI___poll`): Kernel poll syscall waiting on the X11 connection file descriptor
 
-**[OBSERVED]** The `fast_data_types.so` is **not stripped**, so symbol inspection succeeds:
+This stack definitively shows the **Python → C → GLFW → X11** call chain at idle. Python invokes the C `main_loop`, which delegates to GLFW, which blocks on X11 events. When events arrive (or the I/O thread signals data ready), the C `render()` function (line 871 of child-monitor.c) executes the rendering pipeline — all in C, never returning to Python for the hot path.
 
-```bash
-$ nm -D kitty/fast_data_types.so | grep 'T ' | head -8
-0000000000029860 T PyInit_fast_data_types   # Module initialization entry point
-00000000000f5c90 T base64_decode
-00000000000f5bf0 T base64_encode
-00000000000f5be0 T base64_stream_decode
-00000000000f5b90 T base64_stream_decode_init
-00000000000f5b10 T base64_stream_encode
-00000000000f5b20 T base64_stream_encode_final
-00000000000f5ac0 T base64_stream_encode_init
+### 7.2 GDB Stack Trace — I/O Thread (KittyChildMon)
+
+```
+Thread 2 ("KittyChildMon"):
+#0  __GI___poll (fds=0x..._children_fds, nfds=3, timeout=-1)
+#1  io_loop ()     from kitty/fast_data_types.so
+#2  start_thread ()
+#3  clone3 ()
 ```
 
-The key exported symbol is `PyInit_fast_data_types` at address `0x29860` — this is the CPython module initialization function that runs when Python executes `import kitty.fast_data_types`.
+**Thinking**: The I/O thread is sitting in `poll()` waiting on the `children_fds` array (defined at the file scope in child-monitor.c). The `nfds=3` means it's watching: (1) the wakeup pipe from the main thread, (2) a signal pipe, and (3) one child PTY file descriptor (the bash shell). When data arrives on the PTY, `io_loop()` reads it and feeds it to the VT parser, then wakes the main thread. The entire I/O thread stack is pure C — no Python frames appear.
 
-**Imported symbols reveal the C layer's dependencies:**
+### 7.3 GDB Stack Trace — Talk Thread (KittyPeerMon)
 
-```bash
-$ nm -D kitty/fast_data_types.so | grep 'U ' | grep -E 'hb_|FT_|png_|EVP_|cms' | wc -l
-104
+```
+Thread 3 ("KittyPeerMon"):
+#0  __GI___poll (fds=0x..., nfds=2, timeout=-1)
+#1  talk_loop ()   from kitty/fast_data_types.so
+#2  start_thread ()
+#3  clone3 ()
 ```
 
-There are **104 undefined symbols** (imported functions) from HarfBuzz (22), FreeType (25), libpng (25), OpenSSL (26), and lcms2 (6). These are the rendering-adjacent library functions that the C layer calls directly.
+**Thinking**: The Talk thread is similarly in `poll()`, waiting on: (1) the UNIX socket for remote control connections, and (2) a wakeup pipe. When a `kitten @` command arrives, `talk_loop()` accepts the connection, reads the command, and dispatches it to the Python RC handler via the main thread. Again, all C frames — the Talk thread itself never executes Python bytecode.
 
-### 7.2 SIMD Evidence
+### 7.4 DiskCache Thread
 
-**[SOURCE-INFORMED]** The C layer includes SIMD-accelerated string operations:
-
-```c
-// kitty/simd-string-128.c — SSE4.2 (128-bit)
-#define KITTY_SIMD_LEVEL 128
-#include "simd-string-impl.h"
-
-// kitty/simd-string-256.c — AVX2 (256-bit)
-#define KITTY_SIMD_LEVEL 256
-#include "simd-string-impl.h"
+```
+Thread 4 ("kitty:disk$0"):
+#0  __futex_abstimed_wait_common64 (...)
+#1  __GI___futex_abstimed_wait_cancelable64 (...)
+#2  __pthread_cond_wait_common (...)
+#3  ___pthread_cond_wait (...)
+#4  ?? ()   from libgallium-25.2.8-*.so
+#5  ?? ()   from libgallium-25.2.8-*.so
 ```
 
-The VT parser includes SIMD acceleration:
-
-```c
-// kitty/vt-parser.c line 15
-#include "simd-string.h"
-```
-
-And `kitty/simd-string.c` provides the runtime dispatch coordinator that selects the appropriate implementation based on CPU capabilities.
-
-**These SIMD operations exist exclusively in the C layer.** Neither Python (which has no SIMD intrinsics support) nor Go (whose compiler has limited auto-vectorization) provides equivalent acceleration. This is a deliberate architectural choice: the VT parser's inner loop — where every byte of terminal output passes through — is optimized with platform-specific SIMD instructions compiled into the C extension.
-
-### 7.3 Expected Stack Frames Under Rendering Stress
-
-Based on the source code structure, a `gdb -batch -ex 'thread apply all bt' -p PID` during rendering stress would reveal:
-
-**Main Thread (rendering):**
-```
-#0  glXSwapBuffers()              — libGL.so (frame presentation)
-#1  swap_window_buffers()         — fast_data_types.so (kitty/shaders.c)
-#2  render_prepared_os_window()   — fast_data_types.so (kitty/shaders.c)
-#3  render_os_window()            — fast_data_types.so (kitty/child-monitor.c:833)
-#4  render()                      — fast_data_types.so (kitty/child-monitor.c:871)
-#5  run_main_loop()               — fast_data_types.so (GLFW event loop)
-#6  main_loop()                   — fast_data_types.so (kitty/child-monitor.c:1262)
-#7  <Python frame: boss.child_monitor.main_loop()>  — Python calling into C
-```
-
-**I/O Thread (parsing):**
-```
-#0  simd_find_either_of_two_bytes_128() — fast_data_types.so (kitty/simd-string-128.c)
-#1  do_parse_vt()                       — fast_data_types.so (kitty/vt-parser.c)
-#2  parse_worker()                      — fast_data_types.so (kitty/child-monitor.c)
-#3  io_loop()                           — fast_data_types.so (kitty/child-monitor.c)
-#4  start_thread()                      — libpthread.so
-```
-
-**Talk Thread (idle or serving RC):**
-```
-#0  poll()                        — libc.so (waiting for UNIX socket data)
-#1  talk_loop()                   — fast_data_types.so (kitty/child-monitor.c)
-#2  start_thread()                — libpthread.so
-```
-
-> **Observation**: The expected stacks are dominated by C frames. Python frames appear only at the highest level of the Main thread (where Python called `boss.child_monitor.main_loop()`). The I/O thread and Talk thread have **zero** Python frames — they run entirely in C.
+**Thinking**: Despite the name `kitty:disk$0`, this thread's stack shows it waiting in Mesa's Gallium driver. The name comes from Mesa's disk cache subsystem (shader cache), not from kitty's own DiskCache. This is an artifact of the software rendering environment — Mesa caches compiled shader programs to disk using a background thread.
 
 ---
 
-## Section 8 — Language Responsibility Inference
+## 8. Language Responsibility Inference
 
-### 8.1 Synthesis of All Evidence
+Based exclusively on the collected runtime evidence, the following responsibilities are assigned to each language:
 
-Based on the runtime artifacts collected — binary inspection, library linkage, symbol analysis, build system analysis, and source code — the following responsibility model emerges:
+### 8.1 C — The Performance Engine (in-process)
 
-### 8.2 Python Responsibilities
+**Evidence supporting C responsibility:**
 
-| Responsibility | Source File(s) | Evidence |
-|---|---|---|
-| **Application startup and lifecycle** | `kitty/main.py` (lines 441–521) | `_main()` calls `parse_args → create_opts → init_glfw → run_app` |
-| **Configuration loading** | `kitty/config.py` | Parses `kitty.conf`, applies options |
-| **Window/Tab management** | `kitty/boss.py`, `kitty/window.py`, `kitty/tabs.py` | Boss singleton manages OS windows, tabs, windows |
-| **Remote control command dispatch** | `kitty/remote_control.py`, `kitty/rc/*.py` (41 modules) | `RemoteCommand` subclasses handle each `kitty @` command |
-| **Python kitten framework** | `kittens/runner.py` (lines 46–65) | `importlib.import_module(f'kittens.{kitten}.main')` |
-| **Session management** | `kitty/session.py` | Session layout creation |
-| **GLSL shader source loading** | `kitty/shaders.py` | Reads `.glsl` files, injects preprocessor macros |
-| **Entry point dispatch** | `kitty/entry_points.py` | Routes `+kitten`, `+hold`, `+complete` to appropriate handler |
+| Responsibility | Runtime Evidence |
+|---|---|
+| VT escape sequence parsing | `do_parse`, `csi_parse_loop`, `_parse_sgr` symbols in `fast_data_types.so`; I/O thread (pure C stack) feeds parser |
+| Screen model management | `Screen_Type` Python type backed by C struct; `screen.c` handles all cell updates |
+| OpenGL rendering pipeline | `compile_shaders`, `alloc_sprite_map`, `draw_text_loop` symbols; `libGL.so` loaded in process; GLAD version flags in BSS |
+| Font rasterization | `create_freetype_render_context` symbol; `libfreetype.so`, `libharfbuzz.so` loaded; `Face` type in fast_data_types |
+| Glyph caching | `find_or_create_sprite_position`, `find_or_create_glyph_properties` symbols; GPU texture atlas |
+| Thread management | `children_lock` mutex; `pthread_create` for I/O and Talk threads; GDB shows C-only stacks for all worker threads |
+| Child process I/O | I/O thread (`KittyChildMon`) stack is pure C (`io_loop` → `poll`); PTY multiplexing via `poll()` |
+| GLFW event loop | Main thread stack shows `_glfwPlatformRunMainLoop` → `pollForEvents` — all C code in `glfw-x11.so` |
+| SIMD acceleration | `base64_stream_decode_avx2`, `base64_stream_decode_sse41` symbols; `simd-string-128.c`, `simd-string-256.c` source files |
+| Cryptographic operations | `AES256GCMDecrypt`, `AES256GCMEncrypt`, `EllipticCurveKey` C types; `libcrypto.so` linked |
 
-**Evidence Chain:**
-- `sys.setswitchinterval(1000.0)` at `main.py:504` confirms single Python thread
-- Python never participates in the rendering loop (it calls `main_loop()` which enters C)
-- Python's role is **orchestration and high-level logic** — it sets up the system, then delegates to C for the event loop
+### 8.2 Python — The Orchestration Layer (in-process)
 
-### 8.3 C Responsibilities
+**Evidence supporting Python responsibility:**
 
-| Responsibility | Source File(s) | Evidence |
-|---|---|---|
-| **VT escape sequence parsing** | `kitty/vt-parser.c` | Hot path with SIMD acceleration (`simd-string.h` include) |
-| **Screen model + line buffers** | `kitty/screen.c`, `kitty/line.c`, `kitty/line-buf.c` | Core data structures for terminal content |
-| **OpenGL GPU rendering** | `kitty/shaders.c`, `kitty/gl.c`, 13 `.glsl` files | `render_os_window()` → OpenGL draw calls |
-| **Font discovery + rasterization** | `kitty/freetype.c`, `kitty/fontconfig.c`, `kitty/fonts.c` | `FT_*`, `hb_*` symbols in `fast_data_types.so` |
-| **GPU glyph texture atlas** | `kitty/glyph-cache.c` | `alloc_sprite_map()` with `GL_MAX_TEXTURE_SIZE` query |
-| **Graphics protocol (images)** | `kitty/graphics.c` | Inline image buffer management |
-| **Child process monitoring** | `kitty/child-monitor.c` | Three-thread architecture, `pthread_create` calls |
-| **SIMD string operations** | `kitty/simd-string-128.c`, `kitty/simd-string-256.c` | SSE4.2 / AVX2 for VT parser inner loop |
-| **Process entry (launcher)** | `kitty/launcher/main.c` | CPython embedding via `Py_InitializeFromConfig` |
-| **Platform windowing (GLFW)** | `glfw/*.c` | X11/Wayland/Cocoa backends, compiled as separate `.so` |
-| **Cryptography** | `kitty/crypto.c` | `EVP_*` OpenSSL symbols for RC encryption |
-| **PNG decoding** | `kitty/png-reader.c` | `png_*` symbols for image loading |
-| **Color management** | `kitty/colors.c` | `cmsCreateTransform` for ICC profiles |
+| Responsibility | Runtime Evidence |
+|---|---|
+| Application startup | GDB main thread stack shows `PyEval_EvalCode` → `_PyEval_EvalFrameDefault` below the C `main_loop()` call |
+| Configuration loading | `kitty/main.py` startup sequence: `parse_args → create_opts → init_glfw → run_app → boss.child_monitor.main_loop()` |
+| Remote control command dispatch | `kitty @ ls` returns JSON assembled by Python `kitty/rc/ls.py`; Python reads from C-backed objects |
+| Window/tab lifecycle | `Boss` object (Python) manages windows and tabs; `kitty @ ls` output shows Python-managed state |
+| Entry point routing | `kitty/entry_points.py` dispatches `+kitten` → `os.execl(kitten_exe())`, keyboard shortcuts, etc. |
+| GLSL shader preprocessing | `kitty/shaders.py` loads `.glsl` files and injects `#define` macros before passing to C for compilation |
+| Type stubs for C extension | `kitty/fast_data_types.pyi` (581 attributes) provides Python IDE support for the C extension |
 
-**Evidence Chain:**
-- `ldd kitty/fast_data_types.so` shows direct linkage to libharfbuzz, libfreetype, libpng, liblcms2, libcrypto
-- `nm -D` reveals 104 imported symbols from these rendering libraries (hb_=22, FT_=25, png_=25, EVP_=26, cms=6)
-- Thread creation in C (`pthread_create` at lines 286, 291 of `child-monitor.c`)
-- Rendering loop entirely in C (`render()` → `render_os_window()` → OpenGL calls)
-- The `.so` file is 1.5 MB — orders of magnitude larger than the 36 KB launcher
+### 8.3 Go — The CLI Toolkit (separate process)
 
-### 8.4 Go Responsibilities
+**Evidence supporting Go responsibility:**
 
-| Responsibility | Source File(s) | Evidence |
-|---|---|---|
-| **`kitten` CLI binary** | `tools/cmd/main.go` | "Fast, statically compiled implementations of various kittens" |
-| **Image display (icat)** | `kittens/icat/*.go` | Complete Go implementation: detect, process, transmit |
-| **Remote control client** | `tools/cmd/at/` | Go-side `kitty @` command client |
-| **Shell completion** | `os.execvp(kitten_exe(), args)` in `entry_points.py:33` | Delegated to Go binary |
-| **Diff viewer** | `kittens/diff/` | Go-implemented side-by-side diff |
-| **SSH kitten** | `kittens/ssh/` | Go-implemented SSH integration |
-| **Various CLI utilities** | `kittens/hints/`, `kittens/themes/`, `kittens/transfer/`, etc. | Go-implemented kittens |
-| **TUI framework** | `tools/tui/` | Go text UI library for kitten interfaces |
-| **Encryption (client side)** | `tools/crypto/` | Go X25519/AES-GCM for RC client |
+| Responsibility | Runtime Evidence |
+|---|---|
+| All kitten subcommands | 50 Go packages compiled into `kitten` binary (icat, diff, ssh, themes, clipboard, hints, etc.) |
+| Remote control client | `kitty/tools/cmd/at/` package; `kitten @ ls` sends commands over UNIX socket from Go process |
+| Image display (icat) | `kittens/icat/main.go` — separate process (PID 103385, PPid 97459, exe → kitten binary) |
+| TUI interfaces | `kitty/tools/tui/loop` — Go's own event loop for interactive kittens |
+| File transfer | `kitty/kittens/transfer` — rsync-like protocol in Go |
+| SSH integration | `kitty/kittens/ssh` — shell integration, askpass |
+| Encryption for remote control | `kitty/tools/crypto` — X25519/AES-GCM (parallel to C implementation in main process) |
+| No GPU rendering | kitten binary has NO libGL, libfreetype, or libharfbuzz dependencies — rendering is not its job |
 
-**Evidence Chain:**
-- `file kitty/launcher/kitten` shows `Go BuildID` — definitively a Go binary
-- `ldd` shows only `libc.so.6` — no Python, no rendering libraries
-- `strings` reveal `runtime.main`, `kitty/tools/*`, `kitty/kittens/*` Go packages
-- `go version -m` shows 14 direct + 6 indirect Go dependencies embedded, built from `kitty/tools/cmd`
-- The binary is 15 MB — self-contained with the entire Go runtime
-- Kitten process runs as separate PID (via `os.execl`)
+### 8.4 GLSL — The GPU Shader Pipeline (executed on GPU/llvmpipe)
 
-### 8.5 The Architecture Boundary
+**Evidence**: 13 shader files totaling 696 lines, compiled by C `compile_shaders()`:
 
-```
-┌─────────────────────────────────────────────┐
-│           Kitty Process (single PID)         │
-│                                             │
-│  ┌──────────────────────────────────────┐   │
-│  │         Python Layer                  │   │
-│  │  main.py, boss.py, config.py         │   │
-│  │  remote_control.py, rc/*.py          │   │
-│  │  entry_points.py, session.py         │   │
-│  │  shaders.py (GLSL loading)           │   │
-│  └──────────┬───────────────────────────┘   │
-│             │ calls via fast_data_types API  │
-│  ┌──────────▼───────────────────────────┐   │
-│  │         C Layer                       │   │
-│  │  fast_data_types.so (49 .c files)     │   │
-│  │  ├─ child-monitor.c (2–3 threads)     │   │
-│  │  ├─ vt-parser.c (SIMD-accelerated)    │   │
-│  │  ├─ screen.c, line.c, line-buf.c      │   │
-│  │  ├─ shaders.c + 13 .glsl files        │   │
-│  │  ├─ freetype.c, fontconfig.c, fonts.c │   │
-│  │  ├─ glyph-cache.c (GPU texture atlas) │   │
-│  │  ├─ graphics.c (image protocol)       │   │
-│  │  └─ crypto.c (OpenSSL)                │   │
-│  │                                       │   │
-│  │  glfw-x11.so / glfw-wayland.so        │   │
-│  │  (vendored GLFW 3.4 fork)             │   │
-│  └──────────────────────────────────────┘   │
-│                                             │
-│  Linked: libpython3.12, libharfbuzz,        │
-│          libfreetype, libpng, liblcms2,     │
-│          libcrypto, libGL (GLAD-loaded),    │
-│          libX11 / libwayland               │
-└─────────────────────────────────────────────┘
-
-            ╔═══════════════════════════╗
-            ║  PROCESS BOUNDARY         ║
-            ╚═══════════════════════════╝
-
-┌─────────────────────────────────────────────┐
-│       Kitten Process (separate PID)          │
-│                                             │
-│  ┌──────────────────────────────────────┐   │
-│  │         Go Layer                      │   │
-│  │  kitten binary (15 MB, standalone)    │   │
-│  │  ├─ tools/cmd/main.go (entry point)   │   │
-│  │  ├─ kittens/icat/*.go (image display) │   │
-│  │  ├─ tools/cmd/at/ (RC client)         │   │
-│  │  ├─ tools/tui/ (TUI framework)        │   │
-│  │  ├─ tools/crypto/ (encryption)        │   │
-│  │  └─ kittens/{diff,ssh,hints,...}      │   │
-│  └──────────────────────────────────────┘   │
-│                                             │
-│  Links only: libc.so.6                      │
-│  Communication: escape sequences,           │
-│                 UNIX sockets (RC)           │
-└─────────────────────────────────────────────┘
-```
-
-**The fundamental architectural insight**: C and Python share one process (C as Python extension modules loaded via `fast_data_types.so`), while Go **always** runs as a separate process communicating via terminal escape sequences or UNIX sockets. This is not a design accident — it is a deliberate separation that allows the Go tools to be distributed independently of the Python+C kitty installation.
+| Shader Pair | Responsible For |
+|---|---|
+| `cell_vertex.glsl` + `cell_fragment.glsl` | Text cell rendering (233 + 204 lines) |
+| `border_vertex.glsl` + `border_fragment.glsl` | Window border decoration |
+| `graphics_vertex.glsl` + `graphics_fragment.glsl` | Inline image compositing |
+| `bgimage_vertex.glsl` + `bgimage_fragment.glsl` | Background image rendering |
+| `tint_vertex.glsl` + `tint_fragment.glsl` | Window tint overlay |
+| `alpha_blend.glsl`, `linear2srgb.glsl` | Blending and colorspace utilities |
 
 ---
 
-## Section 9 — Two Falsified Interpretations
+## 9. Two Falsified Interpretations
 
-### 9.1 Falsified Interpretation #1: "Go Handles the Rendering Pipeline"
+### 9.1 Falsified: "Go Handles Rendering or Has Access to the GPU"
 
-#### Why This Is Plausible From Code Reading
+**Plausible-but-wrong reasoning**: Since Go is used for several kittens including `icat` (which displays images in the terminal), one might assume that Go code directly interfaces with OpenGL or the GPU to render images. After all, `icat` displays images, so it must be doing rendering, right?
 
-A developer browsing the repository might reasonably conclude that Go participates in the rendering pipeline:
+**Runtime evidence that falsifies this**:
 
-- The `tools/tui/graphics/` package implements the kitty graphics protocol in Go
-- The `kittens/icat/` directory contains Go code that transmits image data for display
-- The `tools/tui/` package provides a complete terminal UI framework with rendering capabilities
-- The `kitten` binary is 15 MB — much larger than the 36 KB kitty launcher, suggesting it carries significant functionality
+1. **The kitten binary links only libc.so.6** — `ldd kitty/launcher/kitten` shows zero graphics libraries. No libGL, no libfreetype, no libharfbuzz, no Mesa libraries. If Go were doing rendering, these libraries would appear in its dependency list.
 
-One could plausibly conclude: "The Go code handles image rendering and perhaps assists with the GPU rendering pipeline."
+2. **The kitty process map shows all rendering libraries** — `libGL.so`, `libGLX.so`, `libgallium`, `libfreetype.so`, `libharfbuzz.so` are all loaded exclusively in the kitty process (PID 97391), not in the kitten process.
 
-#### Runtime Evidence That Falsifies This
+3. **icat uses the terminal graphics protocol, not GPU calls** — The `kittens/icat/transmit.go` file implements the kitty graphics protocol (transmitting base64-encoded image data via terminal escape sequences). The kitten writes escape codes to stdout; the C code in the main kitty process (via `kitty/graphics.c`) decodes these and renders them using OpenGL. The kitten never touches the GPU.
 
-1. **Process map evidence**: `ldd kitty/fast_data_types.so` and `ldd kitty/launcher/kitty` show **zero Go libraries** in the kitty process. There is no `libgo.so`, no Go runtime segments, no Go-compiled shared objects loaded. The rendering pipeline runs entirely within the kitty process, which contains only C and Python code.
+4. **Kitten runs as a separate process** — PID 103385 (kitten) is entirely separate from PID 97391 (kitty). The kitten cannot access the kitty process's OpenGL context because OpenGL contexts are thread-local within a single process.
 
-2. **Binary separation evidence**: `file kitty/launcher/kitten` shows a Go binary with its own `Go BuildID`, and `readelf -d` shows it as a separate executable requiring only `libc.so.6`. The kitten binary never loads into the kitty process — it is invoked via `os.execl()` which **replaces** the process image entirely (`kitty/entry_points.py` lines 10–12).
+**Conclusion**: Go kittens produce terminal output (including graphics protocol escape sequences); the C code in the main kitty process is solely responsible for translating that output into GPU rendering commands.
 
-3. **Rendering hot path is pure C**: The `render()` function in `kitty/child-monitor.c` (lines 870–896) iterates over OS windows and calls `render_os_window()` which invokes `make_os_window_context_current()` → `prepare_to_render_os_window()` → `render_prepared_os_window()` → `swap_window_buffers()`. All of these are C functions within `fast_data_types.so`. No Go interop exists at any point in this call chain.
+### 9.2 Falsified: "Python Interprets VT Escape Sequences in the Hot Path"
 
-4. **Shader compilation is pure C**: `kitty/shaders.c` (line 20) defines the shader programs (`CELL_PROGRAM`, `BORDERS_PROGRAM`, `GRAPHICS_PROGRAM`, etc.) and compiles GLSL shaders. `alloc_sprite_map()` (lines 50–69) queries `GL_MAX_TEXTURE_SIZE` directly via GLAD. No Go code participates in shader management.
+**Plausible-but-wrong reasoning**: Since Python is the "orchestration layer" and manages the `Screen` object, one might assume that incoming VT escape sequences (e.g., SGR color codes, cursor movement, scrolling) are parsed and applied by Python code. The existence of `kitty/fast_data_types.pyi` with its `Screen` type stub might suggest Python is actively calling screen update methods.
 
-5. **Symbol evidence**: `nm -D kitty/fast_data_types.so` shows `FT_*`, `hb_*`, `png_*`, `EVP_*` symbols — the rendering-adjacent libraries are all C. The single exported symbol `PyInit_fast_data_types` is a CPython module init, not a Go function.
+**Runtime evidence that falsifies this**:
 
-#### The Correct Interpretation
+1. **The I/O thread stack is pure C** — GDB shows `KittyChildMon`'s stack as `poll() → io_loop() → start_thread() → clone3()`. There are zero Python frames (`_PyEval_EvalFrameDefault`, `PyObject_Vectorcall`) in the I/O thread. The VT parser runs entirely in C.
 
-Go's `tui/graphics` package implements the **client side** of the kitty graphics protocol — it sends escape sequences containing image data **to** the terminal. The **server side** (receiving and rendering the images on the GPU) is implemented in C (`kitty/graphics.c`). Go generates the protocol messages; C renders them. This is a producer-consumer relationship across a process boundary, not shared rendering responsibility.
+2. **The I/O thread context switches dominate** — During rendering stress, the I/O thread accumulated 4,719 voluntary context switches (10.6× the main thread). This thread does the parsing and buffer management. If Python were in the loop, the GIL would serialize these operations with the main thread, destroying throughput.
 
-### 9.2 Falsified Interpretation #2: "Python Directly Handles VT Parsing and Screen Updates"
+3. **The `do_parse` symbol is in fast_data_types.so** — `nm` shows `do_parse` as a C function in the shared library. This is the main VT parser entry point called by `io_loop()`.
 
-#### Why This Is Plausible From Code Reading
+4. **Python never acquires the GIL in the I/O thread** — The GDB backtrace of the I/O thread shows no `PyGILState_Ensure` or `PyEval_RestoreThread` calls. The I/O thread operates exclusively in C, using mutexes (`children_lock`) to synchronize with the main thread only when handing off parsed data.
 
-Several observations might lead to this conclusion:
+5. **The strace profile shows no Python-level overhead** — The syscall profile is dominated by `futex` (mutex operations) and `poll`/`read` (I/O) — these are raw C syscalls, not Python-mediated operations.
 
-- Python files like `kitty/window.py` and `kitty/tabs.py` manage window and tab state
-- Python imports `Screen` from `fast_data_types`, suggesting Python manipulates screen objects
-- The `kitty/boss.py` module appears to be the central controller that manages all windows and their content
-- The `kitty/fast_data_types.pyi` type stub file declares `Screen` as a Python class with methods like `insert_characters`, `cursor_position`, `erase_in_display`
-- One might conclude: "Python parses VT escape sequences and calls Screen methods to update the display"
-
-#### Runtime Evidence That Falsifies This
-
-1. **The VT parser is entirely C**: `kitty/vt-parser.c` is a ~1000-line C state machine that processes escape sequences. It includes `simd-string.h` (line 15) for SIMD-accelerated byte scanning — an optimization that only makes sense in C, not Python.
-
-2. **The I/O thread is pure C**: The `parse_func` function pointer in `ChildMonitor` (line 61: `void (*parse_func)(void*, ParseData*, bool)`) is set to either `parse_worker` or `parse_worker_dump` (lines 180–181). Both are C functions. The I/O thread that runs `io_loop()` (created via `pthread_create` at line 291) calls this C function directly — Python's GIL is never involved in the parsing path.
-
-3. **Single Python thread proof**: `sys.setswitchinterval(1000.0)` at `main.py` line 504 with the comment `"we have only a single python thread"` proves that Python never runs concurrent threads. Since the I/O thread runs `io_loop` (C), and the Main thread runs `run_main_loop` (C) — Python code only executes in the gaps between C calls on the Main thread. Python cannot be running a high-frequency parsing loop because it only has one thread and that thread is predominantly in C code.
-
-4. **Screen model updates in C**: `kitty/screen.c` implements the screen operations in C. When the VT parser encounters an escape sequence like "cursor move" or "erase display", it calls C functions like `screen_cursor_position()` or `screen_erase_in_display()` directly — these are C-to-C function calls within the I/O thread, never crossing into Python.
-
-5. **The `Screen` Python type is a C extension type**: `Screen` appears in Python (via `fast_data_types.Screen`) but is actually implemented as a C `PyTypeObject` in `screen.c`. Python can call methods on `Screen` objects, but the actual data manipulation happens in C. The `.pyi` stub file merely provides type annotations for Python static analysis — it does not indicate that the logic is written in Python.
-
-#### The Correct Interpretation
-
-Python **orchestrates** screen management at a high level — creating/destroying screens, associating them with windows, and reading their state for features like remote control. But the **hot-path data flow** — bytes from PTY → VT parser → screen model updates → rendering — is entirely in C, running on the I/O thread and Main thread without Python involvement. Python's role is supervisory, not participatory, in the parsing/rendering pipeline.
+**Conclusion**: The VT parser is a pure C state machine (`vt-parser.c`) running in the I/O thread without Python involvement. Python's role is limited to calling `boss.child_monitor.main_loop()` once at startup — after that, the C code takes over the hot path completely.
 
 ---
 
-## Section 10 — Portability vs. Performance Tradeoff
+## 10. Portability vs. Performance Tradeoff
 
-### 10.1 The Core Tradeoff: Go Static Binary (Portable) vs. C SIMD Extensions (Performant)
+### 10.1 The Go Kitten Binary: Portability over Performance
 
-Kitty's three-language architecture embodies a deliberate tradeoff between portability and performance, directly observable through the binary artifacts.
+**Observation**: The Go `kitten` binary is 16 MB, links only libc.so.6, and contains 50 statically-compiled packages including image processing, TUI, crypto, and all kitten implementations. The C `fast_data_types.so` is 1.5 MB but links against 17 shared libraries and contains SIMD-accelerated code paths (AVX, AVX2, SSE4.1, SSE4.2, SSSE3).
 
-### 10.2 The Portability Side: Go's Self-Contained Binary
+**Runtime evidence**:
 
-**[OBSERVED]** The `kitten` binary's dependency profile:
+1. **kitten has zero platform-specific library dependencies** — `ldd` shows only libc. This means the kitten binary can be copied to any Linux x86_64 system and run immediately, regardless of whether FreeType, HarfBuzz, OpenGL, or any other library is installed. The Go runtime handles memory management, networking, and file I/O internally.
 
-```bash
-$ file kitty/launcher/kitten
-...Go BuildID=..., stripped
+2. **fast_data_types.so requires 17 specific shared libraries** — The C extension will fail to load if any of its dependencies (libfreetype, libharfbuzz, libGL, libpng, liblcms2, libcrypto) are missing or are an incompatible version. This makes the C layer sensitive to the host system's library configuration.
 
-$ ldd kitty/launcher/kitten
-  libc.so.6   # Only system dependency
+3. **The C layer has SIMD acceleration, Go does not** — The `nm` output shows `base64_stream_decode_avx2`, `base64_stream_decode_sse41`, and other SIMD variants in `fast_data_types.so`. The Go binary contains no such architecture-specific optimizations — Go's compiler generates portable x86_64 code but does not auto-vectorize or use hand-written SIMD intrinsics.
 
-$ ls -la kitty/launcher/kitten
--rwxr-xr-x 1 root root 15761668 kitty/launcher/kitten  # 15 MB standalone
-```
+4. **The C layer uses platform-specific font backends** — The `find_c_files()` function in `setup.py` (line 908) conditionally excludes `fontconfig.c` and `freetype.c` on macOS (using `core_text.m` instead) or excludes `core_text.m` on Linux. The Go kitten binary does not need any font backend — it delegates text rendering to the terminal (i.e., back to kitty's C layer).
 
-The Go `kitten` binary requires only `libc.so.6` at runtime. It can be:
-- **Copied to any compatible Linux system** and executed immediately, with no installation of Python, FreeType, HarfBuzz, or OpenGL
-- **Cross-compiled** for different platforms — `setup.py` line 1203 shows: `build_static_kittens(args, launcher_dir, args.dir_for_static_binaries, for_platform=(os_, arch))`
-- **Distributed independently** — a user can download just the `kitten` binary to get CLI tools (icat, diff, ssh kitten, etc.) without installing the full kitty application
+**Tradeoff analysis**:
 
-The Go runtime embedded in the binary provides:
-- Garbage collection (no manual memory management)
-- Goroutine scheduler (lightweight concurrency)
-- Pure Go image processing (`github.com/kovidgoyal/imaging`, `golang.org/x/image`) — no system libpng/libjpeg needed
-- Cross-platform syscall abstraction (`golang.org/x/sys`)
+The design splits the application along a **portability boundary**: operations that need to be fast (parsing, rendering, font rasterization) are implemented in C with platform-specific optimizations (SIMD, conditional compilation, OS-specific font APIs), while operations that need to be portable (CLI tools, file transfer, interactive kittens) are implemented in Go with its "compile once, run anywhere" model. This means:
 
-### 10.3 The Performance Side: C's Platform-Optimized Extensions
+- **C extension**: Maximum performance through SIMD, hardware-specific font backends, and direct OpenGL access, at the cost of requiring platform-specific compilation and library dependencies.
+- **Go kitten**: Maximum portability through static compilation and zero external dependencies (beyond libc), at the cost of not having access to SIMD acceleration, hardware font rendering, or direct GPU access.
 
-**[OBSERVED]** The `fast_data_types.so` dependency profile:
-
-```bash
-$ ldd kitty/fast_data_types.so
-  libharfbuzz.so.0   # Text shaping
-  libfreetype.so.6   # Glyph rasterization
-  libpng16.so.16     # PNG decoding
-  liblcms2.so.2      # Color management
-  libcrypto.so.3     # Encryption
-  # + libpython3.12, libm, libz, libc, and transitive deps
-
-$ ls -la kitty/fast_data_types.so
--rwxr-xr-x 1 root root 1541408 kitty/fast_data_types.so  # 1.5 MB compiled C
-```
-
-The C extension requires **eight shared libraries** at runtime, each of which must be installed on the target system. In return, it provides:
-
-1. **SIMD-accelerated VT parsing**: `kitty/simd-string-128.c` (SSE4.2) and `kitty/simd-string-256.c` (AVX2) provide vectorized byte scanning for the VT parser's inner loop. These intrinsics process 16 or 32 bytes simultaneously, compared to Go's byte-at-a-time processing.
-
-2. **Direct OpenGL access**: `kitty/gl.c` loads OpenGL functions via GLAD, enabling direct GPU draw calls. The shader pipeline (`kitty/shaders.c` + 13 `.glsl` files) compiles and executes GLSL shaders for text cell rendering, border decoration, image compositing, and background effects.
-
-3. **Native library integration**: FreeType for sub-pixel glyph rasterization, HarfBuzz for OpenType shaping (ligatures, kerning), and Fontconfig for system font discovery. These mature C libraries represent decades of optimization that no Go package can replicate.
-
-4. **Platform-specific GLFW backends**: The vendored GLFW fork in `glfw/` provides separate backends for X11 (`glfw/x11_*.c`), Wayland (`glfw/wl_*.c`), and macOS Cocoa (`glfw/cocoa_*.m`). Each backend is compiled C tailored to the platform's windowing API, providing minimal-overhead event handling and OpenGL context management.
-
-### 10.4 The Tradeoff in Practice
-
-**[SOURCE-INFORMED]** Consider the image display flow for `kitty +kitten icat photo.png`:
-
-1. **Go (portable)**: The `kitten` binary loads the image using pure Go libraries (`golang.org/x/image`), processes it (resize, color adjustment), encodes it in the kitty graphics protocol, and sends escape sequences to the terminal. **No system libraries needed** — the same binary works on any Linux system.
-
-2. **C (performant)**: The kitty terminal receives the escape sequences on the I/O thread (`child-monitor.c`), decodes the image data via `kitty/graphics.c` using `libpng`, and uploads it to the GPU as a texture via OpenGL. The rendering pipeline (`kitty/shaders.c`) composites the image onto the terminal using a GPU shader (`kitty/graphics_fragment.glsl`). **This requires libpng, OpenGL, and a GPU** — but achieves hardware-accelerated rendering.
-
-If Go were used for the rendering hot path instead of C:
-- SIMD intrinsics (`_mm_cmpistri` for SSE4.2, `_mm256_cmpeq_epi8` for AVX2) would not be available — Go's compiler has limited auto-vectorization
-- Direct OpenGL calls via GLAD would require CGO, losing Go's portability advantage
-- Native FreeType/HarfBuzz integration would require CGO bridges, adding complexity
-- The self-contained binary model would break — the binary would need shared library dependencies
-
-Conversely, if C were used for the CLI kittens:
-- Each kitten would need to link against system libraries
-- Cross-compilation would be complex (different libraries per target)
-- Distribution would require a full build environment on the target system
-- The 15 MB standalone binary model would be impossible
-
-### 10.5 Additional Tradeoff: GLFW Backend Complexity
-
-The vendored GLFW fork demonstrates another dimension of this tradeoff:
-
-- **C approach**: Separate backend implementations for X11 (`glfw/x11_init.c`, `glfw/x11_window.c`, `glfw/x11_monitor.c`), Wayland (`glfw/wl_init.c`, `glfw/wl_window.c`), and Cocoa (`glfw/cocoa_init.m`, `glfw/cocoa_window.m`). Each is ~2000–3000 lines of platform-specific C code compiled conditionally. This trades **code complexity** (maintaining three backends) for **platform performance** (each backend uses the native API directly).
-
-- **Go approach**: The `kitten` binary uses `golang.org/x/sys` for cross-platform system calls, abstracting away platform differences into a single codebase. This trades **some performance** (abstraction overhead) for **portability** (one binary, all platforms).
-
-> **The deliberate split**: Performance-critical rendering runs through platform-specific compiled C with SIMD and direct GPU access. Portable utility functionality runs through self-contained Go with cross-platform abstraction. Python orchestrates the boundary, keeping the high-level logic flexible while delegating hot paths to C and portable tools to Go.
+A concrete example: when `kitten icat` displays an image, the Go code does image decoding and resizing using pure Go libraries (`golang.org/x/image`, `github.com/kovidgoyal/imaging`), then transmits the pixel data via the terminal graphics protocol. The C code in the main kitty process then uses the GPU (or llvmpipe) to composite the image into the terminal display. If the Go code attempted GPU rendering, it would need OpenGL bindings and lose its single-binary portability. By delegating rendering to the host terminal, the kitten binary remains a simple, portable tool.
 
 ---
 
-## Section 11 — Full Command Transcripts (Appendix)
+## 11. Appendix: Full Command Transcripts
 
-### A.1 Build Commands
-
-```bash
-# Build environment setup (performed by setup agent)
-$ python3 --version
-Python 3.12.3
-
-$ go version
-go version go1.22.10 linux/amd64
-
-$ gcc --version | head -1
-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.2) 13.3.0
-
-# Full build invocation
-$ export PATH=/usr/local/go/bin:$PATH
-$ export KITTY_NO_LTO=1
-$ python3 setup.py build --verbose --ignore-compiler-warnings
-# (Output: compiled 49 .c files, built Go kitten binary, built C launcher)
-# Build completed successfully
-
-# Verify build artifacts
-$ ls -la kitty/launcher/kitty kitty/launcher/kitten kitty/fast_data_types.so
--rwxr-xr-x 1 root root  1541408 kitty/fast_data_types.so
--rwxr-xr-x 1 root root 15761668 kitty/launcher/kitten
--rwxr-xr-x 1 root root    36224 kitty/launcher/kitty
-```
-
-### A.2 Binary Verification Commands
+### A.1 Build Verification
 
 ```bash
-# Binary format identification
 $ file kitty/launcher/kitty
 kitty/launcher/kitty: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
   dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
@@ -1553,387 +802,199 @@ kitty/launcher/kitty: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
 $ file kitty/launcher/kitten
 kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV),
   dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
-  Go BuildID=hqq4-U2LKlixbsjwYo2Y/n8c9tVmrH955DZP0gtLh/TlErkqS1Lkyxjr-Onw6b/O2yALBSe3QkGVIYlcExQ,
+  Go BuildID=hWFG_Ca3xQ6VcsZYShGt/vXHUDdkh1kOGPzVOfMDC/TlErkqS1Lkyxjr-Onw6b/6MzJb86-gjtn1TQxs0aQ,
   stripped
 
 $ file kitty/fast_data_types.so
 kitty/fast_data_types.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV),
-  dynamically linked, BuildID[sha1]=847633a229fed560d8483e9fe26d96f881a3c26a,
-  not stripped
+  dynamically linked,
+  BuildID[sha1]=46fd91e410b71f30deee320bd09561401915e677, not stripped
 
-$ file kitty/glfw-x11.so
-kitty/glfw-x11.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV),
-  dynamically linked, BuildID[sha1]=6be30c4e8d075b0108dd2ea67e5e74356a0e0a20,
-  not stripped
+$ ls -lh kitty/launcher/kitty kitty/launcher/kitten kitty/fast_data_types.so
+-rwxr-xr-x  36K  kitty/launcher/kitty
+-rwxr-xr-x  16M  kitty/launcher/kitten
+-rwxr-xr-x 1.5M  kitty/fast_data_types.so
+```
 
-$ file kitty/glfw-wayland.so
-kitty/glfw-wayland.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV),
-  dynamically linked, BuildID[sha1]=618ee49779b013e85c47beadd5d79baf42f6fed8,
-  not stripped
+### A.2 Library Linkage
 
-# Dynamic dependencies — kitty launcher
+```bash
 $ ldd kitty/launcher/kitty
-  linux-vdso.so.1 (0x00007fff251cc000)
   libpython3.12.so.1.0 => /lib/x86_64-linux-gnu/libpython3.12.so.1.0
   libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-  libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6
-  libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1
-  libexpat.so.1 => /lib/x86_64-linux-gnu/libexpat.so.1
-  /lib64/ld-linux-x86-64.so.2
+  libm.so.6, libz.so.1, libexpat.so.1
 
-# Dynamic dependencies — kitten binary
 $ ldd kitty/launcher/kitten
-  linux-vdso.so.1 (0x00007fff6ef99000)
   libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-  /lib64/ld-linux-x86-64.so.2
 
-# Dynamic dependencies — fast_data_types.so
 $ ldd kitty/fast_data_types.so
-  libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6
-  libpython3.12.so.1.0 => /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-  libharfbuzz.so.0 => /lib/x86_64-linux-gnu/libharfbuzz.so.0
-  libpng16.so.16 => /lib/x86_64-linux-gnu/libpng16.so.16
-  liblcms2.so.2 => /lib/x86_64-linux-gnu/liblcms2.so.2
-  libcrypto.so.3 => /lib/x86_64-linux-gnu/libcrypto.so.3
-  libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1
-  libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-  libexpat.so.1 => /lib/x86_64-linux-gnu/libexpat.so.1
-  libfreetype.so.6 => /lib/x86_64-linux-gnu/libfreetype.so.6
-  libglib-2.0.so.0 => /lib/x86_64-linux-gnu/libglib-2.0.so.0
-  libgraphite2.so.3 => /lib/x86_64-linux-gnu/libgraphite2.so.3
-  libbz2.so.1.0 => /lib/x86_64-linux-gnu/libbz2.so.1.0
-  libbrotlidec.so.1 => /lib/x86_64-linux-gnu/libbrotlidec.so.1
-  libpcre2-8.so.0 => /lib/x86_64-linux-gnu/libpcre2-8.so.0
-  libbrotlicommon.so.1 => /lib/x86_64-linux-gnu/libbrotlicommon.so.1
+  libpython3.12.so.1.0, libharfbuzz.so.0, libpng16.so.16,
+  liblcms2.so.2, libcrypto.so.3, libz.so.1,
+  libfreetype.so.6, libglib-2.0.so.0, libgraphite2.so.3,
+  libbz2.so.1.0, libbrotlidec.so.1
 
-# Dynamic dependencies — GLFW X11 backend
 $ ldd kitty/glfw-x11.so
-  libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6
-  libX11.so.6 => /lib/x86_64-linux-gnu/libX11.so.6
-  libXcursor.so.1 => /lib/x86_64-linux-gnu/libXcursor.so.1
-  libxkbcommon.so.0 => /lib/x86_64-linux-gnu/libxkbcommon.so.0
-  libxkbcommon-x11.so.0 => /lib/x86_64-linux-gnu/libxkbcommon-x11.so.0
-  libX11-xcb.so.1 => /lib/x86_64-linux-gnu/libX11-xcb.so.1
-  libdbus-1.so.3 => /lib/x86_64-linux-gnu/libdbus-1.so.3
-  libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-
-# NEEDED entries from ELF dynamic section
-$ readelf -d kitty/fast_data_types.so | grep NEEDED
-  (NEEDED) Shared library: [libm.so.6]
-  (NEEDED) Shared library: [libpython3.12.so.1.0]
-  (NEEDED) Shared library: [libharfbuzz.so.0]
-  (NEEDED) Shared library: [libpng16.so.16]
-  (NEEDED) Shared library: [liblcms2.so.2]
-  (NEEDED) Shared library: [libcrypto.so.3]
-  (NEEDED) Shared library: [libz.so.1]
-  (NEEDED) Shared library: [libc.so.6]
-
-$ readelf -d kitty/launcher/kitten | grep NEEDED
-  (NEEDED) Shared library: [libc.so.6]
+  libX11.so.6, libXcursor.so.1, libxkbcommon.so.0,
+  libxkbcommon-x11.so.0, libX11-xcb.so.1, libdbus-1.so.3,
+  libxcb.so.1, libxcb-xkb.so.1
 ```
 
-### A.3 Symbol Inspection Commands
+### A.3 Process Launch
 
 ```bash
-# Module entry point
-$ nm -D kitty/fast_data_types.so | grep 'T PyInit'
-0000000000029860 T PyInit_fast_data_types
+$ Xvfb :99 -screen 0 1280x1024x24 &
+$ DISPLAY=:99 kitty/launcher/kitty \
+    --listen-on unix:/tmp/kitty-test2.sock \
+    -o allow_remote_control=yes &
+# Output: [0.154] Failed to open systemd user bus with error: Connection refused
+# (non-fatal warning)
+# Kitty PID: 97391
+```
 
-# HarfBuzz symbols (text shaping)
-$ nm -D kitty/fast_data_types.so | grep 'hb_'
-  U hb_buffer_add_utf32
-  U hb_buffer_create
-  U hb_buffer_destroy
-  U hb_buffer_get_glyph_infos
-  U hb_buffer_get_glyph_positions
-  U hb_shape
-  U hb_ft_font_create
-  # ... (22 total)
+### A.4 Process Map Capture
 
-# FreeType symbols (glyph rasterization)
-$ nm -D kitty/fast_data_types.so | grep 'FT_'
-  U FT_Init_FreeType
-  U FT_Done_FreeType
-  U FT_Load_Glyph
-  U FT_Render_Glyph
-  U FT_Bitmap_Convert
-  U FT_Bitmap_Done
-  U FT_Done_Face
-  # ...
+```bash
+$ cat /proc/97391/maps | grep '\.so' | awk '{print $6}' | sort -u
+# (76 unique shared libraries — see Section 2.1 for full list)
+```
 
-# PNG symbols (image decoding)
-$ nm -D kitty/fast_data_types.so | grep 'png_'
-  U png_create_read_struct
-  U png_read_image
-  U png_get_image_width
-  U png_get_image_height
-  # ... (25 total)
+### A.5 Thread Listing at Idle
 
-# OpenSSL symbols (encryption)
-$ nm -D kitty/fast_data_types.so | grep 'EVP_'
-  U EVP_EncryptInit_ex
-  U EVP_EncryptUpdate
-  U EVP_EncryptFinal_ex
-  U EVP_DecryptInit_ex
-  U EVP_PKEY_derive
-  U EVP_PKEY_keygen
-  # ... (26 total)
+```bash
+$ ls /proc/97391/task/ | wc -l
+68
 
-# lcms2 symbols (color management)
-$ nm -D kitty/fast_data_types.so | grep 'cms'
-  U cmsCloseProfile
-  U cmsCreateTransform
-  U cmsCreate_sRGBProfile
-  U cmsDeleteTransform
-  U cmsDoTransform
-  U cmsOpenProfileFromMem
-  # (6 total)
+$ for tid in $(ls /proc/97391/task/); do
+    echo "TID $tid: $(cat /proc/97391/task/$tid/comm)"
+  done
+# TID 97391: kitty          (Main thread)
+# TID 97392-97423: llvmpipe-0 through llvmpipe-31 (Mesa software rendering)
+# TID 97424-97455: kitty      (Mesa/LLVM JIT threads)
+# TID 97456: kitty:disk$0    (DiskCache/Mesa disk thread)
+# TID 97457: KittyPeerMon    (Talk thread — remote control)
+# TID 97458: KittyChildMon   (I/O thread — PTY multiplexing)
+```
 
-# Kitten binary — stripped, no standard symbols
-$ nm kitty/launcher/kitten
-nm: kitty/launcher/kitten: no symbols
+### A.6 Stress Test and Context Switch Measurement
 
-$ go tool nm kitty/launcher/kitten
-reading kitty/launcher/kitten: no symbol section
+```bash
+# Baseline
+# Main: vol=844, IO: vol=2245, Talk: vol=17
 
-# Go runtime strings (proves Go binary)
-# Raw grep produces garbled entries first due to partial matches in stripped binary:
-$ strings kitty/launcher/kitten | grep 'runtime\.' | head -10
-runtime.
-runtime.H9
-runtime.H9
-runtime.H9
-runtime.H9
-runtime.H
-runtime.H
-runtime.H9
-runtime.H92
-runtime.1
+$ kitten @ --to unix:/tmp/kitty-test2.sock send-text --match id:1 \
+  'seq 1 5000 | while read i; do
+    printf "\033[48;5;$(($i%256));38;5;$((($i+128)%256))m%-80s\n" \
+    "LINE $i: heavy colored output"
+  done'
+# Wait 8 seconds for completion
 
-# Filtered for clean Go runtime function names:
-$ strings kitty/launcher/kitten | grep -E '^runtime\.[a-z]' | head -10
-runtime.cmpstring
-runtime.memequal
-runtime.memequal_varlen
-runtime.init
-runtime.init.func2
-runtime.sigdelset
-runtime.memhash8
-runtime.memhash16
-runtime.memhash128
-runtime.memhash_varlen
+# Post-stress
+# Main: vol=1290 (+446), IO: vol=6964 (+4719), Talk: vol=20 (+3)
+```
 
-# Kitty Go packages embedded
-$ strings kitty/launcher/kitten | grep '^kitty/' | head -20
-kitty/tools/cli
-kitty/tools/tty
-kitty/tools/tui
-kitty/kittens/ssh
-kitty/tools/utils
-kitty/kittens/ask
-kitty/tools/rsync
-kitty/tools/config
-kitty/tools/themes
-kitty/tools/cmd/at
-kitty/kittens/diff
-kitty/kittens/icat
-kitty/kittens/hints
-kitty/tools/tui/sgr
-kitty/tools/tui/loop
-kitty/tools/wcswidth
-kitty/kittens/themes
-kitty/tools/utils/shm
-kitty/tools/cli/markup
-kitty/kittens/show_key
+### A.7 strace Capture
 
-# Go build info (using go version -m for readable output; raw readelf -p .go.buildinfo
-# contains ^I tab chars and hash checksums that are difficult to read)
-$ go version -m kitty/launcher/kitten
+```bash
+$ strace -p 97391 -c -f -S calls
+# (5-second capture during stress — see Section 3.3 for full output)
+# Top syscalls: futex(828), poll(134), read(108), recvmsg(69), writev(16)
+```
+
+### A.8 GDB Stack Traces
+
+```bash
+$ gdb -batch -ex 'thread 1' -ex 'bt 15' -p 97391
+# Main thread: poll → pollForEvents → _glfwPlatformWaitEvents →
+#   _glfwPlatformRunMainLoop → main_loop [fast_data_types.so] →
+#   PyObject_Vectorcall → _PyEval_EvalFrameDefault → PyEval_EvalCode
+
+$ gdb -batch -ex 'thread 2' -ex 'bt 15' -p 97391
+# KittyChildMon: poll(children_fds, 3) → io_loop [fast_data_types.so] →
+#   start_thread → clone3
+
+$ gdb -batch -ex 'thread 3' -ex 'bt 15' -p 97391
+# KittyPeerMon: poll(fds, 2) → talk_loop [fast_data_types.so] →
+#   start_thread → clone3
+```
+
+### A.9 Kitten Process Observation
+
+```bash
+# Inside kitty terminal:
+$ kitty/launcher/kitten icat /tmp/test_image.png &
+$ KPID=$!
+
+$ ls -la /proc/$KPID/exe
+lrwxrwxrwx /proc/103385/exe -> .../kitty/launcher/kitten
+
+$ cat /proc/$KPID/status
+Name:   kitten
+PPid:   97459
+Pid:    103385
+```
+
+### A.10 Kitten Binary Inspection
+
+```bash
+$ readelf -S kitty/launcher/kitten | grep -E '\.go|\.text'
+  .text           PROGBITS  0000000000401000
+  .gosymtab       PROGBITS  0000000000f18508
+  .gopclntab      PROGBITS  0000000000f18520
+  .go.buildinfo   PROGBITS  00000000012b1000
+  .note.go.buildid NOTE     0000000000400f80
+
+$ go version kitty/launcher/kitten
 kitty/launcher/kitten: go1.22.10
-	path	kitty/tools/cmd
-	mod	kitty	(devel)
-	dep	github.com/ALTree/bigfloat	v0.2.0
-	dep	github.com/alecthomas/chroma/v2	v2.14.0
-	dep	github.com/bmatcuk/doublestar/v4	v4.6.1
-	dep	github.com/disintegration/imaging	v1.6.2
-	dep	github.com/dlclark/regexp2	v1.11.0
-	dep	github.com/edwvee/exiffix	v0.0.0-20240229113213-0dbb146775be
-	dep	github.com/google/uuid	v1.6.0
-	dep	github.com/klauspost/cpuid/v2	v2.2.5
-	dep	github.com/kovidgoyal/imaging	v1.6.3
-	dep	github.com/rwcarlsen/goexif	v0.0.0-20190401172101-9e8deecbddbd
-	dep	github.com/seancfoley/bintree	v1.3.1
-	dep	github.com/seancfoley/ipaddress-go	v1.6.0
-	dep	github.com/shirou/gopsutil/v3	v3.24.5
-	dep	github.com/tklauser/go-sysconf	v0.3.12
-	dep	github.com/tklauser/numcpus	v0.6.1
-	dep	github.com/zeebo/xxh3	v1.0.2
-	dep	golang.org/x/exp	v0.0.0-20230801115018-d63ba01acd4b
-	dep	golang.org/x/image	v0.17.0
-	dep	golang.org/x/sys	v0.21.0
-	dep	howett.net/plist	v1.0.1
-	build	-buildmode=exe
-	build	-compiler=gc
-	build	-ldflags="-X kitty.VCSRevision=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 -s -w"
-	build	CGO_ENABLED=1
-  # (14 direct deps + 6 indirect deps; google/go-cmp is test-only, excluded from binary)
 
-# Go version embedded
-$ strings kitty/launcher/kitten | grep 'go1\.'
-go1.22.10
+$ readelf -d kitty/launcher/kitten
+  (NEEDED) Shared library: [libc.so.6]
 ```
 
-### A.4 Python Runtime Inspection
+### A.11 Remote Control Queries
 
 ```bash
-# fast_data_types module introspection
+$ kitten @ --to unix:/tmp/kitty-test2.sock ls
+# (JSON output — see Section 4.1)
+
+$ kitten @ --to unix:/tmp/kitty-test2.sock get-colors
+# (267 color entries — see Section 4.2)
+
+$ kitten @ --to unix:/tmp/kitty-test2.sock get-text --match id:1
+# (Screen content including ANSI fragments — see Section 4.3)
+```
+
+### A.12 Python fast_data_types Introspection
+
+```bash
 $ python3 -c "
 import sys; sys.path.insert(0, '.')
-import kitty.fast_data_types as fdt
-attrs = [a for a in dir(fdt) if not a.startswith('_')]
-print(f'Total public attributes: {len(attrs)}')
-print('Programs:', [a for a in attrs if 'PROGRAM' in a])
-print('Crypto:', [a for a in attrs if 'AES' in a or 'Elliptic' in a])
-print('Monitor:', [a for a in attrs if 'Monitor' in a])
+from kitty import fast_data_types as fdt
+attrs = [a for a in dir(fdt) if not a.startswith('__')]
+print(f'Total: {len(attrs)}')
+types = [a for a in attrs if a[0].isupper() and not a.isupper()]
+print(f'Types ({len(types)}): {sorted(types)}')
 "
-Total public attributes: 581
-Programs: ['BGIMAGE_PROGRAM', 'BORDERS_PROGRAM', 'CELL_BG_PROGRAM', 'CELL_FG_PROGRAM',
-           'CELL_PROGRAM', 'CELL_SPECIAL_PROGRAM', 'GRAPHICS_ALPHA_MASK_PROGRAM',
-           'GRAPHICS_PREMULT_PROGRAM', 'GRAPHICS_PROGRAM', 'TINT_PROGRAM']
-Crypto: ['AES256GCMDecrypt', 'AES256GCMEncrypt', 'EllipticCurveKey']
-Monitor: ['ChildMonitor']
+# Total: 581
+# Types (23): ['AES256GCMDecrypt', 'AES256GCMEncrypt', 'ChildMonitor',
+#   'Color', 'ColorProfile', 'CryptoError', 'Cursor', 'DiskCache',
+#   'EllipticCurveKey', 'Face', 'FreeTypeError', 'GraphicsManager',
+#   'HistoryBuf', 'KeyEvent', 'Line', 'LineBuf', 'Parser', 'Region',
+#   'Screen', 'Secret', 'Shlex', 'SigInfo', 'SingleKey']
 ```
 
-### A.5 Version Verification
+### A.13 Environment Constraints Encountered
 
-```bash
-$ kitty/launcher/kitty --version
-kitty 0.35.2 created by Kovid Goyal
-
-$ kitty/launcher/kitten --version
-kitten 0.35.2 created by Kovid Goyal
-```
-
-### A.6 Launch Attempt (Blocked)
-
-```bash
-$ kitty/launcher/kitty --listen-on unix:/tmp/kitty-test.sock
-[0.059] [glfw error 65544]: X11: The DISPLAY environment variable is missing
-GLFW initialization failed
-
-# Analysis: Expected failure. The GLFW initialization in the C layer (via init_glfw()
-# called from kitty/main.py line 514) requires a display server. The X11 backend
-# reads $DISPLAY, which is not set in this headless CI environment. This confirms
-# the C layer's dependency on a platform windowing system for the rendering pipeline.
-```
-
-### A.7 Strace on Kitten Binary
-
-```bash
-$ strace -f -e trace=write,read -c kitty/launcher/kitten --version 2>&1
-strace: Process 44785 attached
-strace: Process 44786 attached
-strace: Process 44787 attached
-strace: Process 44788 attached
-strace: Process 44789 attached
-strace: Process 44790 attached
-strace: Process 44791 attached
-strace: Process 44792 attached
-strace: Process 44793 attached
-strace: Process 44794 attached
-kitten 0.35.2 created by Kovid Goyal
-% time     seconds  usecs/call     calls    errors syscall
------- ----------- ----------- --------- --------- ----------------
-100.00    0.000223          22        10           read
-  0.00    0.000000           0         1           write
------- ----------- ----------- --------- --------- ----------------
-100.00    0.000223          20        11           total
-```
-
-> *Note: The 10 "Process ... attached" messages confirm the Go runtime spawns multiple OS threads (goroutine scheduler, GC, timers) even for a trivial invocation. PIDs will vary between runs.*
-
-### A.8 Remote Control Commands (Could Not Execute)
-
-The following commands would be issued in a full environment with a running kitty instance:
-
-```bash
-# Would require: kitty running with --listen-on unix:/tmp/kitty-test.sock
-
-# List windows/tabs
-$ kitty @ --to unix:/tmp/kitty-test.sock ls
-# Expected: JSON tree of OS windows → tabs → windows with PID, title, dimensions
-
-# Get current colors
-$ kitty @ --to unix:/tmp/kitty-test.sock get-colors
-# Expected: key-value pairs of color names and hex values
-
-# Get screen text
-$ kitty @ --to unix:/tmp/kitty-test.sock get-text --extent screen
-# Expected: plain text content of the active terminal window
-
-# Blocked because: GLFW initialization failed (no display server)
-# Fallback: Source code analysis of kitty/rc/ls.py, get_colors.py, get_text.py
-```
-
-### A.9 Process Observation Commands (Could Not Execute)
-
-```bash
-# Would require: running kitty process
-
-# Thread enumeration
-$ ls /proc/$(pgrep kitty)/task/
-# Expected: 3 directories (Main, I/O, Talk threads)
-
-# Memory map
-$ cat /proc/$(pgrep kitty)/maps | grep '\.so'
-# Expected: fast_data_types.so, glfw-x11.so, libpython, libharfbuzz, libfreetype, ...
-
-# Process tree during icat
-$ kitty +kitten icat photo.png &
-$ pstree -p $(pgrep kitty)
-# Expected: kitty(PID)───zsh(PID2)───kitten(PID3)
-
-# Blocked because: GLFW initialization failed (no display server)
-# Fallback: ldd analysis of compiled binaries reconstructs the expected memory map
-```
-
-### A.10 Stress Test Commands (Could Not Execute)
-
-```bash
-# Would require: running kitty process
-
-# Generate colored output stress
-$ for i in $(seq 1 10000); do printf "\033[38;5;$((i % 256))m█"; done
-
-# Scrollback churn
-$ seq 1 1000000
-
-# Rapid resize (via remote control)
-$ for i in $(seq 1 100); do
-    kitty @ --to unix:/tmp/kitty-test.sock resize-window --increment 2
-    sleep 0.01
-  done
-
-# Blocked because: GLFW initialization failed (no display server)
-# Fallback: Source code analysis of rendering hot path in child-monitor.c
-```
+| Tool / Feature | Status | Impact |
+|---|---|---|
+| Physical GPU | ❌ Not available | Used llvmpipe software rendering; 32 extra llvmpipe threads present |
+| X11 display server | ❌ Not available | Installed and used Xvfb virtual framebuffer |
+| Wayland compositor | ❌ Not available | X11 backend used instead (`glfw-x11.so` loaded) |
+| systemd user bus | ❌ Not available | Non-fatal warning; desktop integration features unavailable |
+| libcanberra (audio) | ❌ Not available | Bell sound disabled; non-fatal |
+| py-spy profiler | ❌ Not installed | Used GDB for stack traces instead |
+| perf tool | ❌ Requires root | Used strace and GDB instead |
+| /dev/tty | ❌ Not available in non-TTY context | kitten icat exited when launched outside kitty; launched inside kitty instead |
 
 ---
 
-## Summary of Findings
-
-### The Three-Language Division
-
-| Language | Process Model | Responsibilities | Key Evidence |
-|---|---|---|---|
-| **C** (49 files, 1.5 MB .so) | In-process (extension module) | VT parsing, OpenGL rendering, font rasterization, GPU glyph cache, SIMD string ops, threading, platform windowing | `ldd` shows libharfbuzz/libfreetype/libpng linkage; `nm -D` shows 104 imported rendering symbols; `pthread_create` in source |
-| **Python** (orchestration layer) | In-process (interpreter) | Startup, config, window/tab management, RC dispatch, kitten framework, shader loading | `sys.setswitchinterval(1000.0)` proves single thread; `ldd kitty` shows libpython; entry_points.py routes all dispatch |
-| **Go** (15 MB binary) | Separate process | CLI tools, kittens (icat, diff, ssh, etc.), RC client, shell completion | `file` shows Go BuildID; `ldd` shows only libc; `strings` reveal Go runtime and kitty packages; `os.execl` in entry_points.py |
-
-### Key Architectural Insights
-
-1. **C and Python share one process** — C runs as Python extension modules (`fast_data_types.so`), called through the CPython C API.
-2. **Go always runs as a separate process** — invoked via `os.execl`/`os.execvp`, communicating via escape sequences or UNIX sockets.
-3. **The 2–3 C threads (Main/IO, and optionally Talk when RC is enabled) are created in C** — Python never creates threads; `sys.setswitchinterval(1000.0)` confirms single-Python-thread design.
-4. **The rendering hot path is entirely C** — from VT parsing (with SIMD) through OpenGL rendering, never touching Python.
-5. **The Go layer trades rendering capability for portability** — the 15 MB standalone binary carries its own runtime but has zero rendering libraries.
+*End of investigation document. All commands, outputs, and analysis are provided for independent reproducibility.*
