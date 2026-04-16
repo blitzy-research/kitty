@@ -42,7 +42,7 @@ The canonical command is:
 python3 setup.py build --ignore-compiler-warnings
 ```
 
-Rationale: `Makefile`'s default `all` target is just `python3 setup.py $(VVAL)` (`Makefile`, lines 13–14), i.e. `setup.py` is the single orchestrator. It compiles the C extension (`compile_c_extension`, `setup.py:856`), GLFW sources (`compile_glfw`, `setup.py:932`), the kittens C helpers (`compile_kittens`, `setup.py:967`), builds Go static binaries via `build_static_binaries` (`setup.py:1195`), and finally assembles the launcher (`build_launcher`, `setup.py:1230`). `--ignore-compiler-warnings` is handy in containers where the system compiler emits warnings that would otherwise fail a strict build.
+Rationale: `Makefile`'s default `all` target is just `python3 setup.py $(VVAL)` (`Makefile`, lines 12–13), i.e. `setup.py` is the single orchestrator. It compiles the C extension (`compile_c_extension`, `setup.py:856`), GLFW sources (`compile_glfw`, `setup.py:932`), the kittens C helpers (`compile_kittens`, `setup.py:967`), builds Go static binaries via `build_static_binaries` (`setup.py:1195`), and finally assembles the launcher (`build_launcher`, `setup.py:1230`). `--ignore-compiler-warnings` is handy in containers where the system compiler emits warnings that would otherwise fail a strict build.
 
 `dev.sh` is a one-liner that delegates to the Go-based developer shell:
 
