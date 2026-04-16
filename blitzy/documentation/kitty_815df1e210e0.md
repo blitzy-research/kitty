@@ -1,12 +1,13 @@
 # kitty OSC 133 Escape Sequence Handling — Investigation Report
 
-| Field            | Value                                                          |
-|------------------|----------------------------------------------------------------|
-| Repository       | `kovidgoyal/kitty`                                             |
-| Commit hash      | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`                     |
-| Scope            | End-to-end handling of OSC 133;A / 133;B / 133;C / 133;D       |
-| Methodology      | Source-code analysis + runtime verification via `parse_bytes` + `CmdDump` |
-| Policy           | Read-only (no repository files modified); test scripts cleaned up after data collection |
+| Field                  | Value                                                          |
+|------------------------|----------------------------------------------------------------|
+| Repository             | `kovidgoyal/kitty`                                             |
+| Commit hash            | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`                     |
+| Date of investigation  | 2026-04-16                                                     |
+| Scope                  | End-to-end handling of OSC 133;A / 133;B / 133;C / 133;D       |
+| Methodology            | Source-code analysis + runtime verification via `parse_bytes` + `CmdDump` |
+| Policy                 | Read-only (no repository files modified); test scripts cleaned up after data collection |
 
 This document is a comprehensive, evidence-based investigation of how the kitty terminal's VT parser and shell-integration layer process OSC 133 command-tracking escape sequences. Every claim below is grounded in either a direct source-code citation (file + line number) or reproducible runtime output collected during the investigation.
 
@@ -533,7 +534,7 @@ This produces three distinct outcomes depending on the input payload:
 | `D;99` | `'D'` | `';'` | `"99"` | skip past `;`, rest of string |
 | `D;not_a_number` | `'D'` | `';'` | `"not_a_number"` | skip past `;`, rest of string (any chars) |
 | `D;` | `'D'` | `';'` | `""` (empty C string) | skip past `;`, but nothing follows |
-| `D` | `'D'` | `'\0'` (null terminator added at `vt-parser.c:544`) | `""` (empty C string) | `buf[1] != ';'`, so use the literal `""` |
+| `D` | `'D'` | `'\0'` (null terminator added at `vt-parser.c:543`) | `""` (empty C string) | `buf[1] != ';'`, so use the literal `""` |
 
 So the C code is lossless for any `buf[2..n]` and only gives Python an empty string when the payload was either `D` alone or `D;` with nothing after the semicolon. In all three "non-valid-integer" cases above, Python receives a string that `int()` cannot parse.
 
