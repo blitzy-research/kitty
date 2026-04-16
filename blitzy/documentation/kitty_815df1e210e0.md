@@ -60,11 +60,11 @@ Narrowing to the core terminal engine in `kitty/`:
 | Language     | Files in `kitty/` | Lines in `kitty/` |
 |--------------|------------------:|------------------:|
 | C (`.c`)     |                51 |            35,917 |
-| Headers (`.h`)|               50 |            24,807 |
+| Headers (`.h`)|               48 |            24,314 |
 | Python (`.py`)|              109 |            39,355 |
 | GLSL (`.glsl`)|               13 |               696 |
 
-C + H is ≈99,745 lines, ≈59% more than Python's 62,874 lines. Inside the core `kitty/` package, the C+H weight (60,724 lines) is ≈1.54× the Python weight (39,355 lines). Volume alone does not prove which language is on the hot path, but it establishes that calling this a "Python application" understates the C commitment by more than half.
+C + H is ≈99,745 lines, ≈59% more than Python's 62,874 lines. Inside the core `kitty/` package, the C+H weight (60,231 lines) is ≈1.53× the Python weight (39,355 lines). Volume alone does not prove which language is on the hot path, but it establishes that calling this a "Python application" understates the C commitment by more than half.
 
 ### 2.2 Subsystem-to-language map
 
@@ -125,15 +125,23 @@ The net effect: once startup completes, the runtime hot path is entirely inside 
 
 `go.mod` declares `go 1.22`. The Go code compiles to a single static binary named `kitten` (produced by `setup.py`; its built size is ≈16 MB, located at `kitty/launcher/kitten` after a successful build). This binary implements the CLI tool dispatched by `kitty +kitten <name>`, as well as several standalone commands (`icat`, `hold`, `complete`, `shebang`).
 
-The dispatch is visible in `kitty/entry_points.py`. Each Go-backed command is not run *inside* the kitty process; it is `exec`ed:
+The dispatch is visible in `kitty/entry_points.py`. Each Go-backed command is not run *inside* the kitty process; it is `exec`ed (verbatim lines, with their source-file line numbers):
 
 ```python
-# kitty/entry_points.py (excerpts)
-os.execl(kitten_exe(), 'kitten', 'icat', *sys.argv[1:])
-os.execl(kitten_exe(), 'kitten', 'hold', *sys.argv[1:])
-os.execl(kitten_exe(), 'kitten', '__complete__', *sys.argv[1:])
-os.execl(kitten_exe(), 'kitten', '__shebang__', *sys.argv[1:])
+# kitty/entry_points.py (verbatim exec lines from each Go-backed dispatcher)
+# icat (line 12)
+os.execl(kitten_exe(), "kitten", *args)
+# hold (lines 29–30)
+args = ['kitten', '__hold_till_enter__'] + args[1:]
+os.execvp(kitten_exe(), args)
+# complete (lines 42–43)
+args = ['kitten', '__complete__'] + args[1:]
+os.execvp(kitten_exe(), args)
+# shebang (line 115)
+os.execvp(kitten_exe(), ['kitten', '__confirm_and_run_shebang__'] + cmd + [script_path])
 ```
+
+Three of the four branches use `os.execvp` (which searches `PATH`) rather than `os.execl`; only `icat` uses `os.execl` directly. Either way, the Python process replaces its image in memory with the Go `kitten` binary.
 
 Go therefore does *not* share the C terminal core. Its purpose is exactly opposite: to be a single static binary that can be copied to a remote machine (over SSH, for example), where the full kitty + CPython + FreeType + HarfBuzz + libGL stack cannot and should not be shipped. The Go CLI speaks to the running kitty process through terminal escape sequences and the remote-control socket. It never links against `fast_data_types`.
 
@@ -238,13 +246,14 @@ def _load_sources(name: str, seen=None, level: int = 0) -> str:
     # `seen` set passed in.
 
 # Program.compile() — hands the final source strings to the C side
-def compile(self, vertex_name: str, fragment_name: str,
-            allow_recompile: bool = False) -> None:
+def compile(self, program_id: int, allow_recompile: bool = False) -> None:   # line 87
     ...
-    compile_program(                                            # line 90
-        self.program_id, vertex_sources, fragment_sources, allow_recompile
+    compile_program(                                             # line 90
+        program_id, self.vertex_sources, self.fragment_sources, allow_recompile
     )
 ```
+
+Note: the vertex and fragment sources are not passed to `compile()` as arguments; they are stored on the `Program` instance as `self.vertex_sources` / `self.fragment_sources` by a prior call to `apply_to_sources()` (line 83 of `shaders.py`). The integer `program_id` identifies which C-side program slot to populate. This decoupling lets callers prepare sources once and recompile the same program slot if needed.
 
 `read_kitty_resource()` (defined at `kitty/constants.py:241`) uses `importlib.resources` to read the GLSL files out of the installed kitty package. On Python ≥ 3.10 it uses `importlib.resources.files()`; on older interpreters it falls back to `importlib.resources.read_binary`. Either way, the GLSL source is a *package resource* — it travels with the Python wheel / install tree, not with the C extension.
 
@@ -336,9 +345,10 @@ So calling kitty "GPU accelerated" is correct but underspecifies. A more accurat
 The file is intentionally trivial — all seven lines of it:
 
 ```python
-# __main__.py  (7 lines total)
-#!/usr/bin/env python3
-# License: GPLv3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
+# __main__.py  (7 lines total, verbatim)
+#!/usr/bin/env python
+# License: GPL v3 Copyright: 2015, Kovid Goyal <kovid at kovidgoyal.net>
+
 
 if __name__ == '__main__':
     from kitty.entry_points import main
@@ -374,7 +384,7 @@ Each step of the chain tells us a little more about the architecture:
    This is fine; `kitty.entry_points` is one of the thirteen Python modules that can import standalone (see §5.4). It is deliberately pure-Python and is the *only* part of the Python layer that will run before we learn whether the C extension exists.
 
 2. **`kitty/entry_points.py:194` — `from kitty.main import main as kitty_main`**
-   When no CLI subcommand matched (`entry_points` dispatches icat/hold/complete/shebang to the Go binary via `os.execl(kitten_exe(), ...)`), control falls through to the default branch, which imports the full kitty application at `kitty.main`. This is the first interesting import.
+   When no CLI subcommand matched (`entry_points` dispatches `icat` via `os.execl(kitten_exe(), ...)` and `hold` / `complete` / `shebang` via `os.execvp(kitten_exe(), ...)` to the Go binary — see §2.4 for the verbatim lines), control falls through to the default branch, which imports the full kitty application at `kitty.main`. This is the first interesting import.
 
 3. **`kitty/main.py:11` — `from .borders import load_borders_program`**
    `main.py` does its own imports at module load time; by line 11 it is already pulling in rendering infrastructure. It does not perform a lazy "only if a window is created" deferral. The reason is that `main.py`'s job is to set up the application singleton (`Boss`), which needs access to border rendering among many other things.
@@ -489,7 +499,7 @@ PyInit_fast_data_types(void) {
 
 This is a single module. `PyInit_fast_data_types` is CPython's entry point for the module initialization contract: when Python sees `import kitty.fast_data_types`, it calls this function exactly once, and whatever objects have been attached to `m` by the time it returns are what the module exposes. There is only one such function in the entire codebase; there is no split extension architecture where screen lives in `_screen` and shaders in `_shaders`. Everything goes through one `.so`.
 
-### 5.2 Twenty-nine subsystem initializers on Linux (25+ cross-platform)
+### 5.2 Thirty subsystem initializers on Linux (29 on macOS; 25+ unconditional cross-platform)
 
 Inside `PyInit_fast_data_types`, a sequence of `init_<Subsystem>(m)` calls registers each subsystem's types, functions, and constants onto the module object. Transcribed directly from `kitty/data-types.c` (lines 524–612), the Linux initialization sequence is:
 
@@ -524,14 +534,14 @@ init_fonts(m);                             // 26 — font caching and shaping
 init_utmp(m);                              // 27 — utmp record management
 init_loop_utils(m);                        // 28 — main-loop helpers
 init_crypto_library(m);                    // 29 — X25519 + AES-GCM + HKDF crypto
-init_systemd_module(m);                    // 30 — systemd socket integration (Linux)
+init_systemd_module(m);                    // 30 — systemd socket integration (compiled on all platforms; only functional on Linux)
 ```
 
-On macOS, the Linux-specific calls (`init_freetype_library`, `init_fontconfig_library`, `init_desktop`, `init_freetype_render_ui_text`, `init_systemd_module`) are omitted and replaced by `init_macos_process_info`, `init_CoreText`, and `init_cocoa`. The net count is essentially the same — ≈25–29 subsystems.
+Structurally, the calls fall into three zones inside `PyInit_fast_data_types`: (a) twenty-one unconditional calls at the top (items 1–21, from `init_monotonic` through `init_png_reader`); (b) a platform block — on Linux (`#else` branch), items 22–25 (`init_freetype_library`, `init_fontconfig_library`, `init_desktop`, `init_freetype_render_ui_text`); on macOS (`#ifdef __APPLE__` branch), three calls instead (`init_macos_process_info`, `init_CoreText`, `init_cocoa`); (c) five more unconditional calls after `#endif` (items 26–30: `init_fonts`, `init_utmp`, `init_loop_utils`, `init_crypto_library`, `init_systemd_module`). Note that `init_systemd_module` is called on every platform but its body uses `dlopen`/`dlsym` to find libsystemd at runtime, so on macOS it gracefully no-ops. The net count is **thirty** on Linux and **twenty-nine** on macOS.
 
 ### 5.3 What each category provides
 
-Grouped by responsibility, these 29 initializers cover every system-level concern a terminal has:
+Grouped by responsibility, these 30 initializers (Linux; 29 on macOS) cover every system-level concern a terminal has:
 
 - **Terminal state machine and grid** — `init_Parser`, `init_Screen`, `init_LineBuf`, `init_HistoryBuf`, `init_Line`, `init_Cursor`, `init_ColorProfile`. Turns PTY byte streams into a structured, drawable model.
 - **GPU rendering** — `init_glfw`, `init_shaders`, `init_graphics`. Windowing, shader compilation, and the inline-image pipeline.
@@ -549,7 +559,7 @@ Note that the list includes `init_monotonic` (a clock) — the *very first line*
 A grep over the source tree gives a quantitative view of how deep the dependency goes:
 
 - **47 `.py` files in `kitty/`** reference `fast_data_types` (either by `from .fast_data_types import ...` or `from kitty.fast_data_types import ...`).
-- **13 `.py` files in `kittens/`** reference `fast_data_types`, with six of those concentrated in `kittens/tui/` (the TUI foundation layer shared by many kittens).
+- **13 `.py` files in `kittens/`** reference `fast_data_types`, with eight of those concentrated in `kittens/tui/` (the TUI foundation layer shared by many kittens: `handler.py`, `images.py`, `line_edit.py`, `loop.py`, `operations.py`, `path_completer.py`, `spinners.py`, `utils.py`).
 
 Going further, I ran an isolation test: attempting `importlib.import_module()` on every Python module directly under `kitty/` with `fast_data_types.so` renamed out of the way. The results are sharp.
 
@@ -636,7 +646,7 @@ With `fast_data_types.so` renamed out of the way, I attempted to import `main` f
 |--------------------|------------------------------------------------------------------------------|
 | `choose_fonts`     | Python stub only — the kitten's logic is in 10 Go files under `kittens/choose_fonts/*.go`. The Python `main()` raises `SystemExit`. |
 | `clipboard`        | Python stub only — logic is in `kittens/clipboard/{main,read,write}.go`.     |
-| `hyperlinked_grep` | Python stub only — wraps Go `kittens/hyperlinked_grep/main.go`. `main()` raises `SystemExit('This should be run as kitten hyperlinked_grep')`. |
+| `hyperlinked_grep` | Python stub only — wraps Go `kittens/hyperlinked_grep/main.go`. There is no `main()` function; a module-level `if __name__ == '__main__': raise SystemExit('This should be run as kitten hyperlinked_grep')` guard fires only when the file is run as a script. Importing it (as this test does) leaves `__name__ == 'kittens.hyperlinked_grep.main'` and the guard does not trigger. |
 | `icat`             | Python stub only — image-rendering kitten. Logic in 5 Go files.             |
 | `show_key`         | Python stub only — wraps 3 Go files under `kittens/show_key/*.go`.          |
 | `transfer`         | Python stub only — file transfer over SSH; logic in 6 Go files.              |
@@ -686,7 +696,7 @@ This pattern — "the Python side only declares the schema, but the schema types
 
 Across the 13 `.py` files in `kittens/` that reference `fast_data_types`, the coupling reaches the rest of the kitten set through three pathways:
 
-1. **Via `kittens.tui.handler`** (imports `fast_data_types.monotonic`). Kittens that use the TUI framework — `ask`, `broadcast`, `hints`, `panel`, `query_terminal`, `unicode_input`, and more — all traverse this path. `kittens/tui/` has six files that directly import `fast_data_types`: `handler.py`, `images.py`, `line_edit.py`, `loop.py`, `operations.py`, `utils.py`.
+1. **Via `kittens.tui.handler`** (imports `fast_data_types.monotonic`). Kittens that use the TUI framework — `ask`, `broadcast`, `hints`, `panel`, `query_terminal`, `unicode_input`, and more — all traverse this path. `kittens/tui/` has eight files that directly import `fast_data_types`: `handler.py`, `images.py`, `line_edit.py`, `loop.py`, `operations.py`, `path_completer.py`, `spinners.py`, `utils.py`.
 
 2. **Via `kitty.cli` → `kitty.conf.utils`** (imports `fast_data_types.Color`, plus configuration primitives). Kittens that declare CLI options or config schemas — `diff`, `themes`, `ssh` — go through this path.
 
@@ -696,52 +706,59 @@ Because these three paths intersect with essentially every non-trivial kitten, a
 
 ### 6.4 The "Python stub for a Go binary" pattern
 
-The six kittens that *do* import cleanly share a specific shape. `kittens/hyperlinked_grep/main.py` is the canonical minimal example:
+The six kittens that *do* import cleanly share a specific shape. `kittens/hyperlinked_grep/main.py` is the canonical minimal example — here is the complete file verbatim (10 lines):
 
 ```python
-# kittens/hyperlinked_grep/main.py (paraphrased; actual file is a few lines)
-def main(args):
-    raise SystemExit('This should be run as kitten hyperlinked_grep')
+# kittens/hyperlinked_grep/main.py (verbatim, all 10 lines)
+#!/usr/bin/env python
+# License: GPLv3 Copyright: 2020, Kovid Goyal <kovid at kovidgoyal.net>
 
-def handle_result(*a, **kw):
-    pass  # delegated to Go
+import sys
+
+if __name__ == '__main__':
+    raise SystemExit('This should be run as kitten hyperlinked_grep')
+elif __name__ == '__wrapper_of__':
+    cd = sys.cli_docs  # type: ignore
+    cd['wrapper_of'] = 'rg'
 ```
 
-The file exists for two reasons:
+Notice that there is no `main()` function, no `handle_result()` function — just a pair of module-level `if __name__` branches. The file exists for two reasons:
 
-1. **Option / help metadata.** `kittens/runner.py` (the framework) needs to call into *some* Python module to discover help text, completion specs, and option definitions. Even if the kitten's logic is entirely in Go, the metadata is Python.
+1. **Option / help metadata and the `__wrapper_of__` declaration.** `kittens/runner.py` (the framework) executes each stub with `__name__` set to one of several sentinel values (`'__wrapper_of__'`, `'__completion__'`, `'__conf_name__'`, etc.) to harvest metadata. For `hyperlinked_grep`, the `__wrapper_of__` branch declares that it wraps the `rg` (ripgrep) binary; the runner uses this to set up completions. Running the file as a script (`python3 kittens/hyperlinked_grep/main.py`) hits the `__main__` branch and exits.
 
-2. **Go↔Python result handler.** Some kittens, after the Go binary produces output, pipe that output back into the kitty process. `handle_result` is a Python hook that the framework calls at the kitty-process side; it may be a no-op (as above) or it may copy results into a kitty window.
+2. **Go↔Python result handler (in richer stubs).** Some kittens — such as `icat`, `clipboard`, `transfer` — additionally define top-level functions that the framework may call after the Go binary finishes (e.g., to push the Go binary's output into the kitty window). `hyperlinked_grep` is the minimal shape; richer stubs add more top-level definitions without changing the overall "it is metadata, not logic" character.
 
-Critically, **if Python code ever tries to call `main(args)` directly on one of these, the program immediately exits with `SystemExit`**. The "kittens can be imported cleanly" result in this isolation test does not mean these kittens are runnable as Python programs. It means their Python side is so minimal that it can be *imported* without `fast_data_types` — but *running* them still requires the Go binary, which still lives inside a properly built kitty install.
+Critically, **these Python stubs do not *run* the kitten's logic.** The `__main__` guard exists to produce a clear error if a user mistakenly invokes the file directly. The actual work is done by the Go `kitten` binary, which is launched by the `kitty +kitten <name>` dispatch (§6.5). The "kittens can be imported cleanly" result in this isolation test does not mean these kittens are runnable as Python programs; it means their Python side is so minimal that it can be *imported* without `fast_data_types` — but *running* them still requires the Go binary, which still lives inside a properly built kitty install.
 
 ### 6.5 The Go binary architecture
 
 For a deeper look at what "the Go binary" means here: `setup.py` also builds a separate native binary called `kitten` (note: singular), at `kitty/launcher/kitten`, by running `go build` against 258 `.go` files spread across `tools/` and `kittens/*/`. Of the 18 kittens with a `main.py`, 14 have matching `.go` files that get compiled into this binary. The binary is statically linked and is ≈16 MB.
 
-The `kitty` process and the `kitten` binary communicate either (a) via terminal escape sequences and the kitty graphics protocol, or (b) via the remote-control socket. A command like `kitty +kitten icat my-image.png` is routed by `kitty/entry_points.py` at lines around 11–12 as:
+The `kitty` process and the `kitten` binary communicate either (a) via terminal escape sequences and the kitty graphics protocol, or (b) via the remote-control socket. A command like `kitty +kitten icat my-image.png` is routed by `kitty/entry_points.py` — the `icat` function is defined at lines 10–12:
 
 ```python
-# kitty/entry_points.py (icat branch)
-os.execl(kitten_exe(), 'kitten', 'icat', *sys.argv[1:])
+# kitty/entry_points.py (icat branch, verbatim lines 10–12)
+def icat(args: List[str]) -> None:
+    from kitty.constants import kitten_exe
+    os.execl(kitten_exe(), "kitten", *args)
 ```
 
-Similar `os.execl(kitten_exe(), ...)` calls exist for `hold`, `complete`, and `shebang`. The Python process `exec`s itself into the Go binary — replacing its own image in memory. After `execl`, the Python interpreter is gone; the Go binary runs; it speaks to the still-running kitty terminal through the TTY. No shared memory, no shared libraries, no shared address space.
+Similar `exec*` calls exist for `hold`, `complete`, and `shebang` (as §2.4 shows verbatim, those three branches use `os.execvp` rather than `os.execl`). In every case the Python process replaces its own image in memory with the Go binary. After the `exec*` call, the Python interpreter is gone; the Go binary runs; it speaks to the still-running kitty terminal through the TTY. No shared memory, no shared libraries, no shared address space.
 
 ### 6.6 Why the naming is misleading
 
 "Kitten" suggests a small, independent creature — a helpful tool that could, in principle, live on its own. That is not what the architecture implements. The kittens directory is the plugin folder of a larger terminal program:
 
 - Kittens that stay in Python depend on the TUI framework and/or config infrastructure, both of which sit on the native bridge.
-- Kittens that move to Go are architecturally *more* independent (they compile into a standalone binary) but are still launched by kitty (`kitty +kitten <name>` via `os.execl`) and still communicate back through kitty-specific escape sequences.
-- Either way, a kitten's natural habitat is inside a running kitty session. The `kittens.runner.run_kitten` framework (180 lines in `kittens/runner.py`) is the glue that makes them addressable.
+- Kittens that move to Go are architecturally *more* independent (they compile into a standalone binary) but are still launched by kitty (`kitty +kitten <name>` via `os.execl` for `icat` or `os.execvp` for the other three dispatch targets — see §2.4 and §6.5) and still communicate back through kitty-specific escape sequences.
+- Either way, a kitten's natural habitat is inside a running kitty session. The `kittens.runner.run_kitten` framework (202 lines in `kittens/runner.py`) is the glue that makes them addressable.
 
 ### 6.7 Rationale — what the empirical test revealed
 
 If you only read the source, you might guess that `kittens/hyperlinked_grep/` is a small, self-contained grep-wrapper. Running the import shows that:
 
-- It's Python side imports cleanly.
-- But `main()` raises `SystemExit` immediately.
+- Its Python side imports cleanly.
+- But the module raises `SystemExit('This should be run as kitten hyperlinked_grep')` if run as a script — the guard `if __name__ == '__main__':` at module scope triggers this (there is no `main()` function).
 - The actual implementation is in `kittens/hyperlinked_grep/main.go`.
 - That Go file gets compiled into the shared `kitten` binary, not into a per-kitten binary.
 
@@ -783,7 +800,7 @@ A purely static review of this repository — reading `README.md`, browsing `kit
 
 - **The transitive dependency shape of kittens.** Reading `kittens/ask/main.py` does not reveal that it depends on `fast_data_types.monotonic`. The dependency only appears as a runtime failure pointing at `kittens/tui/handler.py:10`. Likewise for `diff` → `cli` → `conf/utils` → `Color`.
 
-- **The behavior of the "stub" kittens.** Running `python -c 'from kittens.hyperlinked_grep.main import main; main({})'` reveals that the Python `main()` is a skeleton that exits with `SystemExit` — not obvious from static import analysis, which would report the module imports cleanly.
+- **The behavior of the "stub" kittens.** Running `python3 kittens/hyperlinked_grep/main.py` reveals that it exits immediately with `SystemExit('This should be run as kitten hyperlinked_grep')` — triggered by a module-level `if __name__ == '__main__':` guard, not a `main()` function (the file has none). Static import analysis would report the module imports cleanly and might suggest it contains real logic; reading the 10-line file or running it shows that its Python side is metadata-only.
 
 - **The pkg-config build failure mode.** This is environmental rather than purely code-level. Reading `setup.py` would show that `pkg-config` is called; running it on a system without that tool shows *where* and *how loudly* the build refuses. This matters because it tells you the build has strong native-toolchain preconditions, not just Python-package preconditions.
 
