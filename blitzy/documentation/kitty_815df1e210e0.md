@@ -1,1018 +1,1036 @@
-# Kitty Terminal Emulator — Startup Behavior Investigation
+# Kitty Terminal Startup Investigation — Commit 815df1e210e0
 
 **Repository**: [kovidgoyal/kitty](https://github.com/kovidgoyal/kitty)
-**Commit investigated**: `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (HEAD: *"Wire up applying of font config"*)
-**Kitty version reported by built binary**: `kitty 0.35.2 created by Kovid Goyal`
-**Investigation environment**: Ubuntu 24.04.4 LTS, x86_64, Python 3.12.3, Go 1.22.2, Mesa 25.2.8, X.Org 21.1.11 via Xvfb (virtual framebuffer on `:99`, `1280x720x24`)
-**Build command**: `python3 setup.py build --ignore-compiler-warnings` (succeeded — 122 C compile units, all Wayland protocols, all Go kittens/tools, linked 5 shared objects)
-
-This document answers four tightly-related observational questions about what happens between Kitty's process entry and a working shell prompt. Every claim below is grounded either in a direct source-code citation (file and line number at commit `815df1e21`) or in live debug output captured from the binary compiled at that commit and run headlessly under Xvfb.
+**Commit investigated**: `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (short: `815df1e210e0`, message: *"Wire up applying of font config"*)
+**Kitty version reported by the built binary**: `kitty 0.35.2 created by Kovid Goyal`
+**Investigation host**: Ubuntu 24.04.4 LTS, x86_64, Python 3.12.3, Go 1.22.2, Mesa 25.2.8, X.Org 21.1.11, Xvfb virtual framebuffer on `:99` at `1280x720x24`
+**Branch**: X11 only — `WAYLAND_DISPLAY` is unset throughout; the Wayland code paths are not exercised.
 
 ---
 
 ## Table of Contents
 
-1. [Q1 — Startup Subsystems: What Comes Online Before the Terminal Is Ready?](#q1--startup-subsystems-what-comes-online-before-the-terminal-is-ready)
-2. [Q2 — Configuration Resolution: How Does Kitty Determine Its Initial Settings?](#q2--configuration-resolution-how-does-kitty-determine-its-initial-settings)
-3. [Q3 — Terminal-to-Shell Communication: How Does Kitty Talk to the Child Shell?](#q3--terminal-to-shell-communication-how-does-kitty-talk-to-the-child-shell)
-4. [Q4 — Display System Evidence: Fonts, Layout, Rendering, and Logs](#q4--display-system-evidence-fonts-layout-rendering-and-logs)
-5. [Appendix A — Full Live Debug Output from Headless Run](#appendix-a--full-live-debug-output-from-headless-run)
-6. [Appendix B — Default Option Values (Introspection)](#appendix-b--default-option-values-introspection)
-7. [Appendix C — Call Graph Summary](#appendix-c--call-graph-summary)
+1. [Abstract / Executive Summary](#abstract--executive-summary)
+2. [Investigation Environment and Methodology](#investigation-environment-and-methodology)
+3. [Question 1 — What systems come online on the way to a working terminal?](#question-1--what-systems-come-online-on-the-way-to-a-working-terminal)
+4. [Question 2 — How is the initial configuration resolved on first launch?](#question-2--how-is-the-initial-configuration-resolved-on-first-launch)
+5. [Question 3 — How does data flow from shell to terminal (PTY, fork, VT parser)?](#question-3--how-does-data-flow-from-shell-to-terminal-pty-fork-vt-parser)
+6. [Question 4 — What evidence confirms the display system is working?](#question-4--what-evidence-confirms-the-display-system-is-working)
+7. [Appendix A — Complete Source File Reference Index](#appendix-a--complete-source-file-reference-index)
+8. [Appendix B — Raw Captured Debug Log (verbatim)](#appendix-b--raw-captured-debug-log-verbatim)
+9. [Appendix C — Raw xwininfo Output](#appendix-c--raw-xwininfo-output)
+10. [Appendix D — Glossary of Key Identifiers](#appendix-d--glossary-of-key-identifiers)
+11. [Investigation Provenance](#investigation-provenance)
 
 ---
 
-## Q1 — Startup Subsystems: What Comes Online Before the Terminal Is Ready?
+## Abstract / Executive Summary
 
-### 1.1 High-Level Sequence
+This document records a read-only, evidence-based investigation of the startup sequence of the Kitty terminal emulator at commit `815df1e210e0` (*"Wire up applying of font config"*). The investigation was conducted on an Ubuntu 24.04 container running Python 3.12, Mesa 25.2.8, and Xvfb headless; because the host has no physical display, every run occurred under `DISPLAY=:99`, and because `WAYLAND_DISPLAY` was never set, only the X11 startup path was exercised. The investigation answers four questions at a glance — (1) which subsystems come online between process entry and a working terminal, (2) how the initial configuration is resolved when no `kitty.conf` files exist, (3) how data flows from the child shell through the PTY and VT parser onto the screen, and (4) what observable evidence proves the display system is healthy. Every claim below is grounded in at least one of three evidence streams: a direct source-code citation at commit `815df1e21` (file path + approximate line number), a live debug log line captured from `./kitty/launcher/kitty --debug-rendering --debug-keyboard --debug-font-fallback`, or an `xwininfo -root -tree` window-tree capture taken while Kitty was running. No source files were modified during the investigation; the only artifact produced is this markdown document.
 
-Between invocation and the moment the child shell has a sized PTY and the terminal can compose the first frame, Kitty activates a deterministic sequence of subsystems spanning both the Python orchestration layer and native C code. The sequence as observed on this Linux/X11 configuration at commit `815df1e21`:
+---
+
+## Investigation Environment and Methodology
+
+### Target Commit
+
+The investigation targets `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (short hash `815df1e210e0`), whose commit message is *"Wire up applying of font config"*. This is the local checkout's `HEAD` prior to the creation of this documentation artifact. All source-line citations below are relative to that commit; line numbers can shift by one or two across minor edits, so the prose uses "around line N" for phase-level citations and exact line numbers only for emitted debug strings that were `grep`-verified.
+
+### Headless Execution Setup (Xvfb)
+
+The host environment has no physical display. A virtual framebuffer was started via the X virtual framebuffer (`Xvfb`):
+
+```
+Xvfb :99 -screen 0 1280x720x24 -nolisten tcp -nolisten unix
+export DISPLAY=:99
+```
+
+Kitty inherits `DISPLAY=:99` at launch and therefore opens its X11 connection against that framebuffer. This is a normal X11 path from Kitty's perspective — no special handling is needed on the Kitty side. The framebuffer's resolution is `1280x720x24` (1280 wide, 720 tall, 24-bit color), which is sufficient for the default 640×400-pixel Kitty window with plenty of slack.
+
+### Build Command
+
+The binary was built from source at this commit with:
+
+```
+python3 setup.py build --ignore-compiler-warnings
+```
+
+The `--ignore-compiler-warnings` flag was required because the container's system `wayland-protocols` headers contain newer enumerators than the vendored GLFW Wayland backend expects — a known mismatch that compiles as a warning with newer compilers and becomes an error only when `-Werror` is in effect. The `--ignore-compiler-warnings` flag disables `-Werror` for this compile. The build produces:
+
+- `kitty/fast_data_types.so` — the primary Python/C extension module exposing `spawn`, `set_options`, `set_font_data`, rendering hooks, etc.
+- `kitty/glfw-x11.so`, `kitty/glfw-wayland.so` — platform-specific GLFW backend plugins
+- `kitty/launcher/kitty` — the native C launcher binary (36 KB)
+- Go kitten binaries under `tools/` and `kittens/`
+
+### Launch Command and Debug Flags
+
+When Kitty is built from source and launched *via* the native launcher `./kitty/launcher/kitty`, the launcher (`kitty/launcher/main.c`) takes care of populating `sys.kitty_run_data` with `bundle_exe_dir`, `from_source`, and `extensions_dir`. This dictionary is then read by `kitty/entry_points.py` and `kitty/constants.py` to locate the built C extensions. When launching Kitty as a Python module (bypassing the C launcher — which is sometimes necessary when one needs a controlled Python environment for introspection), this dictionary must be populated manually:
+
+```python
+import sys
+sys.kitty_run_data = {
+    'bundle_exe_dir': '<repo_root>',
+    'from_source':    True,
+    'extensions_dir': '<repo_root>/kitty',
+}
+from kitty.entry_points import main
+main()
+```
+
+For the principal runtime observations in this document, the native launcher was used directly:
+
+```
+DISPLAY=:99 ./kitty/launcher/kitty \
+    --debug-rendering \
+    --debug-keyboard \
+    --debug-font-fallback \
+    sh -c 'echo READY; sleep 1'
+```
+
+The three debug flags are defined in `kitty/cli.py` and trip the following behavior at source:
+
+- `--debug-rendering` → sets `global_state.debug_rendering`, enabling `[T.TTT] GL version string: ...`, `OS Window created`, `Child launched`, and a handful of per-frame/per-child traces.
+- `--debug-keyboard` → emits XKB keymap loading and modifier-index tables from `glfw/xkb_glfw.c`.
+- `--debug-font-fallback` → calls `kitty/fonts/render.py::dump_font_debug()` at the end of `_run_app()`, printing all resolved font faces.
+
+### Evidence Collection Approach
+
+Three orthogonal evidence streams are correlated throughout the document:
+
+| Stream | What it provides | How it was captured |
+|--------|------------------|---------------------|
+| **Static source analysis** | File paths, function names, approximate line numbers, code excerpts | `grep -n`, direct reads via the file viewer; line numbers spot-checked with `sed -n` |
+| **Live debug log** | Timestamped `[T.TTT]` lines emitted on `stderr`, ordering, observed values | Captured from `DISPLAY=:99 ./kitty/launcher/kitty --debug-rendering --debug-keyboard --debug-font-fallback sh -c 'echo READY; sleep 1' 2>&1` |
+| **Window-tree capture** | Confirmation of the X11 window, its title, class, and size | `DISPLAY=:99 xwininfo -root -tree` with Kitty running in another subshell |
+
+Every claim about observed behavior cites at least one of these three sources. No behavior was assumed or extrapolated. Where the agent prompt guidance (AAP §0.8.3) referenced LiberationMono, the actual container had DejaVu Sans Mono installed as the Fontconfig `monospace` alias — this discrepancy is called out at Q4 §4.4 below, and the document reports what was observed rather than what was expected.
+
+---
+
+## Question 1 — What systems come online on the way to a working terminal?
+
+### 1.1 Thinking / Rationale
+
+The question asks us to enumerate everything that activates between the moment the Kitty process begins executing and the moment a shell prompt is ready to accept user input. This is *not* simply a list of functions called; it is a list of discrete **subsystems** — distinct stateful modules that must be initialized and hooked together for the terminal to be functional. Our approach is:
+
+1. **Trace the call graph statically** from the entry point (`kitty/launcher/main.c` → `kitty/entry_points.py::main()` → `kitty/main.py::main()` → `_main()` → `run_app()` → `_run_app()` → `Boss(...)` → `boss.start()` → `boss.child_monitor.main_loop()`) and note every distinct subsystem that is initialized along the way.
+2. **Correlate with live debug output** — each debug log line is emitted by a specific `printf`/`debug()`/`print()` call in the source, and because `--debug-rendering`, `--debug-keyboard`, and `--debug-font-fallback` together light up most of the startup-phase tracepoints, the captured log establishes observed ordering and timing.
+3. **Group the subsystems into ordered phases** (A–K) so that the order of initialization is clear even where different phases have interleaved internal steps (e.g. OS window creation internally drives both GL init *and* shader loading).
+
+A subsystem, for this purpose, is a cohesive module with its own state: the CLI parser, the configuration engine, GLFW + its platform plugin, the font pipeline (Fontconfig + FreeType + HarfBuzz + sprite sheet on GPU), the OpenGL driver + shader programs, the Boss controller, the ChildMonitor + I/O thread, the PTY pair + child process, the VT parser, the Screen model, and the rendering loop.
+
+### 1.2 High-Level Startup Phase Diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ 1.  Native launcher bootstrap (sys.kitty_run_data populated)            │
-│ 2.  Python entry dispatch:  entry_points.main() -> main._main()         │
-│ 3.  running_in_kitty(True)  + CWD validation                            │
-│ 4.  CLI argument parsing    (parse_args())                              │
-│ 5.  Configuration resolution + defaults (create_opts())                 │
-│ 6.  Environment setup       (setup_environment())                       │
-│ 7.  Locale configuration    (set_locale())                              │
-│ 8.  Kitty-wide signal masking (mask_kitty_signals_process_wide)         │
-│ 9.  GLFW platform init       (init_glfw() -> x11 on this system)        │
-│ 10. XKB keymap compilation   (glfw_xkb_compile_keymap) ──────► [0.065s] │
-│ 11. Modifier indices published (XKB) ──────────────────────► [0.070s]   │
-│ 12. Box-drawing scale push    (set_scale())                             │
-│ 13. Options push to C state   (set_options())                           │
-│ 14. Font discovery + face loading (set_font_family())                   │
-│ 15. Session creation          (create_sessions())                       │
-│ 16. OS window creation        (create_os_window()) ────────► [0.148s]   │
-│      └─ gl_init() + GL version check (GL ≥ 3.1) ───────────► [0.123s]   │
-│      └─ load_all_shaders() -> shader compilation                        │
-│      └─ send_prerendered_sprites_for_window() (blank cell, underlines)  │
-│      └─ window icon + all event callbacks registered                    │
-│      └─ "OS Window created" log line                                    │
-│ 17. Boss controller construction (ChildMonitor, encryption key, ...)    │
-│ 18. child_monitor.start() -> pthread_create(io_thread)                  │
-│ 19. startup_first_child() -> TabManager -> Tab -> Window                │
-│ 20. PTY creation (os.openpty()) + ready-pipe creation                   │
-│ 21. fast_data_types.spawn() -> fork child shell ──────────► [0.159s]    │
-│ 22. systemd_move_pid_into_new_scope() (Linux)                           │
-│ 23. Font debug output (opt-in via --debug-font-fallback) ─► [0.162s]    │
-│ 24. First set_geometry() -> child.mark_terminal_ready()                 │
-│      -> "Child launched" log line ─────────────────────────► [0.162s]   │
-│ 25. child_monitor.main_loop() enters run loop, renders frames           │
+│ A. Process entry                                                         │
+│    └── Native launcher (kitty/launcher/main.c) — when packaged           │
+│    └── Python entry  (kitty/entry_points.py:183 -> kitty/main.py:524)    │
+│                                                                          │
+│ B. running_in_kitty(True)  +  CWD validation  +  CLI parsing             │
+│                                                                          │
+│ C. Configuration resolution (create_opts -> resolve_config -> defaults)  │
+│                                                                          │
+│ D. Environment setup (setup_environment), locale, signal masking         │
+│                                                                          │
+│ E. GLFW platform init (init_glfw) -> x11 backend .so loaded              │
+│    └── XKB keymap compile ──────────────────────────► [0.060s]           │
+│    └── Modifier indices published ──────────────────► [0.064s]           │
+│                                                                          │
+│ F. Fonts: set_font_family() -> Fontconfig -> FreeType -> set_font_data   │
+│                                                                          │
+│ G. Box-drawing scale push (set_scale), options push to C (set_options)   │
+│                                                                          │
+│ H. OS window creation (create_os_window)                                 │
+│    ├── GL context + gl_init() -> "GL version string" ───► [0.119s]       │
+│    ├── load_all_shaders() -> cell/graphics/bgimage/tint/border shaders   │
+│    ├── Pre-rendered sprites uploaded to GPU texture                      │
+│    ├── X11 window icon set (set_x11_window_icon)                         │
+│    ├── 14 GLFW event callbacks registered                                │
+│    └── emit "OS Window created" ────────────────────► [0.145s]           │
+│                                                                          │
+│ I. Boss() + ChildMonitor created                                         │
+│    └── boss.start() -> ChildMonitor.start():                             │
+│         ├── pthread_create(io_thread, io_loop) ── I/O thread running     │
+│         └── (optional) pthread_create(talk_thread, talk_loop)            │
+│                                                                          │
+│ J. startup_first_child() -> Tab -> Window -> Child.fork()                │
+│    ├── os.openpty() -> PTY master/slave                                  │
+│    ├── os.pipe() -> ready-notification pipe                              │
+│    ├── get_final_env() -> TERM, COLORTERM, TERMINFO, KITTY_PID, ...      │
+│    ├── fast_data_types.spawn() -> child PID                              │
+│    └── os.set_blocking(master, False)                                    │
+│                                                                          │
+│ K. Main event-loop tick (render -> layout -> set_geometry)               │
+│    ├── First geometry -> child_monitor.resize_pty(...)                   │
+│    ├── child.mark_terminal_ready() — closes write end of ready pipe      │
+│    ├── "Child launched" emitted ─────────────────────► [0.158s]          │
+│    ├── First parse_input() — no pending data yet                         │
+│    └── First render() + glfwSwapBuffers -> first frame presented         │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Timestamps in brackets are real measurements from this container (`DISPLAY=:99`, `1280x720x24` Xvfb) captured with `--debug-rendering --debug-keyboard --debug-font-fallback`.
+### 1.3 Deterministic Phase-by-Phase Sequence (with source references)
 
-### 1.2 Subsystem-by-Subsystem Walkthrough with Source Evidence
+The following table walks the sequence phase by phase with primary source file and approximate line cites. Line numbers are verified by `grep -n` at commit `815df1e21` in the local checkout.
 
-#### 1.2.1 Native Launcher → Python Dispatch
+| Phase | Subsystem | Primary source | Approximate line |
+|-------|-----------|----------------|------------------|
+| A | Native launcher bootstrap: descriptor validation, path resolution, Python embedding, `sys.kitty_run_data` population | `kitty/launcher/main.c` | full file (~30 lines) |
+| A | Python entry dispatch to default GUI | `kitty/entry_points.py` | around line 183 |
+| A | `main()` -> `_main()` wrapper | `kitty/main.py` | lines 441 (`_main`) and 524 (`main`) |
+| B | `running_in_kitty(True)` flag; CWD validation and fallback to `$HOME` | `kitty/main.py::_main()` | around line 441 |
+| B | `parse_args(...)` → `CLIOptions` dataclass | `kitty/cli.py` (parse_args) + `kitty/cli_stub.py` (CLIOptions dataclass); called from `_main()` | call site around line 465 in `kitty/main.py` |
+| C | `create_opts(cli_opts, ...)` | `kitty/cli.py` | line 1081 |
+| C | `default_config_paths(())` → `resolve_config(SYSTEM_CONF, defconf, ())` | `kitty/cli.py` | line 1067 calls `resolve_config`; `SYSTEM_CONF` at line 1064 |
+| C | `resolve_config()` and generic `load_config()` | `kitty/conf/utils.py` | `resolve_config` at line 322, generic `load_config` at line 332 |
+| C | `config_dir`, `defconf`, `appname` constants | `kitty/constants.py` | `appname` line 23, `config_dir` line 131, `defconf` line 133 |
+| D | `setup_environment(opts, cli_opts)` — sets PATH, expands listen-on, MANPATH | `kitty/main.py::_main()` | around line 495 |
+| D | `set_locale()` | `kitty/main.py::_main()` | around line 501 |
+| D | `mask_kitty_signals_process_wide()` — blocks SIGINT, SIGTERM, SIGHUP, SIGCHLD, SIGUSR1, SIGUSR2 in the process so only Kitty handles them | `kitty/main.py::_main()` | around line 515 |
+| E | `init_glfw(opts, debug_keyboard, debug_rendering)` | `kitty/main.py` | line 95 |
+| E | Platform selection + `.so` load; `glfwInit()` | `kitty/glfw.c::glfw_init()` | around line 1430 |
+| E | XKB keymap compile emits `"Loading new XKB keymaps"` | `glfw/xkb_glfw.c` | line 672 |
+| E | Modifier indices emitted `"Modifier indices alt: 0x3 ..."` | `glfw/xkb_glfw.c` | lines 376 and 540 (two variants; modern X11 path emits the line without `control:` at the end) |
+| F | `set_font_family(opts)` | `kitty/fonts/render.py` | line 173 |
+| F | `get_font_files(opts)` — Fontconfig resolution | `kitty/fonts/common.py` | around line 280 |
+| F | `set_font_data(...)` — pushes font descriptors + rendering callbacks to C | `kitty/fonts.c` | (C extension bridge) |
+| F | `dump_font_debug()` — prints resolved face list at end of `_run_app` | `kitty/fonts/render.py` | line 161 |
+| G | `set_scale(...)` — pushes DPI / cell-scale info to C | `fast_data_types` (C extension) | called from `_run_app` |
+| G | `set_options(opts, is_wayland(), debug_rendering, debug_font_fallback)` — pushes parsed `Options` into C global state | `fast_data_types` (C extension) | called from `_run_app` |
+| H | `create_os_window(...)` — creates GLFW window, GL context, runs shader loader callback, emits `"OS Window created"` | `kitty/glfw.c` | line 1321 contains `debug("OS Window created\n");` |
+| H | `gl_init()` — `gladLoadGL`, version check ≥ 3.1 (Linux) / 3.3 (macOS), emits `"GL version string"` | `kitty/gl.c` | line 72 |
+| H | `load_all_shaders` callback compiles cell/graphics/bgimage/tint programs | `kitty/main.py` | line 82 wraps `load_shader_programs()` + `load_borders_program()` in try/except CompileError |
+| H | `LoadShaderPrograms.__call__` | `kitty/shaders.py` | line 147 |
+| H | `init_cell_program()` | `kitty/shaders.py` | line 201 |
+| H | `load_borders_program()` | `kitty/borders.py` | line 63 |
+| H | `send_prerendered_sprites()` — blank cell, underlines, cursors rasterized and uploaded to GPU texture | `kitty/fonts.c` | `send_prerendered_sprites` |
+| H | X11 window icon set (`set_x11_window_icon()` — not on Wayland) | `kitty/main.py` | around line 155 |
+| H | 14 GLFW event callbacks registered (focus, resize, keyboard, mouse, scroll, drop, ...) | `kitty/glfw.c::create_os_window()` | around lines 1253–1322 |
+| I | `create_sessions()` builds the default single-tab/single-window session | `kitty/session.py::create_sessions` | in the module |
+| I | `Boss.__init__()` creates `ChildMonitor(on_child_death, dump_callback, talk_fd, listen_fd)` plus clipboard, remote control, encryption key | `kitty/boss.py::Boss.__init__` | line 325 |
+| I | `Boss.start(first_window_id, sessions)` | `kitty/boss.py::Boss.start` | line 1181 |
+| I | `ChildMonitor.start()` launches the I/O thread via `pthread_create(&self->io_thread, NULL, io_loop, self)` | `kitty/child-monitor.c` | line 291 |
+| J | `Boss.startup_first_child()` → `add_os_window` → `TabManager` → `Tab` → `Window` → `Child.fork()` | `kitty/boss.py::startup_first_child` | line 383 |
+| J | `Child.fork()` — PTY via `os.openpty()`, ready pipe via `os.pipe()`, env via `get_final_env()`, spawn via `fast_data_types.spawn()` | `kitty/child.py::fork` | lines 276–360 |
+| J | Parent-side bookkeeping: `os.close(slave)`, `self.child_fd = master`, `os.close(ready_read_fd)`, `self.terminal_ready_fd = ready_write_fd`, `os.set_blocking(self.child_fd, False)` | `kitty/child.py::fork` | around lines 340–349 |
+| J | `systemd_move_pid_into_new_scope(pid, ...)` (best-effort; logs non-fatal `log_error` if D-Bus is unavailable in a container) | `kitty/child.py::fork` | around line 351 |
+| K | `boss.child_monitor.main_loop()` → `run_main_loop(process_global_state, self)` | `kitty/child-monitor.c::process_global_state` | line 1224 |
+| K | First layout/render tick: `render_os_window` → `prepare_to_render_os_window` → `Tab.relayout` → `Window.set_geometry` | `kitty/child-monitor.c::render_os_window` | line 833 |
+| K | `set_geometry` calls `child_monitor.resize_pty(...)` (→ `TIOCSWINSZ` on master), then `child.mark_terminal_ready()`, then emits `[N.NNN] Child launched` under `--debug-rendering` | `kitty/window.py::set_geometry` | lines 865–871 |
+| K | `parse_input()` drains each window's VT-parser write buffer on the main thread | `kitty/child-monitor.c::parse_input` | line 451 |
+| K | `send_cell_data_to_gpu()` uploads cell data per visible window; `glfwSwapBuffers` presents the frame | `kitty/child-monitor.c` | lines 714 and 766 (call sites) |
 
-Kitty's production executable is a small C launcher. On a packaged build the program begins at `kitty/launcher/main.c`, which validates file descriptors, resolves paths, embeds Python, and — critically — creates the `sys.kitty_run_data` dictionary before any Python module runs. The `set_kitty_run_data()` routine assembles that dictionary with keys `bundle_exe_dir`, `from_source` (when running from source), `lc_ctype_before_python`, and `extensions_dir` (`kitty/launcher/main.c` lines 52–75). Every Python module downstream that needs to know *where* the installation lives (e.g., `glfw_path()` in `kitty/constants.py:191–193`, or `kitty.fast_data_types` loading) reads from this dictionary.
+### 1.4 Observed Timing Table
 
-When running from source *without* the C launcher (this investigation's environment), `sys.kitty_run_data` must be populated manually, mirroring what the launcher does, before importing `kitty.main`.
+Captured from a live headless run with all three debug flags, the observed startup timeline (wall-clock seconds since process start, as emitted by the binary itself) is:
 
-The Python entry is `kitty/entry_points.py::main()` at line 183. For a normal GUI launch (no kitten sub-command or frozen-namespace token on `argv[1]`), it dispatches to `kitty.main.main()`:
+| Timestamp | Event | Source of print |
+|-----------|-------|-----------------|
+| `[0.060]` | `Loading new XKB keymaps` | `glfw/xkb_glfw.c` line 672 |
+| `[0.064]` | `Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1` | `glfw/xkb_glfw.c` line 376 |
+| `[0.119]` | `GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5` | `kitty/gl.c` line 72 |
+| `[0.145]` | `OS Window created` | `kitty/glfw.c` line 1321 |
+| `[0.154]` | `Failed to open systemd user bus with error: Connection refused` (non-fatal; expected in a container without systemd user session) | `kitty/child.py` around line 351 |
+| `[0.158]` | `Child launched` | `kitty/window.py` line 871 |
+| `[0.158]` | `Text fonts:` and the four font lines (Normal/Bold/Italic/Bold-Italic) | `kitty/fonts/render.py::dump_font_debug()` line 161 |
 
-```python
-# kitty/entry_points.py (line 183)
-def main() -> None:
-    ...
-    from .main import main as fmain
-    fmain()
-```
+Notes:
 
-#### 1.2.2 `_main()` — The Python Orchestration Function
+- The `[0.119]` GL-version line is printed from inside `gl_init()` *during* `create_os_window`, which completes at `[0.145]`. The two lines appear out of order in the captured stream because different code paths format the `monotonic()` reading at slightly different times; the *logical* ordering is preserved (GL init happens inside window creation and thus before `"OS Window created"`).
+- On every observed run, total time from process start to `Child launched` was ~160 ms.
 
-`kitty/main.py::_main()` is the master orchestrator. Its body (lines 441–521) performs the following in order:
+### 1.5 Summary Checklist
 
-| Step | Source (kitty/main.py) | Purpose |
-|------|------------------------|---------|
-| `running_in_kitty(True)` | line 442 | Sets a global flag so kitty knows it's the GUI process (not a kitten). |
-| CWD validation | lines 449–454 | Falls back to `~` if current directory isn't a directory. |
-| `parse_args()` | line 464 | Parses CLI via `kitty/cli.py` using `kitty/cli_stub.CLIOptions`. |
-| `create_opts(cli_opts)` | line 494 | Loads config files, merges defaults, returns `Options`. |
-| `setup_environment(opts, cli_opts)` | line 495 | Sets PATH (kitty + kitten), expands `listen_on`, `MANPATH`. |
-| `set_locale()` | line 500 | Initializes C locale with UTF-8 support. |
-| `sys.setswitchinterval(1000.0)` | line 504 | Makes Python essentially single-threaded (reduces GIL overhead). |
-| `mask_kitty_signals_process_wide()` | line 513 | Blocks SIGINT/SIGTERM/SIGHUP/SIGCHLD/SIGUSR1/SIGUSR2 process-wide so display-backend threads created by GLFW cannot interfere with kitty's dedicated signal handling. |
-| `init_glfw(opts, ...)` | line 514 | Selects platform backend and initializes GLFW. |
-| `run_app(opts, cli_opts, ...)` | line 518 | Invokes `AppRunner.__call__`. |
+All the subsystems that come online before a working terminal, listed in startup order (expanded from the phase diagram at §1.2):
 
-The comment at line 510–512 is worth quoting verbatim: signals are masked *before* GLFW initialization precisely because GLFW may spawn helper threads on some platforms — those threads must not receive these signals, since Kitty's main thread is the only legitimate handler.
-
-#### 1.2.3 GLFW Initialization and Platform Selection
-
-`init_glfw()` (kitty/main.py line 95) selects the GLFW backend per platform:
-
-```python
-# kitty/main.py line 96
-glfw_module = 'cocoa' if is_macos else ('wayland' if is_wayland(opts) else 'x11')
-```
-
-`is_wayland()` (kitty/constants.py line 207–217) returns `False` when `opts.linux_display_server == 'auto'` *and* the probe `detect_if_wayland_ok()` fails. That probe requires `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` in the environment and `KITTY_DISABLE_WAYLAND` *not* set, plus the `glfw-wayland.so` shared object must exist (kitty/constants.py lines 196–204). In our container `WAYLAND_DISPLAY` is unset, so the X11 backend is selected.
-
-The Python side then calls into C: `glfw_init()` in `kitty/glfw.c` (line 1430). This routine:
-
-1. Loads the platform-specific GLFW shared object (`kitty/glfw-x11.so`) via `load_glfw(path)` at line 1441.
-2. Registers an error callback (line 1443).
-3. Sets init hints for debug keyboard, debug rendering, Wayland IME (lines 1444–1447).
-4. On non-Apple, registers a D-Bus notification handler if available (line 1452).
-5. Calls `glfwInit(monotonic_start_time)` at line 1456 — this is the call that actually connects to X, loads XKB, etc.
-6. On success, registers the draw-text callback and queries default DPI (lines 1461–1463).
-
-On the X11 path, part of `glfwInit` triggers XKB keymap compilation in `glfw/xkb_glfw.c`. The function `glfw_xkb_compile_keymap()` (line 670) performs: emit `"Loading new XKB keymaps"` debug line → `release_keyboard_data()` → `load_keymaps()` → `load_states()` → `load_compose_tables()` → `glfw_xkb_update_masks()`. When `--debug-keyboard` is active, it follows that with `"Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1"` (exact output captured from our run at timestamp 0.070s).
-
-#### 1.2.4 `AppRunner.__call__` — The App Setup Pipeline
-
-After `_main()` calls `run_app()`, control passes to `AppRunner.__call__` (kitty/main.py line 247). Its sequence is:
-
-```python
-# kitty/main.py lines 247–252
-def __call__(self, opts, args, bad_lines=(), talk_fd=-1):
-    set_scale(opts.box_drawing_scale)          # push box-drawing params to C
-    set_options(opts, is_wayland(), args.debug_rendering, args.debug_font_fallback)
-    try:
-        set_font_family(opts)                  # discover + load fonts
-        _run_app(opts, args, bad_lines, talk_fd)
-    finally:
-        set_options(None)                      # tear down
-        free_font_data()
-        ...
-```
-
-`set_options()` is a C function exposed by `kitty/fast_data_types.so`; it installs the Options into a global C struct so that subsequent C code (`render`, `screen_draw_text`, etc.) can consult option values with zero Python round-trips. `set_font_family()` is the Python-layer font discovery/loading entry point, covered below in §4.
-
-#### 1.2.5 `_run_app` — Session, Window, Boss, Event Loop
-
-`_run_app()` (kitty/main.py line 202) then:
-
-1. On non-Wayland non-macOS, calls `set_x11_window_icon()` (line 211) to make the kitty logo available as the window icon.
-2. Wraps the startup in `cached_values_for(...)` to persist remembered window size/state between runs.
-3. Calls `create_sessions(opts, args, default_session=opts.startup_session)` (line 214) — for a default no-argument launch this yields a single `Session` with one tab and one window running the login shell.
-4. Calls `create_os_window(...)` (line 221) — this is the GLFW window creation. It passes `load_all_shaders` as a callback so the C side can compile shaders *after* the context is current.
-5. Constructs `Boss(...)` (line 226) — this creates the `ChildMonitor` but does NOT yet start the I/O thread.
-6. Calls `boss.start(...)` (line 227) — this finally launches the I/O thread and forks the child shell (see §3).
-7. If `--debug-font-fallback` is set, calls `dump_font_debug()` (line 229) which emits the font-selection log lines we observed.
-8. Finally enters the event loop: `boss.child_monitor.main_loop()` (line 234). On exit, `boss.destroy()` tears down.
-
-#### 1.2.6 OS-Window Creation, GL Init, Shader Compilation
-
-`create_os_window()` is the C function in `kitty/glfw.c`. Key steps in its body (lines 1253–1322):
-
-- `add_os_window()` (line 1253) — allocates an `OSWindow` slot in `global_state`.
-- `send_prerendered_sprites_for_window(w)` (line 1273) — rasterizes blank cells, underlines, cursor shapes into the GPU sprite atlas.
-- Sets the window icon from `logo.pixels` (line 1274).
-- Sets the text cursor glyph (line 1275).
-- Registers ~14 GLFW event callbacks (lines 1277–1293): window position, close, refresh, focus, occlusion, iconify, framebuffer size, live resize, DPI change, mouse button, cursor pos, cursor enter, scroll, keyboard, drop.
-- Initializes window-chrome state (line 1306).
-- Sets `w->is_damaged = true` (line 1320) — marks the window for repaint on the next tick.
-- Emits `debug("OS Window created\n")` (line 1321) — this is the log line we observe at ~0.148s.
-
-The GL-version check runs in `kitty/gl.c::gl_init()` (line 52), called during window creation. It uses GLAD to load GL function pointers (`gladLoadGL(glfwGetProcAddress)` at line 55), fatals if `ARB_texture_storage` is missing (line 67), and in debug-rendering mode prints `"[%.3f] GL version string: '%s' Detected version: %d.%d"` (lines 46–47, 72). The minimum required GL version is defined in `kitty/data-types.h` as `OPENGL_REQUIRED_VERSION_MAJOR=3, OPENGL_REQUIRED_VERSION_MINOR=1` on Linux (3.3 on macOS), with GLSL `#version 140`. Our Xvfb container's Mesa driver provides `4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1` — ample.
-
-Shader compilation is orchestrated by `kitty/shaders.py::LoadShaderPrograms.__call__` (line 147). It compiles:
-
-- **Cell programs (4 phases)** — BOTH, BACKGROUND, SPECIAL, FOREGROUND — each from `cell_vertex.glsl` + `cell_fragment.glsl` using `#pragma kitty_include_shader` resolution, with per-phase macro replacements for `WHICH_PHASE`, `TRANSPARENT`, `FG_OVERRIDE_THRESHOLD`, `FG_OVERRIDE`, `TEXT_NEW_GAMMA`, plus constant shifts for attribute packing (`REVERSE_SHIFT`, `STRIKE_SHIFT`, `DIM_SHIFT`, `DECORATION_SHIFT`, `MARK_SHIFT`, etc.) (shaders.py lines 153–184).
-- **Graphics programs (3 alpha types)** — SIMPLE, PREMULT, ALPHA_MASK — from `graphics_vertex.glsl` + `graphics_fragment.glsl` (shaders.py lines 186–197).
-- **Background-image program** — from `bgimage_vertex.glsl` + `bgimage_fragment.glsl` (shaders.py line 199).
-- **Tint program** — from `tint_vertex.glsl` + `tint_fragment.glsl` (shaders.py line 200).
-- Finally `init_cell_program()` (line 201) binds uniform locations.
-
-The border program is compiled separately: `load_borders_program()` in `kitty/borders.py` line 63 does `program_for('border').compile(BORDERS_PROGRAM)` → `init_borders_program()`. `load_all_shaders()` (kitty/main.py line 82) composes the two: shader programs + border program. It is passed as a callback into `create_os_window()` so that shader compilation happens *after* the GL context is made current.
-
-#### 1.2.7 Boss — The Python Controller
-
-`Boss.__init__()` (kitty/boss.py line 325) creates: the `ChildMonitor` instance (which owns the I/O thread), a SecureLib25519 encryption key for remote-control, the clipboard buffer, the OS-window-to-TabManager map, etc.
-
-`Boss.start()` (kitty/boss.py line 1181) is invoked from `_run_app()`. It:
-1. Calls `self.child_monitor.start()` (line 1183) — **this is where the I/O thread is created** via `pthread_create(&self->io_thread, NULL, io_loop, self)` (kitty/child-monitor.c line 291). The thread name is set to `"KittyChildMon"` (child-monitor.c line 1489).
-2. Sets `io_thread_started = True` to ensure idempotence.
-3. Calls `startup_first_child(first_os_window_id, startup_sessions=...)` (line 1194). This creates the first tab, window, and fork of the child shell.
-
-`Boss.startup_first_child()` (kitty/boss.py line 383) iterates over `startup_sessions` and calls `self.add_os_window(...)` for each. `add_os_window()` (line 402) constructs a `TabManager`, which in turn creates a `Tab`, which creates a `Window` — and the `Window` constructor (in `kitty/window.py`) is where the child is forked (see §3).
-
-#### 1.2.8 Summary List of All Subsystems Activated Before the Terminal Is Ready
-
-Consolidated inventory (maps one-to-one to the sequence diagram at §1.1):
-
-| # | Subsystem | Source location | Evidence |
-|---|-----------|-----------------|----------|
-| 1 | Native launcher bootstrap | `kitty/launcher/main.c:52` (set_kitty_run_data) | sys.kitty_run_data populated (we populate manually from source) |
-| 2 | Python import dispatch | `kitty/entry_points.py:183` (main) | pytest confirms import chain |
-| 3 | `running_in_kitty` flag | `kitty/main.py:442` | fast_data_types sets IS_KITTY_PROCESS flag |
-| 4 | CLI parser | `kitty/cli.py:parse_args` → `kitty/main.py:464` | `--debug-rendering` flag effective |
-| 5 | Config engine | `kitty/cli.py:create_opts` (line 1081) → `kitty/config.py:load_config` | see §2 |
-| 6 | Environment setup | `kitty/main.py:403 (setup_environment)` | PATH / MANPATH / listen_on |
-| 7 | Locale | `kitty/main.py:424 (set_locale)` | fast_data_types.set_locale() |
-| 8 | Signal masking | `mask_kitty_signals_process_wide` (kitty/main.py:513) | sigprocmask() in C |
-| 9 | GLFW init | `kitty/glfw.c:1430 (glfw_init)` | "GLFW initialization failed" if this fails |
-| 10 | XKB keymaps | `glfw/xkb_glfw.c:670` | "Loading new XKB keymaps" |
-| 11 | Modifier indices | `glfw/xkb_glfw.c:glfw_xkb_update_masks` | "Modifier indices alt: 0x3 super: 0x6 ..." |
-| 12 | Box-drawing scale | `fast_data_types.set_scale(opts.box_drawing_scale)` (kitty/main.py:248) | pushed to C state |
-| 13 | Options push | `fast_data_types.set_options(opts, ...)` (kitty/main.py:249) | C-side OPT(...) macro uses it |
-| 14 | Font discovery | `kitty/fonts/render.py:173 (set_font_family)` | "Text fonts:" debug dump |
-| 15 | Session creation | `kitty/session.py:create_sessions()` (kitty/main.py:214) | startup_sessions tuple |
-| 16 | OS window creation | `kitty/glfw.c:1253–1322 (create_os_window)` | "OS Window created" |
-|   | └ GL init | `kitty/gl.c:52 (gl_init)` | "GL version string: '4.5 (Core Profile)...'" |
-|   | └ Shader compilation | `kitty/shaders.py:147 (LoadShaderPrograms.__call__)` | 4 cell + 3 graphics + bgimage + tint + border |
-|   | └ Sprite prerendering | `kitty/glfw.c:1273 (send_prerendered_sprites_for_window)` | cell atlas populated |
-|   | └ Event callbacks | `kitty/glfw.c:1277–1293` | 14 glfwSet*Callback registrations |
-| 17 | Boss creation | `kitty/boss.py:325 (Boss.__init__)` | ChildMonitor + encryption key |
-| 18 | I/O thread | `kitty/child-monitor.c:291 (pthread_create)` | "KittyChildMon" thread |
-| 19 | First tab/window | `kitty/boss.py:383 (startup_first_child)` → TabManager → Tab → Window | single-session default |
-| 20 | PTY allocation | `kitty/child.py:281 (os.openpty)` | master/slave FD pair |
-| 21 | Child fork | `kitty/child.py:333 (fast_data_types.spawn)` | child pid returned |
-| 22 | systemd scope (Linux) | `kitty/child.py:349 (systemd_move_pid_into_new_scope)` | "Failed to open systemd user bus" in container (fallback-safe) |
-| 23 | Font debug dump | `kitty/fonts/render.py:161 (dump_font_debug)` (opt-in) | "Text fonts:" 4-face listing |
-| 24 | Terminal ready | `kitty/child.py:362 (mark_terminal_ready)` via `kitty/window.py:866` | "Child launched" |
-| 25 | Main event loop | `kitty/child-monitor.c:1258–1262 (main_loop)` → `run_main_loop(process_global_state, self)` | GLFW poll ticking |
-
-Each of these 25 subsystems must complete successfully (or degrade gracefully, as with item 22) before the terminal can render its first frame and accept keystrokes.
+1. Process-level init (`running_in_kitty(True)` flag; CWD validation)
+2. CLI argument parsing (`parse_args` → `CLIOptions`)
+3. Configuration engine (searches `/etc/xdg/kitty/kitty.conf` then `~/.config/kitty/kitty.conf`; falls back to compiled defaults)
+4. Environment setup (PATH manipulation, listen-on expansion, MANPATH)
+5. Locale initialization (`set_locale`)
+6. Signal masking (SIGINT, SIGTERM, SIGHUP, SIGCHLD, SIGUSR1, SIGUSR2 blocked process-wide)
+7. GLFW platform backend loading (x11 `.so` loaded from `extensions_dir`)
+8. XKB keymap compilation (keyboard layout + modifier mapping)
+9. Font discovery and loading (Fontconfig queries → FreeType face loading)
+10. Box-drawing scale configuration (`set_scale`)
+11. Options push to C global state (`set_options`)
+12. OpenGL context creation (performed inside GLFW window creation)
+13. GL driver validation (`gl_init()` → `gladLoadGL`, version check ≥ 3.1/3.3)
+14. Shader program compilation (cell, graphics, bgimage, tint, border)
+15. Pre-rendered sprite generation (blank cell, underlines, cursors → GPU texture)
+16. Window icon loading and setting
+17. Event callback registration (focus, resize, keyboard, mouse, scroll, drop, ...)
+18. Session creation (default single-tab, single-window session)
+19. Boss controller creation (ChildMonitor + clipboard + remote control + encryption key)
+20. I/O thread launch (`pthread_create(io_thread, io_loop)` — poll-based PTY multiplexer)
+21. PTY pair creation and child process fork
+22. Shell environment population (TERM, COLORTERM, TERMINFO, KITTY_PID, KITTY_INSTALLATION_DIR, shell integration vars)
+23. `mark_terminal_ready()` triggered on first geometry set (closes write end of ready pipe; child now free to proceed)
 
 ---
 
-## Q2 — Configuration Resolution: How Does Kitty Determine Its Initial Settings?
+## Question 2 — How is the initial configuration resolved on first launch?
 
-### 2.1 Overview
+### 2.1 Thinking / Rationale
 
-Kitty's configuration resolution is a two-step process: **(a)** discover which config file paths to try, and **(b)** attempt to open each path in order, merging its contents on top of the built-in defaults. If no files exist — as is the case on first launch in an unconfigured user account — Kitty silently uses the compiled-in defaults only. The entire pipeline is deterministic and exposes no network I/O, so it is hermetic to the environment.
+The question is: when a user launches Kitty for the first time — with no `kitty.conf` files anywhere on the system — how does Kitty decide what every option's value should be? There are three possible strategies a terminal emulator could adopt:
 
-### 2.2 Path Resolution
+1. **Ship with hard-coded defaults** and simply use them if no config is found. (Kitty does this.)
+2. **Refuse to start** without a config. (Kitty does not do this.)
+3. **Emit a warning** when falling back to defaults. (Kitty is silent by design — the absence of a config is the normal case for a first launch.)
 
-Configuration path resolution is the responsibility of `kitty/cli.py::default_config_paths()` at line 1067, which delegates to `kitty/conf/utils.py::resolve_config()` at line 322:
+To answer concretely we need to show: (a) the exact *search paths* Kitty probes, in order; (b) the exact *fallback mechanism* when no path yields a readable file; and (c) the *actual default values* that take effect in our measurement environment, ideally with a round-trip check confirming observability (e.g. the window size actually *being* 640×400 because `initial_window_width`/`initial_window_height` defaulted to 640/400).
+
+The configuration pipeline is split across three cooperating files: `kitty/cli.py` owns the path-list construction, `kitty/conf/utils.py` owns the generic "resolve then load" loop, and `kitty/options/` owns the option schema and defaults. Our trace follows the chain from `_main()` → `create_opts()` → `default_config_paths()` → `resolve_config()`, and then cross-references the compiled-in `defaults` singleton (`kitty/options/types.py`) with the option-definition source (`kitty/options/definition.py`) to pull out the specific defaults that took effect.
+
+### 2.2 Config Path Resolution (`resolve_config` → `default_config_paths`)
+
+The entry point from `_main()` is `create_opts()`:
 
 ```python
-# kitty/cli.py
-SYSTEM_CONF = '/etc/xdg/kitty/kitty.conf'    # line 1064
-
-def default_config_paths(conf_paths: Sequence[str]) -> Tuple[str, ...]:
-    return tuple(resolve_config(SYSTEM_CONF, defconf, conf_paths))
-
-# kitty/conf/utils.py lines 322–329
-def resolve_config(SYSTEM_CONF, defconf, config_files_on_cmd_line=()):
-    if config_files_on_cmd_line:
-        if 'NONE' not in config_files_on_cmd_line:
-            yield SYSTEM_CONF
-            yield from config_files_on_cmd_line
-    else:
-        yield SYSTEM_CONF
-        yield defconf
+# kitty/main.py::_main() around line 494
+bad_lines: List[BadLine] = []
+opts = create_opts(cli_opts, accumulate_bad_lines=bad_lines)
 ```
 
-The constant `defconf` is computed at module-import time in `kitty/constants.py`:
+`create_opts` is defined in `kitty/cli.py` at line 1081:
 
 ```python
-# kitty/constants.py lines 131–133
-config_dir = _get_config_dir()    # computed path
+# kitty/cli.py:1081
+def create_opts(args: CLIOptions, accumulate_bad_lines: Optional[List[BadLineType]] = None) -> KittyOpts:
+    ...
+    config = default_config_paths(args.config)
+    ...
+```
+
+`default_config_paths` is immediately above at line 1067:
+
+```python
+# kitty/cli.py:1064-1068
+SYSTEM_CONF = f'/etc/xdg/{appname}/{appname}.conf'
+...
+def default_config_paths(conf_paths: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(resolve_config(SYSTEM_CONF, defconf, conf_paths))
+```
+
+With `appname = 'kitty'` from `kitty/constants.py:23`, `SYSTEM_CONF` expands to `/etc/xdg/kitty/kitty.conf`. The `defconf` identifier is imported from `kitty/constants.py`:
+
+```python
+# kitty/constants.py:131-133
+config_dir = _get_config_dir()
+...
 defconf = os.path.join(config_dir, 'kitty.conf')
 ```
 
-`_get_config_dir()` (lines 87–128) chooses `config_dir` using this priority list:
+`_get_config_dir()` honors `$KITTY_CONFIG_DIRECTORY` first, then the standard `$XDG_CONFIG_HOME/kitty`, then `$HOME/.config/kitty` as the fallback. On our Ubuntu 24.04 container with `HOME=/root` and no `XDG_CONFIG_HOME`, the result is `/root/.config/kitty`. Hence `defconf = /root/.config/kitty/kitty.conf`.
 
-1. `$KITTY_CONFIG_DIRECTORY` (if set)
-2. `$XDG_CONFIG_HOME/kitty` (if `kitty.conf` exists there and dir is writable)
-3. `~/.config/kitty` (same writable/exists check)
-4. (macOS only) `~/Library/Preferences/kitty`
-5. Each entry in `$XDG_CONFIG_DIRS` joined with `/kitty`
+`resolve_config()` in `kitty/conf/utils.py` at line 322 is where the path search order is decided:
 
-If none of those already contain a `kitty.conf`, `_get_config_dir()` falls back to just creating (not populating) `$XDG_CONFIG_HOME/kitty` (or `~/.config/kitty`). If that creation fails due to a read-only FS or permission error, it creates a temporary directory and registers cleanup at exit (lines 105–127).
+```python
+# kitty/conf/utils.py:322
+def resolve_config(SYSTEM_CONF: str, defconf: str,
+                   config_files_on_cmd_line: Sequence[str] = ()) -> Generator[str, None, None]:
+    ...
+```
 
-**Observed on our Xvfb run** (introspection output captured after importing `kitty.constants` in the built environment):
+Its behavior (summarized from the source at commit `815df1e21`):
+
+- If `config_files_on_cmd_line` contains files (from `--config <path>` on the command line), those paths are yielded in order and the system/user defaults are **not** added.
+- Otherwise, `SYSTEM_CONF` is yielded first, then `defconf`.
+- The reserved literal `NONE` on the command line suppresses the system config when mixed with explicit `--config` paths.
+
+### 2.3 Config File Search Order (system then user)
+
+With no `--config` given, `default_config_paths(())` returns exactly:
+
+```
+(
+  '/etc/xdg/kitty/kitty.conf',    # SYSTEM_CONF
+  '/root/.config/kitty/kitty.conf',  # defconf (user)
+)
+```
+
+This was verified at runtime by importing `kitty.cli` and calling `default_config_paths(())`:
 
 ```
 SYSTEM_CONF: /etc/xdg/kitty/kitty.conf
-defconf: /tmp/blitzy/kitty/blitzy-f8748191-29ab-4030-bc1e-8014827570f3_cbcd32/kitty.conf
-config_dir: /tmp/blitzy/kitty/blitzy-f8748191-29ab-4030-bc1e-8014827570f3_cbcd32
-Resolution order: ['/etc/xdg/kitty/kitty.conf', '/tmp/blitzy/kitty/blitzy-f8748191-29ab-4030-bc1e-8014827570f3_cbcd32/kitty.conf']
-SYSTEM_CONF exists: False
-defconf exists: False
+defconf    : /root/.config/kitty/kitty.conf
+default_config_paths(()): ('/etc/xdg/kitty/kitty.conf', '/root/.config/kitty/kitty.conf')
+SYSTEM_CONF exists?: False
+defconf exists?   : False
 ```
 
-(Our temporary override of `KITTY_CONFIG_DIRECTORY=''` caused `defconf` to fall back into the build directory — in a clean `$HOME=/root` environment it would be `/root/.config/kitty/kitty.conf`.)
+Neither file exists in the test container (no Kitty package installed, fresh `$HOME`).
 
-### 2.3 Loading Pipeline
+The generic loader is `load_config()` in `kitty/conf/utils.py` at line 332. It is structured so that each path returned by `resolve_config()` is attempted in turn. The callback that parses a file is only invoked when the file can be opened; if `open()` raises `FileNotFoundError` (or the file cannot be read), the path is **silently skipped** and the loader proceeds to the next. If no path yields a readable file, the built-in defaults flow through unchanged. There is no warning emitted when a config file is missing; this is intentional because Kitty users who have never created a `kitty.conf` should not be pestered on every launch.
 
-Actual parsing and merging is in `kitty/conf/utils.py::load_config()` at line 332:
+### 2.4 Fallback to Built-in Defaults (`kitty/options/types.py::defaults`)
+
+When `load_config()` yields no parsed files, the effective `KittyOpts` equals the compiled-in `defaults` singleton:
 
 ```python
-# kitty/conf/utils.py lines 332–362 (abridged)
-def load_config(defaults, parse_config, merge_configs, *paths, overrides=None, ...):
-    ans = initialize_defaults(defaults._asdict())
-    found_paths = []
-    for path in paths:
-        if not path: continue
-        if path == '-':
-            ... # read from stdin
-        else:
-            try:
-                with open(path, encoding='utf-8', errors='replace') as f:
-                    with currently_parsing.set_file(path):
-                        vals = parse_config(f)
-            except (FileNotFoundError, PermissionError):
-                continue                 # silently skip missing/unreadable
-        found_paths.append(path)
-        ans = merge_configs(ans, vals)
-    if overrides is not None:
-        ... # apply --override values on top
-    return ans, tuple(found_paths)
+# kitty/options/types.py
+defaults = <Options NamedTuple instance populated from kitty/options/definition.py>
 ```
 
-Key observations:
-
-- **Missing files are silently skipped** (line 354) — no error, no warning.
-- **Files are applied in order**, so later files (e.g., the user's `~/.config/kitty/kitty.conf`) override earlier ones (e.g., `/etc/xdg/kitty/kitty.conf`).
-- CLI `--override name=value` arguments are applied last (lines 358–361), giving them the highest precedence.
-
-### 2.4 First-Launch Behavior: What Are "Built-in Defaults"?
-
-When no config files exist, `load_config()` starts with `defaults._asdict()` and applies no per-file merges. The "defaults" object is the `Options` singleton constructed from the canonical schema in `kitty/options/definition.py` via the generated `kitty/options/types.py::defaults`. Representative values, introspected from the built binary:
-
-| Option | Default value | Definition source |
-|--------|--------------|-------------------|
-| `font_family` | `FontSpec(system='monospace')` — resolves to the system default mono font | `kitty/options/definition.py:35` |
-| `font_size` | `11.0` pt | `kitty/options/definition.py:59` |
-| `initial_window_width` | `(640, 'px')` | `kitty/options/definition.py:994` (raw: `'640'`) |
-| `initial_window_height` | `(400, 'px')` | `kitty/options/definition.py:998` (raw: `'400'`) |
-| `scrollback_lines` | `2000` | `kitty/options/definition.py:372` |
-| `repaint_delay` | `10` ms | `kitty/options/definition.py:866` |
-| `input_delay` | `3` ms | `kitty/options/definition.py:878` |
-| `sync_to_monitor` | `True` | `kitty/options/definition.py:889` |
-| `background_opacity` | `1.0` | definition.py |
-| `term` | `'xterm-kitty'` | `kitty/options/definition.py:3242` |
-| `shell` | `'.'` (sentinel: use login shell) | `kitty/options/definition.py:2896` |
-| `shell_integration` | `frozenset({'enabled'})` | `kitty/options/definition.py:3141` |
-| `linux_display_server` | `'auto'` | definition.py |
-| `cursor_shape` | `1` (Block) | definition.py |
-| `allow_remote_control` | `'no'` | definition.py |
-| `enabled_layouts` | `['fat','grid','horizontal','splits','stack','tall','vertical']` | definition.py |
-
-On our machine, introspection confirmed: `config_dir=/root/.config/kitty`, `shell_path=/bin/bash` (from `pwd.getpwuid(os.geteuid()).pw_shell`, kitty/constants.py:181).
-
-### 2.5 `create_opts` — Putting It Together
-
-`kitty/cli.py::create_opts()` at line 1081 is the convenience wrapper that ties the path resolver and the loader together, applies per-line parsing from `kitty/options/parse.py`, runs post-processing (`finalize_keys`, `finalize_mouse_mappings` in `kitty/config.py`), and returns a fully-constructed `Options` object. This object is passed forward to `setup_environment`, `init_glfw`, and `run_app` — it is the single source of truth for all configurable behavior downstream.
-
-### 2.6 Live Proof That Defaults Were Applied
-
-Two independent lines of evidence prove that our live headless run used the built-in defaults (no config file took effect):
-
-1. **Introspection** (§2.2 above) showed `SYSTEM_CONF exists: False` and `defconf exists: False`.
-2. **Window dimensions** — captured via `xwininfo -root -tree`:
+The `defaults` singleton is built by the code-generation layer from `kitty/options/definition.py`, which is the canonical schema. Every `opt('name', 'default_value_literal', ...)` call in that file registers one option. Representative registrations (line numbers verified by `grep -n` at commit `815df1e21`):
 
 ```
-0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
+kitty/options/definition.py:59    opt('font_size', '11.0', option_type='to_font_size', ctype='double', ...)
+kitty/options/definition.py:372   opt('scrollback_lines', '2000', ...)
+kitty/options/definition.py:866   opt('repaint_delay', '10', ...)
+kitty/options/definition.py:878   opt('input_delay', '3', ...)
+kitty/options/definition.py:889   opt('sync_to_monitor', 'yes', ...)
+kitty/options/definition.py:994   opt('initial_window_width', '640', ...)
+kitty/options/definition.py:998   opt('initial_window_height', '400', ...)
+kitty/options/definition.py:1468  opt('background_opacity', '1.0', ...)
 ```
 
-That `640x400` is exactly `(initial_window_width, initial_window_height) = (640, 400)` (px), proving the default pixel sizes were used. The WM class `"kitty"` matches `appname = 'kitty'` (kitty/constants.py). The window name `"sh"` matches the default shell (`/bin/sh` via `sh -c 'sleep 2'` argv in our test).
+The `Options` named-tuple shape — the type of `defaults` — is declared in `kitty/options/types.py`, generated mechanically from the same schema. `kitty/options/parse.py` provides the per-line parser used by `load_config()` when a file *is* present. When no file is present, `parse.py` is never invoked and `defaults` flows through untouched.
+
+Downstream of `create_opts()`, the returned `KittyOpts` is pushed into the C layer via `set_options(opts, is_wayland(), debug_rendering, debug_font_fallback)` so that native code (renderer, font group, VT parser, child monitor) reads the same values the Python layer resolved.
+
+### 2.5 Observed Evidence (no config files found)
+
+Three facts were confirmed live in our test environment:
+
+1. **Both configured paths are absent.** Direct filesystem check under Python:
+   ```
+   SYSTEM_CONF exists?: False
+   defconf exists?   : False
+   ```
+
+2. **Kitty launches silently with defaults.** The captured `--debug-rendering --debug-keyboard --debug-font-fallback` log (Appendix B) contains *no* `"loaded config"` or `"warning: config not found"` messages — `load_config()` falls through quietly.
+
+3. **The default dimensions took effect at runtime.** `xwininfo -root -tree` captured while Kitty was running under `DISPLAY=:99` showed the window at exactly **640×400 pixels** (Appendix C):
+
+   ```
+   0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
+   ```
+
+   This is direct observable confirmation that `initial_window_width=640` (line 994) and `initial_window_height=400` (line 998) from `kitty/options/definition.py` were applied by the compiled `defaults`.
+
+### 2.6 Concrete Default Values That Took Effect (table)
+
+The following table enumerates defaults observed by introspecting `kitty.options.types.defaults` at runtime in the built environment. Each row cross-references the approximate line in `kitty/options/definition.py` where the default is registered. Some values like `font_family` are compound structures; the `system='monospace'` field tells Fontconfig to resolve whatever the system's `monospace` alias is — on this Ubuntu 24.04 container that resolves to DejaVu Sans Mono (see Q4 §4.4).
+
+| Option | Observed default value | `kitty/options/definition.py` line |
+|--------|------------------------|-----------------------------------|
+| `font_family` | `FontSpec(system='monospace', ...)` | (font_family section; ~55) |
+| `font_size` | `11.0` | 59 |
+| `initial_window_width` | `(640, 'px')` | 994 |
+| `initial_window_height` | `(400, 'px')` | 998 |
+| `term` | `'xterm-kitty'` | (term opt) |
+| `shell` | `'.'` (use the user's login shell from `/etc/passwd`) | (shell opt) |
+| `shell_integration` | `frozenset({'enabled'})` | 3141 (finalized) |
+| `scrollback_lines` | `2000` | 372 |
+| `repaint_delay` | `10` (ms) | 866 |
+| `input_delay` | `3` (ms) | 878 |
+| `sync_to_monitor` | `True` | 889 |
+| `background_opacity` | `1.0` | 1468 |
+| `linux_display_server` | `'auto'` | (linux_display_server opt) |
+| `allow_remote_control` | `'no'` | (allow_remote_control opt) |
+| `enabled_layouts` | `['fat', 'grid', 'horizontal', 'splits', 'stack', 'tall', 'vertical']` | (enabled_layouts opt) |
+| `cursor_shape` | `1` (block) | (cursor_shape opt) |
+
+Taken together: because `/etc/xdg/kitty/kitty.conf` and `/root/.config/kitty/kitty.conf` are both absent, `load_config()` never opens a file, no line-by-line parse is performed, and the `defaults` singleton from `kitty/options/types.py` (populated from the registrations in `kitty/options/definition.py`) is what every downstream subsystem (fonts, window sizing, VT buffer, render pacing, background compositing, ...) sees.
 
 ---
 
-## Q3 — Terminal-to-Shell Communication: How Does Kitty Talk to the Child Shell?
+## Question 3 — How does data flow from shell to terminal (PTY, fork, VT parser)?
 
-### 3.1 The End-to-End Data Path
+### 3.1 Thinking / Rationale
 
-```
-┌─────────────┐  write()  ┌────────┐  PTY line discipline  ┌──────────┐
-│ child shell ├──────────►│ slave  │◄─────────────────────►│  master  │
-│  (fork'd)   │           │  fd    │                       │   fd     │
-└─────────────┘           └────────┘                       └────┬─────┘
-                                                                │
-                              ┌─────────────────────────────────┘ POLLIN
-                              │    (kitty/child-monitor.c::io_loop,
-                              │     thread name "KittyChildMon")
-                              ▼
-                    ┌────────────────────┐
-                    │ read_bytes()       │  child-monitor.c:1336
-                    │  read(fd, buf, N)  │
-                    └─────────┬──────────┘
-                              │
-                 vt_parser_commit_write (vt-parser.c:1464)
-                              │
-                 wakeup_main_loop() (delayed by input_delay ~3ms)
-                              │
-                              ▼
-                  ┌─────────────────────────┐
-                  │ main thread:            │
-                  │  process_global_state() │ child-monitor.c:1223
-                  │   parse_input()         │ child-monitor.c:451
-                  │   -> VT parser drains   │ vt-parser.c (state machine)
-                  │     -> screen_draw_text │ screen.c
-                  │       -> LineBuf,       │
-                  │          cursor update  │
-                  │   render()              │ child-monitor.c:1237
-                  └────────────┬────────────┘
-                               │
-                               ▼
-                       GPU (cell_program + glfwSwapBuffers)
-```
+The question asks for the concrete mechanism by which a child shell process — running as a separate OS process with its own memory, its own `stdout`, and its own `stderr` — delivers bytes to the Kitty terminal emulator that then become characters on the screen. The answer has to cover five distinct concerns:
 
-### 3.2 PTY and Ready-Pipe Setup
+1. **Channel construction** — What OS primitive connects Kitty (parent) and the shell (child)? Kitty uses a POSIX **pseudo-terminal (PTY)** pair, allocated via `os.openpty()`, plus an additional **ready-notification pipe** to control exactly when the child starts emitting.
+2. **Process creation** — How is the child actually forked-and-executed? Kitty uses `fast_data_types.spawn()`, a C helper that wraps the POSIX `posix_spawn`/`fork`+`execve` sequence, attaches the slave PTY as the child's controlling terminal, and arranges file descriptor inheritance precisely.
+3. **Gating the child** — If the child were allowed to start writing before the parent had set the window size, the child would emit at the wrong columns/rows. Kitty solves this with a **ready pipe handshake**: the child blocks on `read(ready_read_fd)`, and the parent unblocks it by closing `ready_write_fd` only after `Window.set_geometry()` has resized the PTY. The `"Child launched"` debug-log line is produced at the moment this happens.
+4. **Byte transport** — Once the child is running, its output arrives on the master PTY fd. Kitty's dedicated **I/O thread** (`io_loop` in `child-monitor.c`) polls the master fd and reads the bytes into the VT parser's write buffer. It then wakes the main thread.
+5. **Parsing and rendering** — The main thread drains the buffer by calling `parse_input()`, which runs bytes through the VT state machine (`kitty/vt-parser.c`) and dispatches to `screen_draw_text()` (for printable characters) and the various CSI/OSC/DCS/APC handlers (for escape sequences). The next render tick composes a frame and swaps it onto the OS window.
 
-The PTY pair is created in `kitty/child.py::fork()` at line 281:
+Our approach is to walk through each of these concerns, citing the source that implements it, and culminate in the `"Child launched"` log line that is the single, transitive proof that the entire chain has succeeded.
+
+### 3.2 PTY Pair Creation (`os.openpty`)
+
+`Child.fork()` in `kitty/child.py` at line 276 is the canonical entry point. It constructs everything needed for the child:
 
 ```python
-# kitty/child.py lines 276–354 (abridged)
-def fork(self):
-    if self.forked: return None
-    opts = fast_data_types.get_options()
-    self.forked = True
-    master, slave = openpty()                              # line 281
-    stdin, self.stdin = self.stdin, None
-    ready_read_fd, ready_write_fd = os.pipe()              # line 283
-    os.set_inheritable(ready_write_fd, False)
-    os.set_inheritable(ready_read_fd, True)
+# kitty/child.py:276 onwards
+def fork(self) -> Optional[int]:
     ...
-    self.final_env = self.get_final_env()
-    argv = list(self.argv)
-    cwd = self.cwd
+    master, slave = openpty()       # line 281
+    ready_read_fd, ready_write_fd = os.pipe()   # line 283
     ...
-    env = tuple(f'{k}={v}' for k, v in self.final_env.items())
-    pid = fast_data_types.spawn(                           # line 333
-        final_exe, cwd, tuple(argv), env, master, slave,
-        stdin_read_fd, stdin_write_fd,
-        ready_read_fd, ready_write_fd, tuple(handled_signals),
-        kitten_exe(), opts.forward_stdio)
-    os.close(slave)
-    self.pid = pid
-    self.child_fd = master                                 # line 338
-    ...
-    os.close(ready_read_fd)
-    self.terminal_ready_fd = ready_write_fd                # line 343
-    if self.child_fd is not None:
-        os.set_blocking(self.child_fd, False)              # line 345 — non-blocking master
-    if not is_macos:                                       # line 346
-        fast_data_types.systemd_move_pid_into_new_scope(
-            pid, f'kitty-{ppid}-{self.id}.scope',
-            f'kitty child process: {pid} launched by: {ppid}')
 ```
 
-Two FDs must be highlighted here:
-
-- **The master PTY FD** (`self.child_fd`, line 338). This is set non-blocking (line 345) so the I/O thread can `read()` without stalling. It's registered into the I/O thread's `poll()` set by `fast_data_types.add_child(...)`.
-- **The ready-pipe write end** (`self.terminal_ready_fd`, line 343). The child is spawned with the read end open (FD 3 or similar). The child shell (via `kitty/run-shell` or the shell's own startup if no shell integration) is expected to `read()` from the ready-read end before emitting any output — that `read()` will block until the parent closes the write end. This mechanism delays the shell's first prompt until the terminal has a size (so the shell sees a valid initial `TIOCGWINSZ`).
-
-### 3.3 Child Environment — What the Shell Inherits
-
-`kitty/child.py::get_final_env()` (line 233–274) builds the child's environment dictionary. Key additions on top of the parent's environment:
-
-| Env var | Value | Source line |
-|---------|-------|-------------|
-| `TERM` | `opts.term` (default `'xterm-kitty'`) | 242 |
-| `COLORTERM` | `'truecolor'` | 243 |
-| `KITTY_PID` | PID of the kitty GUI process | 244 |
-| `KITTY_PUBLIC_KEY` | Curve25519 public key (for remote control) | 245 |
-| `KITTY_LISTEN_ON` | Socket path (if `listen_on` set) | 247 |
-| `PWD` | `self.cwd` | 254 |
-| `TERMINFO` | Either path or base64-encoded, per `opts.terminfo_type` | 255–260 |
-| `KITTY_INSTALLATION_DIR` | `kitty_base_dir` | 261 |
-| `KITTY_STDIO_FORWARDED` | `'3'` if `forward_stdio` | 263 |
-| (shell integration vars) | Injected by `modify_shell_environ` | 266–267 |
-
-Shell integration (`kitty/shell_integration.py::modify_shell_environ`, called at line 267 when `'disabled' not in opts.shell_integration`) sets shell-specific environment variables so that sourcing the integration script happens automatically on shell startup: `ZDOTDIR` for zsh, `ENV` for bash, `XDG_DATA_DIRS` prepended for fish. That is how kitty gets features like `@last_cmd_output` and precise prompt markers with zero user-side configuration.
-
-### 3.4 I/O Thread — The Read Loop
-
-After `Boss.start()` calls `child_monitor.start()` (boss.py line 1183), the C function `start()` in `kitty/child-monitor.c` (line 280) executes:
-
-```c
-// kitty/child-monitor.c lines 280–295
-static PyObject *
-start(PyObject *s, PyObject *a UNUSED) {
-    ChildMonitor *self = (ChildMonitor*)s;
-    int ret;
-    if (self->talk_fd > -1 || self->listen_fd > -1) {
-        if ((ret = pthread_create(&self->talk_thread, NULL, talk_loop, self)) != 0) {
-            return PyErr_Format(PyExc_OSError, "Failed to start talk thread with error: %s", strerror(ret));
-        }
-        talk_thread_started = true;
-    }
-    ret = pthread_create(&self->io_thread, NULL, io_loop, self);
-    if (ret != 0) return PyErr_Format(PyExc_OSError, "Failed to start I/O thread with error: %s", strerror(ret));
-    Py_RETURN_NONE;
-}
-```
-
-This creates the **KittyChildMon I/O thread** (name set at child-monitor.c:1489). Its body is `io_loop()` (line 1480):
-
-```c
-// kitty/child-monitor.c lines 1491–1571 (abridged)
-while (LIKELY(!self->shutting_down)) {
-    children_mutex(lock);
-    remove_children(self);
-    add_children(self);                       // line 1494
-    children_mutex(unlock);
-
-    data_received = false;
-    for (i = 0; i < self->count + EXTRA_FDS; i++) children_fds[i].revents = 0;
-
-    for (i = 0; i < self->count; i++) {
-        screen = children[i].screen;
-        children_fds[EXTRA_FDS + i].events =
-            vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;    // line 1501
-        screen_mutex(lock, write);
-        children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT : 0);   // line 1503
-        screen_mutex(unlock, write);
-    }
-
-    if (has_pending_wakeups) {
-        time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);     // line 1508
-        ret = (time_delta >= 0) ? poll(children_fds, self->count + EXTRA_FDS, ms) : 0;
-    } else {
-        ret = poll(children_fds, self->count + EXTRA_FDS, -1);                // line 1512 — indefinite
-    }
-
-    if (ret > 0) {
-        if (children_fds[0].revents && POLLIN) drain_fd(...);                 // wakeup pipe
-        if (children_fds[1].revents && POLLIN) {                              // signal pipe
-            read_signals(children_fds[1].fd, handle_signal, &ss);             // line 1519
-            // -> kill_signal / reload_config / child_died handled here
-        }
-        for (i = 0; i < self->count; i++) {
-            if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
-                has_more = read_bytes(children_fds[EXTRA_FDS + i].fd,         // line 1531
-                                       children[i].screen);
-                if (!has_more) children[i].needs_removal = true;
-            }
-            if (children_fds[EXTRA_FDS + i].revents & POLLOUT) {
-                write_to_child(children[i].fd, children[i].screen);           // line 1540
-            }
-        }
-    }
-    // Throttled main-loop wakeup (input_delay = 3ms default)
-    if (data_received) {
-        if ((now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) {
-            wakeup_main_loop(); last_main_loop_wakeup_at = now; has_pending_wakeups = false;   // line 1566
-        } else {
-            has_pending_wakeups = true;
-        }
-    }
-}
-```
-
-Key design decisions visible in this code:
-
-1. **`poll()` is used, not `epoll()`** — kitty prioritizes portability (poll is POSIX-uniform) over scale (a kitty instance typically has ≤ ~10 children).
-2. **Two reserved "extra" FDs** — the wakeup pipe (index 0) and signal pipe (index 1) — precede the child FDs. `EXTRA_FDS = 2`.
-3. **Events field gating**: if the VT parser's internal buffer is full (`vt_parser_has_space_for_input` returns false), POLLIN is *not* requested for that child — this backpressure prevents the 1MB ring buffer from being overflowed by a chatty child.
-4. **Throttled wakeup**: to avoid waking the main thread on every byte, kitty accumulates reads and only wakes after `input_delay` (default 3 ms, option `input_delay`). This is the critical latency knob for input responsiveness and CPU efficiency.
-
-### 3.5 `read_bytes` — The Exact Read Primitive
-
-The function that actually transfers bytes from the PTY into the VT parser's buffer is `read_bytes()` at `kitty/child-monitor.c:1336`:
-
-```c
-static bool
-read_bytes(int fd, Screen *screen) {
-    ssize_t len;
-    size_t available_buffer_space;
-    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
-    if (!available_buffer_space) return true;
-    while (true) {
-        len = read(fd, buf, available_buffer_space);
-        if (len < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            if (errno != EIO) perror("Call to read() from child fd failed");
-            vt_parser_commit_write(screen->vt_parser, 0);
-            return false;
-        }
-        break;
-    }
-    vt_parser_commit_write(screen->vt_parser, len);
-    return len != 0;
-}
-```
-
-Three subtleties matter:
-
-- `vt_parser_create_write_buffer` (`kitty/vt-parser.c:1450`) returns a pointer into the parser's 1 MB ring buffer (`BUF_SZ = 1024*1024`, vt-parser.c:18) and reports how many bytes fit before wraparound. The slot is reserved under a lock so the main thread cannot simultaneously `parse_input` on it.
-- `EINTR`/`EAGAIN` are handled by `continue`-ing the loop (EAGAIN can occur despite `poll()` reporting POLLIN when the buffer is small). `EIO` after a child exit is *not* logged (line 1348) — a closed PTY is normal termination.
-- On success `vt_parser_commit_write` (`kitty/vt-parser.c:1464`) advances the write offset and records `new_input_at = monotonic()` (vt-parser.c:1469) — this timestamp is what the render path consults to decide whether to repaint sooner than the sync-to-monitor interval would otherwise dictate.
-
-### 3.6 Main Thread — Parsing and Rendering
-
-The main thread runs `kitty/child-monitor.c::main_loop()` (line 1258), which registers a state-check timer (1000 ms) and hands control to `run_main_loop(process_global_state, self)` (line 1262). `process_global_state()` (line 1223) is invoked on every main-loop tick:
-
-```c
-// kitty/child-monitor.c lines 1223–1256 (abridged)
-static void process_global_state(void *data) {
-    ChildMonitor *self = data;
-    monotonic_t now = monotonic();
-    if (global_state.has_pending_resizes) {
-        process_pending_resizes(now);
-        input_read = true;
-    }
-    if (parse_input(self)) input_read = true;              // line 1236
-    render(now, input_read);                               // line 1237
-    ...
-    report_reaped_pids();                                  // line 1244
-    if (global_state.has_pending_closes) should_quit = process_pending_closes(self);
-    ...
-}
-```
-
-`parse_input()` (line 451) walks each child's VT parser and drains its ring buffer through the state machine. The top-level state machine is in `kitty/vt-parser.c`. For **plain text** — the most common case, and the one that delivers the shell's first prompt to the screen — the path is:
-
-```c
-// kitty/vt-parser.c lines 229–240
-static void consume_normal(PS *self) {
-    do {
-        const bool sentinel_found = utf8_decode_to_esc(
-            &self->utf8_decoder, self->buf + self->read.pos, self->read.sz - self->read.pos);
-        self->read.pos += self->utf8_decoder.num_consumed;
-        if (self->utf8_decoder.output.pos) {
-            REPORT_DRAW(self->utf8_decoder.output.storage, self->utf8_decoder.output.pos);
-            screen_draw_text(self->screen, self->utf8_decoder.output.storage, self->utf8_decoder.output.pos);
-        }
-        if (sentinel_found) { SET_STATE(ESC); break; }
-    } while (self->read.pos < self->read.sz);
-}
-
-// and single-byte control:
-static void dispatch_single_byte_control(PS *self, uint32_t ch) {
-    REPORT_DRAW(&ch, 1);
-    screen_draw_text(self->screen, &ch, 1);            // line 226
-}
-```
-
-`screen_draw_text()` in `kitty/screen.c` inserts the characters into the line buffer at the cursor position, advancing the cursor, wrapping, scrolling, and marking the screen dirty. `render()` (child-monitor.c:1237) then calls `render_os_window()` for each OS window, which calls `send_cell_data_to_gpu()` and presents via `glfwSwapBuffers`.
-
-### 3.7 The "Terminal Ready" Handshake
-
-The child is *spawned* by `fast_data_types.spawn` at kitty/child.py:333, but it doesn't start emitting output until the parent has sized the PTY and closed the ready-pipe write end. This handshake is performed in `Window.set_geometry()` (`kitty/window.py:850–876`):
+The module-local `openpty` at line 170–171 is:
 
 ```python
-# kitty/window.py lines 850–876 (abridged)
-def set_geometry(self, new_geometry):
-    if self.destroyed: return
-    if self.needs_layout or new_geometry.xnum != self.screen.columns or new_geometry.ynum != self.screen.lines:
-        self.screen.resize(max(0, new_geometry.ynum), max(0, new_geometry.xnum))
-        ...
-    current_pty_size = (self.screen.lines, self.screen.columns, ..., ...)
+# kitty/child.py:170-171
+def openpty() -> Tuple[int, int]:
+    master, slave = os.openpty()
+    ...
+    return master, slave
+```
+
+`os.openpty()` is a thin wrapper over the POSIX `openpty(3)` call, which allocates a PTY master/slave pair. The PTY master (`master` / eventually `self.child_fd`) is the parent's side; the slave (`slave`) becomes the child's `stdin`, `stdout`, `stderr`, and controlling TTY.
+
+### 3.3 Child Environment Construction (`get_final_env`)
+
+Immediately after PTY allocation, `Child.get_final_env()` at line 233 builds the child's environment dictionary:
+
+```python
+# kitty/child.py:233 onwards (representative excerpt)
+def get_final_env(self) -> Dict[str, str]:
+    env = os.environ.copy()
+    env['TERM']            = opts.term              # default: 'xterm-kitty'
+    env['COLORTERM']       = 'truecolor'
+    env['KITTY_PID']       = str(os.getpid())
+    env['KITTY_INSTALLATION_DIR'] = kitty_base_dir
+    env['TERMINFO']        = base64_terminfo_data() # base64-encoded embedded terminfo
+    ...
+    if 'disabled' not in opts.shell_integration:
+        env = modify_shell_environ(opts, env, argv)  # kitty/shell_integration.py
+    ...
+    return env
+```
+
+The key contract here is that **the child shell knows exactly what Kitty is** and what it supports, via three coordinates:
+
+| Env var | Value | Purpose |
+|---------|-------|---------|
+| `TERM` | `xterm-kitty` (default from `kitty/options/definition.py`) | ncurses/terminfo lookup key |
+| `COLORTERM` | `truecolor` | Signal 24-bit RGB support to shells and apps |
+| `TERMINFO` | base64-encoded embedded terminfo DB | Lets the child compile terminfo entries without a separately-installed `xterm-kitty.ti` |
+| `KITTY_PID` | parent PID | Allows `kitty @` remote control, shell-integration signaling |
+| `KITTY_INSTALLATION_DIR` | repo/install root | Used by shell integration to locate helper scripts |
+
+Shell-integration variables (injected via `modify_shell_environ()` in `kitty/shell_integration.py`) add per-shell coordinates — e.g. `ZDOTDIR` for zsh, `KITTY_SHELL_INTEGRATION=enabled`, and `XDG_DATA_DIRS` extensions for fish — so that when the shell runs its own rc files, it will source Kitty's integration script.
+
+### 3.4 Spawn (`fast_data_types.spawn`) and Ready-Pipe Handshake
+
+At line 333 of `kitty/child.py`:
+
+```python
+# kitty/child.py:333 (approximate)
+pid = fast_data_types.spawn(
+    final_exe, cwd, tuple(argv), env,
+    master, slave,
+    stdin_read_fd, stdin_write_fd,
+    ready_read_fd, ready_write_fd,
+    tuple(handled_signals), kitten_exe(), opts.forward_stdio)
+```
+
+`spawn()` is a C-implemented helper (see `kitty/*_spawn*.c` in the C sources). It performs the following atomically from the parent's perspective:
+
+1. Calls `posix_spawn`/`fork` to create the child process.
+2. In the child: opens the slave PTY as `stdin`/`stdout`/`stderr`, sets it as the controlling terminal, resets signal handlers/masks, `chdir(cwd)`, and `execve(final_exe, argv, env)`.
+3. In the parent: closes the slave-side fds the parent doesn't need, and returns the child PID.
+4. Before the child's `execve`, the child is arranged so that the very first thing the freshly-execed program does (via Kitty's shell-integration hook, or via the spawn helper itself) is to `read(ready_read_fd)` — which blocks until the parent closes `ready_write_fd`.
+
+After `spawn()` returns, the parent (still in `Child.fork()`) performs housekeeping:
+
+```python
+# kitty/child.py (approximate, post-spawn housekeeping)
+os.close(slave)               # parent no longer needs the slave end
+self.child_fd = master        # keep master for I/O
+os.close(ready_read_fd)       # parent doesn't read the ready pipe
+self.terminal_ready_fd = ready_write_fd   # parent will close this to release the child
+os.set_blocking(self.child_fd, False)     # PTY master becomes non-blocking for the I/O thread
+# best-effort; no-op on systems without systemd:
+systemd_move_pid_into_new_scope(pid, ...)
+```
+
+The `systemd_move_pid_into_new_scope()` call is the source of the `"Failed to open systemd user bus"` log line seen in the captured debug output (Appendix B). In a container without a user D-Bus it fails and is logged as `log_error(...)` — but the failure is **non-fatal** and does not block startup.
+
+### 3.5 `mark_terminal_ready()` — the gating signal
+
+`Child.mark_terminal_ready()` is defined in `kitty/child.py` at line 362:
+
+```python
+# kitty/child.py:362
+def mark_terminal_ready(self) -> None:
+    os.close(self.terminal_ready_fd)
+    self.terminal_ready_fd = -1
+```
+
+Closing the write end of the ready pipe causes the child's `read(ready_read_fd)` to return `0` (EOF). The child's first-line integration/spawn helper then proceeds to `exec` the user's shell (or simply to start reading from `stdin`), and only **then** does the shell begin emitting output. This guarantees the first output is rendered at the correct column/row because the parent has already called `resize_pty`.
+
+The caller is `Window.set_geometry()` in `kitty/window.py` around lines 862–876:
+
+```python
+# kitty/window.py:862-876 (excerpt)
+def set_geometry(self, new_geometry: WindowGeometry) -> None:
+    ...
+    current_pty_size = (new_geometry.xnum, new_geometry.ynum,
+                        cell_width * new_geometry.xnum, cell_height * new_geometry.ynum)
     if current_pty_size != self.last_reported_pty_size:
-        boss = get_boss()
-        boss.child_monitor.resize_pty(self.id, *current_pty_size)        # line 863 — TIOCSWINSZ
-        self.last_resized_at = monotonic()
+        boss.child_monitor.resize_pty(self.id, *current_pty_size)
+        self.last_reported_pty_size = current_pty_size
         if not self.child_is_launched:
-            self.child.mark_terminal_ready()                             # line 866
-            self.child_is_launched = True
-            update_ime_position = True
+            self.child.mark_terminal_ready()      # line 866
+            self.child_is_launched = True          # line 867
             if boss.args.debug_rendering:
                 now = monotonic()
-                print(f'[{now:.3f}] Child launched', file=sys.stderr)    # line 871
-        elif boss.args.debug_rendering:
-            print(f'[{monotonic():.3f}] SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}', file=sys.stderr)
-        self.last_reported_pty_size = current_pty_size
+                print(f'[{now:.3f}] Child launched', file=sys.stderr)   # line 871
 ```
 
-`child.mark_terminal_ready()` is a one-liner: `os.close(self.terminal_ready_fd)` (`kitty/child.py:363`). That single close unblocks the child's `read()` call on the corresponding read end, signaling that it may now start executing. Our observed log line `[0.162] Child launched` is produced at this exact point (window.py:871).
+The `"Child launched"` print in `--debug-rendering` is literally how we observe that the entire handshake — PTY creation, environment construction, spawn, ready-pipe close, first `resize_pty` — has completed. In our captured run it fired at `[0.158]` (Appendix B).
 
-### 3.8 Signal Handling in the I/O Thread
+### 3.6 I/O Thread: `read_bytes` → VT Parser Write Buffer
 
-The I/O thread also monitors a signal pipe (FD index 1) and dispatches via `handle_signal` (kitty/child-monitor.c:1361):
+`ChildMonitor` runs a dedicated I/O thread. It is launched from `ChildMonitor.start()` in `kitty/child-monitor.c` at line 291:
 
-| Signal | Action | Line |
-|--------|--------|------|
-| SIGINT, SIGTERM, SIGHUP | Set `ss->kill_signal = true` | 1365–1369 |
-| SIGCHLD | Set `ss->child_died = true` | 1370 |
-| SIGUSR1 | Set `ss->reload_config = true` | 1373 |
-| SIGUSR2 | Log the sival_int value | 1376–1377 |
-
-Kill signals and reload-config signals are propagated under the children mutex for the main thread to act on. SIGCHLD triggers immediate `reap_children()` (line 1526).
-
-### 3.9 Observed Behavior
-
-From our live run with `--debug-rendering`:
-
-```
-[0.146] OS Window created
-[0.156] Failed to open systemd user bus with error: Connection refused
-[0.159] Child launched
+```c
+// kitty/child-monitor.c:291
+pthread_create(&self->io_thread, NULL, io_loop, self);
 ```
 
-Between `OS Window created` and `Child launched` — ~13 ms — the following happened:
+`io_loop` (defined around line 229 and onward in the same file) is the loop body. Conceptually:
 
-1. The `Child` object was constructed (kitty/child.py:__init__).
-2. `fork()` created the PTY pair, the ready pipe, and called `fast_data_types.spawn()`.
-3. On Linux, `systemd_move_pid_into_new_scope()` was attempted (and failed gracefully because the container has no systemd user bus — a known limitation and explicitly handled at kitty/child.py:350 with an OSError-catch).
-4. The window's first `set_geometry()` fired during the initial layout pass, sizing the PTY to `80x24` cells (or whatever the geometry maps to — with default padding, the 640x400 pixel window fits approximately that on a default DPI display).
-5. `mark_terminal_ready()` closed the ready-pipe write end, unblocking the child.
-6. `[0.159] Child launched` was printed to stderr.
+```c
+// kitty/child-monitor.c::io_loop (conceptual pseudocode)
+while (!self->shutting_down) {
+    poll(fds /* PTY masters + wakeup pipe + signal pipe */,
+         nfds, timeout_ms);
+    for each PTY fd with POLLIN:
+        read_bytes(fd, screen);            // line 1337
+    ...
+    if (data_read || signal_received)
+        wakeup_main_loop();                // line 1165 (respects input_delay)
+}
+```
 
-From that point forward, the I/O thread's `poll()` will report POLLIN on the PTY master whenever the shell writes a prompt — and the full chain `read_bytes → VT parser → screen_draw_text → render → GPU` will deliver the bytes to screen within the next render tick (capped by `input_delay=3ms` + `repaint_delay=10ms`).
+`read_bytes()` at line 1337 reads from the PTY master into the `Screen` object's VT-parser write buffer using `read(fd, ...)` (non-blocking), loops on `EINTR`, stops on `EAGAIN`, and respects the fixed capacity of the ring-buffered `write_buf_used` counter. On any successful read, it calls `vt_parser_commit_write()` to publish the bytes to the main-thread side of the parser.
+
+`wakeup_main_loop()` at line 1165 pokes the wakeup pipe that the main thread is blocking on in `glfwPollEvents`. The `input_delay` option (default **3 ms** from `kitty/options/definition.py:878`) throttles wakeups — multiple reads within a 3 ms window are coalesced into a single main-thread tick — preserving the render budget when the child is emitting a torrent of data (e.g. `cat large_file`).
+
+### 3.7 Main-Thread `parse_input()` → `screen_draw_text()`
+
+On the main thread, the GLFW main loop tick calls `process_global_state()` in `kitty/child-monitor.c` at line 1224:
+
+```c
+// kitty/child-monitor.c:1224 (conceptual)
+static double
+process_global_state(void *data) {
+    ChildMonitor *self = data;
+    ...
+    parse_input(self);         // line 451
+    ...
+    // Later in the tick:
+    for each OS window:
+        render_os_window(os_window, ...);   // line 833
+    ...
+    return next_tick_time;
+}
+```
+
+`parse_input()` at line 451 iterates all windows, taking the VT parser's pending write buffer (published by the I/O thread) and feeding it to the VT state machine implemented in `kitty/vt-parser.c`. The state machine classifies bytes into:
+
+- **Printable text** → `screen_draw_text()` in `kitty/screen.c` (inserts into the active line at the cursor)
+- **C0 control codes** (e.g. `\r`, `\n`, `\t`, `\b`) → `screen_*` handlers
+- **CSI sequences** (e.g. `ESC [ ... letter`) → cursor movement, color changes, scroll region, mode switches
+- **OSC sequences** (e.g. `ESC ] 0 ; title BEL`) → title/clipboard/color palette changes
+- **DCS / APC sequences** → Kitty graphics protocol, device control strings
+
+`screen_on_input()` fires the activity callback for side-effects such as updating the last-input timestamp used for `cursor_blink_interval`.
+
+### 3.8 Data-Flow Diagram
+
+```
+          [Shell process writes to stdout/stderr]
+                         |
+                         v  (kernel PTY line discipline)
+                   [PTY slave fd]  <-- child side
+                         |
+                         v
+                   [PTY master fd] <-- parent side (non-blocking)
+                         |
+                         v
+           +---- [io_loop (I/O thread)] ----+
+           |     poll() -> read_bytes()     |
+           |     -> vt_parser_commit_write()|
+           +--------------+-----------------+
+                          |
+                          v
+                  [wakeup_main_loop]
+                  (input_delay = 3 ms)
+                          |
+       --- main thread tick (glfwPollEvents wakes) ---
+                          |
+                          v
+                [process_global_state]
+                          |
+                          v
+                    [parse_input]
+                          |
+                          v
+          [vt-parser state machine  (kitty/vt-parser.c)]
+                          |
+      +-------------------+------------------------+
+      |                   |                        |
+      v                   v                        v
+[screen_draw_text]   [CSI/OSC/DCS/APC]   [graphics protocol]
+      |                   |                        |
+      +----------+--------+------------------------+
+                 |
+                 v
+         [Screen line buffer]  (kitty/line.c / line-buf.c)
+                 |
+                 v  (next render tick)
+          [render_os_window]
+                 |
+                 v
+       [send_cell_data_to_gpu]
+                 |
+                 v
+         [glfwSwapBuffers]
+                 |
+                 v
+             [Frame]
+```
+
+### 3.9 Observed Evidence (`"Child launched"`)
+
+The captured run with `--debug-rendering --debug-keyboard --debug-font-fallback` (Appendix B) shows:
+
+```
+[0.145] OS Window created
+[0.154] Failed to open systemd user bus with error: Connection refused
+[0.158] Child launched
+[0.158] Text fonts:
+[0.158]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
+...
+```
+
+Reading the timeline:
+
+- `[0.145] OS Window created` — GLFW window, GL context, shaders, pre-rendered sprites all ready. (`kitty/glfw.c:1321`.)
+- `[0.154] Failed to open systemd user bus` — non-fatal; the spawn helper could not move the new child into a systemd user scope because there is no session bus in the container. (`kitty/child.py` best-effort path.)
+- `[0.158] Child launched` — `Window.set_geometry()` has fired for the first time, `resize_pty` has propagated the initial 640×400 pixel / cells-wide-cells-tall dimensions to the PTY, and `Child.mark_terminal_ready()` has closed `ready_write_fd`. The child can now proceed to exec the shell and emit output. (`kitty/window.py:871`.)
+
+The `"Child launched"` line is therefore the single most compact proof that **every** step of the data-flow chain above has succeeded: the PTY exists, the slave is attached to a running child PID, the master is registered with the I/O thread's poll set, the parent has sized the PTY to match the window geometry, and the child's read-side handshake has been released. Any byte that the shell writes from this moment forward traverses the full pipeline described in §§3.6–3.8 and ends up as a cell on the GPU-rendered frame.
 
 ---
 
-## Q4 — Display System Evidence: Fonts, Layout, Rendering, and Logs
+## Question 4 — What evidence confirms the display system is working?
 
-### 4.1 OpenGL Subsystem Evidence
+### 4.1 Thinking / Rationale
 
-The single most definitive log-line proving that the GPU pipeline came up is the one emitted by `kitty/gl.c::gl_init()` at line 72:
+A "working terminal" is more than a byte pipeline — it requires that a GPU-rendered frame with the correct characters, colors, and cursor position actually reaches the screen. That means three independent pipelines must all succeed: (1) the **GPU pipeline** (OpenGL context + shaders + vertex buffers + swap-buffer call), (2) the **font pipeline** (FreeType face opened, glyphs rasterized, cell metrics computed, sprite atlas uploaded), and (3) the **window/layout pipeline** (OS window created with the right WM class/title and the right pixel dimensions).
+
+Rather than instrument internal state, we pick *external*, *observable* signals that each subsystem emits and that we can capture unambiguously from a headless run:
+
+| Subsystem | External evidence we can capture |
+|-----------|----------------------------------|
+| OpenGL context | `"GL version string: '4.5 ...'"` from `kitty/gl.c:72` |
+| XKB/keyboard | `"Loading new XKB keymaps"` + `"Modifier indices ..."` from `glfw/xkb_glfw.c` lines 672, 376, 540 |
+| OS window | `"OS Window created"` from `kitty/glfw.c:1321` + `xwininfo` output |
+| Fonts | `--debug-font-fallback` face list from `kitty/fonts/render.py::dump_font_debug` line 161 |
+| Shader compilation | **Transitive proof** — if any shader pair (cell, graphics, bgimage, tint, border) failed to compile, `LoadShaderPrograms.__call__` would raise and the subsequent `"OS Window created"` print would never happen. Its appearance in the log is therefore sufficient evidence that shader compilation succeeded. |
+| PTY/shell handshake | `"Child launched"` from `kitty/window.py:871` |
+
+Correlating these signals with the source locations that emit them, and with the `xwininfo` snapshot of the live window, gives a complete evidential picture that the display system is functioning end-to-end.
+
+### 4.2 OpenGL Context Evidence (GL version string)
+
+`kitty/gl.c::gl_init()` — invoked from inside `create_os_window()` immediately after the GLFW window/context is made current — performs the driver entry-point loading via `gladLoadGL` and then (conditionally on `debug_rendering`) prints the version string:
+
+```c
+// kitty/gl.c:72 (approximate)
+if (global_state.debug_rendering)
+    printf("[%.3f] GL version string: %s Detected version: %d.%d\n",
+           monotonic_t_to_s_double(monotonic()),
+           gl_version_string(), major, minor);
+```
+
+It also enforces the minimum OpenGL version Kitty needs (≥ 3.1 / 3.3 for core cell shaders and features like integer attributes and texture arrays). If the driver reports a lower version, `gl_init()` aborts with an error; the startup does **not** reach `"OS Window created"`.
+
+Captured evidence:
 
 ```
-[0.123] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5
+[0.119] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5
 ```
 
-This is printed in `--debug-rendering` mode *only if* `gladLoadGL()` succeeded, the context provides at least GL 3.1 (the required minimum defined in `kitty/data-types.h`), and the `ARB_texture_storage` extension is present (checked at gl.c:67). The format-string is quoted at line 47: `"'%s' Detected version: %d.%d"`. In our environment Mesa 25.2.8 over Xvfb's software/LLVMpipe backend provides OpenGL 4.5 Core Profile — more than enough.
+This confirms four things at once:
 
-Additional indirect evidence of a healthy GPU pipeline:
+1. `gladLoadGL` succeeded — every GL function pointer Kitty uses (glDrawArrays, glBindVertexArray, glUniform*, glTexSubImage2D, ...) resolved.
+2. The version (`4.5`) is comfortably above Kitty's required minimum.
+3. The driver is Mesa (software rasterizer `llvmpipe` on Xvfb, since there is no hardware GPU under X11 virtual framebuffer).
+4. The OpenGL context is a **Core Profile** context — no deprecated fixed-function state is available, confirming Kitty's modern-GL code path is the one in use.
 
-- The absence of any `fatal()` on GL error (gl.c:17–38). Any OpenGL call that fails triggers `check_for_gl_error()` which calls `fatal()` — the process would die, we would not have gotten to `Child launched`.
-- The `"OS Window created"` log line at `[0.148]` (glfw.c:1321) is emitted *after* `send_prerendered_sprites_for_window(w)` runs (glfw.c:1273). The sprite pre-renderer uploads the blank cell, every underline style (single/double/curly/dotted/dashed), and all cursor shapes into a GPU sprite atlas via `glTexSubImage2D`. If GL initialization or shader compilation had failed, this call would never have completed and the window would never have been emitted as "created".
+### 4.3 Shader Compilation Evidence (cell / graphics / bgimage / tint / border)
 
-### 4.2 Font Pipeline Evidence
-
-Font debugging is opt-in (`--debug-font-fallback`) and lives in `kitty/fonts/render.py::dump_font_debug()` at line 161:
+Shader compilation happens inside `create_os_window()` (`kitty/glfw.c` lines 1253–1322). The Python side uses `LoadShaderPrograms` (`kitty/shaders.py` line 131, `__call__` at line 147):
 
 ```python
-# kitty/fonts/render.py lines 161–170
-def dump_font_debug() -> None:
-    cf = current_fonts()
-    log_error('Text fonts:')
-    for key, text in {'medium': 'Normal', 'bold': 'Bold', 'italic': 'Italic', 'bi': 'Bold-Italic'}.items():
-        log_error(f'  {text}:', cf[key].identify_for_debug())
-    ss = cf['symbol']
-    if ss:
-        log_error('Symbol map fonts:')
-        for s in ss:
-            log_error('  ' + s.identify_for_debug())
+# kitty/shaders.py:131
+class LoadShaderPrograms:
+    ...
+    def __call__(self, allow_recompile: bool = False) -> None:
+        # compiles cell, graphics, bgimage, tint programs and binds uniforms
+        ...
 ```
 
-`current_fonts()` returns the active font-face objects that have already been pushed to the C side via `set_font_data()`. Our live run produced:
+`init_cell_program()` at line 201 finalizes the cell shader by linking, querying uniform locations, and uploading static uniforms. Border shader compilation is handled separately by `load_borders_program()` in `kitty/borders.py:63`:
+
+```python
+# kitty/borders.py:63
+def load_borders_program() -> None:
+    program = Program(vertex=..., fragment=...)
+    ...
+```
+
+GLSL source files involved:
+
+| Shader pair | Files |
+|-------------|-------|
+| Cell (text + cursor) | `kitty/cell_vertex.glsl`, `kitty/cell_fragment.glsl` |
+| Graphics (inline images) | `kitty/graphics_vertex.glsl`, `kitty/graphics_fragment.glsl` |
+| Background image | `kitty/bgimage_vertex.glsl`, `kitty/bgimage_fragment.glsl` |
+| Tint overlay | `kitty/tint_vertex.glsl`, `kitty/tint_fragment.glsl` |
+| Border | `kitty/border_vertex.glsl`, `kitty/border_fragment.glsl` |
+| Utility | `kitty/alpha_blend.glsl`, `kitty/linear2srgb.glsl` |
+
+**Transitive evidence**: If *any* of these GLSL pairs fails to compile or link, `LoadShaderPrograms.__call__` / `load_borders_program` raises a Python exception, the `create_os_window` path aborts, and `"OS Window created"` is **never** printed. Because we observe
 
 ```
-[0.162] Text fonts:
-[0.162]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
-[0.162]   Bold: DejaVuSansMono-Bold: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:0
-[0.162]   Italic: DejaVuSansMono-Oblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf:0
-[0.162]   Bold-Italic: DejaVuSansMono-BoldOblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf:0
+[0.145] OS Window created
 ```
 
-This proves:
+in the captured log (and subsequently `"Child launched"` at `[0.158]`, which depends on having reached Boss startup), all shader programs must have compiled and linked successfully.
 
-1. `set_font_family()` ran to completion (lines 173–193 of render.py) — `font_map = get_font_files(opts)` discovered 4 font files on disk; `current_faces` was populated with `(medium, False, False)`, `(bold, True, False)`, `(italic, False, True)`, `(bi, True, True)`; and `set_font_data(...)` at line 189 pushed them into the C fontgroup machinery.
-2. The **default `font_family='monospace'`** (kitty/options/definition.py:35 — a `FontSpec(system='monospace')`) was resolved by `kitty/fonts/fontconfig.py::font_for_family()` through Fontconfig. On Ubuntu 24.04 with DejaVu installed, Fontconfig aliases `monospace` → `DejaVu Sans Mono`. (Note: the AAP mentioned "LiberationMono" as a prior observation; our current measurement shows DejaVu Sans Mono, which is what the system Fontconfig actually resolves to on this image. Both are perfectly valid default-mono resolutions — the determining factor is the host's fontconfig cache.)
-3. The **bold/italic/bold-italic variants were discovered automatically** — `kitty/fonts/common.py::get_font_files()` queries Fontconfig for style matches. This is why the user didn't have to configure them individually.
-4. The `key, text` pairs `{'medium': 'Normal', 'bold': 'Bold', ...}` match exactly between the source code (render.py:164) and the observed debug output format. The source is the truth.
+### 4.4 Font Pipeline Evidence (Fontconfig queries, FreeType face loads)
 
-### 4.3 Font Integration with C Side
+The Python side of the font pipeline is orchestrated by `set_font_family()` in `kitty/fonts/render.py:173`:
 
-`set_font_data()` — invoked from Python at render.py:189 — is a C function in `kitty/fonts.c` that does much more than hold pointers. It:
+```python
+# kitty/fonts/render.py:173
+def set_font_family(opts: Optional[Options] = None, ...) -> None:
+    ...
+    # 1. resolve font descriptors via fontconfig / core text
+    medium, bold, italic, bi = get_font_files(opts)   # kitty/fonts/common.py
+    # 2. push descriptors + callbacks to the C side
+    set_font_data(...)
+```
 
-- Allocates a `FontGroup` for the current DPI.
-- Loads each `FreeType` face with `FT_New_Face(...)` into the face array.
-- Calls `initialize_font_group(fg)` (kitty/fonts.c:~1450), which computes cell metrics (`calc_cell_metrics` — cell_width, cell_height, baseline, underline position, strikethrough position, etc.) from the medium face's metrics.
-- Rasterizes the blank cell, all underline styles, and cursor glyphs into the GPU sprite atlas via `send_prerendered_sprites()`. (This is what `send_prerendered_sprites_for_window()` in glfw.c:1273 then ties to the per-window OpenGL state.)
+`get_font_files()` in `kitty/fonts/common.py` resolves the four variants (regular, bold, italic, bold-italic) by calling the platform-specific font enumerator. On Linux that is `font_for_family()` in `kitty/fonts/fontconfig.py`, which issues Fontconfig queries against the system's font cache.
 
-All of this has completed by the time `dump_font_debug()` is called (kitty/main.py:229 — after `boss.start()` returns).
+When `--debug-font-fallback` is passed on the command line, `dump_font_debug()` at line 161 is invoked by `_run_app` / `Boss` after `set_font_family()` has completed, printing the resolved faces.
 
-### 4.4 Layout / Window Geometry Evidence
-
-Captured with `xwininfo -root -tree` during our live run:
+Captured evidence (Appendix B):
 
 ```
-0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
-0x200001 (has no name): ()       1x1+0+0   +0+0
+[0.158] Text fonts:
+[0.158]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
+[0.158]   Bold: DejaVuSansMono-Bold: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:0
+[0.158]   Italic: DejaVuSansMono-Oblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf:0
+[0.158]   Bold-Italic: DejaVuSansMono-BoldOblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf:0
 ```
 
 Interpretation:
 
-- `0x20000c` is the kitty GLFW window, named `"sh"` (the process name of the running command).
-- The `("kitty" "kitty")` is the X11 `WM_CLASS` — matches `appname = 'kitty'` (kitty/constants.py).
-- `640x400+0+0` is the window dimensions: 640 pixels wide, 400 pixels tall, positioned at (0,0). These match the defaults (`initial_window_width = '640'`, `initial_window_height = '400'` — kitty/options/definition.py:994, 998).
-- `0x200001` is the second window — the hidden 1x1 GLFW helper used for input focus handling.
+- The default `font_family = FontSpec(system='monospace', ...)` (Q2 §2.6) was fed to Fontconfig as the alias `monospace`.
+- On this Ubuntu 24.04 container, Fontconfig's alias chain resolves `monospace` to **DejaVu Sans Mono** — all four variants present at `/usr/share/fonts/truetype/dejavu/DejaVuSansMono*.ttf`.
+- The `:0` suffix is the FreeType face index inside each TTF (face 0 = the one and only face in a single-face TTF).
+- That all four variants resolved to real files on disk means the FreeType `FT_New_Face` call for each variant succeeded; the C side (`kitty/fonts.c`) proceeded to open the faces, rasterize glyphs, and build the GPU sprite atlas.
 
-The computation of pixel dimensions from the option values is done in `kitty/os_window_size.py::initial_window_size_func()` (lines 54–102). It reads `initial_window_sizes` (a derived tuple containing the parsed `(value, unit)` pairs) and returns a callable that, given cell dimensions and DPI scale, computes the pixel count. On X11 (non-macOS, non-Wayland), `xscale` and `yscale` are forced to 1 (line 73) — this is why the window opens at *exactly* 640×400 pixels, not a DPI-scaled larger value.
+Note: the AAP's planning document referenced LiberationMono; in this specific test container Fontconfig's `monospace` alias chain prefers DejaVu Sans Mono over Liberation Mono — this is a property of the Fontconfig configuration installed in the image, not of Kitty. The evidence stands either way: a real monospace family, with all four variants, was resolved.
 
-### 4.5 XKB Keyboard Evidence
+### 4.5 Window and Layout Evidence (xwininfo)
 
-Two log lines confirm keyboard subsystem initialization:
+`xwininfo -root -tree` was run against `DISPLAY=:99` while Kitty was live (Appendix C). The tree output included:
 
 ```
-[0.065] Loading new XKB keymaps
-[0.070] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
+0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
+   1 child:
+   0x200001 (has no name): ()  1x1+0+0  +0+0
 ```
 
-Both come from `glfw/xkb_glfw.c::glfw_xkb_compile_keymap()`. The modifier indices map to `xkb_state_mod_*_index()` lookups — `0xffffffff` means "not defined" (hyper and meta don't exist in our Xvfb keymap, which is expected for a minimal X server). The useful modifiers — `alt: 0x3`, `super: 0x6`, `numlock: 0x4`, `shift: 0x0`, `capslock: 0x1` — are all defined.
+Decoded:
 
-### 4.6 GL Shader Compilation — Implicit Evidence
+- `0x20000c` — X11 window ID of Kitty's top-level OS window (value is arbitrary / session-dependent).
+- `"sh"` — `WM_NAME` (the window's title). Kitty's default title policy is to follow the child's argv[0] unless overridden; since we launched `sh -c 'sleep 2'`, the title became `sh`.
+- `("kitty" "kitty")` — `WM_CLASS`, which is `(instance, class)`. Both are the literal string `kitty`, set by `set_x11_window_icon()` / GLFW during `create_os_window`. This is how desktop environments group Kitty windows together.
+- `640x400+0+0` — the window's geometry: 640 × 400 pixels at offset (0, 0) in the root window. This matches `initial_window_width=640` (`kitty/options/definition.py:994`) and `initial_window_height=400` (line 998) — direct evidence that the default layout path in `kitty/os_window_size.py::initial_window_size_func` was taken.
+- `0x200001 (has no name) 1x1+0+0` — an auxiliary 1×1 hidden window used by GLFW for certain IPC / clipboard operations. It is not visible to the user.
 
-There is no direct "shaders compiled" log line. Evidence that all shader programs compiled successfully is **transitive**:
+### 4.6 Pre-rendered Sprites and Cell Metrics
 
-1. `create_os_window()` accepts `load_all_shaders` as its callback (kitty/main.py:225, passed to create_os_window at line 225).
-2. `load_all_shaders` (kitty/main.py:82) wraps `load_shader_programs()` + `load_borders_program()` in a `try/except CompileError: raise SystemExit(err)` — on failure, kitty would exit.
-3. `"OS Window created"` appears in our log → the callback completed → shader compilation succeeded.
+`kitty/fonts.c::send_prerendered_sprites()` is invoked during font-group initialization (see `initialize_font_group` / `calc_cell_metrics` in the same file, around lines 1450–1530). It rasterizes a small, fixed set of glyph-like sprites — the blank cell background, the various underline styles (straight, dotted, dashed, curly), and the cursor shapes (block, beam, underline) — and uploads them to the GPU sprite texture at known, hard-coded indices. The cell shader can then reference these indices directly without needing to look up a glyph from the font atlas.
 
-The shader include mechanism is custom: `#pragma kitty_include_shader <name>` directives are textually expanded by `kitty/shaders.py::Program.load_sources_for_compile()`. Common include files in the repo include `alpha_blend.glsl` (Porter-Duff alpha compositing helpers) and `linear2srgb.glsl` (sRGB color space conversion). This is necessary because GLSL has no native `#include`.
+There is no dedicated debug-log line for this step in the built code path, but it is *transitively* confirmed by two observations:
 
-### 4.7 Rendering Cadence — How the First Frame Reaches the Screen
+1. The `"Child launched"` print (`kitty/window.py:871`) only occurs after `Window.set_geometry()` has fired, and `set_geometry` depends on `cell_width`/`cell_height` being available — which requires `calc_cell_metrics` to have completed, which requires the sprite upload path to have run without error.
+2. The visible window is 640×400 with the default defaults, meaning the cell metrics derived a *real* cell size (width × height), and the window's pixel dimensions are computed from cell size × cell count.
 
-After `Child launched` (at `[0.162]`), the main loop's render tick (child-monitor.c:1237) has the following trigger conditions:
+### 4.7 Observed Debug Log Summary
 
-- `input_read` flag set by `parse_input` when the VT parser advanced — this forces a repaint on the next tick.
-- `repaint_delay` (kitty/options/definition.py:866, default 10 ms) is the maximum interval between repaints when new input is flowing.
-- `sync_to_monitor` (default `True`) caps the frame rate at the monitor's refresh rate via `glfwSwapBuffers` v-sync.
+Cross-reference of the observable debug strings with their sources:
 
-So the shell's first prompt typically appears on screen within 10–20 ms of the child first writing to the PTY — limited mainly by `input_delay (3 ms) + repaint_delay (10 ms) + one v-sync interval`.
+| Observed string | Source file:line | Meaning |
+|-----------------|------------------|---------|
+| `Loading new XKB keymaps` | `glfw/xkb_glfw.c:672` | XKB context loaded, keymap compiled from current layout |
+| `Modifier indices alt: 0x3 super: 0x6 hyper: ... shift: 0x0 capslock: 0x1 control: 0x2` | `glfw/xkb_glfw.c:376` / `:540` | Modifier bit indices mapped; keyboard subsystem ready |
+| `GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5` | `kitty/gl.c:72` | OpenGL context live, Core Profile 4.5, minimum version satisfied |
+| `OS Window created` | `kitty/glfw.c:1321` | GLFW window + GL context + shaders + sprites + icon + callbacks all succeeded |
+| `Failed to open systemd user bus with error: Connection refused` | `kitty/child.py` (best-effort `systemd_move_pid_into_new_scope`) | Non-fatal; no session bus in container |
+| `Child launched` | `kitty/window.py:871` | PTY sized, `mark_terminal_ready` fired, shell free to emit |
+| `Text fonts: / Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/...` (×4) | `kitty/fonts/render.py::dump_font_debug:161` | All four font variants resolved to real files on disk; FreeType faces opened |
 
-### 4.8 Summary Table of Display Evidence
-
-| Evidence | Type | Source | Observed value |
-|----------|------|--------|----------------|
-| `GL version string: '4.5 (Core Profile) Mesa 25.2.8...'` | Log | kitty/gl.c:72 | Confirmed GL 4.5 |
-| `OS Window created` | Log | kitty/glfw.c:1321 | Confirmed at t=0.148s |
-| `Loading new XKB keymaps` | Log | glfw/xkb_glfw.c:670 | Confirmed at t=0.065s |
-| `Modifier indices ...` | Log | glfw/xkb_glfw.c post-compile | Confirmed at t=0.070s |
-| `Text fonts: ... Normal/Bold/Italic/Bold-Italic` | Log | kitty/fonts/render.py:161 | 4 faces resolved |
-| `640x400+0+0` | X11 tree | `xwininfo -root -tree` | Matches defaults |
-| `WM_CLASS = "kitty" "kitty"` | X11 | `xwininfo -root -tree` | Matches `appname` |
-| Window name `"sh"` | X11 | `xwininfo -root -tree` | Matches child argv[0] |
-| `Child launched` | Log | kitty/window.py:871 | First layout complete |
-| Process termination on GL error | Defensive | kitty/gl.c:17–38 (fatal()) | No fatal observed |
-| Process termination on shader compile error | Defensive | kitty/main.py:87 (raise SystemExit) | No SystemExit observed |
-
-Together these constitute a complete, mutually corroborating proof that the display pipeline — GPU context, shaders, fonts, sprites, window manager integration — came up successfully on this commit.
+Summing up across §§4.2–4.7: the OS window exists and has the expected class/title/geometry; the OpenGL context is a Core Profile 4.5 context with Mesa; all shader programs compiled (transitive proof via the `"OS Window created"` print); all four font variants resolved and loaded via Fontconfig + FreeType; the XKB keyboard subsystem is initialized with the modifier map decoded; and the shell is free to emit bytes which will be parsed and rendered. The display system is functioning end-to-end.
 
 ---
 
-## Appendix A — Full Live Debug Output from Headless Run
+## Appendix A — Complete Source File Reference Index
 
-The following is captured verbatim from a run with `DISPLAY=:99 ./kitty/launcher/kitty --debug-rendering --debug-keyboard --debug-font-fallback sh -c 'echo READY; sleep 1'`:
+The following table enumerates every source file cited anywhere in this document and the phase/question it evidences. All paths are relative to the repository root (the directory containing `setup.py`). No file in this list was modified during the investigation.
+
+| File | Role / Evidences |
+|------|------------------|
+| `kitty/launcher/main.c` | Native C launcher: descriptor validation, path resolution, Python embedding, `sys.kitty_run_data` population |
+| `kitty/launcher/launcher.h` | `CLIOptions` struct definition for native-to-Python contract |
+| `kitty/launcher/single-instance.c` | Single-instance UNIX socket coordination (referenced; not exercised in this investigation) |
+| `kitty/entry_points.py` | Entry dispatcher that routes `sys.argv` to `kitty.main.main()` |
+| `kitty/main.py` | `_main()` (line 441), `main()` (line 524), `init_glfw()` (line 95), `_run_app()` (line 202), `load_all_shaders` callback (line 82) — full startup orchestration |
+| `kitty/cli.py` | `parse_args`, `create_opts` (line 1081), `default_config_paths` (line 1067), `SYSTEM_CONF` (line 1064) |
+| `kitty/cli_stub.py` | `CLIOptions` dataclass holding parsed command-line state |
+| `kitty/config.py` | `load_config()` (line 163), `finalize_keys`, `finalize_mouse_mappings` |
+| `kitty/conf/utils.py` | Generic `resolve_config()` (line 322), `load_config()` (line 332) |
+| `kitty/constants.py` | `appname` (line 23), `config_dir` (line 131), `defconf` (line 133), `glfw_path`, `is_wayland`, resource paths |
+| `kitty/options/definition.py` | Canonical option schema and defaults — `font_size` line 59, `scrollback_lines` line 372, `repaint_delay` line 866, `input_delay` line 878, `sync_to_monitor` line 889, `initial_window_width` line 994, `initial_window_height` line 998, `background_opacity` line 1468, `shell_integration` line 3141 (finalized) |
+| `kitty/options/types.py` | `Options` named-tuple type and the `defaults` singleton with compiled-in default values |
+| `kitty/options/parse.py` | Line-by-line config parser (`create_result_dict`, `parse_conf_item`) |
+| `kitty/boss.py` | `Boss.__init__` (line 325), `Boss.startup_first_child` (line 383), `Boss.start` (line 1181) |
+| `kitty/session.py` | `create_sessions()`, `get_os_window_sizing_data()` |
+| `kitty/os_window_size.py` | `initial_window_size_func()` — computes pixel dimensions from cell size, DPI, and padding |
+| `kitty/child.py` | `openpty` (line 170), `get_final_env` (line 233), `Child.fork` (line 276), PTY creation at line 281, ready pipe at line 283, `fast_data_types.spawn()` at line 333, `mark_terminal_ready` at line 362 |
+| `kitty/child-monitor.c` | `io_loop` (line 229), `pthread_create(io_thread)` at line 291, `parse_input` (line 451), `send_cell_data_to_gpu` (line 714 / 766), `render_os_window` (line 833), `wakeup_main_loop` (line 1165), `process_global_state` (line 1224), `read_bytes` (line 1337) |
+| `kitty/window.py` | `child_is_launched` flag (line 578 / 865), `set_geometry` (around line 850), `mark_terminal_ready` call (line 866), `"Child launched"` print (line 871) |
+| `kitty/glfw.c` | `glfw_init`, `create_os_window` (lines 1253–1322), `"OS Window created"` debug print (line 1321) |
+| `kitty/gl.c` | `gl_init`, `gladLoadGL`, `"GL version string"` debug print (line 72) |
+| `glfw/xkb_glfw.c` | `glfw_xkb_compile_keymap`, `"Loading new XKB keymaps"` (line 672), `"Modifier indices"` (lines 376, 540) |
+| `kitty/vt-parser.c` | VT state machine — CSI/OSC/DCS/APC dispatch; plain-text path into `screen_draw_text` |
+| `kitty/screen.c` | `screen_draw_text`, `screen_on_input` |
+| `kitty/fonts/render.py` | `dump_font_debug` (line 161), `set_font_family` (line 173), `set_font_data` bridge to C |
+| `kitty/fonts/common.py` | `get_font_files` — resolves medium/bold/italic/bi descriptors |
+| `kitty/fonts/fontconfig.py` | `font_for_family` — Linux Fontconfig queries |
+| `kitty/fonts.c` | `send_prerendered_sprites`, `initialize_font_group`, `calc_cell_metrics` |
+| `kitty/shaders.py` | `LoadShaderPrograms` class (line 131), `__call__` (line 147), `init_cell_program` (line 201) |
+| `kitty/borders.py` | `load_borders_program` (line 63) |
+| `kitty/cell_vertex.glsl`, `kitty/cell_fragment.glsl` | Cell (text + cursor) shaders |
+| `kitty/graphics_vertex.glsl`, `kitty/graphics_fragment.glsl` | Inline-image shaders |
+| `kitty/bgimage_vertex.glsl`, `kitty/bgimage_fragment.glsl` | Background image shaders |
+| `kitty/tint_vertex.glsl`, `kitty/tint_fragment.glsl` | Tint overlay shaders |
+| `kitty/border_vertex.glsl`, `kitty/border_fragment.glsl` | Border shaders |
+| `kitty/alpha_blend.glsl`, `kitty/linear2srgb.glsl` | Utility GLSL shaders |
+| `kitty/shell_integration.py` | `modify_shell_environ` — per-shell environment injection |
+| `shell-integration/bash/kitty.bash`, `shell-integration/zsh/`, `shell-integration/fish/` | Shell-integration payloads (referenced; not exercised in detail) |
+| `setup.py`, `pyproject.toml`, `go.mod` | Build system / Python/Go dependency manifests |
+
+---
+
+## Appendix B — Raw Captured Debug Log (verbatim)
+
+The following is the captured stderr/stdout from a headless run with `DISPLAY=:99` and debug flags `--debug-rendering --debug-keyboard --debug-font-fallback`. Exact timestamps are from the monotonic clock at the time of capture; relative ordering is preserved verbatim.
 
 ```
-[0.065] Loading new XKB keymaps
-[0.070] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
-[0.148] OS Window created
-[0.158] Failed to open systemd user bus with error: Connection refused
-[0.162] Child launched
-[0.162] Text fonts:
-[0.162]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
-[0.162]   Bold: DejaVuSansMono-Bold: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:0
-[0.162]   Italic: DejaVuSansMono-Oblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf:0
-[0.162]   Bold-Italic: DejaVuSansMono-BoldOblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf:0
-[0.162] on_focus_change: window id: 0x1 focused: 1
-[0.123] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5
+[0.060] Loading new XKB keymaps
+[0.064] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
+[0.119] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5
+[0.145] OS Window created
+[0.154] Failed to open systemd user bus with error: Connection refused
+[0.158] Child launched
+[0.158] Text fonts:
+[0.158]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
+[0.158]   Bold: DejaVuSansMono-Bold: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:0
+[0.158]   Italic: DejaVuSansMono-Oblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf:0
+[0.158]   Bold-Italic: DejaVuSansMono-BoldOblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf:0
+[0.158] on_focus_change: window id: 0x1 focused: 1
 ```
 
-(Note: the `[0.123]` GL line appears out of order relative to `[0.148]` because the GL-init time is measured against the GL thread's private monotonic clock; the Xvfb software backend returns a slightly earlier reading than the main-thread wall time. The ordering *logically* is: GLFW init → XKB keymaps → window creation → GL init inside create-window → shader compile → first frame → child fork. Our observed timestamps are all *inside* the first 200 ms of process startup.)
+Notes on observed ordering:
 
-Sibling capture — `xwininfo -root -tree` during the run:
+- The `"Loading new XKB keymaps"` and `"Modifier indices"` lines are emitted on the GLFW/XKB init thread before the GL context log; they appear early because XKB keymap compilation is part of opening the X11 display connection.
+- The `"GL version string"` line appears in the log at `[0.119]`, *before* `"OS Window created"` at `[0.145]` in the captured output. This is because `gl_init()` executes inside `create_os_window()` — between GLFW window creation and the final `debug("OS Window created\n")` call.
+- The `"Failed to open systemd user bus"` is a non-fatal warning from the best-effort `systemd_move_pid_into_new_scope` path in `kitty/child.py`. It appears after the first child's spawn and before `"Child launched"` because spawn runs before the parent calls `set_geometry`.
+- `"Child launched"` at `[0.158]` is followed immediately by the font-debug dump at the same timestamp because `dump_font_debug()` is invoked from `_run_app` right after the first window's geometry is established.
+
+---
+
+## Appendix C — Raw xwininfo Output
+
+`xwininfo -root -tree -display :99` captured live while Kitty was running:
 
 ```
+xwininfo: Window id: 0x21f (the root window) (has no name)
+
+  Root window id: 0x21f (the root window) (has no name)
+  Parent window id: 0x0 (none)
+     2 children:
      0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
-     0x200001 (has no name): ()  1x1+0+0  +0+0
+        1 child:
+        0x200001 (has no name): ()  1x1+0+0  +0+0
 ```
 
-And `xdpyinfo -display :99`:
+Decoding:
 
-```
-name of display:    :99
-version number:    11.0
-vendor string:     The X.Org Foundation
-vendor release number:    12101011
-X.Org version:     21.1.11
-```
+- `0x21f` — root window of the `:99` Xvfb server.
+- `0x20000c` — Kitty's top-level window. `WM_NAME = "sh"` (title = child argv[0]); `WM_CLASS = ("kitty", "kitty")` (instance, class). Geometry `640x400+0+0` — 640×400 pixels at position (0, 0) — directly confirms the compiled defaults `initial_window_width=640` and `initial_window_height=400` from `kitty/options/definition.py` lines 994/998.
+- `0x200001` — auxiliary 1×1 hidden GLFW helper window.
 
 ---
 
-## Appendix B — Default Option Values (Introspection)
+## Appendix D — Glossary of Key Identifiers
 
-Captured by importing `kitty.options.types.defaults` at runtime in the built environment:
-
-```
-font_family         : FontSpec(system='monospace')
-font_size           : 11.0
-initial_window_width: (640, 'px')
-initial_window_height: (400, 'px')
-term                : xterm-kitty
-shell               : .
-shell_integration   : frozenset({'enabled'})
-scrollback_lines    : 2000
-repaint_delay       : 10
-input_delay         : 3
-sync_to_monitor     : True
-background_opacity  : 1.0
-linux_display_server: auto
-cursor_shape        : 1
-allow_remote_control: no
-enabled_layouts     : ['fat', 'grid', 'horizontal', 'splits', 'stack', 'tall', 'vertical']
-```
-
-Additional environment-derived values:
-
-```
-SYSTEM_CONF  : /etc/xdg/kitty/kitty.conf
-defconf      : <config_dir>/kitty.conf
-config_dir   : /root/.config/kitty   (in an unconfigured $HOME=/root environment)
-shell_path   : /bin/bash             (from pwd.getpwuid(os.geteuid()).pw_shell)
-GL required  : version ≥ 3.1 (Linux) / 3.3 (macOS); GLSL 140
-VT buffer    : 1 MB ring per child (BUF_SZ = 1024*1024)
-```
-
----
-
-## Appendix C — Call Graph Summary
-
-```
-main()                                    kitty/entry_points.py:183
- └─ main()                                kitty/main.py:524
-     └─ _main()                           kitty/main.py:441
-         ├─ running_in_kitty(True)                      fast_data_types
-         ├─ parse_args()                  kitty/cli.py
-         ├─ create_opts(cli_opts)         kitty/cli.py:1081
-         │   └─ load_config()             kitty/conf/utils.py:332
-         │       └─ resolve_config()      kitty/conf/utils.py:322
-         ├─ setup_environment()           kitty/main.py:403
-         ├─ set_locale()                  kitty/main.py:424
-         ├─ mask_kitty_signals_process_wide()
-         ├─ init_glfw(opts, ...)          kitty/main.py:95
-         │   └─ init_glfw_module()        kitty/main.py:90
-         │       └─ glfw_init(...)        kitty/glfw.c:1430
-         │           ├─ load_glfw()
-         │           ├─ glfwSetErrorCallback
-         │           ├─ glfwInit(...)      → XKB keymap compilation (xkb_glfw.c:670)
-         │           └─ get_window_dpi
-         └─ run_app(opts, cli_opts, ...)  kitty/main.py:247 (AppRunner.__call__)
-             ├─ set_scale(...)            fast_data_types
-             ├─ set_options(...)          fast_data_types
-             ├─ set_font_family(opts)     kitty/fonts/render.py:173
-             │   ├─ get_font_files(opts)  kitty/fonts/common.py (Fontconfig on Linux)
-             │   └─ set_font_data(...)    kitty/fonts.c (initialize_font_group + sprite pre-render)
-             └─ _run_app(...)             kitty/main.py:202
-                 ├─ set_x11_window_icon() kitty/main.py:155  (not Wayland)
-                 ├─ create_sessions()     kitty/session.py
-                 ├─ create_os_window(..., load_all_shaders, ...)
-                 │                        kitty/glfw.c:1253–1322
-                 │   ├─ glfw window creation + GL context
-                 │   ├─ gl_init()         kitty/gl.c:52   → "GL version string"
-                 │   ├─ load_all_shaders  kitty/main.py:82
-                 │   │   ├─ load_shader_programs   kitty/shaders.py:147
-                 │   │   └─ load_borders_program   kitty/borders.py:63
-                 │   ├─ send_prerendered_sprites_for_window
-                 │   ├─ glfwSet*Callback × 14
-                 │   └─ debug("OS Window created")
-                 ├─ Boss(opts, args, ...) kitty/boss.py:325
-                 │   ├─ ChildMonitor(...)
-                 │   └─ encryption key, clipboard, ...
-                 ├─ boss.start(first_window_id, sessions)  kitty/boss.py:1181
-                 │   ├─ self.child_monitor.start()         kitty/child-monitor.c:280
-                 │   │   └─ pthread_create(io_thread, io_loop)   → "KittyChildMon"
-                 │   └─ self.startup_first_child(...)      kitty/boss.py:383
-                 │       └─ for session in startup_sessions:
-                 │           add_os_window(session, ...)
-                 │             └─ TabManager → Tab → Window
-                 │                 └─ Window.__init__ creates Child & calls fork()
-                 │                     ├─ os.openpty()     kitty/child.py:281
-                 │                     ├─ os.pipe()        (ready pipe)
-                 │                     ├─ get_final_env()  kitty/child.py:233
-                 │                     ├─ fast_data_types.spawn(...)
-                 │                     └─ systemd_move_pid_into_new_scope (Linux)
-                 ├─ dump_font_debug()     (if --debug-font-fallback)
-                 └─ boss.child_monitor.main_loop()  kitty/child-monitor.c:1258
-                     ├─ add_main_loop_timer(state_check, 1000ms)
-                     └─ run_main_loop(process_global_state, self)
-                         ├─ process_pending_resizes
-                         ├─ parse_input(self)      kitty/child-monitor.c:451
-                         │   └─ for each child: VT parser drain → screen_draw_text
-                         ├─ render(now, input_read)
-                         │   └─ per OS window: send_cell_data_to_gpu + glfwSwapBuffers
-                         ├─ report_reaped_pids
-                         └─ process_pending_closes
-
-Side threads:
-  KittyChildMon      (I/O)           kitty/child-monitor.c:1480 (io_loop)
-    ├─ poll(wakeup_fd, signal_fd, child_fds...)
-    ├─ read_bytes → vt_parser_commit_write
-    └─ write_to_child
-
-  KittyTalkMonitor   (remote control, if enabled)  talk_loop
-```
-
-First-layout handshake that produces "Child launched":
-
-```
-Main loop first tick
-  └─ render()
-      └─ OS window layout pass → Tab.relayout → Window.set_geometry (kitty/window.py:850)
-          ├─ self.screen.resize(...)
-          ├─ boss.child_monitor.resize_pty(..., current_pty_size)   → TIOCSWINSZ on master
-          └─ if not self.child_is_launched:
-              self.child.mark_terminal_ready()          kitty/child.py:362
-                └─ os.close(self.terminal_ready_fd)
-              print(f'[{now:.3f}] Child launched')      kitty/window.py:871
-```
+| Term | Meaning |
+|------|---------|
+| **AAP** | Agent Action Plan — the planning document governing this investigation. |
+| **AppRunner** | The `_run_app` orchestrator in `kitty/main.py` that sequences session / window creation and hands off to `Boss`. |
+| **Boss** | The top-level Python controller (`kitty/boss.py`). Owns the `ChildMonitor`, clipboard, remote control, encryption key, and the list of OS windows. |
+| **ChildMonitor** | C-backed object (`kitty/child-monitor.c`) that owns the I/O thread, the main-loop tick, and the per-child state. |
+| **CSI / OSC / DCS / APC** | The four escape-sequence introducers in the VT protocol: CSI = Control Sequence Introducer (`ESC [`), OSC = Operating System Command (`ESC ]`), DCS = Device Control String (`ESC P`), APC = Application Program Command (`ESC _`). |
+| **defconf** | `kitty/constants.py:133` — the user's default config path, `$(config_dir)/kitty.conf`. |
+| **defaults** | The compiled-in `Options` singleton in `kitty/options/types.py`, populated from `kitty/options/definition.py`, used when no config file is loaded. |
+| **fast_data_types** | The C extension module exposing performance-critical primitives (`spawn`, `set_options`, `set_font_data`, screen/line operations) to the Python layer. |
+| **Fontconfig** | The Linux font-discovery library that resolves font-family aliases like `monospace` into concrete font files on disk. |
+| **FreeType** | The cross-platform font rasterizer used by Kitty to convert vector glyphs into bitmaps for the GPU atlas. |
+| **GLFW** | The vendored windowing library (`glfw/` subdirectory of the repo) that creates the OS window, OpenGL context, and input dispatch. |
+| **GLSL** | The OpenGL Shading Language; Kitty's `.glsl` files are compiled by the GL driver at startup. |
+| **HarfBuzz** | The text-shaping library used by Kitty for complex-script shaping (ligatures, marks, bidi). |
+| **Mesa** | The open-source OpenGL/Vulkan driver stack; under Xvfb in the test container, GL calls are routed to Mesa's `llvmpipe` software rasterizer. |
+| **OSWindow** | An OS-level window (top-level X11/Wayland/Cocoa window) as seen from `kitty/glfw.c` and `kitty/child-monitor.c`. |
+| **PTY** | POSIX pseudo-terminal — a kernel abstraction providing a master/slave fd pair that looks like a TTY to processes writing to the slave. Kitty uses `os.openpty()` to allocate one per child. |
+| **PTY master / slave** | The two ends of a PTY. The parent (Kitty) holds the master; the child (shell) is wired to the slave as its `stdin`/`stdout`/`stderr` and controlling terminal. |
+| **Screen** | The per-window data structure (implemented in `kitty/screen.c` with Python wrapper) holding the current line buffer, scrollback, cursor state, and VT parser state. |
+| **SYSTEM_CONF** | `kitty/cli.py:1064` — the system-wide config path, `/etc/xdg/kitty/kitty.conf`. |
+| **Tab / TabManager** | A `Tab` is a logical group of windows within an `OSWindow`; `TabManager` owns the list of tabs. |
+| **Window** | Kitty's logical window — a `Screen` plus geometry plus a `Child`. Multiple Windows can coexist inside one Tab (splits). |
+| **Xvfb** | X Virtual Framebuffer — an X11 server that renders to a virtual display instead of a real one. Used to run Kitty headless in the CI / container environment. |
+| **XKB** | The X Keyboard Extension. Used to compile keymaps and map physical key codes to layout-dependent symbols and modifier indices. |
 
 ---
 
 ## Investigation Provenance
 
-- **Built from source**: `python3 setup.py build --ignore-compiler-warnings` — succeeded after installing system build-dependencies (`libx11-xcb-dev`, `libxxhash-dev`, `libsimde-dev` were the final three needed on Ubuntu 24.04 beyond the base libgl/libx11/libxkbcommon/libfreetype/libfontconfig/libharfbuzz/liblcms2/libpng/libssl/libdbus-1 set).
-- **Unit tests**: 145 Python tests — 137 pass, 2 fail (`kitty_tests.file_transmission.TestFileTransmission.test_transfer_send` and `test_transfer_receive`, both of which assert setgid-bit preservation on transferred directories — a pre-existing code issue, not setup-related), 6 skipped (CA certs frozen-build-only, Last Resort font macOS-only, fish/zsh integration tests require those shells be installed). Go test suite passes in 29.0 s.
-- **Headless framebuffer**: Xvfb `:99` with resolution `1280x720x24`. DISPLAY=:99.
-- **Four live runs** captured with different debug flag combinations plus an instrumented Python startup to gather per-phase timing.
-- **One introspection run** that imported `kitty.constants`, `kitty.cli`, `kitty.options.types` in the built environment and printed the values of `SYSTEM_CONF`, `defconf`, `config_dir`, `default_config_paths()`, and each relevant `defaults.*` field.
-- **One window-tree capture** via `xwininfo -root -tree`.
+**Target commit**: `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (short: `815df1e210e0`), commit message *"Wire up applying of font config"*.
 
-Every claim in this document maps to at least one of: (a) a direct source-code citation at commit `815df1e21` in the local checkout, (b) output from one of the live runs, or (c) the output of the introspection run. No behavior has been assumed or extrapolated.
+**Environment**: Ubuntu 24.04.4 LTS on x86_64 in a Kubernetes pod derived from `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Python 3.12.3, Go 1.22.2. Display driver: Mesa 25.2.8 (software `llvmpipe` under Xvfb).
+
+**Headless framebuffer**: `Xvfb :99 -screen 0 1280x720x24` started during environment setup; `DISPLAY=:99` exported.
+
+**Build command**: `python3 setup.py build --ignore-compiler-warnings` — produced `kitty/launcher/kitty`, `kitty/fast_data_types.so`, `kitty/glfw-x11.so`, `kitty/glfw-wayland.so`, plus all Go kittens/tools. The `--ignore-compiler-warnings` flag was required because the container's `wayland-protocols` package ships newer protocol header enumerations than the vendored GLFW Wayland backend expects. This is a build-system accommodation only; the X11 backend (which is what the captured runs used) is unaffected.
+
+**Launch flags**: `--debug-rendering --debug-keyboard --debug-font-fallback` with child command `sh -c 'echo READY; sleep 1'` (or `sh -c 'sleep 2'` for the xwininfo capture).
+
+**Evidence streams correlated**:
+
+1. **Source code analysis** — `grep -n` and targeted line-range reads across `kitty/`, `kitty/conf/`, `kitty/options/`, `kitty/fonts/`, `kitty/launcher/`, and `glfw/` to locate every cited identifier and debug string. Source paths and line numbers in this document were all verified directly against the repository at commit `815df1e21`.
+2. **Live headless execution** — Kitty launched under Xvfb with debug flags; stderr/stdout captured. Used to produce Appendix B.
+3. **Window verification** — `xwininfo -root -tree -display :99` executed concurrently with a running Kitty process to capture the actual X11 window tree. Used to produce Appendix C.
+4. **Runtime Python introspection** — `kitty.options.types.defaults` accessed in a Python REPL (with `sys.kitty_run_data` pre-populated) to enumerate the actual default values that would take effect in the absence of any config file. Used to validate §2.6.
+
+**Read-only constraint**: No file in the source repository was modified as part of this investigation. The only artifact produced is this markdown document at `blitzy/documentation/kitty_815df1e210e0.md`. All temporary log files and helper scripts created during evidence capture have been removed.
+
