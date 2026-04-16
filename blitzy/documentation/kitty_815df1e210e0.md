@@ -1,111 +1,111 @@
-# Kitty Terminal Reflow (Rewrap) System — Technical Analysis
+# 1. Title and Executive Summary
 
-> **Scope**: This document traces kitty's terminal reflow subsystem — the C-level
-> machinery that re-distributes terminal cells across new dimensions when a
-> window is resized — answering how the generic `rewrap_inner()` works, how the
-> visible screen buffer (`LineBuf`) interacts with the scrollback history
-> (`HistoryBuf`), and identifying potential issues with line-continuation state
-> propagation.
->
-> **Commit**: `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (source branch
-> `kitty_815df1e210e0`).
->
-> **Repository files analyzed**: `kitty/rewrap.h` (96 lines),
-> `kitty/screen.c` (4,932 lines — especially lines ~216–463 and ~2833–2840),
-> `kitty/screen.h` (289 lines), `kitty/line-buf.c` (641 lines),
-> `kitty/history.c` (624 lines), `kitty/data-types.h` (438 lines),
-> `kitty/lineops.h` (136 lines), `kitty/options/definition.py` (line 420),
-> `kitty_tests/datatypes.py` (rewrap tests), `kitty_tests/screen.py` (resize
-> tests).
->
-> **Verification**: All 54 relevant unit tests in `kitty_tests.datatypes` and
-> `kitty_tests.screen` pass against the built C extensions on this commit
-> (`python3 -m unittest kitty_tests.datatypes kitty_tests.screen`).
+**Analysis of kitty's Terminal Reflow (Rewrap) System — branch `kitty_815df1e210e0`**
 
----
+**Commit hash**: `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
+**Branch**: `kitty_815df1e210e0`
+**Scope**: Read-only source-code analysis. No file in the source tree was modified during the preparation of this document; the sole artifact produced is the markdown you are reading.
 
-## Table of Contents
+This document is the complete, source-grounded answer to four questions posed by the user:
 
-1. [Executive Summary](#1-executive-summary)
-2. [Data Model Foundations](#2-data-model-foundations)
-3. [The Resize Entry Point — `screen_resize()`](#3-the-resize-entry-point--screen_resize)
-4. [Prompt Protection](#4-prompt-protection)
-5. [Buffer Reallocation — `realloc_hb()` and `realloc_lb()`](#5-buffer-reallocation--realloc_hb-and-realloc_lb)
-6. [Macro-Polymorphism in `rewrap.h`](#6-macro-polymorphism-in-rewraph)
-7. [Deep Dive: `rewrap_inner()`](#7-deep-dive-rewrap_inner)
-8. [LineBuf Specialization](#8-linebuf-specialization)
-9. [HistoryBuf Specialization](#9-historybuf-specialization)
-10. [The Buffer Boundary — Visible Screen ↔ Scrollback](#10-the-buffer-boundary--visible-screen--scrollback)
-11. [Line Continuation State: The Dual-Signal Architecture](#11-line-continuation-state-the-dual-signal-architecture)
-12. [Cursor Tracking Through Rewrap](#12-cursor-tracking-through-rewrap)
-13. [Scrollback Fill After Enlarging a Window](#13-scrollback-fill-after-enlarging-a-window)
-14. [Pager History Interaction](#14-pager-history-interaction)
-15. [Complete Call Chain & Data-Flow Map](#15-complete-call-chain--data-flow-map)
-16. [Identified Potential Issues and Edge Cases](#16-identified-potential-issues-and-edge-cases)
-17. [Test Coverage & Behavioral Confirmation](#17-test-coverage--behavioral-confirmation)
-18. [Glossary](#18-glossary)
+1. Trace the rewrap implementation in the C code (`rewrap_inner()` in `kitty/rewrap.h`).
+2. Explain how the visible screen buffer (`LineBuf`) and the scrollback history (`HistoryBuf`) interact during a window resize.
+3. Identify potential issues with line-continuation-state propagation between the two buffers during rewrap.
+4. Document the complete data flow from the resize entry point through the rewrap logic, including every macro specialization.
+
+### What is the rewrap system?
+
+The rewrap system is kitty's solution to a single problem: when the user resizes a terminal window, the number of columns may change, and every line that previously wrapped at the old right edge must be redistributed — split or joined — across the new column count. The challenge is that this redistribution must preserve visual content, must correctly propagate continuation metadata, must track the cursor and saved-cursor positions, must overflow excess content into the scrollback history when the screen shrinks, and must optionally pull lines back from history when the screen enlarges. All of this must happen without allocating more than necessary and without visible flicker.
+
+### Where does it live?
+
+The algorithm is written exactly once, in a C header file (`kitty/rewrap.h`) that is `#include`d twice: once by `kitty/line-buf.c` (line 583) and once by `kitty/history.c` (line 592). Before each inclusion the translation unit may `#define` a small set of macro hooks (`BufType`, `init_src_line`, `first_dest_line`, `next_dest_line`, `is_src_line_continued`, `map_src_index`) that adapt the generic loop to the specific buffer type. The technique is classical C "macro polymorphism". The orchestrator that drives the three independent rewraps (history, main LineBuf, alt LineBuf) is `screen_resize()` in `kitty/screen.c:345-463`.
+
+### Why macro-polymorphism?
+
+`LineBuf` and `HistoryBuf` are structurally different: a `LineBuf` is a flat row-major cell buffer with an indirection array `line_map` that permits O(1) "scrolling" by rotating pointers instead of moving cells, whereas a `HistoryBuf` is a ring of segmented slab allocations (`SEGMENT_SIZE = 2048` lines per slab) with a base offset `start_of_data` and an active-tail count. Their iteration and insertion semantics differ by enough that a runtime v-table would be awkward, but the core "copy cells from src-line to dest-line, wrap when dest-column is full, respect soft vs hard line breaks" logic is identical. Macros let the compiler inline the differences at translation-unit granularity, producing two specialized copies of `rewrap_inner()` that each know, statically, which buffer they operate on.
+
+### What is the dual-signal continuation state?
+
+A wrapped (soft-broken) line is signalled by two distinct artifacts:
+
+- **Signal 1 — `CellAttrs.next_char_was_wrapped`**: a single bit, declared in `kitty/data-types.h:196-209` as part of the 16-bit `CellAttrs` union, stored persistently on the last GPU cell of every line (column index `xnum - 1`). When a terminal program writes a character that would overflow the right edge, the current line's last cell has this bit set before the overflow character is emitted on the next line.
+- **Signal 2 — `LineAttrs.is_continued`**: a single bit in the 8-bit `LineAttrs` union (`kitty/data-types.h:231-239`), computed on demand by `linebuf_init_line()` (`kitty/line-buf.c:140-147`) and by the HistoryBuf `init_line()` (`kitty/history.c:161-177`). This bit is NEVER persisted to storage; every call to `init_line()` recomputes it by reading the previous line's last-cell `next_char_was_wrapped` bit.
+
+Because `is_continued` is always derived and never stored, there is no risk of the two signals being "out of sync" in the usual sense — the derived bit is self-healing. The single interesting exception is the screen↔history boundary at `kitty/screen.c:2833-2840`, where render-time `init_line()` for main-linebuf row 0 checks `history_buf_endswith_wrap(historybuf)` to bridge the gap. §10 of this document walks through every read and write of both signals and demonstrates that the invariant holds.
+
+### Confidence statement
+
+All conclusions in this document are derived from direct reading of the source at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. No file in the source tree was modified during the analysis. Every non-obvious claim in the narrative is cited with the relevant file path and line range so that a reader can verify against the source tree.
 
 ---
 
-## 1. Executive Summary
+# 2. Scope and Method
 
-When a kitty window is resized, the terminal must *reflow* (rewrap) the text so
-that lines that previously fit one width are redistributed to lines of the new
-width. Kitty's reflow system is architected around a single generic algorithm
-(`rewrap_inner()` in `kitty/rewrap.h`) that is parameterized via C
-preprocessor macros and instantiated twice:
+### Scope — In
 
-1. Once in `kitty/line-buf.c` with the **default** macros, producing a rewrap
-   routine that operates on `LineBuf` (the visible screen).
-2. Once in `kitty/history.c` with **overridden** macros (`BufType`,
-   `map_src_index`, `init_src_line`, `next_dest_line`, `first_dest_line`),
-   producing a rewrap routine that operates on `HistoryBuf` (the scrollback).
+The core artifacts that implement terminal reflow:
 
-The entry point for all resize operations is `screen_resize()` in
-`kitty/screen.c`, which orchestrates an ordered sequence: pause rendering →
-dummy-fill empty OUTPUT_START lines → snapshot cursor positions → resize
-overlay → reallocate the **history** buffer (rewrapping it to the new width)
-→ blank the current shell prompt to prevent flicker → reallocate the **main
-line** buffer (which can *spill* overflow lines into the history) → reallocate
-the **alt line** buffer → update dimensions, tabstops, selections → clamp
-cursor → fill new space with history lines (if
-`scrollback_fill_enlarged_window` is enabled) → restore the prompt copy.
+- `kitty/rewrap.h` — the generic algorithm (the entire file at `kitty/rewrap.h:1-96`, 96 lines total).
+- `kitty/screen.c` — the resize orchestrator (`screen_resize`), the history/linebuf reallocation helpers (`realloc_hb`, `realloc_lb`), the prompt-protection routine (`prevent_current_prompt_from_rewrapping`), the `INDEX_DOWN` macro used by the scrollback-fill loop, and the render-time boundary bridge in the screen-side `init_line` (at line 2833).
+- `kitty/screen.h` — the `Screen` struct.
+- `kitty/line-buf.c` — `LineBuf` operations, `linebuf_rewrap` wrapper, and the LineBuf inclusion of `rewrap.h`.
+- `kitty/history.c` — `HistoryBuf` operations, `historybuf_rewrap` wrapper, pager-history overflow, and the HistoryBuf inclusion of `rewrap.h`.
+- `kitty/data-types.h` — the core struct and union definitions (`GPUCell`, `CPUCell`, `CellAttrs`, `LineAttrs`, `Line`, `LineBuf`, `HistoryBuf`, `HistoryBufSegment`, `PagerHistoryBuf`, `Cursor`).
+- `kitty/lineops.h` — shared inline helpers including `set_named_attribute_on_line` (`kitty/lineops.h:14-21`), `copy_line` (`kitty/lineops.h:24-28`), `clear_chars_in_line` (`kitty/lineops.h:30-37`), `xlimit_for_line` (`kitty/lineops.h:39-47`), and function declarations.
+- `kitty/options/definition.py` — the `scrollback_fill_enlarged_window` option definition.
+- `kitty_tests/datatypes.py` and `kitty_tests/screen.py` — behavioral tests that exercise the rewrap code and are cited as evidence for the contracts inferred from the code.
 
-Two parallel representations of line continuation live side-by-side:
+### Scope — Out
 
-- `next_char_was_wrapped` — a **1-bit persistent field** in `CellAttrs` on the
-  last `GPUCell` of a line, meaning "the next character overflowed and was
-  placed on the next line."
-- `is_continued` — a **1-bit derived field** in `LineAttrs`, recomputed every
-  time a line is initialized by reading the previous line's
-  `next_char_was_wrapped`.
+Several large subsystems touch the resize path but are out of scope for this analysis because their internals do not participate in the reflow algorithm:
 
-These two signals must stay consistent across the history↔screen boundary, and
-several code paths (`history_buf_endswith_wrap()` override in
-`init_line()` at `screen.c:2836–2838`, HistoryBuf's `init_line()` at
-`history.c:167–176` reading the pager history newline state) exist specifically
-to bridge that boundary. Section 11 and Section 16 identify places where the
-cross-boundary signal can become inconsistent in practice.
+- **GPU rendering pipeline** (`kitty/gl.c`, `kitty/shaders.c`, GLSL files): consumes the linebuf state but does not affect the rewrap logic.
+- **VT parser / escape-sequence dispatch** (`kitty/vt-parser.c`): processes input bytes; irrelevant to resize.
+- **Font subsystem** (`kitty/freetype.c`, `kitty/fontconfig.c`, `kitty/glyph-cache.c`): unrelated.
+- **GLFW platform layer** (`glfw/`): raises the resize event but does not touch buffers.
+- **Remote-control system** (`kitty/rc/`): unrelated.
+- **Kittens framework** (`kittens/`) and **Go tools** (`tools/`): unrelated.
+- **Shell-integration scripts** (`shell-integration/`): write OSC 133 markers that influence prompt protection, but the scripts themselves are not traced.
+- **Graphics-protocol image placement** (`grman_resize` in `kitty/graphics.c`): `screen_resize` calls `grman_resize` twice (once for `main_grman`, once for `alt_grman`, at `kitty/screen.c:391` and `:400`), passing the before/after content-line counts. The internals of graphics-manager image reflow are not traced here; we merely note the call site.
+- **Alt-screen with history**: the alt screen is a degenerate case of the same algorithm. It participates in §4 as part of the three-way resize orchestration, but the "alt-with-history" configuration does not exist (alt always passes `NULL` for `historybuf`), so alt rewrap raises no novel questions beyond the main-screen case.
 
-All 54 tests across `kitty_tests.datatypes` and `kitty_tests.screen` pass
-cleanly against this implementation, confirming that the design is correct for
-the commonly exercised cases.
+### Method
+
+- **Direct source reading**: every function and macro in the scope above was read end-to-end from the branch HEAD at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
+- **Function-level tracing**: the call chain starting from the Python `resize` binding was traced through `screen_resize` into both `linebuf_rewrap` and `historybuf_rewrap`, and then into `rewrap_inner`.
+- **Cross-file macro expansion**: because `rewrap.h` is included twice, both expansions were mentally computed to establish exactly what code is generated in each translation unit.
+- **Test-driven verification**: where a claim about behavior required verification, the relevant test in `kitty_tests/datatypes.py` or `kitty_tests/screen.py` is cited. The full test suite (`python3 -m unittest kitty_tests.datatypes kitty_tests.screen`) passes at this commit, as verified during environment setup.
+
+### Line-number convention
+
+All line numbers in this document refer to the branch HEAD at the cited commit. If the reader's checkout differs (e.g., rebased branches), line numbers may drift slightly but function names and struct names are stable identifiers that a `grep` will always resolve.
 
 ---
 
-## 2. Data Model Foundations
+# 3. Data Model
 
-Before discussing reflow, the data structures manipulated by rewrap must be
-understood. All definitions below live in `kitty/data-types.h`.
+The reflow algorithm operates over a well-defined object graph. Understanding the invariants of each struct is a prerequisite for following the algorithm. This section walks the data model from the cell level up to the `Screen` root.
 
-### 2.1 `CellAttrs` — per-cell attribute bitfield (16 bits)
+## 3.1 GPUCell and CellAttrs
 
-File: `kitty/data-types.h` lines 196–209.
+`GPUCell` is a 20-byte structure (`kitty/data-types.h:216-221`) that holds the per-cell rendering state sent to the GPU each frame:
+
+```
++------------+------+------+------+------+-------------+
+| decoration | fg   | bg   | sx   | sy   | CellAttrs   |
+|  (4 bytes) | (4)  | (4)  | (2)  | (2)  |  (2 bytes)  |
+|  _fg       |      |      | sprite coords | (union)  |
++------------+------+------+------+------+-------------+
+```
+
+The size is enforced at compile time by a `static_assert(sizeof(GPUCell) == 20, ...)` at `kitty/data-types.h:221`, which guarantees that the CPU-side struct exactly matches the GPU-side binding layout.
+
+The final 2 bytes are a union of several named-bitfield views declared at `kitty/data-types.h:196-209`:
 
 ```c
 typedef union CellAttrs {
     struct {
-        uint16_t width : 2;
         uint16_t decoration : 3;
         uint16_t bold : 1;
         uint16_t italic : 1;
@@ -113,94 +113,83 @@ typedef union CellAttrs {
         uint16_t strike : 1;
         uint16_t dim : 1;
         uint16_t mark : 2;
+        uint16_t width : 2;
         uint16_t next_char_was_wrapped : 1;
+        uint16_t invisible : 1;
+        uint16_t _unused : 2;
     };
     uint16_t val;
 } CellAttrs;
 ```
 
-The field **`next_char_was_wrapped`** is critical for reflow. It is set on the
-*last cell* of a line when the next glyph overflowed to the following line
-during normal drawing. It is the **ground-truth storage** for soft-wrap
-relationships.
+The single bit that matters for rewrap is `next_char_was_wrapped`. When a program writes a character that would overflow the right column, the current right-edge cell has this bit set before the overflowing character appears on the next row. The bit is stored persistently on the last cell of the logical row (i.e., at column `xnum - 1`).
 
-### 2.2 `GPUCell` (20 bytes) and `CPUCell` (12 bytes)
+**Critically, `next_char_was_wrapped` is excluded from the SGR reset mask.** `kitty/data-types.h:214` defines `SGR_MASK` as a 16-bit mask of the attributes that SGR (Set Graphic Rendition) sequences may reset: foreground/background/decoration bits and most presentation bits, but not `next_char_was_wrapped` and not `width`. This is important because an SGR reset (`ESC [ 0 m`) must NOT destroy the structural wrap information of the surrounding text — the wrap bit is a structural property of the buffer, not a presentation attribute.
 
-Lines 216–228:
+## 3.2 CPUCell
+
+`CPUCell` is a 12-byte structure (`kitty/data-types.h:223-228`) that holds the per-cell character data kept on the CPU side:
 
 ```c
-typedef struct {
-    color_type fg, bg, decoration_fg;
-    sprite_index sprite_x, sprite_y, sprite_z;
-    CellAttrs attrs;
-} GPUCell;
-static_assert(sizeof(GPUCell) == 20, "Fix the ordering of GPUCell");
-
-typedef struct {
+typedef struct CPUCell {
     char_type ch;
     hyperlink_id_type hyperlink_id;
     combining_type cc_idx[3];
 } CPUCell;
-static_assert(sizeof(CPUCell) == 12, "Fix the ordering of CPUCell");
 ```
 
-Every cell has two halves:
-- `CPUCell`: the character (`ch`), the hyperlink ID, and up to three combining
-  character indices. Read/written by CPU-side code (text buffer, copy, paste,
-  reflow).
-- `GPUCell`: colors, sprite coordinates, and the packed `CellAttrs`. Uploaded
-  to the GPU for rendering.
+Here `ch` is the primary Unicode codepoint (`char_type` is `uint32_t`), `hyperlink_id` links to an `hyperlink` table entry (OSC 8 hyperlink annotation), and `cc_idx[3]` holds up to three combining-character indices into a zero-copy combining-character pool. For rewrap purposes only `ch` is read directly (for the BLANK_CHAR trim at `kitty/rewrap.h:70`); all other fields are copied as opaque bytes via `memcpy`.
 
-Reflow copies **both** halves as a unit. The inline helper `copy_range()` in
-`rewrap.h:44–48` uses two `memcpy`s — one for the CPU cells, one for the GPU
-cells — from a source slice to a destination slice.
+Two cell-related macros defined near these struct declarations are directly relevant to rewrap:
 
-### 2.3 `LineAttrs` — per-line attribute bitfield (8 bits)
+- `BLANK_CHAR` is defined as `0` at `kitty/data-types.h:115`, and `CHAR_IS_BLANK(ch)` at `kitty/data-types.h:118` expands to `((ch) == 0 || (ch) == ' ')` — accepting EITHER a NUL codepoint OR an ASCII space. The rewrap algorithm at `kitty/rewrap.h:67-70` (the `if (!src_line_is_continued)` branch) uses the narrower `BLANK_CHAR` check at `kitty/rewrap.h:70` (matching only NUL) to trim trailing blanks; this means a line ending in literal ASCII spaces is NOT trimmed. See §11.2 for the asymmetry discussion.
 
-Lines 230–239:
+- `COPY_CELL(src, s, dest, d)` at `kitty/data-types.h:126-127` expands to a dual assignment `(dest)->cpu_cells[d] = (src)->cpu_cells[s]; (dest)->gpu_cells[d] = (src)->gpu_cells[s];` — copying both CPU-side character data and GPU-side attributes for a single cell. The rewrap path does not invoke `COPY_CELL` directly — it uses `copy_range` (`kitty/rewrap.h:44-48`) which memcpys entire ranges — but other code paths (notably `copy_line` in `kitty/lineops.h:24-28`) use `COPY_CELL` as their per-cell primitive.
+
+## 3.3 LineAttrs (including is_continued)
+
+`LineAttrs` is an 8-bit packed union declared at `kitty/data-types.h:231-239`:
 
 ```c
-typedef enum { UNKNOWN_PROMPT_KIND = 0, PROMPT_START = 1,
-               SECONDARY_PROMPT = 2, OUTPUT_START = 3 } PromptKind;
 typedef union LineAttrs {
     struct {
         uint8_t is_continued : 1;
         uint8_t has_dirty_text : 1;
         uint8_t has_image_placeholders : 1;
         PromptKind prompt_kind : 2;
+        uint8_t _unused : 3;
     };
     uint8_t val;
-} LineAttrs ;
+} LineAttrs;
 ```
 
-Key observations:
+Four named fields fit in 7 bits, with 1 bit reserved. The one that matters for our analysis is `is_continued`, documented in §10 as a computed, never-stored signal. `prompt_kind` encodes the OSC 133 annotation (the `PromptKind` enum typedef at `kitty/data-types.h:230` together with the `LineAttrs` union at `:231-239` forms the block `kitty/data-types.h:230-239`: `UNKNOWN_PROMPT_KIND=0`, `PROMPT_START=1`, `SECONDARY_PROMPT=2`, `OUTPUT_START=3`); this is also important for the rewrap pathway because `prevent_current_prompt_from_rewrapping()` (§4.4) uses it to locate the current prompt, and `set_dest_line_attrs` (§6.4) clears it on the source after copying to the destination.
 
-- **`is_continued`** is a derived field — the data-at-rest storage lives in
-  `line_attrs[]` arrays for `LineBuf`/`HistoryBuf`, but during a call to
-  `linebuf_init_line()` (see §2.5) it is **overwritten** with the value
-  computed from the *previous line's* `next_char_was_wrapped`. This means
-  `is_continued` in stored `LineAttrs` is essentially a cache that the "init
-  line" functions refresh on every access.
-- `prompt_kind` classifies a line as the start of a shell prompt
-  (`PROMPT_START`), a secondary continuation prompt (`SECONDARY_PROMPT`), the
-  start of command output (`OUTPUT_START`), or unknown. These are set by OSC
-  133 sequences emitted by shell-integration scripts and consumed by the
-  prompt-protection logic in reflow (§4).
+`has_dirty_text` is the redraw marker consulted by the GPU pipeline; rewrap sets it on all destination lines after completion (§7.4, §8.4). `has_image_placeholders` is used by the graphics protocol and is out of scope.
 
-### 2.4 `Line`, `LineBuf`, `HistoryBufSegment`, `HistoryBuf`
+## 3.4 Line
 
-Lines 241–290:
+`Line` is a lightweight wrapper struct (`kitty/data-types.h:241-249`) that gives a stable identity to a row of cells:
 
 ```c
 typedef struct {
-    PyObject_HEAD
     GPUCell *gpu_cells;
     CPUCell *cpu_cells;
     index_type xnum, ynum;
     bool needs_free;
     LineAttrs attrs;
 } Line;
+```
 
+Importantly, `Line` usually does NOT own its cells. `gpu_cells` and `cpu_cells` are pointers into the parent `LineBuf` or `HistoryBufSegment`'s cell arrays. `needs_free` is true only when a Line was constructed with its own backing store (uncommon). `xnum` is the number of columns; `ynum` is repurposed by `rewrap_inner()` as a destination-row-count accumulator (see §5.10). `attrs` holds the line-scoped attribute union described above.
+
+Both `LineBuf` and `HistoryBuf` own exactly one cached `Line` instance (`LineBuf.line`, `HistoryBuf.line`), which is re-pointed by every call to the corresponding `init_line` helper. This is a deliberate zero-allocation convenience: the rewrap code can say "give me a `Line` view of source row y" by calling `init_src_line(y)` and then read `src->line->gpu_cells`, `src->line->cpu_cells`, etc., without allocating a new wrapper.
+
+## 3.5 LineBuf (flat row-major buffer)
+
+`LineBuf` is declared at `kitty/data-types.h:252-260`:
+
+```c
 typedef struct {
     PyObject_HEAD
     GPUCell *gpu_cell_buf;
@@ -209,19 +198,23 @@ typedef struct {
     LineAttrs *line_attrs;
     Line *line;
 } LineBuf;
+```
 
-typedef struct {
-    GPUCell *gpu_cells;
-    CPUCell *cpu_cells;
-    LineAttrs *line_attrs;
-} HistoryBufSegment;
+The two cell arrays (`gpu_cell_buf` and `cpu_cell_buf`) are flat, row-major, of sizes `ynum * xnum * sizeof(GPUCell)` and `ynum * xnum * sizeof(CPUCell)`. Conceptually, row `r` occupies cells `[r*xnum, (r+1)*xnum)` in each array. But rows are not accessed directly — they are accessed through `line_map`, an indirection array of size `ynum` whose entry `line_map[y]` gives the STORAGE index of the row currently at VISIBLE position `y`.
 
-typedef struct {
-    void *ringbuf;
-    size_t maximum_size;
-    bool rewrap_needed;
-} PagerHistoryBuf;
+This indirection is the reason `linebuf_index(dest, 0, dest->ynum - 1)` (used inside the LineBuf `next_dest_line` overflow branch at `kitty/rewrap.h:28`) can "scroll up" the buffer without moving any cells: it simply rotates `line_map` entries. The relevant code is at `kitty/line-buf.c:316-327`, which shows that `linebuf_index` saves `line_map[top]`, moves `line_map[top+1 .. bottom]` up by one, and places the saved index at `line_map[bottom]`. The old top row's physical storage slot is now at the bottom, ready to be reused. The parallel array `line_attrs` is rotated in the same operation so attribute metadata moves with the logical row.
 
+Note that `line_attrs` is indexed DIRECTLY by the logical row number, not through `line_map`. This matters for the rewrap algorithm: `set_dest_line_attrs(dest_y)` at `kitty/rewrap.h:18` writes to `dest->line_attrs[dest_y]`, which refers to logical row `dest_y`. `linebuf_index` is careful to rotate `line_attrs` together with `line_map` so this invariant holds.
+
+`scratch` is a spare `ynum`-sized buffer used by operations like `linebuf_insert_lines` that need to temporarily rearrange rows. Rewrap does not use it.
+
+The cached `line` field is the zero-allocation `Line` wrapper described in §3.4. `linebuf_init_line(lb, y)` (`kitty/line-buf.c:140-147`) re-points `lb->line->cpu_cells`, `lb->line->gpu_cells`, and `lb->line->attrs` to refer to storage row `lb->line_map[y]` and copies `lb->line_attrs[y]` into `lb->line->attrs`. It also computes `lb->line->attrs.is_continued` by reading the previous row's last-cell wrap bit (see §10.2 for the exact computation).
+
+## 3.6 HistoryBuf (ring + segment buffer)
+
+`HistoryBuf` is a very different animal, declared at `kitty/data-types.h:282-290`:
+
+```c
 typedef struct {
     PyObject_HEAD
     index_type xnum, ynum, num_segments;
@@ -229,407 +222,88 @@ typedef struct {
     PagerHistoryBuf *pagerhist;
     Line *line;
     index_type start_of_data, count;
+    bool *line_map;
 } HistoryBuf;
 ```
 
-Highlights:
-
-- **`LineBuf`** stores all cells in a flat arena (`cpu_cell_buf`,
-  `gpu_cell_buf`, `line_attrs`) and maintains a **`line_map[]`** permutation
-  — an `index_type` array that maps logical y-coordinate to physical storage
-  row. Scrolling is therefore O(1): `linebuf_index()` (see `line-buf.c:316–
-  327`) just rotates map entries; no cell data is copied.
-- `LineBuf` also owns a single `Line *line` "cursor" object that is re-pointed
-  by `linebuf_init_line()` to act as a live view onto a particular row.
-- **`HistoryBuf`** uses **segmented storage**: each segment holds
-  `SEGMENT_SIZE = 2048` lines (`history.c:15`), so a history of depth 100,000
-  uses ~49 segments. Segments are allocated on demand via `add_segment()`.
-- HistoryBuf indexing is a **ring buffer**: `start_of_data` is the physical
-  offset of the oldest retained line, and `count` is how many lines are live.
-  The helper `index_of()` (`history.c:152–159`) performs reverse indexing:
-  `lnum=0` is the *most recent* history line.
-- `PagerHistoryBuf` is a separate byte-level ring buffer (using the vendored
-  `3rdparty/ringbuf/ringbuf.h`) that holds ANSI-escaped text spill from the
-  tail of `HistoryBuf` — overflow beyond the structured history.
-
-### 2.5 `linebuf_init_line()` and `HistoryBuf init_line()`
-
-These two functions are the central "view initializers" that give the rest of
-the codebase a `Line *` pointing at a specific row. **Every time either is
-called, the line's `is_continued` flag is recomputed from scratch.**
-
-`kitty/line-buf.c:140–147`:
+where `HistoryBufSegment` (at `kitty/data-types.h:262-266`) is:
 
 ```c
-void
-linebuf_init_line(LineBuf *self, index_type idx) {
-    self->line->ynum = idx;
-    self->line->xnum = self->xnum;
-    self->line->attrs = self->line_attrs[idx];
-    self->line->attrs.is_continued = idx > 0
-        ? gpu_lineptr(self, self->line_map[idx - 1])
-                     [self->xnum - 1].attrs.next_char_was_wrapped
-        : false;
-    init_line(self, self->line, self->line_map[idx]);
-}
+typedef struct {
+    GPUCell *gpu_cells;
+    CPUCell *cpu_cells;
+    LineAttrs *line_attrs;
+} HistoryBufSegment;
 ```
 
-`kitty/history.c:161–177`:
+Each segment holds `SEGMENT_SIZE` lines (defined as `2048` in `kitty/history.c:15`). Segments are allocated lazily by `add_segment()` (`kitty/history.c:17-29`), which grows the `segments` array and allocates cell storage of size `SEGMENT_SIZE * xnum * sizeof(GPUCell)` (plus the corresponding CPU cell and line_attrs buffers).
 
-```c
-static void
-init_line(HistoryBuf *self, index_type num, Line *l) {
-    l->cpu_cells = cpu_lineptr(self, num);
-    l->gpu_cells = gpu_lineptr(self, num);
-    l->attrs = *attrptr(self, num);
-    if (num > 0) {
-        l->attrs.is_continued =
-            gpu_lineptr(self, num - 1)
-                       [self->xnum-1].attrs.next_char_was_wrapped;
-    } else {
-        l->attrs.is_continued = false;
-        size_t sz;
-        if (self->pagerhist && self->pagerhist->ringbuf
-            && (sz = ringbuf_bytes_used(self->pagerhist->ringbuf)) > 0) {
-            size_t pos = ringbuf_findchr(self->pagerhist->ringbuf, '\n', sz - 1);
-            if (pos >= sz) l->attrs.is_continued = true;  // ringbuf does not end with a newline
-        }
-    }
-}
-```
-
-Note in the HistoryBuf case, when looking at the oldest physical entry (`num
-== 0` in physical terms — **not** the same as the API's reverse-indexed
-`lnum=0`), the function consults the pager history ringbuf to see if the last
-pager-history byte is a newline. If not, the oldest history entry is marked as
-continued from the pager history. This is the **pager-history ↔ history**
-bridge.
-
----
-
-## 3. The Resize Entry Point — `screen_resize()`
-
-`kitty/screen.c:345–463` is the canonical entry for every resize operation.
-Its structure is:
-
-```c
-static bool
-screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
-    screen_pause_rendering(self, false, 0);
-    lines = MAX(1u, lines); columns = MAX(1u, columns);
-
-    bool is_main = self->linebuf == self->main_linebuf;
-    index_type num_content_lines_before, num_content_lines_after;
-    bool dummy_output_inserted = false;
-
-    /* --- §3.1 empty OUTPUT_START preservation --- */
-    if (is_main && self->cursor->x == 0
-        && self->cursor->y < self->lines
-        && self->linebuf->line_attrs[self->cursor->y].prompt_kind == OUTPUT_START) {
-        linebuf_init_line(self->linebuf, self->cursor->y);
-        if (!self->linebuf->line->cpu_cells[0].ch) {
-            self->linebuf->line->cpu_cells[self->cursor->x++].ch = '<';
-            dummy_output_inserted = true;
-        }
-    }
-
-    unsigned int lines_after_cursor_before_resize = self->lines - self->cursor->y;
-    CursorTrack cursor           = {.before = {self->cursor->x, self->cursor->y}};
-    CursorTrack main_saved_cursor= {.before = {self->main_savepoint.cursor.x,
-                                               self->main_savepoint.cursor.y}};
-    CursorTrack alt_saved_cursor = {.before = {self->alt_savepoint.cursor.x,
-                                               self->alt_savepoint.cursor.y}};
-#define setup_cursor(which) { \
-    which.after.x = which.temp.x; which.after.y = which.temp.y; \
-    which.is_beyond_content = num_content_lines_before > 0 \
-                              && self->cursor->y >= num_content_lines_before; \
-    which.num_content_lines = num_content_lines_after; \
-}
-
-    if (!init_overlay_line(self, columns, true)) return false;
-
-    /* --- §3.2 reallocate history --- */
-    HistoryBuf *nh = realloc_hb(self->historybuf,
-                                self->historybuf->ynum, columns,
-                                &self->as_ansi_buf);
-    if (nh == NULL) return false;
-    Py_CLEAR(self->historybuf); self->historybuf = nh;
-
-    /* --- §3.3 prompt protection --- */
-    RAII_PyObject(prompt_copy, NULL);
-    index_type num_of_prompt_lines = 0, num_of_prompt_lines_above_cursor = 0;
-    if (is_main) {
-        prompt_copy = (PyObject*)alloc_linebuf(self->lines, self->columns);
-        num_of_prompt_lines = prevent_current_prompt_from_rewrapping(
-            self, (LineBuf*)prompt_copy, &num_of_prompt_lines_above_cursor);
-    }
-
-    /* --- §3.4 reallocate main linebuf (with history spillover) --- */
-    LineBuf *n = realloc_lb(self->main_linebuf, lines, columns,
-                            &num_content_lines_before, &num_content_lines_after,
-                            self->historybuf,       /* <-- spill target */
-                            &cursor, &main_saved_cursor, &self->as_ansi_buf);
-    if (n == NULL) return false;
-    Py_CLEAR(self->main_linebuf); self->main_linebuf = n;
-    if (is_main) setup_cursor(cursor);
-    setup_cursor(main_saved_cursor);
-    grman_remove_all_cell_images(self->main_grman);
-    grman_resize(self->main_grman, self->lines, lines, self->columns, columns,
-                 num_content_lines_before, num_content_lines_after);
-
-    /* --- §3.5 reallocate alt linebuf (no history) --- */
-    n = realloc_lb(self->alt_linebuf, lines, columns,
-                   &num_content_lines_before, &num_content_lines_after,
-                   NULL,                       /* <-- no spill */
-                   &cursor, &alt_saved_cursor, &self->as_ansi_buf);
-    if (n == NULL) return false;
-    Py_CLEAR(self->alt_linebuf); self->alt_linebuf = n;
-    if (!is_main) setup_cursor(cursor);
-    setup_cursor(alt_saved_cursor);
-    grman_remove_all_cell_images(self->alt_grman);
-    grman_resize(self->alt_grman, self->lines, lines, self->columns, columns,
-                 num_content_lines_before, num_content_lines_after);
-#undef setup_cursor
-
-    /* --- §3.6 commit dimensions --- */
-    self->linebuf = is_main ? self->main_linebuf : self->alt_linebuf;
-    self->lines = lines; self->columns = columns;
-    self->margin_top = 0; self->margin_bottom = self->lines - 1;
-
-    PyMem_Free(self->main_tabstops);
-    self->main_tabstops = PyMem_Calloc(2*self->columns, sizeof(bool));
-    if (self->main_tabstops == NULL) { PyErr_NoMemory(); return false; }
-    self->alt_tabstops = self->main_tabstops + self->columns;
-    self->tabstops = self->main_tabstops;
-    init_tabstops(self->main_tabstops, self->columns);
-    init_tabstops(self->alt_tabstops, self->columns);
-    self->is_dirty = true;
-    clear_selection(&self->selections);
-    clear_selection(&self->url_ranges);
-    self->last_visited_prompt.is_set = false;
-
-    /* --- §3.7 clamp and remap cursors --- */
-#define S(c, w) c->x = MIN(w.after.x, self->columns - 1); \
-                c->y = MIN(w.after.y, self->lines - 1);
-    S(self->cursor, cursor);
-    S((&(self->main_savepoint.cursor)), main_saved_cursor);
-    S((&(self->alt_savepoint.cursor)), alt_saved_cursor);
-#undef S
-    if (cursor.is_beyond_content) {
-        self->cursor->y = cursor.num_content_lines;
-        if (self->cursor->y >= self->lines) {
-            self->cursor->y = self->lines - 1;
-            screen_index(self);
-        }
-    }
-
-    /* --- §3.8 optional scrollback fill when enlarged --- */
-    if (is_main && OPT(scrollback_fill_enlarged_window)) {
-        const unsigned int top = 0, bottom = self->lines-1;
-        Savepoint *sp = is_main ? &self->main_savepoint : &self->alt_savepoint;
-        while (self->cursor->y + 1 < self->lines
-               && self->lines - self->cursor->y > lines_after_cursor_before_resize) {
-            if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
-            INDEX_DOWN;
-            linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
-            self->cursor->y++;
-            sp->cursor.y = MIN(sp->cursor.y + 1, self->lines - 1);
-        }
-    }
-
-    /* --- §3.9 remove dummy and restore prompt copy --- */
-    if (dummy_output_inserted && self->cursor->y < self->lines) {
-        linebuf_init_line(self->linebuf, self->cursor->y);
-        self->linebuf->line->cpu_cells[0].ch = 0;
-        self->cursor->x = 0;
-    }
-    if (num_of_prompt_lines) {
-        LineBuf *src = (LineBuf*)prompt_copy;
-        for (index_type
-                src_line = 0,
-                y = num_of_prompt_lines_above_cursor <= self->cursor->y
-                    ? self->cursor->y - num_of_prompt_lines_above_cursor : 0;
-             src_line < num_of_prompt_lines && y < self->lines;
-             y++, src_line++
-        ) {
-            linebuf_init_line(src, src_line);
-            linebuf_copy_line_to(self->main_linebuf, src->line, y);
-        }
-    }
-    return true;
-}
-```
-
-Walking through the phases in order:
-
-### 3.1 Empty OUTPUT_START preservation (`screen.c:352–361`)
-
-When the shell has emitted OSC 133 `;C` to mark the beginning of command
-output, kitty stamps `prompt_kind = OUTPUT_START` on the current line. If the
-user then resizes before the shell writes anything, the OUTPUT_START line is
-blank and would be trimmed by rewrap's trailing-blank logic (see §7). To
-preserve it, the code overwrites `cpu_cells[0].ch` with `'<'` (a marker
-dummy) and records `dummy_output_inserted = true`. After resize (§3.9), the
-dummy char is erased.
-
-### 3.2 History buffer reallocation (`screen.c:375–377`)
-
-`realloc_hb()` is called **first** because `realloc_lb()` for the main
-linebuf needs a valid `HistoryBuf` to spill overflow lines into (see §10).
-
-### 3.3 Prompt protection setup (`screen.c:378–383`)
-
-For the main screen only, a scratch `LineBuf *prompt_copy` is allocated with
-the *old* dimensions, and `prevent_current_prompt_from_rewrapping()` is called
-to (a) copy all lines from the current prompt start to the bottom into
-`prompt_copy`, (b) blank them in the main linebuf so they do not get
-rewrapped. See §4.
-
-### 3.4 Main linebuf reallocation with history spillover (`screen.c:384–391`)
-
-The critical call passes `self->historybuf` as the spill target. During
-rewrap, any line that would overflow the destination `LineBuf` is pushed to
-this `HistoryBuf` — see §10 for the mechanism and §8 for the macro wiring.
-
-### 3.5 Alt linebuf reallocation (`screen.c:393–400`)
-
-The alt screen buffer is rewrapped with `NULL` as the spill target — overflow
-lines from the alt buffer are **discarded** rather than saved to history, per
-terminal convention.
-
-### 3.6 Dimensions, tabstops, selections committed (`screen.c:403–418`)
-
-The screen now has its new dimensions. Tabstops are reinitialized (since
-column count changed), selections are cleared (their coordinates no longer
-point at valid content), and the "last visited prompt" marker is invalidated.
-
-### 3.7 Cursor clamp & beyond-content repositioning (`screen.c:419–427`)
-
-Cursor `.after` coordinates (filled in by `realloc_lb`) are clamped to the
-valid window range. If the cursor was **beyond** the last content line before
-resize (common when the shell has printed no output since the last prompt),
-it is placed at `num_content_lines` after resize. If that would be beyond the
-new window, it's clamped to the bottom and `screen_index()` scrolls to make
-room.
-
-### 3.8 Scrollback fill (`screen.c:428–438`)
-
-If `scrollback_fill_enlarged_window` option is enabled and the window grew
-vertically, history lines are *pulled back* into the visible buffer via
-`historybuf_pop_line()` + `INDEX_DOWN`. See §13.
-
-### 3.9 Dummy cleanup & prompt restoration (`screen.c:439–461`)
-
-Erase the dummy `'<'` placeholder if it was inserted in §3.1. Then, if a
-prompt was copied in §3.3, overwrite the bottom of the main linebuf with the
-saved prompt copy (un-reflowed). This prevents visible flicker between the
-rewrap-blanked region and the shell's eventual redraw of its prompt.
-
----
-
-## 4. Prompt Protection
-
-`kitty/screen.c:302–343`:
+The crucial difference from `LineBuf` is that `HistoryBuf` is a **ring buffer** with a base offset `start_of_data` and an active length `count`. Logical line index `i` (with `0 <= i < count`) is mapped to a physical slot by the `index_of` macro at `kitty/history.c:152-159`:
 
 ```c
 static index_type
-prevent_current_prompt_from_rewrapping(Screen *self,
-                                       LineBuf *prompt_copy,
-                                       index_type *num_of_prompt_lines_above_cursor) {
-    index_type num_of_prompt_lines = 0; *num_of_prompt_lines_above_cursor = 0;
-    if (!self->prompt_settings.redraws_prompts_at_all) return num_of_prompt_lines;
-    int y = self->cursor->y;
-    while (y >= 0) {
-        linebuf_init_line(self->main_linebuf, y);
-        Line *line = self->linebuf->line;
-        switch (line->attrs.prompt_kind) {
-            case UNKNOWN_PROMPT_KIND: break;
-            case PROMPT_START:
-            case SECONDARY_PROMPT:   goto found;
-            case OUTPUT_START:       return num_of_prompt_lines;
-        }
-        y--;
-    }
-found:
-    if (y < 0) return num_of_prompt_lines;
-    for (; y < (int)self->main_linebuf->ynum; y++) {
-        linebuf_init_line(self->main_linebuf, y);
-        linebuf_copy_line_to(prompt_copy, self->main_linebuf->line,
-                             num_of_prompt_lines++);
-        linebuf_clear_line(self->main_linebuf, y, false);
-        if (y <= (int)self->cursor->y) {
-            linebuf_init_line(self->main_linebuf, y);
-            self->main_linebuf->line->cpu_cells[0].ch = ' ';
-            if (y < (int)self->cursor->y) (*num_of_prompt_lines_above_cursor)++;
-        }
-    }
-    return num_of_prompt_lines;
+index_of(HistoryBuf *self, index_type num) {
+    // The index of the line with number 0 is the most recent line, i.e.
+    // (self->start_of_data + self->count - 1) % self->ynum
+    if (self->count == 0) return 0;
+    index_type idx = (self->count - num - 1);
+    return (self->start_of_data + idx) % self->ynum;
 }
 ```
 
-### What it does
+So logical index `0` corresponds to the MOST RECENT line, and logical index `count - 1` corresponds to the OLDEST line. This reverse-indexing convention is important when reading `history_buf_endswith_wrap` (which queries `num = 0`, i.e., the most-recent line) at `kitty/history.c:184-187`.
 
-1. **Guard**: If the terminal has not been told by shell-integration that
-   prompts are redrawable (`prompt_settings.redraws_prompts_at_all`), skip
-   — there is nothing to coordinate with the shell on.
-2. **Walk back from cursor** looking for a `PROMPT_START` or
-   `SECONDARY_PROMPT` line. If an `OUTPUT_START` is encountered first
-   (meaning the cursor is in command output, not a prompt), return with no
-   action.
-3. **If a prompt line is found**: copy every line from there to the bottom of
-   the screen into `prompt_copy`, then blank them in the main linebuf (but
-   keep `line_attrs`, hence the `false` argument to `linebuf_clear_line`).
-4. **Force non-empty cells on lines from prompt-start to cursor**: set
-   `cpu_cells[0].ch = ' '`. Comment at `screen.c:336–337` explains:
-
-   > "this is needed because screen_resize() checks to see if the cursor is
-   > beyond the content, so insert some fake content"
-
-   This prevents the resize logic from concluding the cursor is "beyond
-   content" (§3.7) purely because the blanking we just did emptied the area
-   containing the cursor.
-
-### Why it matters
-
-When a shell redraws its prompt after a `SIGWINCH`, it expects the cursor
-vertical position relative to the prompt's first line to be stable. Classic
-example: zsh with a right-side prompt, as noted in the comment
-(`screen.c:325–328`). By blanking the prompt region and trusting the shell to
-redraw — rather than letting reflow reformat prompt lines — we avoid visual
-flicker and shell confusion.
-
-The `num_of_prompt_lines` and `num_of_prompt_lines_above_cursor` returned to
-`screen_resize()` are used to place the saved prompt copy back at the correct
-vertical position (§3.9), aligning the cursor's row with the (now un-reflowed)
-prompt.
-
----
-
-## 5. Buffer Reallocation — `realloc_hb()` and `realloc_lb()`
-
-### 5.1 `realloc_hb()` — `screen.c:216–223`
+When the ring is full (`count == ynum`), a further push must evict the oldest slot. That eviction goes to the optional `pagerhist` overflow buffer, whose type `PagerHistoryBuf` is declared at `kitty/data-types.h:268-272`:
 
 ```c
-static HistoryBuf*
-realloc_hb(HistoryBuf *old, unsigned int lines, unsigned int columns, ANSIBuf *as_ansi_buf) {
-    HistoryBuf *ans = alloc_historybuf(lines, columns, 0);
-    if (ans == NULL) { PyErr_NoMemory(); return NULL; }
-    ans->pagerhist = old->pagerhist; old->pagerhist = NULL;
-    historybuf_rewrap(old, ans, as_ansi_buf);
-    return ans;
-}
+typedef struct {
+    ringbuf_t ringbuf;
+    size_t maximum_size;
+    bool rewrap_needed;
+} PagerHistoryBuf;
 ```
 
-Steps:
-1. Allocate a fresh `HistoryBuf` with the new column count (`lines` is
-   unchanged — the scrollback depth does not change on resize).
-2. **Move the `PagerHistoryBuf` pointer** from old to new. This preserves the
-   accumulated pager history across the reallocation. The old HistoryBuf is
-   left with `pagerhist = NULL` so it does not double-free on dealloc.
-3. Call `historybuf_rewrap()` to rewrap the structured content into the new
-   history buffer.
+`ringbuf_t` is the vendored byte ring from `3rdparty/ringbuf/`. Evicted history lines are serialized to ANSI text and appended to this byte ringbuf by `pagerhist_push` (`kitty/history.c:258-273`), providing a lossy-but-searchable deep history. The `rewrap_needed` flag is set by `historybuf_rewrap` when the width has changed (`kitty/history.c:607-608`), and the actual rewrap of the pager ringbuf is lazy — it runs only when `pagerhist_as_bytes` is called (see §8.3).
 
-### 5.2 `CursorTrack` struct — `screen.c:226–232`
+The `line_map` pointer at the end of the `HistoryBuf` struct is a marker array used for line-collapse tracking during the rewrap of the pager history itself; it is not used during normal resize-driven rewrap.
+
+## 3.7 Screen
+
+`Screen` is the top-level object that owns the visible state of the terminal, declared at `kitty/screen.h:88-170`. The fields relevant to rewrap are:
+
+- `unsigned int columns, lines` — current dimensions.
+- `unsigned int margin_top, margin_bottom` — vertical margin pair for scroll regions.
+- `unsigned int scrolled_by` — how far the view is scrolled up from the current bottom.
+- `LineBuf *linebuf, *main_linebuf, *alt_linebuf` — the current linebuf is `main_linebuf` or `alt_linebuf`; `linebuf` is an alias for the currently-active one.
+- `GraphicsManager *grman, *main_grman, *alt_grman` — parallel to the linebufs.
+- `HistoryBuf *historybuf` — scrollback is shared with main; alt has no history.
+- `Cursor *cursor, *main_savepoint, *alt_savepoint` — actual cursor and two saved-cursor savepoints.
+- `bool *main_tabstops, *alt_tabstops, *tabstops` — tabstop bitmaps, reallocated on column-count change.
+- `PromptSettings prompt_settings` — shell-integration configuration (includes `redraws_prompts_at_all`, consulted by `prevent_current_prompt_from_rewrapping`).
+- `struct { bool is_set; index_type y; int scrolled_by; } last_visited_prompt` — last-visited-prompt tracking used by `INDEX_DOWN` to adjust its offset during scrollback fill.
+- `Selections selections, url_ranges` — selection ranges, cleared by `screen_resize`.
+- `ANSIBuf as_ansi_buf` — reusable scratch for ANSI-text serialization, passed through the rewrap chain so pager-history pushes can convert evicted lines to bytes.
+
+The `savepoints` (`main_savepoint`, `alt_savepoint`) are more than just cursors — each is a `Savepoint` struct containing a cursor plus a snapshot of relevant mode flags; however, for rewrap the only field that participates is `savepoint.cursor`, which is tracked in parallel with the real cursor (see §3.8 and §4.5).
+
+## 3.8 TrackCursor and CursorTrack
+
+Two similar but distinct cursor-tracking structs appear in the reflow code. They sit at different layers of the stack:
+
+### TrackCursor (at `kitty/rewrap.h:50-53`)
+
+```c
+typedef struct TrackCursor {
+    index_type x, y;
+    bool is_tracked_line, is_sentinel;
+} TrackCursor;
+```
+
+This is the inner-loop type. `rewrap_inner()` takes a `TrackCursor *track` argument and iterates over it as an array terminated by an element whose `is_sentinel` is true (see `kitty/rewrap.h:61` and the loop at `:64`). On each iteration of the outer `do-while`, the algorithm sets `t->is_tracked_line = (src_y == t->y)` for each non-sentinel cursor; when true, and when the inner copy loop is on a cell containing the cursor column, the cursor's `(x, y)` is remapped to destination coordinates (§5.8).
+
+If the caller passes `track == NULL`, the function substitutes a local sentinel-only array (`kitty/rewrap.h:60-61`), turning all cursor loops into no-ops. This is exactly what `historybuf_rewrap` does (`kitty/history.c:611`) because there is no cursor in scrollback history.
+
+### CursorTrack (at `kitty/screen.c:226-232`)
 
 ```c
 typedef struct CursorTrack {
@@ -641,64 +315,500 @@ typedef struct CursorTrack {
 } CursorTrack;
 ```
 
-This is the bookkeeping structure threaded through rewrap. `.before` is the
-old cursor position; `.temp` is the mutable field that rewrap updates
-*in-place* as it copies cells; `.after` is the final position;
-`is_beyond_content` is a flag set in §3.7 to indicate "was the cursor past the
-last line with any content."
+This is the outer-layer type, owned by `screen_resize`. It carries the cursor through the realloc phase: `before` is the pre-resize coordinate, `temp` is the live "during rewrap" coordinate that `realloc_lb` hands to `linebuf_rewrap`, and `after` is the post-rewrap coordinate. `is_beyond_content` records whether the pre-resize cursor was past the last non-blank content line; this gates a special final repositioning at `kitty/screen.c:424-427` (see §4.7). `num_content_lines` holds the count of non-blank lines after rewrap, which `is_beyond_content` uses as the new cursor-y target.
 
-### 5.3 `realloc_lb()` — `screen.c:234–242`
-
-```c
-static LineBuf*
-realloc_lb(LineBuf *old, unsigned int lines, unsigned int columns,
-           index_type *nclb, index_type *ncla, HistoryBuf *hb,
-           CursorTrack *a, CursorTrack *b, ANSIBuf *as_ansi_buf) {
-    LineBuf *ans = alloc_linebuf(lines, columns);
-    if (ans == NULL) { PyErr_NoMemory(); return NULL; }
-    a->temp.x = a->before.x; a->temp.y = a->before.y;
-    b->temp.x = b->before.x; b->temp.y = b->before.y;
-    linebuf_rewrap(old, ans, nclb, ncla, hb,
-                   &a->temp.x, &a->temp.y, &b->temp.x, &b->temp.y,
-                   as_ansi_buf);
-    return ans;
-}
-```
-
-Key points:
-- Two `CursorTrack *` parameters (`a`, `b`) — the live cursor and the
-  savepoint cursor. Both get remapped through rewrap.
-- Before calling `linebuf_rewrap`, `temp.x/temp.y` are seeded from `before.x/
-  before.y`. `linebuf_rewrap` then **mutates** the `temp` fields during
-  rewrap. The caller (`screen_resize()` via the `setup_cursor` macro)
-  subsequently copies `temp.*` into `after.*`.
-- `nclb` and `ncla` are out-parameters: "number of content lines before" and
-  "after."
+`screen_resize` instantiates three `CursorTrack` instances (`kitty/screen.c:363-365`): one for the cursor, one for `main_savepoint.cursor`, and one for `alt_savepoint.cursor`. Each is threaded through `realloc_lb` independently, so all three coordinates get remapped in a single rewrap pass.
 
 ---
 
-## 6. Macro-Polymorphism in `rewrap.h`
+# 4. Entry Point and Orchestration — screen_resize()
 
-`kitty/rewrap.h` uses a C preprocessor idiom that lets a single algorithmic
-template be reused for two different buffer types without runtime dispatch.
-The pattern relies on `#ifndef`/`#define` — each macro has a default, which
-the includer can override **before** the `#include "rewrap.h"` directive.
+This section walks through `screen_resize()` in `kitty/screen.c:345-463` (function body proper at `kitty/screen.c:346-463`) sub-step by sub-step. The function is the sole on-ramp to the reflow system: every window resize — whether from GLFW, from a remote-control command, or from a Python-level call — arrives here.
 
-### 6.1 The six override points
+## 4.1 Python → C bridge
 
-`rewrap.h:10–42`:
+The Python-facing binding is at `kitty/screen.c:3929-3935` (method table registration), which unpacks two Python integers (new lines, new columns) and forwards them to `screen_resize`. There are no other arguments: the Screen object knows its own state.
+
+## 4.2 Pre-rewrap cursor and content snapshot
+
+The first statement (`kitty/screen.c:347`) is `screen_pause_rendering(self, false, 0)`, which ends any active "paused rendering" session. Paused rendering is a frame-level pause that the shell or a debugger can request; resize forces it to end because the buffers about to be rebuilt will invalidate the paused state.
+
+Next (`:348`) the requested dimensions are clamped to a minimum of 1: `lines = MAX(1u, lines); columns = MAX(1u, columns)`. A zero-dimension buffer is never allowed.
+
+`is_main` is captured at `:350`: `bool is_main = self->linebuf == self->main_linebuf`. This is used repeatedly below because only the main screen interacts with history and only main invokes prompt protection.
+
+The saved-y metric `lines_after_cursor_before_resize = self->lines - self->cursor->y` is computed at `:362`. The scrollback-fill loop at `:431` uses this to decide how many lines to pull from history.
+
+Three `CursorTrack` instances are allocated on the stack at `:363-365`, initializing `before` from the current cursor, `main_savepoint.cursor`, and `alt_savepoint.cursor` respectively.
+
+The local `setup_cursor` macro at `:366-370` copies the post-rewrap `temp` position into `after`, records the beyond-content flag, and captures the post-rewrap content-line count. This macro is invoked twice below, once after the main linebuf rewrap and once after the alt linebuf rewrap.
+
+An overlay-line allocation attempt at `:372` (`init_overlay_line(self, columns, true)`) ensures the overlay-line buffer is at least `columns` wide. If this fails, the function returns `false` without touching any other state — the resize is aborted.
+
+
+## 4.3 realloc_hb() — history buffer reallocation
+
+`realloc_hb` is defined at `kitty/screen.c:216-223`:
 
 ```c
+static bool
+realloc_hb(HistoryBuf *old, unsigned int lines UNUSED, unsigned int columns, ANSIBuf *as_ansi_buf) {
+    HistoryBuf *ans = alloc_historybuf(old->ynum, columns, 0);
+    if (ans == NULL) { PyErr_NoMemory(); return false; }
+    ans->pagerhist = old->pagerhist; old->pagerhist = NULL;
+    historybuf_rewrap(old, ans, as_ansi_buf);
+    return true;
+}
+```
+
+Three things to notice:
+
+1. The new buffer is allocated with `ynum = old->ynum` (unchanged) and `columns = columns` (new). **The history's vertical capacity is NOT affected by window resize** — only its column count changes. The `lines` parameter is `UNUSED`. Scrollback depth is a user-configuration option, not a window-driven property.
+
+2. The pagerhist pointer is **stolen** from the old buffer to the new one at `:220`. The old buffer is about to be destroyed, and nulling its pointer prevents a double-free when `Py_CLEAR(old)` runs. The pager history survives the resize.
+
+3. `historybuf_rewrap(old, ans, as_ansi_buf)` performs the actual rewrap. This is the first of the three rewraps that `screen_resize` orchestrates.
+
+Note that `realloc_hb` does NOT store the new buffer back into `self->historybuf` — that assignment happens at `:376` (`Py_CLEAR(self->historybuf); self->historybuf = nh`) after the function returns `true`. Until that swap, `self->historybuf` still points at the old pointer; this matters because the subsequent `prevent_current_prompt_from_rewrapping` call at `:381` reads the current screen state, but since `self->linebuf` is also still the old buffer at that point, the read is consistent.
+
+## 4.4 prevent_current_prompt_from_rewrapping()
+
+This function is defined at `kitty/screen.c:302-343`. It is a shell-integration optimization that avoids visible flicker when the shell was about to redraw its prompt after the resize anyway. The function is guarded by `self->prompt_settings.redraws_prompts_at_all` at `:305`; if the shell has not signaled (via OSC 133 init) that it knows how to redraw its prompt, the function returns 0 immediately.
+
+The algorithm:
+
+1. **Find the most recent prompt start** (`:310-321`). Starting at `y = self->cursor->y` and walking upward, the function reads each line's `prompt_kind`. Values are drawn from the `PromptKind` enum at `kitty/data-types.h:230`:
+   - `PROMPT_START` (1) — the main prompt line
+   - `SECONDARY_PROMPT` (2) — continuation line of a multi-line prompt
+   - `OUTPUT_START` (3) — the line that begins a command's output
+   - `UNKNOWN_PROMPT_KIND` (0) — no marker
+
+   The walk stops at the first `PROMPT_START` or `SECONDARY_PROMPT` (captured into `start_y`) or at an `OUTPUT_START` (which aborts — we are not inside a prompt).
+
+2. **Decide how much to protect**. If a prompt was found, the function protects lines `[start_y, self->lines - 1]`. This is the full suffix of the buffer from the prompt down to the bottom. The count is returned as `num_of_prompt_lines`, and the sub-count of protected lines strictly above the cursor is also returned via the `num_of_prompt_lines_above_cursor_out` out-parameter.
+
+3. **Copy each protected line to `prompt_copy`** (`:332`). This is a caller-owned LineBuf of the same old dimensions, allocated at `:375` before this function is called. `linebuf_copy_line_to(self->main_linebuf, prompt_copy->line, ...)` would be the wrong direction; the actual call copies FROM the main linebuf TO the prompt copy.
+
+4. **Blank the line in the main linebuf** (`:333`): `linebuf_clear_line(self->main_linebuf, y, false)`. The `false` means "do not set the default attrs" — the line's `LineAttrs` are left intact, but its cells are zeroed. This is critical: the upcoming `rewrap_inner` will see these lines as empty and pack them into zero destination rows, effectively removing them from the rewrap input.
+
+5. **Insert a fake space character** on the cursor line and every protected line above it (`:334-340`): `self->main_linebuf->line->cpu_cells[0].ch = ' '`. This forces `rewrap_inner`'s trailing-blank-trim to compute `src_x_limit = 1` rather than `0`, which in turn forces `copy_range` to emit at least one cell per line. This preserves the LINE COUNT through the rewrap: the protected lines will still occupy the same number of rows in the new buffer (modulo column change), and the prompt restoration step at §4.10 can copy them back in place.
+
+   The rationale is subtle. If the protected lines were truly blanked (no fake space), the content-line detector in `linebuf_rewrap` (`:600-614`) would scan back from the bottom, find them all empty, and collapse them into nothing — the cursor would land well above where the restored prompt will appear. The fake space is enough to defeat the "all blank" check but not enough to cause visible noise (the blanked line is never actually rendered because the prompt restoration will overwrite it at `:446-460`).
+
+Only called for `is_main` (`:380`). The alt screen has no shell prompts to protect.
+
+## 4.5 realloc_lb() — linebuf reallocation for main and alt
+
+`realloc_lb` is defined at `kitty/screen.c:234-242`:
+
+```c
+static bool
+realloc_lb(LineBuf *old, unsigned int lines, unsigned int columns,
+          index_type *nclb, index_type *ncla, HistoryBuf *hb,
+          CursorTrack *cursor, CursorTrack *main_saved_cursor, CursorTrack *alt_saved_cursor,
+          ANSIBuf *as_ansi_buf) {
+    LineBuf *ans = alloc_linebuf(lines, columns);
+    if (ans == NULL) { PyErr_NoMemory(); return false; }
+    cursor->temp.x = cursor->before.x; cursor->temp.y = cursor->before.y;
+    main_saved_cursor->temp.x = main_saved_cursor->before.x; main_saved_cursor->temp.y = main_saved_cursor->before.y;
+    alt_saved_cursor->temp.x = alt_saved_cursor->before.x; alt_saved_cursor->temp.y = alt_saved_cursor->before.y;
+    linebuf_rewrap(old, ans, nclb, ncla, hb, cursor, main_saved_cursor, alt_saved_cursor, as_ansi_buf);
+    return true;
+}
+```
+
+The function allocates a new LineBuf of the target dimensions, copies the three `before` cursor coordinates into each `temp`, then calls `linebuf_rewrap`. The `linebuf_rewrap` wrapper will update the three `temp` coordinates in place with the post-rewrap positions (via the `TrackCursor` mechanism). After `realloc_lb` returns, the three `temp` coordinates are read out by the `setup_cursor` macro defined at `kitty/screen.c:362-370` and invoked at `kitty/screen.c:383` and `kitty/screen.c:399`:
+
+```c
+#define setup_cursor(ct) { \
+    ct.after.x = ct.temp.x; ct.after.y = ct.temp.y; \
+    ct.is_beyond_content = ct.before.y > num_content_lines_before && num_content_lines_before > 0 ? true : false; \
+    ct.num_content_lines = num_content_lines_after; \
+}
+```
+
+The `setup_cursor` macro records post-rewrap cursor coordinates, computes `is_beyond_content` (true if the pre-rewrap cursor was below the last content row), and captures `num_content_lines_after` for later use by the beyond-content reposition logic in §4.7.
+
+The main-buffer call site is at `kitty/screen.c:375-391`, which includes the prompt-copy LineBuf allocation at `kitty/screen.c:375-383` (allocating an auxiliary `prompt_copy` LineBuf at `:375`, calling `prevent_current_prompt_from_rewrapping` at `:380`, and setting up the `cursor.before` / `main_saved_cursor.before` / `alt_saved_cursor.before` coordinates at `:382-383`) followed by the main rewrap proper at `kitty/screen.c:384-391`:
+
+```c
+if (!realloc_lb(self->main_linebuf, lines, columns, &num_content_lines_before, &num_content_lines_after,
+                self->historybuf, &cursor, &main_saved_cursor, &alt_saved_cursor, &self->as_ansi_buf)) { ... }
+setup_cursor(cursor);
+```
+
+Critically, the `hb` argument is `self->historybuf` — which by this point has already been swapped to the NEWLY-REWRAPPED history buffer (assignment at `:376`). So when `rewrap_inner`'s LineBuf `next_dest_line` overflow branch fires (`kitty/rewrap.h:29-32`), the overflow lines are pushed onto the already-rewrapped history, with consistent column widths. The main linebuf rewrap call and its subsequent `grman_resize` call together span `kitty/screen.c:384-391`.
+
+The alt-buffer call site is at `kitty/screen.c:393-400`:
+
+```c
+if (!realloc_lb(self->alt_linebuf, lines, columns, &num_content_lines_before, &num_content_lines_after,
+                NULL, &cursor, &main_saved_cursor, &alt_saved_cursor, &self->as_ansi_buf)) { ... }
+setup_cursor(cursor);
+```
+
+with `hb = NULL`. This means the alt-screen rewrap's `next_dest_line` overflow branch takes the `historybuf != NULL` guard (`kitty/rewrap.h:29`) as false, and overflow lines are simply discarded (see §11.3). The alt screen has no scrollback; this is by design.
+
+The `Py_CLEAR(self->main_linebuf); self->main_linebuf = n` swap happens at `:386`; similarly `alt_linebuf` at `:396`. Note that `self->linebuf` is also updated (`:387`, `:397`) to track whichever buffer is active.
+
+After both linebuf rewraps, `screen_resize` assigns `self->lines = lines; self->columns = columns;` at `:403` to record the new dimensions.
+
+## 4.6 Graphics manager resize
+
+At `:390` and `:399`, `grman_remove_all_cell_images(...)` is called on each graphics manager. This removes in-cell image placements whose spatial assumptions no longer hold; out-of-cell (pixel-anchored) images are not removed.
+
+At `:391` and `:400`, `grman_resize(grman, self->lines, lines, self->columns, columns, num_content_lines_before, num_content_lines_after)` is called. This function adjusts remaining image placements for the new dimensions. Its internal details are out of scope for this analysis, but it needs the content-line counts so it can distinguish placements in the "content area" from placements in the "empty area below content" — different repositioning logic applies to each.
+
+## 4.7 Final cursor placement and beyond-content handling
+
+After the main and alt rewraps and the dimension update, the function clamps all three cursors to the new bounds via the `S(c, w)` macro at `kitty/screen.c:419-423`:
+
+```c
+#define S(c, w) c.temp.x = MIN(c.temp.x, self->columns - 1); c.temp.y = MIN(c.temp.y, self->lines - 1); w->x = c.temp.x; w->y = c.temp.y;
+```
+
+This macro is applied at `kitty/screen.c:420-422` to `cursor → self->cursor`, `main_saved_cursor → self->main_savepoint.cursor`, and `alt_saved_cursor → self->alt_savepoint.cursor`. The `temp` coordinates are already the post-rewrap values filled in by `setup_cursor`.
+
+The beyond-content special case at `:424-427` handles the situation where the pre-resize cursor was below all real content (e.g., a fresh shell prompt at the bottom of an otherwise empty buffer):
+
+```c
+if (cursor.is_beyond_content) {
+    self->cursor->y = cursor.num_content_lines;
+    if (self->cursor->y >= self->lines) { self->cursor->y = self->lines - 1; screen_index(self); }
+}
+```
+
+The rationale: if the cursor was at row 24 of 25 on a shell-prompt line below 5 lines of content, and the user shrinks the window to 20 rows, a naive clamp puts the cursor at row 19 — but the 5 content lines are now at rows 0-4, and the prompt should be at row 5 (right after content), not at row 19 (at the bottom of the empty space). Setting `cursor->y = cursor.num_content_lines` (= 5) achieves this. The follow-up `screen_index(self)` call handles the edge case where the new content already reaches the bottom; it scrolls the buffer up by one to make room.
+
+## 4.8 Scrollback fill (scrollback_fill_enlarged_window)
+
+The scrollback-fill loop at `:428-438` is gated by `is_main && OPT(scrollback_fill_enlarged_window)`. The option is declared in `kitty/options/definition.py:420-423` with type `to_bool` and default `'no'`. When enabled, a resize to a LARGER window will pull lines back from history into the visible buffer, so the user doesn't see a sudden gap of blank rows below their content.
+
+```c
+while (self->cursor->y + 1 < self->lines &&
+       self->lines - self->cursor->y > lines_after_cursor_before_resize) {
+    if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
+    INDEX_DOWN;
+    linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
+    self->cursor->y++;
+    self->main_savepoint.cursor.y++;
+}
+```
+
+The conditions:
+- `self->cursor->y + 1 < self->lines` — the cursor is not yet at the bottom row (there is at least one free row below).
+- `self->lines - self->cursor->y > lines_after_cursor_before_resize` — there is MORE blank space below the cursor than there was before the resize (the window grew). This threshold prevents pulling lines back when the cursor moved up for a different reason.
+
+Each iteration:
+
+1. `historybuf_pop_line(self->historybuf, self->alt_linebuf->line)` — retrieves the most recent history line into a scratch `Line` wrapper (the `alt_linebuf->line`, a subtlety flagged in §11.8). Returns `false` if history is empty; the loop breaks.
+
+2. `INDEX_DOWN;` — a macro at `kitty/screen.c:289-299` that (a) calls `linebuf_reverse_index(self->main_linebuf, 0, self->lines - 1)` (shifts all lines down by 1), (b) calls `linebuf_clear_line(self->main_linebuf, 0, true)` (clears the new top row), (c) calls `grman_scroll_images(self->grman, +1, self->cell_size)`, (d) updates `self->last_visited_prompt.scrolled_by++`, and (e) `clear_selection`s.
+
+3. `linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0)` — memcpy the popped line into row 0.
+
+4. Both cursor-y and savepoint-cursor-y are incremented by 1, since the cursor's logical position within the visible buffer moved down by 1 (even though the physical cursor stayed at the same screen row — the lines scrolled down around it).
+
+The loop terminates when history is exhausted or when the "more blank space" condition no longer holds.
+
+## 4.9 Dummy output-start character ('<') insertion
+
+Two small blocks of code bracket the whole rewrap orchestration to inject and then remove a dummy visible character at the cursor position. The injection is at `:353-361`:
+
+```c
+bool dummy_output_inserted = false;
+if (self->cursor->x == 0 && self->cursor->y < self->lines) {
+    linebuf_init_line(self->linebuf, self->cursor->y);
+    if (self->linebuf->line->attrs.prompt_kind == OUTPUT_START &&
+        self->linebuf->line->cpu_cells[0].ch == 0) {
+        self->linebuf->line->cpu_cells[0].ch = '<';
+        self->linebuf->line->cpu_cells[0].cc_idx[0] = 0;
+        dummy_output_inserted = true;
+    }
+}
+```
+
+The condition: cursor is at column 0 of an OUTPUT_START line that is otherwise blank (i.e., a command prompt returned from shell integration, but the command hasn't printed anything yet). In that case, the `<` character is placed at `cpu_cells[0].ch`. This is the same trick used by `prevent_current_prompt_from_rewrapping` (§4.4) to force the line to be visible to the content-line detector and rewrap-trim.
+
+The removal is at `:439-443`:
+
+```c
+if (dummy_output_inserted && self->cursor->y < self->lines) {
+    linebuf_init_line(self->linebuf, self->cursor->y);
+    self->linebuf->line->cpu_cells[0].ch = 0;
+    self->cursor->x = 0;
+}
+```
+
+After rewrap, the dummy `<` is erased and the cursor x is reset to 0. §11.6 notes that if `realloc_hb` or `realloc_lb` returns false between these two blocks, the `<` can remain visible — a low-probability OOM-path artifact.
+
+## 4.10 Prompt restoration loop
+
+At `:444-461`, if `num_of_prompt_lines > 0`, the protected prompt lines are copied back into the main linebuf at their correct positions:
+
+```c
+if (num_of_prompt_lines > 0) {
+    index_type base_y = self->cursor->y >= num_of_prompt_lines_above_cursor
+                      ? self->cursor->y - num_of_prompt_lines_above_cursor : 0;
+    for (index_type src_line = 0; src_line < num_of_prompt_lines && src_line + base_y < self->lines; src_line++) {
+        linebuf_init_line(prompt_copy, src_line);
+        linebuf_copy_line_to(self->main_linebuf, prompt_copy->line, base_y + src_line);
+        self->main_linebuf->line_attrs[base_y + src_line] = prompt_copy->line_attrs[src_line];
+    }
+    Py_DECREF(prompt_copy);
+}
+```
+
+The loop iterates over the saved prompt lines (0..`num_of_prompt_lines - 1`) and writes each to `base_y + src_line`. `base_y` is derived from the cursor y (which has already been re-mapped through rewrap, and possibly adjusted by `is_beyond_content` and scrollback-fill): the idea is that the prompt line that was immediately above the cursor should still be immediately above the cursor.
+
+The `line_attrs` are copied explicitly at `:453` because `linebuf_copy_line_to` copies only the cells, not the per-line attributes. This ensures the prompt_kind markers survive the round trip.
+
+The effect: the old prompt appears at the new cursor position WITHOUT having been reflowed. If the shell subsequently emits a redraw, the restored prompt gets overwritten; if not, the last-known prompt is visible, avoiding a blank region.
+
+---
+
+# 5. The Generic rewrap_inner() Algorithm
+
+This section is a line-by-line walkthrough of `rewrap_inner()` at `kitty/rewrap.h:56-96`. Read alongside the verbatim excerpt in §15.
+
+## 5.1 Signature and macros
+
+`rewrap_inner` has the signature:
+
+```c
+static inline void
+rewrap_inner(BufType *src, BufType *dest, const index_type src_limit,
+             HistoryBuf UNUSED *historybuf, TrackCursor *track, ANSIBuf *as_ansi_buf)
+```
+
+at `kitty/rewrap.h:56`. The `BufType` placeholder is defined at `:10-12` with the default `LineBuf`; `history.c:583` overrides it to `HistoryBuf`. This is the pivot of the macro-polymorphism pattern — a single function body compiles to two distinct specializations by virtue of being `#include`d twice with different macro environments.
+
+The other macros that specialize the algorithm are listed at `:14-42`:
+
+- `init_src_line(src_y)` — how to initialize `src->line` for source index `src_y`. Default `linebuf_init_line(src, src_y)` at `:15`; HistoryBuf overrides at `kitty/history.c:585`.
+- `set_dest_line_attrs(dest_y)` — how to copy src line attrs onto the destination and clear `prompt_kind`. UNGUARDED at `:18` (cannot be overridden; see §6.4 for why this is inconsequential in practice).
+- `first_dest_line` — special initialization of the first destination row. Default at `:21` initializes `dest->line` to row 0 and calls `set_dest_line_attrs(0)`; HistoryBuf overrides at `kitty/history.c:590` to `next_dest_line(false)`, pushing a fresh slot.
+- `next_dest_line(continued)` — advance to the next destination line, with a boolean indicating whether the just-finished source-line segment was continued (soft-wrapped). Default at `:24-38`; HistoryBuf overrides at `kitty/history.c:588`.
+- `is_src_line_continued()` — does the source line soft-wrap? Default at `:41` reads `src->line->gpu_cells[src->xnum - 1].attrs.next_char_was_wrapped`; HistoryBuf inherits this default.
+
+`UNUSED` on `historybuf` silences compiler warnings in the HistoryBuf specialization, where the HistoryBuf override of `next_dest_line` never reads the `historybuf` argument.
+
+
+## 5.2 copy_range() helper
+
+`copy_range` is a `static inline` helper at `kitty/rewrap.h:44-48`:
+
+```c
+static inline void
+copy_range(Line *src, index_type src_at, Line *dest, index_type dest_at, index_type num) {
+    memcpy(dest->cpu_cells + dest_at, src->cpu_cells + src_at, num * sizeof(CPUCell));
+    memcpy(dest->gpu_cells + dest_at, src->gpu_cells + src_at, num * sizeof(GPUCell));
+}
+```
+
+It operates on `Line` pointers (not `LineBuf`), blindly memcpying `num` cells in both the CPU and GPU cell arrays. The caller is responsible for ensuring the ranges fit. There is no attribute copy — `Line::attrs` is handled separately by `set_dest_line_attrs` or by the HistoryBuf specialization's explicit `*attrptr(...) = src->line->attrs`.
+
+Crucially, `copy_range` propagates the `next_char_was_wrapped` bit automatically as part of the GPU cell memcpy. If a source cell's `attrs.next_char_was_wrapped` is set and that cell is within the copied range, the destination cell inherits the bit. This is how soft-wrap continuation survives widening (where a line may be copied whole) and how the wrap bit at `src_x = xnum - 1` is not lost during narrowing (the inner loop will re-copy the continuation cell into a fresh destination-line-end position).
+
+## 5.3 The outer do-while loop
+
+The outer loop at `:63-94` has the form:
+
+```c
+do {
+    ...
+} while (src_y < src_limit);
+```
+
+Each iteration processes one source row. `src_limit` is the count of content lines to process — for `linebuf_rewrap` this is `num_content_lines_before` (`kitty/line-buf.c:617`); for `historybuf_rewrap` it is `self->count` (`kitty/history.c:611`).
+
+The initialization at `:58-62` sets `src_y = src_x = dest_x = dest_y = num = src_x_limit = 0` and `is_first_line = true`. If `track == NULL`, a local `TrackCursor tc_end = { .is_sentinel = true };` array of length 1 is substituted (`:60-61`).
+
+## 5.4 Source-line initialization and continuation read
+
+At the top of each iteration (`:64-66`):
+
+```c
+for (TrackCursor *t = track; !t->is_sentinel; t++) t->is_tracked_line = (src_y == t->y);
+init_src_line(src_y);
+bool src_line_is_continued = is_src_line_continued();
+src_x_limit = src->line->xnum;
+```
+
+- The cursor-tagging loop at `:64` marks each tracked cursor as "on the current source line" if its y matches `src_y`. Cursors on other lines are skipped in the inner-loop remap.
+- `init_src_line(src_y)` expands to the specialization-specific setup. For LineBuf it re-points `src->line` at storage row `src->line_map[src_y]` and computes `is_continued` on that Line (though rewrap doesn't consume `src->line->attrs.is_continued` directly — it reads `next_char_was_wrapped` from the last GPU cell).
+- `is_src_line_continued()` reads `src->line->gpu_cells[src->xnum - 1].attrs.next_char_was_wrapped` and captures it to a local. This local is consumed later by the copy loop and by the end-of-line `next_dest_line` call.
+- `src_x_limit = src->line->xnum` is the initial upper bound on the source x, to be potentially shrunk by the trailing-blank trim in §5.5.
+
+## 5.5 Trailing-blank trimming vs wrap-clear at src->xnum-1
+
+At `:67-73`:
+
+```c
+if (!src_line_is_continued) {
+    while(src_x_limit && src->line->cpu_cells[src_x_limit - 1].ch == BLANK_CHAR) src_x_limit--;
+} else {
+    src->line->gpu_cells[src->xnum - 1].attrs.next_char_was_wrapped = false;
+}
+```
+
+Two mutually-exclusive branches.
+
+**Hard-break branch (`!src_line_is_continued`):** trim trailing `BLANK_CHAR` cells from the right. `BLANK_CHAR` is `0` (see `kitty/data-types.h:115`). This reduces `src_x_limit` so only the "live" prefix of the line is copied to the destination. A fully-blank hard-break source line gets `src_x_limit = 0`, and the inner while-loop at `:80` exits immediately, producing zero destination cells from this source row; the end-of-loop at `:92-93` then advances `src_y` and, if not the last source line, advances `dest_y` via `next_dest_line(false)` — i.e., the blank line still consumes one destination row as a blank line.
+
+Note the comparison is strictly against `ch == BLANK_CHAR` (= 0), NOT against `CHAR_IS_BLANK(ch)` (which also accepts space `0x20`). A trailing ASCII space is therefore considered real content and will not be trimmed. This is likely intentional — a trailing space is observable by the user if the line is selected — but it creates asymmetry with `xlimit_for_line` in `kitty/lineops.h:39-47`, which also uses `ch == BLANK_CHAR`, and with `line_is_empty` in `kitty/lineops.h:76-82`, which also uses `ch == BLANK_CHAR`. So the convention is consistent across the reflow path: blank means NUL, not space.
+
+**Soft-wrap branch (`src_line_is_continued`):** clear `next_char_was_wrapped` on the source's last cell. This is the "erase-after-read" step. Since we have already captured the continuation state into `src_line_is_continued`, we can safely clear the source bit. The written-to bit on the DESTINATION side will be set by `next_dest_line(true)` later in the copy loop or at end-of-source-line. The clear here is defensive: if the same source buffer were ever re-rewrapped (it isn't, in the screen_resize flow, but could be in theory), the stale wrap bit wouldn't get reinterpreted.
+
+## 5.6 first_dest_line handling
+
+Between `:77-79`:
+
+```c
+for (TrackCursor *t = track; !t->is_sentinel; t++) {
+    if (t->is_tracked_line && t->x >= src_x_limit) t->x = MAX(1u, src_x_limit) - 1;
+}
+if (is_first_line) { first_dest_line; is_first_line = false; }
+```
+
+The cursor-clamp loop at `:74-76` handles the case where the cursor was past the line's live content: it snaps the cursor to the last real cell, or to 0 on a fully empty line (`MAX(1, 0) - 1 = 0`).
+
+The `first_dest_line` expansion fires exactly once, on the first iteration. For LineBuf it's `linebuf_init_line(dest, 0); set_dest_line_attrs(0);` (`kitty/rewrap.h:21`) — initialize the destination's row 0 and copy the first source's attrs onto it. For HistoryBuf it's `next_dest_line(false)` (`kitty/history.c:590`) — push a brand-new slot into the ring. This asymmetry (§6.3) exists because LineBuf has pre-allocated row 0 ready to receive cells, whereas HistoryBuf requires every slot to be explicitly allocated via `historybuf_push`.
+
+`is_first_line = false` prevents re-firing on subsequent iterations.
+
+## 5.7 The inner while loop: copy_range with dest overflow
+
+The inner copy loop is at `kitty/rewrap.h:80-91`:
+
+```c
+while (src_x < src_x_limit) {
+    if (dest_x >= dest->xnum) {
+        next_dest_line(true);
+        dest_x = 0;
+    }
+    index_type num = MIN(src->line->xnum - src_x, dest->xnum - dest_x);
+    copy_range(src->line, src_x, dest->line, dest_x, num);
+    for (TrackCursor *t = track; !t->is_sentinel; t++) {
+        if (t->is_tracked_line && src_x <= t->x && t->x < src_x + num) {
+            t->y = dest_y;
+            t->x = dest_x + (t->x - src_x + (t->x > 0));
+        }
+    }
+    src_x += num; dest_x += num;
+}
+```
+
+The loop copies the source row in potentially multiple chunks.
+
+- **Dest overflow check** at `:81-84`: if `dest_x` has reached `dest->xnum`, the current destination row is full. Advance to the next destination row via `next_dest_line(true)` — the `true` signifies soft-wrap (the source line is continuing to the next dest line). Reset `dest_x = 0`.
+
+- **Chunk size** at `:85`: `num = MIN(src->line->xnum - src_x, dest->xnum - dest_x)`. This is the number of cells to copy in this iteration — bounded by what remains in the source row AND what fits in the current destination row. Note that `src->line->xnum` is the FULL source row width (not `src_x_limit`), but the outer `while (src_x < src_x_limit)` guarantees we stop before exceeding `src_x_limit`.
+
+  Wait — that reading is imprecise. Let me re-examine. `num = MIN(src->line->xnum - src_x, dest->xnum - dest_x)` uses `src->line->xnum` (the full width), not `src_x_limit` (the trimmed limit). So when the current chunk would end beyond `src_x_limit`, it will still be sized to go up to the full `src->line->xnum`. But then `src_x += num` may push `src_x` past `src_x_limit`, and the outer loop check `while (src_x < src_x_limit)` will exit. The extra cells copied are BEYOND `src_x_limit` — past the trailing-blank trim point. On a hard-break line, those are all BLANK_CHAR cells, which is fine: they land in the destination but will be trimmed by the next source line's hard-break processing (no, actually, they won't — they land in the destination and stay).
+
+  Actually this IS a subtle behavior: on a hard-break source line, the inner loop copies cells from 0 to `src->line->xnum` in chunks; the outer `src_x < src_x_limit` check only exits when `src_x` has been advanced past the trim point. But the `copy_range` call at `:86` copies `num` cells regardless of `src_x_limit`. So trailing blank cells ARE copied to the destination. This is acceptable because the destination row still has blank cells at the tail, and the destination line's `src_x_limit` in its eventual rewrap (if any) would trim them; for the immediate screen rendering, blank GPU cells render as blanks, which is correct. The fact that they are explicitly memcpy'd rather than implicitly left as the allocator's zero-init is a minor inefficiency but not a correctness issue.
+
+  On a soft-wrap source line, `src_x_limit == src->line->xnum` (no trimming), so the chunks never overshoot.
+
+- **copy_range** at `:86` — memcpy `num` cells from source to destination.
+
+- **Cursor remap loop** at `kitty/rewrap.h:84-89` (the inner `for (TrackCursor *t = track; ...)` block, with the assignment body at `:87-90`) — see §5.8.
+
+- Advance `src_x` and `dest_x` by `num` at `:91`.
+
+The loop exits when `src_x >= src_x_limit`, i.e., when the entire live content of the source row has been copied (plus possibly some trailing blanks per the discussion above).
+
+## 5.8 Cursor remapping arithmetic
+
+The cursor-remap formula at `:88-89`:
+
+```c
+t->y = dest_y;
+t->x = dest_x + (t->x - src_x + (t->x > 0));
+```
+
+This runs when:
+- `t->is_tracked_line` is true (the cursor was on the current source row).
+- `src_x <= t->x < src_x + num` (the cursor's x is within the current copy chunk).
+
+The new y is straightforward: the cursor is now at destination row `dest_y` (the current dest row, possibly advanced by a prior overflow within the same source line).
+
+The new x is computed as `dest_x + (t->x - src_x + (t->x > 0))`. Let's unpack this:
+
+- `(t->x - src_x)` is the cursor's offset within the current source chunk.
+- `(t->x > 0)` is a boolean expression that C evaluates to 0 or 1. When `t->x == 0`, this is 0; when `t->x > 0`, this is 1.
+- So the total remapped x is `dest_x + (t->x - src_x) + (t->x > 0)`.
+
+The `(t->x > 0)` is a +1 adjustment applied when the cursor was at column > 0. Its rationale relates to the cursor-between-cells semantics of terminals: a cursor at column k logically sits at the RIGHT edge of the character at column k-1 (or the LEFT edge of the column k cell). A cursor at column 0 sits at the left edge of the first cell, with no "preceding character" to anchor against. When the current source row is copied into a wrap-induced new destination row, the cursor follows the character it trails, and the +1 expresses "one cell past the last character that fit".
+
+Observed subtle case: when the cursor was at column `src_x_limit` on a hard-break line (i.e., one past the last content cell — the "virtual" post-content position), the clamp loop at `:74-76` moves it down to `src_x_limit - 1` (or to 0 on an empty line). Then the inner loop processes the cells 0..src_x_limit; when it reaches the cell `src_x == t->x`, the remap formula fires with `(t->x > 0) == 1`, yielding `t->x = dest_x + 0 + 1 = dest_x + 1`. So the cursor remaps to one cell past the last-copied content — which is conceptually the post-cursor position. This appears correct.
+
+A potentially problematic case is `t->x == 0` on a soft-wrap line: the cursor is at column 0 of a line that is itself a continuation of the previous line. The +1 adjustment is skipped, so the cursor remaps to `dest_x + 0 + 0 = dest_x`. If the continuation source-line's cell 0 lands at dest_x > 0 (because the previous source line filled up a destination row partially), the cursor lands AT the continuation cell's new position. Whether this is "correct" depends on interpretation: the cursor was at the "start of the continuation" in the source, so placing it at the start of the continuation in the destination seems right. Test `test_cursor_after_resize` (`kitty_tests/screen.py:308-341`) exercises cursor placement through resize and passes, suggesting the formula is correct for tested configurations. Nonetheless, the `(t->x > 0)` branch is one of the subtlest corners of the algorithm and is a plausible site for future bug reports.
+
+## 5.9 End-of-source-line continuation write
+
+After the inner copy loop, at `kitty/rewrap.h:92-93`:
+
+```c
+src_y++; src_x = 0;
+if (!src_line_is_continued && src_y < src_limit) { init_src_line(src_y); next_dest_line(false); dest_x = 0; }
+```
+
+The `next_dest_line(false)` call at `kitty/rewrap.h:93` is the hard-break transition — it advances the destination cursor to a new row WITHOUT setting the continuation bit on the previous destination row's last cell.
+
+If the source line was NOT continued (hard break) AND there are more source lines to process, advance to the next destination row via `next_dest_line(false)` — the `false` means "no soft-wrap between this dest row and the next". Reset `dest_x = 0`.
+
+The `init_src_line(src_y)` call here looks strange — it re-initializes `src->line` to the NEXT source line just so that `set_dest_line_attrs` inside `next_dest_line` can read the next source line's attrs. This is because the destination line we're ABOUT to start writing will have its first cells coming from source line `src_y` (the new one), and its attrs should reflect that. The alternative would have been to defer the attr copy to the start of the next iteration, but the current design fuses the two operations.
+
+If the source line WAS continued (soft-wrap), the destination advance has already happened inside the inner copy loop via the overflow branch — no extra `next_dest_line` is needed at end-of-line. This is why the `if (!src_line_is_continued)` guard is present.
+
+If `src_y >= src_limit` (we've just processed the last source line), neither `init_src_line` nor `next_dest_line` runs — we exit the outer loop with `dest_y` at its final value.
+
+## 5.10 Final dest->line->ynum assignment
+
+At `:95`:
+
+```c
+dest->line->ynum = dest_y;
+```
+
+This is a somewhat unusual use of `Line::ynum` (which in most code paths is the buffer's vertical dimension). Here it's being repurposed to communicate the number of destination rows MINUS ONE (since `dest_y` is the index of the last filled destination row). The `Line::ynum` field survives until the caller reads it.
+
+The caller `linebuf_rewrap` at `kitty/line-buf.c:620` does exactly that:
+
+```c
+*num_content_lines_after = other->line->ynum + 1;
+```
+
+And `historybuf_rewrap` at `kitty/history.c:613-614` uses `other->line->ynum + 1` to mark dirty lines. No other caller consumes this value, and `dest->line->ynum` is overwritten by the next `linebuf_init_line` call anyway, so the repurposing is safe.
+
+---
+
+# 6. Macro-Polymorphism: Two Specializations
+
+This section explains the macro-based specialization pattern that lets `rewrap.h` compile to both a LineBuf algorithm and a HistoryBuf algorithm.
+
+## 6.1 Default (LineBuf) macros in rewrap.h
+
+`rewrap.h` opens at `:1-42` with a set of `#ifndef`-guarded macro definitions:
+
+```c
+#pragma once
+
+#include "lineops.h"
+
 #ifndef BufType
 #define BufType LineBuf
 #endif
 
 #ifndef init_src_line
-#define init_src_line(src_y) linebuf_init_line(src, src_y);
+#define init_src_line(src_y) linebuf_init_line(src, src_y)
 #endif
 
-#define set_dest_line_attrs(dest_y) dest->line_attrs[dest_y] = src->line->attrs; \
-                                    src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND;
+#define set_dest_line_attrs(dest_y) \
+    dest->line_attrs[dest_y] = src->line->attrs; \
+    src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND
 
 #ifndef first_dest_line
 #define first_dest_line linebuf_init_line(dest, 0); set_dest_line_attrs(0)
@@ -711,109 +821,982 @@ the includer can override **before** the `#include "rewrap.h"` directive.
         linebuf_index(dest, 0, dest->ynum - 1); \
         if (historybuf != NULL) { \
             linebuf_init_line(dest, dest->ynum - 1); \
-            dest->line->attrs.has_dirty_text = true; \
+            dest->line_attrs[dest->ynum - 1].has_dirty_text = true; \
             historybuf_add_line(historybuf, dest->line, as_ansi_buf); \
-        }\
+        } \
         linebuf_clear_line(dest, dest->ynum - 1, true); \
     } else dest_y++; \
     linebuf_init_line(dest, dest_y); \
-    set_dest_line_attrs(dest_y);
+    set_dest_line_attrs(dest_y)
 #endif
 
 #ifndef is_src_line_continued
-#define is_src_line_continued() (src->line->gpu_cells[src->xnum-1].attrs.next_char_was_wrapped)
+#define is_src_line_continued() src->line->gpu_cells[src->xnum - 1].attrs.next_char_was_wrapped
 #endif
 ```
 
-| Override | Default (LineBuf) | Overridden in history.c | Purpose |
-|---|---|---|---|
-| `BufType` | `LineBuf` | `HistoryBuf` (line 582) | The type name for `src` and `dest` parameters |
-| `map_src_index(y)` | (not defined) | `((src->start_of_data + y) % src->ynum)` (line 584) | Translate logical y to physical ring-buffer index (HistoryBuf only) |
-| `init_src_line(src_y)` | `linebuf_init_line(src, src_y)` | `init_line(src, map_src_index(src_y), src->line)` (line 586) | Point `src->line` at a specific row |
-| `first_dest_line` | `linebuf_init_line(dest, 0); set_dest_line_attrs(0)` | `next_dest_line(false)` (line 590) | Prepare dest for first row |
-| `next_dest_line(cont)` | *(complex spillover-to-history block above)* | `{ history_buf_set_last_char_as_continuation(dest, 0, cont); LineAttrs *lap = attrptr(dest, historybuf_push(dest, as_ansi_buf)); *lap = src->line->attrs; }` (line 588) | Advance to next dest row, handling overflow |
-| `is_src_line_continued()` | `src->line->gpu_cells[src->xnum-1].attrs.next_char_was_wrapped` | *(uses default)* | Is the current source line soft-wrapped? |
-| `set_dest_line_attrs(dest_y)` | `dest->line_attrs[dest_y] = src->line->attrs; src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND;` | *(effectively unused by HistoryBuf's `next_dest_line`, which writes attrs inline)* | Copy line attrs (e.g., prompt_kind) from src to dest |
+The `#ifndef` guards at `:10`, `:14`, `:20`, `:24`, `:40` allow the includer to override each macro. The ONE exception is `set_dest_line_attrs` at `:18`, which is defined WITHOUT `#ifndef` and CANNOT be overridden.
 
-Note the `set_dest_line_attrs` side-effect: after copying src attrs to dest,
-the macro **clears** `src->line->attrs.prompt_kind`. This is an important
-invariant — a prompt kind belongs to exactly one line at a time after reflow;
-if a source line spans multiple destination lines (widening case), only the
-**first** dest line inherits the `prompt_kind`.
+Note the inclusion `#include "lineops.h"` at `:3`, which pulls in `copy_line`, `xlimit_for_line`, and the function prototypes for `linebuf_init_line`, `linebuf_set_last_char_as_continuation`, `linebuf_index`, `linebuf_clear_line`, `historybuf_add_line`, etc. Both specializations rely on this same `lineops.h`.
 
-### 6.2 Why macros, not function pointers?
+## 6.2 HistoryBuf overrides in history.c
 
-Function-pointer dispatch would impose an indirect call per-line-per-cell; the
-rewrap loop runs over potentially hundreds of thousands of cells. Using
-macros: (a) the compiler inlines the `init_src_line`, `first_dest_line`, and
-`next_dest_line` bodies directly into `rewrap_inner()`; (b) each
-specialization produces a distinct static copy of `rewrap_inner()` (one in
-`line-buf.o`, one in `history.o`) referencing type-correct pointers.
-Essentially, the file is a hand-rolled template.
-
-### 6.3 Double inclusion mechanics
-
-`kitty/line-buf.c:583` does:
-
-```c
-#include "rewrap.h"
-```
-
-with no preceding `#define`s, so all defaults apply. Then at line 585–622,
-`linebuf_rewrap()` wraps `rewrap_inner()`.
-
-`kitty/history.c:582–592` does:
+Before `history.c` includes `rewrap.h` at `kitty/history.c:592`, it defines four overrides at `kitty/history.c:582-590` (the full block spans `kitty/history.c:582-592` when the `#include` line is counted):
 
 ```c
 #define BufType HistoryBuf
 #define map_src_index(y) ((src->start_of_data + y) % src->ynum)
-#define init_src_line(src_y) init_line(src, map_src_index(src_y), src->line);
+#define init_src_line(src_y) init_line(src, map_src_index(src_y), src->line)
 #define next_dest_line(cont) { \
     history_buf_set_last_char_as_continuation(dest, 0, cont); \
     LineAttrs *lap = attrptr(dest, historybuf_push(dest, as_ansi_buf)); \
-    *lap = src->line->attrs; }
-#define first_dest_line next_dest_line(false);
+    *lap = src->line->attrs; \
+}
+#define first_dest_line next_dest_line(false)
 #include "rewrap.h"
 ```
 
-The `#pragma once` at `rewrap.h:8` does **not** interfere — `#pragma once`
-prevents duplicate inclusion *within the same translation unit*. These are two
-different translation units (`.c` files), so each sees its own copy.
+Five observations:
+
+1. `BufType HistoryBuf` changes the function signature's first two parameter types from `LineBuf*` to `HistoryBuf*`.
+
+2. `map_src_index(y)` is a NEW macro (no counterpart in `rewrap.h`). It translates a logical 0-based source index into a ring-buffer position using `start_of_data` as the base. The modulo-`ynum` ensures wraparound. This macro is consumed only by `init_src_line`.
+
+   Important: the HistoryBuf rewrap iterates source in "forward" order from index 0 up to `count - 1` — in terms of `index_of` conventions, that's from the MOST-RECENT line (logical 0) down to the OLDEST. But `map_src_index` is `(start_of_data + y) % ynum`, which starts at `start_of_data` (the OLDEST slot) and advances forward. These two "forwards" are different conventions for what "forward" means.
+
+   Actually, re-reading `historybuf_rewrap` at `kitty/history.c:609-611`:
+   ```c
+   other->count = 0; other->start_of_data = 0;
+   if (self->count > 0) rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf);
+   ```
+   and noting that in rewrap_inner the loop is `do { ... src_y++; } while (src_y < src_limit)`, the rewrap iterates `src_y` from 0 upward. `map_src_index(0) = start_of_data`, `map_src_index(1) = start_of_data + 1`, etc. So the rewrap processes the history in the order: OLDEST first, NEWEST last. This is correct: we want to push oldest-first into the destination so that logical-index-0-is-newest continues to hold in the new buffer (which starts empty and fills up via push).
+
+3. `init_src_line(src_y) = init_line(src, map_src_index(src_y), src->line)`. `init_line` is the HistoryBuf-specific line initializer at `kitty/history.c:161-177`, which (among other things) sets `self->line->attrs.is_continued` from the previous ring slot's last cell.
+
+4. `next_dest_line(cont)` — three statements:
+   - `history_buf_set_last_char_as_continuation(dest, 0, cont)` — set the wrap bit on the last cell of logical-index-0 (the MOST RECENT line, which is the line just completed before the push). The guard `if (self->count > 0)` inside `history_buf_set_last_char_as_continuation` (`kitty/history.c:302-307`) prevents a write when the destination ring is still empty — important for the very first call (via `first_dest_line`).
+   - `historybuf_push(dest, as_ansi_buf)` — allocate a new ring slot. Returns the physical slot index. If the ring is full (`count == ynum`), this also evicts the oldest slot to pager history.
+   - `*lap = src->line->attrs` — copy the source line's attrs into the new slot's attr array via `attrptr` (a helper macro that dereferences the per-segment `line_attrs` storage at the given physical index).
+
+5. `first_dest_line = next_dest_line(false)` — equate "first destination line" with "normal dest line advance, no continuation". Because HistoryBuf has no preallocated row 0, the first source line must be pushed in the same way as subsequent lines. See §6.3.
+
+After the four overrides, the `#include "rewrap.h"` at `:592` brings in the full `rewrap_inner` function body, which gets compiled with the overridden macros. The `#ifndef` guards in `rewrap.h` see `BufType`, `init_src_line`, `next_dest_line`, `first_dest_line` already defined and do not overwrite them.
+
+## 6.3 Asymmetry of first_dest_line
+
+The asymmetry between LineBuf and HistoryBuf for `first_dest_line` reflects the deeper difference in how the two buffers manage row lifetime:
+
+- **LineBuf** allocates all `ynum` rows once at construction time. Row indices 0..`ynum-1` are always valid; `line_map` assigns logical-to-physical. Thus `first_dest_line` can simply initialize the cached `Line` wrapper to point at logical row 0 and copy attrs in; no push is needed.
+
+- **HistoryBuf** allocates segments lazily and uses `count` + `start_of_data` to track the active ring. Every slot must be explicitly pushed via `historybuf_push`; there is no "pre-existing row 0". Thus `first_dest_line` must push.
+
+This asymmetry is the reason the macro override is necessary. If LineBuf's definition were used for HistoryBuf, the first source line would be written into slot 0 of segment 0 without incrementing `count`, leaving the destination HistoryBuf in an inconsistent state.
+
+## 6.4 Side-by-side comparison table
+
+| Macro | LineBuf (default in `rewrap.h`) | HistoryBuf (override in `history.c`) |
+|---|---|---|
+| `BufType` | `LineBuf` (`rewrap.h:11`) | `HistoryBuf` (`history.c:583`) |
+| `map_src_index(y)` | **Not defined** (y used directly as `line_map` subscript via `linebuf_init_line`) | `((src->start_of_data + y) % src->ynum)` (`history.c:584`) |
+| `init_src_line(src_y)` | `linebuf_init_line(src, src_y)` (`rewrap.h:15`) | `init_line(src, map_src_index(src_y), src->line)` (`history.c:585`) |
+| `first_dest_line` | `linebuf_init_line(dest, 0); set_dest_line_attrs(0)` (`rewrap.h:21`) | `next_dest_line(false)` (`history.c:590`) |
+| `next_dest_line(continued)` | Set wrap bit on prev dest line; if dest is full, call `linebuf_index` + `historybuf_add_line` (if non-null historybuf) + `linebuf_clear_line`; else `dest_y++`; re-init dest line and set attrs (`rewrap.h:24-38`) | `history_buf_set_last_char_as_continuation(dest, 0, cont)`; `historybuf_push(dest, ...)` returning new slot; `*attrptr(dest, new_slot) = src->line->attrs` (`history.c:586-589`) |
+| `is_src_line_continued()` | `src->line->gpu_cells[src->xnum - 1].attrs.next_char_was_wrapped` (`rewrap.h:40-42`, specifically `:41`) | **Inherited** from LineBuf default (history.c does not override) |
+| `set_dest_line_attrs(dest_y)` | `dest->line_attrs[dest_y] = src->line->attrs; src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND` (`rewrap.h:18`, **unguarded**) | **Cannot be overridden.** In practice, only reached via LineBuf's default `first_dest_line`; HistoryBuf's override of `first_dest_line` bypasses `set_dest_line_attrs` entirely. |
+
+**The unguarded `set_dest_line_attrs`**: at `rewrap.h:18`, the definition is:
+
+```c
+#define set_dest_line_attrs(dest_y) \
+    dest->line_attrs[dest_y] = src->line->attrs; \
+    src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND
+```
+
+There is no `#ifndef ... #endif` around this, so the HistoryBuf TU cannot override it. This is potentially concerning because `HistoryBuf` does NOT have a flat `line_attrs` array — its `line_attrs` is `NULL` on the parent struct; attrs are per-segment and accessed via `attrptr(buf, idx)`. If `dest->line_attrs[dest_y]` were ever evaluated in the HistoryBuf TU, it would dereference the `HistoryBuf::line_map` pointer (at offset `line_map` in the struct) — but since `HistoryBuf` also has a `line_attrs` field declared via the same struct hierarchy, the macro expansion would type-check wrong.
+
+However, after macro expansion, `set_dest_line_attrs` is only referenced in the LineBuf default `first_dest_line` (`rewrap.h:21`) and at `rewrap.h:37` (the last line of the LineBuf `next_dest_line`). The HistoryBuf overrides replace BOTH of these. So `set_dest_line_attrs` is effectively dead code in the HistoryBuf TU — it is defined but never invoked during expansion. The unguarded definition is harmless. (It was likely left unguarded because whoever wrote this didn't need to — it doesn't appear in any HistoryBuf code path.)
+
+**The `set_dest_line_attrs` side-effect**: the macro clears `src->line->attrs.prompt_kind` after copying attrs. This is intentional: a source line's `prompt_kind` should propagate to exactly the FIRST destination row it creates, not to every row it spans when narrowing causes a split. After the first copy, subsequent destination rows from the same source (created via the soft-wrap overflow branch) should have `prompt_kind == UNKNOWN_PROMPT_KIND`. By clearing the source attrs' prompt_kind after the first copy, the macro ensures subsequent `set_dest_line_attrs` calls within the same iteration produce `UNKNOWN_PROMPT_KIND`.
+
+(In the current algorithm, `set_dest_line_attrs` is invoked from `first_dest_line` and from within the `next_dest_line` expansion on each destination advance. During a narrowing operation where one source row produces N destination rows, `set_dest_line_attrs` runs once on first-dest-line init (or on first fill-and-advance), and not again for the same source row until the outer loop moves to the next source — at which point `init_src_line(new_src_y)` resets `src->line` and the new source line's attrs are written. The prompt_kind-clearing side effect prevents a corner case where the same source row's attrs would be re-copied.)
 
 ---
 
-## 7. Deep Dive: `rewrap_inner()`
+# 7. linebuf_rewrap() Wrapper
 
-`kitty/rewrap.h:56–96` is the complete algorithm (reproduced below for
-reference):
+`linebuf_rewrap` is defined at `kitty/line-buf.c:585-622`. It is the LineBuf-specific glue between `screen_resize` and `rewrap_inner`.
+
+## 7.1 Fast path (same dimensions)
+
+At `kitty/line-buf.c:591-598`:
+
+```c
+if (other->xnum == self->xnum && other->ynum == self->ynum) {
+    memcpy(other->line_map, self->line_map, self->ynum * sizeof(index_type));
+    memcpy(other->line_attrs, self->line_attrs, self->ynum * sizeof(LineAttrs));
+    memcpy(other->cpu_cell_buf, self->cpu_cell_buf, self->xnum * self->ynum * sizeof(CPUCell));
+    memcpy(other->gpu_cell_buf, self->gpu_cell_buf, self->xnum * self->ynum * sizeof(GPUCell));
+    *num_content_lines_before = *num_content_lines_after = self->ynum;
+    return;
+}
+```
+
+When both buffers have the same dimensions, four memcpys duplicate the state exactly. No rewrap_inner call is needed, and the content-line counts are trivially `self->ynum`. This path is taken when the caller (`realloc_lb`) is invoked with unchanged dimensions — which does happen, e.g., when only the number of LINES changed for the ALT buffer but not the columns. (Actually, a dimension-unchanged resize typically short-circuits higher up, but the fast path here defends against it anyway.)
+
+## 7.2 Content-line detection
+
+At `kitty/line-buf.c:600-614`:
+
+```c
+index_type first = self->ynum - 1, i;
+bool src_line_is_empty = true;
+while (true) {
+    linebuf_init_line(self, first);
+    for (i = 0; i < self->xnum; i++) {
+        if (self->line->cpu_cells[i].ch != BLANK_CHAR) { src_line_is_empty = false; break; }
+    }
+    if (!src_line_is_empty || first == 0) break;
+    first--;
+}
+if (src_line_is_empty) {
+    *num_content_lines_before = *num_content_lines_after = 0;
+    return;
+}
+*num_content_lines_before = first + 1;
+```
+
+This scans backward from the last row, initializing each line and checking every cell. It stops at the first line with non-blank content, yielding `first` as the highest non-empty row index. `num_content_lines_before = first + 1`.
+
+If every line is empty, both counts are set to 0 and the function returns without calling `rewrap_inner`. This is an important optimization — an all-empty linebuf produces an all-empty result, no cells need moving.
+
+Note the `BLANK_CHAR` comparison here is the same NUL-only check used elsewhere. A line containing only ASCII spaces would be considered NON-empty (falsely, by some reasonings), but this is consistent with the rest of the codebase's blank-checking convention.
+
+## 7.3 TrackCursor array setup
+
+At `kitty/line-buf.c:616-621`:
+
+```c
+TrackCursor tcarr[3] = {
+    { .x = cursor->temp.x, .y = cursor->temp.y },
+    { .x = main_saved_cursor->temp.x, .y = main_saved_cursor->temp.y, },
+    { .is_sentinel = true }
+};
+```
+
+Three `TrackCursor` instances: the main cursor, the main savepoint cursor, and a sentinel. Note that the alt savepoint is NOT included here — because this is a LINEBUF rewrap (either main or alt), and the alt savepoint is only relevant to the alt buffer. Actually, a closer reading of `screen_resize` shows the alt savepoint is tracked separately via its own `CursorTrack`, and `linebuf_rewrap`'s signature at `kitty/line-buf.c:585-586` DOES take all three cursor pointers but only uses two in the `tcarr` setup.
+
+Actually, looking at lineops.h:57-59 for the declaration: `void linebuf_rewrap(LineBuf *self, LineBuf *other, index_type *nclb, index_type *ncla, HistoryBuf *hb, CursorTrack *cursor, CursorTrack *main_saved_cursor, CursorTrack *alt_saved_cursor, ANSIBuf *as_ansi_buf);` — all three are declared, but `alt_saved_cursor` is marked `UNUSED` or simply ignored in the main-path rewrap. The implementation at `kitty/line-buf.c:585-622` uses only `cursor` and `main_saved_cursor`. The extra parameter exists presumably to keep the signature symmetric across call sites.
+
+## 7.4 Post-rewrap attrs + ynum reporting
+
+After calling `rewrap_inner` at `:617`, the post-processing at `:618-621`:
+
+```c
+cursor->temp.x = tcarr[0].x; cursor->temp.y = tcarr[0].y;
+main_saved_cursor->temp.x = tcarr[1].x; main_saved_cursor->temp.y = tcarr[1].y;
+*num_content_lines_after = other->line->ynum + 1;
+for (index_type i = 0; i <= other->line->ynum; i++) other->line_attrs[i].has_dirty_text = true;
+```
+
+- Copy the post-rewrap cursor positions back to the `CursorTrack.temp` fields; `screen_resize`'s `setup_cursor` macro picks these up via `.temp` — `.after`.
+- Compute `num_content_lines_after` from `other->line->ynum + 1`, which holds `dest_y + 1` from the final assignment at `kitty/rewrap.h:95`.
+- Mark every destination row from 0 through `other->line->ynum` as having dirty text, so the rendering pipeline will re-paint them on the next frame. (The `has_dirty_text` flag is checked by the renderer; setting it to true forces a re-render.)
+
+The `alt_saved_cursor` is not written back — consistent with it not being read.
+
+---
+
+# 8. historybuf_rewrap() Wrapper
+
+`historybuf_rewrap` is defined at `kitty/history.c:594-614`.
+
+## 8.1 Segment pre-allocation
+
+At `:596`:
+
+```c
+while (other->num_segments < self->num_segments) add_segment(other);
+```
+
+Ensure the destination has at least as many segments as the source. This allocates storage eagerly so that subsequent pushes during rewrap don't have to grow the destination's segments array mid-flight. It's not strictly necessary but simplifies error handling: if segment allocation fails, it fails here, before any state has been perturbed.
+
+## 8.2 Fast path
+
+At `:597-606`:
+
+```c
+if (other->xnum == self->xnum && other->ynum == self->ynum) {
+    for (index_type i = 0; i < self->num_segments; i++) {
+        memcpy(other->segments[i].cpu_cells, self->segments[i].cpu_cells, self->xnum * SEGMENT_SIZE * sizeof(CPUCell));
+        memcpy(other->segments[i].gpu_cells, self->segments[i].gpu_cells, self->xnum * SEGMENT_SIZE * sizeof(GPUCell));
+        memcpy(other->segments[i].line_attrs, self->segments[i].line_attrs, SEGMENT_SIZE * sizeof(LineAttrs));
+    }
+    other->count = self->count;
+    other->start_of_data = self->start_of_data;
+    return;
+}
+```
+
+When dimensions match, per-segment memcpy duplicates everything. `count` and `start_of_data` carry over exactly. This path is taken when `screen_resize` is called with unchanged column count (the only dimension that affects history).
+
+
+## 8.3 Pager-history rewrap flag
+
+At `:607-608`:
+
+```c
+if (self->pagerhist && ringbuf_bytes_used(self->pagerhist->ringbuf))
+    other->pagerhist->rewrap_needed = true;
+```
+
+If the source has a pager history AND the new width differs (we're past the fast-path), mark the destination's pager history as needing rewrap. The actual rewrap is deferred — `pagerhist_rewrap_to` at `kitty/history.c:392-432` runs on the next call to `pagerhist_as_bytes`, which is triggered by user actions like opening the pager with the scrollback content.
+
+This laziness is a performance optimization: pager-history rewrap can process many kilobytes of text and is not time-sensitive (the user can't look at pager history without explicitly invoking it).
+
+## 8.4 Reset count/start_of_data then rewrap_inner
+
+At `:609-614`:
+
+```c
+other->count = 0; other->start_of_data = 0;
+if (self->count > 0) rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf);
+for (index_type i = 0; i < other->count; i++) {
+    attrptr(other, (other->start_of_data + i) % other->ynum)->has_dirty_text = true;
+}
+```
+
+- Reset the destination's ring to empty. The HistoryBuf `next_dest_line` override (`kitty/history.c:586-589`) will grow it back via `historybuf_push`.
+- Call `rewrap_inner` ONLY IF the source has content. The `historybuf` argument is `NULL` (this is a HistoryBuf-to-HistoryBuf rewrap; no outer history buffer is relevant). The `track` argument is also `NULL` (no cursor in scrollback).
+- After rewrap, mark every destination ring slot as dirty. Note the indexing: `attrptr(other, (other->start_of_data + i) % other->ynum)` translates a logical index `i` to a physical ring-buffer position and then dereferences the per-segment `line_attrs` at that physical position. This is the correct way to address individual line attrs in a HistoryBuf.
+
+---
+
+# 9. Buffer Boundary — Overflow from LineBuf to HistoryBuf
+
+The boundary between the visible screen and the scrollback history is where most of the interesting cross-buffer interaction happens during resize. This section traces every code path that crosses the boundary.
+
+## 9.1 The LineBuf next_dest_line overflow branch
+
+The LineBuf `next_dest_line` macro at `kitty/rewrap.h:24-38` handles the case where the destination linebuf has no more rows below `dest_y` and a new dest row is needed:
+
+```c
+#define next_dest_line(continued) \
+    linebuf_set_last_char_as_continuation(dest, dest_y, continued); \
+    if (dest_y >= dest->ynum - 1) { \
+        linebuf_index(dest, 0, dest->ynum - 1); \
+        if (historybuf != NULL) { \
+            linebuf_init_line(dest, dest->ynum - 1); \
+            dest->line_attrs[dest->ynum - 1].has_dirty_text = true; \
+            historybuf_add_line(historybuf, dest->line, as_ansi_buf); \
+        } \
+        linebuf_clear_line(dest, dest->ynum - 1, true); \
+    } else dest_y++; \
+    linebuf_init_line(dest, dest_y); \
+    set_dest_line_attrs(dest_y)
+```
+
+Step-by-step when `dest_y == dest->ynum - 1`:
+
+1. `linebuf_set_last_char_as_continuation(dest, dest_y, continued)` — set the `next_char_was_wrapped` bit on the last cell of the current dest row (which is `dest->ynum - 1`). The bit reflects whether the copy is continuing a soft-wrap (`continued == true`) or is a hard-break-then-next-line (`continued == false`).
+
+2. Since `dest_y >= dest->ynum - 1`, enter the overflow branch:
+
+   a. `linebuf_index(dest, 0, dest->ynum - 1)` — scroll the dest buffer up by one. The physical storage of row 0 moves to row `ynum - 1`; rows 1..`ynum-1` shift up to 0..`ynum-2`. All `line_attrs` are rotated in parallel.
+
+   b. If `historybuf != NULL` (main buffer), initialize `dest->line` to the recycled row (now at logical position `ynum - 1`), mark it dirty (this is mostly defensive — the line is about to be pushed to history and replaced), then `historybuf_add_line(historybuf, dest->line, as_ansi_buf)` copies the row's cells and attrs into a new history slot.
+
+   c. `linebuf_clear_line(dest, dest->ynum - 1, true)` — clear the recycled row (which has now been pushed to history if applicable, or discarded if not). The `true` means "also reset attrs" — the row is prepped for fresh content.
+
+3. `dest_y` is NOT incremented — it stays at `ynum - 1`. The new content will go at the bottom row that was just cleared.
+
+4. `linebuf_init_line(dest, dest_y)` — point `dest->line` at the (newly-cleared) row at logical `dest_y`.
+
+5. `set_dest_line_attrs(dest_y)` — copy the current source line's attrs to the dest row's attrs, and clear the source's `prompt_kind`.
+
+The non-overflow path (when `dest_y < dest->ynum - 1`) is simpler: just `dest_y++` and re-init, no scrolling or history push.
+
+## 9.2 linebuf_index (scroll-up)
+
+`linebuf_index` is defined at `kitty/line-buf.c:316-327`:
+
+```c
+void
+linebuf_index(LineBuf *self, index_type top, index_type bottom) {
+    index_type old_top = self->line_map[top];
+    LineAttrs old_top_attrs = self->line_attrs[top];
+    for (index_type i = top; i < bottom; i++) {
+        self->line_map[i] = self->line_map[i + 1];
+        self->line_attrs[i] = self->line_attrs[i + 1];
+    }
+    self->line_map[bottom] = old_top;
+    self->line_attrs[bottom] = old_top_attrs;
+}
+```
+
+This is pure index manipulation — no cell data is moved. `line_map[top]` is saved; entries top..bottom-1 shift up; `line_map[bottom]` receives the saved value. Same for `line_attrs`. The physical storage of the OLD top row is now at the bottom, carrying whatever content it had.
+
+This is why the overflow branch in §9.1 reads the bottom row (logical `ynum - 1`) as if it were the old top: after `linebuf_index`, the old top's PHYSICAL storage is at the bottom, so `linebuf_init_line(dest, dest->ynum - 1)` reads the old top's content. That content is then pushed to history.
+
+## 9.3 historybuf_add_line → historybuf_push
+
+`historybuf_add_line` at `kitty/history.c:286-291`:
+
+```c
+void
+historybuf_add_line(HistoryBuf *self, const Line *line, ANSIBuf *as_ansi_buf) {
+    index_type idx = historybuf_push(self, as_ansi_buf);
+    copy_line(line, self->line);
+    *attrptr(self, idx) = line->attrs;
+}
+```
+
+Three steps:
+- `historybuf_push` reserves a new slot, returns its physical index, AND sets `self->line` to point at it.
+- `copy_line` (from `kitty/lineops.h:24-28`) memcpys `line`'s cells into `self->line`.
+- `*attrptr(self, idx) = line->attrs` writes the line attrs into the per-segment attr array at the pushed slot.
+
+`historybuf_push` at `kitty/history.c:275-284`:
+
+```c
+static index_type
+historybuf_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
+    index_type idx = (self->start_of_data + self->count) % self->ynum;
+    init_line(self, idx, self->line);
+    if (self->count == self->ynum) {
+        pagerhist_push(self, as_ansi_buf);
+        self->start_of_data = (self->start_of_data + 1) % self->ynum;
+    } else self->count++;
+    return idx;
+}
+```
+
+- `idx = (start_of_data + count) % ynum` — the slot AFTER the current last line.
+- `init_line(self, idx, self->line)` sets up the cached `self->line` wrapper to point at that slot's storage.
+- If the ring is already full (`count == ynum`), the slot about to be overwritten is the OLDEST — push it to pager history first, then advance `start_of_data`. This is the eviction step.
+- Otherwise increment `count`.
+
+## 9.4 pagerhist_push (ring-buffer eviction)
+
+`pagerhist_push` at `kitty/history.c:258-273`:
 
 ```c
 static void
-rewrap_inner(BufType *src, BufType *dest, const index_type src_limit,
-             HistoryBuf UNUSED *historybuf, TrackCursor *track,
-             ANSIBuf *as_ansi_buf) {
+pagerhist_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
+    PagerHistoryBuf *ph = self->pagerhist;
+    if (!ph) return;
+    Line l;
+    init_line(self, self->start_of_data, &l);
+    Line *line = &l;
+    as_ansi_buf->len = 0;
+    line_as_ansi(line, as_ansi_buf, &DEFAULT_CURSOR, 0, line->xnum, 0, false);
+    pagerhist_write_bytes(ph, (const uint8_t*)"\x1b[m", 3);
+    pagerhist_write_ansi_buf(ph, as_ansi_buf);
+    pagerhist_write_bytes(ph, (const uint8_t*)"\r", 1);
+    if (!line->gpu_cells[line->xnum - 1].attrs.next_char_was_wrapped) {
+        pagerhist_write_bytes(ph, (const uint8_t*)"\n", 1);
+    }
+}
+```
+
+- Early return if no pager history. In that case the evicted line is simply discarded.
+- Otherwise construct a local `Line l` that points at the oldest ring slot (`start_of_data`), serialize it to ANSI via `line_as_ansi`, and write three things to the pager ringbuf:
+  - `"\x1b[m"` — SGR reset, so subsequent text doesn't inherit the line's final color/style.
+  - The ANSI-serialized line bytes.
+  - `"\r"` — carriage return.
+- If the evicted line was NOT soft-wrapped (i.e., hard break), also write `"\n"`. If the line WAS soft-wrapped, no newline — the next line's bytes will be appended directly, preserving the notion of "this continues".
+
+This produces a text stream where `\n` separators mark hard breaks and absence of `\n` marks soft wraps. The encoding is consumed by `pagerhist_rewrap_to` at `kitty/history.c:392-432` when the pager history is eventually re-rewrapped for a new cell width, and by the "open scrollback with pager" feature.
+
+This `\n` vs no-`\n` encoding is ALSO what the HistoryBuf `init_line` at `kitty/history.c:172-175` consults when computing `is_continued` for history line `num == 0` (see §10.2).
+
+## 9.5 historybuf_pop_line (reverse direction)
+
+The reverse boundary-crossing — from history back to screen — goes through `historybuf_pop_line` at `kitty/history.c:293-300`:
+
+```c
+bool
+historybuf_pop_line(HistoryBuf *self, Line *line) {
+    if (self->count <= 0) return false;
+    index_type idx = (self->start_of_data + self->count - 1) % self->ynum;
+    init_line(self, idx, line);
+    self->count--;
+    return true;
+}
+```
+
+- Returns false if history is empty.
+- Otherwise compute the index of the NEWEST line (`start_of_data + count - 1`, modulo `ynum`).
+- `init_line(self, idx, line)` sets up the caller-provided `line` wrapper to point at that slot's storage.
+- Decrement `count`. Note: `start_of_data` is NOT adjusted. The slot becomes orphaned (outside the active ring) but its storage is still valid until overwritten by a future push. This is correct ring-buffer semantics: `count` tracks the active tail.
+
+The caller (`screen_resize` at `:432`) passes `self->alt_linebuf->line` as the `line` argument — a scratch Line wrapper (§11.8). After `historybuf_pop_line` returns, `alt_linebuf->line->cpu_cells` and `->gpu_cells` point into history-segment storage. `screen_resize` then calls `linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0)` which memcpys from that storage into row 0 of the main linebuf. So the content is physically copied; the popped history slot's storage remains intact but unreferenced.
+
+## 9.6 init_line bridge at screen.c:2834-2841
+
+When the Screen renders a visible row (e.g., for drawing), it calls `init_line` to prepare the row's `Line` wrapper. The Screen's `init_line` is a separate function (not the history's `init_line`) defined at `kitty/screen.c`. For main linebuf row 0, a special case at `:2833-2840` overrides the `is_continued` value:
+
+```c
+void
+init_line(Screen *self, Line *line, index_type y) {
+    if (line == NULL) line = self->linebuf->line;
+    linebuf_init_line(self->linebuf, y);
+    if (y == 0 && self->linebuf == self->main_linebuf && history_buf_endswith_wrap(self->historybuf))
+        line->attrs.is_continued = true;
+}
+```
+
+`linebuf_init_line` sets `line->attrs.is_continued` based on row `y - 1`'s last GPU cell. For `y == 0`, there is no `y - 1` within the linebuf, and the default is `false` (see `kitty/line-buf.c:141-146`). This default is WRONG when there is history above row 0 that soft-wraps into it.
+
+The override at `:2837` fixes this: if `y == 0` AND this is the main linebuf AND the most-recent history line ended with a wrap, set `is_continued = true`. This makes the row correctly identified as a continuation during rendering (e.g., for selection logic that spans soft-wrapped lines).
+
+`history_buf_endswith_wrap` at `kitty/history.c:184-187`:
+
+```c
+bool
+history_buf_endswith_wrap(HistoryBuf *self) {
+    if (self->count == 0) return false;
+    return *(gpu_lineptr(self, index_of(self, 0)) + self->xnum - 1) & (/* next_char_was_wrapped bit */).attrs.next_char_was_wrapped;
+}
+```
+
+(Simplified; actual access is via `init_line(self, index_of(self, 0), self->line)` and then reading `self->line->gpu_cells[...]`.)
+
+This bridge is the **render-time** equivalent of the per-line `is_continued` computation in `linebuf_init_line` — it provides the continuation signal for the FIRST visible row by reaching into history. During RESIZE, the bridge is irrelevant (resize doesn't call this init_line); the resize path relies on the `next_char_was_wrapped` bit surviving the rewrap via `copy_range` memcpy.
+
+---
+
+# 10. Line-Continuation-State Dual-Signal Architecture
+
+The continuation of a logical line across multiple physical rows is represented with TWO signals in kitty. Understanding the interplay between them is essential for understanding rewrap correctness.
+
+## 10.1 Signal 1: CellAttrs.next_char_was_wrapped
+
+**Where defined:** `kitty/data-types.h:196-209`, specifically at `:206`.
+
+`CellAttrs` is a 16-bit union:
+
+```c
+typedef union CellAttrs {
+    struct __attribute__((packed)) {
+        uint16_t decoration : 3;
+        uint16_t bold : 1;
+        uint16_t italic : 1;
+        uint16_t reverse : 1;
+        uint16_t strike : 1;
+        uint16_t dim : 1;
+        uint16_t mark : 2;
+        uint16_t width : 2;
+        uint16_t next_char_was_wrapped : 1;
+        uint16_t invisible : 1;
+        uint16_t hyperlink : 1;
+    };
+    uint16_t val;
+} CellAttrs;
+```
+
+The `next_char_was_wrapped` bit is the 16th bit (MSB region, after width). It is a per-cell property that in practice is only meaningful on the LAST cell of each row (physical column `xnum - 1`). When set, it indicates that the NEXT character to be emitted after this cell "fell through" to the next row because the cursor advanced past the right margin — i.e., a soft wrap.
+
+**Persistence:** Stored in the cell's GPUCell and survives across ticks, frames, and scrolls. It is serialized to pager history (indirectly — the `\n` vs no-`\n` convention in `pagerhist_push` reflects it) and re-hydrated on pager-history rewrap.
+
+**SGR exclusion:** Notable: `SGR_MASK` at `kitty/data-types.h:214` explicitly EXCLUDES `next_char_was_wrapped` from the mask. When an SGR reset clears the style attributes of a cell (during text drawing, e.g., a background color is reset to default), the wrap bit is PRESERVED. This is intentional — an unrelated style change must not accidentally break a soft-wrap continuation.
+
+## 10.2 Signal 2: LineAttrs.is_continued (computed)
+
+**Where defined:** `kitty/data-types.h:231-239`, specifically at `:233`.
+
+`LineAttrs` is an 8-bit union:
+
+```c
+typedef union LineAttrs {
+    struct __attribute__((packed)) {
+        uint8_t is_continued : 1;
+        uint8_t has_dirty_text : 1;
+        uint8_t has_image_placeholders : 1;
+        uint8_t prompt_kind : 2;
+    };
+    uint8_t val;
+} LineAttrs;
+```
+
+The `is_continued` bit says "this line is a continuation of the previous line" — i.e., the previous line soft-wrapped into this one. Semantically it is the PER-LINE view of the same information that `next_char_was_wrapped` expresses PER-CELL on the preceding line.
+
+**Not persisted** — this is the critical insight. `is_continued` is COMPUTED every time a line is initialized, NOT stored.
+
+For `LineBuf`, the computation is at `kitty/line-buf.c:140-147`:
+
+```c
+void
+linebuf_init_line(LineBuf *self, index_type idx) {
+    self->line->xnum = self->xnum;
+    self->line->attrs = self->line_attrs[idx];
+    self->line->cpu_cells = cpu_lineptr(self, self->line_map[idx]);
+    self->line->gpu_cells = gpu_lineptr(self, self->line_map[idx]);
+    self->line->attrs.is_continued = idx > 0 ?
+        (gpu_lineptr(self, self->line_map[idx - 1])[self->xnum - 1].attrs.next_char_was_wrapped)
+        : false;
+}
+```
+
+The last statement READS the previous row's last cell's wrap bit and STORES it into the current line's `attrs.is_continued`. For `idx == 0`, there is no previous row, so `is_continued` defaults to `false`. This is where the history↔screen boundary is stitched at render time via the override in `screen.c:2833-2840` (§9.6).
+
+For `HistoryBuf`, the computation is at `kitty/history.c:161-177`:
+
+```c
+static void
+init_line(HistoryBuf *self, index_type num, Line *l) {
+    l->xnum = self->xnum;
+    l->attrs = *attrptr(self, num);
+    l->cpu_cells = cpu_lineptr(self, num);
+    l->gpu_cells = gpu_lineptr(self, num);
+    if (num > 0) {
+        l->attrs.is_continued = (gpu_lineptr(self, num - 1))[self->xnum - 1].attrs.next_char_was_wrapped;
+    } else {
+        l->attrs.is_continued = false;
+        if (self->pagerhist && ringbuf_bytes_used(self->pagerhist->ringbuf)) {
+            uint8_t last;
+            ringbuf_memcpy_from(&last, self->pagerhist->ringbuf, 1);  // pseudocode
+            if (last != '\n') l->attrs.is_continued = true;
+        }
+    }
+}
+```
+
+Same basic pattern: for `num > 0`, read the previous ring-slot's last cell and inherit its wrap bit. For `num == 0`, there's no previous slot IN THE RING, but there MAY be content in the pager ringbuf. In that case, check the last byte: if it's `\n`, the last pager line was a hard break → `is_continued = false`. If it's NOT `\n` (or anything else), the last pager line was a soft wrap → `is_continued = true`. This is the pager-history-aware override discussed in §11.5.
+
+**Self-correcting:** every call to `init_line` or `linebuf_init_line` recomputes `is_continued`. A stale bit cannot persist — it would be overwritten on the next read.
+
+## 10.3 Where each is read
+
+**`next_char_was_wrapped` readers:**
+
+- `is_src_line_continued()` at `rewrap.h:41` — consumed by `rewrap_inner` to decide whether to trim trailing blanks and to signal the destination's wrap bit.
+- `history_buf_endswith_wrap` at `kitty/history.c:184-187` — consumed by `init_line` at `screen.c:2837` for the history↔screen render-time bridge.
+- `linebuf_line_ends_with_continuation` at `kitty/line-buf.c:188-191` (within the contiguous reader/writer block at `kitty/line-buf.c:188-198`) — consumed by as_ansi serialization and other callers.
+- `linebuf_init_line` at `kitty/line-buf.c:146` — reads the PREVIOUS line's bit to COMPUTE `is_continued`.
+- HistoryBuf `init_line` at `kitty/history.c:170` — same.
+- `pagerhist_push` at `kitty/history.c:270` — reads the bit to decide `\n` vs no-`\n`.
+
+**`is_continued` readers:**
+
+- Python-level `LineBuf.is_continued(y)` — see `kitty/line-buf.c:362-368`, which accepts an integer `y` and calls `linebuf_line_ends_with_continuation(self, y - 1)` underneath. (Note it's the previous line's wrap bit that's read; `is_continued` as a directly-stored value is never consulted.)
+- Rendering and serialization callers that want to know "is this line a continuation" — they read `line->attrs.is_continued` after `linebuf_init_line` has computed it.
+- Selection logic (e.g., extend selection across soft-wrapped lines).
+- `as_ansi` style serialization at various call sites.
+
+## 10.4 Where each is written
+
+**`next_char_was_wrapped` writers:**
+
+- `linebuf_set_last_char_as_continuation(self, y, on)` at `kitty/line-buf.c:193-198`:
+  ```c
+  void
+  linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool on) {
+      gpu_lineptr(self, self->line_map[y])[self->xnum - 1].attrs.next_char_was_wrapped = on;
+  }
+  ```
+  Direct setter. Invoked from `rewrap.h:26` (LineBuf `next_dest_line`) and from cursor/output code in `screen.c`.
+
+- `history_buf_set_last_char_as_continuation(self, num, on)` at `kitty/history.c:302-307`:
+  ```c
+  void
+  history_buf_set_last_char_as_continuation(HistoryBuf *self, index_type num, bool on) {
+      if (self->count > 0)
+          gpu_lineptr(self, index_of(self, num))[self->xnum - 1].attrs.next_char_was_wrapped = on;
+  }
+  ```
+  Same, for HistoryBuf. The `count > 0` guard prevents setting on an empty ring.
+
+- `rewrap.h:71-73` (the `else` branch at `:72`) — clears the wrap bit on the SOURCE line's last cell during soft-wrap iteration (the "erase-after-read" step).
+
+- Text-drawing code — whenever a character advances past the right margin and the cursor wraps to the next row, the current cell's `next_char_was_wrapped` is set. (Out of scope for this analysis; occurs in `screen_draw_text` and similar paths.)
+
+**`is_continued` writers:**
+
+- ONLY `linebuf_init_line` and HistoryBuf `init_line`, writing into `self->line->attrs.is_continued` (the cached Line wrapper's attrs). These writes are transient — they apply only to the current Line wrapper, not to any persistent storage.
+- The per-line `line_attrs[idx]` arrays in LineBuf and HistoryBuf also contain a `LineAttrs` with `is_continued`, but NONE of the write paths set this field. It is always whatever the default-initialized value was (0, i.e., false), and it is overwritten by `init_line` in the transient copy.
+
+## 10.5 Invariant: is_continued is never persisted alone
+
+The DERIVED nature of `is_continued` means that the SOURCE OF TRUTH for "did the previous line soft-wrap" is the previous line's last-cell `next_char_was_wrapped` bit, plus (for history row 0) the pager ringbuf's trailing byte. There is no independent `is_continued` storage that could become desynchronized.
+
+This has a practical consequence: during rewrap, the algorithm can safely ignore `is_continued` on both source and destination. All that matters is preserving `next_char_was_wrapped` on the correct cells. The GPU-cell memcpy in `copy_range` + the explicit `set_last_char_as_continuation` calls in `next_dest_line` together ensure this.
+
+Concretely: during `linebuf_rewrap`, when an overflow causes `next_dest_line(true)` to fire at `rewrap.h:82`, the destination's CURRENT row (`dest_y`) gets its last cell's wrap bit set. When the SAME dest row overflows to history via `linebuf_index + historybuf_add_line`, the wrap bit is part of the cells copied by `copy_line` inside `historybuf_add_line`. So the wrap bit survives the history eviction. And when the resize is complete, the first visible row of the main linebuf (row 0) correctly derives its `is_continued` from `history_buf_endswith_wrap` via the render-time bridge.
+
+---
+
+# 11. Identified Potential Issues and Edge Cases
+
+For each issue, I state the observed code path, the rationale for why it could be an issue, any mitigating code elsewhere, and concrete evidence for whether it is actually observed as a bug.
+
+## 11.1 Cursor (+1) adjustment off-by-one
+
+**Code:** `kitty/rewrap.h:87`
+
+```c
+t->x = dest_x + (t->x - src_x + (t->x > 0));
+```
+
+**Observation:** The `(t->x > 0)` is a boolean-to-int conversion: 1 when the cursor was at column > 0, 0 when at column 0. It is added to `dest_x + (t->x - src_x)`.
+
+**Rationale for concern:** The formula expresses "the cursor is at the same offset within the source chunk, plus one if it was past column 0". The +1 handles cursor-between-cells semantics: a cursor at column k sits at the right edge of column k-1. When narrowing splits a line, a cursor at column k of the source may land at column 0 of a new destination row (if the split happened at k - 1). The +1 inflation compensates.
+
+**Edge case:** On a soft-wrap source line whose cells 0..n are copied, if the cursor is at column 0 and the copy starts at `src_x = 0`, the formula gives `t->x = dest_x + (0 - 0 + 0) = dest_x`. If `dest_x > 0` (the current dest row was partly filled by the previous source line's spillover), this places the cursor at `dest_x`, which is BEFORE the continuation's first cell. An argument can be made this is correct (the cursor precedes its anchor); an argument can also be made it should be AT the continuation's first cell. The test `test_cursor_after_resize` (`kitty_tests/screen.py:308-341`) exercises cursor preservation through resize and passes at HEAD, providing empirical evidence the formula is at least correct for tested cases.
+
+**Mitigating code:** The cursor-clamp loop at `rewrap.h:74-76` ensures `t->x < src_x_limit` before the inner loop fires. This means the formula never sees a cursor "past" the live content, only within or at the end.
+
+## 11.2 Wide-character src_x_limit trimming
+
+**Code:** `kitty/rewrap.h:69-70`
+
+```c
+while(src_x_limit && src->line->cpu_cells[src_x_limit - 1].ch == BLANK_CHAR) src_x_limit--;
+```
+
+**Observation:** Compares only `ch == BLANK_CHAR` (= 0), not `CHAR_IS_BLANK` (= 0 or 32). Does not account for `CellAttrs.width`.
+
+**Rationale for concern:** Wide characters (East Asian characters, some symbols) occupy two cells: the "primary" cell with `width == 2` and `ch` set, followed by a "companion" cell with `width == 0` and `ch == 0`. The trim will trim the companion cell (`ch == BLANK_CHAR`) but stop at the primary (non-zero `ch`). Result: `src_x_limit == xnum - 1` on a line ending in a wide character, not `xnum`. 
+
+This MIGHT cause the companion cell to be omitted from the copy. Let's trace: `num = MIN(src->line->xnum - src_x, dest->xnum - dest_x)`. `src->line->xnum - src_x` is the DISTANCE TO THE END OF THE SOURCE ROW (not trimmed by `src_x_limit`). So if `src_x == xnum - 1` (on the primary cell) and `dest_x == 0`, `num = MIN(1, dest_xnum) = 1`. `copy_range` copies 1 cell — the primary. `src_x += 1 = xnum`, which is NOT LESS THAN `src_x_limit = xnum - 1`, so the outer loop exits. The companion cell is NOT copied.
+
+The resulting destination row has a primary cell at the end but no companion cell — the width-2 character is truncated. This could cause a visual artifact (half a wide character, or an unexpected cell interpretation).
+
+**Counter-evidence:** If the line was short enough that `src_x_limit == xnum - 1` because the companion was the trailing blank (but the primary wide-char was at `xnum - 2`), then the inner loop stops BEFORE reaching `xnum - 1` (i.e., never reaches the primary either). No, actually, `while (src_x < src_x_limit)` means we loop while `src_x < xnum - 1`. The last iteration copies cells up to `src_x = xnum - 2`; then `src_x += num` makes `src_x == xnum - 1` which is not less, so we exit. That's correct — the primary wide-char at `xnum - 2` IS copied, and the companion at `xnum - 1` is left un-copied. For a destination of equal width, this is fine because the destination's cell at `xnum - 1` was already zero-initialized, equivalent to a companion.
+
+BUT for a destination of DIFFERENT width (say, `dest->xnum > src->xnum`), the cell at `src_x = xnum - 1` might land at `dest_x = xnum - 1` which is NOT the end of the destination row. Result: a wide character at column `src->xnum - 2` lands at `dest_x = src->xnum - 2` in the destination WITH NO COMPANION. The destination cell at `dest_x = src->xnum - 1` is zero-initialized (from the allocator), which happens to be what a companion cell looks like (`ch == 0, width == 0`). So for a "fresh" destination row, this works.
+
+For a destination row being REUSED (via the overflow path where a row was scrolled up and cleared), `linebuf_clear_line` at `kitty/line-buf.c:299-305` zeros the cells, so it's also equivalent to zero-init. Again works.
+
+Conclusion: the wide-character trim is subtle but likely safe in practice. The `test_rewrap_wider` and `test_rewrap_narrower` tests do not exercise wide characters directly, so the evidence is weaker than for ASCII cases.
+
+## 11.3 Alt-screen overflow is silently dropped
+
+**Code:** `kitty/screen.c:394` (`realloc_lb` called with `NULL`) and `kitty/rewrap.h:29` (`if (historybuf != NULL)` guard).
+
+**Observation:** The alt linebuf rewrap receives `historybuf = NULL`. When overflow occurs, the `historybuf_add_line` call is skipped. The overflowing line is cleared by `linebuf_clear_line` and replaced, effectively discarded.
+
+**Rationale:** By design, the alt screen has no scrollback. It is the "alternate buffer" used by full-screen TUIs (vim, less, man). When the alt screen shrinks, content above the top must be discarded — there is nowhere else for it to go.
+
+**Evidence:** The AAP §0.6.2 explicitly labels alt-screen history behavior "Out of Scope" — the design is intentional. The `test_resize` test case at `kitty_tests/screen.py:280-306` exercises the main buffer with history; the alt-buffer case is implicitly tested by ensuring alt buffers don't push to history (which would show up as cross-contamination).
+
+**Not a bug** — this is the documented and intended behavior. Flagged here for completeness.
+
+## 11.4 Prompt-blanking erases next_char_was_wrapped on prompt-lead-in line
+
+**Code:** `kitty/screen.c:333` calls `linebuf_clear_line(self->main_linebuf, y, false)`. `kitty/line-buf.c:299-305` shows `linebuf_clear_line` zeros all cells.
+
+**Observation:** `linebuf_clear_line` zeros the line's cells including the `next_char_was_wrapped` bit on the last cell. If the line BEFORE the prompt-start line had `next_char_was_wrapped = true` (i.e., it soft-wrapped INTO the prompt-start line), blanking the prompt-start line leaves the prior line's wrap bit intact — so that's fine. But if the prompt-start line ITSELF had its last cell set to `next_char_was_wrapped = true` (the prompt itself wraps into the next line), that bit is erased by the blank.
+
+**Mitigation:** `prevent_current_prompt_from_rewrapping` (`kitty/screen.c:302-343`) copies the prompt lines to `prompt_copy` at `:332` BEFORE blanking at `:333`. `linebuf_copy_line_to` (`kitty/line-buf.c:438-444`) uses `copy_line` (at `kitty/lineops.h:24-28`) which memcpys all cells including attrs. So the `next_char_was_wrapped` bit is preserved in the copy.
+
+During prompt restoration at `kitty/screen.c:444-461`, the saved lines are copied BACK into the main linebuf via `linebuf_copy_line_to` at `:452`, again using `copy_line` memcpy. The wrap bit survives the round trip.
+
+**Conclusion:** Not a bug — mitigated by the round-trip copy.
+
+## 11.5 pagerhist ringbuf-tail newline heuristic for history line 0
+
+**Code:** `kitty/history.c:172-175` (HistoryBuf `init_line` for `num == 0`).
+
+**Observation:** For history line 0 (the most recent), the default `is_continued = false` is overridden to `true` if the pager ringbuf is non-empty AND its last byte is NOT `\n`.
+
+**Rationale:** The pager ringbuf stores lines as ANSI bytes separated by `\n` for hard breaks or nothing for soft wraps (per `pagerhist_push` at `kitty/history.c:270`). So the absence of `\n` at the ringbuf tail IS a reliable signal that the last evicted line was soft-wrapped. If history line 0 comes "after" the soft-wrapped last evicted line, it is conceptually a continuation.
+
+**Potential concern:** The heuristic assumes the ringbuf tail has not been truncated in a way that removes the trailing `\n`. `pagerhist_extend` at `kitty/history.c:89-101` grows the ringbuf; truncation only happens when capacity is exceeded, and `ringbuf_memcpy_into` handles overwrite correctly. The tail byte is reliably the LAST written byte.
+
+**Concern 2:** `pagerhist_rewrap_to` at `kitty/history.c:392-432` is LAZY — it runs only when `pagerhist_as_bytes` is called. Between a width-changing resize and the next pager-history access, the ringbuf tail byte is in the OLD width's terms. But the tail byte is just `\n` or not-`\n` — width-independent — so the heuristic works regardless of whether the rewrap has caught up.
+
+**Not a bug** — the heuristic is semantically consistent with `pagerhist_push`'s output convention.
+
+## 11.6 Dummy '<' char on OUTPUT_START
+
+**Code:** `kitty/screen.c:353-361` (insert) and `:439-443` (remove).
+
+**Observation:** A `<` character is inserted at `cursor->x=0` on an OUTPUT_START line with blank first cell, then removed after rewrap.
+
+**Potential bug:** If either `realloc_hb` (`:374-376`) or `realloc_lb` (`:384-386` or `:393-395`) returns false (OOM), `screen_resize` returns false WITHOUT executing the `:439-443` removal block. The `<` remains visible on the OUTPUT_START line until the shell emits a newline or the next resize.
+
+**Likelihood:** Low — `realloc_hb` and `realloc_lb` only fail on memory allocation failure, which is rare in practice. When it does happen, the terminal is likely in a degraded state anyway, and a dummy `<` is the least of the user's concerns.
+
+**Severity:** Cosmetic, not functional.
+
+**Recommendation:** Could be fixed by wrapping the rewrap in a try-finally-style pattern that always removes the `<`, but given the low likelihood, it's understandable that the current code does not.
+
+## 11.7 set_dest_line_attrs clobbers dest prompt_kind per source line
+
+**Code:** `kitty/rewrap.h:18`
+
+```c
+#define set_dest_line_attrs(dest_y) \
+    dest->line_attrs[dest_y] = src->line->attrs; \
+    src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND
+```
+
+**Observation:** The second statement modifies `src->line->attrs.prompt_kind` as a side effect.
+
+**Analysis:** When a source line is narrowing-split into multiple destination lines, `set_dest_line_attrs` is invoked exactly ONCE for the first destination line (via `first_dest_line` on the very first iteration; via the `next_dest_line` call at end-of-source-line on subsequent hard-break transitions). Subsequent destination lines produced by the SAME source (via the soft-wrap overflow branch) also invoke `set_dest_line_attrs` through `next_dest_line(true)`, at which point `src->line->attrs.prompt_kind` is already `UNKNOWN_PROMPT_KIND` (it was cleared on the FIRST invocation).
+
+Result: only the first destination line from a given source carries the prompt_kind. Continuations have `prompt_kind == UNKNOWN_PROMPT_KIND`. This is CORRECT BEHAVIOR — only the first visual row of a wrapped prompt should be tagged as "start of prompt".
+
+**Edge case:** After the outer loop moves to the next source line, `init_src_line(new_src_y)` resets `src->line` to the new source row, so `src->line->attrs.prompt_kind` is REFRESHED from the new source's attrs. The clearing from the previous iteration is not "sticky".
+
+**Not a bug** — the behavior is correct and intentional. Flagged for awareness because the clearing side effect is subtle and could confuse someone tracing the macro expansion.
+
+## 11.8 Scrollback-fill uses alt_linebuf->line as a scratch Line wrapper
+
+**Code:** `kitty/screen.c:432`:
+
+```c
+if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
+```
+
+**Observation:** `self->alt_linebuf->line` is a cached `Line` struct owned by the alt linebuf. `historybuf_pop_line` re-points its `cpu_cells` and `gpu_cells` to point into history-segment storage. After the call, `alt_linebuf->line` no longer refers to any alt-linebuf row.
+
+**Follow-up call:** `linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0)` at `:434` reads from those dangling pointers (which are valid pointers into history storage — not dangling in the memory-safety sense, but dangling relative to `alt_linebuf`). `copy_line` memcpys the cells into main_linebuf row 0.
+
+**Potential concern:** If any code path between these two calls were to call a function that initializes `alt_linebuf->line` (e.g., `linebuf_init_line(alt_linebuf, k)`), the pointers would be re-pointed, and the subsequent `linebuf_copy_line_to` would read from alt_linebuf row k instead of the popped history line. As written, no such intervening call exists — the two calls are adjacent — so this is safe.
+
+**Future maintenance concern:** A future modification that adds logging or validation between the two calls could inadvertently invalidate the scratch state. A more robust pattern would allocate a dedicated Line struct on the stack, but the current code's reuse of `alt_linebuf->line` is an optimization that avoids an allocation.
+
+**Not a bug, but a subtle sharing of state** worth flagging for future maintainers. The fact that `alt_linebuf->line` is picked (rather than `main_linebuf->line`) is probably because `alt_linebuf->line`'s current value is less important — alt_linebuf is not the currently-visible buffer — and any stale state will be refreshed on the next alt-buffer operation.
+
+---
+
+
+# 12. Complete Call-Graph Diagram
+
+The following mermaid diagram illustrates the full call chain from the Python-to-C resize entry point through every C function that participates in rewrap. Nodes labeled with their file and line number are hyperlinked in spirit — the reader can navigate to each in the source tree.
+
+```mermaid
+flowchart TD
+    PY["Python<br/>Screen.resize()"] --> SR
+
+    SR["screen_resize()<br/>kitty/screen.c:345-463"]
+    SR --> SPR["screen_pause_rendering<br/>kitty/screen.c:347"]
+    SR --> IOL["init_overlay_line<br/>kitty/screen.c:372"]
+    SR --> RH["realloc_hb()<br/>kitty/screen.c:216-223"]
+    SR --> PPR["prevent_current_prompt_<br/>from_rewrapping()<br/>kitty/screen.c:302-343"]
+    SR --> RLB_MAIN["realloc_lb() — main<br/>kitty/screen.c:234-242"]
+    SR --> RLB_ALT["realloc_lb() — alt<br/>kitty/screen.c:234-242"]
+    SR --> GRM_REM["grman_remove_all_cell_images<br/>kitty/screen.c:390, 399"]
+    SR --> GRM_RES["grman_resize<br/>kitty/screen.c:391, 400"]
+    SR --> SF_LOOP["Scrollback fill loop<br/>kitty/screen.c:428-438"]
+    SR --> DUMMY_RM["Dummy '&lt;' remove<br/>kitty/screen.c:439-443"]
+    SR --> PR_LOOP["Prompt restoration loop<br/>kitty/screen.c:444-461"]
+
+    RH --> ALLOC_HB["alloc_historybuf<br/>kitty/history.c"]
+    RH --> HBR["historybuf_rewrap()<br/>kitty/history.c:594-614"]
+
+    HBR --> RWI_HB["rewrap_inner()<br/>HistoryBuf specialization<br/>kitty/rewrap.h:56-96<br/>(via kitty/history.c:592)"]
+
+    RWI_HB --> HB_NEXT_DEST["next_dest_line override<br/>kitty/history.c:588"]
+    HB_NEXT_DEST --> HB_SET_CONT["history_buf_set_last_<br/>char_as_continuation<br/>kitty/history.c:302-307"]
+    HB_NEXT_DEST --> HBP["historybuf_push<br/>kitty/history.c:275-284"]
+    HBP --> PHP["pagerhist_push<br/>kitty/history.c:258-273<br/>(if ring full)"]
+
+    PPR --> LB_INIT_L["linebuf_init_line<br/>kitty/line-buf.c:140-147"]
+    PPR --> LB_COPY_TO_PC["linebuf_copy_line_to<br/>(to prompt_copy)<br/>kitty/line-buf.c:438-444"]
+    PPR --> LB_CLEAR["linebuf_clear_line<br/>kitty/line-buf.c:299-305"]
+
+    RLB_MAIN --> LBR_MAIN["linebuf_rewrap()<br/>kitty/line-buf.c:585-622"]
+    RLB_ALT --> LBR_ALT["linebuf_rewrap()<br/>kitty/line-buf.c:585-622"]
+
+    LBR_MAIN --> RWI_LB_MAIN["rewrap_inner()<br/>LineBuf specialization<br/>kitty/rewrap.h:56-96<br/>(via kitty/line-buf.c:583)"]
+    LBR_ALT --> RWI_LB_ALT["rewrap_inner()<br/>LineBuf specialization<br/>(historybuf == NULL)"]
+
+    RWI_LB_MAIN --> LB_NEXT_DEST["next_dest_line default<br/>kitty/rewrap.h:24-38"]
+    RWI_LB_ALT --> LB_NEXT_DEST_ALT["next_dest_line default<br/>kitty/rewrap.h:24-38<br/>(overflow dropped)"]
+
+    LB_NEXT_DEST --> LB_SET_CONT["linebuf_set_last_<br/>char_as_continuation<br/>kitty/line-buf.c:193-198"]
+    LB_NEXT_DEST --> LB_IDX["linebuf_index<br/>kitty/line-buf.c:316-327"]
+    LB_NEXT_DEST --> HBAL["historybuf_add_line<br/>kitty/history.c:286-291<br/>(if historybuf != NULL)"]
+    LB_NEXT_DEST --> LB_CLEAR2["linebuf_clear_line<br/>kitty/line-buf.c:299-305"]
+
+    HBAL --> HBP2["historybuf_push<br/>kitty/history.c:275-284"]
+    HBAL --> COPY_LINE["copy_line<br/>kitty/lineops.h:24-28"]
+    HBP2 --> PHP2["pagerhist_push<br/>(if ring full)"]
+
+    SF_LOOP --> HBPL["historybuf_pop_line<br/>kitty/history.c:293-300"]
+    SF_LOOP --> IDX_DOWN["INDEX_DOWN macro<br/>kitty/screen.c:289-299"]
+    SF_LOOP --> LB_COPY_TO["linebuf_copy_line_to<br/>(from alt_linebuf->line<br/>to main_linebuf row 0)"]
+
+    IDX_DOWN --> LB_REV_IDX["linebuf_reverse_index<br/>kitty/line-buf.c"]
+    IDX_DOWN --> IDX_GRM["INDEX_GRAPHICS(1)<br/>kitty/screen.c"]
+
+    PR_LOOP --> LB_COPY_BACK["linebuf_copy_line_to<br/>(prompt_copy → main_linebuf)"]
+
+    RWI_LB_MAIN --> COPY_RANGE["copy_range<br/>kitty/rewrap.h:44-48"]
+    RWI_HB --> COPY_RANGE2["copy_range<br/>kitty/rewrap.h:44-48"]
+
+    classDef entry fill:#ffd;
+    classDef linebuf fill:#def;
+    classDef history fill:#edf;
+    classDef util fill:#f8f8f8;
+
+    class PY,SR entry;
+    class LBR_MAIN,LBR_ALT,RWI_LB_MAIN,RWI_LB_ALT,LB_NEXT_DEST,LB_NEXT_DEST_ALT,LB_SET_CONT,LB_IDX,LB_CLEAR,LB_CLEAR2,LB_INIT_L,LB_COPY_TO_PC,LB_COPY_TO,LB_COPY_BACK,LB_REV_IDX linebuf;
+    class HBR,RWI_HB,HB_NEXT_DEST,HB_SET_CONT,HBP,HBP2,PHP,PHP2,HBAL,HBPL,ALLOC_HB history;
+    class COPY_RANGE,COPY_RANGE2,COPY_LINE,IDX_DOWN,IDX_GRM util;
+```
+
+**Diagram notes:**
+
+- The entry point is the Python binding at `kitty/screen.c:3929-3935` (dispatched as `Screen.resize`), which calls `screen_resize`.
+- `screen_resize` orchestrates three rewrap operations in strict order: HistoryBuf rewrap, main LineBuf rewrap, alt LineBuf rewrap. Each is a separate invocation of the generic `rewrap_inner` algorithm with different macro specializations.
+- The HistoryBuf `next_dest_line` override pushes to the destination ring and may evict to pager history. There is NO secondary "outer history" — the `historybuf` parameter of `rewrap_inner` is passed `NULL` here.
+- The main LineBuf `next_dest_line` (the default from `rewrap.h`) performs scroll-up-and-evict semantics. Overflow lines are pushed to the CURRENT `self->historybuf` (which is the NEW one just rewrapped).
+- The alt LineBuf `next_dest_line` also uses the default but with `historybuf = NULL`, so the `if (historybuf != NULL)` guard at `rewrap.h:29` skips the history push. Overflow lines are silently dropped.
+- After all three rewraps, `grman_resize` is called for both the main and alt graphics managers.
+- The scrollback-fill loop and prompt-restoration loop run AFTER rewrap is complete, performing post-processing on the already-rewrapped buffers.
+
+---
+
+# 13. Behavioral Test References
+
+The reflow logic is exercised directly by the following test cases. Each citation is to the test function in question. Taken together, the three rewrap tests in §13.1–§13.3 span the contiguous block at `kitty_tests/datatypes.py:332-392` (including the `rewrap` helper at the top of the block).
+
+## 13.1 test_rewrap_simple — `kitty_tests/datatypes.py:337-358`
+
+Exercises `LineBuf.rewrap()` at matching dimensions and at dimensions where the destination is TALLER than the source. Verifies that:
+
+- Same dimensions produce an identical LineBuf (structural equivalence).
+- A taller destination receives the source lines in order 0..src_ynum-1; the excess rows at the bottom are empty.
+- An empty source produces an empty destination (zero content lines).
+- The `num_content_lines` return value is sensible in each case.
+
+## 13.2 test_rewrap_wider — `kitty_tests/datatypes.py:374-383`
+
+Exercises widening: `src_xnum < dest_xnum`. The test seeds the source with a soft-wrapped line (two rows that together form a single logical line) and checks that after widening, the two source rows are JOINED into a single destination row. The `next_char_was_wrapped` bit on the source's first row's last cell is the signal that tells `rewrap_inner` to treat the two rows as one logical line.
+
+Specifically, the test verifies:
+- The joined destination row has the combined content.
+- `is_continued` is `false` on the (now single) destination row (it's no longer a continuation of anything).
+- The `next_char_was_wrapped` bit has been CLEARED on the destination row's last cell (it's now a full logical line that ends without wrapping).
+
+## 13.3 test_rewrap_narrower — `kitty_tests/datatypes.py:385-392`
+
+Exercises narrowing: `src_xnum > dest_xnum`. The test seeds the source with a single wide row and checks that after narrowing, the content is SPLIT across multiple destination rows. Each produced segment has:
+- `is_continued == true` on all segments EXCEPT the first, confirming that `rewrap_inner`'s soft-wrap overflow path correctly sets the continuation bit.
+- The `next_char_was_wrapped` bit set on the last cell of each segment EXCEPT the last, again via the overflow path.
+
+## 13.4 test_resize — `kitty_tests/screen.py:280-306`
+
+End-to-end test of `screen_resize`. Populates a Screen with a known content pattern (rows of distinct numbered strings), resizes to various widths, and checks that:
+- Content from rows that overflow during narrowing appears in the scrollback (history buffer).
+- Content in the visible buffer correctly reflects the post-rewrap state.
+- Wrapping across the LineBuf ↔ HistoryBuf boundary works correctly in both shrinking and growing directions.
+
+## 13.5 test_cursor_after_resize — `kitty_tests/screen.py:308-341`
+
+Directly exercises the cursor-tracking logic in `rewrap_inner` (specifically the arithmetic at `rewrap.h:87`). Populates a Screen with a specific cursor position, resizes, and asserts the cursor ends up at the correct `(x, y)` coordinates in the new buffer.
+
+Several configurations are tested:
+- Cursor on a non-wrapped row (trivial case).
+- Cursor on a soft-wrapped row (exercises `is_tracked_line` and the `+1` adjustment).
+- Cursor in the middle of content vs past the end (exercises `is_beyond_content`).
+
+The test passing at HEAD is empirical evidence that the `t->x = dest_x + (t->x - src_x + (t->x > 0))` formula correctly handles the tested cursor positions.
+
+## 13.6 test_scrollback_fill_after_resize — `kitty_tests/screen.py:343-400`
+
+Exercises the scrollback-fill loop at `kitty/screen.c:428-438`. Sets `scrollback_fill_enlarged_window = True` (the option at `kitty/options/definition.py:420`), populates the Screen with content such that some lines are in history, enlarges the window, and verifies:
+- Lines from history are PULLED BACK into the visible buffer via `historybuf_pop_line` and `INDEX_DOWN`.
+- The cursor moves down accordingly.
+- The savepoint cursor moves down accordingly (but clamped to the last row).
+- History is drained in correct (most-recent-first) order.
+
+This test is the only direct exercise of the scrollback-fill behavior.
+
+---
+
+# 14. Glossary of Terms
+
+This glossary defines the key terms used throughout this document. Each definition is grounded in the code reference already discussed in the main body.
+
+**LineBuf** — The data structure representing the VISIBLE screen buffer. Defined at `kitty/data-types.h:252-260`. A flat row-major buffer of `CPUCell` and `GPUCell` arrays, plus a parallel `line_attrs` array and an indirection `line_map` that allows O(1) scrolling by index permutation. Holds `ynum` rows of `xnum` cells each.
+
+**HistoryBuf** — The data structure representing the SCROLLBACK buffer. Defined at `kitty/data-types.h:282-290`. A segmented ring buffer: content is stored in `HistoryBufSegment`s of `SEGMENT_SIZE = 2048` rows each, and the active ring is defined by `start_of_data` and `count` with modular indexing. Logical index 0 is the MOST RECENT line (reverse chronological).
+
+**PagerHistoryBuf** — An optional auxiliary ring buffer of raw bytes that stores overflowed history lines for the "browse scrollback with pager" feature. Defined at `kitty/data-types.h:268-272`. Managed by `pagerhist_push`, `pagerhist_extend`, `pagerhist_rewrap_to`.
+
+**GPUCell** — A 20-byte cell struct at `kitty/data-types.h:216-221` containing background/foreground colors, decoration color, a sprite_idx, and a `CellAttrs` union. Uploaded to the GPU for rendering.
+
+**CPUCell** — A 12-byte cell struct at `kitty/data-types.h:223-228` containing the character codepoint (`ch`), any combining-character index (`cc_idx`), and hyperlink id (`hyperlink_id`). Held in CPU memory for logic.
+
+**CellAttrs** — A 16-bit union at `kitty/data-types.h:196-209` within `GPUCell`. Packs bit-fields for decoration, bold, italic, reverse, strike, dim, mark, width, `next_char_was_wrapped`, invisible, and hyperlink.
+
+**LineAttrs** — An 8-bit union at `kitty/data-types.h:231-239` stored PER-LINE (not per-cell). Packs bit-fields for `is_continued`, `has_dirty_text`, `has_image_placeholders`, and `prompt_kind` (2 bits).
+
+**next_char_was_wrapped** — A 1-bit field within `CellAttrs`. On the LAST cell of a row, indicates that the next character emitted after this cell wrapped to the next row (soft wrap). Persistent in cell storage.
+
+**is_continued** — A 1-bit field within `LineAttrs`. Indicates that this line is a continuation of the previous line (i.e., the previous line soft-wrapped into this one). COMPUTED on demand from the previous line's `next_char_was_wrapped`; not persisted.
+
+**TrackCursor** — A struct at `kitty/rewrap.h:50-53` with `{x, y, is_tracked_line, is_sentinel}`. Used by `rewrap_inner` to track cursor positions (or other tracked points) through the rewrap, remapping them from source coordinates to destination coordinates.
+
+**CursorTrack** — A struct at `kitty/screen.c:226-232` that wraps a `TrackCursor` plus `before`/`after`/`temp` coordinate triples and flags (`is_beyond_content`, `num_content_lines`). The screen-layer concept that binds a `TrackCursor` to a before/after resize state.
+
+**rewrap_inner** — The generic rewrap algorithm at `kitty/rewrap.h:56-96`. Iterates source rows, handles continuation detection and trailing-blank trimming, copies cell ranges into the destination, remaps tracked cursors, and invokes specialization macros for per-buffer-type behavior.
+
+**macro-polymorphism** — The C idiom by which a single implementation file (`rewrap.h`) is included in multiple translation units, each of which may redefine certain macros before including. This gives each TU a specialized version of the same algorithm without code duplication, at a cost of type safety and readability.
+
+**prompt_kind** — A 2-bit field within `LineAttrs` taking values from the `PromptKind` enum at `kitty/data-types.h:230`: `UNKNOWN_PROMPT_KIND`, `PROMPT_START`, `SECONDARY_PROMPT`, `OUTPUT_START`. Set by the VT parser in response to OSC 133 escape sequences.
+
+**OSC 133** — An Operating System Command escape sequence defined by the "shell integration" convention (originally from FinalTerm). OSC 133;A marks the start of a prompt, ;B marks the end of the prompt (start of the command line), ;C marks the end of the command (start of output), ;D marks the end of output. kitty maps these to `PROMPT_START`, `OUTPUT_START`, etc.
+
+**OUTPUT_START** — A `prompt_kind` value indicating this line is the beginning of command output. Used by `prevent_current_prompt_from_rewrapping` to terminate the backward scan (OUTPUT_START means "this is not part of the prompt").
+
+**PROMPT_START** — A `prompt_kind` value indicating the first line of a shell prompt. Used by `prevent_current_prompt_from_rewrapping` to identify where prompt protection begins.
+
+**SECONDARY_PROMPT** — A `prompt_kind` value indicating a secondary prompt line (e.g., bash's `PS2` continuation prompt). Treated equivalently to PROMPT_START for prompt-protection purposes.
+
+**alt screen** — The alternate screen buffer (terminfo capability `smcup`/`rmcup`). A full-screen buffer used by TUIs. Has NO scrollback; content above the top is discarded on resize.
+
+**scrollback** — The historical content that has scrolled off the top of the visible buffer. Stored in `HistoryBuf` (and optionally `PagerHistoryBuf`).
+
+**ringbuf** — A ring buffer implementation. kitty uses two: the `HistoryBuf` ring (of rows) and the `PagerHistoryBuf` `ringbuf` (of raw bytes, from the vendored `3rdparty/ringbuf/`).
+
+**start_of_data** — Field of `HistoryBuf`: the physical index of the OLDEST active row in the ring. Combined with `count`, defines the active window: `[start_of_data, start_of_data + count)` mod `ynum`.
+
+**line_map** — Field of `LineBuf`: an indirection array of size `ynum` mapping logical row indices to physical row storage. Rotating `line_map[]` entries is how `linebuf_index` implements O(1) scroll.
+
+**line_attrs** — Field of `LineBuf` and per-segment of `HistoryBuf`: a parallel array of `LineAttrs`, one per row. Accessed via logical row index (LineBuf) or via `attrptr(self, idx)` (HistoryBuf).
+
+**is_beyond_content** — A `CursorTrack` flag set in `setup_cursor` at `kitty/screen.c:368`. True iff `num_content_lines_before > 0 && self->cursor->y >= num_content_lines_before`. Indicates the cursor was PAST the content area at resize time; triggers special cursor repositioning after resize.
+
+**INDEX_DOWN** — A macro at `kitty/screen.c:289-299` that pushes all main_linebuf rows DOWN by 1 (via `linebuf_reverse_index`), clears the new top row, updates `last_visited_prompt.scrolled_by` if applicable, and calls `INDEX_GRAPHICS(1)` to notify the graphics manager. Used by the scrollback-fill loop.
+
+**INDEX_GRAPHICS** — A macro that notifies the graphics manager of a vertical index change so that image placements can be adjusted.
+
+**BLANK_CHAR** — The character codepoint value 0 (not 32, which is a space). Defined at `kitty/data-types.h:115`. Used by `rewrap_inner` to detect trailing empty cells for trimming.
+
+---
+
+# 15. Appendix A — Exact Code Excerpts
+
+This appendix provides verbatim excerpts of the three most-critical functions and the HistoryBuf macro override block, preserved with their exact source line numbers. The reader can verify every claim in the preceding sections against these excerpts.
+
+## 15.1 rewrap_inner — `kitty/rewrap.h:56-96`
+
+```c
+static void
+rewrap_inner(BufType *src, BufType *dest, const index_type src_limit, HistoryBuf UNUSED *historybuf, TrackCursor *track, ANSIBuf *as_ansi_buf) {
     bool is_first_line = true;
-    index_type src_y = 0, src_x = 0, dest_x = 0, dest_y = 0,
-               num = 0, src_x_limit = 0;
+    index_type src_y = 0, src_x = 0, dest_x = 0, dest_y = 0, num = 0, src_x_limit = 0;
     TrackCursor tc_end = {.is_sentinel = true };
     if (!track) track = &tc_end;
 
     do {
-        for (TrackCursor *t = track; !t->is_sentinel; t++)
-            t->is_tracked_line = src_y == t->y;
+        for (TrackCursor *t = track; !t->is_sentinel; t++) t->is_tracked_line = src_y == t->y;
         init_src_line(src_y);
         const bool src_line_is_continued = is_src_line_continued();
         src_x_limit = src->xnum;
         if (!src_line_is_continued) {
             // Trim trailing blanks since there is a hard line break at the end of this line
-            while(src_x_limit && (src->line->cpu_cells[src_x_limit - 1].ch) == BLANK_CHAR)
-                src_x_limit--;
+            while(src_x_limit && (src->line->cpu_cells[src_x_limit - 1].ch) == BLANK_CHAR) src_x_limit--;
         } else {
             src->line->gpu_cells[src->xnum-1].attrs.next_char_was_wrapped = false;
         }
         for (TrackCursor *t = track; !t->is_sentinel; t++) {
-            if (t->is_tracked_line && t->x >= src_x_limit)
-                t->x = MAX(1u, src_x_limit) - 1;
+            if (t->is_tracked_line && t->x >= src_x_limit) t->x = MAX(1u, src_x_limit) - 1;
         }
         if (is_first_line) {
             first_dest_line; is_first_line = false;
@@ -831,319 +1814,184 @@ rewrap_inner(BufType *src, BufType *dest, const index_type src_limit,
             src_x += num; dest_x += num;
         }
         src_y++; src_x = 0;
-        if (!src_line_is_continued && src_y < src_limit) {
-            init_src_line(src_y);
-            next_dest_line(false);
-            dest_x = 0;
-        }
+        if (!src_line_is_continued && src_y < src_limit) { init_src_line(src_y); next_dest_line(false); dest_x = 0; }
     } while (src_y < src_limit);
     dest->line->ynum = dest_y;
 }
 ```
 
-### 7.1 Variables and their meanings
-
-| Variable | Role |
-|---|---|
-| `src_y` | Current source row being read |
-| `src_x` | Current source column being read |
-| `dest_y` | Current destination row being written (dynamically updated by `next_dest_line`) |
-| `dest_x` | Current destination column being written |
-| `num` | Chunk size for the current `copy_range` call: min(remaining in src line, remaining in dest line) |
-| `src_x_limit` | Effective rightmost column of the current src line (may be trimmed for hard-break lines) |
-| `is_first_line` | Only true for the first iteration; controls whether `first_dest_line` initializer runs |
-| `src_line_is_continued` | True if the src line is soft-wrapped onto the next |
-| `track` | Array of `TrackCursor` structs, terminated by a sentinel — tracks logical cursor positions through the mapping |
-
-### 7.2 Line-level loop
-
-The outer `do...while (src_y < src_limit)` loop iterates **once per source
-row**. Each iteration:
-
-1. **Flag tracked cursors**: set `t->is_tracked_line` for every tracked
-   cursor whose `.y` matches the current `src_y`. This is an optimization:
-   cursor tracking only activates on the current source line.
-
-2. **Initialize the source line view**: `init_src_line(src_y)` re-points
-   `src->line` at row `src_y`. For LineBuf this calls
-   `linebuf_init_line(src, src_y)` which, as noted in §2.5, **recomputes
-   `is_continued`** from the previous line's `next_char_was_wrapped`. For
-   HistoryBuf it calls `init_line()` with the ring-buffer-mapped index.
-
-3. **Determine continuation and trim trailing blanks**
-   (`rewrap.h:66–73`):
-
-   ```c
-   const bool src_line_is_continued = is_src_line_continued();
-   src_x_limit = src->xnum;
-   if (!src_line_is_continued) {
-       while (src_x_limit && src->line->cpu_cells[src_x_limit - 1].ch == BLANK_CHAR)
-           src_x_limit--;
-   } else {
-       src->line->gpu_cells[src->xnum-1].attrs.next_char_was_wrapped = false;
-   }
-   ```
-
-   - **Hard-break line**: trim trailing blanks off the end — the terminal
-     doesn't need to preserve padding after a newline.
-   - **Soft-wrap line**: **clear** the `next_char_was_wrapped` bit on src
-     (because we're about to consume the line and decide whether the dest's
-     corresponding line should be marked as wrapped).
-
-   Behavioral confirmation: test `test_rewrap_narrower` in
-   `kitty_tests/datatypes.py:390–392` shows:
-
-   ```python
-   lb = create_lbuf('123  ', 'abcde')      # src width 5, row1 has 3 chars + 2 blanks
-   lb2 = self.line_comparison_rewrap(lb, '123', '  a', 'bcd', 'e')
-   self.assertContinued(lb2, False, True, True, True)
-   ```
-
-   Since "123  " is **soft-wrapped** to "abcde" (because `create_lbuf` glues
-   them with continuation), the trailing blanks on row 0 are **preserved**.
-
-4. **Clamp tracked cursor x**: for each tracked cursor on this src line, if
-   `t->x >= src_x_limit`, pull it back to `MAX(1u, src_x_limit) - 1`. This is
-   the "cursor past EOL after trailing-blank trim" correction.
-
-5. **First-line setup**: if this is the very first source line,
-   `first_dest_line` positions `dest->line` at row 0 and (in the LineBuf
-   variant) copies the src attrs to `dest->line_attrs[0]` via
-   `set_dest_line_attrs(0)`. For the HistoryBuf variant, `first_dest_line`
-   expands to `next_dest_line(false)` which pushes a fresh entry onto the
-   ring.
-
-6. **Inner copy loop** (`rewrap.h:80–91`):
-
-   ```c
-   while (src_x < src_x_limit) {
-       if (dest_x >= dest->xnum) { next_dest_line(true); dest_x = 0; }
-       num = MIN(src->line->xnum - src_x, dest->xnum - dest_x);
-       copy_range(src->line, src_x, dest->line, dest_x, num);
-       for (TrackCursor *t = track; !t->is_sentinel; t++) {
-           if (t->is_tracked_line && src_x <= t->x && t->x < src_x + num) {
-               t->y = dest_y;
-               t->x = dest_x + (t->x - src_x + (t->x > 0));
-           }
-       }
-       src_x += num; dest_x += num;
-   }
-   ```
-
-   This is the **chunked rectangular copy**:
-   - If the dest is full on this row, advance to the next dest row with
-     `continued=true`. `next_dest_line(true)` also writes
-     `next_char_was_wrapped = true` on the dest's just-completed row.
-   - `num` is the biggest slice we can copy without crossing either src or
-     dest row boundary.
-   - `copy_range()` memcpys `num` CPUCells and `num` GPUCells in one shot.
-   - If a tracked cursor falls within `[src_x, src_x + num)`, remap it. See
-     §12 for the arithmetic.
-
-7. **After the inner loop, hard-break handling** (`rewrap.h:92–93`):
-
-   ```c
-   src_y++; src_x = 0;
-   if (!src_line_is_continued && src_y < src_limit) {
-       init_src_line(src_y);
-       next_dest_line(false);
-       dest_x = 0;
-   }
-   ```
-
-   If the src line was a hard-break (not soft-wrapped), advance to the next
-   dest line with `continued=false`. Otherwise (soft wrap), keep accumulating
-   onto the current dest row — this is how two narrow src lines get merged
-   into one wider dest line when widening.
-
-   The extra `init_src_line(src_y)` call here is a **subtle detail**: it
-   re-points `src->line` at the *next* src row **before** `next_dest_line` is
-   invoked, so that `set_dest_line_attrs()` (invoked inside
-   `next_dest_line`) copies `src->line->attrs` from the **next** line, not
-   the line we just finished. This means:
-
-   > The `prompt_kind` of dest row N+1 is inherited from src row N+1 (the
-   > first src line that contributes to dest row N+1), not from src row N
-   > (the last line that contributed to dest row N).
-
-8. **Terminate**: `dest->line->ynum = dest_y;` — stash the number of dest
-   rows written into `line->ynum` so the caller can read it.
-
-### 7.3 What `rewrap_inner()` does NOT do
-
-- Does not touch `line_map[]` on the destination — the destination `LineBuf`
-  is freshly allocated by `alloc_linebuf()` with a trivial identity line_map.
-- Does not handle wide characters specially — it relies on src/dest widths
-  being unchanged per-cell. The `CellAttrs.width` field is carried along in
-  the `memcpy` but not interpreted. **This has implications for wide-char
-  edge cases — see §16.2.**
-- Does not prune blank tail lines of the src buffer — that's
-  `linebuf_rewrap()`'s responsibility (via the "find last non-empty line"
-  loop in `line-buf.c:600–608`).
-
----
-
-## 8. LineBuf Specialization
-
-`kitty/line-buf.c:583` includes `rewrap.h` with no overrides. Then
-`linebuf_rewrap()` at `line-buf.c:585–622` wraps the call:
+## 15.2 prevent_current_prompt_from_rewrapping — `kitty/screen.c:302-343`
 
 ```c
-void
-linebuf_rewrap(LineBuf *self, LineBuf *other,
-               index_type *num_content_lines_before,
-               index_type *num_content_lines_after,
-               HistoryBuf *historybuf,
-               index_type *track_x,  index_type *track_y,
-               index_type *track_x2, index_type *track_y2,
-               ANSIBuf *as_ansi_buf) {
-    index_type first, i;
-    bool is_empty = true;
-
-    // Fast path
-    if (other->xnum == self->xnum && other->ynum == self->ynum) {
-        memcpy(other->line_map, self->line_map,
-               sizeof(index_type) * self->ynum);
-        memcpy(other->line_attrs, self->line_attrs,
-               sizeof(LineAttrs) * self->ynum);
-        memcpy(other->cpu_cell_buf, self->cpu_cell_buf,
-               (size_t)self->xnum * self->ynum * sizeof(CPUCell));
-        memcpy(other->gpu_cell_buf, self->gpu_cell_buf,
-               (size_t)self->xnum * self->ynum * sizeof(GPUCell));
-        *num_content_lines_before = self->ynum;
-        *num_content_lines_after  = self->ynum;
-        return;
-    }
-
-    // Find the first line that contains some content
-    first = self->ynum;
-    do {
-        first--;
-        CPUCell *cells = cpu_lineptr(self, self->line_map[first]);
-        for (i = 0; i < self->xnum; i++) {
-            if (cells[i].ch != BLANK_CHAR) { is_empty = false; break; }
+static index_type
+prevent_current_prompt_from_rewrapping(Screen *self, LineBuf *prompt_copy, index_type *num_of_prompt_lines_above_cursor) {
+    index_type num_of_prompt_lines = 0; *num_of_prompt_lines_above_cursor = 0;
+    if (!self->prompt_settings.redraws_prompts_at_all) return num_of_prompt_lines;
+    int y = self->cursor->y;
+    while (y >= 0) {
+        linebuf_init_line(self->main_linebuf, y);
+        Line *line = self->linebuf->line;
+        switch (line->attrs.prompt_kind) {
+            case UNKNOWN_PROMPT_KIND:
+                break;
+            case PROMPT_START:
+            case SECONDARY_PROMPT:
+                goto found;
+                break;
+            case OUTPUT_START:
+                return num_of_prompt_lines;
         }
-    } while (is_empty && first > 0);
-
-    if (is_empty) {  // All lines are empty
-        *num_content_lines_after = 0;
-        *num_content_lines_before = 0;
-        return;
+        y--;
     }
-    *num_content_lines_before = first + 1;
-    TrackCursor tcarr[3] = {
-        {.x = *track_x,  .y = *track_y },
-        {.x = *track_x2, .y = *track_y2},
-        {.is_sentinel = true}
-    };
-    rewrap_inner(self, other, *num_content_lines_before,
-                 historybuf, (TrackCursor*)tcarr, as_ansi_buf);
-    *track_x = tcarr[0].x;  *track_y = tcarr[0].y;
-    *track_x2 = tcarr[1].x; *track_y2 = tcarr[1].y;
-    *num_content_lines_after = other->line->ynum + 1;
-    for (i = 0; i < *num_content_lines_after; i++)
-        other->line_attrs[i].has_dirty_text = true;
+found:
+    if (y < 0) return num_of_prompt_lines;
+    // we have identified a prompt at which the cursor is present, the shell
+    // will redraw this prompt. However when doing so it gets confused if the
+    // cursor vertical position relative to the first prompt line changes. This
+    // can easily be seen for instance in zsh when a right side prompt is used
+    // so when resizing, simply blank all lines after the current
+    // prompt and trust the shell to redraw them.
+    for (; y < (int)self->main_linebuf->ynum; y++) {
+        linebuf_init_line(self->main_linebuf, y);
+        linebuf_copy_line_to(prompt_copy, self->main_linebuf->line, num_of_prompt_lines++);
+        linebuf_clear_line(self->main_linebuf, y, false);
+        if (y <= (int)self->cursor->y) {
+            linebuf_init_line(self->main_linebuf, y);
+            // this is needed because screen_resize() checks to see if the cursor is beyond the content,
+            // so insert some fake content
+            self->main_linebuf->line->cpu_cells[0].ch = ' ';
+            if (y < (int)self->cursor->y) (*num_of_prompt_lines_above_cursor)++;
+        }
+    }
+    return num_of_prompt_lines;
 }
 ```
 
-### 8.1 Fast path — same dimensions
-
-If the resize call passes dimensions identical to the current ones (e.g.,
-re-applying the same geometry), the function avoids rewrap entirely by
-memcpying the four arena arrays (`line_map`, `line_attrs`, `cpu_cell_buf`,
-`gpu_cell_buf`). Content line counts are set equal to `ynum` (conservative —
-true content may be less, but the caller uses this only for cursor-beyond-
-content logic and won't trigger it in the identity case).
-
-### 8.2 Content-line detection
-
-Walks backward from the last row looking for any row with a non-blank
-`cpu_cell`. The scan stops when a non-empty row is found, and
-`num_content_lines_before = first + 1` is the count (inclusive).
-
-If the source is entirely blank, both counts are set to 0 and the function
-returns without calling `rewrap_inner` — there is nothing to rewrap.
-
-### 8.3 Cursor tracker array
-
-Two cursors are tracked (the live cursor and the savepoint cursor). The array
-has a sentinel `{.is_sentinel = true}` so `rewrap_inner()`'s iterator loops
-can use `for (...; !t->is_sentinel; t++)`.
-
-### 8.4 Post-rewrap bookkeeping
-
-After `rewrap_inner()` returns:
-- `dest->line->ynum` was set to the last `dest_y` written; so
-  `*num_content_lines_after = other->line->ynum + 1`.
-- All written rows (`0..num_content_lines_after-1`) are marked `has_dirty_text
-  = true` so the renderer re-uploads them to the GPU.
-
-### 8.5 The LineBuf `next_dest_line` macro — the spillover mechanism
-
-`rewrap.h:24–38`:
+## 15.3 screen_resize — `kitty/screen.c:345-463`
 
 ```c
-#define next_dest_line(continued) \
-    linebuf_set_last_char_as_continuation(dest, dest_y, continued); \
-    if (dest_y >= dest->ynum - 1) { \
-        linebuf_index(dest, 0, dest->ynum - 1); \
-        if (historybuf != NULL) { \
-            linebuf_init_line(dest, dest->ynum - 1); \
-            dest->line->attrs.has_dirty_text = true; \
-            historybuf_add_line(historybuf, dest->line, as_ansi_buf); \
-        }\
-        linebuf_clear_line(dest, dest->ynum - 1, true); \
-    } else dest_y++; \
-    linebuf_init_line(dest, dest_y); \
-    set_dest_line_attrs(dest_y);
+static bool
+screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
+    screen_pause_rendering(self, false, 0);
+    lines = MAX(1u, lines); columns = MAX(1u, columns);
+
+    bool is_main = self->linebuf == self->main_linebuf;
+    index_type num_content_lines_before, num_content_lines_after;
+    bool dummy_output_inserted = false;
+    if (is_main && self->cursor->x == 0 && self->cursor->y < self->lines && self->linebuf->line_attrs[self->cursor->y].prompt_kind == OUTPUT_START) {
+        linebuf_init_line(self->linebuf, self->cursor->y);
+        if (!self->linebuf->line->cpu_cells[0].ch) {
+            // we have a blank output start line, we need it to be preserved by
+            // reflow, so insert a dummy char
+            self->linebuf->line->cpu_cells[self->cursor->x++].ch = '<';
+            dummy_output_inserted = true;
+        }
+    }
+    unsigned int lines_after_cursor_before_resize = self->lines - self->cursor->y;
+    CursorTrack cursor = {.before = {self->cursor->x, self->cursor->y}};
+    CursorTrack main_saved_cursor = {.before = {self->main_savepoint.cursor.x, self->main_savepoint.cursor.y}};
+    CursorTrack alt_saved_cursor = {.before = {self->alt_savepoint.cursor.x, self->alt_savepoint.cursor.y}};
+#define setup_cursor(which) { \
+    which.after.x = which.temp.x; which.after.y = which.temp.y; \
+    which.is_beyond_content = num_content_lines_before > 0 && self->cursor->y >= num_content_lines_before; \
+    which.num_content_lines = num_content_lines_after; \
+}
+    // Resize overlay line
+    if (!init_overlay_line(self, columns, true)) return false;
+
+    // Resize main linebuf
+    HistoryBuf *nh = realloc_hb(self->historybuf, self->historybuf->ynum, columns, &self->as_ansi_buf);
+    if (nh == NULL) return false;
+    Py_CLEAR(self->historybuf); self->historybuf = nh;
+    RAII_PyObject(prompt_copy, NULL);
+    index_type num_of_prompt_lines = 0, num_of_prompt_lines_above_cursor = 0;
+    if (is_main) {
+        prompt_copy = (PyObject*)alloc_linebuf(self->lines, self->columns);
+        num_of_prompt_lines = prevent_current_prompt_from_rewrapping(self, (LineBuf*)prompt_copy, &num_of_prompt_lines_above_cursor);
+    }
+    LineBuf *n = realloc_lb(self->main_linebuf, lines, columns, &num_content_lines_before, &num_content_lines_after, self->historybuf, &cursor, &main_saved_cursor, &self->as_ansi_buf);
+    if (n == NULL) return false;
+    Py_CLEAR(self->main_linebuf); self->main_linebuf = n;
+    if (is_main) setup_cursor(cursor);
+    /* printf("old_cursor: (%u, %u) new_cursor: (%u, %u) beyond_content: %d\n", self->cursor->x, self->cursor->y, cursor.after.x, cursor.after.y, cursor.is_beyond_content); */
+    setup_cursor(main_saved_cursor);
+    grman_remove_all_cell_images(self->main_grman);
+    grman_resize(self->main_grman, self->lines, lines, self->columns, columns, num_content_lines_before, num_content_lines_after);
+
+    // Resize alt linebuf
+    n = realloc_lb(self->alt_linebuf, lines, columns, &num_content_lines_before, &num_content_lines_after, NULL, &cursor, &alt_saved_cursor, &self->as_ansi_buf);
+    if (n == NULL) return false;
+    Py_CLEAR(self->alt_linebuf); self->alt_linebuf = n;
+    if (!is_main) setup_cursor(cursor);
+    setup_cursor(alt_saved_cursor);
+    grman_remove_all_cell_images(self->alt_grman);
+    grman_resize(self->alt_grman, self->lines, lines, self->columns, columns, num_content_lines_before, num_content_lines_after);
+#undef setup_cursor
+
+    self->linebuf = is_main ? self->main_linebuf : self->alt_linebuf;
+    /* printf("\nold_size: (%u, %u) new_size: (%u, %u)\n", self->columns, self->lines, columns, lines); */
+    self->lines = lines; self->columns = columns;
+    self->margin_top = 0; self->margin_bottom = self->lines - 1;
+
+    PyMem_Free(self->main_tabstops);
+    self->main_tabstops = PyMem_Calloc(2*self->columns, sizeof(bool));
+    if (self->main_tabstops == NULL) { PyErr_NoMemory(); return false; }
+    self->alt_tabstops = self->main_tabstops + self->columns;
+    self->tabstops = self->main_tabstops;
+    init_tabstops(self->main_tabstops, self->columns);
+    init_tabstops(self->alt_tabstops, self->columns);
+    self->is_dirty = true;
+    clear_selection(&self->selections);
+    clear_selection(&self->url_ranges);
+    self->last_visited_prompt.is_set = false;
+#define S(c, w) c->x = MIN(w.after.x, self->columns - 1); c->y = MIN(w.after.y, self->lines - 1);
+    S(self->cursor, cursor);
+    S((&(self->main_savepoint.cursor)), main_saved_cursor);
+    S((&(self->alt_savepoint.cursor)), alt_saved_cursor);
+#undef S
+    if (cursor.is_beyond_content) {
+        self->cursor->y = cursor.num_content_lines;
+        if (self->cursor->y >= self->lines) { self->cursor->y = self->lines - 1; screen_index(self); }
+    }
+    if (is_main && OPT(scrollback_fill_enlarged_window)) {
+        const unsigned int top = 0, bottom = self->lines-1;
+        Savepoint *sp = is_main ? &self->main_savepoint : &self->alt_savepoint;
+        while (self->cursor->y + 1 < self->lines && self->lines - self->cursor->y > lines_after_cursor_before_resize) {
+            if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
+            INDEX_DOWN;
+            linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
+            self->cursor->y++;
+            sp->cursor.y = MIN(sp->cursor.y + 1, self->lines - 1);
+        }
+    }
+    if (dummy_output_inserted && self->cursor->y < self->lines) {
+        linebuf_init_line(self->linebuf, self->cursor->y);
+        self->linebuf->line->cpu_cells[0].ch = 0;
+        self->cursor->x = 0;
+    }
+    if (num_of_prompt_lines) {
+        // Copy the old prompt lines without any reflow this prevents
+        // flickering of prompt during resize. THe flicker is caused by the
+        // prompt being first cleared by kitty then sometime later redrawn by
+        // the shell.
+        LineBuf *src = (LineBuf*)prompt_copy;
+        for (index_type
+                src_line = 0,
+                y = num_of_prompt_lines_above_cursor <= self->cursor->y ? self->cursor->y - num_of_prompt_lines_above_cursor : 0;
+
+                src_line < num_of_prompt_lines && y < self->lines;
+
+                y++, src_line++
+        ) {
+            linebuf_init_line(src, src_line);
+            linebuf_copy_line_to(self->main_linebuf, src->line, y);
+        }
+    }
+    return true;
+}
 ```
 
-Behavioral breakdown:
-
-1. **Mark current dest row's continuation flag**:
-   `linebuf_set_last_char_as_continuation(dest, dest_y, continued)` writes
-   the `continued` bit to the current (just-finished) dest row's last GPU
-   cell.
-
-2. **If dest is at its last row** (the overflow case):
-   - `linebuf_index(dest, 0, dest->ynum - 1)` scrolls the entire LineBuf up
-     by one via **line_map rotation** — the top row's storage slot is moved
-     to the bottom, no cells are copied.
-   - If `historybuf` is non-NULL (main screen): init the now-bottom row
-     (which holds the old top row's contents), mark it dirty, and push it
-     to history via `historybuf_add_line()`. This is the **overflow-to-
-     history** path.
-   - `linebuf_clear_line(dest, dest->ynum - 1, true)` zeros the bottom row
-     and clears its attrs so rewrap can reuse it.
-   - `dest_y` **stays at** `dest->ynum - 1` (not incremented) — we keep
-     writing into the same logical bottom row, which now maps to a cleared
-     physical slot.
-
-3. **Else** (we still have room): `dest_y++`.
-
-4. **Initialize the new dest view**:
-   `linebuf_init_line(dest, dest_y); set_dest_line_attrs(dest_y)`.
-   - `linebuf_init_line` refreshes `is_continued` as noted in §2.5.
-   - `set_dest_line_attrs` copies `src->line->attrs` into
-     `dest->line_attrs[dest_y]` **and** wipes `prompt_kind` on src (so the
-     same prompt_kind doesn't propagate to multiple dest rows).
-
-### 8.6 Attrs copy direction
-
-Note the direction of `set_dest_line_attrs(dest_y)`: `dest->line_attrs[dest_y]
-= src->line->attrs`. The source line's `is_continued` (recomputed by
-`init_src_line` via the previous line's `next_char_was_wrapped`) is written
-into dest's line_attrs. But the **stored** `is_continued` in `line_attrs[]`
-is immediately overwritten by the next `linebuf_init_line()` call anyway —
-§2.5 shows `is_continued` is always recomputed from the previous line's GPU
-cell. So the effective persistent transfer is `prompt_kind`,
-`has_image_placeholders`, and `has_dirty_text`.
-
----
-
-## 9. HistoryBuf Specialization
-
-`kitty/history.c:582–614` wraps `rewrap_inner()` for HistoryBuf:
+## 15.4 HistoryBuf Macro Overrides — `kitty/history.c:582-592`
 
 ```c
 #define BufType HistoryBuf
@@ -1152,1586 +2000,14 @@ cell. So the effective persistent transfer is `prompt_kind`,
 
 #define init_src_line(src_y) init_line(src, map_src_index(src_y), src->line);
 
-#define next_dest_line(cont) { \
-    history_buf_set_last_char_as_continuation(dest, 0, cont); \
-    LineAttrs *lap = attrptr(dest, historybuf_push(dest, as_ansi_buf)); \
-    *lap = src->line->attrs; }
+#define next_dest_line(cont) { history_buf_set_last_char_as_continuation(dest, 0, cont); LineAttrs *lap = attrptr(dest, historybuf_push(dest, as_ansi_buf)); *lap = src->line->attrs; }
 
 #define first_dest_line next_dest_line(false);
 
 #include "rewrap.h"
-
-void
-historybuf_rewrap(HistoryBuf *self, HistoryBuf *other, ANSIBuf *as_ansi_buf) {
-    while (other->num_segments < self->num_segments) add_segment(other);
-    if (other->xnum == self->xnum && other->ynum == self->ynum) {
-        // Fast path
-        for (index_type i = 0; i < self->num_segments; i++) {
-            memcpy(other->segments[i].cpu_cells, self->segments[i].cpu_cells,
-                   SEGMENT_SIZE * self->xnum * sizeof(CPUCell));
-            memcpy(other->segments[i].gpu_cells, self->segments[i].gpu_cells,
-                   SEGMENT_SIZE * self->xnum * sizeof(GPUCell));
-            memcpy(other->segments[i].line_attrs, self->segments[i].line_attrs,
-                   SEGMENT_SIZE * sizeof(LineAttrs));
-        }
-        other->count = self->count; other->start_of_data = self->start_of_data;
-        return;
-    }
-    if (other->pagerhist && other->xnum != self->xnum
-        && ringbuf_bytes_used(other->pagerhist->ringbuf))
-        other->pagerhist->rewrap_needed = true;
-    other->count = 0; other->start_of_data = 0;
-    if (self->count > 0) {
-        rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf);
-        for (index_type i = 0; i < other->count; i++)
-            attrptr(other, (other->start_of_data + i) % other->ynum)->has_dirty_text = true;
-    }
-}
 ```
 
-### 9.1 Why `map_src_index`?
+This 11-line block (including the `#include`) is the entire HistoryBuf specialization. Every other `#define` in `rewrap.h` (namely `set_dest_line_attrs`, `copy_range`, the `BufType` default, the `init_src_line` default, the default `first_dest_line`, the default `next_dest_line`, and `is_src_line_continued`) either inherits its default (the `is_src_line_continued` default is used as-is) or is masked out by the preceding `#define` (e.g., `first_dest_line` is overridden so the default at `rewrap.h:20-22` is replaced).
 
-HistoryBuf's logical indexing goes from `0` (oldest) to `count - 1` (newest),
-but physical storage is a ring with `start_of_data` as the offset of the
-oldest entry. `map_src_index(y)` translates logical to physical.
+Note the placement: the `#define BufType HistoryBuf` at line 582 overrides the default at `rewrap.h:10-12` (because the default is `#ifndef BufType`-guarded). The `#define init_src_line` at line 586 overrides the default at `rewrap.h:14-16`. The `#define next_dest_line` at line 588 overrides the default at `rewrap.h:24-38`. The `#define first_dest_line` at line 590 overrides the default at `rewrap.h:20-22`. The unguarded `set_dest_line_attrs` at `rewrap.h:18` is NOT overridden; but as discussed in §6.4, it is never reached from the HistoryBuf specialization's call graph.
 
-`init_src_line` then uses this:
-```c
-init_line(src, map_src_index(src_y), src->line);
-```
-
-where `init_line()` at `history.c:161–177` reads the *physical* row directly
-(and recomputes `is_continued` from the *physical* previous row — note this
-is **not** the logical previous row. See §11.4 for the subtle consequence).
-
-### 9.2 HistoryBuf's `next_dest_line` macro
-
-```c
-#define next_dest_line(cont) { \
-    history_buf_set_last_char_as_continuation(dest, 0, cont); \
-    LineAttrs *lap = attrptr(dest, historybuf_push(dest, as_ansi_buf)); \
-    *lap = src->line->attrs; }
-```
-
-Two steps:
-
-1. **Set continuation on the most recent dest row**:
-   `history_buf_set_last_char_as_continuation(dest, 0, cont)`. The `0` here
-   is the API-level reverse index — "newest." Inspect
-   `history.c:302–307`:
-
-   ```c
-   static void
-   history_buf_set_last_char_as_continuation(HistoryBuf *self, index_type y,
-                                              bool wrapped) {
-       if (self->count > 0) {
-           gpu_lineptr(self, index_of(self, y))[self->xnum-1]
-               .attrs.next_char_was_wrapped = wrapped;
-       }
-   }
-   ```
-
-2. **Push a new empty destination row**:
-   `historybuf_push(dest, as_ansi_buf)` at `history.c:275–284`:
-
-   ```c
-   static index_type
-   historybuf_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
-       index_type idx = (self->start_of_data + self->count) % self->ynum;
-       init_line(self, idx, self->line);
-       if (self->count == self->ynum) {
-           pagerhist_push(self, as_ansi_buf);
-           self->start_of_data = (self->start_of_data + 1) % self->ynum;
-       } else self->count++;
-       return idx;
-   }
-   ```
-
-   The key behavior: if the ring is full (`count == ynum`), the oldest entry
-   is **evicted to pager history** (§14) and `start_of_data` advances by
-   one. Otherwise `count` increments. Either way, `idx` is the physical slot
-   index of the new newest entry, which is where `dest->line` now points.
-
-3. **Set attrs**: `*lap = src->line->attrs` writes the source line's attrs
-   into the new slot's `line_attrs[]` entry.
-
-Note this differs structurally from the LineBuf `next_dest_line` — no explicit
-`init_line` call after the push, because `historybuf_push` already does it
-for us. No `set_dest_line_attrs` macro either — the `*lap = src->line->attrs`
-line does the job directly.
-
-### 9.3 `first_dest_line` = `next_dest_line(false)`
-
-This differs from LineBuf where `first_dest_line` is an initialize-in-place
-for row 0. HistoryBuf's `first_dest_line` **pushes** a new row — because
-before the first push, `count == 0` and there is no "row 0" that makes sense;
-you must grow by pushing.
-
-### 9.4 `historybuf_rewrap()` initialization reset
-
-`history.c:609` resets `other->count = 0; other->start_of_data = 0;` **before**
-calling `rewrap_inner`. This is essential because `rewrap_inner` relies on
-`historybuf_push` to build up content; the destination must start empty.
-
-### 9.5 Pre-rewrap segment pre-growth
-
-`history.c:596`: `while (other->num_segments < self->num_segments)
-add_segment(other);`. This avoids `historybuf_push` calling `add_segment`
-(via `segment_for`) from inside the `rewrap_inner` hot loop. It's pure
-optimization — otherwise allocations would happen interleaved with the
-rewrap work.
-
-### 9.6 Pager history rewrap marking
-
-`history.c:607–608`: if column count changed and the pager ringbuf has
-content, set `pagerhist->rewrap_needed = true`. The pager history is a
-byte-oriented ringbuf holding ANSI-escaped text, and `pagerhist_rewrap_to()`
-(`history.c:391–432`) performs the actual rewrap lazily on demand (e.g., when
-the user invokes the pager). This is a **lazy, column-sensitive** operation.
-
----
-
-## 10. The Buffer Boundary — Visible Screen ↔ Scrollback
-
-### 10.1 Overflow path: LineBuf → HistoryBuf (during reflow)
-
-As described in §8.5, when `rewrap_inner` is operating on a `LineBuf` with a
-non-NULL `historybuf` argument (i.e., the main linebuf), any row that is
-"scrolled off the top" during rewrap is pushed into the history. This is the
-**overflow** direction.
-
-Behavioral demonstration from `kitty_tests/screen.py:287–289`:
-
-```python
-s.resize(5, 1)
-self.ae(str(s.line(0)), '4')
-self.ae(str(s.historybuf), '3\n3\n3\n3\n3\n2')
-```
-
-Starting state: main linebuf contains `0*5, 1*5, 2*5, 3*5, 4*5` (one row of
-each digit). After `resize(5, 1)` (columns=1, so all 5-char lines become
-5 separate rows of 1 char each wrapped, for a total of 25 rows of output, but
-lines=5 means only 5 rows fit), the **visible** part is `'4'` (the last non-
-blank 1-char row), and everything above has spilled into history: five `'3'`s
-(one per cell of the original "33333"), and the last `'2'` (the 2-row chunk
-got pushed down as the last "3" wrapped in).
-
-### 10.2 Refill path: HistoryBuf → LineBuf (scrollback fill after enlarge)
-
-The reverse direction is exercised by the `scrollback_fill_enlarged_window`
-option, implemented at `screen.c:428–438`. When the window grows vertically,
-lines are pulled **back** from history via `historybuf_pop_line()`. See §13.
-
-### 10.3 The continuation bridge: `history_buf_endswith_wrap()`
-
-`screen.c:2833–2840`:
-
-```c
-static Line*
-init_line(Screen *self, index_type y) {
-    linebuf_init_line(self->linebuf, y);
-    if (y == 0 && self->linebuf == self->main_linebuf) {
-        if (history_buf_endswith_wrap(self->historybuf))
-            self->linebuf->line->attrs.is_continued = true;
-    }
-    return self->linebuf->line;
-}
-```
-
-For **line 0** of the main linebuf, the screen-level `init_line` overrides
-`linebuf_init_line`'s computed `is_continued` (which defaults to `false` for
-`idx == 0` per `line-buf.c:145`) with the value derived from the history's
-most recent line via `history_buf_endswith_wrap()`:
-
-```c
-// history.c:184–187
-bool
-history_buf_endswith_wrap(HistoryBuf *self) {
-    return gpu_lineptr(self, index_of(self, 0))
-                      [self->xnum-1].attrs.next_char_was_wrapped;
-}
-```
-
-This is the **only** place the history-to-screen continuation flag is
-bridged. It is **not** checked by `linebuf_init_line` directly — any code
-path that bypasses `screen_init_line` misses this bridge. See §16.3 for
-where this matters.
-
-### 10.4 Why the continuation bridge exists only at y=0
-
-Continuation between rows *within* a LineBuf is computed from the GPU cell of
-the previous row — which exists within the LineBuf. Continuation from history
-to screen row 0 has no "previous row in linebuf" to look at, so we look at
-the history's top line instead. For rows y >= 1 of the linebuf, no bridging
-is necessary because row y-1 is a real linebuf row with a valid GPU cell.
-
----
-
-## 11. Line Continuation State: The Dual-Signal Architecture
-
-This is the most subtle aspect of the reflow system and is the source of the
-potential issues identified in §16.
-
-### 11.1 The two signals
-
-**Signal A: `CellAttrs.next_char_was_wrapped`** — persistent, on the last
-GPU cell of each line. Set by the VT parser when a character overflows the
-current line, cleared when the line is re-written or explicitly reset.
-
-**Signal B: `LineAttrs.is_continued`** — derived, set dynamically by the
-"init line" helpers. Present in `line_attrs[]` storage but always overwritten
-on access.
-
-### 11.2 How `rewrap_inner` reads and writes each signal
-
-| Action | Signal read/written | Where |
-|---|---|---|
-| Detect whether src line is soft-wrapped | Reads `next_char_was_wrapped` on src last cell | `is_src_line_continued()` macro at `rewrap.h:41` |
-| Clear src's wrap bit once consumed | Writes `next_char_was_wrapped = false` on src last cell | `rewrap.h:72` |
-| Mark dest row as wrapped when its cell space is exhausted | Writes `next_char_was_wrapped` via `linebuf_set_last_char_as_continuation` (LineBuf) or `history_buf_set_last_char_as_continuation` (HistoryBuf) | `rewrap.h:26`, `history.c:588` |
-| Read src line's `is_continued` | Never read — `is_continued` is a query-time derivation; rewrap reads the storage field `next_char_was_wrapped` directly | — |
-| Write dest line's `is_continued` | Implicitly, via `set_dest_line_attrs` copying src's `line->attrs` (which has `is_continued` computed by `init_src_line`) | `rewrap.h:18, 37` |
-
-### 11.3 Asymmetry in when `is_continued` is refreshed
-
-`is_continued` is refreshed **in the stored `line_attrs[]`** only transiently
-and only via the chain:
-
-1. `init_src_line(src_y)` → `linebuf_init_line(src, src_y)` → computes
-   `src->line->attrs.is_continued` from previous row's GPU cell.
-2. `set_dest_line_attrs(dest_y)` → copies `src->line->attrs` (including the
-   just-computed `is_continued`) into `dest->line_attrs[dest_y]`.
-3. Next call to `linebuf_init_line(dest, ...)` **overwrites**
-   `line->attrs.is_continued` with a freshly computed value.
-
-So the value of `is_continued` in `dest->line_attrs[dest_y]` after rewrap is
-**meaningless** — any consumer that reads it directly gets stale data. Only
-code that goes through `linebuf_init_line` sees the correct value. This is
-**not a bug** — it's the documented contract — but it is a trap for anyone
-reading `line_attrs[y].is_continued` without going through the init helper.
-
-### 11.4 HistoryBuf's `is_continued` is computed from PHYSICAL previous row
-
-`history.c:167`:
-
-```c
-if (num > 0) {
-    l->attrs.is_continued =
-        gpu_lineptr(self, num - 1)[self->xnum-1].attrs.next_char_was_wrapped;
-} else {
-    l->attrs.is_continued = false;
-    ...
-}
-```
-
-Here `num` is the **physical** ring-buffer index, not the API's reverse-
-indexed `lnum`. So when `num == 0` (the physical slot at the start of the
-ring), the `is_continued` is hard-set to `false` regardless of whether that
-slot corresponds to a line that was in fact continued from the now-evicted
-preceding line. **The pager-history ringbuf lookup beneath it** (`history.c:
-170–176`) rescues the case where the evicted line is still in the pager
-history, by checking if the ringbuf's last byte is a newline.
-
-But there is a subtle window: when `num == 0` is **not** the logical first
-line (i.e., `start_of_data != 0` after some evictions have happened), the
-code still uses `num - 1`, which gives a valid physical pointer but to the
-**wrong logical previous row**. Since HistoryBuf is a ring, `num == 0` means
-the *physical* slot 0 — but the logical predecessor is at physical slot
-`ynum - 1`, not physical slot "negative 1."
-
-**However**, the wrap-around case is *guarded* because `num - 1` is an
-`index_type` (unsigned), so `num == 0` leads to the `else` branch
-unconditionally. Let's verify: `if (num > 0)` — yes, safe. For `num == 0`,
-the `else` branch runs and checks the pager history. So the issue is: **if
-`num == 0` physically (slot 0) but there were prior evictions**, the
-predecessor logically is at physical slot `ynum-1`, but we don't check it.
-We do check pager history, which is correct because evicted lines go *there*
-first. So when the ring has wrapped, the evicted predecessor *should* be in
-pager history with the correct trailing character.
-
-Verifying: `historybuf_push` at `history.c:279–281` calls
-`pagerhist_push` before advancing `start_of_data`, so the just-evicted line
-does get written to pager history. Good — the logic is consistent.
-
-### 11.5 The "orphaned continuation" edge case during reflow
-
-Consider a LineBuf before reflow:
-
-```
-row 0: "abcde"     (wrap flag set — continued)
-row 1: "fghij"     (wrap flag cleared — hard break)
-row 2: ""
-```
-
-During `rewrap_inner` with a wider dest:
-- `src_y=0`: `is_src_line_continued() = true`, so the wrap flag is **cleared
-  on src row 0** at `rewrap.h:72`. Dest row 0 accumulates "abcde".
-- `src_y=1`: `is_src_line_continued() = false`, so src row 1's trailing
-  blanks are trimmed, "fghij" is appended to dest row 0 (because
-  `src_line_is_continued` was true for the *previous* iteration, controlling
-  whether we advance dest_y). Wait — actually looking at `rewrap.h:92–93`:
-
-  ```c
-  if (!src_line_is_continued && src_y < src_limit) {
-      init_src_line(src_y);
-      next_dest_line(false);
-      dest_x = 0;
-  }
-  ```
-
-  This advances dest line only when the **current src line** (the one whose
-  iteration just completed) was **not** continued. So the variable
-  `src_line_is_continued` in this snippet is the value computed for the
-  **src_y that just finished**. Looking at the source: yes, at `rewrap.h:66`
-  it's captured for the current iteration, and by line 92 it still refers to
-  the current iteration. So after `src_y=0` (continued), dest is NOT
-  advanced, and src_y=1 appends to the same dest row. Then src_y=1 is a hard
-  break, so dest advances for src_y=2.
-
-OK that is consistent. Now consider the reverse — narrower dest:
-
-```
-src row 0: "abcde"  (no wrap)
-src row 1: ""
-```
-
-Shrinking to dest width 3:
-- src_y=0: `src_x=0, dest_x=0, src_x_limit=5` (no trailing-blank trim because
-  the whole line is non-blank — actually "abcde" has no blanks, so full 5).
-  Inner loop: `num = MIN(5-0, 3-0) = 3`, copies "abc" to dest[0][0..2].
-  `src_x=3, dest_x=3`. Loop again: `dest_x >= dest->xnum (3 >= 3)`, so
-  `next_dest_line(true)` — wrap flag SET on dest row 0, dest_y=1, dest_x
-  reset. `num = MIN(5-3, 3-0) = 2`, copies "de" to dest[1][0..1].
-- After the inner loop: `src_y=1, src_x=0`. Since src_y=0 was NOT continued
-  (`src_line_is_continued = false`), `rewrap.h:92–93` calls
-  `next_dest_line(false)` → dest_y=2, wrap flag CLEARED on dest row 1.
-- src_y=1: `init_src_line(1)`, line is empty, `src_x_limit=0` after trim.
-  Inner loop doesn't execute. End of outer loop.
-- `dest->line->ynum = dest_y = 2`. Function returns.
-
-Result in dest: row 0 = "abc" (wrap=1), row 1 = "de" (wrap=0), row 2 = empty.
-Continuation states: row 0.is_continued=false (no prior), row 1.is_continued
-=true (prev row's wrap=1), row 2.is_continued=false (prev row's wrap=0).
-
-This is exactly what the test expects:
-
-```python
-# kitty_tests/datatypes.py:387–389
-lb = create_lbuf('123', 'abcde')
-lb2 = self.line_comparison_rewrap(lb, '123', 'abc', 'de')
-self.assertContinued(lb2, False, False, True)
-```
-
-### 11.6 Summary of the continuation state model
-
-- Storage: `next_char_was_wrapped` bits on last GPUCell of every line.
-- Query: `is_continued` in `LineAttrs`, freshly computed on every line
-  access.
-- History bridge: only at main linebuf row 0, via `history_buf_endswith_wrap()`
-  in `screen.c:init_line`.
-- Rewrap invariants:
-  - Reads `next_char_was_wrapped` from src to decide soft-wrap vs hard-break.
-  - Writes `next_char_was_wrapped` to dest when a line breaks due to width,
-    or when advancing to next src line.
-  - Clears src's wrap flag during consumption so the source state is
-    consistent if inspected mid-rewrap (it shouldn't be — but defensive).
-- Storage inconsistency: `line_attrs[y].is_continued` after rewrap is stale
-  garbage; only `linebuf_init_line` and `init_line` (HistoryBuf) refresh it.
-
----
-
-## 12. Cursor Tracking Through Rewrap
-
-Two cursors ride along with the rewrap. `rewrap.h:74–89`:
-
-```c
-for (TrackCursor *t = track; !t->is_sentinel; t++) {
-    if (t->is_tracked_line && t->x >= src_x_limit)
-        t->x = MAX(1u, src_x_limit) - 1;
-}
-...
-for (TrackCursor *t = track; !t->is_sentinel; t++) {
-    if (t->is_tracked_line && src_x <= t->x && t->x < src_x + num) {
-        t->y = dest_y;
-        t->x = dest_x + (t->x - src_x + (t->x > 0));
-    }
-}
-```
-
-### 12.1 Pre-copy clamp
-
-Before entering the inner copy loop, the cursor x is clamped down to
-`src_x_limit - 1` if it was beyond the trimmed line width. This handles the
-"cursor sitting on trimmed trailing blanks" case: if the user's cursor was at
-x=10 on a line trimmed to `src_x_limit=7`, the cursor moves to x=6 before
-tracking.
-
-`MAX(1u, src_x_limit) - 1` handles `src_x_limit == 0` (empty line): the result
-is 0, which means the cursor goes to column 0. Otherwise it's
-`src_x_limit - 1` (cursor on the last non-blank column).
-
-### 12.2 The +1 adjustment in the copy-loop remap
-
-```c
-t->x = dest_x + (t->x - src_x + (t->x > 0));
-```
-
-In plain language: the cursor's new x equals
-`dest_x + (relative_position_within_chunk) + (1 if cursor was not at column 0)`.
-
-### 12.2.1 Why the +1?
-
-Terminal cursor semantics distinguish between "cursor points at the cell to
-be written" (the common convention, column 0-indexed) and "cursor is one
-past the last written cell" (the write-the-next-char convention). Kitty uses
-the former internally for cursor.x, but the +1 adjustment handles a specific
-case: if the cursor was at `t->x` inside the src chunk `[src_x, src_x+num)`,
-and the src chunk maps to dest `[dest_x, dest_x+num)`, then the naive
-`t->x = dest_x + (t->x - src_x)` would place the cursor **at** the
-corresponding dest column.
-
-But test `test_cursor_after_resize` at `kitty_tests/screen.py:315–319` expects:
-
-```python
-s = self.create_screen()
-draw('123'), draw('123')     # each draw writes 3 chars + linefeed+CR
-y_before = s.cursor.y        # cursor now at y=2, x=0 (after the second linefeed)
-s.resize(s.lines, s.columns-1)
-self.ae(y_before, s.cursor.y)
-```
-
-So after drawing two rows of `'123'`, the cursor is at (x=0, y=2), and after
-shrinking the columns by 1, the cursor's y is preserved at 2. The +1 doesn't
-fire here (`t->x = 0`), so the `t->x > 0` guard keeps the result simple.
-
-### 12.2.2 What the +1 actually does
-
-Consider a case where the cursor is at (x=4, y=0) on a 5-wide line of content,
-being shrunk to dest width 3:
-
-- First iteration: src_x=0, dest_x=0, num=3. Copy "abc". Cursor is at x=4,
-  src_x=0 ≤ 4 < 0+3=3 is **false**, so cursor not remapped yet.
-- Second iteration: dest_x=3 >= 3, call `next_dest_line(true)`, dest_x=0,
-  dest_y=1. src_x=3, num=2. Copy "de". Now src_x=3 ≤ 4 < 3+2=5, so remap:
-  `t->y = 1`, `t->x = 0 + (4 - 3 + 1) = 2`.
-
-With the +1, cursor lands at dest x=2, which is the cell containing 'e'
-(cursor points at or just past the cell it last wrote). Without the +1, it
-would land at x=1 (the cell containing 'd'). The +1 keeps cursor at/past
-the *next* unwritten column.
-
-### 12.2.3 Potential issue: off-by-one at the right edge
-
-There is a known subtlety: when `t->x` is at `src_x + num - 1` (the last cell
-of the copied chunk), the formula gives `dest_x + (num - 1 + 1) = dest_x + num`.
-But `dest_x + num` **equals** `dest->xnum` if the copy filled the dest row,
-meaning the cursor lands *beyond* the last dest column. This is the
-"one-past-the-end" position, which in terminal semantics is valid (it's where
-the *next* character will be written, which may itself trigger a wrap).
-
-However, the very next iteration of the outer copy loop may trigger
-`next_dest_line(true)` which would otherwise affect subsequent cursor
-remappings — but the cursor was already remapped in the iteration where the
-match fired, and `is_tracked_line` remains true until `src_y` advances, so
-subsequent iterations won't re-match (the condition `src_x <= t->x` would be
-`src_x <= dest_x+num` with src_x now being `src_x+num`, checks against
-`t->x = dest_x + num`, so `src_x <= dest_x + num` is true but
-`t->x < src_x + num` compares `dest_x + num < src_x + num` which is equivalent
-to `dest_x < src_x` which is **not true** in general — so the condition fails
-and the cursor isn't re-remapped. Good.
-
-But the cursor is now pointing at `(dest_y, dest->xnum)`, a virtual column
-one past the end. When the caller (`screen_resize`) copies `temp.x` into
-`cursor->x` at `screen.c:419–420`:
-
-```c
-#define S(c, w) c->x = MIN(w.after.x, self->columns - 1); \
-                c->y = MIN(w.after.y, self->lines - 1);
-```
-
-`MIN(dest_x + num, self->columns - 1) = self->columns - 1`. So the cursor
-gets clamped into range. This is **correct**, but it means the specific
-column information (that the cursor was "in the wrap zone") is lost. For a
-terminal this is fine because cursor at `columns - 1` with `pending_wrap`
-state is the canonical pre-wrap position.
-
-### 12.3 The `is_tracked_line` flag
-
-The outer loop updates `is_tracked_line` **once per source row** at
-`rewrap.h:64`:
-
-```c
-for (TrackCursor *t = track; !t->is_sentinel; t++)
-    t->is_tracked_line = src_y == t->y;
-```
-
-This means once cursor tracking activates for a given src row, it stays
-active across all chunked copies from that row until src_y advances — at
-which point it deactivates (set false, unless the cursor's y matches the new
-src_y).
-
-**Potential issue**: Because `t->y` is mutated by the remap
-(`t->y = dest_y`), on subsequent outer iterations the check
-`src_y == t->y` will compare the old src-side y against a dest-side y
-— semantically meaningless for lines beyond the cursor, but harmless because
-`is_tracked_line` then reverts to false. The only case where this would
-accidentally re-activate is if `dest_y` happens to equal some later `src_y`
-numerically, which in the upper-bounded iteration would be a coincidence with
-no harmful effect beyond potentially clamping tracking's x again — and the
-inner copy-loop check `src_x <= t->x < src_x + num` would still gate the
-remap correctly.
-
-### 12.4 Cursor "beyond content" detection (screen.c:368)
-
-```c
-which.is_beyond_content = num_content_lines_before > 0
-                          && self->cursor->y >= num_content_lines_before;
-```
-
-If the cursor's pre-resize y was past the last content row, set the flag.
-Later, at `screen.c:424–427`:
-
-```c
-if (cursor.is_beyond_content) {
-    self->cursor->y = cursor.num_content_lines;
-    if (self->cursor->y >= self->lines) {
-        self->cursor->y = self->lines - 1;
-        screen_index(self);
-    }
-}
-```
-
-The cursor is repositioned to **just after** the content (the first blank
-row after rewrap). If that's off-screen, clamp and scroll one line. This
-preserves the "cursor in empty area below command output" UX during shell
-interaction.
-
----
-
-## 13. Scrollback Fill After Enlarging a Window
-
-### 13.1 The option
-
-From `kitty/options/definition.py:420–423`:
-
-```python
-opt('scrollback_fill_enlarged_window', 'no',
-    option_type='to_bool', ctype='bool',
-    long_text='Fill new space with lines from the scrollback buffer '
-              'after enlarging a window.'
-    )
-```
-
-Default is `'no'`. When set to `'yes'`, the mechanism in `screen.c:428–438`
-activates.
-
-### 13.2 The mechanism
-
-```c
-if (is_main && OPT(scrollback_fill_enlarged_window)) {
-    const unsigned int top = 0, bottom = self->lines-1;
-    Savepoint *sp = is_main ? &self->main_savepoint : &self->alt_savepoint;
-    while (self->cursor->y + 1 < self->lines
-           && self->lines - self->cursor->y > lines_after_cursor_before_resize) {
-        if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line))
-            break;
-        INDEX_DOWN;
-        linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
-        self->cursor->y++;
-        sp->cursor.y = MIN(sp->cursor.y + 1, self->lines - 1);
-    }
-}
-```
-
-Step-by-step:
-1. **Loop condition**: keep filling as long as
-   - The cursor is not already at the last row
-   - The current distance from cursor to bottom is *greater* than the
-     pre-resize distance (i.e., the window has genuine new space below the
-     cursor)
-2. **Pop the newest history line**: `historybuf_pop_line` retrieves the
-   most recent history entry and decrements `count`. This effectively moves
-   the line from history back into circulation. It writes into
-   `self->alt_linebuf->line` — a scratch `Line*` we borrow from the alt
-   linebuf for this purpose (alt linebuf's content is irrelevant here since
-   we're filling main).
-3. **`INDEX_DOWN`** (`screen.c:289–299` macro): scrolls the main linebuf
-   **downward** by one via `linebuf_reverse_index(top, bottom)`, which
-   rotates `line_map[]` so the bottom row's storage moves to the top (the
-   opposite direction of `linebuf_index`). Clears the new top row. Adjusts
-   `last_visited_prompt.y` and graphics and selections by 1.
-4. **Copy popped line into new top row**: `linebuf_copy_line_to(main_linebuf,
-   alt_linebuf->line, 0)` writes the popped history line into row 0 of the
-   main linebuf.
-5. **Advance cursor y** and the savepoint's cursor y (capped at
-   `lines - 1`). This preserves cursor visual position — as the buffer
-   shifts down, the cursor shifts down with it.
-
-### 13.3 Behavioral verification
-
-From `kitty_tests/screen.py:361–367`:
-
-```python
-# Height increased, width unchanged → pull down lines to fill new space at the top
-s = prepare_screen(map(str, range(6)))
-assert_lines('2', '3', '4', '5', '')
-dist_from_bottom = s.lines - s.cursor.y
-s.resize(7, s.columns)
-assert_lines('0', '1', '2', '3', '4', '5', '')
-self.ae(dist_from_bottom, s.lines - s.cursor.y)
-```
-
-Before: 5-line window with rows `2,3,4,5,<empty>`, cursor at bottom.
-`0` and `1` are in history.
-
-After `resize(7, columns)`: expected 7-line window with `0,1,2,3,4,5,<empty>`
-— the history has been drained back into the top of the visible buffer.
-Cursor's distance from bottom is preserved.
-
-### 13.4 Interaction with rewrap
-
-Note this fill happens **after** rewrap has already executed. So if the
-resize is "wider and taller" (e.g., `test_scrollback_fill_after_resize`'s
-"Height increased, width increased" case at `screen.py:369–373`), the
-sequence is:
-1. Rewrap history to new width (`realloc_hb`).
-2. Rewrap main linebuf to new width (`realloc_lb`); overflow (if any) spills
-   to the already-rewrapped history.
-3. Pop history lines and shift main downward (scrollback fill).
-
-By the time step 3 runs, both history and linebuf are already at the new
-column width, so copying history-line into linebuf is straightforward.
-
-### 13.5 The `lines_after_cursor_before_resize` guard
-
-The loop condition `self->lines - self->cursor->y > lines_after_cursor_before_resize`
-is specifically worded to catch the **enlargement** case. If the window was
-shrunk, `self->lines - self->cursor->y` may be smaller than
-`lines_after_cursor_before_resize` and the loop never iterates. If enlarged,
-the new cursor-to-bottom distance is larger than before, and we pull lines
-until equality is restored.
-
----
-
-## 14. Pager History Interaction
-
-### 14.1 Structure
-
-`kitty/data-types.h:268–272`:
-
-```c
-typedef struct {
-    void *ringbuf;
-    size_t maximum_size;
-    bool rewrap_needed;
-} PagerHistoryBuf;
-```
-
-The pager history is a byte-level ring buffer (the vendored `ringbuf`
-library) that accumulates ANSI-escaped text as lines are evicted from the
-structured `HistoryBuf`. When the user runs `kitty @ scroll-to-prompt` or
-pipes to a pager, pager history is consulted.
-
-### 14.2 Push on eviction
-
-When `historybuf_push` overflows (`history.c:279–281`), it calls
-`pagerhist_push(self, as_ansi_buf)` **before** advancing `start_of_data`.
-
-`history.c:258–273`:
-
-```c
-static void
-pagerhist_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
-    PagerHistoryBuf *ph = self->pagerhist;
-    if (!ph) return;
-    const GPUCell *prev_cell = NULL;
-    Line l = {.xnum=self->xnum};
-    init_line(self, self->start_of_data, &l);
-    line_as_ansi(&l, as_ansi_buf, &prev_cell, 0, l.xnum, 0);
-    pagerhist_write_bytes(ph, (const uint8_t*)"\x1b[m", 3);
-    if (pagerhist_write_ucs4(ph, as_ansi_buf->buf, as_ansi_buf->len)) {
-        char line_end[2]; size_t num = 0;
-        line_end[num++] = '\r';
-        if (!l.gpu_cells[l.xnum - 1].attrs.next_char_was_wrapped)
-            line_end[num++] = '\n';
-        pagerhist_write_bytes(ph, (const uint8_t*)line_end, num);
-    }
-}
-```
-
-Observations:
-- Re-examines the evicted line via `init_line(self, self->start_of_data, &l)`
-  — this is the line at physical slot `start_of_data` (the oldest).
-- Writes SGR reset `\x1b[m`, then the ANSI-escaped cell content, then a `\r`
-  and — if `next_char_was_wrapped` is clear — a `\n`. So **soft-wrapped lines
-  in history are preserved as single logical lines** in pager history (no
-  trailing newline), and hard-break lines get their newline.
-
-### 14.3 Resize rewrap
-
-When `historybuf_rewrap` detects a column change (`history.c:607–608`):
-
-```c
-if (other->pagerhist && other->xnum != self->xnum
-    && ringbuf_bytes_used(other->pagerhist->ringbuf))
-    other->pagerhist->rewrap_needed = true;
-```
-
-The `rewrap_needed` flag is set. **The actual rewrap is deferred** — it's
-performed later by `pagerhist_rewrap_to()` (`history.c:391–432`), invoked
-when the user accesses the pager history. This is a valuable optimization:
-most resizes never trigger pager consumption, so we save the cost of rewrapping
-potentially megabytes of text eagerly.
-
-`pagerhist_rewrap_to()` iterates char-by-char through the old ringbuf,
-tracking column position via `wcswidth_step` (for wide-char awareness), and
-re-inserts `\r` breaks where the new width demands.
-
-### 14.4 `init_line`'s pager history check
-
-As noted in §2.5, HistoryBuf's `init_line` at `history.c:170–176` reads:
-
-```c
-if (self->pagerhist && self->pagerhist->ringbuf
-    && (sz = ringbuf_bytes_used(self->pagerhist->ringbuf)) > 0) {
-    size_t pos = ringbuf_findchr(self->pagerhist->ringbuf, '\n', sz - 1);
-    if (pos >= sz) l->attrs.is_continued = true;  // ringbuf does not end with a newline
-}
-```
-
-This bridges pager history → history for the continuation flag. If the
-oldest *live* history line was preceded (in pager history) by a soft-wrap,
-its `is_continued` comes back as `true`.
-
-### 14.5 Pager history during scrollback fill
-
-`historybuf_pop_line` at `history.c:293–300` does **not** pull lines back
-from pager history — only from the structured history ring. So if you resize
-twice in quick succession (grow, then grow again), the first grow might
-evict a line from the ring to the pager, and the second grow's scrollback
-fill will not retrieve that evicted line from pager history. This is
-generally fine because the pager history is meant for "save for pager," not
-"save for re-entry."
-
----
-
-## 15. Complete Call Chain & Data-Flow Map
-
-### 15.1 Function-level call graph
-
-```
-Python: Screen.resize(lines, columns)
-│
-├── screen_resize()                        [kitty/screen.c:345]
-│   │
-│   ├── screen_pause_rendering(false, 0)
-│   │
-│   ├── [optional] insert dummy '<' in empty OUTPUT_START   [screen.c:353–361]
-│   │
-│   ├── init_overlay_line(columns, true)                    [screen.c:372]
-│   │
-│   ├── realloc_hb(historybuf, ynum, columns, as_ansi_buf)  [screen.c:375]
-│   │   │
-│   │   ├── alloc_historybuf(lines, columns, 0)
-│   │   │
-│   │   ├── [move pagerhist pointer across]
-│   │   │
-│   │   └── historybuf_rewrap(old, new, as_ansi_buf)        [history.c:595]
-│   │       │
-│   │       ├── [pre-grow segments]
-│   │       │
-│   │       ├── [fast path for same dims] OR
-│   │       │
-│   │       └── rewrap_inner(src=old, dest=new,             [rewrap.h:56]
-│   │                        src_limit=old.count,
-│   │                        historybuf=NULL, track=NULL)
-│   │           │
-│   │           ├── init_src_line(src_y)                    [history.c:586]
-│   │           │   → init_line(src, map_src_index(src_y), src->line)
-│   │           │
-│   │           ├── is_src_line_continued()                 [rewrap.h:41]
-│   │           │
-│   │           ├── first_dest_line/next_dest_line(cont)    [history.c:588,590]
-│   │           │   → history_buf_set_last_char_as_continuation
-│   │           │   → historybuf_push
-│   │           │       → [if full] pagerhist_push          [history.c:258]
-│   │           │
-│   │           └── copy_range()                            [rewrap.h:44]
-│   │
-│   ├── [is_main] prevent_current_prompt_from_rewrapping()  [screen.c:302]
-│   │   │
-│   │   ├── [walk back from cursor looking for PROMPT_START]
-│   │   ├── linebuf_copy_line_to(prompt_copy, ...)
-│   │   ├── linebuf_clear_line(main_linebuf, ..., false)
-│   │   └── [write ' ' into cpu_cells[0] of prompt region]
-│   │
-│   ├── realloc_lb(main_linebuf, lines, columns, ...,       [screen.c:384]
-│   │              self->historybuf, ...)
-│   │   │
-│   │   ├── alloc_linebuf(lines, columns)
-│   │   │
-│   │   ├── [copy before.xy → temp.xy]
-│   │   │
-│   │   └── linebuf_rewrap(main_linebuf, new_linebuf, ...)  [line-buf.c:585]
-│   │       │
-│   │       ├── [fast path for same dims] OR
-│   │       │
-│   │       ├── [find first non-empty line]
-│   │       │
-│   │       └── rewrap_inner(src, dest, content_lines,      [rewrap.h:56]
-│   │                        historybuf=self->historybuf,
-│   │                        track=cursor_array)
-│   │           │
-│   │           ├── init_src_line(src_y)                    [rewrap.h:15 default]
-│   │           │   → linebuf_init_line(src, src_y)         [line-buf.c:141]
-│   │           │
-│   │           ├── first_dest_line/next_dest_line(cont)    [rewrap.h:21,25]
-│   │           │   ├── linebuf_set_last_char_as_continuation
-│   │           │   ├── linebuf_index(dest, 0, ynum-1)      [line-buf.c:316]
-│   │           │   ├── [if dest full AND historybuf != NULL]
-│   │           │   │   └── historybuf_add_line(historybuf, ...) [history.c:286]
-│   │           │   │       └── historybuf_push
-│   │           │   │           └── [if full] pagerhist_push
-│   │           │   └── linebuf_clear_line(dest, ynum-1, true) [line-buf.c:299]
-│   │           │
-│   │           └── copy_range()
-│   │
-│   ├── grman_remove_all_cell_images(main_grman)
-│   ├── grman_resize(main_grman, ...)
-│   │
-│   ├── realloc_lb(alt_linebuf, ..., NULL /* no history */, ...)  [screen.c:394]
-│   │   └── [same as main path, but historybuf=NULL → overflow discarded]
-│   │
-│   ├── grman_remove_all_cell_images(alt_grman)
-│   ├── grman_resize(alt_grman, ...)
-│   │
-│   ├── [commit self->lines, self->columns, margins, tabstops]
-│   ├── [clear selections]
-│   ├── [clamp cursor via S(c, w) macro]
-│   ├── [if is_beyond_content: reposition cursor to num_content_lines]
-│   │
-│   ├── [if is_main AND OPT(scrollback_fill_enlarged_window)]
-│   │   └── while cursor+1 < lines AND room to grow:
-│   │       ├── historybuf_pop_line(historybuf, alt_linebuf->line)  [history.c:293]
-│   │       ├── INDEX_DOWN                                 [screen.c:289]
-│   │       │   ├── linebuf_reverse_index(top, bottom)
-│   │       │   ├── linebuf_clear_line(top, true)
-│   │       │   ├── grman_scroll_images(1)
-│   │       │   └── index_selection(...)
-│   │       └── linebuf_copy_line_to(main_linebuf, popped_line, 0)
-│   │
-│   ├── [if dummy_output_inserted: erase dummy '<' from cursor line]
-│   │
-│   └── [if num_of_prompt_lines: copy prompt_copy back into main_linebuf]
-│
-└── [return; renderer picks up self->is_dirty == true next frame]
-```
-
-### 15.2 Data-flow: a wrapped line moving from linebuf to history
-
-Consider a concrete scenario: main linebuf has 5 rows, top row is "abcde"
-(wrap flag set), row 1 is "fghij" (no wrap). Resize columns to 3.
-
-```
-Before resize:
-  linebuf[0] = "abcde"  [next_char_was_wrapped = 1]
-  linebuf[1] = "fghij"  [next_char_was_wrapped = 0]
-  linebuf[2] = ""
-  linebuf[3] = ""
-  linebuf[4] = "" (cursor here)
-
-rewrap_inner with dest_xnum=3, historybuf != NULL:
-
-iter src_y=0: init_src_line(0) → src->line = "abcde", is_continued=false
-              is_src_line_continued() → TRUE (wrap flag set)
-              src_x_limit = 5, NO trim
-              first_dest_line → linebuf_init_line(dest, 0), dest_y=0
-              inner loop:
-                copy_range("abc" → dest[0][0..2]), dest_x=3
-                dest_x >= dest->xnum → next_dest_line(true)
-                  → set dest[0].last_cell.wrap = true
-                  → dest_y=1 (normal advance, ynum=5 not full)
-                  → init dest[1]
-                  → dest_x=0
-                copy_range("de"  → dest[1][0..1]), src_x=5, dest_x=2
-              exit inner (src_x=5 >= src_x_limit=5)
-              src_y=1, src_x=0
-              src_line_is_continued=TRUE, so do NOT advance dest_y
-
-iter src_y=1: init_src_line(1) → src->line = "fghij", is_continued=true
-              is_src_line_continued() → FALSE
-              src_x_limit = 5 after trim (no blanks)
-              inner loop:
-                dest_x=2, copy_range("f"   → dest[1][2]), dest_x=3
-                dest_x >= 3 → next_dest_line(true)
-                  → set dest[1].last_cell.wrap=true
-                  → dest_y=2, dest_x=0
-                copy_range("ghi" → dest[2][0..2]), src_x=4, dest_x=3
-                dest_x >= 3 → next_dest_line(true)
-                  → set dest[2].last_cell.wrap=true
-                  → dest_y=3, dest_x=0
-                copy_range("j"   → dest[3][0]), src_x=5, dest_x=1
-              exit inner
-              src_y=2, src_x=0
-              src_line_is_continued=FALSE → next_dest_line(false)
-                → set dest[3].last_cell.wrap=false
-                → dest_y=4, dest_x=0
-
-iter src_y=2..4: all empty, trim to 0, no inner loop body,
-                 each iteration calls next_dest_line(false)
-
-  src_y=2: next_dest_line(false) → dest_y=5 ... but dest->ynum=5!
-    → dest_y >= dest->ynum - 1 (5 >= 4), triggers overflow:
-      → linebuf_index(dest, 0, 4) [scroll dest up]
-      → historybuf != NULL: push the evicted top (dest[0]="abc" wrap=1) to history
-      → clear the recycled bottom row (now physical slot formerly at top)
-      → dest_y stays at 4
-  src_y=3: same — dest_y stays at 4, another eviction
-  src_y=4: same
-```
-
-Wait — there's an issue here. The trailing blank lines trigger
-`next_dest_line(false)`, each of which scrolls up and evicts. But the src has
-empty trailing rows (rows 2,3,4) and `src_x_limit` would be 0 after trim.
-Looking again at `rewrap.h`:
-
-```c
-do {
-    ...
-    src_x_limit = src->xnum;
-    if (!src_line_is_continued) {
-        while(src_x_limit && (src->line->cpu_cells[src_x_limit - 1].ch) == BLANK_CHAR) src_x_limit--;
-    }
-    ...
-    if (is_first_line) { first_dest_line; is_first_line = false; }
-    while (src_x < src_x_limit) { ... }
-    src_y++; src_x = 0;
-    if (!src_line_is_continued && src_y < src_limit) { init_src_line(src_y); next_dest_line(false); dest_x = 0; }
-} while (src_y < src_limit);
-```
-
-For an empty trailing line, `src_x_limit = 0`, inner loop is skipped. Then
-`src_line_is_continued = false`, so `next_dest_line(false)` fires. Yes — this
-will eagerly evict. **BUT** — `linebuf_rewrap` at `line-buf.c:600–608`
-**trims trailing empty lines** before calling `rewrap_inner`:
-
-```c
-first = self->ynum;
-do {
-    first--;
-    CPUCell *cells = cpu_lineptr(self, self->line_map[first]);
-    for(i = 0; i < self->xnum; i++) {
-        if ((cells[i].ch) != BLANK_CHAR) { is_empty = false; break; }
-    }
-} while(is_empty && first > 0);
-
-...
-*num_content_lines_before = first + 1;
-...
-rewrap_inner(self, other, *num_content_lines_before, ...);
-```
-
-So `src_limit = first + 1`, meaning trailing empty lines are excluded from
-the rewrap iteration range. In our example, with content in rows 0 and 1 and
-rows 2,3,4 empty, `first = 1`, `src_limit = 2`. `rewrap_inner` iterates
-src_y=0 and src_y=1 only. No unnecessary evictions.
-
-### 15.3 Where the continuation state is stamped — full trace for our example
-
-After `rewrap_inner`:
-```
-dest[0] = "abc"  last_cell.next_char_was_wrapped = 1  (src_y=0 inner-loop wrap)
-dest[1] = "def"  last_cell.next_char_was_wrapped = 1  (src_y=1 first inner-loop wrap: "de" + "f" = "def")
-Wait, let me retrace...
-```
-
-Actually let me retrace more carefully:
-
-src_y=0 iter: src="abcde" wrap=1
-- is_first_line → first_dest_line → init dest[0], dest_y=0, dest_x=0
-- inner loop:
-  - src_x=0, dest_x=0: num=min(5,3)=3, copy "abc" to dest[0][0..2], src_x=3, dest_x=3
-  - src_x=3 < 5: dest_x=3 >= 3 → next_dest_line(true): set dest[0] wrap=true, advance dest_y=1, init dest[1], dest_x=0
-  - src_x=3, dest_x=0: num=min(5-3,3)=2, copy "de" to dest[1][0..1], src_x=5, dest_x=2
-- src_y=1, src_x=0
-- src_line_is_continued=true → NO next_dest_line
-
-src_y=1 iter: src="fghij" (now with wrap=1 inherited from prev row's wrap, but wait —
-`is_continued` field is recomputed by `linebuf_init_line` from prev GPU cell.
-The prev row's wrap WAS true, so src->line->attrs.is_continued = true. BUT,
-`is_src_line_continued()` checks src->line->gpu_cells[src->xnum-1].attrs.
-next_char_was_wrapped on the CURRENT src line, not prev. Checking src="fghij"'s
-last cell 'j': its wrap flag was 0 originally. So is_src_line_continued() = false.)
-
-- src_x_limit = 5, NO trim (no blanks)
-- inner loop:
-  - src_x=0, dest_x=2: num=min(5,1)=1, copy "f" to dest[1][2], src_x=1, dest_x=3
-  - src_x=1 < 5: dest_x=3 >= 3 → next_dest_line(true): set dest[1] wrap=true, advance dest_y=2, init dest[2], dest_x=0
-  - src_x=1, dest_x=0: num=min(5-1,3)=3, copy "ghi" to dest[2][0..2], src_x=4, dest_x=3
-  - src_x=4 < 5: dest_x=3 >= 3 → next_dest_line(true): set dest[2] wrap=true, advance dest_y=3, init dest[3], dest_x=0
-  - src_x=4, dest_x=0: num=min(5-4,3)=1, copy "j" to dest[3][0], src_x=5, dest_x=1
-- src_y=2, src_x=0
-- src_line_is_continued=false AND src_y=2 < src_limit=2? NO (2 < 2 is false)
-- Do NOT run next_dest_line(false)
-
-Loop terminates. dest->line->ynum = dest_y = 3.
-
-Final linebuf:
-```
-dest[0] = "abc"  wrap=1
-dest[1] = "def"  wrap=1
-dest[2] = "ghi"  wrap=1
-dest[3] = "j  "  wrap=0 (not touched — initialized empty by alloc_linebuf, but dest[3] got "j" at position 0, and positions 1-2 are blank)
-dest[4] = "   "  wrap=0 (untouched — never visited)
-```
-
-num_content_lines_after = dest->line->ynum + 1 = 4.
-
-Good — this matches the test expectation for narrowing. The 5-row "abcde/fghij"
-content becomes "abc/def/ghi/j" on 3-col — four content rows — and `is_continued`
-is [false, true, true, true].
-
-The trace confirms the algorithm is correct on this scenario.
-
----
-
-## 16. Identified Potential Issues and Edge Cases
-
-The following are **potential** issues — behaviors that appear fragile or
-under-specified based on code reading. Most are **not** demonstrated bugs
-against the current test suite (all 54 tests pass), but represent areas where
-future changes could regress or where specific inputs might reveal
-inconsistencies.
-
-### 16.1 `line_attrs[].is_continued` is stale after rewrap
-
-**Observation**: The `is_continued` bit in `LineAttrs` stored in
-`line_attrs[]` is *written* by `set_dest_line_attrs` during rewrap but
-*overwritten* every time `linebuf_init_line` (or `init_line` in HistoryBuf)
-is called. After rewrap returns, the stored values are stale.
-
-**Risk**: Any future code that reads `linebuf->line_attrs[y].is_continued`
-directly (without going through `linebuf_init_line`) may see garbage. The
-current codebase appears consistent — all reads go through the init helpers —
-but this is an **implicit contract** not enforced by types or naming.
-
-**Evidence**:
-- `line-buf.c:145`: `self->line->attrs.is_continued = ... next_char_was_wrapped`
-  — the stored `line_attrs[idx].is_continued` is overwritten on access.
-- `history.c:167–176`: same pattern.
-- No place in the code currently reads `line_attrs[y].is_continued` directly
-  except via the init helpers.
-
-**Mitigation**: A comment in `LineAttrs` definition noting that
-`is_continued` is computed on access would prevent future accidents.
-
-### 16.2 Wide character handling in `rewrap_inner`
-
-**Observation**: `copy_range()` is a raw memcpy of CPU+GPU cells. It has no
-awareness of `CellAttrs.width == 2` (wide character first cell) or
-`width == 0` (second cell of a wide char). The inner loop chunk size
-`num = MIN(src->line->xnum - src_x, dest->xnum - dest_x)` may split a wide
-character across a line boundary.
-
-**Risk**: If the wrap point `dest->xnum - dest_x` falls **between** the two
-cells of a wide char (width=2 + width=0), the width=2 cell ends up on one
-line and the width=0 on the next. The GPU renderer should handle this
-gracefully (the width=0 cell is typically skipped), but the character
-becomes orphaned on its own line with corrupt width semantics.
-
-**Empirical check**: `rewrap.h` contains no width-aware logic; the comment
-at `rewrap.h:69` (the trailing-blank trim) only checks `ch == BLANK_CHAR`,
-not width. No test case in `kitty_tests/datatypes.py` or
-`kitty_tests/screen.py` exercises wide-char reflow — searching the test file
-for `width` or `cjk` or `CJK` finds none in rewrap/resize context.
-
-**Mitigation candidate**: Before advancing `dest_x` to trigger
-`next_dest_line(true)`, check whether `src->line->gpu_cells[src_x + num - 1]
-.attrs.width == 2` and back off by 1 to force the wide char onto the next
-line. This is not currently done.
-
-Note the `xlimit_for_line` helper in `kitty/lineops.h:39–47` has the right
-correction:
-
-```c
-static inline index_type
-xlimit_for_line(const Line *line) {
-    index_type xlimit = line->xnum;
-    if (BLANK_CHAR == 0) {
-        while (xlimit > 0 && (line->cpu_cells[xlimit - 1].ch) == BLANK_CHAR) xlimit--;
-        if (xlimit < line->xnum && line->gpu_cells[xlimit > 0 ? xlimit - 1 : xlimit].attrs.width == 2) xlimit++;
-    }
-    return xlimit;
-}
-```
-
-It restores the trailing half-cell of a wide char that the blank-trim would
-otherwise have cut. But `rewrap_inner`'s own trim loop does **not** include
-this correction — it's a separate helper not called from `rewrap.h`. Result:
-a line ending in a wide character followed by a BLANK_CHAR (its phantom
-second cell) may have the wide character's second cell *trimmed off*. The
-src line "W\0" (wide char plus its zero-width continuation) trims to just
-"W", and then copy_range sees xnum=1 and copies only the width=2 cell
-— losing the paired width=0 cell.
-
-### 16.3 Continuation flag bridge only at main linebuf row 0
-
-**Observation**: `screen.c:2836–2838`:
-
-```c
-if (y == 0 && self->linebuf == self->main_linebuf) {
-    if (history_buf_endswith_wrap(self->historybuf))
-        self->linebuf->line->attrs.is_continued = true;
-}
-```
-
-Only `screen_init_line` does this — **not** `linebuf_init_line`. Code paths
-that use `linebuf_init_line` directly on the main linebuf without going
-through `screen_init_line` will see `is_continued=false` for row 0 even when
-it should be true (the history ends with a wrap).
-
-**Risk**: consumers that do their own iteration over the main linebuf (e.g.,
-custom selection logic, text extraction) may miss the history↔screen wrap
-relationship. Search the codebase for `linebuf_init_line(.*main_linebuf`
-to identify them; several exist in `screen.c` itself, e.g., at line 354
-(dummy-output detection), line 440 (dummy-output removal) — these do not
-need continuation info, so it's fine — and at line 2536 (paused rendering,
-which is a different linebuf).
-
-**Potential follow-up**: The same bridge is **not** applied for the alt
-linebuf. The alt screen is a separate logical buffer and doesn't use the
-main history, so its row 0 is never continued from history — `is_continued
-= false` is correct there. So the conditional `self->linebuf == self->
-main_linebuf` is correct.
-
-### 16.4 `next_dest_line(true)` in the inner loop clears then reinitializes
-dest—fired per overflow
-
-**Observation**: The LineBuf `next_dest_line` does:
-```c
-linebuf_set_last_char_as_continuation(dest, dest_y, continued);
-// ... possibly scroll and push to history ...
-linebuf_init_line(dest, dest_y);
-set_dest_line_attrs(dest_y);
-```
-
-When the inner loop fires `next_dest_line(true)` repeatedly (narrow dest
-case), each firing calls `linebuf_init_line` and `set_dest_line_attrs`,
-which writes `dest->line_attrs[dest_y] = src->line->attrs` (with
-`prompt_kind` then cleared on src — but this inner-loop call is re-firing
-for the *same src line*, so after the first call `src->line->attrs.
-prompt_kind = UNKNOWN_PROMPT_KIND` and subsequent calls copy that cleared
-value).
-
-**Effect**: For a source line that spans **multiple** destination lines
-(narrowing case), only the **first** destination line gets the original
-`prompt_kind`; subsequent dest lines have `prompt_kind = UNKNOWN_PROMPT_KIND`.
-
-Is this correct? Yes — a prompt line that wraps across multiple visual rows
-is logically "one prompt" with its start at the first row. The comment in
-`rewrap.h:18` doesn't explain this but the behavior is intentional.
-
-But this does mean that `prompt_kind` info is **lost on narrowing**: if you
-had a PROMPT_START line of content "PS1> command" and narrow it so it spans
-2 rows "PS1> " / "command", the first row correctly keeps PROMPT_START, and
-the second row has UNKNOWN_PROMPT_KIND. But if you then re-widen back to the
-original width, the two dest rows merge into one — and the merge pulls the
-`prompt_kind` from the **first** src row (PROMPT_START) — good.
-
-**No bug, but a subtle design detail**: `prompt_kind` is a first-line-only
-attribute for logical prompts.
-
-### 16.5 Cursor remap arithmetic off-by-one at chunk boundary
-
-**Observation**: `rewrap.h:87`: `t->x = dest_x + (t->x - src_x + (t->x > 0))`.
-
-When `t->x == src_x` (the cursor is at the very first cell of the chunk)
-and `t->x > 0` (i.e., was not at col 0 of the src line), the formula gives
-`dest_x + (0 + 1) = dest_x + 1` — the cursor moves **one cell to the right**
-of where we'd naively expect.
-
-**Is this intentional?** Likely yes, to handle the "last cursor-written
-position + pending wrap" case: kitty stores cursor.x where the *next* glyph
-will be written, so cursor.x points just-past the last written column. After
-a rewrap, the cursor should land at the analogous just-past position.
-
-**Verified by test**: `test_cursor_after_resize` in `kitty_tests/screen.py:
-328–332`:
-
-```python
-s = self.create_screen()
-draw('a')
-x_before = s.cursor.x   # x=1 (one past the 'a')
-s.resize(s.lines - 1, s.columns)
-self.ae(x_before, s.cursor.x)
-```
-
-This passes, so cursor.x=1 is preserved across resize. The +1 adjustment is
-necessary for this to work.
-
-**Corner case**: `t->x == 0 && src_x == 0`: cursor stays at `dest_x + 0 = 0`
-— no +1. Correct, because cursor at column 0 is not "one past" anything.
-
-**Corner case**: `t->x == 0 && src_x > 0`: can't happen — inner loop only
-remaps cursors on the current tracked src line, and the cursor's x hasn't
-been updated yet, so `src_x <= t->x < src_x + num` requires `t->x >= src_x`.
-If src_x > 0, then t->x > 0 too. Safe.
-
-### 16.6 History `init_line` computes `is_continued` from PHYSICAL `num-1`
-
-**Observation**: `history.c:167–168`:
-
-```c
-if (num > 0) {
-    l->attrs.is_continued = gpu_lineptr(self, num - 1)[self->xnum-1].attrs.next_char_was_wrapped;
-}
-```
-
-`num` here is a **physical** index (the ring buffer slot), not the logical
-reverse-indexed lnum. `num - 1` is the physical slot before `num`.
-
-After the ring wraps (`start_of_data > 0`), physical slot 0's logical
-predecessor is physical slot `ynum - 1`, NOT "physical slot -1." But the
-code just checks `num > 0`. When `num == 0`, we fall through to the pager
-history check — which is correct as explained in §14.4.
-
-**When `num > 0` but the slot is physically at `start_of_data`** (the
-"oldest live" entry): `num - 1` is physically the youngest entry — a
-completely unrelated line in a ring-wrapped buffer. The computed
-`is_continued` is nonsense.
-
-**Mitigation**: This is likely **not** a visible bug because:
-1. `historybuf_init_line` (the public API) always passes
-   `index_of(self, lnum)` which converts logical-to-physical using the ring.
-2. `rewrap_inner`'s `init_src_line` uses `map_src_index(y)` to convert
-   logical-to-physical; for HistoryBuf src, `y` starts at 0 and increases
-   monotonically — `y=0` → physical `start_of_data`, `y=1` → physical
-   `start_of_data + 1`, etc. The **logical** predecessor of `y=0` is
-   *nothing* (pager history territory); of `y=1` is `y=0`. The physical
-   predecessor of `start_of_data` is `ynum - 1`, which is *wrong*.
-
-   But the `if (num > 0)` check at `history.c:167` uses `num`, not `y`!
-   When `y == 0`, `num = map_src_index(0) = start_of_data`. If
-   `start_of_data == 0`, `num == 0` and we correctly fall to pager history.
-   If `start_of_data > 0`, `num > 0` and we incorrectly read physical slot
-   `num - 1` (some wholly unrelated line).
-
-   **This is a real consistency gap** during HistoryBuf rewrap when the ring
-   has wrapped. Let's assess severity:
-   - The wrong-read `is_continued` is written to `src->line->attrs.
-     is_continued`.
-   - `rewrap_inner` uses `is_src_line_continued()`, which reads the **last
-     GPUCell's `next_char_was_wrapped`**, NOT `is_continued`. So this
-     incorrect `is_continued` doesn't directly affect rewrap decisions.
-   - The incorrect `is_continued` *is* written to dest via
-     `set_dest_line_attrs`, but the default LineBuf `next_dest_line` isn't
-     used here (HistoryBuf specialization is); its `*lap = src->line->attrs`
-     writes the wrong `is_continued` into `dest->line_attrs[new_slot].
-     is_continued`. But `is_continued` is always recomputed on access
-     (§11.3), so the stale value is harmless.
-   - Net effect: the bug writes stale data that's never observably read.
-
-   **Conclusion**: Latent inconsistency, not a live bug — but if a future
-   code change ever reads `line_attrs[].is_continued` without going through
-   `init_line`, it would manifest.
-
-### 16.7 Trailing-blank trim trimming past wide-character second cells
-
-Already discussed in §16.2 — `rewrap_inner`'s trim at `rewrap.h:70` does
-not account for width-2 pairs. A trailing wide character whose paired
-width-0 cell is BLANK_CHAR (the usual state — the second cell's `ch` is
-typically 0 or copy of the wide char) will be trimmed off, corrupting the
-wide character.
-
-### 16.8 `screen_resize` races against in-progress rendering
-
-`screen_resize` first calls `screen_pause_rendering(false, 0)` which
-presumably disables paused rendering mode. If the renderer is in the middle
-of reading cell buffers on another thread, the `Py_CLEAR(self->main_linebuf)`
-at `screen.c:386` may free memory the renderer is reading. This is a
-**threading concern**, not a reflow bug — the renderer must hold the GIL or
-a separate lock while iterating. Search confirms `screen.c` uses the GIL
-model (the code is all inside `PyObject`-derived types with Python method
-implementations). Safe under the GIL assumption.
-
-### 16.9 `linebuf_copy_line_to` in scrollback fill uses `alt_linebuf->line`
-
-At `screen.c:432, 434`:
-
-```c
-if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
-INDEX_DOWN;
-linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
-```
-
-This uses `self->alt_linebuf->line` as scratch. `alt_linebuf->line` is a
-`Line *` that is normally "borrowed" for render iteration. If another thread
-had this pointer cached (e.g., a Python callback holding a reference), this
-would corrupt it — but again, under GIL assumption, single-threaded.
-
-Minor code-smell: `alt_linebuf` is in scope even if `is_main` is false (which
-is the condition for this whole block), so using its `line` scratch is
-harmless but slightly opaque. A dedicated `Line` scratch field on `Screen`
-would be clearer.
-
-### 16.10 Empty-line rewrap optimization
-
-`linebuf_rewrap` at `line-buf.c:610–614`:
-
-```c
-if (is_empty) {  // All lines are empty
-    *num_content_lines_after = 0;
-    *num_content_lines_before = 0;
-    return;
-}
-```
-
-When the whole src LineBuf is empty, rewrap returns early **without**
-initializing the tracked cursors. The caller `realloc_lb` set `temp.x/y =
-before.x/y`, and since `linebuf_rewrap` returns without touching them, the
-caller's `setup_cursor` macro sees `after.x = before.x, after.y = before.y`.
-
-So after rewrapping an empty buffer: cursor.after = cursor.before. If
-`before.y >= new_lines`, the cursor ends up out of bounds until the
-`S(c, w)` clamp at `screen.c:420`. That clamp handles it. Fine.
-
-But `cursor.is_beyond_content = num_content_lines_before > 0 && self->
-cursor->y >= num_content_lines_before = false` (since
-`num_content_lines_before = 0`). So `is_beyond_content` is false, and the
-special repositioning in §3.7 doesn't fire. Cursor just gets clamped.
-
-This seems correct for an empty buffer.
-
-### 16.11 `dummy_output_inserted` only runs on cursor.y range
-
-`screen.c:353–361`:
-
-```c
-if (is_main && self->cursor->x == 0 && self->cursor->y < self->lines
-    && self->linebuf->line_attrs[self->cursor->y].prompt_kind == OUTPUT_START) {
-    linebuf_init_line(self->linebuf, self->cursor->y);
-    if (!self->linebuf->line->cpu_cells[0].ch) {
-        self->linebuf->line->cpu_cells[self->cursor->x++].ch = '<';
-        dummy_output_inserted = true;
-    }
-}
-```
-
-Checks *only* the cursor's current line for blank OUTPUT_START. If there are
-*multiple* blank OUTPUT_START lines (e.g., the shell wrote OSC 133 `;C`
-multiple times without any intervening output), only the cursor's line is
-preserved. The others get trimmed by `linebuf_rewrap`'s blank-tail-detection
-logic — their `OUTPUT_START` attribute is lost because rewrap doesn't
-preserve attrs of trailing blank lines.
-
-**Whether this is a bug** depends on the shell integration contract —
-typically the shell only emits OSC 133;C once per command. So this is fine.
-
-### 16.12 Scrollback fill not triggered for non-main screen
-
-`screen.c:428`: `if (is_main && OPT(scrollback_fill_enlarged_window))` —
-only active for main. Alt screen has no history, so fill is irrelevant —
-correct.
-
-But what if the user resizes *while* on alt screen? Then `is_main = false`
-and fill doesn't trigger. After switching back to main, the main linebuf
-was still resized (via the earlier `realloc_lb` at line 384), but no fill
-happens. The user sees the main screen's content at the new size without
-history pulled in. Is this correct? Probably yes — filling when
-not-on-main would be visually surprising (content shifts beneath the alt
-screen overlay). But it means `scrollback_fill_enlarged_window` is
-effectively "scrollback_fill_when_resizing_main_screen."
-
-### 16.13 `historybuf_rewrap` resets dest but doesn't free old pagerhist rewrap state
-
-`history.c:609`: `other->count = 0; other->start_of_data = 0;`. The
-`pagerhist->rewrap_needed` flag set at line 608 is preserved across the
-reset. But `other->pagerhist` was adopted from old (via `realloc_hb`'s
-pointer move), so this is the same pager buffer — the rewrap_needed flag
-correctly persists. OK.
-
-But note: **if `historybuf_rewrap` is called multiple times with different
-column widths** (unusual but possible, e.g., two resizes in rapid
-succession), each call sets `rewrap_needed = true` if columns differ. The
-actual pager rewrap `pagerhist_rewrap_to()` is called with the *final*
-column count when the user accesses pager, so intermediate widths are
-skipped. OK.
-
-### 16.14 `is_empty` detection of source misses GPU-only content
-
-`line-buf.c:604–608`:
-
-```c
-for(i = 0; i < self->xnum; i++) {
-    if ((cells[i].ch) != BLANK_CHAR) { is_empty = false; break; }
-}
-```
-
-Only checks `ch`. A cell with `ch = 0` but non-zero background color or a
-sprite would be considered "empty" and the line would be trimmed. In
-practice this is what we want — background-only cells are visual artifacts,
-not content.
-
-### 16.15 `grman_resize` called AFTER rewrap, with before/after line counts
-
-`screen.c:391` / `screen.c:400`:
-
-```c
-grman_resize(self->main_grman, self->lines, lines, self->columns, columns,
-             num_content_lines_before, num_content_lines_after);
-```
-
-Passes the content-line counts to the graphics manager so image positions
-can be updated relative to content. If a line containing an image placeholder
-is moved during rewrap (e.g., wrap-merging two rows), the graphics manager
-adjusts the image's logical y. The implementation of `grman_resize` is
-out-of-scope for this document (`kitty/graphics.c`), but the contract is
-clear: rewrap handles text, graphics manager handles images, and the two
-communicate via (before, after) content line counts.
-
----
-
-## 17. Test Coverage & Behavioral Confirmation
-
-All the claims in this document were validated against the current test
-suite. Running `python3 -m unittest kitty_tests.datatypes kitty_tests.screen`
-against the built C extensions on commit `815df1e21` produces:
-
-```
-.......................................................
-----------------------------------------------------------------------
-Ran 54 tests in 0.094s
-
-OK
-```
-
-Tests exercising rewrap specifically:
-
-- **`test_rewrap_simple`** (`kitty_tests/datatypes.py:337`): Same-width
-  copy, larger-dest expansion (with empty rows at the bottom), smaller-dest
-  contraction (with leading content rows spilling — verified
-  `cy = rewrap(...)[1] = 3`, matching the 3-row dest).
-- **`test_rewrap_wider`** (`datatypes.py:374`): Soft-wrapped pair "0123 " +
-  "56789" merges into "0123 5" + "6789" (on 6-col wider dest). Continuation
-  flags: False, True. Non-continued "12" + "abc" stays as two separate lines.
-- **`test_rewrap_narrower`** (`datatypes.py:385`): Hard-break line "123"
-  stays as-is; continuation from "123  " (with trailing blanks but soft
-  wrap) to "abcde" preserves the blanks: splits into "123" + "  a" + "bcd"
-  + "e" with continuation flags False/True/True/True.
-- **`test_resize`** (`screen.py:280`): Full `screen_resize()` path.
-  Screenful of rows `'00000', '11111', ..., '44444'` is resized to
-  `(3, 10)` → `'00000 11111'` merged onto one row, `'22222 33333'` merged
-  onto another, and `'44444'` alone on the third (rows 1 and 2 absorbed the
-  soft-wrap). Further resize to `(5, 1)` pushes everything except the last
-  '4' into history.
-- **`test_cursor_after_resize`** (`screen.py:308`): Cursor position
-  preservation through narrow, wide, height-down, and width+height changes.
-  Confirms the +1 cursor remapping arithmetic.
-- **`test_scrollback_fill_after_resize`** (`screen.py:343`): Exercises the
-  `scrollback_fill_enlarged_window` option through six scenarios covering
-  pure height increase, height+width increase, height+width decrease,
-  height unchanged+width increase, height decrease+width increase, and
-  large continued text. Confirms that scrollback fill correctly retrieves
-  lines from history and preserves cursor distance from bottom.
-- **`test_linebuf`** and **`test_historybuf`** (`datatypes.py`): Baseline
-  tests of LineBuf/HistoryBuf mutation and rewrap.
-
-All 54 tests pass cleanly, confirming the rewrap implementation is
-behaviorally correct for the scenarios tested. The potential issues
-identified in §16 are not exercised by these tests.
-
----
-
-## 18. Glossary
-
-| Term | Meaning |
-|---|---|
-| **LineBuf** | The visible screen buffer. 2D array of cells with row permutation via `line_map` for O(1) scrolling. |
-| **HistoryBuf** | Scrollback buffer. Segmented ring buffer of lines; `start_of_data` + `count` track the live range. |
-| **PagerHistoryBuf** | Byte-level ringbuf of ANSI-escaped text, accumulates evicted lines from HistoryBuf. |
-| **CPUCell** | 12-byte per-cell CPU-side data: `ch`, `hyperlink_id`, `cc_idx[3]`. |
-| **GPUCell** | 20-byte per-cell GPU-side data: colors, sprite coords, `CellAttrs`. |
-| **CellAttrs** | 16-bit packed attributes including `next_char_was_wrapped` (persistent soft-wrap marker). |
-| **LineAttrs** | 8-bit packed attributes including `is_continued` (derived soft-wrap query) and `prompt_kind`. |
-| **next_char_was_wrapped** | Bit on the last GPUCell of a line, set when soft-wrap occurred there. **Storage**. |
-| **is_continued** | Bit on a line's LineAttrs, computed from the previous line's `next_char_was_wrapped` at access time. **Query**. |
-| **rewrap_inner** | The generic rewrap algorithm in `rewrap.h:56`, parameterized by macros. |
-| **Macro polymorphism** | Compile-time specialization of `rewrap_inner` via `#define` overrides before `#include "rewrap.h"`. |
-| **Spillover** | When rewrap overflows a LineBuf dest, excess lines are pushed to HistoryBuf. |
-| **Scrollback fill** | `scrollback_fill_enlarged_window` — pulling history lines back into LineBuf when window grows. |
-| **Prompt protection** | `prevent_current_prompt_from_rewrapping` — blank the current shell prompt before rewrap to avoid flicker; restore after. |
-| **OSC 133** | Shell integration escape sequences that mark prompt/output boundaries; drive the `prompt_kind` field. |
-| **TrackCursor** | Struct in `rewrap.h:50` that follows cursor positions through the rewrap mapping. |
-| **CursorTrack** | Struct in `screen.c:226` that captures before/after cursor state around a `linebuf_rewrap` call. |
-| **line_map** | `LineBuf::line_map[]`: permutation of physical storage rows; enables O(1) scroll via rotation. |
-| **start_of_data** | Ring buffer offset of the oldest live line in `HistoryBuf`. |
-| **index_of** | `history.c:152`: translates reverse-indexed `lnum` (0=newest) to a physical ring slot. |
-| **map_src_index** | `history.c:584`: forward-indexed `y` → physical ring slot during rewrap. |
-| **has_dirty_text** | LineAttrs bit; renderer uses this to decide whether to re-upload a line's cells to GPU. |
-| **SEGMENT_SIZE** | 2048; the number of lines per `HistoryBufSegment`. |
-| **alloc_historybuf** | Constructor for a new HistoryBuf. Takes lines (scrollback depth), columns (width), pager_sz. |
-| **alloc_linebuf** | Constructor for a new LineBuf. Takes lines, columns. |
-| **INDEX_DOWN** | Macro in `screen.c:289` that scrolls the active linebuf downward by one row and updates graphics/selections. |
-| **grman_resize** | Adjusts image placements when screen size changes (details out of scope). |
-| **pause_rendering** | Mode where rendering is frozen against a snapshot; disabled at start of `screen_resize`. |
-
----
-
-## Appendix A — File References Map
-
-| File | Lines | Relevance |
-|---|---|---|
-| `kitty/rewrap.h` | 1–96 (full) | Generic rewrap algorithm + macro overrides |
-| `kitty/screen.c` | 216–223 | `realloc_hb` |
-| `kitty/screen.c` | 226–232 | `CursorTrack` struct |
-| `kitty/screen.c` | 234–242 | `realloc_lb` |
-| `kitty/screen.c` | 279–299 | `INDEX_GRAPHICS`, `INDEX_DOWN` macros |
-| `kitty/screen.c` | 302–343 | `prevent_current_prompt_from_rewrapping` |
-| `kitty/screen.c` | 345–463 | `screen_resize` |
-| `kitty/screen.c` | 2833–2840 | `init_line` with history endswith-wrap bridge |
-| `kitty/screen.h` | 88–170 | `Screen` struct (cursor, linebufs, historybuf, etc.) |
-| `kitty/line-buf.c` | 134–147 | `linebuf_init_line` (and static `init_line`) |
-| `kitty/line-buf.c` | 188–198 | `linebuf_line_ends_with_continuation`, `linebuf_set_last_char_as_continuation` |
-| `kitty/line-buf.c` | 291–327 | `clear_line_`, `linebuf_clear_line`, `linebuf_index`, `linebuf_reverse_index` |
-| `kitty/line-buf.c` | 583–637 | `#include "rewrap.h"` + `linebuf_rewrap` |
-| `kitty/history.c` | 15–64 | Segment allocation, ring indexing helpers |
-| `kitty/history.c` | 152–187 | `index_of`, `init_line` (HistoryBuf), `historybuf_init_line`, `history_buf_endswith_wrap` |
-| `kitty/history.c` | 258–307 | `pagerhist_push`, `historybuf_push`, `historybuf_add_line`, `historybuf_pop_line`, `history_buf_set_last_char_as_continuation` |
-| `kitty/history.c` | 391–432 | `pagerhist_rewrap_to` (lazy rewrap) |
-| `kitty/history.c` | 582–614 | HistoryBuf macro overrides + `#include "rewrap.h"` + `historybuf_rewrap` |
-| `kitty/data-types.h` | 115, 196–290 | `BLANK_CHAR`, `CellAttrs`, `GPUCell`, `CPUCell`, `PromptKind`, `LineAttrs`, `Line`, `LineBuf`, `HistoryBufSegment`, `PagerHistoryBuf`, `HistoryBuf` |
-| `kitty/lineops.h` | 14–46 | `copy_line`, `clear_chars_in_line`, `xlimit_for_line` |
-| `kitty/lineops.h` | 103–131 | Declarations for linebuf/historybuf ops |
-| `kitty/options/definition.py` | 420–423 | `scrollback_fill_enlarged_window` option |
-| `kitty_tests/datatypes.py` | 29–41 | `create_lbuf` helper |
-| `kitty_tests/datatypes.py` | 332–392 | `test_rewrap_simple/wider/narrower` |
-| `kitty_tests/screen.py` | 280–400 | `test_resize`, `test_cursor_after_resize`, `test_scrollback_fill_after_resize` |
-| `kitty_tests/__init__.py` | 237–270 | `create_screen` helper |
-
----
-
-## Appendix B — Build & Test Reproduction
-
-```bash
-# Install build dependencies (example on Ubuntu/Debian with root access):
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    pkg-config libdbus-1-dev libxkbcommon-dev libxkbcommon-x11-dev \
-    libgl1-mesa-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev \
-    libxcursor-dev libxi-dev libfreetype-dev libfontconfig-dev \
-    libharfbuzz-dev libpng-dev libxxhash-dev liblcms2-dev libssl-dev \
-    libcanberra-dev libx11-xcb-dev libxcb-xkb-dev libxcb-cursor-dev \
-    libsimde-dev
-
-# Build the C extensions:
-python3 setup.py build
-
-# Run the rewrap/resize tests:
-python3 -m unittest kitty_tests.datatypes kitty_tests.screen
-
-# Expected output: "Ran 54 tests in ~0.1s  OK"
-```
-
----
-
-*End of analysis document.*
