@@ -97,7 +97,8 @@ The call chain from top-level into the event loop is therefore:
 ```
 main()            # kitty/main.py:524
  └─ _main()       # kitty/main.py:441
-     └─ run_app() # kitty/main.py:518 (invocation); defined at line 247
+     └─ run_app   # kitty/main.py:263 (variable: `run_app = AppRunner()`);
+                  # invoked at line 518; AppRunner.__call__ body at line 247
          └─ boss.child_monitor.main_loop()  # runs until all windows close
              └─ boss.destroy()              # normal shutdown
                  └─ returns normally        # → exit code 0
@@ -788,7 +789,7 @@ sequences and dispatches them. For the OSC 133 family, dispatch lands in
 void
 shell_prompt_marking(Screen *self, char *buf) {
     if (self->cursor->y < self->lines) {
-        const char ch = buf[0];
+        char ch = buf[0];
         switch (ch) {
             case 'A': { ... }
             case 'C': {
@@ -947,7 +948,7 @@ spawn(PyObject *self UNUSED, PyObject *args) {
         ...
         if (setsid() == -1) exit_on_err("setsid() in child process failed");
         ...
-        if (ioctl(tfd, TIOCSCTTY, 0) == -1) exit_on_err("ioctl() on child pty failed");
+        if (ioctl(tfd, TIOCSCTTY, 0) == -1) exit_on_err("Failed to set controlling terminal with TIOCSCTTY");
         ...
     }
 ```
@@ -961,26 +962,28 @@ the PTY, readable via the master fd that the parent (Kitty) retains.
 The ChildMonitor I/O thread polls every child's PTY master fd and drains
 it when `POLLIN` fires:
 
-*File: `kitty/child-monitor.c`, lines 1337–1356 (read_bytes):*
+*File: `kitty/child-monitor.c`, lines 1336–1356 (read_bytes):*
 
 ```c
 static bool
 read_bytes(int fd, Screen *screen) {
     ssize_t len;
-    size_t available_buffer_space, orig_sz;
+    size_t available_buffer_space;
+
     uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
-    orig_sz = available_buffer_space;
+    if (!available_buffer_space) return true;
+
     while(true) {
         len = read(fd, buf, available_buffer_space);
         if (len < 0) {
-            if (errno == EINTR) continue;
-            if (errno != EIO && errno != EAGAIN) perror("Call to read() from child fd failed");
-            vt_parser_commit_write(screen->vt_parser, orig_sz - available_buffer_space);
+            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno != EIO) perror("Call to read() from child fd failed");
+            vt_parser_commit_write(screen->vt_parser, 0);
             return false;
         }
         break;
     }
-    vt_parser_commit_write(screen->vt_parser, orig_sz - available_buffer_space + len);
+    vt_parser_commit_write(screen->vt_parser, len);
     return len != 0;
 }
 ```
@@ -989,10 +992,16 @@ Key lines:
 
 - Line 1341: `vt_parser_create_write_buffer(screen->vt_parser, ...)` —
   reserve space inside the VT parser's ring buffer.
+- Line 1342: `if (!available_buffer_space) return true;` — fast-path
+  back-pressure; yield so the main thread can drain the parser before we
+  read more.
 - Line 1345: `len = read(fd, buf, available_buffer_space)` — the actual
   `read()` from the PTY master.
-- Line 1350: `return false` on `EIO`/`EAGAIN` (child died or no more data
-  *and* we're at EOF).
+- Line 1347: `if (errno == EINTR || errno == EAGAIN) continue;` — retry
+  on interrupted-syscall or would-block errors.
+- Line 1350: `return false` — reached on any non-retryable read error,
+  typically `EIO` (the PTY slave side has been closed because the child's
+  session has ended).
 - Line 1354: `vt_parser_commit_write(...)` — advance the parser's
   write-pointer to expose the just-read bytes.
 - Line 1355: `return len != 0` — `false` when `read()` returned 0 (EOF).
