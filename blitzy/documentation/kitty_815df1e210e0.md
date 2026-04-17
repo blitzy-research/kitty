@@ -88,7 +88,7 @@ mouse, resize) arrives, a timer expires, or `glfwPostEmptyEvent` is
 called (which is what Kitty's `wakeup_main_loop` does).
 
 Each iteration invokes Kitty's `process_global_state` tick callback
-(defined at `kitty/child-monitor.c` lines 1223–1253). That tick runs
+(defined at `kitty/child-monitor.c` lines 1224–1256). That tick runs
 seven sub-phases in order, described in Section 9.
 
 The crucial design property is that the loop **only ticks on wakeup**.
@@ -184,10 +184,10 @@ state flows through four mutexes (see §3).
 
 | Mutex | Declared | Protects | Held by |
 |-------|----------|----------|---------|
-| `children_lock` | `kitty/child-monitor.c:76` | the `children[]` array and `Child.refcnt` | main, I/O |
+| `children_lock` | `kitty/child-monitor.c:87` (declaration); `children_mutex(...)` macro at `kitty/child-monitor.c:76` | the `children[]` array and `Child.refcnt` | main, I/O |
 | `screen->write_buf_lock` | `kitty/screen.h:116` via `screen_mutex(...)` macro (`kitty/child-monitor.c:74`) | each `Screen.write_buf`, `write_buf_used`, `write_buf_sz` | main (enqueue), I/O (drain) |
-| `talk_lock` | `kitty/child-monitor.c:78` | `ChildMonitor.messages[]` | main (dequeue), talk (enqueue) |
-| `PS.lock` | `kitty/vt-parser.c:208` (inside `PS` struct at ~193) | the VT parser's 1 MiB ring buffer and its `read`/`write` sub-structs | main (consume), I/O (append) |
+| `talk_lock` | `kitty/child-monitor.c:87` (declaration); `talk_mutex(...)` macro at `kitty/child-monitor.c:78` | `ChildMonitor.messages[]` | main (dequeue), talk (enqueue) |
+| `PS.lock` | `kitty/vt-parser.c:206` (inside `PS` struct at lines 193–211) | the VT parser's 1 MiB ring buffer and its `read`/`write` sub-structs | main (consume), I/O (append) |
 
 ### 3.2 Lock ordering
 
@@ -210,22 +210,33 @@ Because the lock DAG has no cycles, no two threads can deadlock.
 
 The wakeup and signal primitives shared by both the I/O thread and the
 talk thread live in a `LoopData` struct (defined at `kitty/loop-utils.h`
-lines 32–44):
+lines 31–43, reproduced verbatim from source):
 
 ```c
 typedef struct {
-    int signal_read_fd, signal_write_fd;
-    int wakeup_read_fd, wakeup_write_fd;
-#ifdef HAS_SIGNAL_FD
-    int signal_fd;
+#ifndef HAS_EVENT_FD
+    int wakeup_fds[2];
 #endif
-#ifdef HAS_EVENT_FD
-    int wakeup_fd;  // aliased to wakeup_read_fd
+#ifndef HAS_SIGNAL_FD
+    int signal_fds[2];
 #endif
-    SignalSet signals_received;
-    sigset_t oldset;
+    sigset_t signals;
+    int wakeup_read_fd;
+    int signal_read_fd;
+    int handled_signals[16];
+    size_t num_handled_signals;
 } LoopData;
 ```
+
+On Linux (where `HAS_EVENT_FD` and `HAS_SIGNAL_FD` are defined),
+`wakeup_fds[2]` and `signal_fds[2]` are absent — the kernel's
+`eventfd(2)` and `signalfd(2)` objects replace the self-pipes.
+`wakeup_read_fd` is the single fd that both the reader (for `drain_fd`
+or eventfd reads) and the writer (in `wakeup_loop`) use; on the
+eventfd path the same fd serves both roles, whereas on the self-pipe
+path `wakeup_fds[0]` is the read end (copied into `wakeup_read_fd`)
+and `wakeup_fds[1]` is the write end. `signal_read_fd` is the
+analogous single handle for signals.
 
 `init_loop_data` (in `kitty/loop-utils.c`) installs either an `eventfd`
 (Linux, when `HAS_EVENT_FD` is set) or a self-pipe (macOS, BSDs) as the
@@ -234,7 +245,7 @@ signals.
 
 ### 3.4 `wakeup_loop`
 
-`wakeup_loop` (at approximately `kitty/loop-utils.c:113–128`) writes a
+`wakeup_loop` (at `kitty/loop-utils.c:112–127`) writes a
 single byte (pipe) or a `uint64_t` (eventfd) to the wakeup fd:
 
 ```c
@@ -243,20 +254,23 @@ wakeup_loop(LoopData *ld, bool in_signal_handler, const char *loop_name) {
     while(true) {
 #ifdef HAS_EVENT_FD
         static const int64_t value = 1;
-        ssize_t ret = write(ld->wakeup_fd, &value, sizeof value);
+        ssize_t ret = write(ld->wakeup_read_fd, &value, sizeof value);
 #else
-        ssize_t ret = write(ld->wakeup_write_fd, "w", 1);
+        ssize_t ret = write(ld->wakeup_fds[1], "w", 1);
 #endif
         if (ret < 0) {
             if (errno == EINTR) continue;
-            if (!in_signal_handler)
-                log_error("Failed to write to %s wakeup fd with error: %s",
-                          loop_name, strerror(errno));
+            if (!in_signal_handler) log_error("Failed to write to %s wakeup fd with error: %s", loop_name, strerror(errno));
         }
         break;
     }
 }
 ```
+
+Note that on the eventfd path the write target is `ld->wakeup_read_fd`
+— there is no separate write handle because `eventfd(2)` is bidirectional.
+On the self-pipe path the write target is `ld->wakeup_fds[1]`, the
+pre-existing pipe write end.
 
 This function is **async-signal-safe** (it only calls `write` and
 consults `errno`). Multiple wakeups in rapid succession coalesce into a
@@ -276,12 +290,29 @@ this is signal-safe and coalescing-friendly.
 ### 3.6 Signal delivery
 
 On the I/O thread, signals are received via either `signalfd` or a
-self-pipe. `read_signals` (`kitty/loop-utils.c` approximately lines
-131–165) drains the fd, unpacks each pending signal, and invokes a
-per-loop `handle_signal` callback. For the I/O thread, that callback
-(`handle_signal` in `kitty/child-monitor.c:1519`) sets `ss.child_died =
-true` on SIGCHLD, `ss.kill_received = true` on SIGTERM/SIGINT, etc.; the
-main thread consults these flags at the top of `parse_input`.
+self-pipe. `read_signals` (`kitty/loop-utils.c:131–180`, covering both
+the `#ifdef HAS_SIGNAL_FD` branch and the `#else` self-pipe branch)
+drains the fd, unpacks each pending signal into a `siginfo_t`, and
+invokes a per-loop `handle_signal` callback. For the I/O thread, that
+callback is defined at `kitty/child-monitor.c:1362` (`static bool
+handle_signal(const siginfo_t *siginfo, void *data)`) and called from
+the `io_loop` revents-dispatch at `kitty/child-monitor.c:1519`
+(`read_signals(children_fds[1].fd, handle_signal, &ss)`). Its body
+writes into the caller's `SignalSet` via a `ss` pointer:
+
+- `ss->kill_signal = true` on `SIGINT`, `SIGTERM`, or `SIGHUP`.
+- `ss->child_died = true` on `SIGCHLD`.
+- `ss->reload_config = true` on `SIGUSR1`.
+
+(The `SignalSet` struct is declared at `kitty/child-monitor.c:1359`
+with exactly three `bool` fields: `kill_signal`, `child_died`,
+`reload_config`.) The I/O thread then checks those flags immediately
+after `read_signals` returns: on `kill_signal` or `reload_config` it
+sets the corresponding process-global flags
+(`kill_signal_received` / `reload_config_signal_received` at
+`kitty/child-monitor.c:88`) and wakes the main loop; on `child_died`
+it calls `reap_children`. The main thread consults the process-global
+flags at the top of `parse_input`.
 
 The benefit of routing signals through a readable fd is that the C-layer
 signal handler does **no** work beyond writing a byte, so it is trivially
@@ -300,7 +331,8 @@ OS hardware event
   → _glfwInputKeyboard              (glfw/input.c:306)
   → key_callback                    (kitty/glfw.c ≈430)
   → on_key_input                    (kitty/keys.c:166)
-  → encode_glfw_key_event           (kitty/keys.c ≈251)
+  → encode_glfw_key_event           (defined in kitty/key_encoding.c:414,
+                                     called from kitty/keys.c:251)
   → schedule_write_to_child         (kitty/keys.c:259)
 ```
 
@@ -310,9 +342,9 @@ before encoding:
 1. **Shortcut dispatch** — If the key+modifiers match a configured
    `map` entry, the Python action runs and the event is consumed.
 2. **DECARM filter** — `if (action == GLFW_REPEAT && !screen->modes.mDECARM) return;`
-   (at approximately `kitty/keys.c:244`). When the application has
-   disabled auto-repeat (`DECRST 8`), synthetic auto-repeat events are
-   dropped so the shell receives exactly one keystroke per physical press.
+   at `kitty/keys.c:243`. When the application has disabled auto-repeat
+   (`DECRST 8`), synthetic auto-repeat events are dropped so the shell
+   receives exactly one keystroke per physical press.
 3. **Auto-scroll to bottom** — If the scrollback offset is non-zero, it
    is reset so the user sees the line they're typing on.
 4. **Key encoding** — `encode_glfw_key_event` (pure function) consults
@@ -412,59 +444,98 @@ path.
 
 ### 5.1 `read_bytes` — the read call
 
-`read_bytes` at `kitty/child-monitor.c:1336–1357` (verbatim, lightly
-abbreviated):
+`read_bytes` at `kitty/child-monitor.c:1336–1356` (verbatim, just the
+function itself — the surrounding context is elided by definition):
 
 ```c
-static void
-read_bytes(int fd, Screen *screen, ...) {
-    while (true) {
-        size_t available = 0;
-        uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available);
-        if (!buf) break;  // ring full
-        ssize_t len = read(fd, buf, available);
+static bool
+read_bytes(int fd, Screen *screen) {
+    ssize_t len;
+    size_t available_buffer_space;
+
+    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
+    if (!available_buffer_space) return true;
+
+    while(true) {
+        len = read(fd, buf, available_buffer_space);
         if (len < 0) {
-            vt_parser_commit_write(screen->vt_parser, 0);
             if (errno == EINTR || errno == EAGAIN) continue;
-            ... /* child died, mark for removal */
-            break;
+            if (errno != EIO) perror("Call to read() from child fd failed");
+            vt_parser_commit_write(screen->vt_parser, 0);
+            return false;
         }
-        if (len == 0) { /* EOF */ ...; break; }
-        vt_parser_commit_write(screen->vt_parser, len);
-        data_received = true;
+        break;
     }
+    vt_parser_commit_write(screen->vt_parser, len);
+    return len != 0;
 }
 ```
 
-The three important properties:
+The four important properties, each directly visible in the code above:
 
-1. **Zero-copy into the ring.** `vt_parser_create_write_buffer` returns
-   a pointer directly into the parser's 1 MiB buffer (or NULL if there
-   is no room, at which point we stop reading). No intermediate buffer
-   is allocated.
-2. **Incremental loop.** `while(true)` keeps reading until EAGAIN,
-   short-read, or the ring fills. One POLLIN wakeup can drain the entire
-   kernel PTY queue.
-3. **EINTR retry.** `continue` on EINTR means signal delivery during
-   `read()` is harmless — the loop simply retries.
+1. **Zero-copy into the ring.** `vt_parser_create_write_buffer`
+   (`kitty/vt-parser.c:1450–1462`) returns a pointer *directly* into
+   the parser's 1 MiB buffer together with the amount of free space
+   via the out-parameter `available_buffer_space`; its companion
+   `vt_parser_commit_write` (`kitty/vt-parser.c:1465–1474`) advances
+   `write.pending` under `PS.lock` to publish the newly-read bytes
+   to the main thread. If zero space
+   is available (the ring is full), `read_bytes` returns `true`
+   immediately without calling `read()` — the I/O loop interprets a
+   `true` return as "fd still alive, try again later." No intermediate
+   buffer is ever allocated; the bytes from the PTY land straight in
+   the ring.
+2. **Single read per invocation.** There is no draining loop: the
+   `while(true)` block wraps a *single* `read()`, retries only on
+   EINTR/EAGAIN, then `break`s. One call to `read_bytes` consumes at
+   most `available_buffer_space` bytes from the kernel's PTY queue.
+   Draining happens at the higher level: the `io_loop` calls
+   `read_bytes` once per child per poll cycle
+   (`kitty/child-monitor.c:1531`), and kernel `POLLIN` remains
+   asserted as long as unread bytes exist, so the next poll pass
+   picks them up. This is what makes the 1 MiB ring-fill condition
+   self-pacing: once the ring is full, `read_bytes` returns early,
+   and the I/O loop can clear `POLLIN` for that fd until main-thread
+   parsing drains the ring (§11.2).
+3. **EINTR/EAGAIN retry.** The `if (errno == EINTR || errno == EAGAIN)
+   continue` branch makes signal delivery and transient non-blocking
+   stalls harmless: the loop simply retries `read()` in place rather
+   than escalating to an error.
+4. **End-of-stream signalling.** A successful `read()` returning zero
+   bytes causes `read_bytes` to commit zero bytes and return `false`,
+   which tells the I/O loop the child has closed its end. Any real
+   error path (other than EINTR/EAGAIN) also commits zero and returns
+   `false`; the caller in `io_loop` marks the child for removal.
 
 ### 5.2 `write_to_child` — the write call
 
-`write_to_child` (same file, just after `read_bytes`) is the POLLOUT
-handler. It acquires `screen_mutex(write)`, calls `write(fd, write_buf,
-write_buf_used)`, handles partial writes by memmoving the remainder to
-the front of `write_buf`, and releases the lock. If the write
-eliminated all pending data, POLLOUT will be deasserted naturally on the
-next `io_loop` rebuild.
+`write_to_child` (`kitty/child-monitor.c:1442–1481`, called from the
+POLLOUT-revents dispatch at `kitty/child-monitor.c:1540`) is the
+outbound counterpart. It:
+
+1. Acquires `screen_mutex(lock, write)` (the write-buffer mutex).
+2. Loops `write(fd, write_buf + written, write_buf_used - written)`
+   until everything is written, EAGAIN/EWOULDBLOCK is returned
+   (socket/pty full), or a hard error occurs.
+3. On partial writes it advances `written` and keeps looping; on
+   EINTR it `continue`s; on EAGAIN/EWOULDBLOCK it `break`s so the
+   next POLLOUT can resume.
+4. After the loop it decrements `screen->write_buf_used` by `written`
+   and `memmove`s any unwritten remainder to the front of `write_buf`
+   so the next call starts cleanly at offset 0.
+
+If the write eliminated all pending data, POLLOUT will be deasserted
+naturally on the next `io_loop` rebuild (§2.2, step 2).
 
 ### 5.3 Invariant
 
 The I/O thread touches exactly three kinds of shared state:
-`children_mutex` (to walk `children[]`), `PS.lock` (via the parser write
-API), and `screen_mutex(write)` (to drain `write_buf`). It touches the
-Screen model — lines, cursor, colors — **never**. This is the reason
-rendering can run concurrently with PTY reads without any coordination:
-they work on different data.
+`children_mutex` (to walk `children[]`), `PS.lock` (via the parser
+write API — `vt_parser_create_write_buffer` / `vt_parser_commit_write`
+acquire and release it internally), and `screen_mutex(write)` (to drain
+`write_buf`). It touches the Screen model — lines, cursor, colors —
+**never**. This is the reason rendering can run concurrently with PTY
+reads without any coordination: they work on different data.
 
 ---
 
@@ -472,32 +543,72 @@ they work on different data.
 
 ### 6.1 The `PS` struct
 
-Defined at `kitty/vt-parser.c` around line 193:
+Defined at `kitty/vt-parser.c:193–211` (verbatim, comments preserved):
 
 ```c
-typedef struct {
-    Parser parser;
-    struct { size_t pos, sz; } read;        // consumer side
-    struct { size_t pending; } write;        // producer side (promoted into read.sz by run_worker)
-    uint8_t buf[BUF_SZ + BUF_EXTRA];         // the 1 MiB ring
-    uint8_t buf2[MAX_ESCAPE_CODE_LENGTH];    // long-escape accumulator (256 KiB)
+typedef struct PS {
+    alignas(BUF_EXTRA) uint8_t buf[BUF_SZ + BUF_EXTRA];
+    UTF8Decoder utf8_decoder;
+
+    id_type window_id;
+
     VTEState vte_state;
     ParsedCSI csi;
-    UTF8Decoder utf8_decoder;
-    pthread_mutex_t lock;                     // PS.lock at ~208
-    monotonic_t new_input_at;
-    bool has_pending_input;
-    ...
+
+    // these are temporary variables set only for duration of a parse call
+    PyObject *dump_callback;
+    Screen *screen;
+    monotonic_t now, new_input_at;
+    pthread_mutex_t lock;
+
+    // The buffer
+    struct { size_t consumed, pos, sz; } read;
+    struct { size_t offset, sz, pending; } write;
 } PS;
 ```
+
+Field-by-field role in the pipeline:
+
+- `buf[BUF_SZ + BUF_EXTRA]` — the 1 MiB ring with a small tail
+  over-allocation. The `alignas(BUF_EXTRA)` keeps cache-line behavior
+  predictable for SIMD-friendly scanning.
+- `utf8_decoder` — per-parser incremental UTF-8 decoder state so
+  multibyte characters split across two `read()` calls are reassembled
+  correctly.
+- `window_id` — the owning window, used to route Python callbacks
+  (e.g., OSC 133 → `cmd_output_marking`) to the right `Window` object.
+- `vte_state` — one of the eight states enumerated in `VTEState`
+  (`VTE_NORMAL`, `VTE_ESC`, `VTE_CSI`, `VTE_OSC`, `VTE_DCS`,
+  `VTE_APC`, `VTE_PM`, `VTE_SOS`); see §6.2.
+- `csi` — the in-progress CSI parameter accumulator (filled during
+  `consume_csi`, consumed by `dispatch_csi`).
+- `dump_callback`, `screen`, `now`, `new_input_at` — "temporary
+  variables set only for duration of a parse call" (per the source
+  comment). They are repopulated by `run_worker` on every call so the
+  dispatch functions can reach the Screen without threading them
+  through every argument list.
+- `lock` (line 206) — the `pthread_mutex_t` that serialises all
+  producer/consumer access to `read`/`write` offsets. This is the
+  `PS.lock` referenced in §3.1.
+- `read { consumed, pos, sz }` — the *consumer-side* (main thread)
+  ring bookkeeping: `pos` is the next byte to parse, `sz` is the
+  number of bytes promoted from `write` that are available to parse,
+  and `consumed` tracks how many bytes the current `run_worker` pass
+  has already drained.
+- `write { offset, sz, pending }` — the *producer-side* (I/O thread)
+  ring bookkeeping: `offset` is where the next PTY read will land,
+  `sz` is the space that was handed out by
+  `vt_parser_create_write_buffer`, and `pending` counts bytes written
+  but not yet promoted into `read.sz`.
 
 Key constants (all verbatim from source):
 
 - `BUF_SZ = 1024*1024` at `kitty/vt-parser.c:18` — the 1 MiB ring capacity.
 - `BUF_EXTRA = 64` at `kitty/vt-parser.c:20` — a small over-allocation
   that avoids wrap-around in the fast path.
-- `MAX_ESCAPE_CODE_LENGTH = 256*1024` — the maximum payload a single
-  OSC/DCS/APC can hold before being truncated with an error.
+- `MAX_ESCAPE_CODE_LENGTH = 256*1024` at `kitty/vt-parser.c:21` — the
+  maximum payload a single OSC/DCS/APC can hold before being truncated
+  with an error.
 
 ### 6.2 Eight states
 
@@ -534,7 +645,7 @@ characters to `screen_draw_text`. `consume_esc` (line 261) handles the
 
 ### 6.4 `run_worker` — the consume driver
 
-`run_worker` at `kitty/vt-parser.c:1417–1447` is the thread-safe entry
+`run_worker` at `kitty/vt-parser.c:1417–1446` is the thread-safe entry
 point invoked by the main thread. Its structure:
 
 1. Take `PS.lock`.
@@ -700,14 +811,24 @@ one function: `schedule_write_to_child`.
 
 ### 8.1 `Screen.write_buf` data structure
 
-Defined at `kitty/screen.h:114–116`:
+Defined at `kitty/screen.h:114–116` (verbatim, in source order):
 
 ```c
-uint8_t *write_buf;        // PyMem_RawMalloc'd, grown via realloc
-size_t write_buf_used;     // bytes actually queued
-size_t write_buf_sz;       // allocated capacity
-PyMutex write_buf_lock;    // accessed via screen_mutex() macro
+uint8_t *write_buf;
+size_t write_buf_sz, write_buf_used;
+pthread_mutex_t write_buf_lock;
 ```
+
+- `write_buf` — `PyMem_RawMalloc`'d pointer, grown via `PyMem_RawRealloc`
+  in `schedule_write_to_child` (§4.3).
+- `write_buf_sz` — current allocated capacity.
+- `write_buf_used` — number of bytes actually queued (always `<= write_buf_sz`).
+- `write_buf_lock` — a `pthread_mutex_t` (*not* a `PyMutex`) accessed
+  exclusively through the `screen_mutex(op, which)` macro at
+  `kitty/child-monitor.c:74–75`, which expands to
+  `pthread_mutex_##op(&screen->which##_buf_lock)` and is therefore the
+  single entry point for both the main thread (enqueuing bytes) and the
+  I/O thread (draining `write_to_child`).
 
 The buffer starts small (`BUFSIZ`) and grows lazily via `PyMem_RawRealloc`.
 Its logical ceiling is the 100 MiB soft cap (§4.3, §11.3, §14.5).
@@ -738,7 +859,7 @@ not impede PTY-output consumption.
 
 The tick callback, registered from `_run_app` in `kitty/main.py` and
 invoked by `_glfwPlatformRunMainLoop`, lives at
-`kitty/child-monitor.c:1223–1253`. In order:
+`kitty/child-monitor.c:1224–1256`. In order:
 
 1. `maximum_wait = -1`, `input_read = false`.
 2. If `global_state.has_pending_resizes`, call
@@ -756,7 +877,7 @@ invoked by `_glfwPlatformRunMainLoop`, lives at
 
 ### 9.2 `parse_input`
 
-At `kitty/child-monitor.c:451–539`:
+At `kitty/child-monitor.c:451–538`:
 
 1. Take `children_mutex`, copy `children[]` into a local `scratch[]`,
    increment each `Child.refcnt` (so the child cannot be freed mid-parse),
@@ -779,7 +900,7 @@ At `kitty/child-monitor.c:451–539`:
 
 ### 9.3 `do_parse`
 
-At `kitty/child-monitor.c:438–449`:
+At `kitty/child-monitor.c:438–448`:
 
 ```c
 static bool
@@ -852,11 +973,11 @@ read pipeline.
    Each invokes `_glfwInputFramebufferSize` / `_glfwInputWindowSize`
    (defined in `glfw/window.c`).
 2. **GLFW dispatches to Kitty callbacks.** The important two:
-   - `live_resize_callback` (`kitty/glfw.c:316–328`) — records that a
+   - `live_resize_callback` (`kitty/glfw.c:316–327`) — records that a
      live resize is active, sets `has_pending_resizes = true`.
      On `started == false` (OS signals end), sets
      `os_says_resize_complete = true`.
-   - `framebuffer_size_callback` (`kitty/glfw.c:330–348`) — updates
+   - `framebuffer_size_callback` (`kitty/glfw.c:330–346`) — updates
      `live_resize.width/height/last_resize_event_at/num_of_resize_events`,
      calls `update_surface_size`, requests a tick.
 3. **Main tick resolves.** `process_pending_resizes` examines
@@ -869,7 +990,7 @@ read pipeline.
      last_resize_event_at >= OPT(resize_debounce_time.on_end)` (0.5 s).
 
    Otherwise return; the tick will come again via the timer.
-4. **`update_os_window_viewport`** (`kitty/glfw.c:130–183`) recomputes
+4. **`update_os_window_viewport`** (`kitty/glfw.c:130–171`) recomputes
    DPI, cell metrics, and calls `call_boss(on_window_resize, "KiiO",
    os_window_id, w, h, dpi_changed)`.
 5. **Python reflow.** `Boss.on_window_resize` (`kitty/boss.py:1206–1212`)
@@ -904,7 +1025,7 @@ read pipeline.
    The Screen resize takes **two** arguments (rows, cols). The
    `resize_pty` call unpacks the 4-tuple `(lines, columns, xpixels,
    ypixels)` using `*current_pty_size`.
-7. **`resize_pty`** at `kitty/child-monitor.c:592–636` takes
+7. **`resize_pty`** at `kitty/child-monitor.c:592–614` takes
    `children_mutex`, finds the `Child` by id, and calls `pty_resize(fd,
    &dim)`:
 
