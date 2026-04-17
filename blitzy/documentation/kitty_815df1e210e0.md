@@ -94,7 +94,7 @@ if (gl_major < OPENGL_REQUIRED_VERSION_MAJOR ||
 
 If `global_state.debug_rendering` is set (from `--debug-rendering`), `gl_init()` additionally prints a timestamped diagnostic line using the helper `gl_version_string()` (also in `kitty/gl.c`), which formats the output as:
 
-```
+```text
 '<GL_VERSION>' Detected version: <major>.<minor>
 ```
 
@@ -104,7 +104,7 @@ The underlying GLFW backends used to actually create the context are: `glfw/cont
 
 On the test system (Ubuntu 24.04, no GPU, software rasterization), the negotiated renderer is **Mesa 25.2.8 llvmpipe** (LLVM 20.1.2, 256 bits). The version reported by the context is **OpenGL 4.5 Core Profile**, which exceeds kitty's Linux minimum of 3.1 by a comfortable margin. Launching with `--debug-rendering` produces output like:
 
-```
+```text
 [<timestamp>] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5
 ```
 
@@ -179,7 +179,7 @@ Note the divergence between the screen's approximate physical DPI (~100×100, co
 
 Kitty identifies itself to the outside world through a custom terminfo entry (the internal project name for which is "KovIdTTY") and a conventional truecolor environment variable. Inside the child process spawned by kitty's PTY layer, the following environment values are set:
 
-```
+```text
 TERM=xterm-kitty
 COLORTERM=truecolor
 ```
@@ -220,7 +220,7 @@ The font pipeline is a four-stage chain, each stage owned by a different source 
 
 - **Cell shaders — `kitty/shaders.py:load_shader_programs()` (full file, 204 lines).** The shader loader reads GLSL source fragments from `kitty/cell_vertex.glsl` and `kitty/cell_fragment.glsl` and the matching `_vertex.glsl` / `_fragment.glsl` pairs for borders, graphics, background image, tint, and the shared utilities (`alpha_blend.glsl`, `linear2srgb.glsl`). It performs preprocessor-style expansion of `#pragma kitty_include_shader` directives, and substitutes tokens like `{GLSL_VERSION}` through a small `MultiReplacer` utility. The cell program is compiled in **four variants** (BOTH, BACKGROUND, SPECIAL, FOREGROUND), the graphics program in **three variants** (SIMPLE, PREMULT, ALPHA_MASK), plus single variants each for bgimage and tint. Symbol wiring is done through the symbols imported from `fast_data_types`: `CELL_PROGRAM`, `CELL_BG_PROGRAM`, `CELL_FG_PROGRAM`, `CELL_SPECIAL_PROGRAM`, `GRAPHICS_PROGRAM`, `compile_program`, `init_cell_program`, and `GLSL_VERSION`.
 
-**Terminal grid observed.** Inside the 1920×1080 Xvfb window at `font_size=11.0` and 96 DPI, after margins/padding resolution by `kitty/os_window_size.py`, the resulting grid is **64 columns × 21 rows**. The formula is simply `viewport_width / cell_width` and `viewport_height / cell_height`, applied after edge-spacing deduction. The cell width and cell height for LiberationMono at this size land around 8 px and 16 px respectively (Section 7 enumerates these approximations).
+**Terminal grid observed.** Inside the 1920×1080 Xvfb window at `font_size=11.0` and 96 DPI, after margins/padding resolution by `kitty/os_window_size.py`, the resulting grid is **71 columns × 23 rows** (as measured empirically via `tput cols` / `tput lines` / `stty size` inside a child process launched with `--config=NONE -o font_family=LiberationMono -o font_size=11.0`). The formula is simply `viewport_width / cell_width` and `viewport_height / cell_height`, applied after edge-spacing deduction. The cell width and cell height for LiberationMono at this size land around 8 px and 16 px respectively (Section 7 enumerates these approximations). The exact grid dimensions depend on the effective viewport width after window decorations, tab bar height, and configured margins/padding, so environments with different window-manager decorations or different margin/padding settings will see slightly different grid sizes for the same nominal 1920×1080 display.
 
 **Observation tools.** During the investigation, the text-rendering stack was probed using `infocmp xterm-kitty` (terminfo capabilities), `fc-list` (FontConfig font inventory), and kitty's own `--debug-font-fallback` flag, which is implemented by `dump_font_debug()` in `kitty/fonts/render.py` (lines ~161–171). `dump_font_debug()` prints each resolved font-family descriptor (medium, bold, italic, bi) and the per-character symbol_map resolution, which is useful for diagnosing why a particular Unicode block is being rendered from an unexpected font.
 
@@ -334,7 +334,7 @@ The relationship can also be stated as a concise bulleted summary:
 
   Edge spacing (margin + padding) is computed by `edge_spacing()` and converted using the `dpi/72` pts-to-pixels ratio. On X11, `xscale` and `yscale` are **forced to 1** to prevent double scaling (the X server has no separate HiDPI scale factor), and the final size is clamped via `sanitize_window_size()` (lines ~35–37) to `[20, 50000]` to guard against degenerate configurations. Second, into the glyph-atlas layout via `kitty/fonts.c:sprite_tracker_set_layout()` (lines ~276–290):
 
-  ```
+  ```text
   xnum  = clamp(1, max_texture_size / cell_width,  UINT16_MAX)
   max_y = clamp(1, max_texture_size / cell_height, UINT16_MAX)
   ```
@@ -382,11 +382,13 @@ The initialization chain computes a set of measurable values — content scale, 
 | Sprite layout (xnum) | `kitty/fonts.c:sprite_tracker_set_layout()` | `max_texture_size / cell_width` | ~2048 |
 | OpenGL version | `kitty/gl.c:gl_init()` | `gladLoadGL(glfwGetProcAddress)` | 4.5 |
 | Window dimensions | `kitty/os_window_size.py:get_window_size()` | `cell_width × cols / xscale + margins` | Depends on initial_window_size config |
-| Terminal grid (cols × rows) | Computed from viewport and cell dimensions | `viewport_width / cell_width`, `viewport_height / cell_height` | 64 cols × 21 rows |
+| Terminal grid (cols × rows) | Computed from viewport and cell dimensions | `viewport_width / cell_width`, `viewport_height / cell_height` | 71 cols × 23 rows [‡] |
 | GLSL version | `kitty/data-types.h` | Compile-time constant | 140 |
 | Required GL minimum | `kitty/data-types.h` | Compile-time constant | 3.1 (Linux), 3.3 (macOS) |
 
-**Notes on approximations.** The `~8 px` and `~16 px` entries for cell width and height reflect LiberationMono at `font_size=11.0` and 96 logical DPI, after any `modify_font` config adjustments and the clamping logic in `kitty/fonts.c:calc_cell_metrics()` (a post-adjustment is applied when the `_` glyph descends below the computed cell baseline, causing cell height to be widened). The `16384` for `GL_MAX_TEXTURE_SIZE` is what Mesa llvmpipe reports on this Ubuntu 24.04 host; on-chip GPU drivers typically report `16384` or `32768`, so the `~2048` xnum result will vary accordingly. The `64 cols × 21 rows` terminal grid is the post-margins quotient of a 1920×1080 viewport by the approximately 8×16 px cell size, as resolved by `initial_window_size_func()` in `kitty/os_window_size.py`. The "Depends on initial_window_size config" entry for window dimensions reflects the fact that `initial_window_size` can be expressed in cells, pixels, or percent of the screen and is further negotiated with the window manager — so a single observed pair of numbers would be misleading.
+**Notes on approximations.** The `~8 px` and `~16 px` entries for cell width and height reflect LiberationMono at `font_size=11.0` and 96 logical DPI, after any `modify_font` config adjustments and the clamping logic in `kitty/fonts.c:calc_cell_metrics()` (a post-adjustment is applied when the `_` glyph descends below the computed cell baseline, causing cell height to be widened). The `16384` for `GL_MAX_TEXTURE_SIZE` is what Mesa llvmpipe reports on this Ubuntu 24.04 host; on-chip GPU drivers typically report `16384` or `32768`, so the `~2048` xnum result will vary accordingly. The `71 cols × 23 rows` terminal grid is the post-margins quotient of a 1920×1080 viewport by the approximately 8×16 px cell size, as resolved by `initial_window_size_func()` in `kitty/os_window_size.py`. The "Depends on initial_window_size config" entry for window dimensions reflects the fact that `initial_window_size` can be expressed in cells, pixels, or percent of the screen and is further negotiated with the window manager — so a single observed pair of numbers would be misleading.
+
+[‡] The terminal grid dimensions depend on the effective viewport available to the terminal content area after window decorations (title bar, borders), the kitty tab bar (when enabled), and the configured margins/padding are subtracted from the nominal window pixel dimensions. The value `71 cols × 23 rows` was verified empirically in the Xvfb `:99` (1920×1080, 100 DPI) test environment with `--config=NONE -o font_family=LiberationMono -o font_size=11.0`, captured inside a child process via `tput cols` / `tput lines` / `stty size` (all three agreed on `71` and `23`). Different host environments (different window managers, different decoration thicknesses, a configured tab bar, or non-default `window_margin_width`/`window_padding_width` settings) will produce slightly different grid sizes for the same nominal 1920×1080 display.
 
 [†] The underline-position formula in the Computation column is a pedagogically simplified rendering of the actual C expression in `kitty/freetype.c:cell_metrics()` (line ~393):
 `*underline_position = MIN(*cell_height - 1, (unsigned int)font_units_to_pixels_y(self, MAX(0, self->ascender - self->underline_position)));`
