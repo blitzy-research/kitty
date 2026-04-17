@@ -12,7 +12,7 @@ All claims below cite a specific source file and line range. Numbers are derived
 
 **Question 1:** *"When hundreds of thousands of lines of output are generated rapidly, what happens to memory consumption — does it grow unbounded, or does something cap it?"*
 
-Memory grows in discrete, predictable steps until the scrollback buffer is fully populated, after which it plateaus. Each step is an `add_segment()` call (`kitty/history.c:18-29`) that performs a single `calloc()` of `xnum * SEGMENT_SIZE * (sizeof(CPUCell) + sizeof(GPUCell)) + SEGMENT_SIZE * sizeof(LineAttrs)` bytes — at 80 columns this is exactly **5 244 928 bytes (≈ 5.002 MiB)** per 2048 lines. Once `num_segments` reaches `ceil(ynum / 2048)`, no further segments are allocated: `historybuf_push()` at `kitty/history.c:275-284` reuses slots via modular arithmetic, overwriting in place. If the optional pager history is enabled, evicted lines are ANSI-serialized into a ring buffer that grows in 1 MiB increments up to its configured ceiling (`kitty/history.c:90-101`). **Bottom line:** memory grows once to a deterministic ceiling of `ceil(scrollback_lines / 2048) × segment_bytes` and then stays flat — the circular buffer overwrites in place and never grows further.
+Memory grows in discrete, predictable steps until the scrollback buffer is fully populated, after which it plateaus. Each step is an `add_segment()` call (`kitty/history.c:17-29`) that performs a single `calloc()` of `xnum * SEGMENT_SIZE * (sizeof(CPUCell) + sizeof(GPUCell)) + SEGMENT_SIZE * sizeof(LineAttrs)` bytes — at 80 columns this is exactly **5 244 928 bytes (≈ 5.002 MiB)** per 2048 lines. Once `num_segments` reaches `ceil(ynum / 2048)`, no further segments are allocated: `historybuf_push()` at `kitty/history.c:275-284` reuses slots via modular arithmetic, overwriting in place. If the optional pager history is enabled, evicted lines are ANSI-serialized into a ring buffer that grows in 1 MiB increments up to its configured ceiling (`kitty/history.c:89-101`). **Bottom line:** memory grows once to a deterministic ceiling of `ceil(scrollback_lines / 2048) × segment_bytes` and then stays flat — the circular buffer overwrites in place and never grows further.
 
 **Question 2:** *"When scrolling back through a very large history while new output is still being generated, is the terminal responsive — or does scrolling cause observable lag?"*
 
@@ -20,7 +20,7 @@ Scroll rendering cost is independent of the scrollback depth: `screen_update_cel
 
 **Question 3:** *"When does the buffer's internal storage grow — at what boundaries, and can those transitions be observed externally?"*
 
-HistoryBuf storage grows in segment-sized increments: the first segment is allocated eagerly in `create_historybuf()` at `kitty/history.c:127`; every subsequent segment is allocated lazily by `segment_for()` (`kitty/history.c:37-42`) the first time a line would be pushed into a not-yet-allocated segment. The transition boundaries at 80 columns are every 2048 newly pushed lines, each triggering a `realloc` of the 24-byte-per-entry segment pointer array plus a single `calloc` of 5 244 928 bytes. The pager history ring buffer grows differently: it starts at `MIN(1 MiB, configured_max)` (`kitty/history.c:67`) and extends in 1 MiB increments via `pagerhist_extend()` (`kitty/history.c:90-101`), which allocates a new ring buffer, copies the existing contents, and frees the old one — a copy-on-extend, not in-place realloc. **Bottom line:** every 2048 lines pushed into history produces one observable ~5 MiB allocation; every 1 MiB of pager history demand produces one observable extend-and-copy.
+HistoryBuf storage grows in segment-sized increments: the first segment is allocated eagerly in `create_historybuf()` at `kitty/history.c:127`; every subsequent segment is allocated lazily by `segment_for()` (`kitty/history.c:36-42`) the first time a line would be pushed into a not-yet-allocated segment. The transition boundaries at 80 columns are every 2048 newly pushed lines, each triggering a `realloc` of the 24-byte-per-entry segment pointer array plus a single `calloc` of 5 244 928 bytes. The pager history ring buffer grows differently: it starts at `MIN(1 MiB, configured_max)` (`kitty/history.c:67`) and extends in 1 MiB increments via `pagerhist_extend()` (`kitty/history.c:89-101`), which allocates a new ring buffer, copies the existing contents, and frees the old one — a copy-on-extend, not in-place realloc. **Bottom line:** every 2048 lines pushed into history produces one observable ~5 MiB allocation; every 1 MiB of pager history demand produces one observable extend-and-copy.
 
 ---
 
@@ -30,13 +30,13 @@ All claims below cite the file and line number(s) in this table. Line numbers co
 
 | File | Line Range Read | Relevance Summary |
 |------|-----------------|-------------------|
-| `kitty/history.c` | 15, 18-29, 31-34, 37-42, 67, 70-80, 90-101, 117-133, 218-226, 258-273, 275-284, 577-579 | Core scrollback implementation — segment allocation, circular push, pager-history ring-buffer growth, creation-time eager allocation |
+| `kitty/history.c` | 15, 17-29, 31-34, 36-42, 44-48, 67, 70-80, 89-101, 117-133, 218-226, 258-273, 275-284, 577-579 | Core scrollback implementation — segment allocation, circular push, pager-history ring-buffer growth, creation-time eager allocation |
 | `kitty/data-types.h` | 221, 228, 231-239, 262-266, 268-272, 282-290 | Cell and segment struct sizes; `static_assert` pins of 20 / 12 / 1 bytes; HistoryBuf/HistoryBufSegment/PagerHistoryBuf layouts |
 | `kitty/screen.c` | 130, 1552-1567, 1570-1577, 1589-1598, 1907-1911, 1913-1920, 2505-2544, 2597-2601, 2713-2735, 2737-2797, 2842-2853, 4090-4118 | Screen wiring, scroll+index path, dirty/pause rendering, O(visible) render loops, visual-line mapping, user-facing scroll API |
-| `kitty/screen.h` | 85-115 | `Screen` struct fields: `scrolled_by`, `is_dirty`, `scroll_changed`, `history_line_added_count`, `historybuf` |
+| `kitty/screen.h` | 88-115 | `Screen` struct fields: `scrolled_by`, `is_dirty`, `scroll_changed`, `history_line_added_count`, `historybuf` |
 | `kitty/shaders.c` | 393-418, 608-630 | `cell_prepare_to_render()` GPU upload size formula; `draw_scroll_indicator()` `scrolled_by / historybuf->count` position |
 | `kitty/child-monitor.c` | 437-448, 870-896, 1337-1356, 1480-1578 | I/O thread loop, wake-up coalescing by `input_delay`, render gated by `repaint_delay`, `read_bytes` path |
-| `kitty/vt-parser.c` | 18, 21, 1417-1446, 1451-1462 | `BUF_SZ = 1 MiB` per-parser input buffer; `run_worker()` flush condition; `vt_parser_create_write_buffer()` remaining-space API |
+| `kitty/vt-parser.c` | 18, 21, 1416-1446, 1450-1462 | `BUF_SZ = 1 MiB` per-parser input buffer; `run_worker()` flush condition; `vt_parser_create_write_buffer()` remaining-space API |
 | `kitty/line-buf.c` | 85-120 | `alloc_linebuf()` five-call allocation pattern for contrast with HistoryBuf's single-call pattern |
 | `kitty/options/definition.py` | 372, 406, 866, 878 | Default values: `scrollback_lines=2000`, `scrollback_pager_history_size=0`, `repaint_delay=10`, `input_delay=3` |
 | `kitty/options/utils.py` | 557-566 | Parsers: negative `scrollback_lines` → 2³² − 1; `scrollback_pager_history_size` MB-to-bytes capped at 4 GiB − 1 |
@@ -64,21 +64,22 @@ static_assert(sizeof(GPUCell) == 20, "Fix the ordering of GPUCell");
 static_assert(sizeof(CPUCell) == 12, "Fix the ordering of CPUCell");
 ```
 
-`LineAttrs` is a union wrapping a single `uint8_t` with packed bitfields (`kitty/data-types.h:231-239`):
+`LineAttrs` is a union wrapping a single `uint8_t` with packed bitfields (`kitty/data-types.h:230-239`):
 
 ```c
+typedef enum { UNKNOWN_PROMPT_KIND = 0, PROMPT_START = 1, SECONDARY_PROMPT = 2, OUTPUT_START = 3 } PromptKind;
 typedef union LineAttrs {
     struct {
         uint8_t is_continued : 1;
         uint8_t has_dirty_text : 1;
         uint8_t has_image_placeholders : 1;
-        uint8_t prompt_kind : 2;
+        PromptKind prompt_kind : 2;
     };
     uint8_t val;
-} LineAttrs;
+} LineAttrs ;
 ```
 
-The union's underlying storage is `uint8_t val` → `sizeof(LineAttrs) == 1` byte.
+The `prompt_kind` field uses the `PromptKind` enum typedef (a `uint8_t`-backed enum declared on the immediately preceding line). The union's underlying storage is `uint8_t val` → `sizeof(LineAttrs) == 1` byte.
 
 ### Segment Layout
 
@@ -108,9 +109,11 @@ All three sub-arrays share one backing allocation. A single `free(s->cpu_cells)`
 ```c
 static void
 free_segment(HistoryBufSegment *s) {
-    free(s->cpu_cells); s->cpu_cells = NULL; s->gpu_cells = NULL; s->line_attrs = NULL;
+    free(s->cpu_cells); memset(s, 0, sizeof(HistoryBufSegment));
 }
 ```
+
+The `memset(s, 0, sizeof(HistoryBufSegment))` is equivalent to clearing all three pointer fields (`cpu_cells`, `gpu_cells`, `line_attrs`) since `HistoryBufSegment` is exactly three pointer fields (`kitty/data-types.h:262-266`).
 
 The segment constant is fixed at 2048 lines (`kitty/history.c:15`):
 
@@ -176,13 +179,13 @@ screen_scroll()                             kitty/screen.c:1589-1598
         ├─> historybuf_add_line(historybuf, line, as_ansi_buf)   kitty/screen.c:1558
         │     └─> historybuf_push()                               kitty/history.c:275-284
         │           ├─> init_line() → cpu_lineptr/gpu_lineptr/attrptr
-        │           │     └─> segment_for(num, y)                 kitty/history.c:37-42
-        │           │           └─> [if needed] add_segment()     kitty/history.c:18-29
+        │           │     └─> segment_for(num, y)                 kitty/history.c:36-42
+        │           │           └─> [if needed] add_segment()     kitty/history.c:17-29
         │           │                 ├─> realloc(segments, ...)  kitty/history.c:20
         │           │                 └─> calloc(1, cpu+gpu+la)   kitty/history.c:25
         │           └─> [if count == ynum] pagerhist_push()       kitty/history.c:258-273
         │                 └─> pagerhist_write_bytes()             kitty/history.c:218-226
-        │                       └─> [if needed] pagerhist_extend() kitty/history.c:90-101
+        │                       └─> [if needed] pagerhist_extend() kitty/history.c:89-101
         │                             ├─> ringbuf_new(newsz)
         │                             ├─> ringbuf_copy(newbuf, ph->ringbuf, count)
         │                             └─> ringbuf_free(&ph->ringbuf)
@@ -214,7 +217,7 @@ Segment count is bounded by:
 num_segments_max = ceil(ynum / SEGMENT_SIZE) = ceil(max(scrollback_lines, screen_lines) / 2048)
 ```
 
-which is enforced by the guard `SEGMENT_SIZE * self->num_segments < self->ynum` in `segment_for()` at `kitty/history.c:37-42`.
+which is enforced by the guard `SEGMENT_SIZE * self->num_segments < self->ynum` in `segment_for()` at `kitty/history.c:36-42`.
 
 ### Steady-State Memory Table (80 columns)
 
@@ -244,10 +247,8 @@ Once `num_segments == ceil(ynum/2048)` and every slot is populated, memory stops
 ```c
 static index_type
 historybuf_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
-    CPUCell *cpu_cells; GPUCell *gpu_cells; LineAttrs *attrs;
     index_type idx = (self->start_of_data + self->count) % self->ynum;
     init_line(self, idx, self->line);
-    cpu_cells = self->line->cpu_cells; gpu_cells = self->line->gpu_cells; attrs = self->line->attrs;
     if (self->count == self->ynum) {
         pagerhist_push(self, as_ansi_buf);
         self->start_of_data = (self->start_of_data + 1) % self->ynum;
@@ -271,7 +272,7 @@ The pager history is an optional second-tier storage that serializes evicted lin
 - **Default is disabled.** `scrollback_pager_history_size` defaults to `0` (`kitty/options/definition.py:406`). When zero, `alloc_pagerhist(0)` returns `NULL` and no ring buffer is allocated.
 - **Parsing (non-zero case).** `kitty/options/utils.py:564-566` computes `int(max(0, float(x)) * 1024 * 1024)` (MB-to-bytes) and caps the result at `4096 * 1024 * 1024 - 1 = 4 294 967 295` bytes. So the configured maximum is at most 4 GiB − 1.
 - **Initial allocation.** The initial ring-buffer capacity is `MIN(1024u*1024u, pagerhist_sz)` (`kitty/history.c:67`) — at most 1 MiB, regardless of how high the configured maximum is. Requesting 100 MiB still starts with a 1 MiB ring buffer.
-- **Extension is copy-on-extend.** When a write does not fit, `pagerhist_extend()` (`kitty/history.c:90-101`) computes `newsz = MIN(ph->maximum_size, buffer_size + MAX(1 MiB, minsz))`, then:
+- **Extension is copy-on-extend.** When a write does not fit, `pagerhist_extend()` (`kitty/history.c:89-101`) computes `newsz = MIN(ph->maximum_size, buffer_size + MAX(1 MiB, minsz))`, then:
   1. `newbuf = ringbuf_new(newsz)` — new allocation of size `newsz + 1` bytes (`3rdparty/ringbuf/ringbuf.c:56` — `+1` for full/empty disambiguation).
   2. `ringbuf_copy(newbuf, ph->ringbuf, count)` — copies every byte currently in the ring buffer.
   3. `ringbuf_free(&ph->ringbuf)` — frees the old buffer.
@@ -337,7 +338,7 @@ I/O Concurrency Path (kitty/child-monitor.c, kitty/vt-parser.c):
     io_loop()                                    child-monitor.c:1480-1578
       ├─> poll(fds, n, has_pending_wakeups ? input_delay - elapsed : -1)   child-monitor.c:1506-1513
       ├─> if POLLIN on child fd: read_bytes(fd, screen)                    child-monitor.c:1337-1356
-      │     ├─> buf = vt_parser_create_write_buffer(parser, &avail)        vt-parser.c:1451-1462
+      │     ├─> buf = vt_parser_create_write_buffer(parser, &avail)        vt-parser.c:1450-1462
       │     │     └─> *sz = BUF_SZ - self->write.offset;   (BUF_SZ = 1 MiB)
       │     ├─> read(fd, buf, available_buffer_space)
       │     └─> vt_parser_commit_write(parser, len)
@@ -349,7 +350,7 @@ I/O Concurrency Path (kitty/child-monitor.c, kitty/vt-parser.c):
   Main Thread:
     parse_input() → do_parse(self, screen, now, flush)                     child-monitor.c:437-448
       ├─> self->parse_func(screen, &pd, flush)
-      │     └─> run_worker()                                                vt-parser.c:1417-1446
+      │     └─> run_worker()                                                vt-parser.c:1416-1446
       │           └─> while consumer available && (flush ||
       │                 time_since_new_input >= input_delay ||
       │                 read.sz + 16*1024 > BUF_SZ):
@@ -414,7 +415,7 @@ Crucially, `dirty_scroll()` at `kitty/screen.c:1907-1911` passes `pause=false`, 
 
 **Per-child 1 MiB input buffer.** `kitty/vt-parser.c:18` fixes `BUF_SZ` at `1024u*1024u` bytes. Each `Screen` has one `vt_parser` with one such buffer.
 
-**Near-full early flush.** `run_worker()` (`kitty/vt-parser.c:1417-1446`) flushes the parser's consumer loop when `flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16*1024 > BUF_SZ`. The last term is key for backpressure prevention: when the input buffer is within 16 KiB of full, processing starts immediately, bypassing the `input_delay` coalescing. This guarantees the I/O thread never wedges the pipeline waiting for the delay timer.
+**Near-full early flush.** `run_worker()` (`kitty/vt-parser.c:1416-1446`) flushes the parser's consumer loop when `flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16*1024 > BUF_SZ`. The last term is key for backpressure prevention: when the input buffer is within 16 KiB of full, processing starts immediately, bypassing the `input_delay` coalescing. This guarantees the I/O thread never wedges the pipeline waiting for the delay timer.
 
 **Wake-up coalescing by `input_delay`.** The `WAKEUP` macro in `io_loop` (`kitty/child-monitor.c:1562-1570`) only fires `wakeup_main_loop()` when `now - last_main_loop_wakeup_at > OPT(input_delay)`:
 
@@ -457,34 +458,48 @@ Combining the properties above, observable scroll-to-display latency is bounded 
 
 ### Lazy Trigger
 
-The lazy allocation of HistoryBuf segments is implemented by `segment_for()` at `kitty/history.c:37-42`:
+The lazy allocation of HistoryBuf segments is implemented by `segment_for()` at `kitty/history.c:36-42`:
 
 ```c
-static HistoryBufSegment*
+static index_type
 segment_for(HistoryBuf *self, index_type y) {
     index_type seg_num = y / SEGMENT_SIZE;
-    while (seg_num >= self->num_segments && SEGMENT_SIZE * self->num_segments < self->ynum) add_segment(self);
-    return self->segments + seg_num;
+    while (UNLIKELY(seg_num >= self->num_segments && SEGMENT_SIZE * self->num_segments < self->ynum)) add_segment(self);
+    if (UNLIKELY(seg_num >= self->num_segments)) fatal("Out of bounds access to history buffer line number: %u", y);
+    return seg_num;
 }
 ```
 
-Two guards apply:
+Note the return type is `index_type` (an unsigned integer, the segment number) — not `HistoryBufSegment*`. Dereferencing to the actual `HistoryBufSegment` is performed by the `seg_ptr` macro at `kitty/history.c:44-48`, which consumes `segment_for`'s returned `seg_num` to index into `self->segments[]`:
+
+```c
+#define seg_ptr(which, stride) { \
+    index_type seg_num = segment_for(self, y); \
+    y -= seg_num * SEGMENT_SIZE; \
+    return self->segments[seg_num].which + y * stride; \
+}
+```
+
+Three guards apply in `segment_for`:
 
 - `seg_num >= self->num_segments` — only add segments if the requested segment does not yet exist.
-- `SEGMENT_SIZE * self->num_segments < self->ynum` — never over-allocate beyond `ynum`. When the ceiling is reached, this loop exits and the next call to `segment_for` simply returns the existing segment pointer.
+- `SEGMENT_SIZE * self->num_segments < self->ynum` — never over-allocate beyond `ynum`. When the ceiling is reached, this loop exits and the next call to `segment_for` simply returns the existing `seg_num`.
+- `if (UNLIKELY(seg_num >= self->num_segments)) fatal(...)` (line 40) — a belt-and-braces bounds check: if the `while` loop exited without reaching the requested segment (because the `ynum` ceiling was hit first), the process aborts rather than returning an invalid index.
+
+The `UNLIKELY(...)` macros are compiler branch-prediction hints (`__builtin_expect(..., 0)` on GCC/Clang) indicating the allocator-trigger and fatal paths are cold; the hot path is "segment already exists, return immediately."
 
 Note the `while` rather than `if`: if `segment_for(y)` is invoked with a `y` several segments beyond the current frontier (e.g., after a `historybuf_rewrap` or non-sequential init), the loop adds as many segments as needed in one call. In the normal push hot path, the frontier advances one line at a time, so at most one `add_segment` happens per push.
 
 ### `add_segment()` — the Allocation Sequence
 
-Full sequence at `kitty/history.c:18-29`:
+Full sequence at `kitty/history.c:17-29`:
 
 ```c
 static void
 add_segment(HistoryBuf *self) {
     self->num_segments += 1;
     self->segments = realloc(self->segments, sizeof(HistoryBufSegment) * self->num_segments);
-    if (!self->segments) fatal("Out of memory allocating new history buffer segment pointers");
+    if (self->segments == NULL) fatal("Out of memory allocating new history buffer segment");
     HistoryBufSegment *s = self->segments + self->num_segments - 1;
     const size_t cpu_cells_size = self->xnum * SEGMENT_SIZE * sizeof(CPUCell);
     const size_t gpu_cells_size = self->xnum * SEGMENT_SIZE * sizeof(GPUCell);
@@ -499,9 +514,9 @@ Step-by-step:
 
 1. `num_segments += 1` (line 19).
 2. `segments = realloc(segments, 24 × num_segments)` (line 20) — three pointers of 8 bytes each on x86-64 = 24 bytes per entry.
-3. Fatal on OOM (line 21) — the process terminates, there is no graceful back-off.
+3. Fatal on OOM for the segments-pointer realloc (line 21) — the process terminates, there is no graceful back-off. Note that both fatal messages in `add_segment` are textually identical (`"Out of memory allocating new history buffer segment"`); the two call sites differ only in which allocation failed (the pointer-array realloc at line 20 vs the per-segment `calloc` at line 25).
 4. `calloc(1, cpu_cells_size + gpu_cells_size + SEGMENT_SIZE * sizeof(LineAttrs))` (line 25) — one call, one allocation. At 80 cols this is 5 244 928 bytes.
-5. Fatal on OOM (line 26) — same semantics.
+5. Fatal on OOM for the per-segment calloc (line 26) — same semantics, same fatal message.
 6. Pointer arithmetic (lines 27–28) partitions the single allocation into `cpu_cells` | `gpu_cells` | `line_attrs` sub-regions.
 
 Because `calloc` zero-fills, the allocation is memory-safe against uninitialized reads but incurs an O(segment_bytes) memset on each new segment (5 244 928 byte zero-fill at 80 cols).
@@ -529,7 +544,7 @@ Separate from the HistoryBuf segment dynamics, the pager history ring buffer has
 
 - **First allocation.** If `scrollback_pager_history_size > 0`, `alloc_pagerhist(pagerhist_sz)` (`kitty/history.c:70-80`) creates a `PagerHistoryBuf` struct and calls `ringbuf_new(initial_pagerhist_ringbuf_sz(pagerhist_sz))` — the initial capacity is `MIN(1 MiB, pagerhist_sz)` per `kitty/history.c:67`. `ringbuf_new(capacity)` internally `malloc`s `capacity + 1` bytes for the data buffer (`3rdparty/ringbuf/ringbuf.c:56`) — the `+1` byte is reserved for the full-versus-empty distinction since the ring buffer uses the head-equals-tail-means-empty convention. The `struct ringbuf_t` bookkeeping itself is a separate, small allocation.
 - **First write.** A line is evicted from the HistoryBuf (buffer full at `kitty/history.c:279`) → `pagerhist_push()` (line 280) → `pagerhist_write_bytes()` (`kitty/history.c:218-226`). If `sz > ringbuf_bytes_free(ph->ringbuf)`, the write path calls `pagerhist_extend(ph, sz)` before `ringbuf_memcpy_into`.
-- **Extend step.** `pagerhist_extend()` at `kitty/history.c:90-101`:
+- **Extend step.** `pagerhist_extend()` at `kitty/history.c:89-101`:
   - `newsz = MIN(ph->maximum_size, buffer_size + MAX(1024u*1024u, minsz))` — so the minimum growth increment is 1 MiB (larger only if a single write exceeds 1 MiB, which is unusual for a terminal line).
   - `newbuf = ringbuf_new(newsz)` — a fresh allocation.
   - `ringbuf_copy(newbuf, ph->ringbuf, count)` — copies all existing bytes (up to `maximum_size` on the final extend).
@@ -630,7 +645,7 @@ None of these methods require modifying kitty source files. Any observer script 
 - **I/O wake-ups are batched by `input_delay`** (default 3 ms, `kitty/options/definition.py:878`) via the `WAKEUP` macro at `kitty/child-monitor.c:1562-1570`. Rendering is capped by `repaint_delay` (default 10 ms, `kitty/options/definition.py:866`) via the early-return at `kitty/child-monitor.c:875-877`.
 - **`run_worker` bypasses `input_delay` when the input buffer is near-full.** The flush condition `read.sz + 16*1024 > BUF_SZ` at `kitty/vt-parser.c:1425` guarantees the input pipeline never back-pressures the I/O thread for long — critical for scroll responsiveness under sustained heavy output.
 - **`scrollback_lines=-1` parses to 2³² − 1 = 4 294 967 295** (`kitty/options/utils.py:557-561`). The resulting ~10.999 TB (decimal) / ~10.004 TiB (binary) ceiling is nominal only — segments are allocated lazily, so actual memory is bounded by output volume and OS limits rather than by this cap.
-- **Pager history starts at `MIN(1 MiB, configured_max)`** (`kitty/history.c:67`) regardless of the configured ceiling up to 4 GiB − 1 (`kitty/options/utils.py:564-566`). It grows by 1 MiB increments via the copy-on-extend path at `kitty/history.c:90-101`, producing a brief memory peak equal to `old_capacity + new_capacity` during each extend.
+- **Pager history starts at `MIN(1 MiB, configured_max)`** (`kitty/history.c:67`) regardless of the configured ceiling up to 4 GiB − 1 (`kitty/options/utils.py:564-566`). It grows by 1 MiB increments via the copy-on-extend path at `kitty/history.c:89-101`, producing a brief memory peak equal to `old_capacity + new_capacity` during each extend.
 - **HistoryBuf uses one `calloc` per segment; LineBuf uses five `PyMem_Calloc` calls.** Compare `kitty/history.c:23-28` (single allocation for cpu_cells + gpu_cells + line_attrs) with `kitty/line-buf.c:90-98` (separate buffers for `cpu_cell_buf`, `gpu_cell_buf`, `line_map`, `scratch`, `line_attrs`). This is a deliberate density-vs-flexibility trade-off: history is read-mostly (density wins), the visible LineBuf needs auxiliary maps for scroll-region operations (flexibility wins).
 - **Scrollback indicator position is O(1).** `frac = scrolled_by / historybuf->count` at `kitty/shaders.c:616`, controlled by the `scrollback_indicator_opacity` option. Drawing the bar is a single 4-vertex triangle fan with no iteration over history.
 - **Observable allocation boundaries are predictable.** Every 2048 newly captured main-screen lines produces one HistoryBuf segment allocation (~5 MiB at 80 cols); every 1 MiB of pager-history demand produces one ring-buffer extend. Both can be observed externally via `/proc/<pid>/status`, `strace` on `mmap`, or eBPF uprobes — **no kitty source modification is required** to measure either boundary.
@@ -641,13 +656,13 @@ None of these methods require modifying kitty source files. Any observer script 
 
 | File | Lines Cited |
 |------|-------------|
-| `kitty/history.c` | 15 (SEGMENT_SIZE); 18–29 (add_segment); 20 (realloc segments); 23–28 (calloc formula); 31–34 (free_segment); 37–42 (segment_for); 67 (initial_pagerhist_ringbuf_sz); 70–80 (alloc_pagerhist); 90–101 (pagerhist_extend); 92 (ceiling check); 117–133 (create_historybuf); 127 (eager add_segment); 218–226 (pagerhist_write_bytes); 224 (ringbuf_memcpy_into); 258–273 (pagerhist_push); 275–284 (historybuf_push); 279 (full-check before pagerhist_push); 280 (pagerhist_push call); 281 (start_of_data advance); 577–579 (alloc_historybuf) |
+| `kitty/history.c` | 15 (SEGMENT_SIZE); 17–29 (add_segment); 20 (realloc segments); 23–28 (calloc formula); 31–34 (free_segment); 36–42 (segment_for); 44–48 (seg_ptr macro); 67 (initial_pagerhist_ringbuf_sz); 70–80 (alloc_pagerhist); 89–101 (pagerhist_extend); 92 (ceiling check); 117–133 (create_historybuf); 127 (eager add_segment); 218–226 (pagerhist_write_bytes); 224 (ringbuf_memcpy_into); 258–273 (pagerhist_push); 275–284 (historybuf_push); 279 (full-check before pagerhist_push); 280 (pagerhist_push call); 281 (start_of_data advance); 577–579 (alloc_historybuf) |
 | `kitty/data-types.h` | 221 (sizeof(GPUCell)==20); 228 (sizeof(CPUCell)==12); 231–239 (LineAttrs union); 262–266 (HistoryBufSegment); 268–272 (PagerHistoryBuf); 282–290 (HistoryBuf) |
 | `kitty/screen.c` | 130 (alloc_historybuf wiring); 1552–1567 (INDEX_UP); 1558 (historybuf_add_line); 1559 (history_line_added_count++); 1570–1577 (screen_index / add_to_history); 1574 (main_linebuf + margin_top==0); 1589–1598 (screen_scroll); 1907–1911 (dirty_scroll); 1909 (scroll_changed=true); 1910 (pause_rendering(false)); 1913–1920 (screen_clear_scrollback); 2505–2544 (screen_pause_rendering); 2531 (snapshot LineBuf); 2534–2539 (copy_line loop); 2597–2601 (screen_reset_dirty); 2713–2735 (screen_update_only_line_graphics_data); 2716 (graphics-path scrolled_by hook); 2737–2797 (screen_update_cell_data); 2761 (main scrolled_by auto-adjust); 2763–2775 (history-half render loop); 2776–2788 (live-half render loop); 2842–2853 (visual_line_); 4090–4118 (screen_history_scroll); 4111 (new_scroll MIN); 4114 (dirty_scroll call) |
-| `kitty/screen.h` | 85–115 (Screen struct: scrolled_by, is_dirty, scroll_changed, history_line_added_count, historybuf) |
+| `kitty/screen.h` | 88–115 (Screen struct: scrolled_by, is_dirty, scroll_changed, history_line_added_count, historybuf) |
 | `kitty/shaders.c` | 393–418 (cell_prepare_to_render); 408–409 (update_cell_data macro / sz formula); 608–630 (draw_scroll_indicator); 616 (frac = scrolled_by / historybuf->count); 627 (glDrawArrays 4-vertex) |
 | `kitty/child-monitor.c` | 437–448 (do_parse); 445 (set_maximum_wait input_delay); 870–896 (render); 874–877 (repaint_delay gate); 1337–1356 (read_bytes); 1480–1578 (io_loop); 1506–1513 (poll with timeout); 1562–1570 (WAKEUP / input_delay coalesce) |
-| `kitty/vt-parser.c` | 18 (BUF_SZ = 1 MiB); 21 (MAX_ESCAPE_CODE_LENGTH = BUF_SZ/4); 1417–1446 (run_worker); 1425 (flush condition); 1451–1462 (vt_parser_create_write_buffer) |
+| `kitty/vt-parser.c` | 18 (BUF_SZ = 1 MiB); 21 (MAX_ESCAPE_CODE_LENGTH = BUF_SZ/4); 1416–1446 (run_worker); 1425 (flush condition); 1450–1462 (vt_parser_create_write_buffer) |
 | `kitty/line-buf.c` | 85–120 (alloc_linebuf); 90–98 (five PyMem_Calloc calls) |
 | `kitty/options/definition.py` | 372 (scrollback_lines default 2000); 406 (scrollback_pager_history_size default 0); 866 (repaint_delay default 10); 878 (input_delay default 3) |
 | `kitty/options/utils.py` | 557–561 (scrollback_lines parser → 2³²−1); 564–566 (scrollback_pager_history_size MB-to-bytes, 4 GiB−1 cap) |
