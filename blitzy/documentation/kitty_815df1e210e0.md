@@ -30,18 +30,19 @@ Frame `#3` (`_glfwDispatchX11Events`) calls `XNextEvent`, routes to `processEven
 
 ### 4.4 `_glfwInputKeyboard`: C callback entry
 
-Dedupes auto-repeat; maintains `activated_keys` (stuck-key cleanup on `FocusOut`). Hot band of the 28-frame bt:
+Dedupes auto-repeat; maintains `activated_keys` (stuck-key cleanup on `FocusOut`). Hot band of the 29-frame bt (indices 0-28):
 
 ```text
 #0 _glfwInputKeyboard         glfw-x11.so
 #1 glfw_xkb_handle_key_event  glfw-x11.so
 #2 processEvent               glfw-x11.so
 #3 _glfwDispatchX11Events     glfw-x11.so
-#4 main_loop                  fast_data_types.so
-#5 method_vectorcall_NOARGS   libpython3.12    <- Python first appears as CALLER
+#4 glfwRunMainLoop            glfw-x11.so
+#5 main_loop                  fast_data_types.so
+#6 method_vectorcall_NOARGS   libpython3.12    <- Python first appears as CALLER
 ```
 
-Frames 0-4 native. Python first at `#5` — the CPython shim that called **into** `main_loop` at startup; inside the loop Python is only a callee (S8.2).
+Frames 0-5 native. Python first at `#6` — the CPython shim that called **into** `main_loop` at startup via `glfwRunMainLoop` (glfw/init.c:357, invoked from `run_main_loop` in kitty/glfw.c:2103); inside the loop Python is only a callee (S8.2).
 
 ### 4.5 `active_window()`: O(1) resolution
 
@@ -110,7 +111,7 @@ Signalfd fires first, EIO 423 us later — signals primary, EIO backstops a chil
 
 ### 6.3 Safety nets for key -> closed window
 
-Three, all observed: (1) `active_window()` returns `NULL` when `render_data.screen == NULL`; `Window.destroy` clears it before Tab mutation (keys.c:106). (2) `is_window_ready_for_callbacks()` short-circuits `key_callback` when `num_tabs==0 || num_windows==0` (glfw.c:196). (3) `schedule_write_to_child` drops a byte whose `window_id` is absent from `children[]` (cm.c:340).
+Three, all observed: (1) `active_window()` returns `NULL` when `render_data.screen == NULL`; `Window.destroy` clears it before Tab mutation (keys.c:106). (2) `is_window_ready_for_callbacks()` short-circuits `key_callback` when `num_tabs==0 || num_windows==0` (glfw.c:196). (3) `schedule_write_to_child` drops a byte whose `window_id` is absent from `children[]` — the id match is `children[i].id == id` at `cm.c:336`, inside the `schedule_write_to_child_generic` macro body spanning `cm.c:323-369`.
 
 ### 6.4 Race window
 
@@ -124,7 +125,7 @@ I/O never holds the GIL (S7.3); all Python cleanup runs on main after the `event
 
 ### 7.1 Runtime membership
 
-Launcher (36 KiB C) runs `Py_RunMain`; GDB bottom `main()` lives here. `fast_data_types.so` is `-fvisibility=hidden` — **8 T**, rest `t` (LTO). Hot T: `main_loop, io_loop, schedule_write_to_child, on_key_input, encode_glfw_key_event, key_callback, wakeup_main_loop, window_focus_callback`. `glfw-x11.so` T: `_glfwInputKeyboard, _glfwDispatchX11Events, glfwPostEmptyEvent, glfw_xkb_handle_key_event, processEvent`. Externals hot: `libX11, libX11-xcb, libxkbcommon`. Off hot path: `libGL, libgallium, libLLVM, libfreetype, libharfbuzz`.
+Launcher (36 KiB C) runs `Py_RunMain`; GDB bottom `main()` lives here. `fast_data_types.so` is built with `-fvisibility=hidden` + LTO — exactly **8 T** (global) symbols, all exposed for the Python C-API / test surface: `PyInit_fast_data_types` and `base64_decode`, `base64_encode`, `base64_stream_{decode,encode}{,_init,_final}`. Every hot-path function is **lowercase `t`** (file-local) because LTO privatizes non-exported symbols: `main_loop.lto_priv.0`, `io_loop` (+ `io_loop.cold`), `schedule_write_to_child` (+ `.constprop.0`), `encode_glfw_key_event`, `key_callback.lto_priv.0`, `window_focus_callback.lto_priv.0`, and `wakeup.lto_priv.0` (LTO-renamed from `wakeup_main_loop`). `on_key_input` has no standalone symbol — it is fully inlined into its sole caller `key_callback` by LTO; the function body is still reachable via source-line breakpoints, just not via symbol-name lookup in `nm`. `glfw-x11.so` has 154 T symbols (the public GLFW API, e.g. `glfwRunMainLoop`, `glfwPostEmptyEvent`, `glfwCreateWindow`); of the input-path entry points, **only `glfwPostEmptyEvent` is T** — `_glfwInputKeyboard`, `_glfwDispatchX11Events.lto_priv.0`, `processEvent`, and `glfw_xkb_handle_key_event.constprop.0` are all `t` (LTO-local). Externals hot: `libX11, libX11-xcb, libxkbcommon`. Off hot path: `libGL, libgallium, libLLVM, libfreetype, libharfbuzz`.
 
 ### 7.2 Boundaries along the path
 
@@ -152,15 +153,15 @@ Plausible: "Python + C" branding, Python `Boss.dispatch_possible_special_key`, T
 
 ### 9.2 Source sites reading `OPT(input_delay)`
 
-`OPT(x)` = `global_state.opts.x`. Sites: (1) `cm.c:1558` hot-path gate: on PTY data, fire `wakeup_main_loop` iff `now - last_main_loop_wakeup_at > OPT(input_delay)`; else set `has_pending_wakeups`. Surrounding `poll` timeout = `OPT(input_delay) - elapsed`. (2) `vt-parser.c:run_worker` applies the same threshold to parser-side batching.
+`OPT(x)` = `global_state.opts.x`. Sites: (1) `cm.c:1566` hot-path gate (wrapped by `#define WAKEUP` at `cm.c:1562`; backstop duplicate at `cm.c:1569`): on PTY data, fire `wakeup_main_loop` iff `now - last_main_loop_wakeup_at > OPT(input_delay)`; else set `has_pending_wakeups`. Surrounding `poll` timeout = `OPT(input_delay) - elapsed` (computed at `cm.c:1508`). (2) `vt-parser.c:run_worker` applies the same threshold to parser-side batching.
 
 ### 9.3 Observable evidence: eventfd coalescing
 
-Default-flag `eventfd` accumulates writes; the read = count since last drain. `wakeup_main_loop` writes `1`, so `read(fd=4)` value = pending wakeups. `strace_io.txt`: 171 x 1, 18 x 2, 1 x 3, 1 x 4, 1 x 8, **1 x 24** — `12425 read(4, "\30\0\0\0\0\0\0\0", 64) = 8` (`0x18`=24), immediately followed by `12425 writev(3, [...24 bytes...], 3) = 24`: 24 `glfwPostEmptyEvent` calls collapsed into one X round-trip and one render. `fd 6` never coalesced above 1.
+Default-flag `eventfd` accumulates writes; the read = count since last drain. `wakeup_main_loop` writes `1`, so `read(fd=4)` value = pending wakeups. Peak coalescing scales with background-output load. `strace_io.txt` (moderate load): 171 x 1, 18 x 2, 1 x 3, 1 x 4, 1 x 8, **1 x 24** — `12425 read(4, "\30\0\0\0\0\0\0\0", 64) = 8` (`0x18`=24), immediately followed by `12425 writev(3, [...24 bytes...], 3) = 24`: 24 `glfwPostEmptyEvent` calls collapsed into one X round-trip and one render. Heavier-load re-capture (`seq 1 20000` running concurrently with typed keystrokes) observed peak `\35` = **29** (`0x1D`) — i.e. 29 wakeup writes collapsed into one main-loop wake. Distribution variance confirms `input_delay`-gated batching scales with wakeup pressure: higher output rates -> higher coalescing factor. `fd 6` never coalesced above 1.
 
 ### 9.4 The tradeoff
 
-`input_delay=3`: child-output display latency <= 3 ms. `=0`: every byte -> `glfwPostEmptyEvent` -> X round-trip -> full-frame GL submit (CPU, flicker). Backstop: per-child `events` mask -> `0` when `!vt_parser_has_space_for_input` — batching yields under backpressure. Up to 3 ms for up to ~24x fewer render passes under heavy output; the `read(4, "\30...", 64) = 8` line is the proof.
+`input_delay=3`: child-output display latency <= 3 ms. `=0`: every byte -> `glfwPostEmptyEvent` -> X round-trip -> full-frame GL submit (CPU, flicker). Backstop: per-child `events` mask -> `0` when `!vt_parser_has_space_for_input` — batching yields under backpressure. Up to 3 ms for ~20-30x fewer render passes under heavy output (load-dependent: 24x observed in moderate traces, 29x in heavier re-captures); the `read(4, "\30...", 64) = 8` line is the proof.
 
 ## Appendix A. Commands
 
@@ -188,12 +189,12 @@ xdotool key ctrl+shift+t; xdotool type "hi"; xdotool key "ctrl+shift+]"; kill -9
 | Python re-enters once/keystroke | `keys.c:221` |
 | `KittyChildMon` runs `io_loop` | `.../task/12492/comm` |
 | I/O polls {6,7,8..11}; main never polls PTYs | `strace_io.txt` |
-| `input_delay` default 3ms gates wakeup | `definition.py:878`; `cm.c:1558` |
-| eventfd coalescing up to 24 | `strace_io.txt` |
+| `input_delay` default 3ms gates wakeup | `definition.py:878`; `cm.c:1566` (macro `WAKEUP` at `cm.c:1562`) |
+| eventfd coalescing up to ~29 (load-dependent; 24 in moderate trace, 29 in heavy re-capture) | `strace_io.txt` + heavy-load re-capture |
 | Death: signalfd first, EIO ~423us | `child_kill_trace.log` |
 | Dead child: `needs_removal`, close, poll 6->5 | `child_kill_trace.log` |
 | `Boss.on_child_death` via eventfd 4 | `boss.py:881` |
-| 3 safety nets key -> closed window | keys.c:106; glfw.c:196; cm.c:340 |
+| 3 safety nets key -> closed window | keys.c:106; glfw.c:196; cm.c:336 (`children[i].id == id` lookup inside `schedule_write_to_child_generic` macro at `cm.c:323-369`) |
 | `fast_data_types.so` hidden-vis, 8 T syms | `nm` |
 | `kitty:disk$0` = Mesa Gallium | `libgallium` strings |
 
