@@ -135,7 +135,7 @@ Reading `go.mod`, the transfer-relevant third-party modules are:
 |--------|---------|---------|
 | `github.com/zeebo/xxh3` | v1.0.2 | XXH3 hashing (64-bit and 128-bit) for rsync strong hashes and file-integrity checksums |
 | `github.com/google/uuid` | v1.6.0 | UUID generation — declared dependency used by other tools (not consumed by `random_id`; see §18.2 Step 3 for the actual `random_id` implementation) |
-| `golang.org/x/sys` | v0.21.0 | System calls: `syscall.Stat_t` in `kittens/transfer/send.go` `NewFile` (line 124) for device/inode duplication detection |
+| `golang.org/x/sys` | v0.21.0 | System calls: `syscall.Stat_t` in `kittens/transfer/send.go` `NewFile` (line 121) for device/inode duplication detection |
 | `github.com/bmatcuk/doublestar/v4` | transitively | Glob patterns for file selection |
 | `github.com/google/go-cmp` | v0.6.0 | Test-only: deep equality comparisons in `*_test.go` files |
 
@@ -561,7 +561,7 @@ From `kittens/transfer/ftc.go:33-118`:
 
 Each enum type has a `String()` method (for serialization) and a `SetString()`
 method (for deserialization), as required by the `Serializable` /
-`Unserializable` interfaces defined at the top of `ftc.go:24-31`.
+`Unserializable` interfaces defined at the top of `ftc.go:23-30`.
 
 ### 5.3 Serialization
 
@@ -904,7 +904,7 @@ behaviors:
   `stat_result.Sys()` as a `*syscall.Stat_t` and builds a `FileHash{Dev, Ino}`
   key. Subsequent files with the same device-and-inode are marked as
   `FileType_link` with their `hard_link_target` set to `"fid:" +
-  first_file.file_id` — see `NewFile` at line 122 and the de-duplication
+  first_file.file_id` — see `NewFile` at line 120 and the de-duplication
   logic in `process`.
 - **Symlink handling**: A `FileType_symlink` reads the link target via
   `os.Readlink` and encodes the target with a prefix indicating how the target
@@ -920,7 +920,7 @@ behaviors:
 
 ### 7.3 `NewFile` Constructor
 
-At `kittens/transfer/send.go:122-137`:
+At `kittens/transfer/send.go:120-137`:
 
 ```go
 func NewFile(opts *Options, local_path, expanded_local_path string, file_id int, stat_result fs.FileInfo, remote_base string, file_type FileType) *File {
@@ -1493,7 +1493,7 @@ finalization time).
 
 ### 8.7 `write_data` — Decompression Wrapper
 
-Lines 203-228:
+Lines 200-228:
 
 ```go
 func (self *remote_file) write_data(data []byte, is_last bool) (amt_written int64, err error) {
@@ -2838,16 +2838,29 @@ to the terminal emulator's disk on machine-A).
 **Step 2: File discovery**
 - `kittens/transfer/send.go` `files_for_send(opts, args)` — walks the arg
   list, stats `/remote/hello.txt`, builds a `[]*File` with one entry.
-  `NewFile` at line 122 sets `rsync_capable = true` (file > 4096 bytes) and
+  `NewFile` at line 120 sets `rsync_capable = true` (file > 4096 bytes) and
   `compression_capable` according to `should_be_compressed`.
 
 **Step 3: SendManager construction**
-- `NewSendManager(opts, files, ...)` — constructs the manager, generates
-  `request_id = random_id()` from `kittens/transfer/utils.go:76-80`, which
-  draws two random bytes via `crypto/rand.Read`, hex-encodes them with
-  `encoding/hex.EncodeToString`, and prefixes the result with `os.Getpid()`
-  formatted as `%x`. (Note: despite `google/uuid` being declared as a Go
-  module dependency, this function does not use it.)
+- There is no `New*` constructor function for `SendManager`; it is
+  constructed inline within `send_loop()` at `kittens/transfer/send.go:1208`
+  as a struct literal nested inside the `&SendHandler{...}` initialization
+  (line 1205):
+  ```go
+  manager: &SendManager{
+      request_id: random_id(), files: files,
+      bypass: opts.PermissionsBypass, use_rsync: opts.TransmitDeltas,
+  },
+  ```
+  This wires the manager and its handler up in a single expression, passing
+  the request ID, file list, optional permission-bypass token, and the
+  rsync delta flag directly into the manager's exported fields.
+- `request_id` is produced by `random_id()` at
+  `kittens/transfer/utils.go:76-80`, which draws two random bytes via
+  `crypto/rand.Read`, hex-encodes them with `encoding/hex.EncodeToString`,
+  and prefixes the result with `os.Getpid()` formatted as `%x`. (Note:
+  despite `google/uuid` being declared as a Go module dependency, this
+  function does not use it.)
 
 **Step 4: Initialization**
 - `SendManager.initialize()` at line 367 — sets
@@ -2972,7 +2985,7 @@ sequenceDiagram
     participant FT as file_transmission.py
     participant T as Terminal UI
 
-    Note over K: Step 1-4: main, NewSendManager, initialize
+    Note over K: Step 1-4: main, SendManager init, initialize
     K->>S: action=send id=REQ
     S->>V: OSC bytes
     V->>SC: DISPATCH_OSC(file_transmission)
@@ -3135,7 +3148,7 @@ where the symbol is defined (or first used).
 | `FileTransmissionCommand` (Go) | `kittens/transfer/ftc.go:120` | The on-wire message. |
 | `FileTransmissionCommand` (Py) | `kitty/file_transmission.py:252` | Python counterpart dataclass. |
 | `File` (Go) | `kittens/transfer/send.go:82` | Per-file sender state. |
-| `remote_file` (Go) | `kittens/transfer/receive.go:127` | Per-file receiver state. |
+| `remote_file` (Go) | `kittens/transfer/receive.go:125` | Per-file receiver state. |
 | `SendManager` | `kittens/transfer/send.go:344` | Sender session orchestrator. |
 | `manager` (receive) | `kittens/transfer/receive.go` | Receiver session orchestrator. |
 | `ActiveSend` (Py) | `kitty/file_transmission.py:714` | Terminal-side send session. |
@@ -3153,7 +3166,7 @@ where the symbol is defined (or first used).
 | `DefaultBlockSize` | `tools/rsync/algorithm.go:25` | 6144 (6 KiB) | Default rsync block size. |
 | `MaxBlockSize` | `tools/rsync/api.go:29` | 1048576 (1 MiB) | Cap on block size for large files. |
 | `NewPatcher` | `tools/rsync/api.go:270` | function | Constructs Patcher; block_size = √(expected_size). |
-| `NewDiffer` | `tools/rsync/api.go:266` | function | Constructs Differ. |
+| `NewDiffer` | `tools/rsync/api.go:265` | function | Constructs Differ. |
 
 ### 20.4 Chunk Handling
 
@@ -3162,7 +3175,7 @@ where the symbol is defined (or first used).
 | `split_for_transfer` | `kittens/transfer/ftc.go:326` | function | Chunks payload into 4096-byte FTCs. |
 | `chunk_size` | `kittens/transfer/ftc.go:327` | 4096 | The OSC chunk size constant. |
 | 1 MiB read buffer | `kittens/transfer/send.go:916` | 1048576 | File I/O read unit. |
-| 4000-byte flush | `kittens/transfer/receive.go:372` | 4000 | sigwriter flush threshold. |
+| 4000-byte flush | `kittens/transfer/receive.go:368` | 4000 | sigwriter flush threshold. |
 
 ### 20.5 Auxiliary Functions
 
@@ -3255,14 +3268,14 @@ kitty/
         │   ├── Lines 1-17: API comment block
         │   ├── Line 29: MaxBlockSize = 1 MiB
         │   ├── Lines 71-108: read_signature_header (signature header format)
-        │   ├── Lines 266-268: NewDiffer
+        │   ├── Lines 265-268: NewDiffer
         │   └── Lines 270-288: NewPatcher
         └── api_test.go                   196 lines
 
 kittens/
 ├── transfer/
-│   ├── main.go                           72 lines
-│   │   └── Lines 38-72: main() dispatch
+│   ├── main.go                           71 lines
+│   │   └── Lines 38-71: main() dispatch
 │   ├── ftc.go                            338 lines
 │   │   ├── Lines 37-47: Action enum
 │   │   ├── Lines 49-56: Compression enum
@@ -3274,7 +3287,7 @@ kittens/
 │   │   └── Lines 326-339: split_for_transfer + chunk_size = 4096
 │   ├── send.go                           1288 lines
 │   │   ├── Lines 82-109: File struct
-│   │   ├── Lines 122-137: NewFile constructor
+│   │   ├── Lines 120-137: NewFile constructor
 │   │   ├── Lines 277-284: SendState enum
 │   │   ├── Lines 286-296: Transfer struct
 │   │   ├── Lines 297-342: ProgressTracker
@@ -3291,10 +3304,10 @@ kittens/
 │   │   ├── Lines 43-47: output_file interface
 │   │   ├── Lines 49-66: filesystem_file
 │   │   ├── Lines 68-124: patch_file + new_patch_file
-│   │   ├── Lines 127-149: remote_file struct
+│   │   ├── Lines 125-149: remote_file struct
 │   │   ├── Lines 151-164: remote_file.close
 │   │   ├── Lines 165-194: remote_file.Write
-│   │   ├── Lines 203-228: remote_file.write_data
+│   │   ├── Lines 200-228: remote_file.write_data
 │   │   ├── Lines 355-386: sigwriter
 │   │   ├── Lines 388-445: manager.request_files
 │   │   ├── Lines 453+: handler struct
