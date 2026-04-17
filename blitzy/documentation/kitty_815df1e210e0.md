@@ -22,7 +22,7 @@
 6. [Import Chain Classification (All 22 Test Modules)](#section-6--import-chain-classification-all-22-test-modules)
 7. [C Source → Functional Area → Test Module Traceability Matrix](#section-7--c-source--functional-area--test-module-traceability-matrix)
 8. [Cross-Language Test Orchestration](#section-8--cross-language-test-orchestration)
-9. [Test Environment Isolation](#section-9--test-environment-isolation)
+9. [Test Environment Isolation](#section-9--test-environment-isolation-env_for_python_tests)
 10. [Controlled Failure Experiments](#section-10--controlled-failure-experiments)
 11. [Rationale and Thinking Behind the Answers](#section-11--rationale-and-thinking-behind-the-answers)
 
@@ -146,7 +146,7 @@ def find_c_files() -> Tuple[List[str], List[str]]:
     return ans, headers
 ```
 
-On Linux, the `if is_macos else { 'core_text.m', 'cocoa_window.m', 'macos_process_info.c' }` branch is selected, so 49 − 3 = **46 native `.c` files** from `kitty/` are compiled, plus `kitty/vt-parser-dump.c` (added separately on line 920), plus 3rdparty objects. The container produced **62 object files** prefixed with `kitty/fast_data_types-` in `build/`, which are linked into `kitty/fast_data_types.so`.
+On Linux, the `if is_macos else { 'core_text.m', 'cocoa_window.m', 'macos_process_info.c' }` branch is selected. Of the 3 excluded items, only `macos_process_info.c` is a `.c` file (`core_text.m` and `cocoa_window.m` are Objective-C `.m` files that are not counted in the 49 `.c` total), so 49 − 1 = **48 native `.c` files** from `kitty/` are compiled, plus `kitty/vt-parser-dump.c` (added separately on line 920), plus 3rdparty objects. The container produced **62 object files** prefixed with `kitty/fast_data_types-` in `build/`, which are linked into `kitty/fast_data_types.so`.
 
 #### Stage 2 — `compile_glfw()` (setup.py line 932)
 
