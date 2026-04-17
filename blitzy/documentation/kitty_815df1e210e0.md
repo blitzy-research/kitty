@@ -134,7 +134,7 @@ Reading `go.mod`, the transfer-relevant third-party modules are:
 | Module | Version | Purpose |
 |--------|---------|---------|
 | `github.com/zeebo/xxh3` | v1.0.2 | XXH3 hashing (64-bit and 128-bit) for rsync strong hashes and file-integrity checksums |
-| `github.com/google/uuid` | v1.6.0 | UUID generation — used in `kittens/transfer/utils.go` `random_id` for session IDs |
+| `github.com/google/uuid` | v1.6.0 | UUID generation — declared dependency used by other tools (not consumed by `random_id`; see §18.2 Step 3 for the actual `random_id` implementation) |
 | `golang.org/x/sys` | v0.21.0 | System calls: `syscall.Stat_t` in `kittens/transfer/send.go` `NewFile` (line 124) for device/inode duplication detection |
 | `github.com/bmatcuk/doublestar/v4` | transitively | Glob patterns for file selection |
 | `github.com/google/go-cmp` | v0.6.0 | Test-only: deep equality comparisons in `*_test.go` files |
@@ -430,7 +430,7 @@ A complete OSC 5113 frame looks like:
   permitted is the single-byte ST `\x9c`, but kitty emits the two-byte form.
 
 The literal construction on the sender side is at
-`kittens/transfer/send.go:385-386`:
+`kittens/transfer/send.go:384-385`:
 
 ```go
 self.prefix = fmt.Sprintf("\x1b]%d;id=%s;", kitty.FileTransferCode, self.request_id)
@@ -551,7 +551,7 @@ From `kittens/transfer/ftc.go:33-118`:
   `send`, `cancel`, `status`, `finish`. These correspond to the protocol's
   command verbs.
 - **Compression** (lines 49-56): `none`, `zlib`.
-- **FileType** (lines 58-65): `regular`, `symlink`, `directory`, `link`. The
+- **FileType** (lines 59-68): `regular`, `symlink`, `directory`, `link`. The
   `link` value is kitty's internal name for hard links (distinct from
   `symlink`).
 - **TransmissionType** (lines 99-106): `simple`, `rsync`.
@@ -611,29 +611,31 @@ compatibility with the Go side.
 
 ### 5.5 The 4096-Byte Chunk Limit
 
-`kittens/transfer/ftc.go:326-339`:
+`kittens/transfer/ftc.go:326-338` (reproduced verbatim):
 
 ```go
-func split_for_transfer(data []byte, file_id string, mark_last bool, callback func(ftc *FileTransmissionCommand)) {
+func split_for_transfer(data []byte, file_id string, mark_last bool, callback func(*FileTransmissionCommand)) {
     const chunk_size = 4096
-    ftc := &FileTransmissionCommand{Action: Action_data, File_id: file_id}
-    for len(data) > chunk_size {
-        ftc.Data = data[:chunk_size]
-        data = data[chunk_size:]
-        callback(ftc)
+    for len(data) > 0 {
+        chunk := data
+        if len(chunk) > chunk_size {
+            chunk = data[:chunk_size]
+        }
+        data = data[len(chunk):]
+        callback(&FileTransmissionCommand{
+            Action:  utils.IfElse(mark_last && len(data) == 0, Action_end_data, Action_data),
+            File_id: file_id, Data: chunk})
     }
-    if mark_last {
-        ftc.Action = Action_end_data
-    }
-    ftc.Data = data
-    callback(ftc)
 }
 ```
 
 This is the fundamental throughput chokepoint. Arbitrarily large input bytes
-are broken into 4096-byte fragments, each wrapped in a `FileTransmissionCommand`
-with `Action_data`. If `mark_last` is true, the final fragment is changed to
-`Action_end_data`.
+are broken into 4096-byte fragments, each wrapped in a fresh
+`FileTransmissionCommand`. The single loop iterates while `len(data) > 0`,
+slicing out up to 4096 bytes per iteration. The action for each frame is
+computed on the fly with `utils.IfElse(mark_last && len(data) == 0, Action_end_data, Action_data)`
+so that exactly the final frame of a terminating call is marked
+`Action_end_data` — all earlier frames use `Action_data`.
 
 ### 5.6 Why 4096 Bytes?
 
@@ -672,7 +674,7 @@ emulator's host filesystem.
 
 #### 6.1.1 Sender States
 
-`kittens/transfer/send.go:278-284`:
+`kittens/transfer/send.go:277-284`:
 
 ```go
 type SendState int
@@ -727,7 +729,7 @@ Per `docs/file-transfer-protocol.rst`, the wire sequence for a send session is:
 #### 6.1.4 Payload Emission
 
 The per-tick driver in the TUI loop is `SendHandler.send_payload` at
-`kittens/transfer/send.go:645-649`:
+`kittens/transfer/send.go:646-650`:
 
 ```go
 func (self *SendHandler) send_payload(payload string) loop.IdType {
@@ -743,7 +745,7 @@ TUI loop then flushes these in order on its next write cycle.
 
 #### 6.1.5 Metadata Command
 
-`kittens/transfer/send.go:651-665`:
+`kittens/transfer/send.go:652-667`:
 
 ```go
 func (self *File) metadata_command(use_rsync bool) *FileTransmissionCommand {
@@ -777,7 +779,7 @@ The receive direction pulls files from the terminal's host to the kitten.
 
 #### 6.2.1 Receiver States
 
-`kittens/transfer/receive.go:36-41`:
+`kittens/transfer/receive.go:34-41`:
 
 ```go
 type state int
@@ -856,28 +858,35 @@ unless otherwise noted.
 
 ### 7.1 Entry Point
 
-`kittens/transfer/main.go:38-72` dispatches between send and receive
-directions based on the `--direction` flag:
+`kittens/transfer/main.go:46-67` dispatches between send and receive
+directions based on the `--direction` flag. The core of the dispatch at
+`main.go:57-62` (reproduced verbatim) is:
 
 ```go
-func main(_ *cli.Command, opts_ *Options, args []string) (rc int, err error) {
-    ...
-    opts := &Options{...}
-    switch opts.Direction {
-    case "send", "upload":
-        return send_main(opts, args)
-    case "receive", "download":
-        return receive_main(opts, args)
-    }
-    ...
+switch opts.Direction {
+case "send", "download":
+    err, rc = send_main(opts, args)
+default:
+    err, rc = receive_main(opts, args)
 }
 ```
 
-The `send`/`upload` aliases feed into `send_main`, and `receive`/`download`
-feed into `receive_main`. These two functions sit in `send.go` and
-`receive.go` respectively. Each sets up its own `SendHandler`/`handler`
-instance, constructs a `SendManager`/`manager`, and spins up the TUI
-event loop.
+Two important observations about this mapping:
+
+1. The string `"download"` is routed to `send_main` — it is a **send
+   alias**, not a receive alias. The intuition is that from the perspective
+   of the kitten CLI user, "download" means "send a file from this machine
+   (the remote) down to the terminal host", which the protocol implements by
+   running the kitten's send path. The word `"upload"` is not an accepted
+   direction value at all.
+2. There is no explicit `case` for receive. Instead, the `default:` clause
+   routes every remaining direction value — including the documented
+   `"receive"` value — to `receive_main`. In other words, anything that
+   is not literally `"send"` or `"download"` takes the receive path.
+
+Each of `send_main` / `receive_main` sits in `send.go` and `receive.go`
+respectively. Each sets up its own `SendHandler`/`handler` instance,
+constructs a `SendManager`/`manager`, and spins up the TUI event loop.
 
 ### 7.2 File Discovery (`files_for_send`)
 
@@ -990,7 +999,7 @@ Notable fields:
 
 ### 7.5 `SendManager`
 
-`kittens/transfer/send.go:349-370`:
+`kittens/transfer/send.go:344-361`:
 
 ```go
 type SendManager struct {
@@ -1025,7 +1034,7 @@ Key responsibilities:
 
 ### 7.6 `initialize()` — Building the Prefix
 
-`kittens/transfer/send.go:375-393`:
+`kittens/transfer/send.go:367-392`:
 
 ```go
 func (self *SendManager) initialize() {
@@ -1050,9 +1059,9 @@ func (self *SendManager) initialize() {
 }
 ```
 
-Line 385 is where the OSC prefix string is cached. From this point on, every
-outgoing FTC is wrapped with this exact prefix — zero runtime cost to format
-per message.
+Line 384 is where the OSC prefix string is cached (with the matching suffix
+on line 385). From this point on, every outgoing FTC is wrapped with this
+exact prefix — zero runtime cost to format per message.
 
 ### 7.7 Chunk Reading — `File.next_chunk()`
 
@@ -1273,8 +1282,10 @@ are to `kittens/transfer/receive.go` unless otherwise noted.
 
 ### 8.1 Entry Point
 
-`receive_main` (around line 1080) is invoked from `main.go` when `--direction`
-is `receive` or `download`. It:
+`receive_main` (around line 1080) is invoked from `main.go` via the
+`default:` clause of the direction switch — i.e., for any `--direction`
+value that is *not* `"send"` or `"download"` (see §7.1). In practice that
+means the documented `--direction receive` route ends up here. It:
 
 1. Parses CLI args into `files []*remote_file` specs.
 2. Constructs `handler` (around line 1083) with a fresh `manager`.
@@ -1777,13 +1788,25 @@ For each block-sized read from the target file:
 3. Emit `BlockHash{Index: n, WeakHash: weak, StrongHash: strong}`.
 4. Advance `n`.
 
-The iterator is exposed as `rsync.CreateSignatureIterator(target)` in the
-public API (`tools/rsync/api.go` around lines 267-271).
+Two functions share the "create signature iterator" name with slightly
+different call surfaces. They are easy to confuse, so it is worth
+distinguishing them:
+
+- **Private**: `tools/rsync/algorithm.go:268` defines a method
+  `create_signature_iterator` on the unexported `*rsync` struct. This is the
+  low-level iterator factory that actually wires up a `signature_iterator`
+  around an `io.Reader` and the algorithm's configured block size and
+  hashers.
+- **Public**: `tools/rsync/api.go:195` defines a method
+  `CreateSignatureIterator` on the exported `*Patcher` type, which is the
+  public entry point callers outside the package use. It delegates to the
+  algorithm-layer version.
 
 ### 10.5 Signature Wire Format (API Layer)
 
-`tools/rsync/api.go` around lines 66-99 defines the signature stream format.
-A signature stream consists of:
+`tools/rsync/api.go` around lines 71-108 (the `read_signature_header`
+function) defines the signature stream format. A signature stream consists
+of:
 
 - A **12-byte header**:
   - Bytes 0-1: `version` (u16 big-endian, must be 0).
@@ -1986,7 +2009,7 @@ RAW BYTES
   │
   │  compressor.Compress(chunk)
   │     — IdentityCompressor (no-op) or ZlibCompressor
-  │     — chosen per file in metadata_command (send.go:651)
+  │     — chosen per file in metadata_command (send.go:652)
   ▼
 COMPRESSED BYTES (possibly same size as raw if identity)
   │
@@ -2002,7 +2025,7 @@ FileTransmissionCommand{Action: Action_data, File_id, Data}
 "ac=data;fid=F;d=<base64>"
   │
   │  send_payload wraps in "\x1b]5113;id=REQ;" + ... + "\x1b\\"
-  │     — send.go:645 via loop.QueueWriteString
+  │     — send.go:646 via loop.QueueWriteString
   ▼
 OSC ENVELOPE BYTES
   │
@@ -2102,9 +2125,11 @@ but happens in the Go kitten process:
 - **`IdentityDecompressor`** (line 358) — stateless passthrough; `__call__`
   takes `(data, is_last)` and returns `data`.
 - **`ZlibDecompressor`** (line 364) — wraps a `zlib.decompressobj()`. On each
-  call, `self.d.decompress(data)` inflates the bytes; on `is_last`, also
-  emits `self.d.flush()` and checks `self.d.eof` is True (otherwise the
-  stream was truncated).
+  call, `self.d.decompress(data)` inflates the bytes and returns them; when
+  `is_last` is true, the return value is the concatenation of
+  `self.d.decompress(data)` with `self.d.flush()`, ensuring any residual
+  bytes buffered inside the decompressor object are emitted at end-of-stream.
+  No explicit stream-completion validation is performed at this layer.
 
 The Go-side counterpart is `utils.StreamDecompressor` — functionally
 equivalent.
@@ -2474,16 +2499,23 @@ Kitty's extension. The terminal emulator exports `KITTY_PUBLIC_KEY` to the
 environment of every child process it spawns. The kitten reads this key and
 uses it to encrypt the bypass token.
 
-`kittens/transfer/utils.go:37-52`:
+`kittens/transfer/utils.go:37-51`:
 
 ```go
 func encode_bypass(request_id string, bypass string) (string, error) {
-    q := fmt.Sprintf("%s;%s", request_id, bypass)
-    public_key := os.Getenv("KITTY_PUBLIC_KEY")
-    ...
-    // split into algorithm:key_bytes, call crypto.Encrypt_data
-    ans, err := crypto.Encrypt_data(utils.UnsafeStringToBytes(q), key, "kitty-1")
-    return utils.UnsafeBytesToString(ans), err
+    q := request_id + ";" + bypass
+    if pkey_encoded := os.Getenv("KITTY_PUBLIC_KEY"); pkey_encoded != "" {
+        encryption_protocol, pubkey, err := crypto.DecodePublicKey(pkey_encoded)
+        if err != nil {
+            return "", err
+        }
+        encrypted, err := crypto.Encrypt_data(utils.UnsafeStringToBytes(q), pubkey, encryption_protocol)
+        if err != nil {
+            return "", err
+        }
+        return fmt.Sprintf("kitty-1:%s", utils.UnsafeBytesToString(encrypted)), nil
+    }
+    return "", fmt.Errorf("KITTY_PUBLIC_KEY env var not set, cannot transmit password securely")
 }
 ```
 
@@ -2536,7 +2568,7 @@ sides and the user must restart the transfer from the beginning.
 
 ### 16.2 Evidence from the Source
 
-- **Sender `SendManager`** at `kittens/transfer/send.go:349-370` holds all
+- **Sender `SendManager`** at `kittens/transfer/send.go:344-361` holds all
   state in memory: `files`, `fid_map`, `state`, `progress_tracker`. There are
   no save-to-disk hooks, no journal files, no `.partial`-style indicator
   files. When the process exits, the state dies with it.
@@ -2645,15 +2677,22 @@ file actually sends substantially less data than an initial transfer?
 
 ### 17.1 The Built-In Metric
 
-`kittens/transfer/utils.go:109-114`:
+`kittens/transfer/utils.go:109-114` (reproduced verbatim):
 
 ```go
 func print_rsync_stats(total_bytes, delta_bytes, signature_bytes int64) {
-    fmt.Printf("Rsync stats: delta_size: %s signature_size: %s transmitted: %.2f%%\n",
-        humanize.Size(delta_bytes), humanize.Size(signature_bytes),
-        100*float64(delta_bytes+signature_bytes)/float64(utils.Max(1, total_bytes)))
+    fmt.Println("Rsync stats:")
+    fmt.Printf("  Delta size: %s Signature size: %s\n", humanize.Size(delta_bytes), humanize.Size(signature_bytes))
+    frac := float64(delta_bytes+signature_bytes) / float64(utils.Max(1, total_bytes))
+    fmt.Printf("  Transmitted: %s of a total of %s (%.1f%%)\n", humanize.Size(delta_bytes+signature_bytes), humanize.Size(total_bytes), frac*100)
 }
 ```
+
+The function emits a small multi-line report: a `Rsync stats:` banner, one
+line with the delta and signature sizes (each run through `humanize.Size` so
+a 13 KiB delta prints as `13 KB` rather than `13312`), and a third line
+with the transmitted-bytes and transmitted-percentage, formatted to one
+decimal place via `%.1f%%`.
 
 Inputs:
 
@@ -2664,10 +2703,13 @@ Inputs:
   `ProgressTracker.signature_bytes`). This is the protocol's unavoidable
   rsync overhead.
 
-Output format (human-readable):
+Output format (human-readable, three lines as emitted by the two
+`fmt.Printf` calls after the `Rsync stats:` banner):
 
 ```
-Rsync stats: delta_size: 12.3 KiB signature_size: 62.5 KiB transmitted: 0.73%
+Rsync stats:
+  Delta size: 12.3 KB Signature size: 62.5 KB
+  Transmitted: 74.8 KB of a total of 10.2 MB (0.7%)
 ```
 
 Invocation site: `kittens/transfer/send.go:1252-1262`, called once at the
@@ -2789,8 +2831,9 @@ to the terminal emulator's disk on machine-A).
 ### 18.2 Step-by-Step Trace
 
 **Step 1: Entry point**
-- `kittens/transfer/main.go:49` — `main()` parses `--direction=send`;
-  dispatches to `send_main(opts, args)` at line 59 (approximately).
+- `kittens/transfer/main.go:46` — `main()` parses `--direction=send`;
+  the `switch` at line 58 matches `case "send", "download"` and dispatches
+  to `send_main(opts, args)` on line 59.
 
 **Step 2: File discovery**
 - `kittens/transfer/send.go` `files_for_send(opts, args)` — walks the arg
@@ -2800,16 +2843,19 @@ to the terminal emulator's disk on machine-A).
 
 **Step 3: SendManager construction**
 - `NewSendManager(opts, files, ...)` — constructs the manager, generates
-  `request_id = random_id()` from `kittens/transfer/utils.go:78-82` (which
-  uses `google/uuid`).
+  `request_id = random_id()` from `kittens/transfer/utils.go:76-80`, which
+  draws two random bytes via `crypto/rand.Read`, hex-encodes them with
+  `encoding/hex.EncodeToString`, and prefixes the result with `os.Getpid()`
+  formatted as `%x`. (Note: despite `google/uuid` being declared as a Go
+  module dependency, this function does not use it.)
 
 **Step 4: Initialization**
-- `SendManager.initialize()` at line 375 — sets
-  `prefix = "\x1b]5113;id=<rid>;"` (line 385) and `suffix = "\x1b\\"`
-  (line 386). Sums file sizes into `progress_tracker.total_size_of_all_files`.
+- `SendManager.initialize()` at line 367 — sets
+  `prefix = "\x1b]5113;id=<rid>;"` (line 384) and `suffix = "\x1b\\"`
+  (line 385). Sums file sizes into `progress_tracker.total_size_of_all_files`.
 
 **Step 5: TUI loop starts**
-- `lp.OnInitialize` handler fires (line 1218); calls `handler.initialize()`.
+- `lp.OnInitialize` handler fires (line 1215); calls `handler.initialize()`.
 - First action: kitten sends `FileTransmissionCommand{Action: Action_send,
   Id: request_id [, Bypass: <encrypted>]}` via `send_payload`.
 
@@ -2850,7 +2896,7 @@ to the terminal emulator's disk on machine-A).
 
 **Step 13: File metadata**
 - Kitten calls `send_file_metadata` at line 675 (approximately). For the one
-  file, it builds an FTC via `metadata_command(true)` at line 651:
+  file, it builds an FTC via `metadata_command(true)` at line 652:
   `{Action: Action_file, File_id: "1", Ftype: FileType_regular,
   Name: "/hello.txt", Ttype: TransmissionType_rsync [if enabled], Compression:
   Compression_zlib [if compressible], Mtime, Permissions}`.
@@ -2966,9 +3012,9 @@ sequenceDiagram
 
 | Landmark | Location |
 |----------|----------|
-| Kitten main dispatch | `kittens/transfer/main.go:49` |
-| Request ID + prefix generation | `kittens/transfer/send.go:385-386` |
-| Metadata command construction | `kittens/transfer/send.go:651` |
+| Kitten main dispatch | `kittens/transfer/main.go:46` |
+| Request ID + prefix generation | `kittens/transfer/send.go:384-385` |
+| Metadata command construction | `kittens/transfer/send.go:652` |
 | Chunk reading | `kittens/transfer/send.go:915` |
 | Split for transfer | `kittens/transfer/ftc.go:326` |
 | OSC dispatch (C) | `kitty/vt-parser.c:547` |
@@ -3090,7 +3136,7 @@ where the symbol is defined (or first used).
 | `FileTransmissionCommand` (Py) | `kitty/file_transmission.py:252` | Python counterpart dataclass. |
 | `File` (Go) | `kittens/transfer/send.go:82` | Per-file sender state. |
 | `remote_file` (Go) | `kittens/transfer/receive.go:127` | Per-file receiver state. |
-| `SendManager` | `kittens/transfer/send.go:349` | Sender session orchestrator. |
+| `SendManager` | `kittens/transfer/send.go:344` | Sender session orchestrator. |
 | `manager` (receive) | `kittens/transfer/receive.go` | Receiver session orchestrator. |
 | `ActiveSend` (Py) | `kitty/file_transmission.py:714` | Terminal-side send session. |
 | `ActiveReceive` (Py) | `kitty/file_transmission.py:583` | Terminal-side receive session. |
@@ -3125,7 +3171,7 @@ where the symbol is defined (or first used).
 | `encode_bypass` | `kittens/transfer/utils.go:37` | Encrypts bypass token with `KITTY_PUBLIC_KEY`. |
 | `should_be_compressed` | `kittens/transfer/utils.go:88` | Compression heuristic. |
 | `print_rsync_stats` | `kittens/transfer/utils.go:109` | Prints final delta/signature summary. |
-| `random_id` | `kittens/transfer/utils.go:78` | Generates request_id via `uuid`. |
+| `random_id` | `kittens/transfer/utils.go:76` | Generates request_id via `crypto/rand` + hex encoding (not the `uuid` package). |
 | `write_ftc_to_child` | `kitty/file_transmission.py:1145` | Python → kitten output. |
 | `send_escape_code_to_child` | `kitty/screen.c:4464` | C-level OSC writer. |
 | `file_transmission` (C) | `kitty/screen.c:2311` | C→Python callback entry. |
@@ -3134,9 +3180,9 @@ where the symbol is defined (or first used).
 
 | Symbol | Location | Purpose |
 |--------|----------|---------|
-| `SendState` | `kittens/transfer/send.go:278` | Session-level send state enum. |
+| `SendState` | `kittens/transfer/send.go:277` | Session-level send state enum. |
 | `FileState` (send side) | `kittens/transfer/send.go` (near SendState) | Per-file send state. |
-| `state` (receive side) | `kittens/transfer/receive.go:36` | Session-level receive state enum. |
+| `state` (receive side) | `kittens/transfer/receive.go:34` | Session-level receive state enum. |
 
 ### 20.7 Compressors and Decompressors
 
@@ -3208,7 +3254,7 @@ kitty/
         ├── api.go                        287 lines
         │   ├── Lines 1-17: API comment block
         │   ├── Line 29: MaxBlockSize = 1 MiB
-        │   ├── Lines 66-99: signature header format
+        │   ├── Lines 71-108: read_signature_header (signature header format)
         │   ├── Lines 266-268: NewDiffer
         │   └── Lines 270-288: NewPatcher
         └── api_test.go                   196 lines
@@ -3220,7 +3266,7 @@ kittens/
 │   ├── ftc.go                            338 lines
 │   │   ├── Lines 37-47: Action enum
 │   │   ├── Lines 49-56: Compression enum
-│   │   ├── Lines 58-65: FileType enum
+│   │   ├── Lines 59-68: FileType enum
 │   │   ├── Lines 99-106: TransmissionType enum
 │   │   ├── Lines 108-118: QuietLevel enum
 │   │   ├── Lines 120-138: FileTransmissionCommand struct
@@ -3229,19 +3275,19 @@ kittens/
 │   ├── send.go                           1288 lines
 │   │   ├── Lines 82-109: File struct
 │   │   ├── Lines 122-137: NewFile constructor
-│   │   ├── Lines 278-284: SendState enum
+│   │   ├── Lines 277-284: SendState enum
 │   │   ├── Lines 286-296: Transfer struct
-│   │   ├── Lines 297-360: ProgressTracker
-│   │   ├── Lines 349-370: SendManager struct
-│   │   ├── Lines 375-393: initialize() (prefix/suffix)
-│   │   ├── Lines 645-649: send_payload
-│   │   ├── Lines 651-665: metadata_command
+│   │   ├── Lines 297-342: ProgressTracker
+│   │   ├── Lines 344-362: SendManager struct
+│   │   ├── Lines 367-392: initialize() (prefix/suffix)
+│   │   ├── Lines 646-650: send_payload
+│   │   ├── Lines 652-667: metadata_command
 │   │   ├── Lines 915-981: File.next_chunk()
 │   │   ├── Lines 983-1019: SendManager.next_chunks
 │   │   ├── Lines 1223-1237: OnEscapeCode handler
 │   │   └── Lines 1252-1263: rsync stats finalization
 │   ├── receive.go                        1189 lines
-│   │   ├── Lines 36-41: state enum
+│   │   ├── Lines 34-41: state enum (type on line 34; const block on 36-41)
 │   │   ├── Lines 43-47: output_file interface
 │   │   ├── Lines 49-66: filesystem_file
 │   │   ├── Lines 68-124: patch_file + new_patch_file
@@ -3256,7 +3302,7 @@ kittens/
 │   │   └── Lines 1080-1100: receive_main entry
 │   ├── utils.go                          114 lines
 │   │   ├── Lines 37-52: encode_bypass (KITTY_PUBLIC_KEY)
-│   │   ├── Lines 78-82: random_id
+│   │   ├── Lines 76-80: random_id (crypto/rand + hex)
 │   │   ├── Lines 88-107: should_be_compressed
 │   │   └── Lines 109-113: print_rsync_stats
 │   ├── utils.py                          Python-side transfer helpers
@@ -3310,8 +3356,14 @@ setup.py                                  Build orchestration
 
 <!--
 Document integrity notes:
-- All line-number citations verified against the actual source tree during
-  the discovery phase.
+- Line-number citations in this document were cross-checked against the
+  actual source tree at commit `815df1e21` on branch
+  `blitzy-1480114b-53a5-484e-bfc4-412ff7ae5406`. Source code evolves; if
+  you read this document against a later revision, specific line numbers
+  may have drifted while the surrounding functions, structs, and constants
+  remain the stable anchors. When in doubt, consult the file paths and
+  symbol names cited alongside each line number — those are the ground
+  truth.
 - No source files were modified to produce this document; only this new file
   `blitzy/documentation/kitty_815df1e210e0.md` was created.
 - Mermaid diagrams: 5 embedded (architecture, round-trip sequence, VT dispatch,
