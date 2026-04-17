@@ -327,7 +327,7 @@ active_window(void) {
 }
 ```
 
-`global_state.callback_os_window` is set one frame earlier, in `key_callback` (glfw.c:435):
+`global_state.callback_os_window` is set one frame earlier, in `key_callback` (glfw.c:429):
 
 ```c
 static void
@@ -587,7 +587,7 @@ Both paths ultimately only mutate the same fields that `active_window()` reads, 
 
 During the test I fired `xdotool key --window 2097164 ctrl+shift+]` to switch tabs while another `xdotool type` stream was piping characters. Observed behaviour in `strace_io.txt`:
 
-* X11 delivers the modifier + special key first. The main thread's `on_key_input` calls `boss.dispatch_possible_special_key` which returns `True` ("consumed"); the shortcut triggers `Boss.switch_to_next_tab` (a Python method), which mutates `OSWindow.active_tab` via a C extension setter. **No `schedule_write_to_child` for this keystroke.**
+* X11 delivers the modifier + special key first. The main thread's `on_key_input` calls `boss.dispatch_possible_special_key` which returns `True` ("consumed"); the shortcut triggers `Boss.next_tab` (a Python method, `kitty/boss.py:2293`, decorated with `@ac('tab', 'Make the next tab active')`), which mutates `OSWindow.active_tab` via a C extension setter. **No `schedule_write_to_child` for this keystroke.**
 * All subsequent characters see the new `active_tab` and therefore the new `active_window`; each keystroke lands on the newly-focused tab's PTY, written by KittyChildMon to (e.g.) fd 9 rather than fd 8.
 * Background output in the now-unfocused tab continues without interruption — `poll([6,7,8,9,10,11])` on the I/O thread returns `POLLIN` on the background PTY, data is read, bytes are appended to the background `Screen->vt_parser` queue, and the I/O thread calls `wakeup_main_loop()` (subject to the `input_delay` gate, see §9). The main thread then re-renders the tab bar and the background tab's off-screen buffer, which is why typing in tab 1 while `seq 1 100000` runs in tab 3 produces the trademark `writev(3, …)` storms visible in the trace.
 
@@ -679,20 +679,33 @@ Several things are worth underlining:
 
 ### 6.4 Python side: `Boss.on_child_death`
 
-The callback is entered on the main thread once `parse_input` dequeues. Source (`kitty/boss.py:881`):
+The callback is entered on the main thread once `parse_input` dequeues. Source (`kitty/boss.py:881`, condensed — actual implementation uses `os_window_map` iteration rather than a dedicated lookup helper):
 
 ```python
 def on_child_death(self, window_id: int) -> None:
+    prev_active_window = self.active_window
     window = self.window_id_map.pop(window_id, None)
     if window is None: return
-    if window.actions_on_close: …run…
-    window.destroy()
-    tab = self.tab_for_id_unsafe(window.tab_id)
-    if tab is not None:
-        tab.remove_window(window)
-        self._cleanup_tab_after_window_removal(tab)
-        window.actions_on_removal and …run…
-    # … focus transfer handled by tab.active_window reassignment
+    with self.suppress_focus_change_events():
+        for close_action in window.actions_on_close: …run…
+        os_window_id = window.os_window_id
+        window.destroy()
+        # Walk the tab manager for this OS window to find the containing tab.
+        # There is no tab_for_id_<anything> helper on this path; the lookup is
+        # inlined by design so that a stale window_id can never resurrect a tab.
+        tm = self.os_window_map.get(os_window_id)
+        tab = None
+        if tm is not None:
+            for q in tm:
+                if window in q:
+                    tab = q
+                    break
+        if tab is not None:
+            tab.remove_window(window)
+            self._cleanup_tab_after_window_removal(tab)  # boss.py:859
+        for removal_action in window.actions_on_removal: …run…
+    # Focus transfer: if the newly-active window differs from prev_active_window,
+    # fire focus_changed(False) on the old and focus_changed(True) on the new.
 ```
 
 So the full child-death chain is:
@@ -1070,7 +1083,7 @@ The only place in the Kitty source tree that creates a long-lived thread to mana
 342:    set_thread_name("DiskCacheWrite");
 ```
 
-The thread is created via `pthread_create(&self->write_thread, NULL, write_loop, self)` at line 397, but — critically — only from inside `ensure_state()` (line 376), which is called lazily by entry points such as `add_path` (490), `remove_path` (519), `get_data` (594), and the `PYWRAP(ensure_state)` binding (686). In an idle Kitty with nothing swapped to disk, **none of these entry points fires, and `ensure_state()` is never called**, so `write_thread` is never started.
+The thread is created via `pthread_create(&self->write_thread, NULL, write_loop, self)` at line 397, but — critically — only from inside `ensure_state()` (line 376), which is called lazily by entry points such as `add_to_disk_cache` (488), `remove_from_disk_cache` (517), `read_from_disk_cache` (591), and the `PYWRAP(ensure_state)` binding (686). In an idle Kitty with nothing swapped to disk, **none of these entry points fires, and `ensure_state()` is never called**, so `write_thread` is never started.
 
 That is exactly what `/proc/<pid>/task/*/comm` confirms on the instrumented instance:
 
@@ -1185,6 +1198,12 @@ pkill -f "Xvfb :99" 2>/dev/null || true
 # part of the repository.
 rm -rf /tmp/kitty_analysis
 
+# Remove any stray GDB log files that were written directly under /tmp
+# (not inside /tmp/kitty_analysis/). During the analysis, a few one-shot
+# `gdb -batch ... > /tmp/gdb_*.log` invocations wrote here rather than
+# into the scratch directory; the glob below catches all of them.
+rm -f /tmp/gdb_*.log
+
 # Remove any ad-hoc test or scratch files that may have been placed
 # under the repository root (prefix is standard for this agent).
 find . -maxdepth 2 -name 'blitzy_adhoc_test_*' -delete
@@ -1200,6 +1219,9 @@ ls: cannot access '/tmp/kitty_analysis': No such file or directory
 
 $ pgrep -a Xvfb | grep ':99'
 # (no output — the :99 Xvfb has exited)
+
+$ ls /tmp/gdb_*.log 2>&1
+ls: cannot access '/tmp/gdb_*.log': No such file or directory
 
 $ find . -name 'blitzy_adhoc_test_*'
 # (no output — no leftover ad-hoc test files)
