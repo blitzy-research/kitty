@@ -62,11 +62,11 @@ first use:
   `ESC [ ? 2004 h` turns on bracketed-paste mode (mode 2004 in `kitty/modes.h`
   line 81) and `ESC [ ? 2026 h` turns on pending-update / synchronized-output
   mode (mode 2026, defined as `PENDING_MODE` in `kitty/control-codes.h` line
-  235 and as `PENDING_UPDATE = (2026 << 5)` in `kitty/modes.h` line 85).
+  235 and as `PENDING_UPDATE = (2026 << 5)` in `kitty/modes.h` line 86).
 - **SIGWINCH** — the POSIX signal the kernel sends to every process in a PTY's
   foreground process group when `ioctl(fd, TIOCSWINSZ, &winsize)` changes the
   window size. Triggered by `resize_pty()` in `kitty/child-monitor.c`.
-- **DECARM** — DEC Auto-Repeat Mode (mode 8, `kitty/modes.h` line 36). When
+- **DECARM** — DEC Auto-Repeat Mode (mode 8, `kitty/modes.h` line 40). When
   disabled, key auto-repeat events from the OS are dropped at the encoding
   stage instead of being forwarded to the shell.
 - **VT state machine** — an incremental parser for the DEC VT-series escape
@@ -181,7 +181,7 @@ every frame. No frame is ever composed from a half-updated buffer.
 ### 2.2 I/O thread (`KittyChildMon`)
 
 The I/O thread is created during `ChildMonitor.start()` and its entry point is
-`io_loop` in `kitty/child-monitor.c` at approximately line 1485. The very first
+`io_loop` in `kitty/child-monitor.c` at approximately line 1481. The very first
 thing it does is set its OS-visible thread name with
 `set_thread_name("KittyChildMon")`, so `ps -L` / `top -H` / `htop` can identify
 it.
@@ -282,7 +282,7 @@ flowchart TB
         Tick --> Parse --> Render
     end
     subgraph IO["I/O Thread 'KittyChildMon'"]
-        IOLoop["io_loop<br/>(child-monitor.c ~1485)"]
+        IOLoop["io_loop<br/>(child-monitor.c ~1481)"]
         ReadB["read_bytes<br/>(~1336)"]
         WriteC["write_to_child<br/>(~323 macro)"]
         IOLoop --> ReadB
@@ -526,7 +526,7 @@ The journey of a single key event is:
      "fake" event, call `on_key_input(ev)` in `kitty/keys.c`.
    - Call `request_tick_callback()` so the main loop processes the resulting
      write buffer on its next iteration.
-5. **`on_key_input` in `kitty/keys.c` at line 167** (the function body runs
+5. **`on_key_input` in `kitty/keys.c` at line 166** (the function body runs
    to approximately line 270). In order, it:
    - Handles IME states first. `WAYLAND_DONE` / `NONE` / `PREEDIT_CHANGED` /
      `COMMIT_TEXT` dispatch into `screen_update_overlay_text`,
@@ -546,7 +546,7 @@ The journey of a single key event is:
    - Encodes the key via
      `encode_glfw_key_event(ev, screen->modes.mDECCKM,
      screen_current_key_encoding_flags(screen), encoded_key)` at approx. line
-     248. This is the Kitty keyboard protocol encoder — it honors cursor-key
+     251. This is the Kitty keyboard protocol encoder — it honors cursor-key
      mode (DECCKM), the modern kitty-keyboard protocol enhancement flags, and
      legacy fallbacks.
    - Optionally short-circuits to termios signal delivery (see 4.2 below).
@@ -564,7 +564,7 @@ both held for microseconds.
 ### 4.2 Termios signal short-circuit (Ctrl-C, Ctrl-Z, Ctrl-\\)
 
 When `screen->modes.mHANDLE_TERMIOS_SIGNALS` is on (mode `19997 << 5` defined
-in `kitty/modes.h` line 88) and the encoded-key size is exactly one byte,
+in `kitty/modes.h` line 89) and the encoded-key size is exactly one byte,
 `on_key_input` asks whether that byte is a termios control character. The
 C-level call forwards to Python `Child.send_signal_for_key` in `kitty/child.py`
 at line 481. That method reads `termios.tcgetattr(self.child_fd)` for the
@@ -665,7 +665,7 @@ rendering without ever blocking on a slow child.
 
 ### 5.1 The `io_loop` function
 
-The entry point is `io_loop` in `kitty/child-monitor.c` at approx. line 1485
+The entry point is `io_loop` in `kitty/child-monitor.c` at approx. line 1481
 (full body runs to ~1577). It sets its thread name to `"KittyChildMon"` so
 tools like `ps` and `top` can identify it, initializes signal handling and
 wakeup file descriptors, and enters a `while (!self->shutting_down)` loop.
@@ -737,24 +737,25 @@ wakeups coalesced into 3 ms windows.
 
 ### 5.2 `read_bytes` — how bytes enter the parser
 
-The complete `read_bytes` function at `kitty/child-monitor.c` lines
-1337–1357:
+The complete `read_bytes` function is a verbatim reproduction from
+`kitty/child-monitor.c` lines 1336–1357:
 
 ```c
 static bool
 read_bytes(int fd, Screen *screen) {
-    size_t available_buffer_space;
-    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser,
-                                                 &available_buffer_space);
-    if (!available_buffer_space) return true;
     ssize_t len;
-    while (true) {
+    size_t available_buffer_space;
+
+    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
+    if (!available_buffer_space) return true;
+
+    while(true) {
         len = read(fd, buf, available_buffer_space);
         if (len < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             if (errno != EIO) perror("Call to read() from child fd failed");
             vt_parser_commit_write(screen->vt_parser, 0);
-            return false;   /* signals child death upstream */
+            return false;
         }
         break;
     }
@@ -762,6 +763,12 @@ read_bytes(int fd, Screen *screen) {
     return len != 0;
 }
 ```
+
+The return value is the signal channel: a `false` return from
+`read_bytes` — reached only when `read()` fails with a non-recoverable
+`errno` (most commonly `EIO` after the child has closed the PTY slave)
+— is how `io_loop` learns that the child has died, triggering the
+cleanup branch that later calls `reap_children`.
 
 Key details:
 
@@ -860,7 +867,7 @@ The `VTEState` enum at line 160 lists the states the parser can be in:
 |-------|-------------|----------|---------------|
 | `VTE_NORMAL` | initial, end of any sequence | `ESC (0x1B)`, any control byte | `screen_draw_text` (for printable/UTF-8) or direct C0 handler |
 | `VTE_ESC` | `ESC` in NORMAL | final byte | direct escape handler (e.g., `ESC 7` = DECSC) |
-| `VTE_CSI` | `[` in ESC | CSI final byte (`0x40`–`0x7E`) | `dispatch_csi` (line 839-range) |
+| `VTE_CSI` | `[` in ESC | CSI final byte (`0x40`–`0x7E`) | `dispatch_csi` (line 1027) |
 | `VTE_OSC` | `]` in ESC | `BEL (0x07)` or `ST (ESC \\)` | `dispatch_osc` (line 457) |
 | `VTE_DCS` | `P` in ESC | `ST` | `dispatch_dcs` |
 | `VTE_APC` | `_` in ESC | `ST` | `dispatch_apc` (line 1323, for kitty graphics protocol) |
@@ -1136,21 +1143,26 @@ def cmd_output_marking(self, is_start: Optional[bool], cmdline: str = '') -> Non
 
 ### 7.4 `process_cwd_notification` — the 7 handler
 
-In `kitty/screen.c` at approximately line 2393:
+In `kitty/screen.c` at approximately line 2393 (verbatim from source):
 
 ```c
 void
-process_cwd_notification(Screen *self, unsigned code, const char *data, size_t sz) {
+process_cwd_notification(Screen *self, unsigned int code, const char *data, size_t sz) {
     if (code == 7) {
         PyObject *x = PyBytes_FromStringAndSize(data, sz);
         if (x) {
             Py_CLEAR(self->last_reported_cwd);
             self->last_reported_cwd = x;
-        }
-    }
-    /* code 6 intentionally ignored per xterm's extension-policy comment */
+        } else { PyErr_Clear(); }
+    }  // we ignore OSC 6 document reporting as we dont have a use for it
 }
 ```
+
+The in-source comment on the closing brace of the `if (code == 7)`
+branch documents the intentional omission: OSC 6 (document reporting)
+is received and parsed but not acted upon — the branch falls through
+to the function's `return`. OSC 7 (CWD reporting) is the only code
+this routine actually handles.
 
 `Screen.last_reported_cwd` is exposed to Python via a getter in
 `fast_data_types`; the `Window` layer reads it when splitting the window to
@@ -1282,11 +1294,17 @@ encoded key is one byte, `on_key_input` asks the Python side whether the
 byte is a termios control. `Child.send_signal_for_key` in `kitty/child.py`
 lines 481–500 reads `termios.tcgetattr(self.child_fd)` to extract the
 current `VINTR`, `VSUSP`, and `VQUIT` characters, and if the byte matches
-one, calls `os.killpg(self.pgid, signal.SIGINT | SIGTSTP | SIGQUIT)` and
-returns `True`. When `True` is returned, the encoded byte is **not**
-written to `write_buf` — the signal is the write. This is why Ctrl-C kills
-a hung `cat` even when the PTY input queue is full: the signal is an
-out-of-band delivery that bypasses the line discipline.
+one, fetches the PTY's foreground process group via `pgrp =
+os.tcgetpgrp(self.child_fd)` and then calls `os.killpg(pgrp,
+signal.SIGINT | SIGTSTP | SIGQUIT)` (whichever is appropriate) and
+returns `True`. The foreground pgrp is **not** cached on the `Child`
+object — there is no `self.pgid` — it is fetched from the PTY master
+each time because the kernel's tty subsystem updates the foreground
+pgrp whenever job control transitions occur (`fg`, `bg`, background
+jobs, etc.). When `True` is returned, the encoded byte is **not** written
+to `write_buf` — the signal is the write. This is why Ctrl-C kills a hung
+`cat` even when the PTY input queue is full: the signal is an out-of-band
+delivery that bypasses the line discipline.
 
 ### 8.5 Why separate inbound and outbound buffers
 
@@ -1315,41 +1333,57 @@ control to Kitty's tick callback.
 
 ### 9.1 `_glfwPlatformRunMainLoop`
 
-This function is defined in full in `glfw/main_loop.h` lines 27–38 (the
-file is only 51 lines total):
+This function is defined in full at `glfw/main_loop.h` lines 26–38 (the
+file is only 51 lines total). The 13-line body below is a verbatim
+reproduction from source:
 
 ```c
-void
-_glfwPlatformRunMainLoop(tick_callback_func tick_callback, void *data) {
-    EventLoopData *eld = &_glfw.eventLoopData;
-    while(!eld->keep_going) {
+void _glfwPlatformRunMainLoop(GLFWtickcallback tick_callback, void* data) {
+    keep_going = 1;
+    EventLoopData *eld = &_glfw.GLFW_LOOP_BACKEND.eventLoopData;
+    while(keep_going) {
         _glfwPlatformWaitEvents();
+        EVDBG("--------- loop tick, wakeups_happened: %d ----------", eld->wakeup_data_read);
         if (eld->wakeup_data_read) {
             eld->wakeup_data_read = false;
             tick_callback(data);
         }
     }
+    EVDBG("main loop exiting");
 }
 ```
 
-Notice the structure:
+A few observations keyed to that source:
 
-- It blocks in `_glfwPlatformWaitEvents` — the platform-specific select /
-  poll / epoll / kqueue on all of GLFW's input sources (X11 connection fd,
-  Wayland display fd, wakeup fd, macOS NSRunLoop).
-- After return, it only invokes `tick_callback` if `wakeup_data_read` is
-  true. That flag is set by:
-  1. `glfwPostEmptyEvent()` — called by `wakeup_main_loop` from the I/O
-     thread.
+- `keep_going` is a file-scope `static bool keep_going = false;` at
+  `glfw/main_loop.h:16` — NOT a member of `EventLoopData`. It is set to
+  `1` on entry and cleared by `_glfwPlatformStopMainLoop` (lines 19–24).
+  The standalone `while (keep_going)` pattern matches the condensed
+  sketch shown earlier in Section 2.1.
+- `eld` binds to `_glfw.GLFW_LOOP_BACKEND.eventLoopData` — i.e., the
+  platform-specific event-loop data for the selected backend (x11,
+  wayland, cocoa, null). The `GLFW_LOOP_BACKEND` macro is defined at
+  line 13 and defaults to `x11` when compiled for X11.
+- `_glfwPlatformWaitEvents()` blocks in the platform-specific select /
+  poll / epoll / kqueue on all of GLFW's input sources (X11 connection
+  fd, Wayland display fd, wakeup fd, macOS NSRunLoop).
+- The two `EVDBG(...)` calls are the event-loop debug instrumentation
+  used by Kitty's `glfw-diff` and event-logging facilities; they
+  compile away in release builds.
+- After return from `_glfwPlatformWaitEvents`, the loop invokes
+  `tick_callback(data)` only if `wakeup_data_read` is true. That flag
+  is set by:
+  1. `glfwPostEmptyEvent()` — called by `wakeup_main_loop` from the
+     I/O thread.
   2. Any real GLFW input event (key, mouse, resize) as those are
      dispatched from the platform glue.
   3. A GLFW timer expiry (timers are installed via
-     `_glfwPlatformUpdateTimer`, driven from `request_tick_callback` and
-     `update_main_loop_timer`).
+     `_glfwPlatformUpdateTimer`, driven from `request_tick_callback`
+     and `update_main_loop_timer`).
 
 This "only tick on wakeup" design is what gives idle Kitty its zero-CPU
-floor. The process sits in `poll()` without doing anything until there is
-a reason.
+floor. The process sits in `poll()` without doing anything until there
+is a reason.
 
 ### 9.2 `process_global_state` — the tick callback
 
@@ -1714,11 +1748,12 @@ resumes it via SIGCONT.
 
 In Kitty's plumbing:
 
-- If `mHANDLE_TERMIOS_SIGNALS` (`19997 << 5`, `kitty/modes.h` line 88) is
+- If `mHANDLE_TERMIOS_SIGNALS` (`19997 << 5`, `kitty/modes.h` line 89) is
   set, the Ctrl-Z keystroke goes through the termios signal short-circuit
   (Section 4.2). `Child.send_signal_for_key` in `kitty/child.py` line 481
-  calls `os.killpg(self.pgid, signal.SIGTSTP)`. The byte is **not**
-  written to the PTY.
+  fetches the PTY's foreground process group via `pgrp =
+  os.tcgetpgrp(self.child_fd)` and then calls `os.killpg(pgrp,
+  signal.SIGTSTP)`. The byte is **not** written to the PTY.
 - If the mode is off, the byte is written to the PTY. The kernel's line
   discipline sees it is the termios `VSUSP` character and itself delivers
   SIGTSTP to the foreground process group.
@@ -1756,7 +1791,7 @@ about to do a bulk update; I'll tell you when I'm done; if I forget or
 die, un-pause after a safety timeout".
 
 The shifted mode constant is `PENDING_UPDATE = (2026 << 5)` at
-`kitty/modes.h` line 85.
+`kitty/modes.h` line 86.
 
 #### 12.2.1 Setting the mode
 
@@ -1779,7 +1814,7 @@ case PENDING_MODE << 5:
 lines 2506–2544. If `pause=true`:
 
 - Return `false` if already paused (idempotent).
-- If `for_in_ms <= 0`, set `for_in_ms = 2000` at line 2523 — this is the
+- If `for_in_ms <= 0`, set `for_in_ms = 2000` at line 2521 — this is the
   **default 2-second safety timeout** to prevent a crashed or lost
   application from leaving the terminal frozen forever.
 - `paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms)`.
@@ -1822,12 +1857,23 @@ main loop wakes precisely when the pause ends — no polling needed.
 - Calls `grman_pause_rendering(NULL, self->paused_rendering.grman)` to
   release the snapshot.
 
-**Automatic expiry** — the render pipeline (`prepare_for_draw` in
-`kitty/screen.c` around line 2490) checks `if
-(self->paused_rendering.expires_at && now > self->paused_rendering.expires_at)`
-and calls `screen_pause_rendering(self, false, 0)`. The live state is
-then rendered for the first time since the pause, which typically shows
-whatever the application was constructing (possibly partially).
+**Automatic expiry** — `screen_check_pause_rendering` in
+`kitty/screen.c` line 2489 is the timer-expiry check. Its entire body
+is a single line (verbatim from source at lines 2489–2491):
+
+```c
+void
+screen_check_pause_rendering(Screen *self, monotonic_t now) {
+    if (self->paused_rendering.expires_at && now > self->paused_rendering.expires_at) screen_pause_rendering(self, false, 0);
+}
+```
+
+Called from the render path on every frame tick; if the 2-second
+timer has expired, it invokes `screen_pause_rendering(self, false,
+0)` — the same unpause path as the explicit `DECRST 2026` case — to
+release the snapshot. The live state is then rendered for the first
+time since the pause, which typically shows whatever the application
+was constructing (possibly partially).
 
 #### 12.2.5 Why the 2000 ms default
 
@@ -2046,7 +2092,7 @@ multiple `read()` calls.
 - The I/O thread's `poll()` blocks efficiently during latency gaps. No
   busy-wait; no CPU burn.
 - `run_worker` releases `PS.lock` around `consume_input` (`kitty/vt-parser.c`
-  lines 1432–1434). So even if the consume path stalls (e.g., the main
+  lines 1431–1433). So even if the consume path stalls (e.g., the main
   thread is doing a long render), the I/O thread can still accept new
   bytes into `write.pending` and set up the next read. The parser does
   not serialize I/O behind parse.
@@ -2106,7 +2152,7 @@ was blocked in `read()` on another child's fd.
   ```c
   if (errno == EINTR || errno == EAGAIN) continue;
   ```
-  (see the `while (true)` loop in `read_bytes` at approximately `kitty/child-monitor.c:1343`).
+  (see the `while(true)` loop in `read_bytes` at `kitty/child-monitor.c:1344`).
 - The signal itself is captured by `signalfd` (Linux) or the self-pipe
   (macOS). The handler for signalfd/pipe wrote an entry; `read_signals`
   in `loop-utils.c` reads it on the next `poll()` iteration.
@@ -2121,18 +2167,64 @@ interrupt any critical work. The main thread never runs signal handlers
 — the handler is just "write an entry to signalfd" (or "write a byte to
 the self-pipe").
 
-### 14.5 Memory-pressure failure of `PyMem_RawRealloc`
+### 14.5 Pressure on `Screen.write_buf` — two distinct failure modes
 
-Scenario: out-of-memory on a tiny embedded box trying to grow
-`Screen.write_buf` past its current capacity.
+Scenario: outbound data accumulates faster than the I/O thread can
+drain it, or available heap memory runs low.
 
-- `schedule_write_to_child_generic` checks `PyMem_RawRealloc` return
-  value. If NULL, the new buffer is not installed, and the append is
-  skipped with an error log. `write_buf` keeps its old size; previously-enqueued
-  bytes are unaffected.
-- This means a single out-of-memory event does not corrupt the outbound
-  queue — it just drops the new data. The child will not receive those
-  bytes but the terminal does not hang or misbehave.
+`schedule_write_to_child_generic` (macro body at `kitty/child-monitor.c`
+approximately lines 323–370) has **two separate failure paths** with
+very different semantics. Conflating them would obscure a critical
+safety property, so they are presented separately below.
+
+**(a) Soft 100 MiB cap — graceful drop.** At `kitty/child-monitor.c`
+line 341:
+
+```c
+if (screen->write_buf_used + sz > 100 * 1024 * 1024) {
+    log_error("Too much data being sent to child with id: %lu, ignoring it", id);
+    screen_mutex(unlock, write);
+    break;
+}
+```
+
+If enqueuing these bytes would push `write_buf_used` past 100 MiB,
+the macro logs an error, releases `screen_mutex(write)`, and `break`s
+out of the enclosing children-lookup loop — discarding the new data
+and continuing normally. `write_buf` keeps its old size; previously-
+enqueued bytes are unaffected; the child simply does not receive the
+dropped bytes. The terminal does not hang, crash, or misbehave. This
+is a **policy choice**: protect against runaway scripts or broken
+clients that would otherwise consume unbounded memory.
+
+**(b) `PyMem_RawRealloc` failure — hard termination.** At
+`kitty/child-monitor.c` line 348 (two lines later in the same macro):
+
+```c
+screen->write_buf_sz = screen->write_buf_used + sz;
+screen->write_buf = PyMem_RawRealloc(screen->write_buf, screen->write_buf_sz);
+if (screen->write_buf == NULL) { fatal("Out of memory."); }
+```
+
+If the realloc call returns NULL — i.e., the OS truly cannot satisfy
+the allocation — the code invokes `fatal(...)`, which is a macro
+defined at `kitty/data-types.h` line 49 as
+`{ log_error(__VA_ARGS__); exit(EXIT_FAILURE); }`. **The Kitty
+process terminates.** This is an intentionally strict policy: there
+is no safe way to recover from a genuine OOM deep inside the input
+pipeline (the invariants relating `write_buf_sz`, `write_buf_used`,
+and the `write_buf` pointer would be violated; subsequent `memcpy`s
+would write to a stale or NULL pointer), so the program exits
+cleanly rather than limp along in an undefined state.
+
+To summarize: the **soft cap** (line 341) is graceful and discards
+data; the **hard cap** (line 348, when the kernel actually refuses
+the allocation) terminates the process. Both branches exist for
+safety; only one is survivable. The soft cap is reached routinely
+under pathological workloads; the hard cap is essentially never
+reached in production because Linux's default overcommit behavior
+almost never returns NULL from `malloc` / `realloc` — the OOM killer
+intervenes before that happens.
 
 ### 14.6 Crashed application holding PENDING_MODE
 
@@ -2396,12 +2488,30 @@ commands.)
 - `encode_glfw_key_event` produces one byte: `0x1A` (SUB, the `VSUSP`
   termios control character).
 - In `keys.c` at approximately lines 256–258: because `size == 1` and
-  `screen->modes.mHANDLE_TERMIOS_SIGNALS` is set (it is by default), the
-  code first calls `screen_send_signal_for_key(screen, 0x1A)` which
-  bounces to `Child.send_signal_for_key` in Python (`kitty/child.py`
-  line 481). That function reads `termios.tcgetattr` of the PTY slave,
-  finds `VSUSP = 0x1A` matches, calls
-  `os.killpg(self.pgid, signal.SIGTSTP)`.
+  `screen->modes.mHANDLE_TERMIOS_SIGNALS` is set (it is by default),
+  the code first calls `screen_send_signal_for_key(screen, 0x1A)`
+  which bounces to `Child.send_signal_for_key` in Python
+  (`kitty/child.py` line 481). That function reads
+  `termios.tcgetattr` of the PTY master, finds `VSUSP = 0x1A`
+  matches, then at `kitty/child.py` lines 498–499 executes:
+
+  ```python
+  pgrp = os.tcgetpgrp(self.child_fd)
+  os.killpg(pgrp, signal.SIGTSTP)
+  ```
+
+  Note: the foreground process-group id is **fetched on demand**
+  from the PTY master fd via `os.tcgetpgrp(self.child_fd)` at the
+  moment of signal dispatch — it is NOT cached as an attribute on
+  the `Child` object (there is no `self.pgid`). This matters because
+  the foreground pgrp changes over time: it starts as the shell's
+  own pgrp, becomes a foreground job's pgrp when the user runs
+  `some_command`, swaps back to the shell when the job ends or is
+  backgrounded with `Ctrl-Z` / `bg`, and returns to a job's pgrp
+  again on `fg`. The kernel's TTY subsystem tracks the current
+  foreground pgrp on the tty; `tcgetpgrp` asks it at the last
+  possible moment so the signal is delivered to whatever process
+  group currently owns the terminal — correct by construction.
 - The shell's foreground process group receives SIGTSTP. If it is the
   shell itself (no foreground job), nothing happens — bash handles
   SIGTSTP by ignoring it (only applies to child jobs). If it is a
