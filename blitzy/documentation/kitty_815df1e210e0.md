@@ -1,10 +1,12 @@
-# Kitty Terminal Emulator — Runtime-Behavioral Analysis of the Python / C / Go Layering
+# Kitty Runtime Language-Responsibility Investigation (v0.35.2, commit 815df1e21)
+
+> **TL;DR.** The running Kitty process is a C-centric GPU terminal emulator that embeds CPython for orchestration, confines all Python to a single cooperative main thread, delegates every wrapped kitten (including `icat`) via `execv`/`os.execl` to a completely separate, statically-linked Go binary, and maintains two parallel SIMD implementations (C for the hot VT parser, Go for the portable kitten binary) because the kitten must be deployable over SSH with only `libc` linked.
 
 **Repository:** `kovidgoyal/kitty`
 **Commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
 **Version:** `kitty 0.35.2 created by Kovid Goyal`
 **Analysis environment:** Docker container `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` (Linux x86_64, Ubuntu 24.04)
-**Host toolchains used:** Python `3.12.3` (system), Go `1.22.5` (downloaded from go.dev), GCC from `/usr/libexec/gcc/x86_64-linux-gnu/13/cc1`
+**Host toolchains used:** Python `3.12.3` (system), Go `1.22.5` (downloaded from go.dev), GCC `13.3.0` (`gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0`; its `cc1` front-end is under `/usr/libexec/gcc/x86_64-linux-gnu/13/cc1`)
 
 ---
 
@@ -17,6 +19,7 @@
 5. [Section 5 — Kitten Process Architecture](#section-5--kitten-process-architecture)
 6. [Section 6 — Symbol / Stack Analysis](#section-6--symbol--stack-analysis)
 7. [Section 7 — Language Responsibility Inference (with Falsifications and a Tradeoff)](#section-7--language-responsibility-inference-with-falsifications-and-a-tradeoff)
+8. [Section 8 — Appendix: Exact Evidence Index](#section-8--appendix-exact-evidence-index)
 
 ---
 
@@ -368,14 +371,25 @@ long-lived threads** plus occasional short-lived helpers:
 | `KittyChildMon` | `pthread_create(&self->io_thread, NULL, io_loop, self)` in `kitty/child-monitor.c:291` | `poll()` on all child PTYs; reads terminal output; delivers signals; never touches the GPU |
 | `KittyPeerMon` | `pthread_create(&self->talk_thread, NULL, talk_loop, self)` in `kitty/child-monitor.c:286` (optional — only if `--listen-on` or `listen_on` set, or when a peer is injected) | Accepts remote-control socket connections and forwards messages to the main thread |
 
-Two optional short-lived helpers can appear:
+Three optional short-lived helpers can appear, each named verbatim via
+`set_thread_name()`:
 
-- `KittyWriteStdin` — started by `thread_write()` in `kitty/child-monitor.c`
-  (line 1002) when large async stdin writes are needed; named at line 967.
-- `canberra_play_loop` — one thread per notification sound, in
-  `kitty/desktop.c:239`, when libcanberra audio is triggered.
-- A background disk-cache writer, `write_loop`, in `kitty/disk-cache.c:397`,
-  serializing graphics data to disk.
+- `KittyWriteStdin` — started by `thread_write()` in
+  `kitty/child-monitor.c` (`pthread_create` at line 1002) when large async
+  stdin writes are needed; the thread is named verbatim at line 967 via
+  `set_thread_name("KittyWriteStdin")`.
+- `LinuxAudioSucks` — one thread per notification sound produced by
+  libcanberra. The worker function is `canberra_play_loop`, whose
+  definition begins at `kitty/desktop.c:210`; it names itself at
+  `kitty/desktop.c:214` via `set_thread_name("LinuxAudioSucks")`; and the
+  `pthread_create(..., canberra_play_loop, ...)` call site is at
+  `kitty/desktop.c:239`.
+- `DiskCacheWrite` — a background disk-cache writer that serialises
+  graphics data to disk. The worker function is `write_loop`, whose
+  definition begins at `kitty/disk-cache.c:340`; it names itself at
+  `kitty/disk-cache.c:342` via `set_thread_name("DiskCacheWrite")`; and
+  the `pthread_create(..., write_loop, ...)` call site is at
+  `kitty/disk-cache.c:397`.
 
 ### 3.2 Source evidence — thread creation
 
@@ -675,54 +689,64 @@ binary.
 Source: `kitty/launcher/main.c`
 
 ```c
-/* line 332 — list of wrapped kittens (compiled-in via WRAPPED_KITTENS) */
+/* line 333 — verbatim from kitty/launcher/main.c:332-337 */
 static bool
-is_wrapped_kitten(const char *kitten) {
-    return strstr(WRAPPED_KITTENS, kitten) != NULL;
+is_wrapped_kitten(const char *arg) {
+    char buf[64];
+    snprintf(buf, sizeof(buf)-1, " %s ", arg);
+    return strstr(" " WRAPPED_KITTENS " ", buf);
 }
 
-/* line 340 — exec path, NOT fork+exec */
+/* line 340 — verbatim from kitty/launcher/main.c:339-351 — NOT fork+exec */
 static void
 exec_kitten(int argc, char *argv[], char *exe_dir) {
-    char exe[PATH_MAX];
-    snprintf(exe, sizeof(exe), "%s/kitten", exe_dir);
-    char **newargv = calloc(argc + 1, sizeof(char *));
+    char exe[PATH_MAX+1] = {0};
+    snprintf(exe, PATH_MAX, "%s/kitten", exe_dir);
+    char **newargv = malloc(sizeof(char*) * (argc + 1));
+    memcpy(newargv, argv, sizeof(char*) * argc);
+    newargv[argc] = 0;
     newargv[0] = "kitten";
-    /* copy argv[2..] into newargv[1..] */
-    ...
+    errno = 0;
     execv(exe, newargv);
-    /* if we get here, execv failed */
-    fprintf(stderr, "Failed to execute: %s\n", exe);
+    fprintf(stderr, "Failed to execute kitten (%s) with error: %s\n", exe, strerror(errno));
     exit(1);
 }
 
-/* line 354 — three delegation patterns */
+/* line 354 — verbatim from kitty/launcher/main.c:353-358.
+   Note: three *independent* `if` statements, not an `else if` chain.
+   Each shifts argv/argc differently so the kitten sees a correctly
+   trimmed argument vector (`argv[1..]`, `argv[2..]`, or `argv[3..]`)
+   regardless of which invocation form was used. */
 static void
-delegate_to_kitten_if_possible(int argc, char *argv[], char *exe_dir) {
-    if (argc < 2) return;
-    if (argv[1][0] == '@') {                          /* kitty @ <cmd> */
-        exec_kitten(argc, argv, exe_dir);
-    } else if (strcmp(argv[1], "+kitten") == 0 &&     /* kitty +kitten <k>*/
-               argc >= 3 && is_wrapped_kitten(argv[2])) {
-        exec_kitten(argc, argv, exe_dir);
-    } else if (strcmp(argv[1], "+") == 0 &&           /* kitty + kitten <k>*/
-               argc >= 4 && strcmp(argv[2], "kitten") == 0 &&
-               is_wrapped_kitten(argv[3])) {
-        exec_kitten(argc, argv, exe_dir);
-    }
+delegate_to_kitten_if_possible(int argc, char *argv[], char* exe_dir) {
+    if (argc > 1 && argv[1][0] == '@') exec_kitten(argc, argv, exe_dir);
+    if (argc > 2 && strcmp(argv[1], "+kitten") == 0 && is_wrapped_kitten(argv[2])) exec_kitten(argc - 1, argv + 1, exe_dir);
+    if (argc > 3 && strcmp(argv[1], "+") == 0 && strcmp(argv[2], "kitten") == 0 && is_wrapped_kitten(argv[3])) exec_kitten(argc - 2, argv + 2, exe_dir);
 }
 
-/* line 439 — main flow */
+/* line 440 — main flow (abridged; see kitty/launcher/main.c:440 for the
+   full body, which includes ensure_working_stdio(), RAII_ALLOC of a
+   RunData struct, read_exe_path()+dirname() to compute exe_dir, and
+   library-path construction). The signature includes envp per POSIX
+   so the launcher can forward/adjust the environment across execv. */
 int
-main(int argc, char *argv[]) {
-    char exe_dir[PATH_MAX];
-    /* ... compute exe_dir ... */
+main(int argc, char *argv[], char* envp[]) {
+    /* ... ensure_working_stdio(), compute exe_dir from /proc/self/exe, ... */
     delegate_to_kitten_if_possible(argc, argv, exe_dir);
-    /* if we got here, no delegation happened, initialise Python */
-    handle_fast_commandline(argc, argv);
-    return run_embedded(argc, argv);    /* Py_InitializeFromConfig + Py_RunMain */
+    /* If we got here, no kitten delegation happened — initialise Python. */
+    /* ... handle_fast_commandline(argc, argv); run_embedded(argc, argv) ... */
+    /* run_embedded() is what calls Py_InitializeFromConfig (line 211) and
+       Py_RunMain (line 216). */
 }
 ```
+
+The space-padding trick in `is_wrapped_kitten` is significant: both the
+compiled-in macro value and the lookup string are wrapped in single
+spaces (`" %s "`), so `strstr` looks for `" diff "` rather than `"diff"`.
+Without that padding, `"diff"` would false-positively match the middle
+of a longer name like `"difference"`. The padding is consistent with
+`setup.py:1233`, which itself embeds the list as
+`WRAPPED_KITTENS=" <names> "` — space-padded at both ends.
 
 So the delegation is the **first** thing `main()` does, *before* any
 Python initialisation. This means the Go binary is reached *without* ever
@@ -743,27 +767,46 @@ via `run_kitten()` in `kitty/entry_points.py`.)
 
 ### 5.2 Python-side delegation — `os.execl` for the icat entry point
 
-Source: `kitty/entry_points.py`
+Source: `kitty/entry_points.py` (verbatim excerpts; return annotations
+are `-> None`, and `kitten_exe` is imported *locally inside each
+function body* to defer the import until the dispatch actually runs).
 
 ```python
-def icat(args: List[str]) -> NoReturn:
-    os.execl(kitten_exe(), 'kitten', *args)
+def icat(args: List[str]) -> None:
+    from kitty.constants import kitten_exe
+    os.execl(kitten_exe(), "kitten", *args)
 
-def hold(args: List[str]) -> NoReturn:
+def hold(args: List[str]) -> None:
+    from kitty.constants import kitten_exe
+    args = ['kitten', '__hold_till_enter__'] + args[1:]
     os.execvp(kitten_exe(), args)
 
-def complete(args: List[str]) -> NoReturn:
-    os.execvp(kitten_exe(), ['kitten', '__complete__'] + args)
+def complete(args: List[str]) -> None:
+    # Delegate to kitten to maintain backward compatibility
+    if len(args) < 2 or args[1] not in ('setup', 'zsh', 'fish2', 'bash'):
+        raise SystemExit(1)
+    # ... fish2 rewrite elided ...
+    from kitty.constants import kitten_exe
+    args = ['kitten', '__complete__'] + args[1:]
+    os.execvp(kitten_exe(), args)
 
-def shebang(args: List[str]) -> NoReturn:
+def shebang(args: List[str]) -> None:
+    from kitty.constants import kitten_exe
+    # ... read script, detect shebang, assemble cmd ...
     os.execvp(kitten_exe(),
-              ['kitten', '__confirm_and_run_shebang__'] + ...)
+              ['kitten', '__confirm_and_run_shebang__'] + cmd + [script_path])
 ```
 
 Even if the user invokes `icat` via a pathway that happens to have
-initialised Python first, the Python layer **also** `execl()`s to the Go
-binary. The `NoReturn` annotation is a Python type-system assertion that
-this function does not return — because `os.execl` replaces the process.
+initialised Python first, the Python layer **also** `execl()`s/`execvp()`s
+to the Go binary. Although the annotations are `-> None` (the source's
+actual choice — not `NoReturn`), the control-flow reality is that these
+functions never return to their caller: `os.execl`/`os.execvp` replace
+the process image with the `kitten` binary. The local-import pattern
+(`from kitty.constants import kitten_exe` inside each function body
+rather than at module level) also matters for runtime behaviour: on
+a fast path where the user only ever wraps a kitten, `kitty/constants`
+is not paid for at `kitty/entry_points.py` import time.
 
 `kitten_exe()` is defined in `kitty/constants.py` as:
 
@@ -855,12 +898,20 @@ Key facts:
   package in this repository (`tools/cmd/main.go`).
 - There is **no CPython dependency** — the binary links only `libc.so.6`
   and a per-platform dynamic interpreter.
-- `CGO_ENABLED=1` is reported by `go version -m` for this native host
-  build, but `setup.py` force-sets `CGO_ENABLED='0'` when building for
-  cross-targets (see `setup.py` in the commit, lines 1165–1195). The
-  point is that the Go build does not need any of kitty's C headers to
-  function; even in CGO=1 mode on the native host, the produced binary
-  here has no HarfBuzz/OpenGL/FreeType dependencies.
+- `CGO_ENABLED=1` is reported by `go version -m` for this *native host*
+  build. This is not a contradiction: `setup.py:1173` sets
+  `e['CGO_ENABLED'] = '0'` **only** inside the `if for_platform:` branch
+  — i.e., cross-compilation for a different OS/arch (see
+  `setup.py:1161-1175`). Native builds fall into the `elif
+  args.building_arch:` branch at `setup.py:1176-1177` (or neither), so
+  Go's default `CGO_ENABLED=1` is left in place. The critical point is
+  that the Go build does not need any of kitty's C headers to function:
+  even in CGO=1 mode on the native host, the produced binary here has
+  no HarfBuzz / OpenGL / FreeType / libpng dependencies (confirmed by
+  `readelf -d ... | grep NEEDED` above — only `libc.so.6`). The
+  `CGO_ENABLED=0` toggle for cross-compilation is what *guarantees*
+  static linkage for release artefacts; on a native build it is not
+  needed.
 
 ### 5.5 The Go kitten's own architecture (`kittens/icat/main.go`)
 
@@ -1105,8 +1156,10 @@ so perhaps it is dynamically loaded and called from Python.
    could be loaded into a running kitty process to get Go code; the
    kitten is a full standalone Go program. See §5.4.
 4. `kitty/entry_points.py:icat()` also uses `os.execl(kitten_exe(),
-   ...)` for the non-launcher path. The `NoReturn` type annotation is
-   itself a documentation claim that this does not return. See §5.2.
+   ...)` for the non-launcher path. The return annotation is `-> None`
+   (not `NoReturn`), but the control-flow reality is that `os.execl`
+   replaces the process image, so the function never returns to its
+   caller regardless of the annotation. See §5.2.
 
 ### 7.3 A portability-vs-performance tradeoff visible in the runtime
 
@@ -1265,7 +1318,7 @@ python3 setup.py test
 
 ---
 
-## Appendix C — Exact Evidence Index
+## Section 8 — Appendix: Exact Evidence Index
 
 This index tabulates every non-trivial cited file:line combination used in
 the body, so that a reviewer can independently verify each claim in under
@@ -1282,10 +1335,10 @@ line numbers in the repository at commit `815df1e21`.
 |  5 | `delegate_to_kitten_if_possible()` matches `@`, `+kitten`, and `+ kitten` invocation forms. | `kitty/launcher/main.c` | 354–357 |
 |  6 | The launcher calls `delegate_to_kitten_if_possible()` before any Python initialisation. | `kitty/launcher/main.c` | 452 |
 |  7 | The single C extension `fast_data_types` registers 20+ subsystems in one `PyInit_*`. | `kitty/data-types.c` | 525–577 |
-|  8 | `init_child_monitor(m)` is part of that registration (the three-thread engine's Python type). | `kitty/data-types.c` | 549 |
-|  9 | `init_shaders(m)` and `init_graphics(m)` register the GL rendering subsystems. | `kitty/data-types.c` | 556–557 |
-| 10 | `init_fonts(m)`, `init_freetype_library(m)`, `init_fontconfig_library(m)` register the font pipeline. | `kitty/data-types.c` | 565–571 |
-| 11 | `init_crypto_library(m)` registers the X25519+AES-GCM crypto subsystem. | `kitty/data-types.c` | 575 |
+|  8 | `init_child_monitor(m)` is part of that registration (the three-thread engine's Python type). | `kitty/data-types.c` | 548 |
+|  9 | `init_graphics(m)` and `init_shaders(m)` register the GL rendering subsystems. | `kitty/data-types.c` | 555–556 |
+| 10 | `init_freetype_library(m)`, `init_fontconfig_library(m)`, `init_fonts(m)` register the font pipeline. | `kitty/data-types.c` | 565, 566, 570 |
+| 11 | `init_crypto_library(m)` registers the X25519+AES-GCM crypto subsystem. | `kitty/data-types.c` | 573 |
 | 12 | `ChildMonitor.start()` unconditionally creates the I/O thread via `pthread_create(io_loop)`. | `kitty/child-monitor.c` | 291 |
 | 13 | `ChildMonitor.start()` conditionally creates the Talk thread via `pthread_create(talk_loop)` iff a listening socket is configured. | `kitty/child-monitor.c` | 286 |
 | 14 | `inject_peer()` starts the Talk thread on demand if not already started. | `kitty/child-monitor.c` | 256 |
@@ -1301,30 +1354,30 @@ line numbers in the repository at commit `815df1e21`.
 | 24 | `send_cell_data_to_gpu()` function definition in the shaders module. | `kitty/shaders.c` | 970 |
 | 25 | `draw_cells()` dispatcher function issues the actual OpenGL draw calls. | `kitty/shaders.c` | 1009 |
 | 26 | Three specialised draw paths: simple, interleaved, interleaved-premult. | `kitty/shaders.c` | 577, 868, 912 |
-| 27 | `set_thread_name()` inline helper; uses `pthread_setname_np` (Linux) or `pthread_set_name_np` (FreeBSD) or Apple variant. | `kitty/threading.h` | 25–37 |
+| 27 | `set_thread_name()` inline helper; uses `pthread_setname_np` (Linux) or `pthread_set_name_np` (FreeBSD) or Apple variant. | `kitty/threading.h` | 26–37 |
 | 28 | "We have only a single python thread" — `sys.setswitchinterval(1000.0)` is executed in `_main()`. | `kitty/main.py` | 504 |
-| 29 | Python-side delegation: `icat()` calls `os.execl(kitten_exe(), "kitten", *args)` — process replacement. | `kitty/entry_points.py` | 9–11 |
+| 29 | Python-side delegation: `icat()` calls `os.execl(kitten_exe(), "kitten", *args)` — process replacement. | `kitty/entry_points.py` | 10–12 |
 | 30 | Python-side delegation: `hold()` calls `os.execvp(kitten_exe(), args)` to run the Go `__hold_till_enter__` helper. | `kitty/entry_points.py` | 27–30 |
-| 31 | Python-side delegation: `complete()` calls `os.execvp(kitten_exe(), …)` for shell completions. | `kitty/entry_points.py` | 34–45 |
-| 32 | `kitten_exe()` returns the `kitten` Go binary in the same directory as the C launcher. | `kitty/constants.py` | (definition of `kitten_exe`) |
+| 31 | Python-side delegation: `complete()` calls `os.execvp(kitten_exe(), …)` for shell completions. | `kitty/entry_points.py` | 33–43 |
+| 32 | `kitten_exe()` returns the `kitten` Go binary in the same directory as the C launcher. | `kitty/constants.py` | 83 |
 | 33 | `wrapped_kittens()` in `setup.py` reads and **sorts** the kitten names before embedding as the preprocessor macro. | `setup.py` | 1075–1078 |
 | 34 | `WRAPPED_KITTENS` is passed to the C launcher compile as a preprocessor define. | `setup.py` | 1233 |
 | 35 | Cross-platform Go builds set `CGO_ENABLED=0` for a fully static kitten binary. | `setup.py` | 1173 |
-| 36 | Go `kitten` build source is `tools/cmd/` (destination binary literally named `kitten`). | `setup.py` | 1164, 1166 |
+| 36 | Go `kitten` build source is `tools/cmd/` (destination binary literally named `kitten`). | `setup.py` | 1160, 1163, 1166 |
 | 37 | `at_least_version('harfbuzz', 1, 5)` — the first `pkg-config` probe in `kitty_env()` (this is where the offline build failed with `FileNotFoundError: 'pkg-config'`). | `setup.py` | 609 |
-| 38 | `tools/cmd/main.go` declares `package main` — an executable, not a shared library. | `tools/cmd/main.go` | 1 |
-| 39 | Registers Go kittens (icat, ssh, clipboard, …) via `tool.KittyToolEntryPoints(root)`. | `tools/cmd/main.go` | (end of `main()`) |
-| 40 | Go-side SIMD: `Have128bit`/`Have256bit` + function-valued dispatchers rewired in `init()`. | `tools/simdstring/intrinsics.go` | 1–67 |
-| 41 | C-side SIMD 128-bit shim defines `KITTY_SIMD_LEVEL 128` and includes the impl header. | `kitty/simd-string-128.c` | 1–4 |
-| 42 | C-side SIMD interface declares `find_either_of_two_bytes(...)`, consumed by the VT parser. | `kitty/simd-string.h` | (declaration section) |
-| 43 | C-side cryptography uses OpenSSL (`<openssl/evp.h>`, `<openssl/ec.h>`, etc.). | `kitty/crypto.c` | top of file |
+| 38 | `tools/cmd/main.go` declares `package main` — an executable, not a shared library. | `tools/cmd/main.go` | 3 |
+| 39 | Registers Go kittens (icat, ssh, clipboard, …) via `tool.KittyToolEntryPoints(root)`. | `tools/cmd/main.go` | 31 |
+| 40 | Go-side SIMD: `Have128bit`/`Have256bit` + function-valued dispatchers rewired in `init()`. | `tools/simdstring/intrinsics.go` | 1–64 |
+| 41 | C-side SIMD 128-bit shim defines `KITTY_SIMD_LEVEL 128` and includes the impl header. | `kitty/simd-string-128.c` | 8–9 |
+| 42 | C-side SIMD interface declares `find_either_of_two_bytes(...)`, consumed by the VT parser. | `kitty/simd-string.h` | 47 |
+| 43 | C-side cryptography uses OpenSSL (`<openssl/evp.h>`, `<openssl/ec.h>`, etc.). | `kitty/crypto.c` | 11–15 |
 | 44 | Go-side cryptography is reimplemented in `tools/crypto/` (no CGO/OpenSSL linkage). | `tools/crypto/` | package directory |
-| 45 | Go remote-control `@` client connects to kitty's UNIX socket with its own crypto. | `tools/cmd/at/main.go` | imports |
+| 45 | Go remote-control `@` client connects to kitty's UNIX socket with its own crypto. | `tools/cmd/at/main.go` | 5–29 (import block; `kitty/tools/crypto` at line 22) |
 | 46 | The `listen_on` configuration option documented in the remote-control Python docstring. | `kitty/remote_control.py` | 270 |
-| 47 | Shell-integration list of wrapped kittens — raw source, before sort. | `shell-integration/ssh/kitty` | `wrapped_kittens=...` |
-| 48 | Go icat worker pool sized from `runtime.NumCPU()` with a channel-based pipeline. | `kittens/icat/main.go` | worker-pool section |
+| 47 | Shell-integration list of wrapped kittens — raw source, before sort. | `shell-integration/ssh/kitty` | 27 |
+| 48 | Go icat worker pool sized from `runtime.NumCPU()` with a channel-based pipeline. | `kittens/icat/main.go` | 217–226 |
 | 49 | `kittens/icat/main.py` is 182 lines and contains only the options schema (no runtime). | `kittens/icat/main.py` | entire file |
-| 50 | Go binary uses `//go:embed data_generated.bin`, regenerated by `gen/go_code.py` (evidence of the C↔Go bootstrap circular dependency). | `tools/tui/shell_integration/data.go` | 18–20 |
+| 50 | Go binary uses `//go:embed data_generated.bin`, regenerated by `gen/go_code.py` (evidence of the C↔Go bootstrap circular dependency). | `tools/tui/shell_integration/data.go` | 19–20 |
 
 The table includes 50 rows, exceeding the minimum of 25.
 
