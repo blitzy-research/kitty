@@ -7,7 +7,7 @@ This document answers seven specific questions about kitty's pseudoterminal (PTY
 - **Q1** — The spawned child is the user's login shell as resolved from `getpwuid()`; on the observed container this was `/bin/bash --posix` (wrapped by `kitten run-shell`, then `execvp()`-ed as `/bin/bash`).
 - **Q2** — The PTY pair is `/dev/pts/ptmx` on the master side (held by kitty as fd **8**, opened via `/dev/ptmx`) and `/dev/pts/0` on the slave side (attached to the shell's stdin/stdout/stderr).
 - **Q3** — kitty uses the POSIX `read()` syscall from `read_bytes()` in `kitty/child-monitor.c`, with a request size of up to **1,048,576 bytes** (`BUF_SZ`); the `echo test123` output produced exactly one 9-byte read: `read(8, "test123\r\n", 1048576) = 9`.
-- **Q4** — Under `yes hello`, `poll()` returns immediately with `POLLIN` and `read_bytes()` fires back-to-back (≥95 reads per ~1-second burst), with per-read byte counts of **14–4,095** and the `count` parameter shrinking across a fill cycle then resetting to 1 MiB after the main thread drains the parser buffer.
+- **Q4** — Under `yes hello`, `poll()` returns immediately with `POLLIN` and `read_bytes()` fires back-to-back (thousands of reads per ~1-second burst — observed **11,699 reads** in a single burst on the measured system), with per-read byte counts of **79–14,133** (median ≈ 569, mean ≈ 822) and the `count` parameter shrinking across a fill cycle (from 1,048,576 down to as low as 87 on this run) then resetting to 1 MiB after the main thread drains the parser buffer.
 - **Q5** — The PTY master file descriptor observed in the kitty process is fd **8** (not a constant — this is whatever the kernel returned as the lowest available fd at `openat("/dev/ptmx", ...)` time).
 - **Q6** — The C function that issues `read(2)` on the PTY master fd is **`read_bytes(int fd, Screen *screen)`** in **`kitty/child-monitor.c:1337`**.
 - **Q7** — The top-level parser that separates printable text from terminal escape sequences is **`consume_input()`** in **`kitty/vt-parser.c:1367`**; the byte-level split itself happens inside **`utf8_decode_to_esc()`** in **`kitty/simd-string.c:72`**, which scans bytes for the `0x1b` (ESC) sentinel.
@@ -20,7 +20,7 @@ kitty spawns the user's login shell. On the observed Linux/X11 container the she
 
 ### Thinking / Rationale
 
-kitty resolves the shell by reading the current effective user's passwd entry: `pwd.getpwuid(os.geteuid()).pw_shell`, falling back to `/bin/sh` when the passwd entry lacks a shell. That default-shell string is consumed by `Child.fork()` in `kitty/child.py`, which constructs the final `argv` — wrapping the user's shell with `kitten_exe() run-shell ...` so that kitty's shell-integration shim runs first and then `execvp`s the real shell. The Python side then calls the C extension `fast_data_types.spawn()`, which is the function `spawn()` in `kitty/child.c`: it performs the POSIX `fork()`, opens the slave PTY inside the child, establishes the controlling terminal via `ioctl(TIOCSCTTY)`, redirects stdin/stdout/stderr, and finally calls `execvp(exe, argv)` to replace the child image with the shell binary. Thus the process that ultimately runs in the child is whatever `exe` is passed into `spawn()` — in the observed run this was `/bin/bash` with `argv[0] = "-bash"` and `argv[1] = "--posix"`.
+kitty resolves the shell by reading the current effective user's passwd entry: `pwd.getpwuid(os.geteuid()).pw_shell`, falling back to `/bin/sh` when the passwd entry lacks a shell. That default-shell string is consumed by `Child.fork()` in `kitty/child.py`, which constructs the final `argv` — wrapping the user's shell with `kitten_exe() run-shell ...` so that kitty's shell-integration shim runs first, then the kitten (Go binary) calls `syscall.Exec()` (`tools/tui/run.go:186`) to replace itself with the real shell. The Python side then calls the C extension `fast_data_types.spawn()`, which is the function `spawn()` in `kitty/child.c`: it performs the POSIX `fork()`, opens the slave PTY inside the child, establishes the controlling terminal via `ioctl(TIOCSCTTY)`, redirects stdin/stdout/stderr, and finally calls `execvp(exe, argv)` to replace the child image with the kitten binary (which in turn `exec`s the shell). Thus the process that ultimately runs in the child is whatever `exe` the kitten passes to `unix.Exec()` — in the observed run this was `/bin/bash` with `argv[0] = "/bin/bash"` and `argv[1] = "--posix"`. (The `argv[0] = "-bash"` login-shell convention is applied by the kitten `run-shell` helper **only** on macOS — see the `runtime.GOOS == "darwin"` gate at `tools/tui/run.go:167`. On Linux, argv[0] is left as the shell's resolved path.)
 
 ### Source Code References
 
@@ -70,7 +70,13 @@ kitty resolves the shell by reading the current effective user's passwd entry: `
 
 ### Runtime Evidence
 
-Under `strace -f -e trace=clone,execve`, kitty's main process issued a `clone()` (fork) that produced a new child PID, and in the child the very next observable syscall of interest was `execve("/bin/bash", ["-bash", "--posix", ...], <envp>)`. The `ps -ef` output after launch showed `/bin/bash --posix` as a direct descendant of the kitty main process PID tree, with the `kitten run-shell` intermediate step having already `exec`-chained into the shell. The `--posix` flag is contributed by kitty's shell integration (not by the user's environment) and is reproducible across runs. `argv[0]` was observed as `-bash` (the leading dash flags an interactive login shell to bash), confirming that the wrapping `kitten run-shell` stage constructs a login-style argv before handing off to the real shell.
+Under `strace -f -e trace=clone,execve`, kitty's main process issued a `clone()` (fork) that produced a new child PID, and in the child the next observable `execve` chain was:
+
+1. `execve("./kitty/launcher/kitty", ...)` — the launcher re-exec.
+2. `execve(".../kitty/launcher/kitten", ["...", "run-shell", "--shell=/bin/bash", "--shell-integration=enabled", ...], ...)` — the kitten `run-shell` helper that injects shell-integration.
+3. `execve("/bin/bash", ["/bin/bash", "--posix"], <envp>)` — the final exec that replaces the process image with the real shell.
+
+`ps -ef` output after launch showed `/bin/bash --posix` as a direct descendant of the kitty main process PID tree, with the `kitten run-shell` intermediate step having already `exec`-chained into the shell. The `--posix` flag is contributed by kitty's shell-integration mechanism (not by the user's environment) and is reproducible across runs. On Linux the observed `argv[0]` was `"/bin/bash"` (the shell's absolute path — no leading-dash login-shell marker). The dash-prefix login-shell convention is **only** applied by the kitten `run-shell` helper on macOS (see `tools/tui/run.go:167-171` — `shell_cmd[0] = "-" + filepath.Base(shell_cmd[0])` is gated on `runtime.GOOS == "darwin"`), which is why this container's Linux launch produced a non-login shell with `argv[0] = "/bin/bash"` rather than `-bash`.
 
 ## Q2 — What PTY device path connects kitty to the shell?
 
@@ -78,7 +84,7 @@ Under `strace -f -e trace=clone,execve`, kitty's main process issued a `clone()`
 
 A single kernel-allocated PTY pair connects kitty and the shell:
 
-- **Master (kitty's side)**: `/dev/pts/ptmx`, acquired by `open("/dev/ptmx", O_RDWR|O_NOCTTY)` and held in the kitty process as file descriptor **8**.
+- **Master (kitty's side)**: `/dev/pts/ptmx`, acquired by `open("/dev/ptmx", O_RDWR)` (via Python's `os.openpty()` which calls glibc `openpty(3)` → `posix_openpt(O_RDWR)`) and held in the kitty process as file descriptor **8**.
 - **Slave (shell's side)**: `/dev/pts/0`, attached to the child shell's `stdin`, `stdout`, and `stderr`.
 
 ### Thinking / Rationale
@@ -119,7 +125,7 @@ Inside the child process — after `fork()` but before `execvp()` — kitty reso
 ### Runtime Evidence
 
 - Under `strace -f -e trace=openat,ioctl` on the kitty process:
-  - `openat(AT_FDCWD, "/dev/ptmx", O_RDWR|O_NOCTTY) = 8` — the master was opened at fd 8.
+  - `openat(AT_FDCWD, "/dev/ptmx", O_RDWR) = 8` — the master was opened at fd 8.
   - `ioctl(8, TIOCSPTLCK, [0])` — slave unlock.
   - `ioctl(8, TIOCGPTN, [0])` — kernel returned slave index `0`, meaning the slave is at `/dev/pts/0`.
 - `ls -l /proc/<kitty-pid>/fd/8` resolved to `/dev/pts/ptmx` (the master end of the pair).
@@ -213,12 +219,12 @@ The `count` parameter to `read()` was consistently 1,048,576 throughout this slo
 
 ### Answer
 
-Under a continuous high-throughput producer like `yes hello`, kitty's `poll()` on the PTY master fd returns immediately with `POLLIN` on every iteration, so `read_bytes()` executes back-to-back without `poll()` ever blocking. Observed metrics:
+Under a continuous high-throughput producer like `yes hello`, kitty's `poll()` on the PTY master fd returns immediately with `POLLIN` on every iteration, so `read_bytes()` executes back-to-back without `poll()` ever blocking. Observed metrics from a ~1-second `yes hello` burst on an Ubuntu 24.04/x86_64 container (values vary by system speed, I/O scheduler, and parser drain rate — see the "Runtime Evidence" table below for the raw numbers):
 
-- **~95 consecutive `read()` calls on fd 8 per ~1-second burst** before `poll()` finally blocks (it blocks only after the producer pauses or after `vt_parser_has_space_for_input()` transiently clears `POLLIN` from the fd's event mask).
-- Per-read byte counts ranged from **14 to 4,095**, with a median in the low hundreds (reflecting PTY line-discipline chunking, not the 1 MiB `count` maximum). The 4,095 cap is consistent with typical Linux PTY read-buffer sizing where a single `read()` drains roughly one page worth of queued data.
-- The **`count` parameter passed to `read()` progressively decreased** within a single fill cycle (e.g., 1,048,576 → ~900,000 → ~500,000 → …) because the parser buffer accumulates unprocessed bytes faster than the main thread consumes them. Once the main thread drains via `run_worker()`/`consume_input()`, the next `vt_parser_create_write_buffer()` call reports the full 1 MiB available again and `count` resets to 1,048,576.
-- Per-call latency was **~15–50 μs** (from `strace -T` column) — nearly all of that is syscall entry/exit and kernel PTY buffer copy; the user-space portion (buffer-space query, commit) is negligible.
+- **Thousands of consecutive `read()` calls on fd 8 per ~1-second burst** — on the measured run, **11,699** reads were captured against fd 8 whose return buffer contained `hello` output, before `poll()` finally blocked (it blocks only after the producer pauses or after `vt_parser_has_space_for_input()` transiently clears `POLLIN` from the fd's event mask).
+- Per-read byte counts ranged from **79 to 14,133** on the measured run, with a **median of 569 bytes** and a **mean of 822 bytes** (reflecting PTY line-discipline chunking, not the 1 MiB `count` maximum). These byte counts are well above the historical 4,095-byte `N_TTY_BUF_SIZE` limit — modern Linux PTY buffers are much larger (typically 64 KB default), and a single `read()` drains as much of the kernel queue as will fit in kitty's requested `count`.
+- The **`count` parameter passed to `read()` progressively decreased** within a single fill cycle — e.g. on this run it marched down 1,048,576 → 1,044,740 → 1,044,000 → 1,043,165 → 1,042,451 → 1,041,529 → … → as low as **87** — because the parser buffer accumulates unprocessed bytes faster than the main thread consumes them. Once the main thread drains via `run_worker()`/`consume_input()`, the next `vt_parser_create_write_buffer()` call reports the full 1 MiB available again and `count` resets to 1,048,576.
+- Per-call latency was **7–19,894 μs** with a **mean of ≈19 μs** (from `strace -T` column) — nearly all of that is syscall entry/exit and kernel PTY buffer copy; the user-space portion (buffer-space query, commit) is negligible. The outliers (tens of milliseconds) correspond to moments when the main thread was also active and the parser mutex inside `vt_parser_create_write_buffer()` / `vt_parser_commit_write()` briefly contended.
 
 ### Thinking / Rationale
 
@@ -263,17 +269,22 @@ for (i = 0; i < self->count; i++) {
 
 ### Runtime Evidence
 
-Summary table from `strace -f -T -e trace=read` on fd 8 during a ~1-second `yes hello` burst:
+Summary table from `strace -f -T -e trace=read` on fd 8 during a ~1-second `yes hello` burst (values from an actual measured run — individual numbers will vary with hardware and scheduler):
 
 | Metric | Observed value |
 |--------|---------------|
-| Total reads in ~1 s burst | ≥ 95 |
-| Min bytes per read | 14 |
-| Max bytes per read | 4,095 |
-| Median bytes per read | ~200 (varies by kernel buffer state) |
-| Initial `count` parameter | 1,048,576 |
-| Final `count` before drain | Decreases monotonically within a fill cycle |
-| Typical read latency | 15–50 μs |
+| Total reads against fd 8 returning `hello`-bearing data | 11,699 |
+| Min bytes per read | 79 |
+| Max bytes per read | 14,133 |
+| Median bytes per read | 569 |
+| Mean bytes per read | 822 |
+| Total bytes delivered to kitty during the burst | 9,622,866 (≈ 9.6 MiB) |
+| Initial `count` parameter | 1,048,576 (full `BUF_SZ`) |
+| Minimum `count` parameter before parser drain | 87 (buffer nearly full) |
+| Typical read latency (mean) | ≈ 19 μs |
+| Read latency range | 7 μs – 19,894 μs (outliers during mutex contention) |
+
+The count parameter's monotonic decrease within a single fill cycle is the direct empirical signature of the back-pressure mechanism: as `self->write.pending` grows, `BUF_SZ - self->write.offset` shrinks. When the main thread finally runs `run_worker()` → `consume_input()` and drains accumulated bytes, `write.offset` is reset (via `write.pending → read.sz` transfer and `memmove`-compaction), and the next `read()` sees the full 1 MiB window again.
 
 The burst-to-idle transition was crisp: once the `yes` process was suspended (or killed) the I/O thread's next `poll()` call blocked with no timeout, confirming that the hot loop is driven entirely by `POLLIN` level-triggering rather than by any busy-wait in user space.
 
@@ -320,7 +331,7 @@ The value **8** is a runtime observation specific to this kitty launch profile o
 
 ### Runtime Evidence
 
-- From `strace -f -e trace=openat`: `openat(AT_FDCWD, "/dev/ptmx", O_RDWR|O_NOCTTY) = 8`.
+- From `strace -f -e trace=openat`: `openat(AT_FDCWD, "/dev/ptmx", O_RDWR) = 8`.
 - All subsequent PTY operations referenced fd 8: `ioctl(8, TIOCSPTLCK, ...)`, `ioctl(8, TIOCGPTN, ...)`, `read(8, ...)`, `write(8, ...)` for every interactive keystroke and output byte.
 - `ls -l /proc/<kitty-pid>/fd/8` resolved to a symlink pointing at `/dev/pts/ptmx` (the master end of the pair).
 - Inspecting `children_fds` layout (consistent with the code above): `children_fds[0]` held the wakeup pipe fd, `children_fds[1]` held the signal pipe fd, and `children_fds[2].fd = 8` held the PTY master — matching the `EXTRA_FDS + i` indexing used throughout `io_loop()`.
