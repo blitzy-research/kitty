@@ -46,9 +46,9 @@ GlobalState
 
 Per `kitty/state.h` (roughly lines 156–280):
 
-- **`Window`** (lines ~156–172) — fields include `id_type id`, `bool visible`, `ScreenRenderData render_data`, `WindowGeometry geometry`, and `WindowLogoRenderData logo`.
-- **`Tab`** (lines ~186–191) — fields include `id_type id`, `id_type active_window`, `unsigned int num_windows`, `Window *windows`.
-- **`OSWindow`** (lines ~216–256) — fields include `id_type id`, `LiveResizeInfo live_resize`, `bool is_semi_transparent`, `bool has_pending_resizes`, `CloseRequest close_request`, `Tab *tabs`, `id_type focused_window_id`, `FONTS_DATA_HANDLE fonts_data`.
+- **`Window`** (lines ~156–172) — fields include `id_type id`, `bool visible`, `WindowRenderData render_data`, `WindowGeometry geometry`, and `WindowLogoRenderData window_logo`.
+- **`Tab`** (lines ~186–191) — fields include `id_type id`, `unsigned int active_window`, `unsigned int num_windows`, `unsigned int capacity`, `Window *windows`.
+- **`OSWindow`** (lines ~216–256) — fields include `id_type id`, `LiveResizeInfo live_resize`, `bool is_semi_transparent`, `bool has_pending_resizes`, `CloseRequest close_request`, `Tab *tabs`, `unsigned int last_active_window_id`, `FONTS_DATA_HANDLE fonts_data`.
 - **`GlobalState`** (lines ~259–280) — fields include `OSWindow *os_windows`, `size_t num_os_windows, capacity`, `bool has_pending_resizes`, `bool has_pending_closes`, `PyObject *boss`.
 
 Every entity carries a monotonically increasing `id_type id`. Lookup is linear-scan via three guard macros in `kitty/state.c`:
@@ -150,28 +150,31 @@ The source contains an explicit comment in `Tab.new_window` stating that the chi
 
 ### 1.2 `Child.fork` — PTY Allocation and the Ready Pipe
 
-`Child.fork` in `kitty/child.py` (lines 276–360) sets up two pipes:
+`Child.fork` in `kitty/child.py` (lines 278–358) sets up two pipes. The snippet below is **illustrative / simplified** — omitted are the `run-shell` kitten branch, macOS `/usr/bin/login` wrapper, systemd scope placement, stdin-pipe routing, and several environment-preparation steps. The core sequence of syscalls and the critical ordering of file-descriptor manipulations mirror the actual source:
 
 ```python
-# 1) Master/slave PTY pair.
+# 1) Master/slave PTY pair (before any child-process creation).
 master, slave = openpty()
-self.child_fd = master
 # 2) A ready-pipe used to gate first output until the window is fully initialised.
 ready_read_fd, ready_write_fd = os.pipe()
-os.set_inheritable(ready_read_fd, True)
-os.set_inheritable(ready_write_fd, False)
+os.set_inheritable(ready_write_fd, False)  # parent keeps write end, not inherited
+os.set_inheritable(ready_read_fd, True)    # child inherits read end
 # 3) Spawn — a fork + execve implemented in the C extension.
+#    The real call takes final_exe, cwd, argv tuple, env tuple, master/slave,
+#    stdin fds, ready-pipe fds, handled_signals tuple, kitten_exe, forward_stdio.
 pid = fast_data_types.spawn(
-    argv, cwd, master, slave, stdin_read_fd, stdin_write_fd,
+    final_exe, cwd, tuple(argv), env, master, slave,
+    stdin_read_fd, stdin_write_fd,
     ready_read_fd, ready_write_fd,
-    tuple(handled_signals),  # signal set to restore in the child
-    # ...
+    tuple(handled_signals), kitten_exe(), opts.forward_stdio,
 )
 # 4) Post-spawn, the parent keeps master; slave is closed on the parent side.
 os.close(slave)
-os.set_blocking(self.child_fd, False)  # master is non-blocking
 self.pid = pid
+self.child_fd = master  # parent-side PTY master fd is stored after spawn
+os.close(ready_read_fd)           # parent does not need the read end
 self.terminal_ready_fd = ready_write_fd
+os.set_blocking(self.child_fd, False)  # master is non-blocking
 ```
 
 The **ready-pipe** is the linchpin of this section: the child process, before `exec`ing the user's shell, is expected to read from `ready_read_fd` and block until EOF. The parent holds the **write end** (`ready_write_fd`). The child therefore cannot race ahead and emit output until the parent explicitly releases it by **closing the write end** of the ready-pipe, which is done in `Child.mark_terminal_ready()` (`kitty/child.py:362`):
@@ -186,13 +189,15 @@ Once the parent closes the write end, the child's blocked `read` on the read end
 
 ### 1.3 `Window.__init__` — Screen Creation and C-Layer Registration
 
-`Window.__init__` in `kitty/window.py:544` performs — in order:
+`Window.__init__` in `kitty/window.py:544` performs — in this strict order (verified from `kitty/window.py` lines 544–605):
 
-1. Initialises bookkeeping: `self.last_resized_at = 0.`, `self.last_reported_pty_size = (-1, -1, -1, -1)`, `self.destroyed = False`, `self.geometry = WindowGeometry(0, 0, 0, 0, 0, 0)`.
-2. Creates the `Screen` object: `self.screen = Screen(self, 24, 80, scrollback_lines, cell_width, cell_height, self.id, ...)` — the default initial size is **24 rows × 80 columns** (hard-coded because layout hasn't produced a geometry yet).
-3. Registers the window with the C layer: `self.id = add_window(tab.os_window_id, tab.id, self.title)` — the C function `add_window` is in `kitty/state.c:296`.
+1. Installs watchers (`self.watchers = ...`).
+2. Initialises early bookkeeping fields: `self.last_focused_at`, `self.is_focused`, `self.last_resized_at`, `self.started_at`, `self.created_at`, `self.child_is_launched = False`, `self.last_reported_pty_size = (-1, -1, -1, -1)`, etc.
+3. Registers the window with the C layer **before** creating the `Screen`: `self.id: int = add_window(tab.os_window_id, tab.id, self.title)` at `kitty/window.py` line 588 — the C function `add_window` is in `kitty/state.c:296`. This gives the window a valid `id` that the Screen can reference.
+4. Performs further bookkeeping: `self.clipboard_request_manager = ClipboardRequestManager(self.id)`, `self.margin`, `self.padding`, `self.tab_id`, `self.os_window_id`, `self.tabref`, `self.destroyed = False`, `self.geometry = WindowGeometry(0, 0, 0, 0, 0, 0)`, `self.needs_layout = True`, `self.is_visible_in_layout = True`, `self.child = child`, and cell-size lookup.
+5. Creates the `Screen` object **after** the C-layer registration: `self.screen: Screen = Screen(self, 24, 80, opts.scrollback_lines, cell_width, cell_height, self.id)` at `kitty/window.py` line 604 — the default initial size is **24 rows × 80 columns** (hard-coded because layout hasn't produced a geometry yet), and the Screen is passed the already-valid `self.id`.
 
-After this, the C-layer `Window *` slot inside `os_window->tabs[t].windows[]` carries a valid id and is ready to be reached through `WITH_WINDOW`. Critically, the Screen is fully constructed **before** the child is handed to the `ChildMonitor` in step 4 of §1.1.
+After this, the C-layer `Window *` slot inside `os_window->tabs[t].windows[]` carries a valid id and is ready to be reached through `WITH_WINDOW`. Critically, the Screen is fully constructed **before** the child is handed to the `ChildMonitor` in step 4 of §1.1, and the C-layer `add_window()` has already executed **before** the Screen constructor runs — so the Screen's reference to `self.id` is always valid.
 
 ### 1.4 `ChildMonitor.add_child` — Handoff to the I/O Thread
 
@@ -335,8 +340,8 @@ Resize events originate in GLFW callbacks installed per OS window in `kitty/glfw
 
 | Callback | File/line (approx.) | Trigger | Action summary |
 |----------|----------------------|---------|----------------|
-| `framebuffer_size_callback` | `kitty/glfw.c` line 329 | OS reports new framebuffer dimensions (continuous during drag-resize on X11/Wayland/macOS) | Sets `global_state.has_pending_resizes = true`, records `live_resize.last_resize_event_at`, stores `width`/`height`, increments `num_of_resize_events`. |
-| `live_resize_callback` | `kitty/glfw.c` line 315 | OS signals resize start/end (macOS and GLFW-Wayland provide this; X11 does not) | Sets `live_resize.from_os_notification = true`; on end sets `live_resize.os_says_resize_complete = true`. |
+| `framebuffer_size_callback` | `kitty/glfw.c` line 330 | OS reports new framebuffer dimensions (continuous during drag-resize on X11/Wayland/macOS) | Sets `global_state.has_pending_resizes = true`, records `live_resize.last_resize_event_at`, stores `width`/`height`, increments `num_of_resize_events`. |
+| `live_resize_callback` | `kitty/glfw.c` line 316 | OS signals resize start/end (macOS and GLFW-Wayland provide this; X11 does not) | Sets `live_resize.from_os_notification = true`; on end sets `live_resize.os_says_resize_complete = true`. |
 | `dpi_change_callback` | `kitty/glfw.c` line 349 | Monitor DPI changes (screen migration, HiDPI toggle) | Triggers `change_live_resize_state(true)`, sets `has_pending_resizes = true`. |
 | `window_close_callback` | `kitty/glfw.c` line 249 | User clicks close button / system close gesture | Sets `close_request = CONFIRMABLE_CLOSE_REQUESTED`; handled in Section 3. |
 
@@ -463,36 +468,46 @@ Boss.on_window_resize()            (kitty/boss.py line 1206)
 
 ### 2.7 Final Leg — `Window.set_geometry()`
 
-The terminal leg of the resize chain is `kitty/window.py:set_geometry()` at line 850. The key excerpts are summarised below (indentation and ordering preserved):
+The terminal leg of the resize chain is `kitty/window.py:set_geometry()` at line 850. The excerpt below mirrors the actual source (lines 850–882), with only minor whitespace elisions — identifiers, conditions, and ordering are preserved verbatim:
 
 ```python
 def set_geometry(self, new_geometry: WindowGeometry) -> None:
     if self.destroyed:
-        return                                          # Premature-destruction guard
-    needs_layout = new_geometry.xnum != self.geometry.xnum or new_geometry.ynum != self.geometry.ynum
-    if needs_layout:
+        return                                          # Premature-destruction guard (first statement)
+    if self.needs_layout or new_geometry.xnum != self.screen.columns or new_geometry.ynum != self.screen.lines:
         self.screen.resize(max(0, new_geometry.ynum), max(0, new_geometry.xnum))
-        self.call_watchers(self.watchers.on_resize, {'old_geometry': self.geometry, 'new_geometry': new_geometry})
-    self.geometry = new_geometry
-    current_pty_size = (self.screen.lines, self.screen.columns,
-                        max(0, new_geometry.right - new_geometry.left),
-                        max(0, new_geometry.bottom - new_geometry.top))
+        self.needs_layout = False
+        call_watchers(weakref.ref(self), 'on_resize', {'old_geometry': self.geometry, 'new_geometry': new_geometry})
+    current_pty_size = (
+        self.screen.lines, self.screen.columns,
+        max(0, new_geometry.right - new_geometry.left),
+        max(0, new_geometry.bottom - new_geometry.top))
+    update_ime_position = False
     if current_pty_size != self.last_reported_pty_size:
         boss = get_boss()
         boss.child_monitor.resize_pty(self.id, *current_pty_size)
         self.last_resized_at = monotonic()
         if not self.child_is_launched:
-            self.child.mark_terminal_ready()           # Release the ready-pipe
+            self.child.mark_terminal_ready()           # Release the ready-pipe (first resize only)
             self.child_is_launched = True
+            update_ime_position = True
         self.last_reported_pty_size = current_pty_size
-    set_window_render_data(self.os_window_id, self.tab_id, self.id, ...)
+    else:
+        mark_os_window_dirty(self.os_window_id)        # No PTY change: schedule a repaint
+    self.geometry = g = new_geometry                   # Geometry assigned AFTER pty-size handshake
+    set_window_render_data(self.os_window_id, self.tab_id, self.id, self.screen, *g[:4])
+    self.update_effective_padding()
+    if update_ime_position:
+        update_ime_position_for_window(self.id, True)
 ```
 
-Three critical details:
+Four critical details:
 
 1. The `self.destroyed` check is the **first statement** — any resize arriving after `Window.destroy()` has set this flag is a no-op, protecting against calls into a freed `Screen`.
-2. `resize_pty` is skipped if `current_pty_size == self.last_reported_pty_size`, avoiding redundant ioctls and redundant `SIGWINCH`es.
-3. The first successful resize triggers `mark_terminal_ready()`, which closes the ready-pipe's write end (`kitty/child.py` line 362) — this is the handshake that unblocks the freshly forked child so it can begin executing the shell.
+2. The reflow condition tests `self.needs_layout or new_geometry.xnum != self.screen.columns or new_geometry.ynum != self.screen.lines` — it compares against **the Screen's current dimensions** (`self.screen.columns/lines`), not against `self.geometry.xnum/ynum`. This is important because `self.screen` is the authoritative source of truth for cell dimensions (a prior `Screen.resize()` may have changed them even without a geometry update). The `needs_layout` flag is cleared once reflow completes.
+3. `resize_pty` is skipped if `current_pty_size == self.last_reported_pty_size`, avoiding redundant ioctls and redundant `SIGWINCH`es. When skipped, the else branch still calls `mark_os_window_dirty(self.os_window_id)` so a repaint is scheduled.
+4. The first successful resize triggers `mark_terminal_ready()` (closing the ready-pipe's write end, `kitty/child.py` line 363) — this is the handshake that unblocks the freshly forked child so it can begin executing the shell. Only on this first call does `update_ime_position_for_window(self.id, True)` run (after geometry is assigned).
+5. `self.geometry = g = new_geometry` happens **after** the pty-size handshake, so any exception inside `resize_pty()` leaves the prior `self.geometry` intact. `set_window_render_data` and `update_effective_padding` then run with the freshly committed geometry.
 
 ### 2.8 Screen Reflow — `screen_resize()`
 
@@ -601,18 +616,24 @@ def set_geometry(self, new_geometry: WindowGeometry) -> None:
         return
 ```
 
-`self.destroyed` is set to `True` inside `Window.destroy()` at `kitty/window.py` around line 1560:
+`self.destroyed` is set to `True` inside `Window.destroy()` at `kitty/window.py` line 1561 — the actual source is:
 
 ```python
 def destroy(self) -> None:
     self.call_watchers(self.watchers.on_close, {})
     self.destroyed = True
-    # ... clipboard manager close, kitten result processors delete, ...
+    self.clipboard_request_manager.close()
+    del self.kitten_result_processors
     if hasattr(self, 'screen'):
-        self.screen.cancel_ime()
+        if self.is_active and self.os_window_id == current_focused_os_window_id():
+            # Cancel IME composition when window is destroyed
+            update_ime_position_for_window(self.id, False, -1)
+        # Remove cycles so that screen is de-allocated immediately
         self.screen.reset_callbacks()
         del self.screen
 ```
+
+IME cancellation is performed via the module-level `update_ime_position_for_window(self.id, False, -1)` — the `-1` sentinel indicates "cancel composition" — and is only invoked when the destroyed window was the active window inside the currently focused OS window. Screen teardown then proceeds via `self.screen.reset_callbacks()` followed by `del self.screen` (breaking the reference cycle so Python's garbage collector can deallocate the Screen immediately).
 
 Between the moment Python calls `window.destroy()` and the moment the C layer's `remove_window()` completes, any resize path that re-enters `set_geometry()` returns immediately. Because the flag check precedes every other state mutation (including `self.screen.resize()`, `boss.child_monitor.resize_pty()`, and `set_window_render_data()`), there is no possibility of operating on a freed `Screen` object.
 
@@ -1106,7 +1127,7 @@ Each iteration:
 1. `remove_children(self)` — process any `needs_removal` flags set in the previous iteration.
 2. `add_children(self)` — promote entries from `add_queue[]` to `children[]` under `children_mutex`.
 3. `poll(children_fds, self->count + EXTRA_FDS, timeout)` where `timeout` is computed from pending writes and the next deadline (`OPT(input_delay)` = 3ms for wakeup throttling).
-4. If `children_fds[0].revents & POLLIN` (wakeup): `consume_events(&wakeup_fds)` just drains the fd.
+4. If `children_fds[0].revents & POLLIN` (wakeup): `drain_fd(children_fds[0].fd)` just drains the fd (`kitty/child-monitor.c:1517`; `drain_fd` is defined inline in `kitty/loop-utils.h:76`).
 5. If `children_fds[1].revents & POLLIN` (signal): `read_signals(...)` + `handle_signal(...)` — detailed below.
 6. For each child fd at indices `EXTRA_FDS..`: handle `POLLIN` via `read_bytes(fd, screen)`, `POLLOUT` via `write_to_child(fd, screen)`, `POLLHUP` or read-returns-0 by setting `needs_removal = true`, and `POLLNVAL` (fd closed unexpectedly) by marking removal.
 7. If any child received data and `(now - last_main_loop_wakeup_at) > OPT(input_delay)`, call `wakeup_main_loop()` — otherwise set `has_pending_wakeups = true` for the next iteration. This throttles wakeups to at most one per `input_delay` milliseconds (default 3ms per `kitty/options/definition.py` line ~878).
@@ -1118,18 +1139,23 @@ Each iteration:
 - **Linux**: `read(signal_fd, buf, sizeof(struct signalfd_siginfo) * N)` loop, iterating until EAGAIN; for each `signalfd_siginfo` record, invokes the provided callback (`handle_signal`) with the signal number and siginfo.
 - **macOS / BSD**: `read(signal_fds[0], buf, sizeof(siginfo_t) * N)` loop; each entry carries the full `siginfo_t` written by the signal handler.
 
-`handle_signal` at `kitty/child-monitor.c` lines 1362–1383 maps signal numbers to boolean flags in a stack-local `SignalSet ss`:
+`handle_signal` at `kitty/child-monitor.c` lines 1360–1383 maps signal numbers to boolean flags in a stack-local `SignalSet ss`. The `SignalSet` typedef at line 1358 is literally:
 
 ```c
-static void
-handle_signal(int sig_num, siginfo_t *siginfo, void *data) {
+typedef struct { bool kill_signal, child_died, reload_config; } SignalSet;
+```
+
+Note that `SignalSet` carries **only three booleans** — there is no field recording *which* specific signal arrived. The handler:
+
+```c
+static bool
+handle_signal(const siginfo_t *siginfo, void *data) {
     SignalSet *ss = data;
-    switch (sig_num) {
+    switch(siginfo->si_signo) {
         case SIGINT:
         case SIGTERM:
         case SIGHUP:
             ss->kill_signal = true;
-            ss->signum = sig_num;
             break;
         case SIGCHLD:
             ss->child_died = true;
@@ -1138,33 +1164,37 @@ handle_signal(int sig_num, siginfo_t *siginfo, void *data) {
             ss->reload_config = true;
             break;
         case SIGUSR2:
-            log_error("Received SIGUSR2");
+            log_error("Received SIGUSR2: %d\n", siginfo->si_value.sival_int);
             break;
         default:
             break;
     }
+    return true;
 }
 ```
 
-Back in `io_loop`, the I/O thread translates `ss` into persistent flags:
+Two important properties: (a) the function takes **two parameters** (`const siginfo_t *siginfo` and `void *data`) — the signal number is read off `siginfo->si_signo`, not passed separately; (b) it returns `bool` (`true` to continue reading, the return value is presently always `true`); (c) SIGUSR2 is treated as a debug probe — it logs the `siginfo->si_value.sival_int` carried by the sender and does not flip any flag.
+
+Back in `io_loop` (`kitty/child-monitor.c` lines 1516–1528), the I/O thread translates `ss` into persistent flags — verbatim from source:
 
 ```c
-children_mutex(lock);
-if (ss.kill_signal) {
-    kill_signal_received = true;
-    kill_signum = ss.signum;
+if (children_fds[1].revents && POLLIN) {
+    SignalSet ss = {0};
+    data_received = true;
+    read_signals(children_fds[1].fd, handle_signal, &ss);
+    if (ss.kill_signal || ss.reload_config) {
+        children_mutex(lock);
+        if (ss.kill_signal) kill_signal_received = true;
+        if (ss.reload_config) reload_config_signal_received = true;
+        children_mutex(unlock);
+    }
+    if (ss.child_died) reap_children(self, OPT(close_on_child_death));
 }
-if (ss.reload_config) {
-    reload_config_signal_received = true;
-}
-children_mutex(unlock);
-if (ss.child_died) {
-    reap_children(self, OPT(close_on_child_death));
-}
-wakeup_main_loop();   // so main thread sees the flags on next tick
 ```
 
-The key pattern: signals never cause direct state mutation; they flip boolean flags under `children_mutex` (so that the main thread reads them atomically with the children array).
+The key pattern: signals never cause direct state mutation; they flip boolean flags under `children_mutex` **only when there is something to flip** (the lock/unlock bracket is itself skipped when neither `kill_signal` nor `reload_config` fired). `ss.child_died` triggers `reap_children()` *outside* the mutex because `reap_children` acquires `children_mutex` internally via `mark_child_for_removal`, and the lock is non-recursive.
+
+`wakeup_main_loop()` is issued later in the loop body — not directly after the flag transfer — via the `WAKEUP` macro (`kitty/child-monitor.c` line 1562), and is gated on `data_received` plus the `input_delay` throttle. The main thread therefore sees the freshly set flags on its next tick.
 
 ### 5.8 Main-Thread Signal Consumption — `parse_input`
 
@@ -1234,29 +1264,36 @@ flowchart LR
 
 ### 5.10 `reap_children` — The `waitpid` Loop
 
-`kitty/child-monitor.c` lines 1413–1426:
+`kitty/child-monitor.c` lines 1413–1427 (verbatim from source):
 
 ```c
 static void
-reap_children(ChildMonitor *self, bool close_on_child_death) {
+reap_children(ChildMonitor *self, bool enable_close_on_child_death) {
     int status;
     pid_t pid;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        mark_monitored_pids(pid, status);
-        if (close_on_child_death) {
-            children_mutex(lock);
-            mark_child_for_removal(self, pid);
-            children_mutex(unlock);
-        }
+    (void)self;
+    while(true) {
+        pid = waitpid(-1, &status, WNOHANG);
+        if (pid == -1) {
+            if (errno != EINTR) break;
+        } else if (pid > 0) {
+            if (enable_close_on_child_death) mark_child_for_removal(self, pid);
+            mark_monitored_pids(pid, status);
+        } else break;
     }
 }
 ```
 
-- `waitpid(-1, &status, WNOHANG)` is non-blocking — if no zombies are available, it returns 0 immediately, exiting the loop.
-- `mark_monitored_pids(pid, status)` adds the exited pid to a list that `report_reaped_pids()` (main-thread tick step 4) drains and reports to Python watchers.
-- If `OPT(close_on_child_death)` is true (default **`no`** per `kitty/options/definition.py`), the child's window is queued for removal. When false (default), the window persists showing `[Process exited]` but the user must manually close it.
+Four details worth highlighting:
 
-Because `waitpid` only reaps children that have actually died, and `SIGCHLD` was the trigger, this loop runs once per batch of child deaths and then exits. There is no spin risk.
+- **Parameter name** is `enable_close_on_child_death` (not `close_on_child_death`). It is sourced from `OPT(close_on_child_death)` at the call site inside `io_loop`.
+- **EINTR is explicitly retried**: if `waitpid` returns −1 with `errno == EINTR` (interrupted by another signal), the loop continues; any other −1 (e.g., `ECHILD` — no unreaped children) breaks. This is critical because even though `SIGCHLD` is the common trigger, `waitpid` can race with other signals arriving during the syscall.
+- **Ordering**: `mark_child_for_removal(self, pid)` is called **first** (when `enable_close_on_child_death` is true), *then* `mark_monitored_pids(pid, status)`. This ordering ensures that by the time `report_reaped_pids()` (main-thread tick step 4) reports the death to Python, any corresponding child entry in `children[]` has already been flagged for removal — so the subsequent `process_pending_closes()` tick step will handle it cleanly.
+- **Mutex ownership**: `mark_child_for_removal` takes `children_mutex(lock)` internally (see `kitty/child-monitor.c` line 1386) — `reap_children` does **not** wrap the call in an external mutex. The non-recursive mutex cannot be reacquired, so the internal lock is mandatory. A `(void)self;` cast silences the unused-parameter warning when `enable_close_on_child_death` is false.
+
+Default value: `OPT(close_on_child_death)` is **`no`** per `kitty/options/definition.py`. When false, `mark_child_for_removal` is skipped; the window persists showing `[Process exited]` and the user must manually close it. `mark_monitored_pids(pid, status)` runs regardless, so Python watchers (including `Boss.on_child_death`) always learn about the exit via the main-thread `report_reaped_pids()` step.
+
+Because `waitpid(-1, &status, WNOHANG)` is non-blocking and only reaps already-exited children, the loop terminates as soon as no more zombies remain (returns 0 → `else break`). There is no spin risk.
 
 ### 5.11 Why This Architecture?
 
@@ -1374,7 +1411,7 @@ The table below consolidates every source-code reference in this document for qu
 | `kitty/child-monitor.c` | line 1224 `process_global_state()` | Main tick: resize → parse → render → report → close |
 | `kitty/child-monitor.c` | line 1259 `main_loop()` | Top-level main-thread loop |
 | `kitty/child-monitor.c` | line 1281 `add_children()` | I/O-side promotion add_queue → children |
-| `kitty/child-monitor.c` | line 1299 `hangup()` | killpg(pgid, SIGHUP) |
+| `kitty/child-monitor.c` | line 1294 `hangup()` | killpg(pgid, SIGHUP) |
 | `kitty/child-monitor.c` | line 1306 `cleanup_child()` | safe_close(fd) + hangup(pid) |
 | `kitty/child-monitor.c` | line 1313 `remove_children()` | I/O-side compaction and move to remove_queue |
 | `kitty/child-monitor.c` | lines 1362–1383 `handle_signal()` | Signal → SignalSet flag translation |
@@ -1395,17 +1432,17 @@ The table below consolidates every source-code reference in this document for qu
 | `kitty/state.c` | line 200 `add_os_window()` | Allocate OSWindow, assign id |
 | `kitty/state.c` | line 232 `add_tab()` | Append to os_window->tabs[] |
 | `kitty/state.c` | line 296 (`add_window`, ~line 293 in some revisions) | Append to tab->windows[] |
-| `kitty/state.c` | line 339 `destroy_window()` | Destructor used by REMOVER |
-| `kitty/state.c` | line 356 `remove_window_inner()` | REMOVER on tab->windows[] |
-| `kitty/state.c` | line 452 `destroy_tab()` | REMOVER on os_window->tabs[] |
-| `kitty/state.c` | line 483 `remove_os_window()` | REMOVER on global_state.os_windows[] |
-| `kitty/state.c` | line 491 `remove_os_window()` REMOVER site | The actual REMOVER invocation |
+| `kitty/state.c` | line 339 `destroy_window()` | Destructor callback passed to REMOVER in `remove_window_inner` |
+| `kitty/state.c` | line 353 `remove_window_inner()` (REMOVER call at line 356) | REMOVER on tab->windows[] with `destroy_window` as the destroy callback |
+| `kitty/state.c` | line 440 `destroy_tab()` | Destructor callback passed to REMOVER in `remove_tab_inner`; loops over tab's windows and invokes `remove_window_inner` for each |
+| `kitty/state.c` | line 448 `remove_tab_inner()` (REMOVER call at line 452) | REMOVER on os_window->tabs[] with `destroy_tab` as the destroy callback |
+| `kitty/state.c` | line 483 `remove_os_window()` (REMOVER call at line 491) | REMOVER on global_state.os_windows[] with `destroy_os_window_item` as the destroy callback |
 | `kitty/state.c` | line 579 `mark_os_window_for_close()` | Transitions close_request state |
 | `kitty/glfw.c` | line 130 `update_os_window_viewport()` | Called after debounce; early-return dedup; call_boss(on_window_resize) |
 | `kitty/glfw.c` | line 249 `window_close_callback()` | CONFIRMABLE_CLOSE_REQUESTED; suppresses GLFW own close |
 | `kitty/glfw.c` | line 300 `change_live_resize_state()` | Toggles `in_progress`; swap-interval control |
-| `kitty/glfw.c` | line 315 `live_resize_callback()` | Sets from_os_notification and os_says_resize_complete |
-| `kitty/glfw.c` | line 329 `framebuffer_size_callback()` | Overwrites live_resize dimensions |
+| `kitty/glfw.c` | line 316 `live_resize_callback()` | Sets from_os_notification and os_says_resize_complete |
+| `kitty/glfw.c` | line 330 `framebuffer_size_callback()` | Overwrites live_resize dimensions |
 | `kitty/glfw.c` | line 349 `dpi_change_callback()` | Triggers resize + pending path |
 | `kitty/screen.c` | line 346 `screen_resize()` | Linebuf reflow; unpauses rendering |
 | `kitty/screen.c` | `screen_pause_rendering()` | Snapshot for remote-control pause; cancelled by screen_resize |
@@ -1418,7 +1455,7 @@ The table below consolidates every source-code reference in this document for qu
 | `kitty/boss.py` | line 881 `Boss.on_child_death()` | Pops window_id_map, calls window.destroy(), tab.remove_window |
 | `kitty/boss.py` | line 1206 `Boss.on_window_resize()` | Delegates to dpi_change or TabManager.resize |
 | `kitty/boss.py` | line 1729 `Boss.confirm_os_window_close()` | Reads `confirm_os_window_close` option, shows dialog or closes |
-| `kitty/boss.py` | line 1770 `Boss.handle_close_os_window_confirmation()` | Applies user's confirm/cancel decision |
+| `kitty/boss.py` | line 1766 `Boss.handle_close_os_window_confirmation()` | Applies user's confirm/cancel decision |
 | `kitty/boss.py` | line 1775 `Boss.on_os_window_closed()` | Destroys TabManager, cleans window_id_map |
 | `kitty/window.py` | line 544 `Window.__init__()` | Creates Screen(24, 80); add_window() C-API |
 | `kitty/window.py` | line 850 `Window.set_geometry()` | `if self.destroyed: return` guard; calls screen.resize, resize_pty, mark_terminal_ready |
