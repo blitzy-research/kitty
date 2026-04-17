@@ -531,8 +531,8 @@ The following table shows when each segment allocation occurs as lines are pushe
 | 2 048 | — (still filling seg 0) | 1 | 5 244 928 | 5.002 |
 | 2 049 | seg 1 (lazy) | 2 | 10 489 856 | 10.003 |
 | 4 097 | seg 2 (lazy) | 3 | 15 734 784 | 15.005 |
-| 6 145 | seg 3 (lazy) | 4 | 20 979 712 | 20.006 |
-| 8 193 | seg 4 (lazy) | 5 | 26 224 640 | 25.008 |
+| 6 145 | seg 3 (lazy) | 4 | 20 979 712 | 20.008 |
+| 8 193 | seg 4 (lazy) | 5 | 26 224 640 | 25.010 |
 
 For `scrollback_lines = 10 000`, `ynum = 10 000`, so the loop guard `SEGMENT_SIZE * num_segments < ynum` stops at `num_segments = 5` (since `5 × 2048 = 10 240 ≥ 10 000`). Lines 8 192 through 10 239 reside in segment 4 even though only 10 000 are logically valid (the remainder stay zeroed until overwritten).
 
