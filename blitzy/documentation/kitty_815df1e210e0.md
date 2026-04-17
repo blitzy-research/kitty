@@ -417,22 +417,22 @@ The following table enumerates defaults observed by introspecting `kitty.options
 
 | Option | Observed default value | `kitty/options/definition.py` line |
 |--------|------------------------|-----------------------------------|
-| `font_family` | `FontSpec(system='monospace', ...)` | (font_family section; ~55) |
+| `font_family` | `FontSpec(system='monospace', ...)` | 35 |
 | `font_size` | `11.0` | 59 |
 | `initial_window_width` | `(640, 'px')` | 994 |
 | `initial_window_height` | `(400, 'px')` | 998 |
-| `term` | `'xterm-kitty'` | (term opt) |
-| `shell` | `'.'` (use the user's login shell from `/etc/passwd`) | (shell opt) |
+| `term` | `'xterm-kitty'` | 3242 |
+| `shell` | `'.'` (use the user's login shell from `/etc/passwd`) | 2896 |
 | `shell_integration` | `frozenset({'enabled'})` | 3141 (finalized) |
 | `scrollback_lines` | `2000` | 372 |
 | `repaint_delay` | `10` (ms) | 866 |
 | `input_delay` | `3` (ms) | 878 |
 | `sync_to_monitor` | `True` | 889 |
 | `background_opacity` | `1.0` | 1468 |
-| `linux_display_server` | `'auto'` | (linux_display_server opt) |
-| `allow_remote_control` | `'no'` | (allow_remote_control opt) |
-| `enabled_layouts` | `['fat', 'grid', 'horizontal', 'splits', 'stack', 'tall', 'vertical']` | (enabled_layouts opt) |
-| `cursor_shape` | `1` (block) | (cursor_shape opt) |
+| `linux_display_server` | `'auto'` | 3427 |
+| `allow_remote_control` | `'no'` | 2969 |
+| `enabled_layouts` | `['fat', 'grid', 'horizontal', 'splits', 'stack', 'tall', 'vertical']` | 1002 |
+| `cursor_shape` | `1` (block) | 320 |
 
 Taken together: because `/etc/xdg/kitty/kitty.conf` and `/root/.config/kitty/kitty.conf` are both absent, `load_config()` never opens a file, no line-by-line parse is performed, and the `defaults` singleton from `kitty/options/types.py` (populated from the registrations in `kitty/options/definition.py`) is what every downstream subsystem (fonts, window sizing, VT buffer, render pacing, background compositing, ...) sees.
 
@@ -588,7 +588,7 @@ The `"Child launched"` print in `--debug-rendering` is literally how we observe 
 pthread_create(&self->io_thread, NULL, io_loop, self);
 ```
 
-`io_loop` (defined around line 229 and onward in the same file) is the loop body. Conceptually:
+`io_loop` (forward-declared at line 229 as `static void* io_loop(void *data);` and defined at line 1481 in the same file) is the loop body. Conceptually:
 
 ```c
 // kitty/child-monitor.c::io_loop (conceptual pseudocode)
@@ -763,7 +763,7 @@ This confirms four things at once:
 
 ### 4.3 Shader Compilation Evidence (cell / graphics / bgimage / tint / border)
 
-Shader compilation happens inside `create_os_window()` (`kitty/glfw.c` lines 1253–1322). The Python side uses `LoadShaderPrograms` (`kitty/shaders.py` line 131, `__call__` at line 147):
+Shader compilation happens inside `create_os_window()` in `kitty/glfw.c`. Specifically, the Python shader-loader callback is invoked at `kitty/glfw.c:1243` via `PyObject_CallFunction(load_programs, "O", is_semi_transparent ? Py_True : Py_False);`; the subsequent lines 1253–1322 cover OS-window bookkeeping (sprite upload, icon, event-callback registration, and the `"OS Window created"` debug print at line 1321). The Python side uses `LoadShaderPrograms` (`kitty/shaders.py` line 131, `__call__` at line 147):
 
 ```python
 # kitty/shaders.py:131
@@ -873,7 +873,7 @@ Cross-reference of the observable debug strings with their sources:
 | Observed string | Source file:line | Meaning |
 |-----------------|------------------|---------|
 | `Loading new XKB keymaps` | `glfw/xkb_glfw.c:672` | XKB context loaded, keymap compiled from current layout |
-| `Modifier indices alt: 0x3 super: 0x6 hyper: ... shift: 0x0 capslock: 0x1 control: 0x2` | `glfw/xkb_glfw.c:376` / `:540` | Modifier bit indices mapped; keyboard subsystem ready |
+| `Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1` | `glfw/xkb_glfw.c:376` (X11 path; the Wayland variant at `:540` additionally appends a `control: 0x%x` field, but that path was not exercised in this investigation) | Modifier bit indices mapped; keyboard subsystem ready |
 | `GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.1' Detected version: 4.5` | `kitty/gl.c:72` | OpenGL context live, Core Profile 4.5, minimum version satisfied |
 | `OS Window created` | `kitty/glfw.c:1321` | GLFW window + GL context + shaders + sprites + icon + callbacks all succeeded |
 | `Failed to open systemd user bus with error: Connection refused` | `kitty/child.py` (best-effort `systemd_move_pid_into_new_scope`) | Non-fatal; no session bus in container |
@@ -907,9 +907,9 @@ The following table enumerates every source file cited anywhere in this document
 | `kitty/session.py` | `create_sessions()`, `get_os_window_sizing_data()` |
 | `kitty/os_window_size.py` | `initial_window_size_func()` — computes pixel dimensions from cell size, DPI, and padding |
 | `kitty/child.py` | `openpty` (line 170), `get_final_env` (line 233), `Child.fork` (line 276), PTY creation at line 281, ready pipe at line 283, `fast_data_types.spawn()` at line 333, `mark_terminal_ready` at line 362 |
-| `kitty/child-monitor.c` | `io_loop` (line 229), `pthread_create(io_thread)` at line 291, `parse_input` (line 451), `send_cell_data_to_gpu` (line 714 / 766), `render_os_window` (line 833), `wakeup_main_loop` (line 1165), `process_global_state` (line 1224), `read_bytes` (line 1337) |
+| `kitty/child-monitor.c` | `io_loop` (forward-declared at line 229, defined at line 1481), `pthread_create(io_thread)` at line 291, `parse_input` (line 451), `send_cell_data_to_gpu` (line 714 / 766), `render_os_window` (line 833), `wakeup_main_loop` (line 1165), `process_global_state` (line 1224), `read_bytes` (line 1337) |
 | `kitty/window.py` | `child_is_launched` flag (line 578 / 865), `set_geometry` (around line 850), `mark_terminal_ready` call (line 866), `"Child launched"` print (line 871) |
-| `kitty/glfw.c` | `glfw_init`, `create_os_window` (lines 1253–1322), `"OS Window created"` debug print (line 1321) |
+| `kitty/glfw.c` | `glfw_init`, `create_os_window` (shader-loader callback invoked at line 1243; OS-window bookkeeping, sprite upload, icon, and event-callback registration at lines 1253–1322), `"OS Window created"` debug print (line 1321) |
 | `kitty/gl.c` | `gl_init`, `gladLoadGL`, `"GL version string"` debug print (line 72) |
 | `glfw/xkb_glfw.c` | `glfw_xkb_compile_keymap`, `"Loading new XKB keymaps"` (line 672), `"Modifier indices"` (lines 376, 540) |
 | `kitty/vt-parser.c` | VT state machine — CSI/OSC/DCS/APC dispatch; plain-text path into `screen_draw_text` |
