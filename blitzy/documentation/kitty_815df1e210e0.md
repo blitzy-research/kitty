@@ -106,6 +106,7 @@ The final 2 bytes are a union of several named-bitfield views declared at `kitty
 ```c
 typedef union CellAttrs {
     struct {
+        uint16_t width : 2;
         uint16_t decoration : 3;
         uint16_t bold : 1;
         uint16_t italic : 1;
@@ -113,16 +114,13 @@ typedef union CellAttrs {
         uint16_t strike : 1;
         uint16_t dim : 1;
         uint16_t mark : 2;
-        uint16_t width : 2;
         uint16_t next_char_was_wrapped : 1;
-        uint16_t invisible : 1;
-        uint16_t _unused : 2;
     };
     uint16_t val;
 } CellAttrs;
 ```
 
-The single bit that matters for rewrap is `next_char_was_wrapped`. When a program writes a character that would overflow the right column, the current right-edge cell has this bit set before the overflowing character appears on the next row. The bit is stored persistently on the last cell of the logical row (i.e., at column `xnum - 1`).
+The 9 named bit-fields total 13 bits (2+3+1+1+1+1+1+2+1) of the 16 bits in the underlying `uint16_t val`; the remaining 3 bits are unnamed padding that the compiler leaves unused (they do not appear in the source and must not be misread as an `_unused` field). The single bit that matters for rewrap is `next_char_was_wrapped`. When a program writes a character that would overflow the right column, the current right-edge cell has this bit set before the overflowing character appears on the next row. The bit is stored persistently on the last cell of the logical row (i.e., at column `xnum - 1`).
 
 **Critically, `next_char_was_wrapped` is excluded from the SGR reset mask.** `kitty/data-types.h:214` defines `SGR_MASK` as a 16-bit mask of the attributes that SGR (Set Graphic Rendition) sequences may reset: foreground/background/decoration bits and most presentation bits, but not `next_char_was_wrapped` and not `width`. This is important because an SGR reset (`ESC [ 0 m`) must NOT destroy the structural wrap information of the surrounding text — the wrap bit is a structural property of the buffer, not a presentation attribute.
 
@@ -157,13 +155,12 @@ typedef union LineAttrs {
         uint8_t has_dirty_text : 1;
         uint8_t has_image_placeholders : 1;
         PromptKind prompt_kind : 2;
-        uint8_t _unused : 3;
     };
     uint8_t val;
-} LineAttrs;
+} LineAttrs ;
 ```
 
-Four named fields fit in 7 bits, with 1 bit reserved. The one that matters for our analysis is `is_continued`, documented in §10 as a computed, never-stored signal. `prompt_kind` encodes the OSC 133 annotation (the `PromptKind` enum typedef at `kitty/data-types.h:230` together with the `LineAttrs` union at `:231-239` forms the block `kitty/data-types.h:230-239`: `UNKNOWN_PROMPT_KIND=0`, `PROMPT_START=1`, `SECONDARY_PROMPT=2`, `OUTPUT_START=3`); this is also important for the rewrap pathway because `prevent_current_prompt_from_rewrapping()` (§4.4) uses it to locate the current prompt, and `set_dest_line_attrs` (§6.4) clears it on the source after copying to the destination.
+Four named fields fit in 5 bits, with the remaining 3 bits in the 8-bit union being implicit compiler padding (not an explicit field in the source). The one that matters for our analysis is `is_continued`, documented in §10 as a computed, never-stored signal. `prompt_kind` encodes the OSC 133 annotation (the `PromptKind` enum typedef at `kitty/data-types.h:230` together with the `LineAttrs` union at `:231-239` forms the block `kitty/data-types.h:230-239`: `UNKNOWN_PROMPT_KIND=0`, `PROMPT_START=1`, `SECONDARY_PROMPT=2`, `OUTPUT_START=3`); this is also important for the rewrap pathway because `prevent_current_prompt_from_rewrapping()` (§4.4) uses it to locate the current prompt, and `set_dest_line_attrs` (§6.4) clears it on the source after copying to the destination.
 
 `has_dirty_text` is the redraw marker consulted by the GPU pipeline; rewrap sets it on all destination lines after completion (§7.4, §8.4). `has_image_placeholders` is used by the graphics protocol and is out of scope.
 
@@ -192,6 +189,7 @@ Both `LineBuf` and `HistoryBuf` own exactly one cached `Line` instance (`LineBuf
 ```c
 typedef struct {
     PyObject_HEAD
+
     GPUCell *gpu_cell_buf;
     CPUCell *cpu_cell_buf;
     index_type xnum, ynum, *line_map, *scratch;
@@ -217,12 +215,12 @@ The cached `line` field is the zero-allocation `Line` wrapper described in §3.4
 ```c
 typedef struct {
     PyObject_HEAD
+
     index_type xnum, ynum, num_segments;
     HistoryBufSegment *segments;
     PagerHistoryBuf *pagerhist;
     Line *line;
     index_type start_of_data, count;
-    bool *line_map;
 } HistoryBuf;
 ```
 
@@ -257,15 +255,13 @@ When the ring is full (`count == ynum`), a further push must evict the oldest sl
 
 ```c
 typedef struct {
-    ringbuf_t ringbuf;
+    void *ringbuf;
     size_t maximum_size;
     bool rewrap_needed;
 } PagerHistoryBuf;
 ```
 
-`ringbuf_t` is the vendored byte ring from `3rdparty/ringbuf/`. Evicted history lines are serialized to ANSI text and appended to this byte ringbuf by `pagerhist_push` (`kitty/history.c:258-273`), providing a lossy-but-searchable deep history. The `rewrap_needed` flag is set by `historybuf_rewrap` when the width has changed (`kitty/history.c:607-608`), and the actual rewrap of the pager ringbuf is lazy — it runs only when `pagerhist_as_bytes` is called (see §8.3).
-
-The `line_map` pointer at the end of the `HistoryBuf` struct is a marker array used for line-collapse tracking during the rewrap of the pager history itself; it is not used during normal resize-driven rewrap.
+The `ringbuf` pointer is declared as an opaque `void *` in the struct; at runtime it holds a `ringbuf_t` from the vendored byte ring at `3rdparty/ringbuf/`. Using `void *` in `data-types.h` avoids pulling `ringbuf.h` into a header that is included throughout the project. Evicted history lines are serialized to ANSI text and appended to this byte ringbuf by `pagerhist_push` (`kitty/history.c:258-273`), providing a lossy-but-searchable deep history. The `rewrap_needed` flag is set by `historybuf_rewrap` when the width has changed (`kitty/history.c:607-608`), and the actual rewrap of the pager ringbuf is lazy — it runs only when `pagerhist_as_bytes` is called (see §8.3).
 
 ## 3.7 Screen
 
@@ -912,7 +908,7 @@ This asymmetry is the reason the macro override is necessary. If LineBuf's defin
     src->line->attrs.prompt_kind = UNKNOWN_PROMPT_KIND
 ```
 
-There is no `#ifndef ... #endif` around this, so the HistoryBuf TU cannot override it. This is potentially concerning because `HistoryBuf` does NOT have a flat `line_attrs` array — its `line_attrs` is `NULL` on the parent struct; attrs are per-segment and accessed via `attrptr(buf, idx)`. If `dest->line_attrs[dest_y]` were ever evaluated in the HistoryBuf TU, it would dereference the `HistoryBuf::line_map` pointer (at offset `line_map` in the struct) — but since `HistoryBuf` also has a `line_attrs` field declared via the same struct hierarchy, the macro expansion would type-check wrong.
+There is no `#ifndef ... #endif` around this, so the HistoryBuf TU cannot override it. This is potentially concerning because `HistoryBuf` does NOT have a flat `line_attrs` array at all — see the struct definition at `kitty/data-types.h:282-290`, which has only `segments`, `pagerhist`, `line`, `start_of_data`, `count`, and the dimension fields. `LineAttrs` storage is per-segment inside `HistoryBufSegment::line_attrs` and is accessed via `attrptr(buf, idx)` in `kitty/history.c`. If `dest->line_attrs[dest_y]` were ever evaluated in the HistoryBuf TU, the compiler would fail outright because `line_attrs` is not a member of `HistoryBuf`.
 
 However, after macro expansion, `set_dest_line_attrs` is only referenced in the LineBuf default `first_dest_line` (`rewrap.h:21`) and at `rewrap.h:37` (the last line of the LineBuf `next_dest_line`). The HistoryBuf overrides replace BOTH of these. So `set_dest_line_attrs` is effectively dead code in the HistoryBuf TU — it is defined but never invoked during expansion. The unguarded definition is harmless. (It was likely left unguarded because whoever wrote this didn't need to — it doesn't appear in any HistoryBuf code path.)
 
@@ -1231,35 +1227,35 @@ historybuf_pop_line(HistoryBuf *self, Line *line) {
 
 The caller (`screen_resize` at `:432`) passes `self->alt_linebuf->line` as the `line` argument — a scratch Line wrapper (§11.8). After `historybuf_pop_line` returns, `alt_linebuf->line->cpu_cells` and `->gpu_cells` point into history-segment storage. `screen_resize` then calls `linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0)` which memcpys from that storage into row 0 of the main linebuf. So the content is physically copied; the popped history slot's storage remains intact but unreferenced.
 
-## 9.6 init_line bridge at screen.c:2834-2841
+## 9.6 init_line bridge at screen.c:2833-2840
 
 When the Screen renders a visible row (e.g., for drawing), it calls `init_line` to prepare the row's `Line` wrapper. The Screen's `init_line` is a separate function (not the history's `init_line`) defined at `kitty/screen.c`. For main linebuf row 0, a special case at `:2833-2840` overrides the `is_continued` value:
 
 ```c
-void
-init_line(Screen *self, Line *line, index_type y) {
-    if (line == NULL) line = self->linebuf->line;
+static Line*
+init_line(Screen *self, index_type y) {
     linebuf_init_line(self->linebuf, y);
-    if (y == 0 && self->linebuf == self->main_linebuf && history_buf_endswith_wrap(self->historybuf))
-        line->attrs.is_continued = true;
+    if (y == 0 && self->linebuf == self->main_linebuf) {
+        if (history_buf_endswith_wrap(self->historybuf)) self->linebuf->line->attrs.is_continued = true;
+    }
+    return self->linebuf->line;
 }
 ```
 
-`linebuf_init_line` sets `line->attrs.is_continued` based on row `y - 1`'s last GPU cell. For `y == 0`, there is no `y - 1` within the linebuf, and the default is `false` (see `kitty/line-buf.c:141-146`). This default is WRONG when there is history above row 0 that soft-wraps into it.
+`linebuf_init_line` sets `self->linebuf->line->attrs.is_continued` based on row `y - 1`'s last GPU cell. For `y == 0`, there is no `y - 1` within the linebuf, and the default is `false` (see `kitty/line-buf.c:140-147`). This default is WRONG when there is history above row 0 that soft-wraps into it.
 
-The override at `:2837` fixes this: if `y == 0` AND this is the main linebuf AND the most-recent history line ended with a wrap, set `is_continued = true`. This makes the row correctly identified as a continuation during rendering (e.g., for selection logic that spans soft-wrapped lines).
+The override at `:2836-2838` fixes this: if `y == 0` AND this is the main linebuf AND the most-recent history line ended with a wrap, set `is_continued = true`. This makes the row correctly identified as a continuation during rendering (e.g., for selection logic that spans soft-wrapped lines).
 
 `history_buf_endswith_wrap` at `kitty/history.c:184-187`:
 
 ```c
 bool
 history_buf_endswith_wrap(HistoryBuf *self) {
-    if (self->count == 0) return false;
-    return *(gpu_lineptr(self, index_of(self, 0)) + self->xnum - 1) & (/* next_char_was_wrapped bit */).attrs.next_char_was_wrapped;
+    return gpu_lineptr(self, index_of(self, 0))[self->xnum-1].attrs.next_char_was_wrapped;
 }
 ```
 
-(Simplified; actual access is via `init_line(self, index_of(self, 0), self->line)` and then reading `self->line->gpu_cells[...]`.)
+This is a single-statement read that dereferences the GPU cell array for the most-recent ring slot (`index_of(self, 0)`), indexes to the last cell (column `self->xnum-1`), and returns its `next_char_was_wrapped` bit. There is no explicit `count == 0` guard — callers rely on either always having at least one history line when this is reached during rendering, or on the `index_of` macro at `kitty/history.c:152-159` (which returns `0` when `count == 0`, yielding a read of physical slot 0 whose `next_char_was_wrapped` bit is `false` for an all-zeroed slot).
 
 This bridge is the **render-time** equivalent of the per-line `is_continued` computation in `linebuf_init_line` — it provides the continuation signal for the FIRST visible row by reaching into history. During RESIZE, the bridge is irrelevant (resize doesn't call this init_line); the resize path relies on the `next_char_was_wrapped` bit surviving the rewrap via `copy_range` memcpy.
 
@@ -1277,7 +1273,8 @@ The continuation of a logical line across multiple physical rows is represented 
 
 ```c
 typedef union CellAttrs {
-    struct __attribute__((packed)) {
+    struct {
+        uint16_t width : 2;
         uint16_t decoration : 3;
         uint16_t bold : 1;
         uint16_t italic : 1;
@@ -1285,16 +1282,13 @@ typedef union CellAttrs {
         uint16_t strike : 1;
         uint16_t dim : 1;
         uint16_t mark : 2;
-        uint16_t width : 2;
         uint16_t next_char_was_wrapped : 1;
-        uint16_t invisible : 1;
-        uint16_t hyperlink : 1;
     };
     uint16_t val;
 } CellAttrs;
 ```
 
-The `next_char_was_wrapped` bit is the 16th bit (MSB region, after width). It is a per-cell property that in practice is only meaningful on the LAST cell of each row (physical column `xnum - 1`). When set, it indicates that the NEXT character to be emitted after this cell "fell through" to the next row because the cursor advanced past the right margin — i.e., a soft wrap.
+The `next_char_was_wrapped` bit is the last (9th) named bit-field in the layout, declared after `mark`. It is a per-cell property that in practice is only meaningful on the LAST cell of each row (physical column `xnum - 1`). When set, it indicates that the NEXT character to be emitted after this cell "fell through" to the next row because the cursor advanced past the right margin — i.e., a soft wrap.
 
 **Persistence:** Stored in the cell's GPUCell and survives across ticks, frames, and scrolls. It is serialized to pager history (indirectly — the `\n` vs no-`\n` convention in `pagerhist_push` reflects it) and re-hydrated on pager-history rewrap.
 
@@ -1308,14 +1302,14 @@ The `next_char_was_wrapped` bit is the 16th bit (MSB region, after width). It is
 
 ```c
 typedef union LineAttrs {
-    struct __attribute__((packed)) {
+    struct {
         uint8_t is_continued : 1;
         uint8_t has_dirty_text : 1;
         uint8_t has_image_placeholders : 1;
-        uint8_t prompt_kind : 2;
+        PromptKind prompt_kind : 2;
     };
     uint8_t val;
-} LineAttrs;
+} LineAttrs ;
 ```
 
 The `is_continued` bit says "this line is a continuation of the previous line" — i.e., the previous line soft-wrapped into this one. Semantically it is the PER-LINE view of the same information that `next_char_was_wrapped` expresses PER-CELL on the preceding line.
@@ -1327,41 +1321,49 @@ For `LineBuf`, the computation is at `kitty/line-buf.c:140-147`:
 ```c
 void
 linebuf_init_line(LineBuf *self, index_type idx) {
+    self->line->ynum = idx;
     self->line->xnum = self->xnum;
     self->line->attrs = self->line_attrs[idx];
-    self->line->cpu_cells = cpu_lineptr(self, self->line_map[idx]);
-    self->line->gpu_cells = gpu_lineptr(self, self->line_map[idx]);
-    self->line->attrs.is_continued = idx > 0 ?
-        (gpu_lineptr(self, self->line_map[idx - 1])[self->xnum - 1].attrs.next_char_was_wrapped)
-        : false;
+    self->line->attrs.is_continued = idx > 0 ? gpu_lineptr(self, self->line_map[idx - 1])[self->xnum - 1].attrs.next_char_was_wrapped : false;
+    init_line(self, self->line, self->line_map[idx]);
 }
 ```
 
-The last statement READS the previous row's last cell's wrap bit and STORES it into the current line's `attrs.is_continued`. For `idx == 0`, there is no previous row, so `is_continued` defaults to `false`. This is where the history↔screen boundary is stitched at render time via the override in `screen.c:2833-2840` (§9.6).
+The inner `init_line(self, self->line, self->line_map[idx])` call delegates to the 3-line static helper at `kitty/line-buf.c:134-138`, which simply points `self->line->cpu_cells` and `self->line->gpu_cells` at the physical storage row indexed by `self->line_map[idx]`. Source for reference:
+
+```c
+static void
+init_line(LineBuf *lb, Line *l, index_type ynum) {
+    l->cpu_cells = cpu_lineptr(lb, ynum);
+    l->gpu_cells = gpu_lineptr(lb, ynum);
+}
+```
+
+The fourth statement of `linebuf_init_line` (the `is_continued` ternary) READS the previous row's last cell's wrap bit and STORES it into the current line's `attrs.is_continued`. For `idx == 0`, there is no previous row, so `is_continued` defaults to `false`. This is where the history↔screen boundary is stitched at render time via the override in `screen.c:2833-2840` (§9.6).
 
 For `HistoryBuf`, the computation is at `kitty/history.c:161-177`:
 
 ```c
 static void
 init_line(HistoryBuf *self, index_type num, Line *l) {
-    l->xnum = self->xnum;
-    l->attrs = *attrptr(self, num);
+    // Initialize the line l, setting its pointer to the offsets for the line at index (buffer position) num
     l->cpu_cells = cpu_lineptr(self, num);
     l->gpu_cells = gpu_lineptr(self, num);
+    l->attrs = *attrptr(self, num);
     if (num > 0) {
-        l->attrs.is_continued = (gpu_lineptr(self, num - 1))[self->xnum - 1].attrs.next_char_was_wrapped;
+        l->attrs.is_continued = gpu_lineptr(self, num - 1)[self->xnum-1].attrs.next_char_was_wrapped;
     } else {
         l->attrs.is_continued = false;
-        if (self->pagerhist && ringbuf_bytes_used(self->pagerhist->ringbuf)) {
-            uint8_t last;
-            ringbuf_memcpy_from(&last, self->pagerhist->ringbuf, 1);  // pseudocode
-            if (last != '\n') l->attrs.is_continued = true;
+        size_t sz;
+        if (self->pagerhist && self->pagerhist->ringbuf && (sz = ringbuf_bytes_used(self->pagerhist->ringbuf)) > 0) {
+            size_t pos = ringbuf_findchr(self->pagerhist->ringbuf, '\n', sz - 1);
+            if (pos >= sz) l->attrs.is_continued = true;  // ringbuf does not end with a newline
         }
     }
 }
 ```
 
-Same basic pattern: for `num > 0`, read the previous ring-slot's last cell and inherit its wrap bit. For `num == 0`, there's no previous slot IN THE RING, but there MAY be content in the pager ringbuf. In that case, check the last byte: if it's `\n`, the last pager line was a hard break → `is_continued = false`. If it's NOT `\n` (or anything else), the last pager line was a soft wrap → `is_continued = true`. This is the pager-history-aware override discussed in §11.5.
+Same basic pattern: for `num > 0`, read the previous ring-slot's last cell and inherit its wrap bit. For `num == 0`, there is no previous slot IN THE RING, but there MAY be content in the pager ringbuf. In that case, `ringbuf_findchr` is used to search for a `\n` byte starting at offset `sz - 1` (the last byte); if that search returns a position `>= sz` (i.e., no `\n` was found at the terminal position), the ringbuf does NOT end with a newline, meaning the last pager line was a soft wrap → `is_continued = true`. Otherwise, the ringbuf ends with a newline → the last pager line was a hard break → `is_continued = false` (the default). This is the pager-history-aware override discussed in §11.5, and the fact that the search positions itself at `sz - 1` (the last byte) rather than scanning the whole ringbuf is what makes this a constant-time check.
 
 **Self-correcting:** every call to `init_line` or `linebuf_init_line` recomputes `is_continued`. A stale bit cannot persist — it would be overwritten on the next read.
 
@@ -1387,21 +1389,24 @@ Same basic pattern: for `num > 0`, read the previous ring-slot's last cell and i
 
 **`next_char_was_wrapped` writers:**
 
-- `linebuf_set_last_char_as_continuation(self, y, on)` at `kitty/line-buf.c:193-198`:
+- `linebuf_set_last_char_as_continuation(self, y, continued)` at `kitty/line-buf.c:193-198`:
   ```c
   void
-  linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool on) {
-      gpu_lineptr(self, self->line_map[y])[self->xnum - 1].attrs.next_char_was_wrapped = on;
+  linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool continued) {
+      if (y < self->ynum) {
+          gpu_lineptr(self, self->line_map[y])[self->xnum - 1].attrs.next_char_was_wrapped = continued;
+      }
   }
   ```
-  Direct setter. Invoked from `rewrap.h:26` (LineBuf `next_dest_line`) and from cursor/output code in `screen.c`.
+  Direct setter. The `if (y < self->ynum)` bounds check silently no-ops the call if the row index is out of range. Invoked from `rewrap.h:26` (LineBuf `next_dest_line`) and from cursor/output code in `screen.c`.
 
-- `history_buf_set_last_char_as_continuation(self, num, on)` at `kitty/history.c:302-307`:
+- `history_buf_set_last_char_as_continuation(self, y, wrapped)` at `kitty/history.c:302-307`:
   ```c
-  void
-  history_buf_set_last_char_as_continuation(HistoryBuf *self, index_type num, bool on) {
-      if (self->count > 0)
-          gpu_lineptr(self, index_of(self, num))[self->xnum - 1].attrs.next_char_was_wrapped = on;
+  static void
+  history_buf_set_last_char_as_continuation(HistoryBuf *self, index_type y, bool wrapped) {
+      if (self->count > 0) {
+          gpu_lineptr(self, index_of(self, y))[self->xnum-1].attrs.next_char_was_wrapped = wrapped;
+      }
   }
   ```
   Same, for HistoryBuf. The `count > 0` guard prevents setting on an empty ring.
@@ -1455,7 +1460,7 @@ while(src_x_limit && src->line->cpu_cells[src_x_limit - 1].ch == BLANK_CHAR) src
 
 **Observation:** Compares only `ch == BLANK_CHAR` (= 0), not `CHAR_IS_BLANK` (= 0 or 32). Does not account for `CellAttrs.width`.
 
-**Rationale for concern:** Wide characters (East Asian characters, some symbols) occupy two cells: the "primary" cell with `width == 2` and `ch` set, followed by a "companion" cell with `width == 0` and `ch == 0`. The trim will trim the companion cell (`ch == BLANK_CHAR`) but stop at the primary (non-zero `ch`). Result: `src_x_limit == xnum - 1` on a line ending in a wide character, not `xnum`. 
+**Rationale for concern:** Wide characters (East Asian characters, some symbols) occupy two cells: the "primary" cell with `width == 2` and `ch` set, followed by a "companion" cell with `width == 0` and `ch == 0`. The trim will trim the companion cell (`ch == BLANK_CHAR`) but stop at the primary (non-zero `ch`). Result: `src_x_limit == xnum - 1` on a line ending in a wide character, not `xnum`.
 
 This MIGHT cause the companion cell to be omitted from the copy. Let's trace: `num = MIN(src->line->xnum - src_x, dest->xnum - dest_x)`. `src->line->xnum - src_x` is the DISTANCE TO THE END OF THE SOURCE ROW (not trimmed by `src_x_limit`). So if `src_x == xnum - 1` (on the primary cell) and `dest_x == 0`, `num = MIN(1, dest_xnum) = 1`. `copy_range` copies 1 cell — the primary. `src_x += 1 = xnum`, which is NOT LESS THAN `src_x_limit = xnum - 1`, so the outer loop exits. The companion cell is NOT copied.
 
@@ -1722,7 +1727,7 @@ This glossary defines the key terms used throughout this document. Each definiti
 
 **CPUCell** — A 12-byte cell struct at `kitty/data-types.h:223-228` containing the character codepoint (`ch`), any combining-character index (`cc_idx`), and hyperlink id (`hyperlink_id`). Held in CPU memory for logic.
 
-**CellAttrs** — A 16-bit union at `kitty/data-types.h:196-209` within `GPUCell`. Packs bit-fields for decoration, bold, italic, reverse, strike, dim, mark, width, `next_char_was_wrapped`, invisible, and hyperlink.
+**CellAttrs** — A 16-bit union at `kitty/data-types.h:196-209` within `GPUCell`. Packs bit-fields (in source order): `width` (2), `decoration` (3), `bold` (1), `italic` (1), `reverse` (1), `strike` (1), `dim` (1), `mark` (2), `next_char_was_wrapped` (1). Totals 13 bits of the 16-bit `val`, leaving 3 bits unused (implicit compiler padding; no explicit unused field in source).
 
 **LineAttrs** — An 8-bit union at `kitty/data-types.h:231-239` stored PER-LINE (not per-cell). Packs bit-fields for `is_continued`, `has_dirty_text`, `has_image_placeholders`, and `prompt_kind` (2 bits).
 
