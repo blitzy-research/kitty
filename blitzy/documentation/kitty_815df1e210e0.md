@@ -1,6 +1,6 @@
 # Kitty Runtime Language-Responsibility Investigation (v0.35.2, commit 815df1e21)
 
-> **TL;DR.** The running Kitty process is a C-centric GPU terminal emulator that embeds CPython for orchestration, confines all Python to a single cooperative main thread, delegates every wrapped kitten (including `icat`) via `execv`/`os.execl` to a completely separate, statically-linked Go binary, and maintains two parallel SIMD implementations (C for the hot VT parser, Go for the portable kitten binary) because the kitten must be deployable over SSH with only `libc` linked.
+> **TL;DR.** The running Kitty process is a C-centric GPU terminal emulator that embeds CPython for orchestration, confines all Python to a single cooperative main thread, delegates every wrapped kitten (including `icat`) via `execv`/`os.execl` to a completely separate Go binary that links no shared library other than `libc.so.6`, and maintains two parallel SIMD implementations (C for the hot VT parser, Go for the portable kitten binary) because the kitten must be deployable over SSH with only `libc` linked.
 
 **Repository:** `kovidgoyal/kitty`
 **Commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
@@ -160,17 +160,21 @@ Kitty is a GPU-accelerated graphical terminal. It therefore needs either an
 X11 display, a Wayland compositor, or its headless `null` backend:
 
 ```bash
+$ unset DISPLAY WAYLAND_DISPLAY
 $ ./kitty/launcher/kitty
-[ERROR] glfw: Failed to detect any supported platform.
-Failed to initialize GLFW: unknown error
+[0.058] [glfw error 65544]: X11: The DISPLAY environment variable is missing
+GLFW initialization failed
 ```
 
-This is the expected failure mode in a container without `DISPLAY` /
-`WAYLAND_DISPLAY` / a DRM device; it is produced by the GLFW init path
-embedded in `kitty/fast_data_types.so`. The failure is *runtime* (the
-binary built and loaded fine — see §2.1) and not a build failure, which is
-itself useful evidence for §3 (the thread/render model lives in the built
-binaries).
+The leading bracketed number (`[0.058]`) is GLFW's elapsed-time
+microsecond timer and varies by a few thousandths between runs; the
+rest of the message is stable. This is the expected failure mode in a
+container without `DISPLAY` / `WAYLAND_DISPLAY` / a DRM device; it is
+produced by the GLFW init path embedded in `kitty/fast_data_types.so`.
+The GLFW error code `65544` is `GLFW_PLATFORM_ERROR` (= `0x10008`).
+The failure is *runtime* (the binary built and loaded fine — see §2.1)
+and not a build failure, which is itself useful evidence for §3 (the
+thread/render model lives in the built binaries).
 
 Non-interactive commands that do **not** need a display succeed:
 
@@ -271,11 +275,19 @@ The Go binary (see §2.3) has none of these dependencies.
 ```
 $ readelf -d kitty/launcher/kitten | grep NEEDED
  0x0000000000000001 (NEEDED)  Shared library: [libc.so.6]
+
+$ file kitty/launcher/kitten
+kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV),
+    dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
+    Go BuildID=..., with debug_info, not stripped (or stripped in a CI build)
 ```
 
-A single `NEEDED: libc.so.6`. The Go binary is self-contained at 15.7 MB
-and statically bundles every library it uses (HTTP, TLS, image codecs,
-syntax-highlighting grammars, etc.).
+A single `NEEDED: libc.so.6`. The Go binary is **dynamically linked against
+`libc.so.6` only** (required by the CGO runtime shim — see §6.5 for the
+`_cgo_panic` / `_cgo_topofstack` / `crosscall2` symbols) while every Go
+dependency — HTTP, TLS, image codecs, syntax-highlighting grammars — is
+statically bundled into the binary by Go's normal package linking. At
+15.7 MB on disk, it contains everything except `libc`.
 
 ### 2.2 `PyInit_fast_data_types()` — the C↔Python bridge
 
@@ -309,17 +321,18 @@ into the single Python module:
 **Live inspection of the built extension:**
 
 ```python
->>> import kitty.fast_data_types as f
->>> type_count = sum(1 for n in dir(f) if isinstance(getattr(f,n), type))
->>> const_count = sum(1 for n in dir(f) if isinstance(getattr(f,n), int))
->>> func_count  = sum(1 for n in dir(f) if callable(getattr(f,n))
-                                      and not isinstance(getattr(f,n), type))
->>> total = len([n for n in dir(f) if not n.startswith('_')])
-(types=23, constants=365, functions=193, total=581)
+>>> import inspect, kitty.fast_data_types as f
+>>> attrs  = [n for n in dir(f) if not n.startswith('_')]
+>>> types  = [n for n in attrs if inspect.isclass(getattr(f, n))]
+>>> funcs  = [n for n in attrs if callable(getattr(f, n))
+...                            and not inspect.isclass(getattr(f, n))]
+>>> consts = [n for n in attrs if not callable(getattr(f, n))]
+>>> print(len(types), len(funcs), len(consts), len(attrs))
+23 188 370 581
 ```
 
-So `fast_data_types` publishes **23 C-implemented types**, **193
-C-implemented functions**, and **365 constants** — 581 public attributes
+So `fast_data_types` publishes **23 C-implemented types**, **188
+C-implemented functions**, and **370 constants** — 581 public attributes
 from a single module. By contrast, the Python layer implements very few
 C-like types of its own; most of the Python code under `kitty/*.py` is
 *dispatch* that eventually hits this module.
@@ -753,17 +766,27 @@ Python initialisation. This means the Go binary is reached *without* ever
 loading `libpython3.12.so.1.0` — it really is a completely separate
 runtime.
 
-The compiled-in list `WRAPPED_KITTENS` (confirmed by `strings` on the
-built binary) contains exactly:
+The authoritative source of this list is `shell-integration/ssh/kitty:27`,
+which defines it in raw declaration order:
+
+```
+clipboard icat hyperlinked_grep ask hints unicode_input ssh themes diff show_key transfer query_terminal
+```
+
+`setup.py:1075-1082` (`def wrapped_kittens()`) reads that single line,
+splits on whitespace, and **sorts** the tokens before embedding them
+into the C launcher via `cppflags = [define(f'WRAPPED_KITTENS=" {wrapped_kittens()} "')]`
+(`setup.py:1233`). The resulting binary-embedded string is therefore
+the sorted form, which `strings` on the built binary confirms:
 
 ```
 ask clipboard diff hints hyperlinked_grep icat query_terminal
 show_key ssh themes transfer unicode_input
 ```
 
-Twelve kittens. (These are the "wrapped" kittens; there are also a
-handful of still-Python kittens like `runner.py`, handled separately
-via `run_kitten()` in `kitty/entry_points.py`.)
+Twelve kittens, sorted. (These are the "wrapped" kittens; there are
+also a handful of still-Python kittens like `runner.py`, handled
+separately via `run_kitten()` in `kitty/entry_points.py`.)
 
 ### 5.2 Python-side delegation — `os.execl` for the icat entry point
 
@@ -935,11 +958,13 @@ shared between it and the parent kitty process **at the binary level**.
 Two pragmatic reasons visible in the code:
 
 1. **Deployability (SSH).** The `ssh` kitten (`kittens/ssh/main.go`) needs
-   to bootstrap itself on an arbitrary remote host. Being a single static
-   ELF with only `libc` linked is essential for that story; a Python-
-   dependent kitten would require a Python interpreter on the remote.
-   The `shell-integration/ssh/kitty` and `shell-integration/ssh/kitten`
-   shell scripts in this repo are specifically for this bootstrapping.
+   to bootstrap itself on an arbitrary remote host. Being a single
+   self-contained Go ELF with only `libc.so.6` linked (every Go
+   dependency is statically bundled by the Go toolchain) is essential
+   for that story; a Python-dependent kitten would require a Python
+   interpreter on the remote. The `shell-integration/ssh/kitty` and
+   `shell-integration/ssh/kitten` shell scripts in this repo are
+   specifically for this bootstrapping.
 2. **Cold-start cost.** Invoking `kitty +kitten clipboard "hello"` from
    any shell has to be fast; paying CPython interpreter-startup cost
    every time would be visible to users. `execv` into a Go binary is
@@ -960,13 +985,20 @@ environment precluded it.
 ### 6.1 What was attempted
 
 ```bash
-# 1. Symbol-level inspection of the extension
+# 1. Dynamic-symbol inspection of the extension
 $ nm -D kitty/fast_data_types.so | wc -l
-6841
+388
 $ nm -D kitty/fast_data_types.so | grep " T " | wc -l     # defined text symbols
-2793
+8
 $ nm -D kitty/fast_data_types.so | grep " U " | wc -l     # external refs
-4048
+376
+
+# The dynamic-symbol table is intentionally small: the extension only needs
+# to export `PyInit_fast_data_types` plus a handful of other entry points,
+# because Python loads the module via `dlopen` and invokes `PyInit_*` by
+# name. Everything else is internal linkage. The full (non-dynamic) symbol
+# table — obtained with plain `nm` — exposes the internal structure and is
+# the basis for §6.2 below.
 
 # 2. Attach-style inspection was NOT possible — no gdb attach without CAP_SYS_PTRACE
 #    in this container, and the kitty process needs a display to stay alive.
@@ -975,24 +1007,57 @@ $ nm -D kitty/fast_data_types.so | grep " U " | wc -l     # external refs
 
 ### 6.2 Defined-symbol evidence (inside `fast_data_types.so`)
 
-Grouping the defined text symbols by prefix (partial listing):
+Plain `nm` (the full symbol table, not just the dynamic one) reveals the
+internal structure. Grouping the defined text symbols (`T`/`t`) by the
+leading identifier component:
 
 ```
-Parser_*          (VT escape-sequence parser entry points)
-Screen_*          (Screen methods: draw, scroll, resize, dirty-region…)
-LineBuf_* / HistoryBuf_*  (scrollback ring buffer)
-ChildMonitor_*    (the three-thread engine)
-OSWindow_* / Border_*     (window + border management)
-graphics_*        (graphics protocol: load_image, composite, disk cache)
-fonts_*, glyph_cache_*, freetype_*, harfbuzz_shape_* (font pipeline)
-shaders_*, gl_*   (OpenGL shader program + draw dispatch)
-simd_string_*     (SSE/AVX/NEON accelerated byte scanners)
-crypto_*          (X25519 + AES-GCM for remote-control encryption)
+$ nm kitty/fast_data_types.so \
+    | awk '$2 ~ /^[Tt]$/ {print $3}' \
+    | grep -oE "^[a-zA-Z_]+" \
+    | sort | uniq -c | sort -rn | head -16
+     72 glad_       (OpenGL function-loader trampolines, from GLAD)
+     43 screen_     (Screen methods: scroll, resize, dirty-region, redraw…)
+     32 set_        (property setters across Screen/Line/Cursor/Options…)
+     25 get_        (matching getters)
+     25 base64_     (vendored base64 encode/decode)
+     20 cursor_     (cursor state/render helpers)
+     17 pyset_      (Python-object construction helpers)
+     17 new_        (type __new__ slots)
+     16 add_        (mutators on the data structures)
+     14 render_     (render_os_window, render_prepared_os_window, …)
+     13 find_       (lookup helpers on screen, line, history)
+     13 SingleKey_  (Kitty keyboard-protocol single-key encoding)
+     11 draw_       (draw_cells, draw_text, draw_graphics, draw_tint)
+     10 parse_      (parse_color, parse_graphics_code, parse_input_from_terminal, parse_worker)
+     10 line_       (Line methods)
+      9 init_       (the PyInit sub-initialisers: init_child_monitor, init_shaders, …)
 ```
 
-Every one of these is a C symbol, defined in the extension, callable from
-Python via the `fast_data_types` module's `init_*` registration. Together
-they cover the *entire* hot path identified in §3.4.
+Representative individual hot-path symbols present in the extension:
+
+```
+T draw_cells              — shader-driven text/graphics rendering
+T draw_graphics           — graphics-protocol compositing
+T draw_tint               — background-tint pass
+T render_os_window        — main-thread render driver
+T parse_input_from_terminal  — VT escape-sequence state machine entry
+T utf8_decode_to_esc      — scalar UTF-8 → escape-boundary scanner
+T utf8_decode_to_esc_128  — SSE2 variant
+T utf8_decode_to_esc_256  — AVX2 variant
+T utf8_decode_to_esc_scalar  — explicit scalar fallback
+T xor_data64 / xor_data64_128 / xor_data64_256   — remote-control AES-GCM XOR
+T wcswidth_std / wcwidth_std  — Unicode width classification
+T screen_align / screen_change_charset / screen_cursor_at_a_line / ...
+```
+
+Every one of these is a C symbol, defined in the extension, and the `init_*`
+sub-initialisers (9 symbols with the `init_` prefix — `init_child_monitor`,
+`init_shaders`, `init_graphics`, `init_fonts`, `init_keys`, `init_mouse`,
+`init_crypto_library`, `init_kittens`, `init_state`, etc.) are exactly what
+`PyInit_fast_data_types` calls in sequence (§2.3). Together they cover the
+*entire* hot path identified in §3.4 — there is **no** Python function on
+the rendering/parsing critical path, because none exists at this layer.
 
 ### 6.3 Undefined-symbol evidence (what the extension pulls in)
 
@@ -1026,11 +1091,27 @@ U PyErr_Occurred
   link against `libpython3.12.so.1.0` (see `readelf -d` in §2.1) is
   runtime-observable evidence that the C extension *does* know about the
   GIL and manages it.
-- No `Harfbuzz_*` or `FT_*` or `png_*` symbols are marked undefined —
-  HarfBuzz, FreeType, and libpng are loaded via the
-  `NEEDED: libharfbuzz.so.0 / libfreetype.so.6 / libpng16.so.16` entries
-  and resolved by the dynamic linker. That is: the C extension is the
-  one that talks to them, not Python directly.
+- `FT_*`, `hb_*`, and `png_*` symbols **are** marked undefined and are
+  resolved at load time by the dynamic linker from the `NEEDED` entries
+  (`libharfbuzz.so.0 / libfreetype.so.6 / libpng16.so.16`) listed in
+  §2.1. Exact counts on the built extension:
+
+  ```
+  $ nm -D kitty/fast_data_types.so | awk '$1=="U" && $2 ~ /^FT_/' | wc -l
+  25
+  $ nm -D kitty/fast_data_types.so | awk '$1=="U" && $2 ~ /^hb_/' | wc -l
+  22
+  $ nm -D kitty/fast_data_types.so | awk '$1=="U" && $2 ~ /^png_/' | wc -l
+  25
+  ```
+
+  Representative names:
+  `U FT_Bitmap_Convert`, `U FT_Done_Face`, `U FT_Load_Glyph`,
+  `U hb_buffer_create`, `U hb_shape`, `U hb_font_create`,
+  `U png_read_image@PNG16_0`, `U png_create_read_struct@PNG16_0`.
+  That is: **the C extension is the one that talks to HarfBuzz /
+  FreeType / libpng, not Python directly**. Python has no way to reach
+  these libraries except through `fast_data_types`.
 
 ### 6.4 Thread-comm trace (substitute for live stacks)
 
@@ -1053,21 +1134,57 @@ reason for an override otherwise.
 
 ### 6.5 Go-binary symbol observations
 
-The Go binary is stripped (`-ldflags "-s -w"`), so `nm` on it yields
-essentially nothing:
+The Go binary is stripped (`-ldflags "-s -w"` — see `setup.py` around
+line 1182), so plain `nm` on it produces only the "no symbols" notice:
 
 ```
-$ nm kitty/launcher/kitten | wc -l
+$ nm kitty/launcher/kitten 2>/dev/null | wc -l
 0
-$ nm -D kitty/launcher/kitten | wc -l
-3         (runtime.buildVersion, runtime.modinfo, go:buildinfo)
+$ nm kitty/launcher/kitten
+nm: kitty/launcher/kitten: no symbols
 ```
 
-But `go version -m` (shown in §5.4) is the Go-specific equivalent: it
-reads the `go.buildinfo` section and reports all the modules statically
-linked into the binary — 15 direct and indirect dependencies. This plus
-the `Go BuildID` in `file(1)`'s output forms the portable way to prove
-what a stripped Go binary contains.
+The *dynamic* symbol table, on the other hand, is small but non-empty —
+it is exactly the CGO runtime shim plus the GLIBC imports resolved at
+load time by `libc.so.6`:
+
+```
+$ nm -D kitty/launcher/kitten | wc -l
+46
+$ nm -D kitty/launcher/kitten | awk '$2=="T"'
+                 T _cgo_panic
+                 T _cgo_topofstack
+                 T crosscall2
+$ nm -D kitty/launcher/kitten | awk '$2=="U"' | wc -l
+43
+$ nm -D kitty/launcher/kitten | awk '$2=="U"' | head -10
+                 U __errno_location@GLIBC_2.2.5
+                 U free@GLIBC_2.2.5
+                 U fwrite@GLIBC_2.2.5
+                 U malloc@GLIBC_2.2.5
+                 U pthread_attr_destroy@GLIBC_2.2.5
+                 U pthread_attr_getstacksize@GLIBC_2.2.5
+                 U pthread_attr_init@GLIBC_2.2.5
+                 U pthread_create@GLIBC_2.2.5
+                 U pthread_detach@GLIBC_2.2.5
+                 U pthread_sigmask@GLIBC_2.32
+```
+
+The three defined `T` symbols — `_cgo_panic`, `_cgo_topofstack`, and
+`crosscall2` — are the CGO runtime bridge: they exist because Go was
+built with `CGO_ENABLED=1` on this native build (see §5.4 and `setup.py`
+around line 1175), which enables Go's net/os packages to use glibc's
+resolver. The 43 undefined `U` symbols are all `@GLIBC_*` entries
+resolved via the single `NEEDED: libc.so.6` in the ELF header. There
+is **no** Python, libharfbuzz, libfreetype, libpng, or OpenGL symbol —
+consistent with the kitten running as a separate process with no
+inherited memory from the parent.
+
+`go version -m` (shown in §5.4) is the Go-specific complement: it reads
+the `go.buildinfo` section and reports all the modules statically linked
+into the binary — 15 direct and indirect dependencies. This plus the
+`Go BuildID` in `file(1)`'s output forms the portable way to prove what
+a stripped Go binary contains.
 
 ### 6.6 Net effect
 
@@ -1194,20 +1311,23 @@ The reason both exist is direct:
   on the VT-parser hot path. See §6.4 — `KITTY_SIMD=0` can be used to
   turn it off, which in itself is evidence it is on the hot path.
 - The Go version runs inside the `kitten` binary, which has **no shared
-  libraries from the kitty main process** (§2.1 — only `libc.so.6`
-  linked). A Go binary cannot reuse the C `simd-string.c` code at
-  runtime without introducing either CGO (destroying the
-  "static-binary-runs-on-any-remote-host" property — see §5.6) or a
-  shared-library dependency (destroying the same property).
+  libraries from the kitty main process** (§2.1 — the only `NEEDED`
+  entry is `libc.so.6`; all Go modules are statically bundled by the
+  Go linker). A Go binary cannot reuse the C `simd-string.c` code at
+  runtime without introducing a non-libc shared-library dependency or
+  switching to a CGO call-out, either of which would break the
+  "self-contained-Go-binary-runs-on-any-remote-host-with-compatible-glibc"
+  property that `kitty +kitten ssh` relies on (§5.6).
 
 **The tradeoff stated plainly:** Because the kitten is required to be a
-self-contained static binary so it can be rsync'd to a fresh remote host
-and run under `kitty +kitten ssh`, *the SIMD hot-path code is
-implemented twice*. The cost is implementation duplication and the
+self-contained Go binary with no non-libc runtime dependencies — so it
+can be rsync'd to a fresh remote host and run under `kitty +kitten ssh`
+against only the remote's stock `libc.so.6` — *the SIMD hot-path code
+is implemented twice*. The cost is implementation duplication and the
 permanent risk of the two drifting; the benefit is that kittens stay
-portable, cold-start-fast, and deployable anywhere Linux+libc runs,
-while the main process keeps its C-native performance on the parser
-hot path.
+portable, cold-start-fast, and deployable anywhere Linux with a
+compatible glibc runs, while the main process keeps its C-native
+performance on the parser hot path.
 
 The same tradeoff is visible for **X25519 + AES-GCM encryption**:
 `kitty/crypto.c` in the main process versus `tools/crypto/*.go` in the
@@ -1219,10 +1339,11 @@ same portability reason.
 > Kitty is a **C-core** terminal emulator that embeds CPython for
 > orchestration and configuration, **never lets Python touch the hot
 > path** (single Python thread + GIL switchinterval of 1000 s), and
-> **spawns its CLI tooling as a separate static Go process** by
-> `execv()`-replacing the launcher before CPython is even initialised,
-> paying the cost of duplicated SIMD/crypto code in exchange for
-> deployable-anywhere kittens.
+> **spawns its CLI tooling as a separate self-contained Go process**
+> (linking only `libc.so.6`, with every Go dependency statically
+> bundled) by `execv()`-replacing the launcher before CPython is even
+> initialised, paying the cost of duplicated SIMD/crypto code in
+> exchange for deployable-anywhere kittens.
 
 ---
 
@@ -1256,14 +1377,15 @@ readelf -d kitty/fast_data_types.so | grep NEEDED
 
 # A.5 Extension-module exports (§2.2)
 python3 -c '
-import kitty.fast_data_types as f
-items = [n for n in dir(f) if not n.startswith("_")]
-t = sum(1 for n in items if isinstance(getattr(f,n), type))
-i = sum(1 for n in items if isinstance(getattr(f,n), int)
-                          and not isinstance(getattr(f,n), bool))
-c = sum(1 for n in items if callable(getattr(f,n)) and not isinstance(getattr(f,n), type))
-print(f"types={t} constants={i} functions={c} total={len(items)}")
+import inspect, kitty.fast_data_types as f
+attrs  = [n for n in dir(f) if not n.startswith("_")]
+types  = [n for n in attrs if inspect.isclass(getattr(f, n))]
+funcs  = [n for n in attrs if callable(getattr(f, n))
+                           and not inspect.isclass(getattr(f, n))]
+consts = [n for n in attrs if not callable(getattr(f, n))]
+print(f"types={len(types)} constants={len(consts)} functions={len(funcs)} total={len(attrs)}")
 '
+# → types=23 constants=370 functions=188 total=581
 
 # A.6 Thread-name proof (§3.3) — requires running a kitty process with a
 # controlled null backend and then reading /proc
