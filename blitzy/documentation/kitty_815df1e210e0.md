@@ -529,8 +529,8 @@ The following table shows when each segment allocation occurs as lines are pushe
 |----------------------|---------------------|----------------|------------------|----------------|
 | 0 (Screen creation) | seg 0 (eager) | 1 | 5 244 928 | 5.002 |
 | 2 048 | — (still filling seg 0) | 1 | 5 244 928 | 5.002 |
-| 2 049 | seg 1 (lazy) | 2 | 10 489 856 | 10.003 |
-| 4 097 | seg 2 (lazy) | 3 | 15 734 784 | 15.005 |
+| 2 049 | seg 1 (lazy) | 2 | 10 489 856 | 10.004 |
+| 4 097 | seg 2 (lazy) | 3 | 15 734 784 | 15.006 |
 | 6 145 | seg 3 (lazy) | 4 | 20 979 712 | 20.008 |
 | 8 193 | seg 4 (lazy) | 5 | 26 224 640 | 25.010 |
 
