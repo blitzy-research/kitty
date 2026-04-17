@@ -9,9 +9,12 @@ targets Kitty **version 0.35.2** (see `kitty/constants.py` line 25:
 Every answer below is grounded in the Kitty source tree. File paths are
 relative to the repository root; line numbers reference the repository as it
 exists at the current commit. All code excerpts are direct, verbatim quotes
-from the source — no paraphrasing. Where behavior differs between platforms
-(Linux vs. macOS/BSD) or between scenarios (direct-child vs. shell-integrated),
-the difference is called out explicitly.
+from the source — no paraphrasing of the content that is shown. Where an
+excerpt is abbreviated, elided lines are denoted by an explicit `...` marker
+and the excerpt is labeled `(excerpt)` or `(excerpts)`; the lines that *are*
+shown always match the source at the cited line numbers exactly. Where
+behavior differs between platforms (Linux vs. macOS/BSD) or between scenarios
+(direct-child vs. shell-integrated), the difference is called out explicitly.
 
 ---
 
@@ -636,7 +639,7 @@ encoded exit/signal status.
 
 #### Evidence
 
-*File: `kitty/child-monitor.c`, lines 1413–1426:*
+*File: `kitty/child-monitor.c`, lines 1412–1426:*
 
 ```c
 static void
@@ -936,21 +939,22 @@ Kitty allocates a PTY master/slave pair in `Child.fork()` in
 In the native `spawn()`, after `fork()` the child branch sets up the PTY
 slave as its controlling terminal and attaches it as stdin/stdout/stderr:
 
-*File: `kitty/child.c`, lines 81–132 (excerpts):*
+*File: `kitty/child.c`, lines 80–170 (excerpts):*
 
 ```c
 static PyObject*
 spawn(PyObject *self UNUSED, PyObject *args) {
     ...
     pid_t pid = fork();
-    ...
-    if (pid == 0) {
-        ...
-        if (setsid() == -1) exit_on_err("setsid() in child process failed");
-        ...
-        if (ioctl(tfd, TIOCSCTTY, 0) == -1) exit_on_err("Failed to set controlling terminal with TIOCSCTTY");
-        ...
-    }
+    switch(pid) {
+        case 0: {
+            // child
+            ...
+            if (setsid() == -1) exit_on_err("setsid() in child process failed");
+            ...
+            if (ioctl(tfd, TIOCSCTTY, 0) == -1) exit_on_err("Failed to set controlling terminal with TIOCSCTTY");
+            ...
+        }
 ```
 
 The kernel guarantees that any bytes the child writes to fd 1 (stdout) —
@@ -1008,19 +1012,24 @@ Key lines:
 
 `read_bytes()` is invoked from the I/O loop:
 
-*File: `kitty/child-monitor.c`, lines 1531–1535 (excerpt):*
+*File: `kitty/child-monitor.c`, lines 1529–1538 (excerpt):*
 
 ```c
                 if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
                     data_received = true;
                     has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);
-                    ...
-                    if (!has_more) children[i].needs_removal = true;
+                    if (!has_more) {
+                        // child is dead
+                        children_mutex(lock);
+                        children[i].needs_removal = true;
+                        children_mutex(unlock);
+                    }
                 }
 ```
 
-Line 1531 calls `read_bytes()`; line 1535 marks the child for removal if
-`read_bytes()` returned `false` (EOF — see Q3).
+Line 1531 calls `read_bytes()`; lines 1532–1537 mark the child for
+removal (under the `children_mutex`) if `read_bytes()` returned `false`
+(EOF — see Q3).
 
 #### Evidence — VT parser → screen model
 
@@ -1233,10 +1242,11 @@ prompt.
 
 ### 5.1 `close_on_child_death` (default: `no`)
 
-*File: `kitty/options/definition.py`, line 2920:*
+*File: `kitty/options/definition.py`, lines 2920–2921:*
 
 ```python
-opt('close_on_child_death', 'no', option_type='to_bool', ctype='bool',
+opt('close_on_child_death', 'no',
+    option_type='to_bool', ctype='bool',
 ```
 
 When `no` (the default), Kitty **does not close** the window when the
@@ -1257,7 +1267,7 @@ exactly as a normal interactive terminal would behave.
 *File: `kitty/options/definition.py`, line 3190:*
 
 ```python
-opt('notify_on_cmd_finish', 'never', option_type='notify_on_cmd_finish', long_text=
+opt('notify_on_cmd_finish', 'never', option_type='notify_on_cmd_finish', long_text='''
 ```
 
 And for the accompanying duration threshold:
