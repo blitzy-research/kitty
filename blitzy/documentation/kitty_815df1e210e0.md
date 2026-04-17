@@ -34,13 +34,14 @@ This document is a code-as-truth empirical analysis of the kitty terminal emulat
 
 The key architectural finding is a **three-tier criticality classification** of compiled extensions, derived directly from **where each extension is imported in the source tree**:
 
-| Tier | Extension | Import Trigger Site | Tests Blocked If Missing |
+| Tier | Extension | Import Trigger Site | Tests Blocked / Affected If Missing |
 |------|-----------|---------------------|--------------------------|
 | **CRITICAL** | `kitty/fast_data_types.so` | `kitty_tests/__init__.py` line 22 (package-level) | All 145 Python tests |
 | **SECONDARY FAILURE DOMAIN** | `kittens/transfer/rsync.so` | `kitty_tests/file_transmission.py` line 13 (test-module-level) | All Python tests (via `find_all_tests` import crash) |
-| **LOCALIZED** | `kitty/glfw-x11.so`, `kitty/glfw-wayland.so` | `kitty_tests/check_build.py` line 46 (filesystem `os.path.isfile()` check, runtime only) | 1 test (`test_glfw_modules`) |
+| **LOCALIZED (asymmetric)** | `kitty/glfw-x11.so` | `kitty_tests/check_build.py` line 46 (filesystem `os.path.isfile()` check) **plus** `kitty_tests/glfw.py` line 50 (`ctypes.CDLL(glfw_path('x11'))` runtime library load) | 2 tests: `test_glfw_modules` (FAIL) + `test_utf_8_strndup` (ERROR) |
+| **LOCALIZED** | `kitty/glfw-wayland.so` | `kitty_tests/check_build.py` line 46 (filesystem `os.path.isfile()` check, runtime only) | 1 test (`test_glfw_modules` FAIL) |
 
-The criticality tier of each extension correlates directly with **at what point in the import lifecycle the dependency manifests** — package initialization, test-module discovery, or per-test runtime — and not with the functional importance of the extension. Go tests are fully isolated from C extensions: they run in a separate OS subprocess via `go test` (`kitty_tests/main.py` lines 185–192) and receive only the launcher path through the `KITTY_PATH_TO_KITTY_EXE` environment variable (`kitty_tests/main.py` line 155).
+The criticality tier of each extension correlates directly with **at what point in the import lifecycle the dependency manifests** — package initialization, test-module discovery, or per-test runtime — and not with the functional importance of the extension. The **asymmetry between the two GLFW backends** is significant: although both are filesystem-checked by `test_glfw_modules`, only `glfw-x11.so` is additionally loaded as a shared library by `test_utf_8_strndup` via `ctypes.CDLL` (`kitty_tests/glfw.py` line 50 hard-codes `glfw_path('x11')`). Therefore removing `glfw-x11.so` affects 2 tests while removing `glfw-wayland.so` affects only 1. Go tests are fully isolated from C extensions: they run in a separate OS subprocess via `go test` (`kitty_tests/main.py` lines 185–192) and receive only the launcher path through the `KITTY_PATH_TO_KITTY_EXE` environment variable (`kitty_tests/main.py` line 155).
 
 ---
 
@@ -417,9 +418,11 @@ Importantly, this `ModuleNotFoundError` is **uncaught** by `find_all_tests()`. I
 
 The practical effect is that a missing `rsync.so` blocks **all** Python tests, not just `file_transmission` tests. Verified empirically (see Section 10.2).
 
-### 4.3 `kitty/glfw-x11.so` — LOCALIZED
+### 4.3 `kitty/glfw-x11.so` — LOCALIZED (asymmetric, 2 tests affected)
 
-**Load trigger**: Filesystem existence check at runtime, only inside `test_glfw_modules`.
+**Load triggers (TWO distinct sites, both runtime)**:
+
+1. **Filesystem existence check** inside `test_glfw_modules`:
 
 ```python
 # kitty_tests/check_build.py lines 38-47 (verbatim)
@@ -435,13 +438,33 @@ def test_glfw_modules(self) -> None:
         self.assertTrue(os.access(path, os.X_OK), f'{path} is not executable')
 ```
 
-The GLFW backends are **never** imported as Python modules. They are loaded by the C side of `init_glfw()` via `dlopen` at runtime when a graphical kitty window is created. The test exercises only the build-correctness invariant: the file must exist and be executable. If the file is removed, `os.path.isfile(path)` returns `False` and `self.assertTrue(...)` fails at line 46.
+When this loop iterates with `name == 'x11'`, a missing file triggers `os.path.isfile(path) == False`, causing `assertTrue` to **FAIL** at line 46.
 
-**Cascade behavior**: Localized — exactly one test (`test_glfw_modules`) fails. All other 144 Python tests run unaffected. Verified empirically (see Section 10.3).
+2. **`ctypes.CDLL` runtime shared-library load** inside `test_utf_8_strndup`:
 
-### 4.4 `kitty/glfw-wayland.so` — LOCALIZED
+```python
+# kitty_tests/glfw.py lines 44-50 (verbatim, excerpt)
+@unittest.skipIf(is_macos, 'Skipping test on macOS because glfw-cocoa.so is not built with backend_utils')
+def test_utf_8_strndup(self):
+    import ctypes
 
-Same pattern as the X11 backend, but conditional. The test code at `check_build.py` lines 41–42:
+    from kitty.constants import glfw_path
+
+    backend_utils = glfw_path('x11')
+    lib = ctypes.CDLL(backend_utils)
+```
+
+Line 49 is **hard-coded to `'x11'`** — the test never loads the wayland backend. If `kitty/glfw-x11.so` is absent, `ctypes.CDLL` calls `dlopen()` under the hood, which fails with `OSError: ...glfw-x11.so: cannot open shared object file: No such file or directory`. Because `unittest` classifies uncaught exceptions that are not `AssertionError` as **ERRORs** (not failures), this test ends up in the error count rather than the failure count.
+
+The GLFW backends are **never** imported as Python modules (there is no `import kitty.glfw_x11`). They are loaded either (a) at application runtime by the C side of `init_glfw()` via `dlopen` when a graphical kitty window is created, (b) at test runtime by `test_glfw_modules` via a mere filesystem stat, or (c) at test runtime by `test_utf_8_strndup` via `ctypes.CDLL` which actually performs a `dlopen` of the X11 backend. The `ctypes.CDLL` site is stricter than the `os.path.isfile` site because it requires the `.so` not merely to exist but to be a loadable ELF shared object with resolvable dependencies.
+
+**Cascade behavior**: Localized but **asymmetric** — exactly **2 tests are affected** when `glfw-x11.so` is missing: `test_glfw_modules` (FAIL, via filesystem check) and `test_utf_8_strndup` (ERROR, via `ctypes.CDLL` shared-library load). The other 143 Python tests run unaffected. No discovery cascade occurs — `kitty_tests/glfw.py` does **not** import `ctypes` or call `glfw_path('x11')` at module scope (both are done inside the `test_utf_8_strndup` method body at lines 45–49), so discovery proceeds normally. Verified empirically (see Section 10.3).
+
+### 4.4 `kitty/glfw-wayland.so` — LOCALIZED (1 test affected)
+
+Same pattern as the X11 backend for the filesystem-check site, but **not** the `ctypes.CDLL` site: `kitty_tests/glfw.py` line 49 is hard-coded to `'x11'`, not `'wayland'`. Therefore removing `glfw-wayland.so` affects only the one test `test_glfw_modules` (via `os.path.isfile`) and **does not** trigger a `ctypes.CDLL` failure anywhere. This asymmetry — x11 affects 2 tests, wayland affects 1 — is a direct consequence of the hard-coded `'x11'` backend string in `glfw.py` line 49.
+
+Additionally, the wayland check is conditional. The test code at `check_build.py` lines 41–42:
 
 ```python
 if not self.is_ci:
@@ -462,7 +485,7 @@ excludes Wayland from the assertion when `is_ci=True` (the CI environment lacks 
 | `datatypes.py` | DIRECT (lines 9-22) | — | — | — |
 | `file_transmission.py` | INDIRECT | **DIRECT (line 13)** | — | — |
 | `fonts.py` | DIRECT (line 11) | — | — | — |
-| `glfw.py` | INDIRECT | — | — | — |
+| `glfw.py` | INDIRECT | — | **DIRECT** (line 50, `ctypes.CDLL(glfw_path('x11'))` runtime library load) | — |
 | `graphics.py` | DIRECT (line 14) | — | — | — |
 | `keys.py` | DIRECT (line 6) | — | — | — |
 | `layout.py` | INDIRECT | — | — | — |
@@ -483,7 +506,7 @@ excludes Wayland from the assertion when `is_ci=True` (the CI environment lacks 
 - 10 modules import `BaseTest` from `kitty_tests` (or use other indirect imports), making them transitively dependent on `fast_data_types` via `__init__.py` line 22.
 - 1 module (`check_build.py`) imports `kitty.fast_data_types` lazily **inside** the body of `test_loading_extensions()` (line 29), which is a separate test from `test_glfw_modules`.
 - 1 module (`file_transmission.py`) is the sole importer of `kittens.transfer.rsync`.
-- The two GLFW backends are never imported by any test module; they are only referenced through `kitty.constants.glfw_path()` for filesystem checks.
+- The two GLFW backends are never imported as Python modules by any test module. `check_build.py` (both backends) and `glfw.py` (x11 only) reference them through `kitty.constants.glfw_path()` — `check_build.py` at line 46 performs a filesystem `os.path.isfile()` check (both backends), while `glfw.py` at line 50 performs a `ctypes.CDLL` runtime shared-library load that is **hard-coded to the X11 backend**. This creates the asymmetric dependency: `glfw-x11.so` is referenced by two tests (one FS-check, one CDLL-load), while `glfw-wayland.so` is referenced by only one (FS-check only).
 
 ---
 
@@ -866,7 +889,7 @@ The `build/` directory contains 122 `.o` files at the end of `python3 setup.py b
 | Kittens (`kittens/transfer/algorithm.c`) | 1 |
 | **Total** | **122** |
 
-The 62-file count for `fast_data_types` exceeds the 48 compiled kitty `.c` files because `setup.py` also compiles in 3rdparty sources (e.g., `3rdparty/ringbuf/ringbuf.c`, several SIMD helper variants, and generated files like `ref_map.c` and `uniforms.c` produced earlier in the build).
+The 62-file count for `fast_data_types` exceeds the 48 compiled kitty `.c` files because `setup.py` also compiles in 3rdparty sources. The additional compiled translation units include `3rdparty/ringbuf/ringbuf.c` (appended to sources at `setup.py` line 923) and the base64 codec family: `glob.glob('3rdparty/base64/lib/arch/*/codec.c')` plus `3rdparty/base64/lib/tables/tables.c`, `3rdparty/base64/lib/codec_choose.c`, and `3rdparty/base64/lib/lib.c` (setup.py lines 925–928). Note that `build_ref_map()` at `setup.py` line 1011 and `build_uniforms_header()` at line 1025 produce **generated headers**, not generated C sources — specifically `kitty/docs_ref_map_generated.h` (included by `kitty/data-types.c` line 243) and `kitty/uniforms_generated.h` (included by `kitty/shaders.c` line 14). Both are appended to the `headers` list at setup.py lines 1088–1089 (not the `sources` list), so they contribute to compilation only via `#include` directives inside existing translation units and do **not** add to the 62-object count.
 
 ---
 
@@ -1254,7 +1277,7 @@ def itertests(suite: unittest.TestSuite) -> Generator[unittest.TestCase, None, N
 
 **Setup**: Rename `kitty/glfw-x11.so` to `kitty/glfw-x11.so.bak`, then invoke `./kitty/launcher/kitty +launch test.py`.
 
-**Observed behavior**: The test suite runs to completion. Exactly **one** test fails:
+**Observed behavior**: The test suite runs to completion. Exactly **two** tests are affected — one FAIL and one ERROR:
 
 ```
 ======================================================================
@@ -1264,39 +1287,81 @@ Traceback (most recent call last):
   File ".../kitty_tests/check_build.py", line 46, in test_glfw_modules
     self.assertTrue(os.path.isfile(path), f'{path} is not a file')
 AssertionError: False is not true : .../kitty/glfw-x11.so is not a file
+
+======================================================================
+ERROR: test_utf_8_strndup (kitty_tests.glfw.TestGLFW.test_utf_8_strndup)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File ".../kitty_tests/glfw.py", line 50, in test_utf_8_strndup
+    lib = ctypes.CDLL(backend_utils)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: .../kitty/glfw-x11.so: cannot open shared object file: No such file or directory
+
+----------------------------------------------------------------------
+Ran 145 tests in ~28s
+FAILED (failures=3, errors=1, skipped=6)
 ```
 
-**Cascade analysis**: Zero cascade. `test_glfw_modules` performs a filesystem check, not a Python import. When the file is absent, `os.path.isfile()` returns `False`, which triggers the `assertTrue(False, ...)` failure. Every other test imports and uses `kitty.fast_data_types` normally.
+(The `failures=3` count comprises `test_glfw_modules` plus the two pre-existing baseline failures `test_transfer_send` / `test_transfer_receive` that fail on any filesystem without setgid-inherit semantics — unrelated to this experiment. The `errors=1` is exclusively `test_utf_8_strndup`.)
 
-**Tests blocked**: 0. **Tests failed**: 1 (`test_glfw_modules`). **Tests passed**: 144 (or 136 + 2 + 6 skip given this environment's baseline).
+**Cascade analysis**: Zero import-discovery cascade. Both `test_glfw_modules` and `test_utf_8_strndup` discover and import normally because `kitty_tests/glfw.py` does **not** reference `glfw_path('x11')` or `ctypes.CDLL` at module scope — both are performed inside the `test_utf_8_strndup` method body (lines 45–50). The **two distinct failure sites** are:
 
-**Origin of error**: `kitty_tests/check_build.py` line 46 (the `assertTrue(os.path.isfile(path), ...)` line).
+1. `kitty_tests/check_build.py` line 46: `self.assertTrue(os.path.isfile(path), f'{path} is not a file')` — FAILS because `os.path.isfile()` returns `False`.
+2. `kitty_tests/glfw.py` line 50: `lib = ctypes.CDLL(backend_utils)` — ERRORS because `ctypes.CDLL` invokes `dlopen()` which cannot find the missing `.so` file on the library search path. Because `OSError` is not an `AssertionError`, `unittest` classifies this as an **error**, not a failure.
+
+Every other test imports and uses `kitty.fast_data_types` normally.
+
+**Tests blocked**: 0. **Tests failed (GLFW-related)**: 1 (`test_glfw_modules`). **Tests errored (GLFW-related)**: 1 (`test_utf_8_strndup`). **Tests passed**: 143 (from a baseline of 145 ran minus the 2 new GLFW-related impacts; in this environment's baseline there are also 2 pre-existing `file_transmission` failures and 6 skipped tests, so the observed breakdown is 135 pass + 3 fail + 1 error + 6 skip = 145 ran).
+
+**Origin of errors**:
+- FAIL — `kitty_tests/check_build.py` line 46 (`assertTrue(os.path.isfile(path), ...)`).
+- ERROR — `kitty_tests/glfw.py` line 50 (`ctypes.CDLL(backend_utils)` where `backend_utils = glfw_path('x11')`).
+
+**Rationale for the asymmetric dependency**: The design choice in `kitty_tests/glfw.py` to hard-code `glfw_path('x11')` at line 49 reflects that the test was written to exercise the UTF-8 helper function exported by the X11 backend specifically (historically the only backend on Linux before Wayland support was added). Because the test does a real `dlopen` via `ctypes.CDLL` rather than a mere filesystem check, its dependency on `glfw-x11.so` is **load-time strict** (the file must exist, be a valid ELF shared object, and have all its dynamic library dependencies resolvable) — strictly more demanding than `test_glfw_modules`'s filesystem-stat-only check. If `glfw-wayland.so` were substituted for `glfw-x11.so`, this test would still not exercise wayland — because the string `'x11'` is a literal in the source code.
 
 ### 10.4 Experiment 4: Remove `kitty/glfw-wayland.so`
 
 **Setup**: Identical pattern to X11. Rename `kitty/glfw-wayland.so` to `kitty/glfw-wayland.so.bak`.
 
-**Observed behavior**: Same as X11, but the failure only occurs when **not** in CI mode (i.e., when `self.is_ci == False`). `check_build.py` lines 41–42 conditionally append `'wayland'` to the `linux_backends` list only in the non-CI path. On this developer container, Wayland is checked and fails.
+**Observed behavior**: Exactly **one** test fails — `test_glfw_modules`. Critically, there is **no ERROR** in `test_utf_8_strndup`: that test is hard-coded to call `glfw_path('x11')` at line 49 (not `'wayland'`), so removing the wayland backend does not affect the `ctypes.CDLL` load site at all. This is the core of the asymmetric dependency identified in §4.3.
 
-**Tests blocked**: 0. **Tests failed**: 1. **Origin**: `check_build.py` line 46.
+```
+======================================================================
+FAIL: test_glfw_modules (kitty_tests.check_build.TestBuild.test_glfw_modules)
+----------------------------------------------------------------------
+AssertionError: False is not true : .../kitty/glfw-wayland.so is not a file
+
+----------------------------------------------------------------------
+Ran 145 tests in ~28s
+FAILED (failures=3, skipped=6)
+```
+
+(Again, the `failures=3` count includes the two pre-existing baseline failures plus the one GLFW-related failure. `errors=0`.)
+
+The wayland check is additionally conditional: it only occurs when **not** in CI mode (i.e., when `self.is_ci == False`). `check_build.py` lines 41–42 conditionally append `'wayland'` to the `linux_backends` list only in the non-CI path. On this developer container, Wayland is checked and fails.
+
+**Tests blocked**: 0. **Tests failed (GLFW-related)**: 1. **Tests errored (GLFW-related)**: 0. **Origin**: `check_build.py` line 46.
 
 ### 10.5 Experiment 5: Remove Both GLFW Backends
 
 **Setup**: Rename both `kitty/glfw-x11.so` and `kitty/glfw-wayland.so`.
 
-**Observed behavior**: Still exactly **one** test fails (`test_glfw_modules`). The test's assertion loop iterates both backends and invokes `assertTrue` for each; the first assertion to fail terminates the test (which is correct behavior — one assertion failure is enough to fail the test case).
+**Observed behavior**: Same impact shape as removing x11 alone — **1 FAIL + 1 ERROR**. The `test_glfw_modules` test's assertion loop iterates both backends and invokes `assertTrue` for each; the first assertion (`'x11'`) fails and terminates that single test case (one assertion failure is sufficient to fail the test), so `test_glfw_modules` contributes exactly 1 failure total regardless of whether one or both backends are missing. Additionally, `test_utf_8_strndup` fails on the missing `glfw-x11.so` via `ctypes.CDLL` at line 50, contributing 1 error. The wayland-only assertion inside `test_glfw_modules` is never reached — but it doesn't need to be, because the test has already failed.
 
-**Tests blocked**: 0. **Tests failed**: 1.
+**Tests blocked**: 0. **Tests failed (GLFW-related)**: 1. **Tests errored (GLFW-related)**: 1.
 
 ### 10.6 Cascade Summary
 
-| Removed Extension | Failure Type | Phase | Python Tests Blocked | Python Tests Failed | Go Tests Run | Origin Line |
-|-------------------|--------------|-------|---------------------:|--------------------:|-------------:|-------------|
-| `fast_data_types.so` | Package-level import | pre-discovery | 145 | 0 (blocked) | 0 | `kitty_tests/__init__.py:22` |
-| `rsync.so` | Test-module import | discovery | 145 | 0 (blocked) | indeterminate | `kitty_tests/file_transmission.py:13` |
-| `glfw-x11.so` | Runtime assertion | execution | 0 | 1 | full 64 | `kitty_tests/check_build.py:46` |
-| `glfw-wayland.so` | Runtime assertion | execution | 0 | 1 | full 64 | `kitty_tests/check_build.py:46` |
-| Both GLFW backends | Runtime assertion | execution | 0 | 1 (test fails on first) | full 64 | `kitty_tests/check_build.py:46` |
+| Removed Extension | Failure Type | Phase | Python Tests Blocked | Python Tests Failed | Python Tests Errored | Go Tests Run | Origin Line(s) |
+|-------------------|--------------|-------|---------------------:|--------------------:|---------------------:|-------------:|----------------|
+| `fast_data_types.so` | Package-level import | pre-discovery | 145 | 0 (blocked) | 0 (blocked) | 0 | `kitty_tests/__init__.py:22` |
+| `rsync.so` | Test-module import | discovery | 145 | 0 (blocked) | 0 (blocked) | indeterminate | `kitty_tests/file_transmission.py:13` |
+| `glfw-x11.so` | Runtime assertion **+** runtime `ctypes.CDLL` load | execution | 0 | 1 | 1 | full 64 | `kitty_tests/check_build.py:46` **and** `kitty_tests/glfw.py:50` |
+| `glfw-wayland.so` | Runtime assertion | execution | 0 | 1 | 0 | full 64 | `kitty_tests/check_build.py:46` |
+| Both GLFW backends | Runtime assertion **+** runtime `ctypes.CDLL` load (x11) | execution | 0 | 1 (x11 assertion fires first) | 1 (`test_utf_8_strndup` fails on x11 `ctypes.CDLL`) | full 64 | `kitty_tests/check_build.py:46` **and** `kitty_tests/glfw.py:50` |
 
 ### 10.7 Import Chain Cascade (ASCII Visualization)
 
@@ -1365,20 +1430,62 @@ Process exits; the already-running Go subprocess is still alive and its
 output is never read (stdout discarded).
 ```
 
-For the GLFW scenarios, no cascade — just a single `assertTrue` failure:
+For the GLFW scenarios, there is no discovery-phase cascade — discovery completes for all 22 test modules. Execution then encounters **two distinct failure sites** that exhibit an asymmetric pattern between the two backends:
+
+**Removing `glfw-x11.so` (2 tests affected — 1 FAIL + 1 ERROR):**
 
 ```
 Normal execution proceeds through all 145 tests.
-When test_glfw_modules runs:
+
+When test_glfw_modules runs (kitty_tests/check_build.py:37):
     path = glfw_path('x11')                     # e.g., kitty/glfw-x11.so
     self.assertTrue(os.path.isfile(path), ...)  # returns False
     |
     v
-    AssertionError recorded; test_glfw_modules fails.
+    AssertionError recorded; test_glfw_modules FAILS.
+    (The 'wayland' iteration of the loop is never reached because
+     assertTrue short-circuits the test case on first failure.)
+
+When test_utf_8_strndup runs (kitty_tests/glfw.py:44):
+    backend_utils = glfw_path('x11')            # hard-coded 'x11' at line 49
+    lib = ctypes.CDLL(backend_utils)            # dlopen(kitty/glfw-x11.so)
+    |
+    v
+    OSError: cannot open shared object file: No such file or directory
+    |
+    v
+    Exception is NOT an AssertionError, so unittest records it as an
+    ERROR (not a failure); test_utf_8_strndup ERRORS.
+    |
+    v
+All other 143 tests continue uninterrupted.
+```
+
+**Removing `glfw-wayland.so` (1 test affected — 1 FAIL, 0 ERROR):**
+
+```
+Normal execution proceeds through all 145 tests.
+
+When test_glfw_modules runs (kitty_tests/check_build.py:37):
+    Iteration 1: path = glfw_path('x11')        # still exists, assertion passes
+    Iteration 2: path = glfw_path('wayland')    # missing
+                 self.assertTrue(os.path.isfile(path), ...)  # False
+    |
+    v
+    AssertionError recorded; test_glfw_modules FAILS.
+
+When test_utf_8_strndup runs (kitty_tests/glfw.py:44):
+    backend_utils = glfw_path('x11')            # STILL 'x11' — not affected
+    lib = ctypes.CDLL(backend_utils)            # succeeds; x11 still present
+    |
+    v
+    Test proceeds normally and PASSES.
     |
     v
 All other 144 tests continue uninterrupted.
 ```
+
+The asymmetry is an artifact of the hard-coded string literal `'x11'` at `kitty_tests/glfw.py` line 49. If this literal were parameterized (e.g., by iterating `['x11', 'wayland']`), the cascade would be symmetric; as written, only the x11 backend has this second, stricter dependency site.
 
 ### 10.8 Restoration Protocol
 
@@ -1453,9 +1560,11 @@ The "secondary" label captures that this extension has its own independent failu
 
 **Important correction to the AAP**: The AAP section 0.4.2 states the missing `rsync.so` manifests via `ModuleImportFailure` detection in `itertests()`. Empirical testing (Section 10.2) shows this is **not** the case at this commit: the failure propagates as a raw `ModuleNotFoundError` from `find_all_tests()` line 64, bypassing `itertests()` entirely. The distinction matters because `itertests()` raises `Exception('Failed to import a test module: %s' % test)` with a clearly-formatted test name, while the raw `ModuleNotFoundError` simply names the missing extension — different error messages for different paths.
 
-### 11.3 Why GLFW Backends Are LOCALIZED
+### 11.3 Why GLFW Backends Are LOCALIZED (and Why the Asymmetry Exists)
 
-Neither `glfw-x11.so` nor `glfw-wayland.so` is ever imported as a Python extension. They are **not** `.so` files Python knows about; they are C-side shared libraries that `init_glfw()` loads via `dlopen` at **runtime** when a graphical window is requested (not during `PyInit_fast_data_types`). The only test-time reference to them is the filesystem check in `test_glfw_modules`:
+Neither `glfw-x11.so` nor `glfw-wayland.so` is ever imported as a Python extension module (there is no `import kitty.glfw_x11` anywhere). They are C-side shared libraries that `init_glfw()` loads via `dlopen` at application **runtime** when a graphical window is requested (not during `PyInit_fast_data_types`). The test suite references them in two distinct ways — and the asymmetry between those two ways is what causes removing `glfw-x11.so` to affect 2 tests while removing `glfw-wayland.so` affects only 1.
+
+**Reference site 1: filesystem check in `test_glfw_modules`** (both backends):
 
 ```python
 # kitty_tests/check_build.py lines 44-47
@@ -1465,9 +1574,28 @@ for name in modules:
     self.assertTrue(os.access(path, os.X_OK), f'{path} is not executable')
 ```
 
-`os.path.isfile()` and `os.access(..., os.X_OK)` are plain POSIX checks. A missing file produces exactly one `AssertionError`, confined to the one test method that contains the check. No other test uses `glfw_path()`, so no other test observes the missing file.
+`os.path.isfile()` and `os.access(..., os.X_OK)` are plain POSIX checks. They succeed or fail based only on directory metadata — they do **not** require the file to be a valid ELF or loadable shared library. A missing file for either backend produces exactly one `AssertionError`, confined to the single test method `test_glfw_modules`.
 
-This is a **deliberate architectural choice**: the GLFW backends are optional at runtime (kitty runs headless for some operations, e.g., `kitten` CLI utilities), so their absence is treated as a build-correctness invariant rather than a hard dependency.
+**Reference site 2: `ctypes.CDLL` load in `test_utf_8_strndup`** (X11 only):
+
+```python
+# kitty_tests/glfw.py lines 44-50 (the relevant excerpt)
+def test_utf_8_strndup(self):
+    import ctypes
+
+    from kitty.constants import glfw_path
+
+    backend_utils = glfw_path('x11')
+    lib = ctypes.CDLL(backend_utils)
+```
+
+Line 49 passes the literal string `'x11'` — **not** a parameterized backend name. `ctypes.CDLL(backend_utils)` internally invokes `dlopen()` on the path, which requires the file to exist **and** to be a valid shared object **and** to have all its transitive library dependencies resolvable. A missing `glfw-x11.so` causes `dlopen` to fail with `OSError: cannot open shared object file: No such file or directory`. Because `OSError` is not a subclass of `AssertionError`, `unittest` records it as an **ERROR** rather than a failure.
+
+**Why the asymmetry exists**: The test `test_utf_8_strndup` was written to validate a specific symbol (`utf_8_strndup`) exported by the X11 backend's `backend_utils` helper. Historically X11 was the only Linux backend, so the test was hard-coded to `glfw_path('x11')`. Wayland support was added later but the test was not extended to iterate both backends. As a result, `glfw-x11.so` has two independent test-time reference sites (one FS-check, one CDLL-load) while `glfw-wayland.so` has only one (FS-check only). A hypothetical refactor of line 49 to iterate `['x11', 'wayland']` would make the cascade symmetric (both backends would affect 2 tests), but as written the code produces the 2-vs-1 asymmetric pattern.
+
+**Why this still qualifies as LOCALIZED (not broader)**: Neither reference site is at module scope. Both live **inside test method bodies** (`check_build.py:37` defines `test_glfw_modules`; `glfw.py:44` defines `test_utf_8_strndup`). Because `kitty_tests/glfw.py` imports `ctypes` and calls `glfw_path` only within the method body (not at module top-level), the module can be discovered by `find_all_tests()` regardless of whether `glfw-x11.so` exists — the failure occurs only when `unittest` actually runs the method. No discovery cascade occurs for either backend.
+
+This is a **deliberate architectural choice**: the GLFW backends are optional at runtime (kitty runs headless for some operations, e.g., `kitten` CLI utilities), so their absence is treated as a build-correctness invariant rather than a hard dependency. The asymmetric cascade count is an emergent consequence of how individual test methods happen to reference each backend, not a design flaw.
 
 ### 11.4 Why Go Tests Are Independent of C Extensions
 
@@ -1535,17 +1663,18 @@ The monolithic design is therefore a conscious trade-off: a single `import kitty
 
 This analysis has established, via code-as-truth reading and empirical controlled-failure experiments, that kitty's test architecture at commit `815df1e21` has a three-tier extension-dependency structure:
 
-| Tier | Extension | Line of Coupling | Cascade Radius |
-|------|-----------|------------------|----------------|
+| Tier | Extension | Line(s) of Coupling | Cascade Radius |
+|------|-----------|---------------------|----------------|
 | **CRITICAL** | `kitty/fast_data_types.so` | `kitty_tests/__init__.py:22` | All 145 Python tests |
 | **SECONDARY FAILURE DOMAIN** | `kittens/transfer/rsync.so` | `kitty_tests/file_transmission.py:13` | All 145 Python tests (via discovery crash) |
-| **LOCALIZED** | `kitty/glfw-x11.so`, `kitty/glfw-wayland.so` | `kitty_tests/check_build.py:46` | 1 test (`test_glfw_modules`) |
+| **LOCALIZED (asymmetric)** | `kitty/glfw-x11.so` | `kitty_tests/check_build.py:46` **and** `kitty_tests/glfw.py:50` | 2 tests: `test_glfw_modules` (FAIL) + `test_utf_8_strndup` (ERROR) |
+| **LOCALIZED** | `kitty/glfw-wayland.so` | `kitty_tests/check_build.py:46` | 1 test (`test_glfw_modules` FAIL) |
 
-The criticality is **not** determined by the complexity of the extension (the 55 KB `rsync.so` blocks the entire suite, while the 358 KB `glfw-x11.so` blocks only one test). Criticality is determined by **where the coupling line lives** — specifically, **the import scope of the Python statement that references the extension**:
+The criticality is **not** determined by the complexity of the extension (the 55 KB `rsync.so` blocks the entire suite, while the 358 KB `glfw-x11.so` blocks only two tests). Criticality is determined by **where the coupling line lives** — specifically, **the import scope of the Python statement that references the extension**:
 
 - Package `__init__.py` → CRITICAL (every test depends on package import).
 - Test-module scope → SECONDARY (discovery crashes, blocking tests).
-- Inside a single test method body → LOCALIZED (only that test fails).
+- Inside test method bodies → LOCALIZED (only those tests fail). The number of affected tests equals the number of distinct test methods that reference the extension — this is why `glfw-x11.so` affects 2 tests (one in `check_build.py` via `os.path.isfile`, one in `glfw.py` via `ctypes.CDLL`) while `glfw-wayland.so` affects only 1 (no `ctypes.CDLL` site targets wayland).
 
 This is a valuable piece of architectural knowledge: to reduce the criticality of an extension in kitty's test architecture, its import must be moved **out of** package scope and **into** the bodies of specific test methods (the pattern used by `check_build.py` line 29 for its diagnostic smoke test). No code change was made during this analysis, but the pattern is evident in the existing source.
 
