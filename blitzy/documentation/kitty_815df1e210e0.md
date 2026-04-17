@@ -222,6 +222,8 @@ Empirical enumeration of the public surface of `kitty.fast_data_types` (excludin
 
 This breadth — 23 types and 188 functions accessed across every layer of the test harness — is the structural reason the `__init__.py` imports `Cursor`, `HistoryBuf`, `LineBuf`, `Screen`, `get_options`, `monotonic`, and `set_options` directly: those seven symbols alone are the fixture DNA of every test class.
 
+**Note on categorization divergence from the AAP**: The Agent Action Plan estimated a breakdown of 165 types + 190 functions + 223 GLFW + 3 capability flags = 581. The empirical enumeration above is more granular: it separates true `PyType_Type` objects (23) from the remaining non-callable integer/string module constants (144) — e.g., cursor shapes (`CURSOR_BEAM`, `CURSOR_BLOCK`, `CURSOR_UNDERLINE`), VT parser state codes, color attribute bit-shift values (`COL_SHIFT`, `BG_SHIFT`, etc.), and action flags. Summing the granular categories (23 + 188 + 223 + 3 + 144) yields the same total of **581**, confirming the two breakdowns enumerate the same underlying symbol set; the AAP simply lumped types together with non-callable constants in its "types" bucket.
+
 ---
 
 ## Section 3 — Test Execution Results
@@ -368,9 +370,9 @@ The trigger is a single line at the top of the test package's `__init__.py`:
 from kitty.fast_data_types import Cursor, HistoryBuf, LineBuf, Screen, get_options, monotonic, set_options
 ```
 
-Because `__init__.py` is executed by the import system **before** any submodule of `kitty_tests` can be imported, this line is the gateway through which **every** test module passes. If `fast_data_types.so` is missing, the very act of writing `import kitty_tests.<anything>` raises `ModuleNotFoundError: No module named 'kitty.fast_data_types'`, originating from line 22.
+Because `__init__.py` is executed by the import system **before** any submodule of `kitty_tests` can be imported, this line is the gateway through which **every** test module passes. If `fast_data_types.so` is missing, the very act of writing `import kitty_tests.<anything>` raises `ModuleNotFoundError: No module named 'kitty.fast_data_types'`. Empirically, the traceback surfaces at the *preceding* line 21 (`from kitty.config import finalize_keys, finalize_mouse_mappings`), because `kitty.config` transitively imports `kitty.fast_data_types.Color` via `kitty/conf/utils.py:27` before Python's import evaluator ever reaches line 22 — see the full traceback in §10.1. Line 22 is nevertheless the canonical foundational reference because it is the direct import that the rest of `__init__.py` and the test infrastructure uses.
 
-In addition, line 24 imports `Options, defaults` from `kitty.options.types`, which itself transitively imports `kitty.fast_data_types`. So the package load fails at the same stack frame even if line 22 were ever to be removed.
+In addition, line 24 imports `Options, defaults` from `kitty.options.types`, which itself transitively imports `kitty.fast_data_types`. So the package load fails at an even earlier cascade point (line 21) before reaching either line 22 or line 24; any of the three lines would individually trigger the same failure if the others were somehow bypassed.
 
 **Cascade behavior**: All 145 Python tests blocked. Test discovery cannot proceed past `import kitty_tests`. Verified empirically (see Section 10.1).
 
@@ -553,7 +555,7 @@ The function performs three preconditions before any subsystem is initialized:
 2. **`PyModule_Create(&module)`** (line 532): allocates the empty module object.
 3. **`Py_AtExit(run_at_exit_cleanup_functions)`** (line 534): registers cleanup hooks for resources allocated during init.
 
-Then 30 `init_*` calls run sequentially. **Any one of them returning `false` causes `PyInit_fast_data_types` to return `NULL`**, which the CPython import machinery converts into `ImportError: initialization of fast_data_types raised unreported exception` — and from `kitty_tests/__init__.py` line 22's perspective, this is indistinguishable from a missing `.so`: every test module is blocked.
+Then 30 `init_*` calls run sequentially. **Any one of them returning `false` causes `PyInit_fast_data_types` to return `NULL`**, which the CPython import machinery converts into `ImportError: initialization of fast_data_types raised unreported exception` — and from the perspective of any import site that transitively depends on `fast_data_types` (including `kitty_tests/__init__.py` lines 21, 22, and 24), this is indistinguishable from a missing `.so`: every test module is blocked.
 
 ### 5.2 Initialization Flow Diagram (Linux Branch)
 
@@ -734,11 +736,11 @@ Notes:
 
 ### 6.2 Indirect-Only Importers (10 modules)
 
-These modules do not contain `from kitty.fast_data_types ...` at module scope, but they all `from . import BaseTest` (or `from kitty_tests import BaseTest`), which executes `__init__.py` line 22:
+These modules do not contain `from kitty.fast_data_types ...` at module scope, but they all `from . import BaseTest` (or `from kitty_tests import BaseTest`), which forces Python to execute `__init__.py` in its entirety — including the `fast_data_types`-dependent import chain that begins at line 21 (the `kitty.config` import that cascades through `kitty/conf/utils.py:27`) and also includes the direct `fast_data_types` import at line 22 and the `kitty.options.types` import at line 24:
 
 | Module | Indirect Path |
 |--------|---------------|
-| `check_build.py` | `from . import BaseTest` (line 13) — also imports `kitty.fast_data_types as fdt` lazily inside `test_loading_extensions` (line 29) |
+| `check_build.py` | `from . import BaseTest` (line 12) — also lazily imports `kitty.fast_data_types as fdt` on line 29 inside `test_loading_extensions` (defined at line 28) |
 | `clipboard.py` | `from . import BaseTest` |
 | `completion.py` | `from . import BaseTest` |
 | `crypto.py` | `from . import BaseTest` |
@@ -749,7 +751,7 @@ These modules do not contain `from kitty.fast_data_types ...` at module scope, b
 | `search_query_parser.py` | `from . import BaseTest` |
 | `tui.py` | `from . import BaseTest` |
 
-In every case, the indirect dependency is no less hard than a direct one: importing `BaseTest` triggers loading of `kitty_tests/__init__.py`, which immediately attempts to load `kitty.fast_data_types`. If the extension is missing, the indirect importers fail at exactly the same line (line 22 of `__init__.py`) as the direct ones.
+In every case, the indirect dependency is no less hard than a direct one: importing `BaseTest` triggers loading of `kitty_tests/__init__.py`, which then chains through `from kitty.config import ...` (line 21) → `kitty/config.py:10` → `kitty/conf/utils.py:27` (`from ..fast_data_types import Color`) before it ever reaches its own direct line-22 `from kitty.fast_data_types import ...` statement. If the extension is missing, every indirect importer therefore fails at exactly the same point in the chain as the direct ones — at the cascade initiated by `__init__.py:21` (see §10.1 for the full empirical traceback).
 
 ### 6.3 Lazy In-Method Importers
 
@@ -763,7 +765,7 @@ def test_loading_extensions(self) -> None:
     del fdt, rsync                       # line 31
 ```
 
-This pattern provides a deliberate, explicit smoke test: if the imports succeed when run, the build is intact. Because the imports are lazy, the *parent module* `check_build.py` can still be discovered by `find_all_tests()` even if `fast_data_types.so` is missing — but this only matters in theory, since `__init__.py` line 22 would prevent `check_build.py` from being imported in the first place.
+This pattern provides a deliberate, explicit smoke test: if the imports succeed when run, the build is intact. Because the imports are lazy, the *parent module* `check_build.py` can still be discovered by `find_all_tests()` even if `fast_data_types.so` is missing — but this only matters in theory, since `__init__.py`'s import cascade (starting at line 21 and including lines 22 and 24 — see §4.1 and §10.1) would prevent `check_build.py` from being imported in the first place.
 
 ### 6.4 Counting Convention and Caveat
 
@@ -874,83 +876,109 @@ This section traces the entire control-flow path from the user invoking `./kitty
 
 ### 8.1 Entry Point and Bootstrapping
 
-The user-facing entry point is `test.py` (14 lines):
+The user-facing entry point is `test.py` (13 lines, verbatim from the repository):
 
 ```python
 #!./kitty/launcher/kitty +launch
-# License: GPLv3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
-
+# License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import importlib
-import sys
 
-sys.path.insert(0, 'kittens')
-sys.path.insert(0, '.')
 
-m = importlib.import_module('kitty_tests.main')
-raise SystemExit(m.main())
+def main() -> None:
+    m = importlib.import_module('kitty_tests.main')
+    getattr(m, 'main')()
+
+
+if __name__ == '__main__':
+    main()
 ```
 
 - **Line 1 (shebang)**: `#!./kitty/launcher/kitty +launch` — when `test.py` is executed directly, Linux invokes the kitty launcher with `+launch test.py` as arguments. The `+launch` subcommand instructs the launcher to embed CPython, set `sys.kitty_run_data`, and execute the script.
-- **Lines 7–8**: prepend `kittens` and `.` to `sys.path` so that `kitty.*` and `kittens.*` modules can be imported directly from the source checkout.
-- **Lines 10–11**: dynamic import of `kitty_tests.main` and execution of its `main()` function. The `SystemExit(...)` propagates the exit code back to the launcher, which exits the process with the same code.
+- **Line 4**: `import importlib` — the only standard-library dependency. `test.py` deliberately avoids importing `sys`, adjusting `sys.path`, or touching anything from `kitty.*` / `kittens.*` at module scope; it relies entirely on the launcher to have already established a valid interpreter state (including `sys.kitty_run_data`) before line 1 runs.
+- **Lines 7–9 (`def main() -> None`)**: a function-scoped wrapper. Inside, `importlib.import_module('kitty_tests.main')` (line 8) triggers the package-initialization chain — it is this call that first executes `kitty_tests/__init__.py` and therefore first loads `fast_data_types.so` (see §4.1, §10.1). Line 9 then invokes the orchestrator's own `main()` function via `getattr(m, 'main')()` — a dynamic attribute lookup that avoids binding `m.main` at import-analysis time.
+- **Lines 12–13**: the `if __name__ == '__main__':` guard calls `main()`. Control returns normally from `getattr(m, 'main')()` only if `kitty_tests.main.main()` returns normally — which it never does, because `run_python_tests()` always ends with `raise SystemExit(exit_code)` (line 243 of `main.py`). The SystemExit propagates up through `getattr(m, 'main')()` → `main()` at line 9 → the `if __name__` guard → the launcher, which uses the raised code as the process exit status.
 
-This indirection (instead of `from kitty_tests.main import main; main()`) allows `test.py` to be invoked from any working directory while still bootstrapping the right module path.
+This two-layer indirection (`def main()` wrapper plus dynamic `getattr` lookup) allows `test.py` to be invoked from any working directory while cleanly deferring the package load to runtime. Crucially, the `kitty_tests.main` import is *inside* `main()`, not at module scope — so a traceback of an import failure (see §10.1) will show the frame as `test.py:8, in main`, not `<module>`.
 
 ### 8.2 The Orchestrator: `kitty_tests/main.py`
 
-The `main()` function (line 334) is the entry point inside the orchestrator. It calls `run_tests()` (line 246) which performs argument parsing, suite construction, and concurrent execution. The control flow is:
+The `main()` function (line 334) is the entry point inside the orchestrator. It calls `run_tests()` (line 246), which performs argument parsing, Go-package reduction, and concurrent execution of the Go subprocess alongside sequential Python tests. Both `main()` and `run_tests()` return `None`; the non-zero exit code is propagated via `raise SystemExit(exit_code)` inside `run_python_tests()`. The condensed structure, with **exact** line numbers from the source, is:
 
 ```python
-# kitty_tests/main.py — annotated structure
-def main() -> int:                              # line 334
-    return run_tests()                          # line 337
+# kitty_tests/main.py — condensed from actual source (exact line numbers verified)
+def main() -> None:                                       # line 334
+    import warnings                                        # line 335
+                                                           # (blank line 336)
+    warnings.simplefilter('error')                         # line 337
+    run_tests()                                            # line 338 (no return value)
 
-def run_tests() -> int:                         # line 246
-    args = parse_args()
-    excludes = ...
-    package = 'kitty_tests'
-    if args.module is not None:
-        ...                                     # filtered tests
-    elif args.test_name:
-        ...                                     # specific tests
-    else:
-        tests = find_all_tests(package, excludes=excludes)  # uses line 57
 
-    go_pkgs = reduce_go_pkgs(...)               # line 267 -> reduces 26 packages
-    go_proc: Optional[GoProc] = None
-    if go_pkgs:
-        go_proc = GoProc(...)                   # spawns Go test thread (line 149)
-        go_proc.start()
+def run_tests(report_env: bool = False) -> None:           # line 246
+    report_env = report_env or BaseTest.is_ci              # line 247
+    # argparse boilerplate (lines 248-263) parses:
+    #   positional `name` (zero or more test names)
+    #   --verbosity (default 4)
+    #   --module (e.g. 'ssh' or 'tools/cli')
+    args = parser.parse_args()                             # line 264
+    if args.name and args.name[0] in ('type-check', 'type_check', 'mypy'):  # line 265
+        type_check()                                       # line 266
+    go_pkgs = reduce_go_pkgs(args.module, args.name)       # line 267
+    os.environ['ASAN_OPTIONS'] = 'detect_leaks=0'          # line 268
+    if go_pkgs:                                            # line 269
+        go_proc: 'Optional[GoProc]' = run_go(go_pkgs, args.name)  # line 270
+    else:                                                  # line 271
+        go_proc = None                                     # line 272
+    with env_for_python_tests(report_env):                 # line 273
+        if go_pkgs:                                        # line 274
+            if report_env:
+                print('Go executable:', go_exe())          # line 276
+            print('Go packages being tested:', ' '.join(go_pkgs))  # line 277
+        sys.stdout.flush()                                 # line 278
+        run_python_tests(args, go_proc)                    # line 279
 
-    with env_for_python_tests(...):             # line 297
-        py_rc = run_python_tests(tests, ...)    # line 210
 
-    if go_proc:
-        go_proc.join()
-        go_rc = go_proc.returncode
-    else:
-        go_rc = 0
-    return py_rc | go_rc                        # combine exit codes
+def run_python_tests(args, go_proc=None) -> None:          # line 210
+    tests = find_all_tests()                               # line 211  (← discovery)
+    # nested def print_go() at line 213; calls go_proc.wait() at line 214.
+    # filter by --module / --name (lines 219-231).
+    if tests._tests:                                       # line 232
+        python_tests_ok = run_cli(tests, args.verbosity)   # line 233
+    else:                                                  # line 234
+        python_tests_ok = True                             # line 235
+    exit_code = 0 if python_tests_ok else 1                # line 236
+    if go_proc:                                            # line 237
+        print_go()                                         # line 238 (waits on GoProc, prints output)
+        if exit_code == 0:                                 # line 239
+            exit_code = go_proc.returncode                 # line 240
+    if exit_code != 0:                                     # line 241
+        print("\x1b[31mError\x1b[39m: Some tests failed!") # line 242
+    raise SystemExit(exit_code)                            # line 243
 ```
 
-Key components:
+Key structural observations:
 
-- **`find_all_tests()`** (lines 57–66): iterates `os.listdir('kitty_tests')`, imports every `*.py` file except those in the `excludes` set (`('main', 'gr')` by default), and assembles a `unittest.TestSuite`.
-- **`find_testable_go_packages()`** (lines 127–141): walks the source tree looking for `*_test.go` files and returns the set of containing package paths (relative to the repo root).
-- **`GoProc(Thread)`** (lines 149–182): a `threading.Thread` subclass that wraps a `subprocess.Popen` invocation of `go test -v -run <name> <packages>`. It sets `env['KITTY_PATH_TO_KITTY_EXE'] = kitty_exe()` (line 155) so Go tests that need the kitty binary path can locate it.
-- **`run_python_tests()`** (lines 210–243): runs the constructed `unittest.TestSuite` via `run_cli()` (line 114) using a custom `unittest.TextTestRunner`.
-- **`env_for_python_tests()`** (lines 297–331): a context manager that sets up an isolated `HOME`, controlled environment variables, and pre-caches font discovery before the isolation takes effect.
+- `find_all_tests()` is called inside **`run_python_tests()`** (line 211), not inside `run_tests()`. This is important because the Go subprocess is already running by the time Python discovery begins.
+- `run_go(...)` at line 270 returns a `GoProc` whose `__init__` (lines 151–159) both constructs the `subprocess.Popen` (line 158) and calls `self.start()` (line 159). No explicit `go_proc.start()` appears in user code.
+- There is no explicit `go_proc.join()` inside `run_tests()`. The join is driven by `GoProc.wait()` (lines 173–182), invoked from `print_go()` inside `run_python_tests()`.
+
+Supporting functions referenced above:
+
+- **`find_all_tests()`** (lines 57–66): iterates `contents(package)` (a thin wrapper around `importlib.resources.files`), imports every `*.py` / `*.pyc` file whose name is not in the `excludes` tuple `('main', 'gr')` (the parameter default on line 57), and assembles a `unittest.TestSuite` via `unittest.defaultTestLoader.loadTestsFromModule(m)` (line 65).
+- **`find_testable_go_packages()`** (lines 127–143, approx): walks the source tree looking for `*_test.go` files and returns the set of containing package paths (relative to the repo root).
+- **`GoProc(Thread)`** (lines 149–182): a `threading.Thread` subclass that wraps a `subprocess.Popen` invocation of `go test -v [-run <name>] <packages>`. It sets `env['KITTY_PATH_TO_KITTY_EXE'] = kitty_exe()` into the subprocess environment (line 155) so Go tests that need the kitty binary path can locate it.
+- **`run_python_tests()`** (lines 210–243): executes the constructed `unittest.TestSuite` via `run_cli(...)` (line 233), prints the Go output via its nested `print_go()` helper (defined at line 213, invoked at line 238), and raises `SystemExit(exit_code)` at line 243.
+- **`env_for_python_tests()`** (lines 297–331): a context manager that pre-caches font discovery, then sets up an isolated `HOME`, controlled environment variables, and `PYTHONWARNINGS='error'` before yielding.
 
 ### 8.3 Why Go Tests Run in a Background Thread
 
 The Python test suite executes **sequentially** in the main interpreter (because `unittest` is single-threaded by design and many tests share global C extension state, e.g., the parser's static buffers and the font subsystem's caches). The Go test suite, however, runs in a **separate OS process** spawned by `subprocess.Popen("go test ...")`.
 
 Putting `subprocess.Popen` inside a `Thread` (`GoProc`) means:
-1. The Go process starts immediately (as soon as `go_proc.start()` is called, line 149-ish).
+1. The Go process starts immediately as soon as `GoProc(cmd)` is constructed — its `__init__` (`main.py` lines 151–159) calls `subprocess.Popen(...)` (line 158) and then auto-invokes `self.start()` (line 159) to launch the thread. `run_go(...)` at `main.py:270` is what triggers this construction.
 2. The main thread continues into `env_for_python_tests()` and `run_python_tests()`, executing the 145 Python tests serially.
-3. When Python tests finish, `go_proc.join()` waits for the Go process to complete (if it hasn't already).
-4. The two exit codes are OR'd: any failure in either suite produces a non-zero exit.
+3. When Python tests finish, `go_proc.wait()` (`main.py` lines 173–182, which internally calls `self.join()`) blocks for the Go process to complete (if it hasn't already). In `run_python_tests()`, this is driven by the nested `print_go()` helper (defined at `main.py:213`, invoked at `main.py:238`), whose first line is `stdout, rc = go_proc.wait()` (line 214).
+4. The two exit codes are combined at `main.py` lines 236–240: `exit_code = 0 if python_tests_ok else 1` (line 236); then if `go_proc:` (line 237) the Python code calls `print_go()` (line 238) and, if `exit_code == 0` (line 239), sets `exit_code = go_proc.returncode` (line 240). Any failure in either suite produces a non-zero exit.
 
 This pattern overlaps Python and Go execution time without contaminating either: there is no shared memory between the Python interpreter and the Go subprocess. The only coupling is environment variables, of which `KITTY_PATH_TO_KITTY_EXE` is the most important.
 
@@ -971,10 +999,10 @@ flowchart TD
     ENV --> AFM["all_fonts_map(True) BEFORE HOME swap (line 314)"]
     AFM --> RPT["run_python_tests() (line 210)"]
     RPT --> PYS["Python: 145 tests sequentially"]
-    PYS --> JOIN["go_proc.join()"]
+    PYS --> JOIN["print_go() -> GoProc.wait() (line 214)<br/>(internally calls self.join())"]
     GE --> GR["Go: 64 tests across 26 pkgs"]
     GR --> JOIN
-    JOIN --> EXIT["SystemExit(py_rc | go_rc)"]
+    JOIN --> EXIT["raise SystemExit(exit_code) (line 243)"]
 ```
 
 ### 8.5 The `KITTY_PATH_TO_KITTY_EXE` Bridge
@@ -1053,12 +1081,12 @@ The context manager `env_for_python_tests()` at `kitty_tests/main.py` lines 297�
 
 The ordered steps (condensed from lines 297–331) are:
 
-1. **Emit capability flags** (if `report_env=True`, lines 309–310):
+1. **Emit capability flags** (if `report_env=True`, lines 309–310, verbatim):
    ```python
    from kitty.fast_data_types import has_avx2, has_sse4_2
-   print(f'[runtime] has_avx2={has_avx2} has_sse4_2={has_sse4_2}')
+   print(f'Intrinsics: {has_avx2=} {has_sse4_2=}')
    ```
-   This reports to the test log whether the CPU supports AVX2 and SSE4.2, which the SIMD parser tests (`parser.py`) depend on to decide which code paths to exercise.
+   Note the self-documenting f-string syntax (`{has_avx2=}` expands to `has_avx2=True` or `has_avx2=False`). This reports to the test log whether the CPU supports AVX2 and SSE4.2, which the SIMD parser tests (`parser.py`) depend on to decide which code paths to exercise.
 
 2. **Pre-cache font discovery** (line 314):
    ```python
@@ -1115,7 +1143,7 @@ This is an aggressive policy but is justified by the test suite's strict quality
 
 ### 9.5 Interaction with Go Tests
 
-The Go subprocess is spawned **before** `env_for_python_tests()` is entered (see Section 8.2, `go_proc.start()` is called prior to the `with env_for_python_tests(...)` block). This means the Go tests inherit the real environment variables from the outer process (with `KITTY_PATH_TO_KITTY_EXE` added), **not** the temporary-HOME environment.
+The Go subprocess is spawned **before** `env_for_python_tests()` is entered (see Section 8.2: `run_go(go_pkgs, args.name)` at `main.py:270` constructs a `GoProc(...)` whose `__init__` auto-invokes `self.start()` at `main.py:159`, spawning the thread and the `subprocess.Popen`; this all happens prior to the `with env_for_python_tests(...):` block at `main.py:273`). This means the Go tests inherit the real environment variables from the outer process (with `KITTY_PATH_TO_KITTY_EXE` added), **not** the temporary-HOME environment.
 
 Consequently, Go tests that need `$HOME` read the developer's real home. This is the intended behavior: Go tests either use their own `t.TempDir()` fixtures for filesystem isolation, or they exercise genuine system behaviors (temp file creation semantics, sockets, shared memory) that require a real environment.
 
@@ -1141,47 +1169,59 @@ This section documents the empirical evidence collected by temporarily renaming 
 
 **Setup**: Rename `kitty/fast_data_types.so` to `kitty/fast_data_types.so.bak`, then invoke `./kitty/launcher/kitty +launch test.py`.
 
-**Observed behavior**: The Python process aborts during orchestrator startup. The traceback (abridged) is:
+**Observed behavior**: The Python process aborts during orchestrator startup. The empirically observed traceback (abridged to remove `runpy` / launcher wrapper frames) is:
 
 ```
 Traceback (most recent call last):
-  File ".../test.py", line 10, in <module>
+  File "test.py", line 13, in <module>
+    main()
+  File "test.py", line 8, in main
     m = importlib.import_module('kitty_tests.main')
-  File ".../kitty_tests/main.py", line 9, in <module>
-    from kitty_tests import BaseTest
-  File ".../kitty_tests/__init__.py", line 22, in <module>
-    from kitty.fast_data_types import Cursor, HistoryBuf, LineBuf, Screen, get_options, monotonic, set_options
+  File ".../kitty_tests/__init__.py", line 21, in <module>
+    from kitty.config import finalize_keys, finalize_mouse_mappings
+  File ".../kitty/config.py", line 10, in <module>
+    from .conf.utils import BadLine, parse_config_base
+  File ".../kitty/conf/utils.py", line 27, in <module>
+    from ..fast_data_types import Color
 ModuleNotFoundError: No module named 'kitty.fast_data_types'
 ```
 
-**Cascade analysis**: The error occurs **before** any test is even discovered. Python's import machinery evaluates `kitty_tests.main` → `kitty_tests.__init__` → line 22, which fails. Neither `find_all_tests()` nor `run_python_tests()` nor any Go machinery runs.
+**Cascade analysis**: The error occurs **before** any test is even discovered. `importlib.import_module('kitty_tests.main')` at `test.py:8` triggers evaluation of the `kitty_tests` package's `__init__.py` (Python always initializes a package before importing any of its submodules). `kitty_tests/__init__.py:21` imports `kitty.config`, which at `kitty/config.py:10` imports `kitty.conf.utils`, which at `kitty/conf/utils.py:27` imports `Color` from `kitty.fast_data_types` — this is the first transitive reference to the missing `.so`. The subsequent line `kitty_tests/__init__.py:22` (`from kitty.fast_data_types import Cursor, HistoryBuf, LineBuf, Screen, get_options, monotonic, set_options`) is never reached because line 21 raises first. Neither `main.py` nor `find_all_tests()` nor any Go machinery runs.
 
 **Tests blocked**: 145 / 145 (all Python tests).
 
-**Go tests affected**: Indirectly. Because `GoProc` is started inside `run_tests()` which is never reached, the Go subprocess is also not spawned. Net: 0 / 64 Go tests run either.
+**Go tests affected**: Indirectly. Because `run_go()` is called inside `run_tests()` at `main.py:270`, and `main.py` itself is never executed (the package `__init__.py` crashes first), the Go subprocess is also not spawned. Net: 0 / 64 Go tests run either.
 
-**Origin of error**: `kitty_tests/__init__.py` line 22 (the foundational package-level import).
+**Origin of error**: `kitty_tests/__init__.py` line 21 (the first transitive reference to `kitty.fast_data_types` via the `kitty.config` → `kitty.conf.utils` chain). Line 22 (the direct `from kitty.fast_data_types import ...` that this document elsewhere quotes as the foundational package-level import) would also fail, but Python's import evaluation order aborts at line 21 first. Either way, `kitty_tests/__init__.py` cannot load without `fast_data_types.so`.
 
 ### 10.2 Experiment 2: Remove `kittens/transfer/rsync.so`
 
 **Setup**: Rename `kittens/transfer/rsync.so` to `kittens/transfer/rsync.so.bak`, then invoke `./kitty/launcher/kitty +launch test.py`.
 
-**Observed behavior**: The Python process aborts during test **discovery**, not during test execution. The traceback (abridged) is:
+**Observed behavior**: The Python process aborts during test **discovery**, not during test execution. The empirically observed traceback (abridged to remove `runpy` / launcher wrapper frames) is:
 
 ```
+Running under CI: False
+Go packages being tested: tools/utils/style tools/utils/base85 kittens/diff ... tools/rsync
 Traceback (most recent call last):
-  File ".../test.py", line 11, in <module>
-    raise SystemExit(m.main())
-  File ".../kitty_tests/main.py", line 337, in main
-    return run_tests()
-  File ".../kitty_tests/main.py", line ~263, in run_tests
-    tests = find_all_tests(package, excludes=excludes)
+  File "test.py", line 13, in <module>
+    main()
+  File "test.py", line 9, in main
+    getattr(m, 'main')()
+  File ".../kitty_tests/main.py", line 338, in main
+    run_tests()
+  File ".../kitty_tests/main.py", line 279, in run_tests
+    run_python_tests(args, go_proc)
+  File ".../kitty_tests/main.py", line 211, in run_python_tests
+    tests = find_all_tests()
   File ".../kitty_tests/main.py", line 64, in find_all_tests
     m = importlib.import_module(package + '.' + x.partition('.')[0])
   File ".../kitty_tests/file_transmission.py", line 13, in <module>
     from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc
 ModuleNotFoundError: No module named 'kittens.transfer.rsync'
 ```
+
+The `Running under CI: False` and `Go packages being tested: ...` lines appear *before* the traceback because `env_for_python_tests()` (`main.py:307`) and the `print('Go packages being tested: ...')` statement (`main.py:277`) both execute inside the `with env_for_python_tests(report_env):` block (entered at `main.py:273`) **before** `run_python_tests(args, go_proc)` is called (`main.py:279`) and before `run_python_tests` invokes `find_all_tests()` at `main.py:211`.
 
 **Cascade analysis**: `find_all_tests()` iterates every `*.py` file in `kitty_tests/` and calls `importlib.import_module()` on each. When it reaches `file_transmission.py`, that module's line 13 fails. The exception is **not caught** by `find_all_tests()` — it propagates up to `main()`.
 
@@ -1206,7 +1246,7 @@ def itertests(suite: unittest.TestSuite) -> Generator[unittest.TestCase, None, N
 
 **Tests blocked**: all 145 Python tests (indirectly — discovery crashes before any test runs).
 
-**Go tests affected**: Depends on timing. Because `go_proc.start()` runs **before** `find_all_tests()` in `run_tests()`, the Go subprocess may have already been spawned when the Python discovery crashes. In practice the Go tests continue to run (they are in a separate process) but their results are discarded because the Python process exits before `go_proc.join()` can return.
+**Go tests affected**: Depends on timing. Because `run_go(go_pkgs, args.name)` (`main.py:270`) spawns the `GoProc` *before* `env_for_python_tests()` is entered (`main.py:273`) and before `run_python_tests()` reaches `find_all_tests()` (`main.py:211`), the Go subprocess has already been spawned when the Python discovery crashes. In practice the Go tests continue to run (they are in a separate OS process) but their results are discarded because the Python process exits before `GoProc.wait()` can return them to the parent.
 
 **Origin of error**: `kitty_tests/file_transmission.py` line 13.
 
@@ -1263,48 +1303,52 @@ AssertionError: False is not true : .../kitty/glfw-x11.so is not a file
 For the `fast_data_types.so` removal scenario, the cascade from top to bottom is:
 
 ```
-test.py (line 10)
+test.py line 13:       main()   # from the __name__ == '__main__' guard
     |
     v
-importlib.import_module('kitty_tests.main')
+test.py line 8:        m = importlib.import_module('kitty_tests.main')
+    |
+    v  (Python must first initialize the kitty_tests package)
+kitty_tests/__init__.py line 21:
+    from kitty.config import finalize_keys, finalize_mouse_mappings
     |
     v
-import kitty_tests.main
-    |
-    v  (Python first imports the containing package)
-import kitty_tests  ---->  execute kitty_tests/__init__.py
+kitty/config.py line 10:
+    from .conf.utils import BadLine, parse_config_base
     |
     v
-kitty_tests/__init__.py line 22:
-    from kitty.fast_data_types import Cursor, HistoryBuf, ...
+kitty/conf/utils.py line 27:
+    from ..fast_data_types import Color
     |
     v
 !! ModuleNotFoundError: No module named 'kitty.fast_data_types' !!
     |
     v
-Propagates up uncaught through:
-    kitty_tests.main (import)
-  <--
-    test.py line 10
-    |
-    v
-Process exits with non-zero status; 145 tests never ran.
+Traceback terminates at the launcher; all 145 Python tests never run.
+(Go subprocess was not yet spawned — run_go() at main.py:270 was never reached
+ because main.py was never evaluated; the package __init__.py crashed first.)
 ```
 
 For the `rsync.so` scenario, the cascade differs at the middle:
 
 ```
-test.py (line 10)
+test.py line 13:       main()
     |
     v
-import kitty_tests.main     -- succeeds
+test.py line 9:        getattr(m, 'main')()
     |
     v
-main() -> run_tests() -> find_all_tests()
+main.py line 338:      run_tests()            # call inside kitty_tests.main.main()
+    |
+    v  (Go subprocess is ALREADY started here: run_go() at main.py:270)
+    |
+main.py line 279:      run_python_tests(args, go_proc)   # inside run_tests()
     |
     v
-for x in contents('kitty_tests'):   # iterates *.py files
-    importlib.import_module('kitty_tests.file_transmission')
+main.py line 211:      tests = find_all_tests()
+    |
+    v
+main.py line 64:       importlib.import_module(f'{package}.{name}')  # inside find_all_tests
     |
     v
 kitty_tests/file_transmission.py line 13:
@@ -1314,17 +1358,11 @@ kitty_tests/file_transmission.py line 13:
 !! ModuleNotFoundError: No module named 'kittens.transfer.rsync' !!
     |
     v
-Propagates up uncaught through:
-    find_all_tests()  -- line 64
-  <--
-    run_tests()       -- line ~263
-  <--
-    main()            -- line 337
-  <--
-    test.py line 11 (SystemExit)
-    |
-    v
-Process exits; Go subprocess left running but its output is discarded.
+Traceback propagates up uncaught; finally raise SystemExit
+(at main.py:243 would be the normal path, but this ModuleNotFoundError
+bypasses that line and unwinds the stack directly).
+Process exits; the already-running Go subprocess is still alive and its
+output is never read (stdout discarded).
 ```
 
 For the GLFW scenarios, no cascade — just a single `assertTrue` failure:
@@ -1389,7 +1427,7 @@ Python's import system evaluates package `__init__.py` **before** any submodule 
 
 There is **no import path** into the test suite that bypasses line 22. A missing `fast_data_types.so` therefore blocks **every** test. This is the definition of "critical" in the classification: the extension is a single point of failure whose loss has a 100% cascade impact.
 
-Additionally, line 24 imports `Options, defaults` from `kitty.options.types`, which transitively imports `kitty.fast_data_types`, providing a second redundant hard link. Even a hypothetical refactor that moved the first import away would still fail at line 24.
+Additionally, the redundancy is threefold: line 21 (`from kitty.config import ...`) cascades through `kitty/conf/utils.py:27` (`from ..fast_data_types import Color`), line 22 is the direct import quoted above, and line 24 (`from kitty.options.types import Options, defaults`) also transitively reaches `kitty.fast_data_types`. Empirically the traceback aborts at line 21 first (see §10.1). Even a hypothetical refactor that removed any one of these three lines would still leave the other two as hard links — there is no import path that avoids loading the extension.
 
 ### 11.2 Why `rsync.so` Is a SECONDARY FAILURE DOMAIN (not CRITICAL, not LOCALIZED)
 
