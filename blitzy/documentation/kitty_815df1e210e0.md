@@ -262,21 +262,22 @@ Before compilation, the Python side prepends a `#version <GLSL_VERSION>` directi
 **C side — `kitty/shaders.c`** (1,285 lines total):
 
 ```c
-// kitty/shaders.c (excerpts, line numbers verified on HEAD)
+// kitty/shaders.c (verbatim excerpts, line numbers verified on HEAD)
 static PyObject*
-compile_program(PyObject *self, PyObject *args) {                  // line 1168
+compile_program(PyObject UNUSED *self, PyObject *args) {                                   // line 1168
     ...
-    program->id = glCreateProgram();                               // line 1179
-    attach_shaders(program, vertex_sources, GL_VERTEX_SHADER);     // line 1180
-    attach_shaders(program, fragment_sources, GL_FRAGMENT_SHADER); // line 1181
-    glLinkProgram(program->id);                                    // line 1182
+#define fail_compile() { glDeleteProgram(program->id); return NULL; }                      // line 1178
+    program->id = glCreateProgram();                                                        // line 1179
+    if (!attach_shaders(vertex_shaders, program->id, GL_VERTEX_SHADER)) fail_compile();     // line 1180
+    if (!attach_shaders(fragment_shaders, program->id, GL_FRAGMENT_SHADER)) fail_compile(); // line 1181
+    glLinkProgram(program->id);                                                             // line 1182
     ...
-    init_uniforms(which);                                          // line 1193
+    init_uniforms(which);                                                                   // line 1193
     ...
 }
 ```
 
-Inside `attach_shaders()` (called twice, once per stage), C calls `glCreateShader()`, `glShaderSource()`, and `glCompileShader()` for each source string. This is standard OpenGL. There is no "interpret GLSL in Python" path; there is no "render on the CPU if the shader fails to compile" path.
+The `attach_shaders()` helper (defined at `kitty/shaders.c:1153` with signature `attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type)`) is called twice, once per stage. Inside, C calls `glCreateShader()`, `glShaderSource()`, and `glCompileShader()` for each source string, then `glAttachShader(program_id, shader_id)`. This is standard OpenGL. There is no "interpret GLSL in Python" path; there is no "render on the CPU if the shader fails to compile" path.
 
 **Pipeline summary (top to bottom is runtime order):**
 
@@ -644,12 +645,12 @@ With `fast_data_types.so` renamed out of the way, I attempted to import `main` f
 
 | Kitten             | Why import succeeds                                                          |
 |--------------------|------------------------------------------------------------------------------|
-| `choose_fonts`     | Python stub only — the kitten's logic is in 10 Go files under `kittens/choose_fonts/*.go`. The Python `main()` raises `SystemExit`. |
-| `clipboard`        | Python stub only — logic is in `kittens/clipboard/{main,read,write}.go`.     |
+| `choose_fonts`     | Python stub only — the kitten's logic is in 11 Go files under `kittens/choose_fonts/*.go` (`backend.go`, `face.go`, `faces.go`, `family_list.go`, `final.go`, `graphics.go`, `list.go`, `main.go`, `styles.go`, `types.go`, `ui.go`). The Python `main()` raises `SystemExit`. |
+| `clipboard`        | Python stub only — logic is in `kittens/clipboard/{legacy,main,read,write}.go` (4 Go files). |
 | `hyperlinked_grep` | Python stub only — wraps Go `kittens/hyperlinked_grep/main.go`. There is no `main()` function; a module-level `if __name__ == '__main__': raise SystemExit('This should be run as kitten hyperlinked_grep')` guard fires only when the file is run as a script. Importing it (as this test does) leaves `__name__ == 'kittens.hyperlinked_grep.main'` and the guard does not trigger. |
-| `icat`             | Python stub only — image-rendering kitten. Logic in 5 Go files.             |
+| `icat`             | Python stub only — image-rendering kitten. Logic in 6 Go files (`detect.go`, `magick.go`, `main.go`, `native.go`, `process_images.go`, `transmit.go`). |
 | `show_key`         | Python stub only — wraps 3 Go files under `kittens/show_key/*.go`.          |
-| `transfer`         | Python stub only — file transfer over SSH; logic in 6 Go files.              |
+| `transfer`         | Python stub only — file transfer over SSH; logic in 7 Go files (5 implementation files: `ftc.go`, `main.go`, `receive.go`, `send.go`, `utils.go`; plus 2 Go test files: `ftc_test.go`, `send_test.go`). |
 
 **12 fail with `ModuleNotFoundError` for `kitty.fast_data_types`** (transitively):
 
