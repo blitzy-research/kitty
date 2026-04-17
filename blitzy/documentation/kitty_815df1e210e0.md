@@ -150,7 +150,7 @@ The source contains an explicit comment in `Tab.new_window` stating that the chi
 
 ### 1.2 `Child.fork` — PTY Allocation and the Ready Pipe
 
-`Child.fork` in `kitty/child.py` (lines 278–358) sets up two pipes. The snippet below is **illustrative / simplified** — omitted are the `run-shell` kitten branch, macOS `/usr/bin/login` wrapper, systemd scope placement, stdin-pipe routing, and several environment-preparation steps. The core sequence of syscalls and the critical ordering of file-descriptor manipulations mirror the actual source:
+`Child.fork` in `kitty/child.py` (lines 276–358) sets up two pipes. The snippet below is **illustrative / simplified** — omitted are the `run-shell` kitten branch, macOS `/usr/bin/login` wrapper, systemd scope placement, stdin-pipe routing, and several environment-preparation steps. The core sequence of syscalls and the critical ordering of file-descriptor manipulations mirror the actual source:
 
 ```python
 # 1) Master/slave PTY pair (before any child-process creation).
@@ -468,7 +468,7 @@ Boss.on_window_resize()            (kitty/boss.py line 1206)
 
 ### 2.7 Final Leg — `Window.set_geometry()`
 
-The terminal leg of the resize chain is `kitty/window.py:set_geometry()` at line 850. The excerpt below mirrors the actual source (lines 850–882), with only minor whitespace elisions — identifiers, conditions, and ordering are preserved verbatim:
+The terminal leg of the resize chain is `kitty/window.py:set_geometry()` at line 850. The excerpt below is a **condensed quote** of the actual source (lines 850–882): identifiers, conditions, and statement ordering are preserved verbatim, but two `if boss.args.debug_rendering:` diagnostic branches (the "Child launched" and "SIGWINCH sent to child" log prints around source lines 870–873) have been elided for readability — they are pure tracing aids and do not influence the runtime state transitions discussed in this section:
 
 ```python
 def set_geometry(self, new_geometry: WindowGeometry) -> None:
@@ -616,7 +616,7 @@ def set_geometry(self, new_geometry: WindowGeometry) -> None:
         return
 ```
 
-`self.destroyed` is set to `True` inside `Window.destroy()` at `kitty/window.py` line 1561 — the actual source is:
+`self.destroyed` is set to `True` inside `Window.destroy()` (defined at `kitty/window.py` line 1560); the assignment itself is at line 1562. The actual source is:
 
 ```python
 def destroy(self) -> None:
@@ -639,7 +639,7 @@ Between the moment Python calls `window.destroy()` and the moment the C layer's 
 
 ### 3.3 Guard Layer 2 — C-Layer `WITH_*` Macros
 
-Defined in `kitty/state.c` lines 24–45:
+Defined in `kitty/state.c` lines 24–49. The listing below is **simplified pseudocode** — it preserves the semantic structure (open-loop search + `if id==target` body + matching `END_WITH_*` that closes the braces) but renames loop variables and elides the `do { ... } while (0); break;` usage pattern of the real macros, which use `break` statements in the `END_WITH_*` counterparts to exit the loops. Consult the actual preprocessor expansion at `kitty/state.c:24-49` for the exact brace/break sequence:
 
 ```c
 #define WITH_OS_WINDOW(os_window_id) \
@@ -669,7 +669,7 @@ Every C function that mutates window state — `set_window_render_data()`, `upda
 
 ### 3.4 Guard Layer 3 — Array-Based Storage with `REMOVER` Macro
 
-The `REMOVER` macro at `kitty/state.c` line 14 compacts arrays when elements are removed:
+The `REMOVER` macro at `kitty/state.c` line 14 compacts arrays when elements are removed. The block below is **paraphrased pseudocode** — it spells out the compaction and zeroing inline to make the semantics plain, but the actual macro parameter is named `qid` (not `id`) and delegates the compaction/clear steps to inline helpers `zero_at_i(array, i)` and `remove_i_from_array(array, i, count)` defined earlier in `state.c`. Consult lines 14–22 for the verbatim source:
 
 ```c
 #define REMOVER(array, id, count, destroy, capacity) \
@@ -686,11 +686,11 @@ The `REMOVER` macro at `kitty/state.c` line 14 compacts arrays when elements are
 
 It is used in three places:
 
-- `kitty/state.c` line 356: `remove_window_inner()` → removes from `tab->windows[]`
-- `kitty/state.c` line 452: `destroy_tab()` → removes from `os_window->tabs[]`
-- `kitty/state.c` line 491: `remove_os_window()` → removes from `global_state.os_windows[]`
+- `kitty/state.c` line 356: `remove_window_inner()` → removes from `tab->windows[]` with `destroy_window` as the destroy callback.
+- `kitty/state.c` line 452: `remove_tab_inner()` → removes from `os_window->tabs[]` with `destroy_tab` as the destroy callback (callers such as `detach_tab()` and `remove_tab()` route through `remove_tab_inner()`; `destroy_tab` itself at `state.c:440` is never invoked directly — only through `REMOVER`).
+- `kitty/state.c` line 491: `remove_os_window()` → removes from `global_state.os_windows[]` with `destroy_os_window_item` as the destroy callback.
 
-After each removal, the array is compacted (`memmove`) and the trailing slot is zeroed (`memset`). This means pointer-valued global references (such as `global_state.callback_os_window` and `global_state.focused_window_id`) must be saved and restored across `REMOVER` calls — that is the purpose of `WITH_OS_WINDOW_REFS` (defined around `state.c` line 55+), which captures these ids before the remover runs and re-resolves them afterward.
+After each removal, the array is compacted (conceptually `memmove`, implemented via `remove_i_from_array`) and the trailing slot is zeroed (conceptually `memset`, implemented via `zero_at_i`). This means pointer-valued global references (such as `global_state.callback_os_window` and `global_state.focused_window_id`) must be saved and restored across `REMOVER` calls — that is the purpose of `WITH_OS_WINDOW_REFS` (defined around `state.c` line 55+), which captures these ids before the remover runs and re-resolves them afterward.
 
 ### 3.5 Child-Death Cascade — I/O Thread → Main Thread
 
@@ -746,7 +746,7 @@ stateDiagram-v2
     [*] --> NO_CLOSE_REQUESTED
     NO_CLOSE_REQUESTED --> CONFIRMABLE_CLOSE_REQUESTED : window_close_callback<br/>glfw.c:249
     CONFIRMABLE_CLOSE_REQUESTED --> CLOSE_BEING_CONFIRMED : process_pending_closes<br/>invokes confirm_os_window_close
-    CLOSE_BEING_CONFIRMED --> IMPERATIVE_CLOSE_REQUESTED : user confirms<br/>boss.py ~1770
+    CLOSE_BEING_CONFIRMED --> IMPERATIVE_CLOSE_REQUESTED : user confirms<br/>boss.py ~1766
     CLOSE_BEING_CONFIRMED --> NO_CLOSE_REQUESTED : user cancels<br/>(mark NO_CLOSE_REQUESTED)
     CONFIRMABLE_CLOSE_REQUESTED --> IMPERATIVE_CLOSE_REQUESTED : confirmation not needed<br/>(option threshold not met)
     IMPERATIVE_CLOSE_REQUESTED --> [*] : close_os_window()<br/>kitty/child-monitor.c line 1083
@@ -922,7 +922,7 @@ The last line is critical: `glfwSetWindowShouldClose(window, false)` *counterman
    - If confirmation needed, creates a confirmation dialog window via `self.confirm(msg, self.handle_close_os_window_confirmation, os_window_id, ...)`.
 3. After `confirm_os_window_close` returns, if `w->close_request == IMPERATIVE_CLOSE_REQUESTED`, call `close_os_window(self, w)` immediately.
 
-**The confirmation handler** (`Boss.handle_close_os_window_confirmation` around `kitty/boss.py` line 1770):
+**The confirmation handler** (`Boss.handle_close_os_window_confirmation` at `kitty/boss.py` line 1766):
 
 ```python
 def handle_close_os_window_confirmation(self, confirmed: bool, os_window_id: int) -> None:
@@ -1055,16 +1055,18 @@ Defined in `kitty/child-monitor.c` line 121:
 
 ### 5.3 `mask_kitty_signals_process_wide`
 
-`kitty/child-monitor.c` line 150 (approximate):
+`kitty/child-monitor.c` line 150. The actual source is a Python-binding wrapper (not a bare C function); the body below is **conceptually simplified** — the real declaration is `static PyObject* mask_kitty_signals_process_wide(PyObject *self UNUSED, PyObject *a UNUSED)`, and the helper `mask_variadic_signals(int sentinel, ...)` at `child-monitor.c:124` returns `void` (not `bool`). The significant logic — the call into `mask_variadic_signals` with the `KITTY_HANDLED_SIGNALS` set — is preserved exactly:
 
 ```c
-bool
+// Simplified signature; the real function returns PyObject* and takes the
+// standard METH_NOARGS Python-binding parameters.
+void
 mask_kitty_signals_process_wide(void) {
-    return mask_variadic_signals(0, KITTY_HANDLED_SIGNALS);
+    mask_variadic_signals(0, KITTY_HANDLED_SIGNALS);
 }
 ```
 
-`mask_variadic_signals(how, ...)` has platform-specific behaviour:
+`mask_variadic_signals(sentinel, ...)` has platform-specific behaviour:
 
 - **Linux (`HAS_SIGNAL_FD`)**: calls `sigprocmask(SIG_BLOCK, &set, NULL)` with the set containing `KITTY_HANDLED_SIGNALS`. Blocked signals accumulate in the kernel's per-process pending queue until read via `signalfd`.
 - **macOS / BSD**: since `signalfd` is unavailable, uses `sigaction()` to install `SIG_IGN` for signals that cannot be delivered via self-pipe, and `SA_SIGINFO` handlers that write to the self-pipe for signals that can.
@@ -1081,10 +1083,10 @@ The effect is identical: the main thread (and all GLFW display threads) will nev
 sigemptyset(&ld->signals);
 sigaddset(&ld->signals, SIGINT);   /* ... etc for all KITTY_HANDLED_SIGNALS */
 sigprocmask(SIG_BLOCK, &ld->signals, NULL);
-ld->signal_fd = signalfd(-1, &ld->signals, SFD_NONBLOCK | SFD_CLOEXEC);
+ld->signal_read_fd = signalfd(-1, &ld->signals, SFD_NONBLOCK | SFD_CLOEXEC);
 ```
 
-The `signalfd` is a kernel-provided readable fd that delivers `struct signalfd_siginfo` records. `SFD_NONBLOCK` prevents blocking reads; `SFD_CLOEXEC` prevents inheritance to child processes.
+`LoopData` (declared in `kitty/loop-utils.h` lines 32–42) carries a single `int signal_read_fd` field that is populated by either the `signalfd()` call above (Linux) or from `ld->signal_fds[0]` after `self_pipe()` succeeds (macOS/BSD). The `signalfd` is a kernel-provided readable fd that delivers `struct signalfd_siginfo` records. `SFD_NONBLOCK` prevents blocking reads; `SFD_CLOEXEC` prevents inheritance to child processes.
 
 **macOS / BSD path**:
 
@@ -1127,7 +1129,7 @@ Each iteration:
 1. `remove_children(self)` — process any `needs_removal` flags set in the previous iteration.
 2. `add_children(self)` — promote entries from `add_queue[]` to `children[]` under `children_mutex`.
 3. `poll(children_fds, self->count + EXTRA_FDS, timeout)` where `timeout` is computed from pending writes and the next deadline (`OPT(input_delay)` = 3ms for wakeup throttling).
-4. If `children_fds[0].revents & POLLIN` (wakeup): `drain_fd(children_fds[0].fd)` just drains the fd (`kitty/child-monitor.c:1517`; `drain_fd` is defined inline in `kitty/loop-utils.h:76`).
+4. If `children_fds[0].revents & POLLIN` (wakeup): `drain_fd(children_fds[0].fd)` just drains the fd (`kitty/child-monitor.c:1515`; `drain_fd` is defined inline in `kitty/loop-utils.h:76`).
 5. If `children_fds[1].revents & POLLIN` (signal): `read_signals(...)` + `handle_signal(...)` — detailed below.
 6. For each child fd at indices `EXTRA_FDS..`: handle `POLLIN` via `read_bytes(fd, screen)`, `POLLOUT` via `write_to_child(fd, screen)`, `POLLHUP` or read-returns-0 by setting `needs_removal = true`, and `POLLNVAL` (fd closed unexpectedly) by marking removal.
 7. If any child received data and `(now - last_main_loop_wakeup_at) > OPT(input_delay)`, call `wakeup_main_loop()` — otherwise set `has_pending_wakeups = true` for the next iteration. This throttles wakeups to at most one per `input_delay` milliseconds (default 3ms per `kitty/options/definition.py` line ~878).
