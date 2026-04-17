@@ -841,12 +841,12 @@ Note: the AAP's planning document referenced LiberationMono; in this specific te
 
 ### 4.5 Window and Layout Evidence (xwininfo)
 
-`xwininfo -root -tree` was run against `DISPLAY=:99` while Kitty was live (Appendix C). The tree output included:
+`xwininfo -root -tree` was run against `DISPLAY=:99` while Kitty was live (Appendix C). Under the X11 root, two top-level windows appear as siblings:
 
 ```
-0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
-   1 child:
-   0x200001 (has no name): ()  1x1+0+0  +0+0
+     2 children:
+     0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
+     0x200001 (has no name): ()  1x1+0+0  +0+0
 ```
 
 Decoded:
@@ -855,7 +855,7 @@ Decoded:
 - `"sh"` — `WM_NAME` (the window's title). Kitty's default title policy is to follow the child's argv[0] unless overridden; since we launched `sh -c 'sleep 2'`, the title became `sh`.
 - `("kitty" "kitty")` — `WM_CLASS`, which is `(instance, class)`. Both are the literal string `kitty`, set by `set_x11_window_icon()` / GLFW during `create_os_window`. This is how desktop environments group Kitty windows together.
 - `640x400+0+0` — the window's geometry: 640 × 400 pixels at offset (0, 0) in the root window. This matches `initial_window_width=640` (`kitty/options/definition.py:994`) and `initial_window_height=400` (line 998) — direct evidence that the default layout path in `kitty/os_window_size.py::initial_window_size_func` was taken.
-- `0x200001 (has no name) 1x1+0+0` — an auxiliary 1×1 hidden window used by GLFW for certain IPC / clipboard operations. It is not visible to the user.
+- `0x200001 (has no name) 1x1+0+0` — an auxiliary 1×1 hidden GLFW helper window that exists as a **sibling** of Kitty's main window `0x20000c` directly under the X11 root (not as a child of `0x20000c`). GLFW creates it for certain IPC / clipboard operations. It is not visible to the user.
 
 ### 4.6 Pre-rendered Sprites and Cell Metrics
 
@@ -971,15 +971,14 @@ xwininfo: Window id: 0x21f (the root window) (has no name)
   Parent window id: 0x0 (none)
      2 children:
      0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
-        1 child:
-        0x200001 (has no name): ()  1x1+0+0  +0+0
+     0x200001 (has no name): ()  1x1+0+0  +0+0
 ```
 
 Decoding:
 
-- `0x21f` — root window of the `:99` Xvfb server.
+- `0x21f` — root window of the `:99` Xvfb server. Both windows below are its direct children (siblings of one another).
 - `0x20000c` — Kitty's top-level window. `WM_NAME = "sh"` (title = child argv[0]); `WM_CLASS = ("kitty", "kitty")` (instance, class). Geometry `640x400+0+0` — 640×400 pixels at position (0, 0) — directly confirms the compiled defaults `initial_window_width=640` and `initial_window_height=400` from `kitty/options/definition.py` lines 994/998.
-- `0x200001` — auxiliary 1×1 hidden GLFW helper window.
+- `0x200001` — auxiliary 1×1 hidden GLFW helper window. It is a top-level sibling of `0x20000c` directly under the X11 root (not a child of Kitty's main window); GLFW creates it as an IPC / clipboard helper and keeps it unmapped/invisible.
 
 ---
 
