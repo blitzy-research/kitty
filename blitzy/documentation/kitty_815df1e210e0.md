@@ -447,7 +447,7 @@ handler.manager.request_id)`.
 ### 4.7 Kitten-Side Inbound Parsing
 
 When OSC bytes flow from terminal to kitten, the Go TUI loop calls an
-`OnEscapeCode` handler. In `kittens/transfer/send.go:1223-1237`:
+`OnEscapeCode` handler. In `kittens/transfer/send.go:1224-1237`:
 
 ```go
 ftc_code := strconv.Itoa(kitty.FileTransferCode)
@@ -545,17 +545,17 @@ field is always base64-encoded because it's `[]byte`.
 
 ### 5.2 Enum Definitions
 
-From `kittens/transfer/ftc.go:33-118`:
+From `kittens/transfer/ftc.go:32-118`:
 
 - **Action** (lines 37-47): `invalid`, `file`, `data`, `end_data`, `receive`,
   `send`, `cancel`, `status`, `finish`. These correspond to the protocol's
   command verbs.
-- **Compression** (lines 49-56): `none`, `zlib`.
-- **FileType** (lines 59-68): `regular`, `symlink`, `directory`, `link`. The
+- **Compression** (lines 49-57): `none`, `zlib`.
+- **FileType** (lines 59-69): `regular`, `symlink`, `directory`, `link`. The
   `link` value is kitty's internal name for hard links (distinct from
   `symlink`).
-- **TransmissionType** (lines 99-106): `simple`, `rsync`.
-- **QuietLevel** (lines 108-115): `none` (0), `acknowledgements` (1),
+- **TransmissionType** (lines 99-107): `simple`, `rsync`.
+- **QuietLevel** (lines 109-118): `none` (0), `acknowledgements` (1),
   `errors` (2). Level 1 suppresses STARTED/OK responses; level 2 additionally
   suppresses error messages. Controlled by the `q` key in the protocol.
 
@@ -812,20 +812,32 @@ Per `docs/file-transfer-protocol.rst`:
 
 #### 6.2.3 Entry Point
 
-`kittens/transfer/receive.go` around line 465:
+`kittens/transfer/receive.go` at lines 465-471:
 
 ```go
-func (self *manager) start_transfer(send func(*FileTransmissionCommand, func(string) loop.IdType)) {
-    self.send(&FileTransmissionCommand{Action: Action_receive, Bypass: self.bypass, Size: int64(len(self.spec))}, send)
-    for _, x := range self.spec {
-        self.send(&FileTransmissionCommand{Action: Action_file, Name: x}, send)
+func (self *manager) start_transfer(send func(string) loop.IdType) {
+    self.send(FileTransmissionCommand{Action: Action_receive, Bypass: self.bypass, Size: int64(len(self.spec))}, send)
+    for i, x := range self.spec {
+        self.send(FileTransmissionCommand{Action: Action_file, File_id: strconv.Itoa(i), Name: x}, send)
     }
+    self.progress_tracker.start_transfer()
 }
 ```
 
 `self.spec` is the list of path arguments the user passed on the command line.
 The client announces the spec count, then iterates through each one sending a
-`file` metadata command.
+`file` metadata command tagged with a numeric `file_id` (the index within the
+spec) so the terminal can correlate subsequent `file` metadata replies back to
+the client's request. After enqueuing the metadata commands, the manager calls
+`self.progress_tracker.start_transfer()` to record the transfer start time so
+speed/ETA calculations in later progress updates are grounded in a consistent
+baseline. Note the callback signature `func(string) loop.IdType` — it is the
+`lp.QueueWriteString` function from the TUI event loop, which writes a raw
+string to the terminal stream and returns the queued write's id. The
+`self.send(...)` helper on `*manager` accepts `FileTransmissionCommand` by
+value (not pointer), wraps it in the OSC 5113 envelope via `Serialize(false)`,
+and uses the provided `send` callback to push the framed bytes onto the
+TTY.
 
 ### 6.3 Cancellation
 
@@ -953,7 +965,7 @@ The `rsync_capable` and `compression_capable` flags are set at construction:
 
 ### 7.4 The `File` Struct
 
-`kittens/transfer/send.go:82-109`:
+`kittens/transfer/send.go:83-108`:
 
 ```go
 type File struct {
@@ -1209,8 +1221,8 @@ existing file as `Action_data` chunks. On the sender side (the kitten with the
 
 ### 7.11 Progress Tracking — `ProgressTracker`
 
-At approximately `kittens/transfer/send.go:297-360`, the `ProgressTracker`
-struct tracks:
+At `kittens/transfer/send.go:295-342`, the `ProgressTracker` struct
+(and its methods) tracks:
 
 - `total_size_of_all_files int64` — sum of all file sizes (known at
   construction time).
@@ -1346,13 +1358,21 @@ is interrupted mid-file, the destination is left truncated. The rsync path
 
 ### 8.4 `patch_file` — Rsync Backing
 
-Lines 68-124:
+Lines 69-123:
 
 ```go
 type patch_file struct {
     path      string
     src, temp *os.File
     p         *rsync.Patcher
+}
+
+func (pf *patch_file) tell() (int64, error) {
+    if pf.temp == nil {
+        s, err := os.Stat(pf.path)
+        return s.Size(), err
+    }
+    return pf.temp.Seek(0, io.SeekCurrent)
 }
 
 func (pf *patch_file) close() (err error) {
@@ -1404,6 +1424,12 @@ Key behaviors:
   creates a temp file in the same directory (`temp`), and calls
   `p.StartDelta(temp, src)` to wire up the patcher with output (temp) and
   reference (src) streams.
+- **`tell()`**: reports the number of bytes written so far. If the patcher has
+  already closed and the temp file was renamed over the destination, it
+  returns the final size of the renamed file via `os.Stat`; otherwise it
+  returns the current seek offset in the temp file. This is how the progress
+  tracker reports on-disk reconstructed bytes for rsync transfers without
+  holding a running counter.
 - **`write(data)`**: delegates to `p.UpdateDelta(data)` which parses
   serialized operations and emits reconstructed bytes to `temp`.
 - **`close()`**: calls `p.FinishDelta()` to finalize and verify the integrity
@@ -1672,7 +1698,7 @@ efficiency story for repeated transfers.
 All hashing in kitty's rsync uses xxHash (the `github.com/zeebo/xxh3` module).
 
 - **XXH3-64** — used for the per-block `StrongHash` field. Fast, 64-bit output.
-  Defined around `tools/rsync/algorithm.go:61-65` as `new_xxh3_64`. Tested
+  Defined at `tools/rsync/algorithm.go:59-63` as `new_xxh3_64`. Tested
   with a known-answer vector in `kitty_tests/file_transmission.py`:
   xxh3-64 of `'abcd'` = `6497a96f53a89890`.
 - **XXH3-128** — used for the end-of-delta file integrity checksum. 128-bit
@@ -1708,12 +1734,13 @@ const BlockHashSize = 20
 
 Wire serialization: 8 bytes `Index` (big-endian) + 4 bytes `WeakHash` +
 8 bytes `StrongHash`, for a total of 20 bytes. The `Serialize(output []byte)`
-and `Unserialize(data []byte)` methods (lines 186-211) handle the
+and `Unserialize(data []byte)` methods (lines 186-200) handle the
 encoding/decoding with the standard `encoding/binary` package.
 
 #### 10.3.2 `Operation` — Delta Instructions
 
-At `tools/rsync/algorithm.go:73-95`:
+At `tools/rsync/algorithm.go:72-92` (struct at 72-78, `String()` method at
+80-92):
 
 ```go
 type Operation struct {
@@ -1723,14 +1750,19 @@ type Operation struct {
     Data          []byte
 }
 
-func (op Operation) String() string {
-    switch op.Type {
-    case OpBlock:       return fmt.Sprintf("Block(%d)", op.BlockIndex)
-    case OpBlockRange:  return fmt.Sprintf("BlockRange(%d,%d)", op.BlockIndex, op.BlockIndexEnd)
-    case OpData:        return fmt.Sprintf("Data(%d)", len(op.Data))
-    case OpHash:        return fmt.Sprintf("Hash(%x)", op.Data)
+func (self Operation) String() string {
+    ans := "{" + self.Type.String() + " "
+    switch self.Type {
+    case OpBlock:
+        ans += strconv.FormatUint(self.BlockIndex, 10)
+    case OpBlockRange:
+        ans += strconv.FormatUint(self.BlockIndex, 10) + " to " + strconv.FormatUint(self.BlockIndexEnd, 10)
+    case OpData:
+        ans += strconv.Itoa(len(self.Data))
+    case OpHash:
+        ans += hex.EncodeToString(self.Data)
     }
-    ...
+    return ans + "}"
 }
 ```
 
@@ -1835,7 +1867,9 @@ needed to compute a delta:
 - `pending_op` — an in-progress `OpBlockRange` accumulator (so adjacent
   blocks coalesce without emitting one op at a time).
 
-The core loop (`read_next` method, around lines 390-470) proceeds:
+The core loop (`read_next` method, at lines 533-570; the `Next()` entry point
+that drives it is at line 381 and delegates to `pump_till_op_written`)
+proceeds:
 
 1. Read one byte forward; slide the window via `rc.add_one_byte`.
 2. Compute the current `weak`; look up in `hash_lookup`.
@@ -1850,14 +1884,14 @@ The core loop (`read_next` method, around lines 390-470) proceeds:
 6. At EOF, flush the final `OpData` (if any), then emit an `OpHash` with the
    XXH3-128 digest of the entire source file for receiver verification.
 
-The `enqueue` method (nearby) coalesces adjacent `OpBlock`s into a single
-`OpBlockRange`: if the last-emitted op is `OpBlock` or `OpBlockRange` and the
-new op's `BlockIndex` is exactly one past the previous one, extend the range
-instead of emitting a new op.
+The `enqueue` method at lines 401-430 coalesces adjacent `OpBlock`s into a
+single `OpBlockRange`: if the last-emitted op is `OpBlock` or `OpBlockRange`
+and the new op's `BlockIndex` is exactly one past the previous one, extend
+the range instead of emitting a new op.
 
 ### 10.7 Delta Application
 
-`tools/rsync/algorithm.go` `ApplyDelta` (around lines 274-330) is the
+`tools/rsync/algorithm.go` `ApplyDelta` (lines 275-325) is the
 reconstruction function. It dispatches on `op.Type`:
 
 - **`OpBlock`**: `target.Seek(BlockIndex * BlockSize, SeekStart)`, read
@@ -2003,7 +2037,7 @@ user file data passes through, in both directions.
 FILE ON DISK
   │
   │  os.File.Read (up to 1 MiB per call)
-  │     — kittens/transfer/send.go:918 (const sz = 1024*1024)
+  │     — kittens/transfer/send.go:916 (const sz = 1024*1024)
   ▼
 RAW BYTES
   │
@@ -2392,26 +2426,22 @@ terminal-protocol perspective).
 `kittens/transfer/utils.go:88-107` defines `should_be_compressed`:
 
 ```go
-func should_be_compressed(path string, strategy string) bool {
-    switch strategy {
-    case "always":
+func should_be_compressed(path, strategy string) bool {
+    if strategy == "always" {
         return true
-    case "never":
+    }
+    if strategy == "never" {
         return false
     }
     ext := strings.ToLower(filepath.Ext(path))
-    switch ext {
-    case ".zip", ".odt", ".odp", ".pptx", ".docx", ".gz", ".bz2", ".xz", ".svgz":
-        return false
+    if ext != "" {
+        switch ext[1:] {
+        case "zip", "odt", "odp", "pptx", "docx", "gz", "bz2", "xz", "svgz":
+            return false
+        }
     }
-    mt := mime.TypeByExtension(ext)
-    if strings.HasSuffix(mt, "+zip") {
-        return false
-    }
-    if strings.HasPrefix(mt, "image/") && mt != "image/svg+xml" {
-        return false
-    }
-    if strings.HasPrefix(mt, "video/") {
+    mt := utils.GuessMimeType(path)
+    if strings.HasSuffix(mt, "+zip") || (strings.HasPrefix(mt, "image/") && mt != "image/svg+xml") || strings.HasPrefix(mt, "video/") {
         return false
     }
     return true
@@ -2420,15 +2450,19 @@ func should_be_compressed(path string, strategy string) bool {
 
 The heuristic follows simple logic:
 
-- **`strategy == "always"`**: always compress.
-- **`strategy == "never"`**: never compress.
+- **`strategy == "always"`**: always compress (early return).
+- **`strategy == "never"`**: never compress (early return).
 - **Default (`"auto"`)**:
+  - Lowercase the extension via `filepath.Ext` — this returns the leading dot
+    (e.g. `.zip`), so the switch strips the dot with `ext[1:]` before matching.
   - Skip extensions known to be already compressed (zip archives, gzip, bzip2,
     xz, svg-gzipped, and the Office XML formats which internally contain
     compressed ZIPs).
-  - Skip MIME types ending in `+zip` (covers e.g. `application/epub+zip`).
-  - Skip image types except SVG (which is typically XML and compresses well).
-  - Skip video types.
+  - Resolve the MIME type via `utils.GuessMimeType(path)` (kitty's wrapper
+    around the Go stdlib `mime` package plus its own extension table).
+  - A single compound predicate combines three skip conditions: MIME types
+    ending in `+zip` (e.g. `application/epub+zip`), image types except SVG
+    (which is typically XML and compresses well), and any video type.
   - Otherwise, compress.
 
 ### 14.2 User Flag
@@ -2572,7 +2606,7 @@ sides and the user must restart the transfer from the beginning.
   state in memory: `files`, `fid_map`, `state`, `progress_tracker`. There are
   no save-to-disk hooks, no journal files, no `.partial`-style indicator
   files. When the process exits, the state dies with it.
-- **Receiver `manager`** (around `kittens/transfer/receive.go:335-355`) has
+- **Receiver `manager`** (at `kittens/transfer/receive.go:337-354`) has
   the same pattern: `files`, in-memory state, in-memory progress tracker.
 - **`docs/file-transfer-protocol.rst`** does not define any "resume session"
   command. The `Action` enum in `kittens/transfer/ftc.go:37-47` has
@@ -2629,7 +2663,7 @@ So the resumption story is:
 ### 16.5 The Temp File Name
 
 The `patch_file.temp` is created by `os.CreateTemp(filepath.Dir(path), "")`
-at `kittens/transfer/receive.go:118` — note the empty pattern, which uses
+at `kittens/transfer/receive.go:115` — note the empty pattern, which uses
 Go's default `tmp` prefix. The file name is a random suffix. This name is
 **not recorded anywhere persistent**, so a restart of the kitten cannot
 locate an orphaned temp file from a previous run. The OS's temp-file GC (or
@@ -3147,7 +3181,7 @@ where the symbol is defined (or first used).
 |--------|----------|---------|
 | `FileTransmissionCommand` (Go) | `kittens/transfer/ftc.go:120` | The on-wire message. |
 | `FileTransmissionCommand` (Py) | `kitty/file_transmission.py:252` | Python counterpart dataclass. |
-| `File` (Go) | `kittens/transfer/send.go:82` | Per-file sender state. |
+| `File` (Go) | `kittens/transfer/send.go:83` | Per-file sender state. |
 | `remote_file` (Go) | `kittens/transfer/receive.go:125` | Per-file receiver state. |
 | `SendManager` | `kittens/transfer/send.go:344` | Sender session orchestrator. |
 | `manager` (receive) | `kittens/transfer/receive.go` | Receiver session orchestrator. |
@@ -3256,68 +3290,72 @@ kitty/
         │   ├── Line 25: DefaultBlockSize = 6144
         │   ├── Line 28: _M = 1 << 16
         │   ├── Lines 33-38: OpType enum
-        │   ├── Lines 40-71: xxh3 hash wrappers
-        │   ├── Lines 73-95: Operation struct
+        │   ├── Lines 41-69: xxh3 hash wrappers (xxh3_128, new_xxh3_64, new_xxh3_128)
+        │   ├── Lines 72-92: Operation struct + String() method
         │   ├── Lines 177-183: BlockHash struct + BlockHashSize
-        │   ├── Lines 186-211: BlockHash serialization
-        │   ├── Lines 238-262: signature_iterator
-        │   ├── Lines 274-330: ApplyDelta
-        │   ├── Lines 336-360: rolling_checksum
-        │   └── Lines 362-530+: diff struct + compute_delta_ops
+        │   ├── Lines 186-200: BlockHash serialization (Serialize, Unserialize)
+        │   ├── Lines 238-265: signature_iterator (struct 238-244; next() 247-265)
+        │   ├── Lines 268-272: rsync.CreateSignatureIterator
+        │   ├── Lines 275-325: ApplyDelta
+        │   ├── Lines 336-360: rolling_checksum (type + full + add_one_byte)
+        │   ├── Lines 362-378: diff struct
+        │   └── Lines 533-570: diff.read_next (the rolling-window core loop)
         ├── api.go                        287 lines
         │   ├── Lines 1-17: API comment block
         │   ├── Line 29: MaxBlockSize = 1 MiB
-        │   ├── Lines 71-108: read_signature_header (signature header format)
-        │   ├── Lines 265-268: NewDiffer
+        │   ├── Lines 71-109: read_signature_header (signature header format)
+        │   ├── Line 195: Patcher.CreateSignatureIterator
+        │   ├── Line 265: NewDiffer
         │   └── Lines 270-288: NewPatcher
         └── api_test.go                   196 lines
 
 kittens/
 ├── transfer/
 │   ├── main.go                           71 lines
-│   │   └── Lines 38-71: main() dispatch
+│   │   └── Lines 46-67: main() dispatch
 │   ├── ftc.go                            338 lines
 │   │   ├── Lines 37-47: Action enum
-│   │   ├── Lines 49-56: Compression enum
-│   │   ├── Lines 59-68: FileType enum
-│   │   ├── Lines 99-106: TransmissionType enum
-│   │   ├── Lines 108-118: QuietLevel enum
+│   │   ├── Lines 49-57: Compression enum
+│   │   ├── Lines 59-69: FileType enum
+│   │   ├── Lines 99-107: TransmissionType enum
+│   │   ├── Lines 109-118: QuietLevel enum
 │   │   ├── Lines 120-138: FileTransmissionCommand struct
 │   │   ├── Lines 164-214: Serialize method
-│   │   └── Lines 326-339: split_for_transfer + chunk_size = 4096
+│   │   └── Lines 326-338: split_for_transfer + chunk_size = 4096
 │   ├── send.go                           1288 lines
-│   │   ├── Lines 82-109: File struct
+│   │   ├── Lines 83-108: File struct
 │   │   ├── Lines 120-137: NewFile constructor
 │   │   ├── Lines 277-284: SendState enum
-│   │   ├── Lines 286-296: Transfer struct
-│   │   ├── Lines 297-342: ProgressTracker
-│   │   ├── Lines 344-362: SendManager struct
+│   │   ├── Lines 286-293: Transfer struct + is_too_old method
+│   │   ├── Lines 295-342: ProgressTracker struct + methods
+│   │   ├── Lines 344-361: SendManager struct
 │   │   ├── Lines 367-392: initialize() (prefix/suffix)
 │   │   ├── Lines 646-650: send_payload
 │   │   ├── Lines 652-667: metadata_command
-│   │   ├── Lines 915-981: File.next_chunk()
-│   │   ├── Lines 983-1019: SendManager.next_chunks
-│   │   ├── Lines 1223-1237: OnEscapeCode handler
-│   │   └── Lines 1252-1263: rsync stats finalization
+│   │   ├── Lines 915-981: File.next_chunk() (const sz = 1 MiB at line 916)
+│   │   ├── Lines 983-1017: SendManager.next_chunks
+│   │   ├── Lines 1224-1237: OnEscapeCode handler
+│   │   └── Lines 1251-1262: rsync stats finalization
 │   ├── receive.go                        1189 lines
 │   │   ├── Lines 34-41: state enum (type on line 34; const block on 36-41)
 │   │   ├── Lines 43-47: output_file interface
 │   │   ├── Lines 49-66: filesystem_file
-│   │   ├── Lines 68-124: patch_file + new_patch_file
-│   │   ├── Lines 125-149: remote_file struct
-│   │   ├── Lines 151-164: remote_file.close
-│   │   ├── Lines 165-194: remote_file.Write
-│   │   ├── Lines 200-228: remote_file.write_data
-│   │   ├── Lines 355-386: sigwriter
-│   │   ├── Lines 388-445: manager.request_files
-│   │   ├── Lines 453+: handler struct
-│   │   ├── Lines 465+: manager.start_transfer
-│   │   └── Lines 1080-1100: receive_main entry
+│   │   ├── Lines 69-123: patch_file (69-73) + tell (75-81) + close (83-97) + write (99-105) + new_patch_file (107-123)
+│   │   ├── Lines 125-147: remote_file struct
+│   │   ├── Lines 149-164: remote_file.close
+│   │   ├── Lines 166-198: remote_file.Write
+│   │   ├── Lines 200-235: remote_file.write_data
+│   │   ├── Lines 337-354: manager struct
+│   │   ├── Lines 358-384: sigwriter (struct 358-364; Write 366-372 with 4000-byte flush at line 368; flush 374-384)
+│   │   ├── Lines 388-440: manager.request_files
+│   │   ├── Line 442: handler struct
+│   │   ├── Lines 464-470: manager.start_transfer
+│   │   └── Lines 1173+: receive_main entry
 │   ├── utils.go                          114 lines
-│   │   ├── Lines 37-52: encode_bypass (KITTY_PUBLIC_KEY)
+│   │   ├── Lines 37-51: encode_bypass (KITTY_PUBLIC_KEY)
 │   │   ├── Lines 76-80: random_id (crypto/rand + hex)
 │   │   ├── Lines 88-107: should_be_compressed
-│   │   └── Lines 109-113: print_rsync_stats
+│   │   └── Lines 109-114: print_rsync_stats
 │   ├── utils.py                          Python-side transfer helpers
 │   ├── main.py                           Python entry point
 │   ├── algorithm.c                       C extension (xxhash-backed rsync)
@@ -3326,11 +3364,12 @@ kittens/
 │   └── send_test.go                      102-line path-mapping tests
 └── ssh/
     └── main.go                           897 lines
-        ├── connection_data struct (~line 184)
+        ├── connection_data struct (line 171)
         ├── KITTY_PUBLIC_KEY forwarding (line 248)
         ├── kitty/kitten binary deployment (line 348)
+        ├── bootstrap_script function (line 422)
         ├── bootstrap_script assignment (line 481)
-        └── wrap_bootstrap_script (lines 486-518)
+        └── wrap_bootstrap_script (line 486)
 
 docs/
 └── file-transfer-protocol.rst            614-line protocol specification
