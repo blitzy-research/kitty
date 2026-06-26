@@ -182,13 +182,15 @@ exist on only one side. See the [appendix](#how-this-was-verified).
 ### Direct answer
 
 The kitten keeps **seven package-level LRU caches**, all keyed by **absolute path** and all created at
-a fixed capacity of **4096 entries**. Raw file bytes are read **exactly once** per path into the
-`data_cache`; every higher-level artifact — MD5 hash, sanitized lines, syntax-highlighted lines,
+a fixed capacity of **4096 entries**. Raw file bytes are read **on first access and then reused while
+the cache entry stays resident** in the `data_cache` — and re-read only if the LRU later evicts that
+entry; every higher-level artifact — MD5 hash, sanitized lines, syntax-highlighted lines,
 mimetype, size, and the text/binary verdict — is **lazily derived on first access and memoized** on
 top of that. Repeated work (re-rendering, scrolling, re-diffing the same file) is therefore served
-from cache. Efficiency comes from three things working together: **(a)** read-once raw bytes with
-layered reuse, **(b)** bounded memory via LRU eviction at capacity 4096, and **(c)** a correctness
-safeguard that prevents a half-finished highlight from corrupting the layout.
+from cache. Efficiency comes from three things working together: **(a)** raw bytes read once per
+cache residency (re-read only if evicted) with layered reuse, **(b)** bounded memory via LRU eviction
+at capacity 4096, and **(c)** a correctness safeguard that prevents a half-finished highlight from
+corrupting the layout.
 
 ### Rationale / mechanism
 
@@ -235,10 +237,8 @@ the front of the recency list, and — crucially — **evict the least-recently-
 exceeds `max_size`:
 
 ```go
-if self.max_size > 0 && self.lru.Len() > self.max_size {
-    k := self.lru.Remove(self.lru.Back())
-    delete(self.data, k.(K))
-}
+k := self.lru.Remove(self.lru.Back()) // when lru.Len() > max_size
+delete(self.data, k.(K))
 ```
 
 at `cache.go:L51-54`. This fixed-4096 eviction is what bounds memory regardless of how many files a
@@ -310,10 +310,9 @@ to write the same key.
 `LRUCache.Set` takes a **read** lock, not a write lock, and does not update the recency list:
 
 ```go
-func (self *LRUCache[K, V]) Set(key K, val V) {
-    self.lock.RLock()
-    self.data[key] = val
-    self.lock.RUnlock()
+self.lock.RLock() // read lock, not a write lock
+self.data[key] = val
+self.lock.RUnlock()
 ```
 
 at `tools/utils/cache.go:L32-37`. In general, writing to a Go `map` while holding only a read lock —
@@ -374,19 +373,27 @@ non-text (`render.go:L706-709`), and `is_img` derived from `is_image` on either 
 
 **The branch leaves.**
 
-- `image_lines` (`kittens/diff/render.go:L333`) builds a header of the form `"Dimensions: WxH"` and a
-  human-readable size, using `image_collection.ResolutionOf` (`render.go:L342`) and the size text at
-  `render.go:L344`, then places the actual image via the kitty graphics protocol.
+- `image_lines` (`kittens/diff/render.go:L333-392`) **prepares** the image entry but does **not** emit
+  any graphics itself: it builds a header of the form `"Dimensions: WxH"` and a human-readable size
+  using `image_collection.ResolutionOf` (`render.go:L342`) and the size text (`render.go:L344`),
+  reserves the logical image rows via `image_lines_offset` (`render.go:L352`), fills a
+  "Loading image..." placeholder while the load is pending (`render.go:L364`), records the per-side
+  image **keys** (`render.go:L370`, `render.go:L374`), and tags the logical line `IMAGE_LINE`
+  (`render.go:L390`). The **actual** graphics-protocol placement happens later, during drawing:
+  `draw_image_pair` / `draw_image` (`kittens/diff/ui.go:L319-337`) call
+  `image_collection.PlaceImageSubRect` (`tools/tui/graphics/collection.go:L155-181`), which builds a
+  `GRT_action_display` graphics command and writes it to the loop (`collection.go:L177-180`).
 - `binary_lines` (`kittens/diff/render.go:L446`) emits a single `"Binary file: <human-readable size>"`
   line per side (`render.go:L452`) and **no content diff**.
 - `rename_lines` (`kittens/diff/render.go:L684-694`) emits the single message
   `"The file <old> was renamed to <new>"` (`render.go:L688`) and no content diff.
 
 **Tie-back to the runtime.** Images are loaded **asynchronously** by `load_all_images`
-(`kittens/diff/ui.go:L190-211`) into an `image_collection`; while loading, the placeholder text
-"Loading image..." is shown, and the rendered image is emitted using kitty's graphics protocol (APC
-escape codes) once the load completes. This is why image entries appear in two stages at runtime (see
-[Q7](#q7--full-runtime-flow-end-to-end) and the [appendix](#how-this-was-verified)).
+(`kittens/diff/ui.go:L190-211`) into an `image_collection`; while the load is pending the placeholder
+text "Loading image..." is shown, and once the load completes the kitten re-renders and the image is
+emitted to the terminal via kitty's graphics protocol (APC escape codes) **during drawing**
+(`draw_image_pair` / `draw_image`, `ui.go:L319-337`). This is why image entries appear in two stages
+at runtime (see [Q7](#q7--full-runtime-flow-end-to-end) and the [appendix](#how-this-was-verified)).
 
 
 ---
@@ -398,9 +405,11 @@ escape codes) once the load completes. This is why image entries appear in two s
 `kitten diff <left> <right>` validates that it received exactly two inputs, initializes the caches and
 the TUI loop, then runs an **asynchronous pipeline**: a background goroutine builds the file
 *collection* (the [Q1](#q1--directory-file-pairing) pairing plus [Q2](#q2--rename-detection-the-magic)
-rename detection). When the collection completes, it fans out into **three parallel background jobs** —
-**diffing**, **highlighting**, and **image loading** — and each job posts a typed result back to the
-main thread, which re-renders the side-by-side view as results arrive. The diff algorithm
+rename detection). When the collection completes, the main thread invokes **three producer methods** —
+**diffing**, **highlighting**, and **image loading**. Diffing and highlighting *always* spawn a
+background job, but image loading spawns one **only when the diff actually contains images** —
+so an image-free diff fans out into just two jobs, not three. Each spawned job posts a typed result
+back to the main thread, which re-renders the side-by-side view as results arrive. The diff algorithm
 ([Q8](#q8--diff-matching-regions-the-algorithm)) is invoked during the diffing job.
 
 ### Rationale / mechanism — tracing the journey
@@ -434,15 +443,18 @@ main thread, which re-renders the side-by-side view as results arrive. The diff 
 6. **Wakeup drain.** When woken, `on_wakeup` (`kittens/diff/ui.go:L161-177`) drains the
    `async_results` channel (`ui.go:L165`) and dispatches each result to `handle_async_result`.
 7. **Fan-out.** `handle_async_result` (`kittens/diff/ui.go:L245-275`) is the hub. On a `COLLECTION`
-   result (`ui.go:L247`) it stores the collection and launches the three producers —
+   result (`ui.go:L247`) it stores the collection and invokes the three producer methods —
    `generate_diff()` (`ui.go:L249`), `highlight_all()` (`ui.go:L250`), and `load_all_images()`
    (`ui.go:L251`). On a `DIFF` result (`ui.go:L252`) it stores the diff map, computes statistics,
    renders, and draws the screen (`ui.go:L253-268`). `IMAGE_RESIZE` (`ui.go:L269`) and
-   `IMAGE_LOAD`/`HIGHLIGHT` (`ui.go:L272`) trigger a re-render (`ui.go:L271`, `ui.go:L273`). Each of
-   the three producers — `generate_diff` (`ui.go:L142-159`), `highlight_all` (`ui.go:L179-188`),
-   `load_all_images` (`ui.go:L190-211`) — runs in its own goroutine that posts a typed `AsyncResult`
-   and wakes the main thread, which is how their work re-enters the single-threaded render path
-   safely.
+   `IMAGE_LOAD`/`HIGHLIGHT` (`ui.go:L272`) trigger a re-render (`ui.go:L271`, `ui.go:L273`). Note that
+   the three methods do **not** all spawn a job unconditionally: `generate_diff` (`ui.go:L142-159`)
+   and `highlight_all` (`ui.go:L179-188`) **always** launch a goroutine that posts a `DIFF` /
+   `HIGHLIGHT` result, whereas `load_all_images` (`ui.go:L190-211`) first counts image paths and
+   spawns its `IMAGE_LOAD` goroutine **only when `self.image_count > 0`** (the guard at `ui.go:L202`,
+   goroutine at `ui.go:L204-209`) — so a diff with no images produces just two async jobs. Each
+   spawned goroutine posts a typed `AsyncResult` and wakes the main thread, which is how its work
+   re-enters the single-threaded render path safely.
 8. **Diffing & rendering.** The parallel `diff` ([Q4](#q4--multiple-file-processing-parallelism))
    produces the `*Patch` per file; `render` ([Q6](#q6--binary--image-handling)) lays out the
    side-by-side lines; the matching-region algorithm ([Q8](#q8--diff-matching-regions-the-algorithm))
@@ -456,10 +468,10 @@ graph TD
     D --> E["handle_async_result: COLLECTION"]
     E --> F["generate_diff (parallel diff over jobs)"]
     E --> G["highlight_all (parallel chroma over paths)"]
-    E --> H["load_all_images (kitty graphics)"]
+    E -.-> H["load_all_images (spawns job ONLY if images present)"]
     F -->|"AsyncResult DIFF"| D
     G -->|"AsyncResult HIGHLIGHT"| D
-    H -->|"AsyncResult IMAGE_LOAD"| D
+    H -.->|"AsyncResult IMAGE_LOAD (only when images exist)"| D
     F --> I["render_diff + draw_screen"]
     G --> J["rerender_diff"]
     H --> J
@@ -602,12 +614,15 @@ matched the source exactly:
 - **Q6 binary:** the binary file rendered as `Binary file: 4 KB` / `Binary file: 8 KB` with no content
   diff — corroborating `binary_lines` (`render.go:L446-452`).
 - **Q6 image:** the PNG rendered with a `Dimensions: WxH` + size header and a transient
-  "Loading image..." placeholder, and the captured terminal byte-stream contained kitty
-  graphics-protocol APC escapes (`ESC _ G ...`) — corroborating `image_lines`
-  (`render.go:L333-345`) and asynchronous `load_all_images` (`ui.go:L190-211`).
+  "Loading image..." placeholder — corroborating the `image_lines` *preparation* step
+  (`render.go:L333-392`) — while the captured terminal byte-stream contained kitty
+  graphics-protocol APC escapes (`ESC _ G ...`) emitted at **draw** time, corroborating
+  `draw_image_pair` (`ui.go:L319-337`) → `PlaceImageSubRect` (`collection.go:L155-181`); image
+  loading itself is asynchronous via `load_all_images` (`ui.go:L190-211`).
 - **Q7 async pipeline:** the view briefly displayed "Calculating diff, please wait..." before results
   appeared, and image entries updated in a second pass — corroborating the
-  `COLLECTION → DIFF/HIGHLIGHT/IMAGE_LOAD` fan-out (`ui.go:L245-275`).
+  `COLLECTION → DIFF/HIGHLIGHT (+ conditional IMAGE_LOAD)` fan-out (`ui.go:L245-275`), where the
+  `IMAGE_LOAD` job only appears because the fixture contained an image.
 
 > **Honesty note.** The `go test` output above is real captured output. The `kitten diff` observations
 > are real but are described in prose because the kitten is a full-screen TUI that positions text with
@@ -624,7 +639,7 @@ matched the source exactly:
 | Q3 Caching pipeline | `collect.go:L20-37` (7 caches, cap 4096), `collect.go:L65-157` (accessors); `tools/utils/cache.go:L13-72` | served implicitly by repeated render/scroll |
 | Q4 Multiple-file parallelism | `tools/utils/images/utils.go:L27-56` (`Parallel`); `patch.go:L352-377` (diff); `highlight.go:L217-228` (highlight) | multi-file directory diff processed |
 | Q5 Parallel-highlight safety | `highlight.go:L217-228` (disjoint keys); `tools/utils/cache.go:L32-37` (`Set` RLock) | highlighted multi-file output |
-| Q6 Binary & image handling | `render.go:L696-770` (dispatch); `collect.go:L86-104` (`is_path_text`); `render.go:L333` / `render.go:L446` / `render.go:L684` | "Binary file: …", "Dimensions: …", graphics APC escapes |
+| Q6 Binary & image handling | `render.go:L696-770` (dispatch); `collect.go:L86-104` (`is_path_text`); `render.go:L333-392` (`image_lines` *prepares*) / `render.go:L446` / `render.go:L684`; actual placement at draw: `ui.go:L319-337` → `collection.go:L155-181` | "Binary file: …", "Dimensions: …", graphics APC escapes |
 | Q7 Full runtime flow | `main.go:L102-175`; `ui.go:L114-275` (async pipeline) | "Calculating diff…" then staged results |
 | Q8 Diff matching regions | `diff.go:L21-263` (anchored diff, `tgs`); `patch.go:L86-99` (`changed_center`) | hunk header + changed line observed; `nil` for identical |
 
