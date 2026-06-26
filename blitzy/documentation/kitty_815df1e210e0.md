@@ -137,7 +137,7 @@ def file_transmission(self, data: memoryview) -> None:           # [kitty/window
 
 ### Step 7 — The orchestrator reconstructs the file to disk
 
-`handle_serialized_command` `[kitty/file_transmission.py:858]` parses the wire command into a `FileTransmissionCommand` dataclass `[kitty/file_transmission.py:252]` and drives the receive/send state machines. For a delta receive it uses `PatchFile` `[kitty/file_transmission.py:377]` (which applies an rsync delta as data arrives); for the destination it uses `DestFile` `[kitty/file_transmission.py:441]`. Crucially, bytes are written to a **temporary file** and atomically renamed into place on completion (see [Q4](#q4--encoding-demultiplexing--reassembly)), so an interrupted transfer never corrupts the real destination.
+`handle_serialized_command` `[kitty/file_transmission.py:858]` parses the wire command into a `FileTransmissionCommand` dataclass `[kitty/file_transmission.py:252]` and drives the receive/send state machines. For a delta receive it uses `PatchFile` `[kitty/file_transmission.py:377]` (which applies an rsync delta as data arrives); for the destination it uses `DestFile` `[kitty/file_transmission.py:441]`. The two receive paths reconstruct to disk differently (detailed in [Q4](#q4--encoding-demultiplexing--reassembly)): in **delta mode** `PatchFile` writes to a **temporary file** and atomically renames it into place on completion `[kitty/file_transmission.py:392,405]`, so an interrupted delta never corrupts the real destination; the **simple (non-delta)** path instead opens the destination directly and truncates it `[kitty/file_transmission.py:541-547]`, so it carries no such guarantee (see [Q5](#q5--transfer-resumption)).
 
 ### The complete path, visualized
 
@@ -155,7 +155,7 @@ flowchart LR
         WIN["window.py:1388-1389<br/>per-window FileTransmission"]
         FT["file_transmission.py<br/>orchestrator + state machines"]
         RS["tools/rsync engine<br/>signatures + deltas"]
-        DISK[("temp file →<br/>atomic os.replace")]
+        DISK[("file on disk<br/>delta: temp file → atomic os.replace<br/>simple: direct O_TRUNC write")]
     end
     K -->|writes escape codes to stdout| OSC
     OSC -->|SSH forwards TTY bytes| VP
@@ -421,7 +421,7 @@ The Python side is the `@dataclass FileTransmissionCommand` `[kitty/file_transmi
 
 ### Reassembly and atomicity
 
-On the receiving side, the orchestrator does **not** write directly to the destination path. It opens a temporary file in the destination directory and writes chunks there:
+The receiving side reconstructs a file in one of **two** ways, depending on the transmission type, and only one of them stages through a temporary file. In **delta (rsync) mode**, the orchestrator routes the incoming file through `PatchFile` `[kitty/file_transmission.py:377]`, which does **not** write directly to the destination path; it opens a temporary file in the destination directory and writes chunks there:
 
 ```python
 import tempfile                                            # [kitty/file_transmission.py:10]
@@ -432,13 +432,15 @@ self._dest_file = tempfile.NamedTemporaryFile(
     delete=False)                                          # [kitty/file_transmission.py:392]
 ```
 
-When the transfer (or delta application) completes, it atomically renames the temporary file over the destination:
+When the delta application completes, `PatchFile` atomically renames the temporary file over the destination:
 
 ```python
 os.replace(self.dest_file.name, self.src_file.name)        # [kitty/file_transmission.py:405]
 ```
 
-**Why a temp file plus atomic rename:** `os.replace` is an atomic rename on the same filesystem, so an observer of the destination path sees either the *old* file or the *fully written new* file — never a half‑written one. If the transfer is interrupted, the real destination is untouched and only the temporary file is left behind. This same property is what makes resumption safe (Q5): a partial write can never corrupt the file you are updating.
+**Why a temp file plus atomic rename:** `os.replace` is an atomic rename on the same filesystem, so an observer of the destination path sees either the *old* file or the *fully written new* file — never a half‑written one. If a delta transfer is interrupted, the real destination is untouched and only the temporary file is left behind. This same property is what makes delta-mode resumption safe (Q5): a partial write can never corrupt the file you are updating.
+
+**The simple (non-delta) path is different.** A regular file received *without* `--transmit-deltas` is not staged through a temporary file. The Python core opens the destination directly with `os.O_RDWR | os.O_CREAT | os.O_TRUNC` and writes in place `[kitty/file_transmission.py:541-547]`, and the Go receiver's non-diff branch likewise calls `os.Create(self.expanded_local_path)` `[kittens/transfer/receive.go:181-188]`. Because the destination itself is created/truncated up front, the simple path does **not** offer the same destination-untouched-on-interruption guarantee — an interrupted simple transfer can leave a partially written destination. The temp-file-plus-atomic-rename safety is therefore a property of `PatchFile`/delta mode specifically, not of every receive; it is the same asymmetry that lets only delta mode resume (see [Q5](#q5--transfer-resumption)).
 
 ---
 
@@ -585,5 +587,5 @@ The measurement exercised the **real in‑tree engine**, not a copy. A scratch G
 
 ## Summary
 
-kitty makes file transfer over SSH efficient by combining two ideas. First, it carries the transfer **in the terminal byte stream itself** as `OSC 5113` escape codes `[kitty/control-codes.h:233]`, `[kitty/vt-parser.c:547-549]`, so it needs no side channel and works across any link that relays a TTY; the numeric `5113` tag is the demultiplexer that keeps transfer data distinct from clipboard and shell‑integration output, and that one value is shared across C, Python, and Go by code generation `[gen/go_code.py:575,597]`. Second, when the receiver already has the file, it runs **rsync‑style delta transfer** `[tools/rsync/algorithm.go:31-205]`, `[tools/rsync/api.go:270-279]`: a compact signature plus a delta that references unchanged blocks via a fast weak‑checksum filter confirmed by a strong XXH3‑64 hash `[tools/rsync/algorithm.go:556-563]`. Resumption needs no journal because the partial file's own bytes are the resume state `[kittens/transfer/receive.go:404-425]`, and atomic temp‑file renames `[kitty/file_transmission.py:392,405]` guarantee the destination is never left half‑written. The net effect, measured against the real engine, is that a 256‑byte edit in a 1 MiB file moved **97.94 %** fewer bytes than a naive re‑send, with a sha256‑verified result.
+kitty makes file transfer over SSH efficient by combining two ideas. First, it carries the transfer **in the terminal byte stream itself** as `OSC 5113` escape codes `[kitty/control-codes.h:233]`, `[kitty/vt-parser.c:547-549]`, so it needs no side channel and works across any link that relays a TTY; the numeric `5113` tag is the demultiplexer that keeps transfer data distinct from clipboard and shell‑integration output, and that one value is shared across C, Python, and Go by code generation `[gen/go_code.py:575,597]`. Second, when the receiver already has the file, it runs **rsync‑style delta transfer** `[tools/rsync/algorithm.go:31-205]`, `[tools/rsync/api.go:270-279]`: a compact signature plus a delta that references unchanged blocks via a fast weak‑checksum filter confirmed by a strong XXH3‑64 hash `[tools/rsync/algorithm.go:556-563]`. Resumption needs no journal because the partial file's own bytes are the resume state `[kittens/transfer/receive.go:404-425]`, and in delta mode atomic temp‑file renames `[kitty/file_transmission.py:392,405]` keep the destination from being left half‑written (the simple, non-delta path instead writes the destination directly with `os.O_TRUNC` `[kitty/file_transmission.py:541-547]`). The net effect, measured against the real engine, is that a 256‑byte edit in a 1 MiB file moved **97.94 %** fewer bytes than a naive re‑send, with a sha256‑verified result.
 
