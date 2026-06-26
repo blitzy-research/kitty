@@ -305,7 +305,7 @@ These `on_key_input:` lines are emitted by the `OPT(debug_keyboard)` trace block
 
 **Python-side propagation.** The focus-propagation hub is `WindowList.notify_on_active_window_change(old, new)` (`kitty/window_list.py:L192`), which calls `old_active_window.focus_changed(False)` (`L194`) and `new_active_window.focus_changed(True)` (`L196`). `Window.focus_changed(focused)` (`kitty/window.py:L1123`) **early-returns** if `self.destroyed or self.ignore_focus_changes or self.is_focused == focused` (`L1124`), then updates state and propagates to the C screen via `self.screen.focus_changed(focused)` (`kitty/window.py:L1134`).
 
-**Reasoning.** The paired `on_focus_change: ... focused: 0` then `... focused: 1` lines are the runtime signature of the `focus_changed(False)`/`focus_changed(True)` call pair in `window_list.py:L194/196`. The guard at `window.py:L1124` explains why redundant or post-destroy notifications are no-ops (relevant again in §(e)).
+**Reasoning.** The paired `on_focus_change: ... focused: 0` then `... focused: 1` lines are the runtime signature of the `focus_changed(False)`/`focus_changed(True)` call pair in `kitty/window_list.py:L194/196`. The guard at `kitty/window.py:L1124` explains why redundant or post-destroy notifications are no-ops (relevant again in §(e)).
 
 ### (c) How input is routed to the correct child process
 
@@ -353,7 +353,7 @@ kitty 53227 root 13u CHR 5,2 ... /dev/pts/ptmx     # -> WIN4 slave pts/3 (pid 53
 
 When `mHANDLE_TERMIOS_SIGNALS` *is* set (`kitty/keys.c:L256-257` calls `screen_send_signal_for_key`), Kitty instead resolves the foreground pgrp itself in Python — `Child.send_signal_for_key()` (`kitty/child.py:L481`) does `pgrp = os.tcgetpgrp(self.child_fd)` (`L498`) and `os.killpg(pgrp, s)` (`L499`).
 
-**Reasoning.** The `lsof` fd→window map plus the `strace` `write(10,…)`/`write(13,…)` switch is end-to-end proof that the *encoded bytes physically reach the focused window's child and no other*. The `write(13,"\3",1)` with **no** accompanying `kill`/`tgkill` from Kitty shows that, by default, signal generation is delegated to the kernel line discipline — Kitty's own `os.killpg` path (`child.py:L498-499`) is reserved for the `mHANDLE_TERMIOS_SIGNALS` mode.
+**Reasoning.** The `lsof` fd→window map plus the `strace` `write(10,…)`/`write(13,…)` switch is end-to-end proof that the *encoded bytes physically reach the focused window's child and no other*. The `write(13,"\3",1)` with **no** accompanying `kill`/`tgkill` from Kitty shows that, by default, signal generation is delegated to the kernel line discipline — Kitty's own `os.killpg` path (`kitty/child.py:L498-499`) is reserved for the `mHANDLE_TERMIOS_SIGNALS` mode.
 
 **Summary of R2.** *Which components see input first:* the GLFW X11 backend → `key_callback` → `on_key_input`. *Intermediate processing:* `active_window()` target selection, optional shortcut dispatch into Python (Boss), then `encode_glfw_key_event`. *How the final destination is chosen:* `active_window()` returns the focused OS-window's active tab's active window, and `schedule_write_to_child(w->id, …)` queues the bytes for exactly that window's non-blocking PTY master fd.
 
@@ -402,8 +402,10 @@ Thread 3 (Thread 0x7faf50bd36c0 (LWP 53295) "KittyChildMon"):
 
 ### Snapshot C — py-spy native dump (cross-check)
 
+> **Note on invoking py-spy.** `py-spy` (v0.4.2) is installed in the investigation virtualenv and is **not** on the default `PATH`; the commands below therefore use its absolute path `/opt/kitty-venv/bin/py-spy` (as listed in the tooling table above) so each one re-executes verbatim. Equivalently, run `export PATH=/opt/kitty-venv/bin:$PATH` once and then the bare `py-spy …` forms work. Substitute the live kitty PID for the historical one shown.
+
 ```text
-# command: py-spy dump --native --pid 53227   (trimmed)
+# command: /opt/kitty-venv/bin/py-spy dump --native --pid 53227   (trimmed)
 Process 53227: ./kitty/launcher/kitty --debug-input --debug-rendering ... --session .../repro.session
 Python v3.13.7
 Thread 53227 (idle): "MainThread"
@@ -444,7 +446,7 @@ No stack.
 ```
 
 ```text
-# command (unprivileged): sudo -u nobody py-spy dump --native --pid 106581     [exit status: 1]
+# command (unprivileged): sudo -u nobody /opt/kitty-venv/bin/py-spy dump --native --pid 106581     [exit status: 1]
 Permission Denied: Try running again with elevated permissions by going 'sudo env "PATH=$PATH" !!'
 ```
 
@@ -462,7 +464,7 @@ So the **underlying OS error is `EPERM` ("Operation not permitted")** — Yama a
 1. **Run the tracer as root / with `CAP_SYS_PTRACE`.** → *Works even at `scope=1`* — verified directly: as root, `gdb -p 106581 -batch -ex 'print (int)1+1'` returns `$1 = 2` (gdb attached and evaluated *inside* the target). This is how Snapshots A/B/C were captured.
 2. **Temporarily `sysctl -w kernel.yama.ptrace_scope=0`** (revert afterward) → permits a same-uid tracer to attach (used briefly for the forced-guard capture in §(e), then restored to `1`).
 3. **For Docker, start the container with `--cap-add=SYS_PTRACE`** → grants the tracer `CAP_SYS_PTRACE` so attach is permitted.
-4. **Launch the target *under* the tracer** (`gdb --args …`, `py-spy record -- …`) → works even at `scope=1`, because the tracer becomes the **parent** and Yama always permits tracing a direct child. Verified live (unprivileged, `scope=1`):
+4. **Launch the target *under* the tracer** (`gdb --args …`, `/opt/kitty-venv/bin/py-spy record -- …`) → works even at `scope=1`, because the tracer becomes the **parent** and Yama always permits tracing a direct child. Verified live (unprivileged, `scope=1`):
 
 ```text
 # command (unprivileged, scope=1): sudo -u nobody gdb --batch -ex 'set startup-with-shell off' \
@@ -563,7 +565,7 @@ The injected keystroke then drove the **real** guard, captured verbatim in the `
 
 The **PRESS** event shows `on_key_input … no active window, ignoring` — exactly the guard at `kitty/keys.c:L182` firing because `active_window()` returned `NULL`. The immediately following **RELEASE** event (after the `Screen*` was restored and gdb detached) took the *normal* path, and typing `echo POSTCAPTURE_OK` into `FOCUSED` right afterward echoed back correctly — proving the capture was non-destructive and the window was healthy again. The robust, *organically-observable* degenerate-target safeguard in everyday use remains the post-dispatch re-fetch/drop in §(e)(2); this forced capture additionally exercises the no-live-target guard end-to-end.
 
-**Reasoning.** The runtime evidence cleanly separates three degenerate cases: (i) *unfocused-but-alive* → output keeps draining and a bell raises `needs_attention` (`window.py:L1180-1182`) detectable via the attention indicator; (ii) *closed mid-dispatch* → the `window_for_window_id` re-fetch + `if (!w) return;` (`keys.c:L224,L236`) drops the write, observed as "echo survivor" going only to the live window with no crash; (iii) *no live target at all* → the defensive `"no active window, ignoring"` guard (`keys.c:L182`), **observed firing** (the captured PRESS log line above) once the documented precondition (`active_window() == NULL`) was established with the debugger and a real keystroke injected, even though it is not reached under ordinary close sequences.
+**Reasoning.** The runtime evidence cleanly separates three degenerate cases: (i) *unfocused-but-alive* → output keeps draining and a bell raises `needs_attention` (`kitty/window.py:L1180-1182`) detectable via the attention indicator; (ii) *closed mid-dispatch* → the `window_for_window_id` re-fetch + `if (!w) return;` (`kitty/keys.c:L224,L236`) drops the write, observed as "echo survivor" going only to the live window with no crash; (iii) *no live target at all* → the defensive `"no active window, ignoring"` guard (`kitty/keys.c:L182`), **observed firing** (the captured PRESS log line above) once the documented precondition (`active_window() == NULL`) was established with the debugger and a real keystroke injected, even though it is not reached under ordinary close sequences.
 
 
 ---
