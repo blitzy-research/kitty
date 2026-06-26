@@ -246,14 +246,29 @@ rendering code points that DejaVu Sans Mono lacks (`A` + CJK `你` + emoji `😀
 [t] U+1f600 emoji_presentation Face(family=Noto Color Emoji style=Regular ps_name=NotoColorEmoji path=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf ttc_index=0 variant=False named_instance=False scalable=False color=True)
 ```
 
-`A` (`U+0041`) produces no line — it is in the primary face. A direct fallback query confirms the
-Arabic case is served by the primary, while CJK/emoji map to distinct fallback faces:
+`A` (`U+0041`) produces no line — it is in the primary face. A **direct** fallback query via kitty's
+own public helper `test_fallback_font` (`kitty/fonts/render.py:512`), which calls `get_fallback_font`
+(`kitty/fonts.c:1678`), confirms the Arabic case is served by the primary, while the CJK and emoji
+code points map to distinct fallback faces (full `Face(...)` reprs reproduced verbatim):
 
 ```text
-U+0645 (Arabic Meem) -> Face(family=DejaVu Sans Mono ... ps_name=DejaVuSansMono path=.../DejaVuSansMono.ttf ...)
-U+4F60 (CJK)          -> Face(family=Noto Sans CJK JP ... ps_name=NotoSansCJKjp-Regular ...)
-U+1F600 (emoji)       -> Face(family=Noto Color Emoji ... color=True)
+U+0645 (Arabic Meem) -> Face(family=DejaVu Sans Mono style=Book ps_name=DejaVuSansMono path=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf ttc_index=0 variant=False named_instance=False scalable=True color=False)
+U+4F60 (CJK)         -> Face(family=Noto Sans CJK JP style=Regular ps_name=NotoSansCJKjp-Regular path=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc ttc_index=0 variant=False named_instance=False scalable=True color=False)
+U+1F600 (emoji)      -> Face(family=DejaVu Sans style=Book ps_name=DejaVuSans path=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ttc_index=0 variant=False named_instance=False scalable=True color=False)
+U+1F929 (emoji)      -> Face(family=Noto Color Emoji style=Regular ps_name=NotoColorEmoji path=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf ttc_index=0 variant=False named_instance=False scalable=False color=True)
 ```
+
+**Why `U+1F600` resolves differently here than on the render path above.** This direct query is *not*
+the render path: `get_fallback_font` (`kitty/fonts.c:1678`) builds a probe cell without a display
+width, so `has_emoji_presentation` — which requires a width-2 cell (`kitty/fonts.c:430`:
+`gpu_cell->attrs.width == 2 && is_emoji(...)`) — returns `False`. With emoji-presentation *off*,
+FontConfig is asked only for *a* face that covers the code point, and DejaVu Sans (which carries a
+monochrome `U+1F600` glyph) satisfies that, so the direct query returns **DejaVu Sans** (`color=False`).
+On the **render path** an emoji occupies a width-2 cell, so `has_emoji_presentation` is `True` and
+kitty deliberately selects a color/emoji face — exactly the `U+1f600 emoji_presentation → Noto Color
+Emoji (color=True)` line captured just above. `U+1F929` (star-struck) has **no** glyph in DejaVu Sans
+at all, so even the presentation-agnostic direct query falls through to **Noto Color Emoji**; it is the
+same code point kitty's own test harness uses as its default emoji trial (`kitty/fonts/render.py:517`).
 
 ### (b) Emitting source locators
 
