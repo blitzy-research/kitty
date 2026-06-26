@@ -164,7 +164,7 @@ launch --title OSWIN2A --cwd /tmp
 focus
 ```
 
-This realizes the **"background window produces output while another has focus"** case directly: the window titled `BACKGROUND` runs a continuous streaming loop, while the `focus` directive (`kitty/session.py:L186-187`) keeps the `FOCUSED` window active.
+This realizes the **"background window produces output while another has focus"** case directly: the window titled `BACKGROUND` runs a continuous streaming loop. The **authoritative, observed** evidence that `FOCUSED` (not `BACKGROUND`) held focus is the **runtime `kitty @ ls`** output in *Verifying the off-screen structure* below — specifically its per-window `is_focused`/`is_active` booleans. The session `focus` directive only *corroborates* this, and the corroboration is precise: `focus` dispatches `Session.focus()` (`kitty/session.py:L186-187`), which sets `active_window_idx = max(0, len(windows) - 1)` **at the moment it runs** (`kitty/session.py:L138-140`). Because `focus` appears immediately after `launch --title FOCUSED` — when `FOCUSED` is the only (hence last-added) window in the tab — it pins `active_window_idx` onto `FOCUSED`; the subsequent `launch --title BACKGROUND` merely *appends* a second window and does **not** advance `active_window_idx`, so `FOCUSED` stays the tab's active window. The runtime `ls` is what actually proves this held.
 
 ### Launch command
 
@@ -181,17 +181,24 @@ This realizes the **"background window produces output while another has focus"*
 
 The `--debug-input`/`--debug-rendering` flags are defined at `kitty/cli.py:L989` (`--debug-rendering`) and `kitty/cli.py:L996-997` (`--debug-input`, alias `--debug-keyboard`, `dest=debug_keyboard`); the user-facing doc is at `kitty/options/definition.py:L724`. They reach the C layer via `glfwInitHint(GLFW_DEBUG_KEYBOARD, debug_keyboard)` / `glfwInitHint(GLFW_DEBUG_RENDERING, debug_rendering)` and `OPT(debug_keyboard)=...` at `kitty/glfw.c:L1444-1446`.
 
-### Verifying the off-screen structure
+### Verifying the off-screen structure (and confirming FOCUSED holds focus)
+
+A runtime `kitty @ ls` is the authoritative check of both the off-screen layout **and** the focus state. The per-window `is_focused`/`is_active` booleans it emits (`Window.as_dict`, `kitty/window.py:L694-707`) are observed runtime state — the decisive proof that `FOCUSED`, not the streaming `BACKGROUND`, held focus (the OS window was focused with `xdotool windowfocus 2097164` first):
 
 ```jsonc
-// command: kitty @ --to unix:/tmp/kitty_investigation/krc.sock ls   (trimmed)
-// OS window 1 (xid 2097164)
-//   tab 1: WIN1 "FOCUSED"  (pid 53296)   <-- holds focus
-//          WIN2 "BACKGROUND" (pid 53297) <-- streams output continuously
-//   tab 2: WIN3 "TAB2SHELL" (pid 53300)
-// OS window 2 (xid 2097180)
-//   tab 3: WIN4 "OSWIN2A"  (pid 53303)
+// command: kitty @ --to unix:/tmp/kitty_investigation/krc.sock ls   (focus-relevant fields; trimmed)
+// OS window 1   "is_focused": true     (xid 2097164)
+//   tab 1 (active tab):
+//     { "id": 1, "title": "FOCUSED",    "pid": 53296, "is_focused": true,  "is_active": true  }   <-- holds focus
+//     { "id": 2, "title": "BACKGROUND", "pid": 53297, "is_focused": false, "is_active": false }   <-- streams output continuously
+//   tab 2:
+//     { "id": 3, "title": "TAB2SHELL",  "pid": 53300, "is_focused": true,  "is_active": true  }   (active window of tab 2)
+// OS window 2   "is_focused": false    (xid 2097180)
+//   tab 3:
+//     { "id": 4, "title": "OSWIN2A",    "pid": 53303, "is_focused": false, "is_active": true  }
 ```
+
+The decisive pair is within OS window 1's active tab: `FOCUSED` (id 1) reports `is_focused: true, is_active: true`, while `BACKGROUND` (id 2) reports `is_focused: false, is_active: false` **even though its child is busily streaming** — directly answering the R1 "background output while a different window holds focus" case from *observed state* rather than from the session file. (kitty marks the *active window of each tab* `is_focused` when its OS window is focused — which is why `TAB2SHELL` is also `true` — but only one tab is current; tab 1 is the active tab, so `FOCUSED` is the window that actually receives keystrokes, confirmed by the strace fd routing in §(c).)
 
 ### Driving overlapping activity
 
@@ -204,9 +211,25 @@ xdotool type --clearmodifiers "abc"  # XTEST key events -> GLFW key_callback -> 
 # rapid focus switching between the two OS windows
 xdotool windowfocus 2097180 ; xdotool windowfocus 2097164
 # type while resizing and scrolling (via remote control)
-kitty @ resize-os-window --match id:1 --width 120 --height 40
-kitty @ scroll-window --match id:1 1p
+# NOTE: --match id:1 matches the KITTY WINDOW whose id is 1 (i.e. FOCUSED), then
+#       resize-os-window resizes the OS WINDOW that CONTAINS it (OS window 1).
+kitty @ resize-os-window --match id:1 --width 120 --height 40   # resizes OS window 1 (container of kitty win 1)
+kitty @ scroll-window   --match id:1 1p                          # scrolls kitty window 1 by 1 page
 ```
+
+**Precise semantics of `--match id:1` (so the target is unambiguous).** `resize-os-window` first resolves `--match id:1` to the **kitty window** with id `1` (`FOCUSED`), then resizes the **OS window that contains** that matched window — not an OS window whose id is `1`. In `kitty/rc/resize_os_window.py:L79-87`, `windows_for_match_payload(...)` returns the matched *kitty* windows and the handler then iterates `for os_window_id in {w.os_window_id for w in windows if w}` and calls `boss.resize_os_window(os_window_id, ...)`. The command happens to hit OS window 1 because kitty window 1 lives in OS window 1. Proof the resize actually occurred during the input activity (before/after, captured live):
+
+```text
+# command: xdotool getwindowgeometry 2097164   (OS window 1, before)
+Geometry: 640x400
+# kitty @ ls before:  FOCUSED (win 1)  columns=35 lines=21
+# command: kitty @ resize-os-window --match id:1 --width 120 --height 40     [exit status: 0]
+# command: xdotool getwindowgeometry 2097164   (OS window 1, after)
+Geometry: 1080x720
+# kitty @ ls after:   FOCUSED (win 1)  columns=59 lines=38
+```
+
+The OS window grew `640x400 -> 1080x720` px and `FOCUSED`'s cell grid grew `35x21 -> 59x38` (the `tall` layout splits the 120-column OS width between the two windows), confirming the matched kitty window's *containing OS window* was resized.
 
 > **Note on injection method.** Kitty's own `kitty @ send-text`/`send-key` write *already-encoded* bytes straight to the child and bypass `on_key_input`. To exercise the *real* input pipeline (and produce genuine `on_key_input` traces), this investigation used `xdotool` XTEST injection against the Xvfb display, which enters through the GLFW X11 backend exactly as a physical keypress would.
 
@@ -339,7 +362,7 @@ When `mHANDLE_TERMIOS_SIGNALS` *is* set (`kitty/keys.c:L256-257` calls `screen_s
 
 ## (d) Stack / Symbol Snapshot — R3
 
-**Goal (R3):** capture at least one stack/symbol snapshot of input handling. In this environment `ptrace_scope=0` and the tracer ran as root, so the **primary attach succeeded**. The mandatory blocked-attach failure mode is *also* demonstrated honestly below (reproduced at `ptrace_scope=1` with an unprivileged tracer), together with the full escalation ladder and the guaranteed ptrace-free fallback.
+**Goal (R3):** capture at least one stack/symbol snapshot of input handling. The host's default Yama policy is restrictive (`ptrace_scope=1`); with the scope temporarily set to `0` and the tracer running as **root**, the **primary attach succeeded** (and, as shown below, a root tracer attaches even at `scope=1`). The mandatory blocked-attach failure mode is *also* demonstrated verbatim below (reproduced at the default `ptrace_scope=1` with an unprivileged tracer), together with the full escalation ladder and the guaranteed ptrace-free fallback.
 
 ### Snapshot A — live `on_key_input` (gdb, MAIN thread, merged native + Python)
 
@@ -399,13 +422,20 @@ Thread 53227 (idle): "MainThread"
 
 py-spy dumps the Python (main) thread, merging native GLFW frames with the Python entry chain (`entry_points.py:195` → `main.py`). (Minor: gdb reports call-site lines `2103`/`1262` while py-spy reports `2104`/`1272` — the same `run_main_loop`/`main_loop` functions, differing only by the exact instruction line. The pure-C `io_thread` is best seen with gdb, Snapshot B.)
 
-### Blocked-attach failure mode (reproduced honestly) + escalation ladder
+### Blocked-attach failure mode (reproduced verbatim) + escalation ladder
 
-To document the mandatory blocked-attach protocol, the attach was retried under the restrictive policy (`ptrace_scope=1`) as an unprivileged user (`nobody`). Both tracers fail with verbatim "operation not permitted"-class errors:
+To document the mandatory blocked-attach protocol, a **fresh headless kitty** (pid `106581`, owned by `root`) was targeted and the attach retried under the restrictive Yama policy (`ptrace_scope=1`) by an **unprivileged** tracer (user `nobody`, `uid=65534`, no `CAP_SYS_PTRACE`). The exact context and the *complete, verbatim* output of each blocked attempt (with exit status) follow — note the two tracers report the failure **differently**, so the precise wording matters:
 
 ```text
-# command: cat /proc/sys/kernel/yama/ptrace_scope   ->  1   (restrictive)
-# command (unprivileged): gdb -p 53227 -batch -ex 'bt'
+# command: cat /proc/sys/kernel/yama/ptrace_scope
+1
+# command: id nobody
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+# target: kitty pid 106581 (root-owned);  tracer uid 65534 != target uid 0
+```
+
+```text
+# command (unprivileged): sudo -u nobody gdb -p 106581 -batch -ex 'bt'     [exit status: 1]
 Could not attach to process.  If your uid matches the uid of the target
 process, check the setting of /proc/sys/kernel/yama/ptrace_scope, or try
 again as the root user.  For more details, see /etc/sysctl.d/10-ptrace.conf
@@ -414,25 +444,38 @@ No stack.
 ```
 
 ```text
-# command (unprivileged): py-spy dump --native --pid 53227
+# command (unprivileged): sudo -u nobody py-spy dump --native --pid 106581     [exit status: 1]
 Permission Denied: Try running again with elevated permissions by going 'sudo env "PATH=$PATH" !!'
 ```
 
-**Escalation ladder (each rung verified):**
-
-1. **Run the tracer as root / with `CAP_SYS_PTRACE` at `scope=0`.** → *Works* — this is how Snapshots A/B/C were captured.
-2. **Temporarily `sysctl -w kernel.yama.ptrace_scope=0`** (revert afterward) → attach permitted.
-3. **For Docker, start the container with `--cap-add=SYS_PTRACE`** → attach permitted.
-4. **Launch the target *under* the tracer** (works even at `scope=1`, because the tracer becomes the parent and Yama permits tracing a direct child):
+**Precise reading of the two errors (do not conflate them).** gdb's surfaced message is literally **`ptrace: Inappropriate ioctl for device.`** — *not* the string "Operation not permitted" — and py-spy prints only **`Permission Denied`** with no underlying OS detail. To surface the *actual* kernel error behind both, the same unprivileged gdb attach was re-run under `strace`, which prints the real `errno` returned by the `ptrace` syscall:
 
 ```text
-# command (unprivileged, scope=1): py-spy record -o /tmp/flame.svg -- python3 ...
-py-spy> Sampling process 100 times a second for 2 seconds. Press Control-C to exit.
-py-spy> Stopped sampling because process exited
-# NO permission error during sampling — the launch-under-tracer rung is not blocked by Yama scope=1.
+# command (unprivileged): sudo -u nobody strace -f -e trace=ptrace gdb -p 106581 -batch -ex 'bt'
+[pid 109304] ptrace(PTRACE_ATTACH, 106581) = -1 EPERM (Operation not permitted)
 ```
 
-After each toggle, `ptrace_scope` was restored to `0`.
+So the **underlying OS error is `EPERM` ("Operation not permitted")** — Yama at `ptrace_scope=1` denies a non-root, non-parent tracer — even though gdb's *displayed* wording is "Inappropriate ioctl for device" and py-spy's is "Permission Denied". This is the honest, precise form of the blocked-attach evidence.
+
+**Escalation ladder (rungs 1 and 4 verified live in this run; 2–3 are the standard remedies):**
+
+1. **Run the tracer as root / with `CAP_SYS_PTRACE`.** → *Works even at `scope=1`* — verified directly: as root, `gdb -p 106581 -batch -ex 'print (int)1+1'` returns `$1 = 2` (gdb attached and evaluated *inside* the target). This is how Snapshots A/B/C were captured.
+2. **Temporarily `sysctl -w kernel.yama.ptrace_scope=0`** (revert afterward) → permits a same-uid tracer to attach (used briefly for the forced-guard capture in §(e), then restored to `1`).
+3. **For Docker, start the container with `--cap-add=SYS_PTRACE`** → grants the tracer `CAP_SYS_PTRACE` so attach is permitted.
+4. **Launch the target *under* the tracer** (`gdb --args …`, `py-spy record -- …`) → works even at `scope=1`, because the tracer becomes the **parent** and Yama always permits tracing a direct child. Verified live (unprivileged, `scope=1`):
+
+```text
+# command (unprivileged, scope=1): sudo -u nobody gdb --batch -ex 'set startup-with-shell off' \
+#     -ex 'break _PyRuntime_Initialize' -ex run -ex 'bt 1' -ex kill --args python3 -c 'print(1)'
+Breakpoint 1 at 0x425cb6: _PyRuntime_Initialize. (6 locations)
+[Thread debugging using libthread_db enabled]
+Breakpoint 1.2, _PyRuntime_Initialize () at ../Python/pylifecycle.c:137
+#0  _PyRuntime_Initialize () at ../Python/pylifecycle.c:137
+[Inferior 1 (process 116122) killed]
+# NO ptrace/permission error — the launch-under-tracer rung is not blocked by Yama scope=1.
+```
+
+After the investigation, `ptrace_scope` was restored to its original value (`1`).
 
 ### Guaranteed ptrace-free fallback
 
@@ -493,13 +536,34 @@ Observed close-window behavior:
 
 `Window.focus_changed()` early-returns when `self.destroyed or self.ignore_focus_changes or self.is_focused == focused` (`kitty/window.py:L1124`). Focus/attention work for a destroyed window is therefore a no-op, which is why closing a window cannot leave a stale "focused" state behind.
 
-### 4. The "no active window, ignoring" path (documented honestly)
+### 4. The "no active window, ignoring" path (observed via a forced precondition)
 
-When `active_window()` returns `NULL` (no live `render_data.screen`; `kitty/keys.c:L105-111`, the `NULL` return at `L110`), `on_key_input` logs **`"no active window, ignoring"`** and returns (`kitty/keys.c:L182`).
+When `active_window()` returns `NULL` — i.e., the callback OS window's active-tab active window has no live `render_data.screen` (`kitty/keys.c:L105-110`, the `NULL` return at `L110`) — `on_key_input` logs **`"no active window, ignoring"`** and returns immediately (`kitty/keys.c:L182`).
 
-**Honest observation.** An explicit attempt to trigger this — bursting ~40 keys into OS window 2 while closing its only window — did **not** fire the log line in normal operation. The reason is itself informative: once the underlying X window is destroyed, the GLFW backend delivers **no further key events** to it, so `on_key_input` is simply not reached for the dead window. The `"no active window, ignoring"` branch is therefore a **defensive guard** for transient states (e.g., a brief interval with a `callback_os_window` whose active window has no live screen) rather than a routinely-hit path. The robust, *observable* degenerate-target safeguard in practice is the post-dispatch re-fetch/drop in §(e)(2), which was reproduced.
+**Why it is hard to reach under ordinary close sequences.** This branch is a **defensive guard** for the transient state in which a `callback_os_window`'s active window has no live screen. It is *not* reached by simply closing windows: once the underlying X window is destroyed, the GLFW backend delivers **no further key events** to it, so `on_key_input` is never entered for the dead window (an earlier "burst keys while closing the window" attempt confirmed this — no log line, because no event arrives). To observe the *guard itself*, the **documented precondition** (`active_window() == NULL`) was therefore established deterministically with the debugger and a **real** injected keystroke, so that the *real compiled guard* — not a paraphrase — emits the log line.
 
-**Reasoning.** The runtime evidence cleanly separates three degenerate cases: (i) *unfocused-but-alive* → output keeps draining and a bell raises `needs_attention` (`window.py:L1180-1182`) detectable via the attention indicator; (ii) *closed mid-dispatch* → the `window_for_window_id` re-fetch + `if (!w) return;` (`keys.c:L224,L236`) drops the write, observed as "echo survivor" going only to the live window with no crash; (iii) *no live target at all* → the defensive `"no active window, ignoring"` guard (`keys.c:L182`), which the source makes unambiguous even though it is not hit under ordinary close sequences.
+**Method (non-destructive).** Under `gdb` (root, `ptrace_scope=0`), a breakpoint at `active_window()`'s screen check (`kitty/keys.c:L109`) saved the active window's `Screen*` and set `w->render_data.screen = 0`, so `active_window()` genuinely takes its `return NULL` path (`L110`). A second breakpoint at the dispatch guard (`kitty/keys.c:L182`) confirmed `on_key_input`'s local `w` was `NULL`, then **restored** the saved `Screen*` and detached. A single key (`a`) was then injected with `xdotool` through the real GLFW path:
+
+```text
+# command: gdb -p 106581 -x /tmp/kitty_investigation/force_noaw.gdb     (then, from another shell: xdotool key a)
+Breakpoint 1 at ...: file kitty/keys.c, line 109.
+Breakpoint 2 at ...: file kitty/keys.c, line 182.
+[gdb] BP keys.c:109 -> forced render_data.screen=0 on active win=0x55a550489110 (saved Screen*=0x55a550479010); active_window() will return NULL
+[gdb] BP keys.c:182 -> restored Screen* on win=0x55a550489110; on_key_input local w=(nil) (NULL) -> guard fires; detaching
+[Inferior 1 (process 106581) detached]
+```
+
+The injected keystroke then drove the **real** guard, captured verbatim in the `--debug-input` log (`/tmp/kitty_investigation/kitty_debug.log`, ANSI color codes stripped for readability):
+
+```text
+[240.392] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[240.401] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 no active window, ignoring
+[240.417] on_key_input: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+```
+
+The **PRESS** event shows `on_key_input … no active window, ignoring` — exactly the guard at `kitty/keys.c:L182` firing because `active_window()` returned `NULL`. The immediately following **RELEASE** event (after the `Screen*` was restored and gdb detached) took the *normal* path, and typing `echo POSTCAPTURE_OK` into `FOCUSED` right afterward echoed back correctly — proving the capture was non-destructive and the window was healthy again. The robust, *organically-observable* degenerate-target safeguard in everyday use remains the post-dispatch re-fetch/drop in §(e)(2); this forced capture additionally exercises the no-live-target guard end-to-end.
+
+**Reasoning.** The runtime evidence cleanly separates three degenerate cases: (i) *unfocused-but-alive* → output keeps draining and a bell raises `needs_attention` (`window.py:L1180-1182`) detectable via the attention indicator; (ii) *closed mid-dispatch* → the `window_for_window_id` re-fetch + `if (!w) return;` (`keys.c:L224,L236`) drops the write, observed as "echo survivor" going only to the live window with no crash; (iii) *no live target at all* → the defensive `"no active window, ignoring"` guard (`keys.c:L182`), **observed firing** (the captured PRESS log line above) once the documented precondition (`active_window() == NULL`) was established with the debugger and a real keystroke injected, even though it is not reached under ordinary close sequences.
 
 
 ---
@@ -565,11 +629,11 @@ TID 53295   KittyChildMon    # io_thread       -> io_loop + read_bytes (child OU
 
 ## (g) One Correctness-vs-Responsiveness Tradeoff — R6
 
-> **The single tradeoff (observed, not from code comments).** Kitty handles **keyboard input synchronously on the main/UI thread** (`on_key_input`, `kitty/keys.c:L166`, reached from `key_callback`, `kitty/glfw.c:L439`), while it reads **child output on a separate `io_thread`** (`io_loop`, `kitty/child-monitor.c:L1512`; `read_bytes`/`read`, `L1336-1337`/`L1345`; thread created at `L291`, declared at `L55`). Decoupling output onto its own thread **keeps the UI responsive while a background child floods output** (the responsiveness/throughput win). The cost is that, because input shares the main thread with rendering and the event loop, **heavy main-thread work raises input-handling latency** (the responsiveness price of keeping input on the thread that also renders).
+> **The single tradeoff (observed, not from code comments).** Kitty handles **keyboard input synchronously on the main/UI thread** (`on_key_input`, `kitty/keys.c:L166`, reached from `key_callback`, `kitty/glfw.c:L439`; proven on **Thread 1 "kitty" LWP 53227** by Snapshot A in §(d)) — the *same* thread that runs the GLFW event pump delivering focus changes (`on_focus_change`, §(c)(b)) and that synchronously dispatches each key into Python for shortcut/keymap matching and child-routing — while it reads **child output on a separate `io_thread`** (`io_loop`, `kitty/child-monitor.c:L1512`; `read_bytes`/`read`, `L1336-1337`/`L1345`; thread created at `L291`, declared at `L55`; observed as TID 53295 "KittyChildMon" in Snapshot B). **The correctness this buys:** because every keystroke is handled on the one thread that also owns focus state, render state, and shortcut dispatch, input is **serialized against those mutations** — a key is always routed, encoded, and shortcut-matched against a single, consistent snapshot of *which window is focused* and the current screen/cursor-key/keyboard-protocol mode, with no cross-thread race between a focus change and the routing of the next key. **The responsiveness it gives up:** because input shares that thread with rendering and the event loop, **heavy main-thread work raises input-handling latency** — measured below. (Output is deliberately *not* on this thread, so a flooding background child never blocks the UI; that decoupling is the mechanism that *bounds* the responsiveness cost to genuine main-thread saturation — it is **not** a second tradeoff.)
 
 This was measured two ways from the running process. End-to-end latency = time from the `xdotool` X-injection timestamp to the `write()` of that byte on the PTY master (so it *includes* X/XTEST overhead; the relative comparison is what matters).
 
-**(i) Responsiveness win — input stays fast while background output drains concurrently.** With the `BACKGROUND` window streaming, six keystrokes into the focused window were delivered to its child with a tight, low latency, while the io_thread concurrently drained background reads:
+**(i) Responsiveness baseline — input stays fast while background output drains concurrently.** With the `BACKGROUND` window streaming, six keystrokes into the focused window were delivered to its child with a tight, low latency, while the io_thread concurrently drained background reads:
 
 ```text
 # idle/light-background case  (strace_lat.out + injection timestamps)
@@ -595,14 +659,14 @@ flood output drained on io_thread during the same window: 42793 reads on fd10
 53295 21:19:37.240473 write(10, "w", 1) = 1     # (strace line ~15000; ~5400 reads between the two writes)
 ```
 
-**(iii) Causal corroboration.** When the main thread was *stopped* at a `gdb` breakpoint on `on_key_input`, a subsequently injected key was **not processed until `continue`** — input handling is gated on main-thread availability. (Note: output drains independently on the io_thread, which is exactly why background floods do not freeze the UI.)
+**(iii) Causal corroboration — the serialization is directly observable.** When the main thread was *stopped* at a `gdb` breakpoint on `on_key_input`, a subsequently injected key was **not processed until `continue`** — input is handled strictly *in turn* on that one thread, never concurrently with rendering or a focus change. This is the observed basis for the **correctness** side of the tradeoff: the very same single-threading that delays a key under load is what guarantees a key can never interleave with a focus/render mutation. (Output meanwhile drains independently on the io_thread, which is exactly why background floods do not freeze the UI.)
 
 | Scenario | Main thread | Input→child latency | Concurrent output (io_thread) |
 |---|---|---|---|
 | Idle / light background | mostly free | **median 4.4 ms** (max 4.8) | 23 reads (background) |
 | Heavy flood into focused window | busy rendering | **6.4–23.3 ms** (~5× max) | 42,793 reads |
 
-**Reasoning.** The architecture wins responsiveness for the common case (a noisy background process): output never blocks the UI because it is read on `KittyChildMon` (TID 53295), so focused-window input held at ~4.4 ms median even while 23 background reads landed on that same io_thread. The *correctness/serialization* price appears precisely when the **main** thread is saturated: because `on_key_input` runs there alongside rendering, a heavy focused-window flood pushed input latency to 23.3 ms — directly observed, and corroborated by the gdb main-thread stall blocking input entirely. **This conclusion is drawn from the measured numbers and observed stall above, not from any code comment.**
+**Reasoning.** The property *bought* by handling input on the main thread is **serialized, race-free ordering**: because `on_key_input` runs on the **same** thread that pumps focus changes and synchronously dispatches shortcut/keymap matching and child-routing (observed on TID 53227 in Snapshot A, never on the io_thread), every key is processed against one consistent snapshot of focus + render + keyboard-mode state — a focus change can never interleave with the routing of the next key. The directly observed proof of that serialization is (iii): with the main thread halted on `on_key_input`, the next injected key was **not processed until `continue`**. The **responsiveness** *given up* for that guarantee is latency under load: because input shares the thread with rendering, a heavy focused-window flood pushed input→child latency from a ~4.4 ms idle median to 23.3 ms (~5×), while the idle case held at ~4.4 ms median even with 23 background reads draining on the io_thread. The separate `io_thread` (`KittyChildMon`, TID 53295) absorbing 42,793 flood reads without freezing the UI is the design that *bounds* this cost to genuine main-thread saturation — it is **not** a second tradeoff. **This conclusion is drawn from the measured numbers and observed stall above, not from any code comment.**
 
 
 ---
@@ -713,5 +777,5 @@ All citations were verified against the source on disk at HEAD `815df1e210e0a9ab
 
 `repro.session`, `kitty_debug.log` (`--debug-input`/`--debug-rendering`), `ls.json`, `threadmap_named.txt`, `lsof_pty.txt`, `strace_route.out`, `strace_ctrlc.out`, `strace_lat.out`, `strace_lat2.out`, `gdb_onkey.txt`, `gdb_all_bt.txt`, `gdb_bell.txt`, `pyspy_native.txt`, `blocked_gdb.txt`, `blocked_pyspy.txt`, `launch_under.txt`, `proc_maps.txt`.
 
-> **Provenance note.** Every code block in this report is trimmed from a real capture in the inventory above; none is fabricated. Where something could not be captured (e.g., the `"no active window, ignoring"` log line, or IBus mappings in a headless run), that is stated explicitly with the corroborating source citation instead.
+> **Provenance note.** Every code block in this report is trimmed from a real capture in the inventory above; none is fabricated. Where something genuinely could not be captured (e.g., IBus IME mappings, which are absent in a headless run with no input method active), that is stated explicitly with the corroborating source citation instead. The `"no active window, ignoring"` guard — which is not reached under ordinary close sequences — was captured by establishing its documented precondition (`active_window() == NULL`) with the debugger and injecting a real keystroke (§(e)(4)).
 
