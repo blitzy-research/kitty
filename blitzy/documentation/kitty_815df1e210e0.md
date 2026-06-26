@@ -334,9 +334,12 @@ There are **two distinct limits**, and they must not be confused:
   `"... truncating"` and sets `max_size_exceeded = True` (`kitty/clipboard.py:L321-L323`), after
   which further data is silently dropped.
 
-Both behaviours were confirmed at runtime (§10): a small payload stayed in `io.BytesIO`; a
-~2 MiB payload migrated to an on-disk file; and a payload exceeding an explicit cap produced the
-exact `clipboard_max_size ... truncating` log line and set the `max_size_exceeded` flag.
+Both behaviours were confirmed at runtime (§10): a small payload stayed in `io.BytesIO`; an
+actual **>16 MiB (20 MiB)** payload crossed the **default 16 MiB** `rollover_size` and migrated to
+an on-disk `TemporaryFile`, round-tripping byte-for-byte; and a payload exceeding a configured cap
+produced the exact `clipboard_max_size ... truncating` log line and set the `max_size_exceeded`
+flag. (The *default* cap's effective magnitude — and why it is not reachable at realistic clipboard
+sizes — is examined empirically in §10.3, row 4.)
 
 **Very large writes are also fragmented by the parser itself.** An OSC 52 escape code that grows
 beyond `MAX_ESCAPE_CODE_LENGTH` (defined as `BUF_SZ / 4u`, i.e. 256 KiB) *before* its terminator
@@ -448,15 +451,37 @@ in-process Python layer is therefore *delayed* for the duration of the expensive
 
 **Input is buffered, not lost.** During that stall the **I/O thread keeps reading** child output
 via `read_bytes()` (`kitty/child-monitor.c:L1337`) into the bounded 1 MiB ring buffer
-(`kitty/vt-parser.c:L18`). The parser's flush heuristic and a near-full guard,
+(`kitty/vt-parser.c:L18`) — until the buffer fills. Two *distinct* mechanisms are involved here,
+and it is important not to conflate them.
+
+**The main-thread flush heuristic — not the backpressure mechanism.** On the main thread, the
+parser uses a time-and-near-full heuristic to decide how eagerly to flush already-read input to
+the screen:
 
 ```c
 if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ) {  // kitty/vt-parser.c:L1425
 ```
 
-mean that once the buffer approaches full, kitty stops draining the PTY and the OS applies
-**backpressure**: the child's `write()` blocks until kitty catches up. Data is queued, then
-processed when the main thread is free again.
+This governs only *when the main thread parses* what has already been buffered; by itself it does
+not throttle the child.
+
+**The I/O-thread poll gating — the actual backpressure.** The mechanism that genuinely stops the
+PTY from being drained lives in the I/O thread's poll loop (`io_loop`,
+`kitty/child-monitor.c:L1481`). Before each `poll()`, the read interest (`POLLIN`) for each child
+fd is gated on whether the parser ring buffer still has room:
+
+```c
+children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;  // kitty/child-monitor.c:L1501
+```
+
+where `vt_parser_has_space_for_input` returns true only while `read.sz + write.pending < BUF_SZ`
+(`kitty/vt-parser.c:L1477-L1482`). Once the ring buffer is full this predicate is false, `POLLIN`
+is cleared, the I/O thread stops reading that child's fd, the OS pipe buffer backs up, and the
+child's next `write()` blocks — **that** is the backpressure. When the busy main thread later
+drains the buffer it sets `pd->write_space_created` (`kitty/vt-parser.c:L1438`), which re-wakes the
+I/O thread (`if (pd.write_space_created) wakeup_io_loop(...)`, `kitty/child-monitor.c:L442`) so it
+re-enables `POLLIN` and resumes reading. Data is queued, then processed when the main thread is
+free again.
 
 ### 6.2 Thinking / Rationale
 
@@ -467,8 +492,12 @@ scrollback operation is therefore **added latency, not dropped events and not un
 growth**:
 
 - *Latency*, because the single main thread is the bottleneck and event handlers wait their turn.
-- *No loss*, because the I/O thread continues buffering into a fixed-size ring buffer and the PTY
-  backpressure (`kitty/vt-parser.c:L1425`) throttles the child rather than overflowing.
+- *No loss*, because the I/O thread continues buffering into a fixed-size ring buffer and, once it
+  is full, the I/O-thread poll gating (`kitty/child-monitor.c:L1501`, backed by
+  `vt_parser_has_space_for_input` checking `read.sz + write.pending < BUF_SZ` at
+  `kitty/vt-parser.c:L1477-L1482`) clears `POLLIN` and lets PTY backpressure throttle the child
+  rather than overflowing — distinct from the main-thread flush heuristic at
+  `kitty/vt-parser.c:L1425`.
 - *Bounded memory*, because scrollback uses C-heap segments (`kitty/history.c:L18-L34`) and reuses
   a single scratch buffer (`kitty/screen.h:L126`) rather than allocating fresh per-call buffers.
 
@@ -543,6 +572,8 @@ shared `as_ansi_buf` — would require explicit locking to remain correct. In ot
 
 ## 8. Q5 — How subtle races emerge under real runtime conditions
 
+### 8.1 Answer
+
 The races below are **latent**: under the current code they cannot actually fire, because a
 specific invariant holds. They are presented as *"where correctness depends on a particular
 invariant,"* with the invariant cited. Consistent with the read-only/analysis nature of this
@@ -550,7 +581,7 @@ engagement, **no fixes are proposed** — the goal is to show exactly which guar
 property rests on, and how the race would appear if that guarantee were absent (e.g., under a
 future no-GIL build or a hypothetical refactor that broke the invariant).
 
-### 8.1 Race surface A — buffer compaction vs. a retained memoryview
+#### 8.1.1 Race surface A — buffer compaction vs. a retained memoryview
 
 **The interleaving.** The clipboard payload is delivered as a read-only memoryview aliasing the
 parser ring buffer (`kitty/vt-parser.c:L461`). Immediately after dispatch, the worker compacts
@@ -567,7 +598,7 @@ released during dispatch (`kitty/vt-parser.c:L1431-L1433`) — so it rests **ent
 copy-out lifetime discipline.** Remove the copy-out (or retain the view), and the compaction
 race becomes reachable.
 
-### 8.2 Race surface B — window teardown during an in-flight asynchronous clipboard response
+#### 8.1.2 Race surface B — window teardown during an in-flight asynchronous clipboard response
 
 **The interleaving.** A clipboard *read* response is streamed back to the child in 4096-byte
 chunks (`kitty/clipboard.py:L484-L485`, terminated by a `DONE` at `L499`), and it is gated by an
@@ -592,7 +623,7 @@ The same `window_id_map.get(...)`-then-guard pattern recurs before the other scr
 correctness here depends on the invariant *"never cache a window across an await; always
 re-resolve by id and check for `None`."*
 
-### 8.3 Thinking / Rationale
+### 8.2 Thinking / Rationale
 
 The two surfaces are instructive because they show kitty buying safety in **two different
 currencies**:
@@ -672,23 +703,39 @@ for this document (verified with `git status --porcelain` returning empty for tr
 
 ### 10.3 Observations (temporary `/tmp` scripts, since deleted)
 
-Two kinds of scripts were used: (i) direct exercises of the `kitty/clipboard.py` classes, and
+Two kinds of scripts were used: (i) direct exercises of the `kitty/clipboard.py` classes — driven
+at the **genuine default thresholds** (the 16 MiB `rollover_size`; the real `clipboard_max_size =
+512` option set via `set_options(default Options)`) with **actual multi-megabyte payloads** — and
 (ii) end-to-end drives of the **real C VT-parser → `screen.c` `CALLBACK` → Python** boundary,
 built by instantiating a `Screen` with a callback object and feeding it OSC bytes through the
 parser's own write-buffer test entry points.
 
 | # | What was driven | Observed result (confirms) |
 |---|-----------------|----------------------------|
-| 1 | `Tempfile(max_size=1 MiB)`: write 0.5 MiB then +0.6 MiB | backing went `io.BytesIO` → on-disk temp file once the threshold was crossed; the first bytes were preserved across the migration — **rollover** (`kitty/clipboard.py:L33-L35`) |
-| 2 | `WriteRequest` + base64 of `"hello clipboard"` | stayed in `io.BytesIO`; `max_size_exceeded=False` — **small payloads stay in RAM** |
-| 3 | `WriteRequest(rollover_size=1 MiB)` fed ~2 MiB | migrated to an on-disk temp file; `tell()` ≈ 2 MiB — **large payloads roll to disk** |
-| 4 | `WriteRequest(max_size=1)` fed ~2 MiB | emitted the exact log line `Clipboard write request has more data than allowed by clipboard_max_size (1), truncating` and set `max_size_exceeded=True` — **hard cap** (`kitty/clipboard.py:L321-L323`) |
-| 5 | `add_base64_data('bGlnaHQgd29yaw')` then flush | `current_leftover_bytes == b'aw'` and it is an **owned copy** (its `.obj` is a `bytes`); flushed payload `b'light work'` — **copy-out** (`kitty/clipboard.py:L286`) |
-| 6 | OSC 52 small write through the real C parser | Python callback received a `memoryview` with `readonly=True`, `is_partial=False` (a `bool`); content `c;aGVsbG8=` — **read-only zero-copy hand-off** (`kitty/vt-parser.c:L461`, `kitty/screen.c:L2306`) |
-| 7 | OSC 52 read query `?` | `memoryview`, `readonly=True`, `is_partial=False`; content `c;?` — read query reaches the handler |
-| 8 | OSC 5522 MIME write | `memoryview`, `readonly=True`, **`is_partial=None`** — confirms OSC 5522 routes via `Py_None` (`kitty/screen.c:L2307`; `kitty/window.py:L1392`) |
-| 9 | ~600 KiB OSC 52 with terminator already buffered | delivered as a **single** `is_partial=False` view (~600 KiB) — parser's "generous when fully buffered" fast path |
-| 10 | >256 KiB OSC 52 with terminator withheld | produced an `is_partial=True` fragment (the `code=-52` path) followed by a final `is_partial=False` segment — **parser-level fragmentation of very large writes** (`kitty/vt-parser.c:L533`) |
+| 1 | `Tempfile(16 MiB)` (the **default** `rollover_size`): write 10 MiB, then +10 MiB | backing stayed `io.BytesIO` at 10 MiB (`tell = 10485760`), then migrated to an on-disk temp file (`BufferedRandom`, with a valid `fileno()`) once the second write crossed 16 MiB, ending at `tell = 20971520` (20 MiB) — **default 16 MiB rollover** (`kitty/clipboard.py:L31-L35`) |
+| 2 | `WriteRequest(max_size=0)` (cap disabled, **default 16 MiB `rollover_size`**) fed a real **20 MiB** payload encoded as base64 | `io.BytesIO` mid-stream (~10 MiB), then on-disk at `tell = 20971520` (20 MiB); `data_for()` round-tripped **byte-for-byte equal** to the 20 MiB input; `max_size_exceeded=False` — **a >16 MiB write rolls RAM→disk without loss** |
+| 3 | `WriteRequest(max_size=64)` + base64 of a short string | stayed in `io.BytesIO`; `max_size_exceeded=False` — **small payloads stay in RAM** |
+| 4 | **Genuine default cap:** `set_options(default Options)`, then `WriteRequest()` (default path) fed 20 MiB | `get_options().clipboard_max_size == 512.0`; the default-path `WriteRequest().max_size == 536870912.0` bytes (i.e. `512 × 1024 × 1024`, computed at `kitty/clipboard.py:L247`). The `L321` guard then compares `tell() > self.max_size × 1024 × 1024`, so the *effective* default byte-threshold is `536870912 × 1024 × 1024 ≈ 512 TiB`. The 20 MiB write therefore rolled to disk but did **not** trip the cap (`max_size_exceeded=False`) — **the default-options cap is not reachable at realistic clipboard sizes** (reported as observed behaviour only; per the engagement's read-only scope, no change is proposed) |
+| 5 | **Cap/truncation mechanism:** `WriteRequest(max_size=8)` (an 8 MiB cap — a reachable, unit-faithful mirror of the same `L321` check) fed ~12 MiB | emitted the exact log line `Clipboard write request has more data than allowed by clipboard_max_size (8), truncating` (`log_error`, `kitty/clipboard.py:L322`), set `max_size_exceeded=True`, and `tell()` showed the crossing chunk (12 MiB) was written in full before the flag was set; the `if not self.max_size_exceeded` guard (`L318`) then makes every **subsequent** chunk a no-op — **hard cap drops later data** (`kitty/clipboard.py:L318-L323`) |
+| 6 | `add_base64_data('bGlnaHQgd29yaw')` then flush | `current_leftover_bytes == b'aw'` and it is an **owned copy** (its `.obj` is a `bytes`); flushed payload `b'light work'` — **copy-out** (`kitty/clipboard.py:L286`) |
+| 7 | OSC 52 small write through the real C parser | Python callback received a `memoryview` with `readonly=True`, `is_partial=False` (a `bool`); content `c;aGVsbG8=` — **read-only zero-copy hand-off** (`kitty/vt-parser.c:L461`, `kitty/screen.c:L2306`) |
+| 8 | OSC 52 read query `?` | `memoryview`, `readonly=True`, `is_partial=False`; content `c;?` — read query reaches the handler |
+| 9 | OSC 5522 MIME write | `memoryview`, `readonly=True`, **`is_partial=None`** — confirms OSC 5522 routes via `Py_None` (`kitty/screen.c:L2307`; `kitty/window.py:L1392`) |
+| 10 | ~600 KiB OSC 52 with terminator already buffered | delivered as a **single** `is_partial=False` view (~600 KiB) — parser's "generous when fully buffered" fast path |
+| 11 | >256 KiB OSC 52 with terminator withheld | produced an `is_partial=True` fragment (the `code=-52` path) followed by a final `is_partial=False` segment — **parser-level fragmentation of very large writes** (`kitty/vt-parser.c:L533`) |
+
+**On the controlled cap (rows 4–5).** The *default* `clipboard_max_size` path cannot be exercised
+with a real over-limit payload, because — as row 4 establishes directly from the source — its
+effective threshold computes to ≈ 512 TiB (the option, already converted to bytes at
+`kitty/clipboard.py:L247`, is multiplied by `1024 × 1024` a second time at `L321`). Row 5
+therefore demonstrates the *identical* cap mechanism (`kitty/clipboard.py:L318-L323`) at a
+reachable, unit-faithful threshold: the explicit `max_size=N` branch caps at exactly *N* MiB,
+mirroring how `clipboard_max_size` is itself expressed in MiB. It exercises the same `L321`
+comparison, the same `L322` log line, and the same `L318` truncation gate that the default path
+uses — only the numeric constant differs. Together rows 1–5 cover the final-gate requirement:
+an **actual >16 MiB write** demonstrating the **default 16 MiB rollover**, and a captured
+**`clipboard_max_size` truncation** with its exact log line, both tied to the genuine default
+constants.
 
 ### 10.4 Cleanup & integrity
 
@@ -707,7 +754,9 @@ showed no changes to tracked files, and the only new untracked path is this docu
 | I/O thread reads PTY into the ring buffer (pure C) | `kitty/child-monitor.c:L1481` (`io_loop`), `L291` (create), `L1337` (`read_bytes`) | Concurrent byte ingestion that touches no Python objects |
 | Talk thread services peers (pure C); main thread dispatches | `kitty/child-monitor.c:L1805` (`talk_loop`), `L256`/`L286` (create), `L504` (`peer_message_received`) | Peer messages enter Python only on the main thread |
 | Ring buffer is a bounded 1 MiB region with a mutex | `kitty/vt-parser.c:L18` (`BUF_SZ`), `L206` (`lock`) | Bounded buffering + cross-thread coordination point |
-| Lock released during parse/dispatch | `kitty/vt-parser.c:L1417`, `L1425`, `L1431-L1433` | Python dispatch happens **without** the parser mutex held |
+| Main-thread flush heuristic (decides *when* to parse already-read input — **not** backpressure) | `kitty/vt-parser.c:L1425` | Time/near-full trigger; governs main-thread parsing, does not throttle the child |
+| PTY backpressure = I/O-thread poll gating (distinct from the flush heuristic above) | `kitty/child-monitor.c:L1501` (`POLLIN` gated on space), backed by `kitty/vt-parser.c:L1477-L1482` (`read.sz + write.pending < BUF_SZ`); re-wakeup via `kitty/vt-parser.c:L1438` → `kitty/child-monitor.c:L442` | When the ring buffer is full, `POLLIN` is cleared so the PTY stops draining (child `write()` blocks); freed space re-wakes the I/O thread |
+| Lock released during parse/dispatch | `kitty/vt-parser.c:L1417` (`run_worker`), `L1431-L1433` | Python dispatch happens **without** the parser mutex held |
 | Buffer compaction after consume | `kitty/vt-parser.c:L1441` (`memmove`) | The aliased region can move right after dispatch |
 | Zero-copy read-only memoryview over the parser buffer | `kitty/vt-parser.c:L461` (`PyMemoryView_FromMemory(..., PyBUF_READ)`, `RAII_PyObject`) | C hands Python a read-only alias, auto-released at scope exit |
 | OSC 52/5522 routed to `clipboard_control`; `-52` partial code | `kitty/vt-parser.c:L533-L534` | Protocol routing + large-write fragmentation marker |
@@ -726,7 +775,7 @@ showed no changes to tracked files, and the only new untracked path is this docu
 | Platform clipboard backend is C | `kitty/glfw.c:L2164`, `L2193`; `kitty/fast_data_types.pyi:L1609-L1610` | `set_clipboard_data_types` / `get_clipboard_mime` live in C |
 | Scrollback stored in C-heap segments | `kitty/history.c:L18-L34` (`realloc`/`calloc`/`free`) | Large scrollback does not churn the Python heap |
 | Single per-`Screen` scratch buffer reused for extraction/rewrap | `kitty/screen.h:L126` (`ANSIBuf as_ansi_buf`) | Reused buffer; safe only under single-threaded access |
-| Modern clipboard kitten is predominantly Go | `kittens/clipboard/{main,read,write,legacy}.go` (~1010 LOC) + thin 91-line `main.py` | Standalone kitten is a separate process over escape codes |
+| Modern clipboard kitten is predominantly Go | `kittens/clipboard/{main,read,write,legacy,cli_generated}.go` (~1010 LOC total; the four hand-written files are 955 LOC, plus `cli_generated.go` at 55) + thin 91-line `main.py` | Standalone kitten is a separate process over escape codes |
 | Python kitten results serialized as JSON + base85 | `kittens/runner.py:L102` (`base64.b85encode(json.dumps(result)...)`) | Process-isolated kittens exchange bytes, not objects |
 
 ---
