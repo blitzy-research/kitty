@@ -51,7 +51,7 @@ A `None` action in a `re.Scanner` means **"match this but emit no token."** So *
 
 This is the first half of the surprise: because a space emits no token, the parser must *decide* what an adjacency of two terms means. As we will see, it decides **AND**.
 
-### A.2 — The node types and their set‑algebra semantics
+### A.2 — The node types and their set-algebra semantics
 
 The parser builds a tree from four node classes, each a `SearchTreeNode` whose `__call__(candidates, get_matches)` returns the subset of `candidates` it matches:
 
@@ -101,7 +101,7 @@ A query is evaluated through `search()` (`kitty/search_query_parser.py:L292-296`
 
 ---
 
-## Section B — Precedence & implicit‑AND (the crux)
+## Section B — Precedence & implicit-AND (the crux)
 
 This section is the core of the explanation. Two grammar facts combine to produce the user's symptom.
 
@@ -134,7 +134,7 @@ if ((self.token_type() in (TokenType.WORD, TokenType.QUOTED_WORD) or self.token(
 
 Recall from [Section A.1](#a1--the-lexer-discards-whitespace) that whitespace emits **no token**. So when you write two terms separated only by a space, the parser — sitting on the second term with no operator in between — hits exactly this branch and wraps them in an `AndNode`. **The space is therefore an implicit AND (intersection).** The comment in the source, *"Account for the optional 'and'"*, says this explicitly: the `and` keyword is optional precisely because adjacency already means AND.
 
-### B.3 — Operators are case‑insensitive
+### B.3 — Operators are case-insensitive
 
 The operator checks above use `lcase_token()` (`kitty/search_query_parser.py:L161-167`), which lower‑cases the token before comparing. So `or`/`OR`/`Or`, `and`/`AND`, and `not`/`NOT` are all recognized equivalently. (This is confirmed empirically in [Section E](#section-e--empirical-demonstration-r2), row 7: `title:foo OR title:bar` yields the same union as lowercase `or`.)
 
@@ -154,7 +154,7 @@ The parse tree (verified empirically via `build_tree()` introspection — see [S
 
 The previous sections explain the *mixed* query. But the user's *literal* example, `foo or bar`, fails even earlier — and for a different, simpler reason.
 
-### C.1 — The call sites disallow location‑free terms
+### C.1 — The call sites disallow location-free terms
 
 Every term must carry a `field:` (the code calls it a *location*) prefix. The parser supports an `allow_no_location` flag, but it **defaults to `False`** at every layer:
 
@@ -296,7 +296,7 @@ The repository ships a canonical test, `kitty_tests/search_query_parser.py` (`L1
 
 These confirm, against the project's own authoritative expectations, that OR is union (`L25`), AND is intersection (`L26`, empty here), NOT is set difference (`L27`), parentheses group as expected (`L28`), and location‑free terms raise (`L29-30`).
 
-### E.3 — Parse‑tree diagram (the crux query)
+### E.3 — Parse-tree diagram (the crux query)
 
 Introspecting the tree produced by `build_tree()` confirms the shape of the crux query `title:foo or title:bar title:baz` is `OR(title:foo, AND(title:bar, title:baz))`:
 
@@ -317,7 +317,7 @@ For contrast, the other two shapes (also verified via introspection) are:
 
 ---
 
-## Section F — Root‑cause verdict
+## Section F — Root-cause verdict
 
 **Working as designed — not a bug.** The reported symptom is the combined effect of **four** deliberate, documented behaviors, each proven above:
 
@@ -397,7 +397,7 @@ The window call site's `get_matches` normalizes **negative** ids to absolute one
 
 ## Section I — Evidence index & appendix
 
-### I.1 — Claim‑to‑citation index
+### I.1 — Claim-to-citation index
 
 | Claim | Citation |
 |---|---|
