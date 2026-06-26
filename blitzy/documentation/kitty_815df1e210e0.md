@@ -20,11 +20,18 @@ The four questions:
 
 ## Build & observation methodology
 
-Observations were produced in the user-provided `swe-atlas` build/run environment with the kitty
-repository built in place by its own native build (`python setup.py`, which produces the
-`kitty/fast_data_types` C extension at `setup.py:1091`). The runtime was CPython **3.13.7**; the Go
-toolchain present was **go1.24.4** (the repository declares `go 1.22` at `go.mod:3` and requires
-Python `>=3.8` at `pyproject.toml:2`); the size profile was generated with **cloc 2.04**.
+Two build/run venues were available and both were exercised; this note states which venue produced
+which observation so that no figure is misattributed. The canonical, user-provided `swe-atlas`
+Docker image (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`, Ubuntu 24.04) ships
+kitty **pre-built** — `kitty/fast_data_types.so` is already present at `/app` — and runs **CPython
+3.12.3** with **go1.23.4**; it was used to confirm that the built application imports and runs, but
+it does **not** ship `cloc`. The version counts and the `cloc` size profile quoted below were
+therefore taken in the **host-native** venue (Ubuntu 25.10), where the repository is likewise built
+in place by its own native build (`python setup.py`, which produces the `kitty/fast_data_types` C
+extension at `setup.py:1091`) and which provides **CPython 3.13.7**, **go1.24.4**, and **cloc 2.04**
+(the repository itself declares `go 1.22` at `go.mod:3` and requires Python `>=3.8` at
+`pyproject.toml:2`). The host-native figures are not attributed to the Docker image; where a specific
+runtime version is material below, the venue is identified explicitly.
 
 The two import-time failures (O3 and O4) are **build-independent** — they occur while Python is
 *importing* modules, before any compiled code runs — so they were reproduced against a **pristine,
@@ -310,9 +317,14 @@ it *the* critical dependency is *when* it is required: `kitty.borders` imports
 `kitty.fast_data_types` at **module load** (`kitty/borders.py:7`), not lazily inside a function, so
 the import chain from `__main__.py` cannot even finish loading `kitty.main` without it. The Python
 layer is therefore hard-wired to the compiled C core at import time. That single artifact —
-`kitty/fast_data_types.so` — is the one indispensable piece: present, the app starts; absent, nothing
-in the package can be imported. The fix is not a code change but a *build*; this document deliberately
-explains the failure rather than remediating it.
+`kitty/fast_data_types.so` — is the one indispensable piece: present, the app starts; absent, the
+entire main-application import chain (`__main__.py` → `entry_points` → `main` → `borders`) and every
+`kitty.*` module that imports the native bridge at module scope (for example `kitty.utils`,
+`kitty.cli`, `kitty.clipboard`, `kitty.conf.utils`, `kitty.rgb`) cannot load. (A handful of
+dependency-light leaf modules — for example `kitty.constants` and `kitty.types` — *do* still import
+on an unbuilt tree, because they touch the native bridge only inside functions, if at all; but
+nothing that actually drives the terminal can run without the extension.) The fix is not a code
+change but a *build*; this document deliberately explains the failure rather than remediating it.
 
 ---
 
@@ -380,17 +392,23 @@ ModuleNotFoundError: No module named 'kitty.fast_data_types'
   `path_completer.py`. Any kitten built on `tui` inherits the dependency.
 - Scope of the pattern: 18 kitten subpackages ship a `main.py` — `ask`, `broadcast`, `choose_fonts`,
   `clipboard`, `diff`, `hints`, `hyperlinked_grep`, `icat`, `pager`, `panel`, `query_terminal`,
-  `remote_file`, `resize_window`, `show_key`, `ssh`, `themes`, `transfer`, `unicode_input` — and the
-  common choke-point modules they pull in (`kitty/clipboard.py`, `kitty/cli.py`, `kitty/utils.py`,
-  `kitty/constants.py`) all route through `kitty/conf/utils.py:27`.
+  `remote_file`, `resize_window`, `show_key`, `ssh`, `themes`, `transfer`, `unicode_input`. These
+  reach the native bridge through more than one choke point, not a single shared line. The
+  representative `hints` and `diff` paths converge at `kitty/conf/utils.py:27` because
+  `kitty/clipboard.py:11` and `kitty/cli.py:13` each import `.conf.utils` *before* their own direct
+  `fast_data_types` import. By contrast `kitty/utils.py` imports `fast_data_types` **directly** at
+  module scope (`kitty/utils.py:45`), and `kitty/constants.py` reaches it only inside functions
+  (`kitty/constants.py:154`, `:170`, `:304`) — so `utils.py` and `constants.py` are *additional*
+  native-bridge choke points, not routes through `kitty/conf/utils.py:27`.
 
 ### Rationale / Conclusion
 
 The `kittens/` directory is a clean *organizational* decomposition — each tool is a tidy subpackage
 with its own `main.py`. But organization is not runtime independence. At load time, a kitten imports
 shared `kitty.*` modules (`kitty.clipboard`, `kitty.cli`, the `kittens/tui/*` framework), and those
-modules import `kitty.fast_data_types` at module scope — most often by converging on
-`kitty/conf/utils.py:27`. So a standalone kitten is no more self-contained than the main app: both
+modules import `kitty.fast_data_types` at module scope — frequently by converging on
+`kitty/conf/utils.py:27`, though some (such as `kitty.utils`) import the bridge directly. So a
+standalone kitten is no more self-contained than the main app: both
 fail with the identical `ModuleNotFoundError` until the native core is built. The modularity is real
 at the source-layout level and absent at the runtime-dependency level.
 
