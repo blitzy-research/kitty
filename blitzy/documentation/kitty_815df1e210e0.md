@@ -76,8 +76,12 @@ To understand where flow control happens, it helps to know that reading bytes an
 are done on **different threads**: the I/O thread runs `io_loop()` `[kitty/child-monitor.c:1481]`
 (started via `pthread_create` `[kitty/child-monitor.c:291]`) and performs the raw
 `read_bytes()`/`write_to_child()` `[kitty/child-monitor.c:1336-1357,1443]`, whereas the VT parser's
-`run_worker()` `[kitty/vt-parser.c:1417]` is driven from the render/main thread through
-`parse_worker()` `[kitty/screen.c:4775-4776]`. The two sides are decoupled by the shared bounded
+`run_worker()` `[kitty/vt-parser.c:1417]` is driven from the render/main thread through the thin
+`parse_worker()` wrapper `[kitty/vt-parser.c:1496]`. At runtime that wrapper is installed as the
+monitor's `parse_func` `[kitty/child-monitor.c:178-181]` and invoked by `do_parse()`
+`[kitty/child-monitor.c:438-440]`, which `parse_input()` calls for each child
+`[kitty/child-monitor.c:530]`; the main loop runs `parse_input()` and then `render()`
+`[kitty/child-monitor.c:1236-1237]`. The two sides are decoupled by the shared bounded
 buffer introduced above `[kitty/vt-parser.c:18]`.
 
 - **The I/O thread** lives in `kitty/child-monitor.c`. It owns the `poll()` loop over the child
@@ -581,7 +585,7 @@ is tied to a specific line at HEAD `815df1e210e0`. Where dynamic corroboration i
 example, running `kitty_tests/graphics.py`, `parser.py`, or `screen.py`), it is performed inside the
 project-provided Docker image
 (`andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` from
-`ghcr.io/scaleapi/swe-atlas`), because the local analysis sandbox lacks the `go`/`cc` toolchain needed
+`ghcr.io/scaleapi/swe-atlas`), because the local analysis sandbox lacks the `go` toolchain needed
 to build kitty. The source tree is left unchanged and any temporary observation script is removed
 afterward.
 
@@ -598,7 +602,7 @@ afterward.
 | 3 | Parser advertises remaining space | `vt_parser_has_space_for_input()` | `read.sz + write.pending < BUF_SZ` | `[kitty/vt-parser.c:1477-1481]` |
 | 4 | Writable region handed to reader | `vt_parser_create_write_buffer()` | `BUF_SZ - (read.sz + write.pending)` | `[kitty/vt-parser.c:1451-1457]` |
 | 5 | `POLLIN` read-gating | `kitty/child-monitor.c` poll setup | request `POLLIN` only if space | `[kitty/child-monitor.c:1501]` |
-| 6 | Read-skip when buffer full | `read_bytes()` | `if (!available_buffer_space) return true;` | `[kitty/child-monitor.c:1342]` (`[:1336-1357]`) |
+| 6 | Read-skip when buffer full | `read_bytes()` | `if (!available_buffer_space) return true;` | `[kitty/child-monitor.c:1342]` (`[kitty/child-monitor.c:1336-1357]`) |
 | 7 | Parse throttle / coalescing | `run_worker()` | flush ∥ `input_delay` ∥ within **16 KB** of full | `[kitty/vt-parser.c:1425]` |
 | 8 | Poll timeout honors `input_delay` | `kitty/child-monitor.c` poll loop | `OPT(input_delay) - elapsed` | `[kitty/child-monitor.c:1506-1512]` |
 | 9 | `input_delay` default | `kitty/options/types.py` | **3 ms** | `[kitty/options/types.py:536]` |
