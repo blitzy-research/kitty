@@ -58,8 +58,8 @@ them, and the recorded exit status lives in another:
    answered against this notion.)
 3. **The recorded integer exit status on the `Window`** —
    `Window.last_cmd_exit_status`, an `int`
-   ([`kitty/window.py:L572`](#) initializer,
-   [`kitty/window.py:L1413`](#) assignment). This is the *only* thing preserved
+   (`kitty/window.py:L572` initializer,
+   `kitty/window.py:L1413` assignment). This is the *only* thing preserved
    *from* the `D` marker, and it is what Q3 and Q4 are really asking about.
 
 Throughout this document, each question is answered against the correct notion,
@@ -69,10 +69,18 @@ and the answer explicitly names which notion it concerns.
 
 ## Section 2 — OSC 133 (FinalTerm/iTerm2) protocol background
 
-OSC 133 is the **FinalTerm** shell-integration ("semantic prompt") protocol,
-later adopted by **iTerm2**, **VS Code**, **Ghostty**, and others. It lets a
-shell tell the terminal where prompts, commands, and command output begin and
-end. The wire form is:
+OSC 133 is the **FinalTerm** shell-integration ("semantic prompt") protocol —
+[the original shell-integration protocol](https://terminfo.dev/osc) whose
+prompt/command/output markers were later adopted by
+[**iTerm2**](https://iterm2.com/documentation-escape-codes.html),
+[**VS Code**](https://code.visualstudio.com/docs/terminal/shell-integration),
+[**Ghostty**](https://ghostty.org/docs/features/shell-integration), and others
+(full URLs are listed under **External references** at the end of this section).
+kitty's own documentation independently corroborates this adoption, noting that
+"Many modern terminals make use of it, for example: kitty, iTerm2, WezTerm,
+DomTerm" (`docs/shell-integration.rst:L421-L422`). It lets a shell tell the
+terminal where prompts, commands, and command output begin and end. The wire
+form is:
 
 ```
 OSC 133 ; <Command> [ ; <Parameters> ... ] ST
@@ -108,16 +116,45 @@ accepts **both** terminators: the bundled shell-integration scripts emit `BEL`
   `<OSC>133;C;cmdline=<%q-encoded><ST>` and
   `<OSC>133;C;cmdline_url=<URL-escaped><ST>`
   (`docs/shell-integration.rst:L461` and `:L463`).
+- For the *full* protocol — the one that also marks the command region — kitty's
+  documentation explicitly defers to the iTerm2 escape-codes specification
+  (`docs/shell-integration.rst:L441-L443`, which links to
+  <https://iterm2.com/documentation-escape-codes.html>).
 
 **Standards-aligned design choice: `B` is intentionally a no-op in kitty.**
 kitty's documentation describes only `A`, `C`, and `D`; there is **no** `B`
 described, and — as Section 3 shows — kitty's C handler has **no `'B'` case**.
-Because OSC 133 originated with FinalTerm and the `B` marker (end-of-prompt) is
-optional for terminals that derive command boundaries from `A`/`C`, handling
+Because OSC 133 originated with FinalTerm (see **External references** below) and
+the `B` marker (end-of-prompt) is optional for terminals that derive command
+boundaries from `A`/`C`, handling
 `A`/`C`/`D` while silently ignoring `B` is a deliberate, standards-aligned design
 choice, not a defect. Direct evidence that `B` is intentionally unused: kitty's
 zsh integration ships a **commented-out** `133;B` emission
 (`shell-integration/zsh/kitty-integration:L226`).
+
+### External references
+
+The OSC 133 *protocol origin* and *cross-terminal adoption* stated at the start of
+this section are external (non-kitty) facts, so they are grounded in the following
+authoritative sources rather than in kitty's repository. (Every claim about
+kitty's *own* behavior elsewhere in this document remains grounded in kitty source
+files and/or empirical measurement, cited inline.)
+
+- **FinalTerm origin and cross-terminal adoption** — terminfo.dev, *Operating
+  System Commands (OSC)*: describes OSC 133 as the original FinalTerm
+  shell-integration ("semantic prompt") protocol whose prompt/command/output
+  markers are now adopted by iTerm2, VS Code, Ghostty, and others.
+  <https://terminfo.dev/osc>
+- **iTerm2** — *Proprietary Escape Codes*: documents `OSC 133 ; A/B/C` and
+  attributes the sequences to the (now-defunct) FinalTerm emulator. This is also
+  the reference kitty's own docs point to (`docs/shell-integration.rst:L441-L443`).
+  <https://iterm2.com/documentation-escape-codes.html>
+- **VS Code** — *Terminal Shell Integration*: states that it "supports Final
+  Term's shell integration sequences" and documents `OSC 133 ; A/B/C/D`.
+  <https://code.visualstudio.com/docs/terminal/shell-integration>
+- **Ghostty** — *Shell Integration*: documents its OSC 133 prompt-marking
+  implementation across supported shells.
+  <https://ghostty.org/docs/features/shell-integration>
 
 ---
 
