@@ -541,8 +541,12 @@ propagated end-to-end across the C VT parser → C screen handler → Python win
 2. **The `on_cmd_startstop` watcher payload contains `exit_status: 99`** — the
    `handle_cmd_end` watcher dispatch at `kitty/window.py:L1419–L1420` builds
    `{"is_start": False, "time": …, 'cmdline': …, 'exit_status': self.last_cmd_exit_status}`.
-   The driven probe observed the end payload
-   `{'is_start': False, 'cmdline': 'ls', 'exit_status': 99}`.
+   The driven probe (running the real `handle_cmd_end`) observed the end
+   payload
+   `{'is_start': False, 'time': <monotonic timestamp>, 'cmdline': 'ls', 'exit_status': 99}`
+   — i.e. the four keys built at `L1419–L1420`, where `time` is a
+   non-deterministic `monotonic()` value and the command-tracking keys are
+   `is_start=False`, `cmdline='ls'`, and the integer `exit_status=99`.
 3. **`99` is surfaced in the window state dictionary** — `last_cmd_exit_status`
    is written into the state dicts at `kitty/window.py:L704` (`as_dict`,
    consumed by remote control) and `kitty/window.py:L729` (`serialize_state`),
