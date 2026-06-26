@@ -28,7 +28,7 @@ allocated lazily in **fixed 2048-line segments** (`kitty/history.c:L15`), so a 2
 **single segment**. Under the out-of-the-box configuration, the user's "hundreds of thousands of lines"
 therefore produce an **essentially flat memory profile after the first ~2048 lines**: the grid is a fixed-size
 ring that simply overwrites its oldest entries. We measured this directly — pushing **500,000** lines into a
-default-sized buffer grew RSS by only **≈ 4.887 MiB** (one segment), with the live line `count` capped at 2000.
+default-sized buffer grew RSS by only **≈ 4.891 MiB** (one segment), with the live line `count` capped at 2000.
 
 **Consequence for the investigation:** to *observe* the allocation steps the user asks about, you must
 configure a **large or effectively-infinite scrollback**. Negative values map to `2³²−1` lines
@@ -73,30 +73,38 @@ total allocated capacity is still below `ynum`. That second clause is what makes
 
 ### 1.2 The per-line and per-segment byte cost (derivation)
 
-The cell struct sizes are fixed and enforced by `static_assert` at compile time:
+The two per-cell struct sizes are fixed and enforced by `static_assert` at compile time; the per-line
+attribute size is **not** asserted, so it is taken from the **actual compiled `sizeof`** (verified by a probe
+below — code is the source of truth):
 
 - `static_assert(sizeof(GPUCell) == 20, ...)` — `kitty/data-types.h:L221`.
 - `static_assert(sizeof(CPUCell) == 12, ...)` — `kitty/data-types.h:L228`.
-- `LineAttrs` is a one-byte union (its largest member is `uint8_t val`) — `kitty/data-types.h:L231-L239`.
+- `LineAttrs` is a `union` (`kitty/data-types.h:L231-L239`) whose anonymous struct contains the bitfield
+  `PromptKind prompt_kind : 2`, where `PromptKind` is an `enum` (`kitty/data-types.h:L230`). An enum-typed
+  bitfield is laid out in an `int`-sized (4-byte) storage unit, so the struct — and therefore the union — is
+  **4 bytes**, *not* 1. There is **no** `static_assert` on `LineAttrs`. A probe that `#include`s the real
+  `kitty/data-types.h` and prints the sizes confirms `sizeof(LineAttrs) == 4` (alongside `sizeof(GPUCell) == 20`
+  and `sizeof(CPUCell) == 12`). Reading only the `uint8_t val` member and concluding the union is one byte is
+  the mistake to avoid: the enum bitfield dominates the layout.
 
-A scrollback line stores **one CPUCell and one GPUCell per column**, plus **one byte of line attributes per
-line**. Therefore:
+A scrollback line stores **one CPUCell and one GPUCell per column**, plus **four bytes of line attributes per
+line** (`sizeof(LineAttrs) == 4`). Therefore:
 
 ```
 per-line bytes    = xnum * sizeof(CPUCell) + xnum * sizeof(GPUCell) + sizeof(LineAttrs)
-                  = xnum*12 + xnum*20 + 1
-                  = xnum*32 + 1
+                  = xnum*12 + xnum*20 + 4
+                  = xnum*32 + 4
 
-per-segment bytes = SEGMENT_SIZE * (xnum*32 + 1)
-                  = 2048 * (xnum*32 + 1)
+per-segment bytes = SEGMENT_SIZE * (xnum*32 + 4)
+                  = 2048 * (xnum*32 + 4)
 ```
 
 Evaluating the formula:
 
 | Columns (`xnum`) | per-line bytes | per-segment bytes | per-segment (MiB) |
 |---|---|---|---|
-| 80  | `80*32+1`  = **2561** | `2048*2561`  = **5,244,928**  | **5.002 MiB** |
-| 200 | `200*32+1` = **6401** | `2048*6401` = **13,109,248** | **12.502 MiB** |
+| 80  | `80*32+4`  = **2564** | `2048*2564`  = **5,251,072**  | **5.008 MiB** |
+| 200 | `200*32+4` = **6404** | `2048*6404` = **13,115,392** | **12.508 MiB** |
 
 So each freshly allocated segment adds **~5.0 MiB at 80 columns** (the "~5 MiB step") and **~12.5 MiB at 200
 columns**. The total grid capacity is `ynum` lines, where:
@@ -112,28 +120,29 @@ Python 3.13.7; `kitty/fast_data_types.so` = 1,253,792 bytes; page size 4096 B.)
 
 | Lines pushed | Measured RSS delta | Live `count` | Notes |
 |---|---|---|---|
-| 2,048   | **+5.01 MiB**   | 2,048   | first segment fully populated → 1 × 5.002 MiB |
-| 4,096   | **+10.02 MiB**  | 4,096   | 2 segments |
-| 6,144   | **+15.03 MiB**  | 6,144   | 3 segments |
-| 8,192   | **+20.04 MiB**  | 8,192   | 4 segments |
-| 10,240  | **+25.05 MiB**  | 10,240  | 5 segments |
-| 50,000  | **+122.36 MiB** | 50,000  | ~24.4 segments |
-| 99,999  | **+244.71 MiB** | 99,999  | ~48.8 segments |
-| 100,000 | (cap reached)   | 100,000 | `count == ynum` — ring saturated |
+| 2,048   | **+5.008 MiB**   | 2,048   | first segment fully populated → 1 × 5.008 MiB |
+| 4,096   | **+10.207 MiB**  | 4,096   | 2 segments |
+| 6,144   | **+15.219 MiB**  | 6,144   | 3 segments |
+| 8,192   | **+20.234 MiB**  | 8,192   | 4 segments |
+| 10,240  | **+25.250 MiB**  | 10,240  | 5 segments |
+| 50,000  | **+122.551 MiB** | 50,000  | ~24.4 segments |
+| 99,999  | **+244.906 MiB** | 99,999  | ~48.8 segments |
+| 100,000 | (cap reached)    | 100,000 | `count == ynum` — ring saturated |
 
-The measured per-step increment (~5.0 MiB) matches the derived per-segment size (5.002 MiB @ 80 cols) within
-RSS sampling noise. **The model is empirically confirmed:** memory grows linearly in the number of *allocated*
-segments, in discrete ~5 MiB jumps, up to the `ynum` ceiling.
+The measured per-step increment (~5.0 MiB; the first, cleanest step is **+5.008 MiB**) matches the derived
+per-segment size (5.008 MiB @ 80 cols) to within RSS sampling noise — small variations above 5.008 on later
+steps are first-touch/allocator overhead. **The model is empirically confirmed:** memory grows linearly in
+the number of *allocated* segments, in discrete ~5 MiB jumps, up to the `ynum` ceiling.
 
 ### 1.4 The default configuration: massive output does *not* balloon grid memory
 
 With the default `scrollback_lines = 2000` (`kitty/options/definition.py:L372`), `ynum = MAX(2000, screen_lines)`
 fits in a single segment. Pushing **500,000** lines into `HistoryBuf(2000, 80, 0)` grew RSS by only
-**≈ 4.887 MiB total**, and the live `count` stayed pinned at 2000:
+**≈ 4.891 MiB total**, and the live `count` stayed pinned at 2000:
 
 | Configuration | Lines pushed | Total RSS growth | Final `count` |
 |---|---|---|---|
-| `HistoryBuf(2000, 80, 0)` (default) | 500,000 | **≈ 4.887 MiB** (one segment) | 2,000 (capped) |
+| `HistoryBuf(2000, 80, 0)` (default) | 500,000 | **≈ 4.891 MiB** (one segment) | 2,000 (capped) |
 
 This is the direct answer to "what happens to memory under hundreds of thousands of lines": **at defaults,
 almost nothing after the first segment** — the grid is a fixed ring that overwrites its oldest lines. The
@@ -245,8 +254,8 @@ Every time a line index crosses into a new, not-yet-allocated 2048-line block (a
 `ynum`), `segment_for()` calls `add_segment()` — guard at `kitty/history.c:L39`, allocation at
 `kitty/history.c:L17-L29`. That is a **single ~5 MiB `calloc`** (`kitty/history.c:L25`) at 80 columns.
 
-**Observable as:** the discrete **+5.0 MiB RSS steps** in the §1.3 table — at 2,048 (+5.01 MiB), 4,096
-(+10.02), 6,144 (+15.03), … 99,999 (+244.71). Each step is exactly one segment. This is the literal "allocation
+**Observable as:** the discrete **+5.0 MiB RSS steps** in the §1.3 table — at 2,048 (+5.008 MiB), 4,096
+(+10.207), 6,144 (+15.219), … 99,999 (+244.906). Each step is exactly one segment. This is the literal "allocation
 of new storage" the user asked to watch, and memory monitoring shows it as a clean staircase.
 
 ### 3.2 Boundary #2 — ring saturation at `count == ynum` (the curve goes flat)
@@ -299,12 +308,14 @@ The backing ring buffer is the vendored `ringbuf`, included at `kitty/history.c:
 at the repository root** (a sibling of `kitty/`), *not* inside `kitty/`.
 
 **Observable as:** with `HistoryBuf(2000, 80, 8 MiB)` and 200,000 lines pushed, the **grid `count` stayed flat
-at 2000** while `pagerhist_as_text()` returned **exactly 8,388,608 characters** — precisely the configured
-8 MiB cap:
+at 2000** while `pagerhist_as_text()` returned **≈ 8,362,586 characters** — the pager ring filled to its
+configured **8 MiB cap** (`maximum_size = 8,388,608` bytes). The returned length sits *just under* the byte cap
+(a byte ring buffer never reports itself 100 % full) and varies by a few KiB run-to-run (e.g. 8,362,586–
+8,371,242) with the wrap position:
 
 | Configuration | Lines pushed | Grid `count` | `pagerhist_as_text()` length |
 |---|---|---|---|
-| `HistoryBuf(2000, 80, 8 MiB)` | 200,000 | 2,000 (flat) | **8,388,608 chars** (= 8 MiB cap) |
+| `HistoryBuf(2000, 80, 8 MiB)` | 200,000 | 2,000 (flat) | **≈ 8,362,586 chars** (fills the 8 MiB cap = 8,388,608 B) |
 
 This proves the pager history is a **distinct, independently-bounded growth axis** that the grid's `count`
 metric does not reflect — you must monitor it separately (e.g. via `pagerhist_as_text()` length or process RSS).
@@ -313,9 +324,9 @@ metric does not reflect — you must monitor it separately (e.g. via `pagerhist_
 
 | Event | Code trigger | What memory monitoring shows |
 |---|---|---|
-| New segment allocated | `add_segment` via `segment_for` (`history.c:L37-L42`, guard L39) | **+5.0 MiB RSS step** at each 2048 crossing |
-| Ring saturates | `count == ynum` in `historybuf_push` (`history.c:L279-L282`) | **flat** RSS — eviction, no allocation |
-| Pager history grows | `pagerhist_extend` (`history.c:L90-L101`) in ≥1 MiB chunks, ≤ 4 GiB−1 | **separate, bounded** RSS/text-length growth |
+| New segment allocated | `add_segment` via `segment_for` (`kitty/history.c:L37-L42`, guard `kitty/history.c:L39`) | **+5.0 MiB RSS step** at each 2048 crossing |
+| Ring saturates | `count == ynum` in `historybuf_push` (`kitty/history.c:L279-L282`) | **flat** RSS — eviction, no allocation |
+| Pager history grows | `pagerhist_extend` (`kitty/history.c:L90-L101`) in ≥1 MiB chunks, ≤ 4 GiB−1 | **separate, bounded** RSS/text-length growth |
 
 "When does allocation occur?" — at each 2048-line crossing while filling (Boundary #1), and (if pager history
 is enabled) in ≥1 MiB chunks as text is evicted (Boundary #3). "Can I observe it?" — yes: each grid allocation
@@ -372,20 +383,28 @@ the saturation and default-scrollback runs.
 The default `scrollback_lines` is **2000** (`kitty/options/definition.py:L372`). Because the grid is allocated
 in 2048-line segments (`kitty/history.c:L15`), a 2000-line cap is a **single segment**. Under the default
 configuration, "hundreds of thousands of lines" produce an **essentially flat memory profile after the first
-~2048 lines** — measured: **500,000 lines → ≈ 4.887 MiB total** grid growth, `count` capped at 2000. To
+~2048 lines** — measured: **500,000 lines → ≈ 4.891 MiB total** grid growth, `count` capped at 2000. To
 **observe** the allocation steps, you must configure a **large or effectively-infinite scrollback**; negative
 values map to `2³²−1` lines via `scrollback_lines()` (`kitty/options/utils.py:L557-L561`). Skipping this step
 is the single most common way a measurement would *understate* the behavior.
 
 ### 4.5 Repository immutability statement
 
-This investigation produced **zero changes to the source repository**. All measurement harnesses live in
-`/tmp` (outside the repo): `/tmp/hb_real.py` (drives the real `HistoryBuf` and samples RSS) and
-`/tmp/hb_mem_probe.c` → `/tmp/hb_mem_probe` (the standalone C allocator model). The build artifacts
+This investigation produced **zero changes to the kitty source tree**. All measurement harnesses live in
+`/tmp` (outside the repo) and their full source is embedded in this document for self-contained reproduction:
+`/tmp/hb_real.py` (drives the real `HistoryBuf` and samples RSS — Appendix A.5) and `/tmp/hb_mem_probe.c` →
+`/tmp/hb_mem_probe` (the standalone C allocator model — Appendix A.6). The build artifacts
 `kitty/fast_data_types.so` and `build/` are **git-ignored** (`.gitignore` entries `*.so` and `/build/`), so
-they are not repository changes. `git status --porcelain` was **empty** before and after, and `HEAD` remained
-pinned at `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. The only tracked file added by the task is this document
-under `blitzy/documentation/`.
+they are not repository changes, and `git status --porcelain` reports a **clean working tree**.
+
+To be precise about git state (rather than overstating it): the **kitty source baseline analysed** is commit
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, and every code locator in this document is valid at that revision.
+The **only** tracked change introduced after that baseline is the addition of this deliverable document under
+`blitzy/documentation/`; that documentation addition is what advances the branch, so the repository `HEAD` is
+the **documentation commit, not the source commit** — the source commit is the analysed *baseline*, not the
+current `HEAD`. No tracked kitty source, test, configuration, or reference-documentation file (anything under
+`kitty/`, `kitty_tests/`, `docs/`, `3rdparty/`, `setup.py`, or any dependency manifest) was created, modified,
+or deleted relative to the baseline.
 
 ---
 
@@ -395,42 +414,57 @@ under `blitzy/documentation/`.
 
 ```mermaid
 flowchart TD
-    Push["historybuf_push line<br/>history.c L276-L284"] --> Full{"count == ynum ?"}
+    Push["historybuf_push line<br/>kitty/history.c L276-L284"] --> Full{"count == ynum ?"}
     Full -->|"No (growing)"| Seg{"crossed a 2048<br/>line boundary?"}
-    Seg -->|Yes| Alloc["add_segment: calloc ~5 MiB<br/>history.c L17-L29 -> RSS STEP"]
+    Seg -->|Yes| Alloc["add_segment: calloc ~5 MiB<br/>kitty/history.c L17-L29 -> RSS STEP"]
     Seg -->|No| NoOp["write into existing segment<br/>no allocation"]
-    Full -->|"Yes (saturated)"| Ring["evict oldest -> pagerhist_push<br/>advance start_of_data -> RING<br/>history.c L280-L282 -> NO grid growth"]
+    Full -->|"Yes (saturated)"| Ring["evict oldest -> pagerhist_push<br/>advance start_of_data -> RING<br/>kitty/history.c L280-L282 -> NO grid growth"]
     Ring --> PH{"pager history<br/>capacity exceeded?"}
-    PH -->|Yes| Extend["pagerhist_extend >=1 MiB<br/>history.c L90 -> separate RSS growth"]
+    PH -->|Yes| Extend["pagerhist_extend >=1 MiB<br/>kitty/history.c L90 -> separate RSS growth"]
     PH -->|No| PHwrite["append text to ringbuf"]
 ```
 
 ### A.2 Standalone C cross-validation
 
 To confirm the measured RSS steps reflect the **C allocator** and not Python interpreter overhead, a standalone
-C model (`/tmp/hb_mem_probe.c`, outside the repo) replicates `add_segment()` (`kitty/history.c:L17-L29`) using
-the exact asserted struct sizes (`sizeof(GPUCell)==20`, `sizeof(CPUCell)==12`, `sizeof(LineAttrs)==1`). It
-`calloc`s `2048*(xnum*32+1)` bytes per segment, touches every page, and reads RSS from `/proc/self/statm`.
+C model (`/tmp/hb_mem_probe.c`, outside the repo; full source in Appendix A.6) `#include`s the real
+`kitty/data-types.h` and replicates `add_segment()` (`kitty/history.c:L17-L29`) using the **actual compiled**
+struct sizes — `sizeof(GPUCell)==20` and `sizeof(CPUCell)==12` are `static_assert`ed, while `sizeof(LineAttrs)`
+is read directly from the compiled header and is **4** (it is *not* asserted). It `calloc`s `2048*(xnum*32+4)`
+bytes per segment, touches every page, and reads RSS from `/proc/self/statm`.
 
 | Columns | per-segment (model = measured) | per-segment RSS step |
 |---|---|---|
-| 80  | **5,244,928 B = 5.002 MiB** (`2048*(80*32+1)`)  | ~5.00 MiB per segment |
-| 200 | **13,109,248 B = 12.502 MiB** (`2048*(200*32+1)`) | ~12.5 MiB per segment |
+| 80  | **5,251,072 B = 5.008 MiB** (`2048*(80*32+4)`)  | ~5.0 MiB per segment |
+| 200 | **13,115,392 B = 12.508 MiB** (`2048*(200*32+4)`) | ~12.5 MiB per segment |
 
-The C model reproduces **5.002 MiB @ 80 cols** and **12.502 MiB @ 200 cols** to the byte, matching both the
-derived formula and the Python-measured steps — confirming the staircase is the allocator.
+The C model computes **5,251,072 B (5.008 MiB) @ 80 cols** and **13,115,392 B (12.508 MiB) @ 200 cols** — exact
+to the byte — and its touched-page RSS step reproduces these (the 200-column step measures 12.508 MiB exactly),
+matching both the derived formula and the Python-measured steps — confirming the staircase is the allocator.
 
 ### A.3 Reproduction notes
 
-- Build (already done in this environment):
+Both harnesses are reproduced **in full** below (Appendix A.5 and A.6), so this document is self-contained:
+copy each listing to the indicated `/tmp` path and run the commands shown. Nothing is written inside the
+repository. (The `/tmp` scripts are ephemeral working files; if they are not present, recreate them from the
+listings below.)
+
+- **Build** (already done in this environment): from the repository root,
   `CI=true CFLAGS="-Wno-error" python3 setup.py build --ignore-compiler-warnings` produces the git-ignored
   `kitty/fast_data_types.so`.
-- Drive headlessly with the repository root on `PYTHONPATH`:
-  `PYTHONPATH=. python3 /tmp/hb_real.py`.
-- Expected results (reproduced this session): large `HistoryBuf(100000,80,0)` → ~5 MiB steps at each 2048
-  boundary; +30k beyond the cap → ~0 growth; default `HistoryBuf(2000,80,0)` + 500k lines → ≈ 4.887 MiB total;
-  `HistoryBuf(2000,80,8 MiB)` + 200k lines → `pagerhist_as_text()` length = 8,388,608 chars.
-- All scripts must remain in `/tmp`; the source repository stays byte-for-byte unchanged.
+- **Drive the real `HistoryBuf`** — save the Appendix A.5 listing to `/tmp/hb_real.py`, then run it from the
+  repository root with the root on `PYTHONPATH`: `PYTHONPATH=. python3 /tmp/hb_real.py` (or one scenario at a
+  time: `PYTHONPATH=. python3 /tmp/hb_real.py growth|default|pager`). Each scenario runs in a fresh subprocess
+  so RSS deltas are not contaminated by a prior scenario's freed-but-still-resident memory.
+- **C cross-validation** — save the Appendix A.6 listing to `/tmp/hb_mem_probe.c`, then build and run it
+  (the `-I` flags supply the real kitty headers and the system Python headers):
+  `gcc -I kitty -I "$(python3 -c 'import sysconfig;print(sysconfig.get_path("include"))')" /tmp/hb_mem_probe.c -o /tmp/hb_mem_probe && /tmp/hb_mem_probe`.
+- **Expected results** (reproduced this session; Python 3.13.7, page size 4096 B): `sizeof(LineAttrs)==4`;
+  large `HistoryBuf(100000,80,0)` → ~5 MiB steps at each 2048 boundary (first, cleanest step **+5.008 MiB**);
+  +30k beyond the cap → ~0 growth; default `HistoryBuf(2000,80,0)` + 500k lines → **≈ 4.891 MiB** total with
+  `count` capped at 2000; `HistoryBuf(2000,80,8 MiB)` + 200k lines → `pagerhist_as_text()` length
+  **≈ 8,362,586** chars (just under the 8,388,608-byte cap, varies a few KiB run-to-run).
+- All scripts remain in `/tmp`; the kitty source tree stays byte-for-byte unchanged.
 
 ### A.4 Code locator index (all at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`)
 
@@ -442,7 +476,7 @@ derived formula and the Python-measured steps — confirming the staircase is th
 | Pager init / alloc / extend | `kitty/history.c:L67`, `:L70-L80`, `:L90-L101` (newsz `:L93`) |
 | `create_historybuf` / arg parse | `kitty/history.c:L117-L133` (`add_segment` `:L127`, `alloc_pagerhist` `:L130`); parse `:L138` |
 | Push / eviction / saturation | `kitty/history.c:L276-L284` (branch `:L279-L282`) |
-| Cell/attr sizes | `kitty/data-types.h:L221` (GPUCell=20), `:L228` (CPUCell=12), `:L231-L239` (LineAttrs=1) |
+| Cell/attr sizes | `kitty/data-types.h:L221` (GPUCell=20, asserted), `:L228` (CPUCell=12, asserted), `:L230` (`PromptKind` enum), `:L231-L239` (LineAttrs=**4** — enum-bitfield ⇒ 4-byte storage unit, not `static_assert`ed) |
 | Struct layouts | `kitty/data-types.h:L262-L266` (segment), `:L268-L272` (pager), `:L282-L290` (HistoryBuf) |
 | Ringbuf header (ROOT) | `3rdparty/ringbuf/ringbuf.h` (e.g. `ringbuf_new` `:L41`); included at `kitty/history.c:L12` |
 | `ynum = MAX(scrollback, lines)` | `kitty/screen.c:L130` |
@@ -454,6 +488,166 @@ derived formula and the Python-measured steps — confirming the staircase is th
 | `set_text` / line ops | `kitty/line.c:L485-L486`; `kitty/line-buf.c:L171`; `kitty/lineops.h:L122`/`:L125` |
 | Build entry point | `setup.py` |
 | Terminology | `docs/overview.rst:L248`/`:L250`; `docs/glossary.rst:L33`; `docs/unscroll.rst:L10` |
+
+### A.5 Measurement harness — `/tmp/hb_real.py` (full source)
+
+Save this listing to `/tmp/hb_real.py` and run it as described in A.3. It drives the **real** compiled
+`HistoryBuf` and samples RSS from `/proc/self/statm`; each scenario runs in its own subprocess for clean,
+isolated RSS deltas.
+
+```python
+#!/usr/bin/env python3
+"""
+Drive the REAL compiled kitty HistoryBuf and sample process RSS from
+/proc/self/statm to characterise scrollback memory growth.
+
+Run from the kitty repository root with the built extension available:
+    PYTHONPATH=. python3 /tmp/hb_real.py            # runs every scenario, each in a fresh subprocess
+    PYTHONPATH=. python3 /tmp/hb_real.py growth     # large-scrollback growth staircase + saturation
+    PYTHONPATH=. python3 /tmp/hb_real.py default     # default scrollback_lines=2000, 500k lines
+    PYTHONPATH=. python3 /tmp/hb_real.py pager       # pager-history second growth axis
+Requires kitty/fast_data_types.so (built via setup.py). Each scenario is run in a
+*separate* process so resident-set-size deltas are not contaminated by a prior
+scenario's freed-but-still-resident allocations.
+"""
+import os, sys, subprocess
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+def rss_bytes():
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * PAGE
+
+def mib(b):
+    return b / (1024.0 * 1024.0)
+
+def make_line(xnum):
+    from kitty.fast_data_types import LineBuf, Cursor
+    lb = LineBuf(1, xnum)
+    line = lb.line(0)
+    line.set_text("x" * xnum, 0, xnum, Cursor())
+    return line
+
+def scenario_growth(ynum=100000, xnum=80):
+    from kitty.fast_data_types import HistoryBuf
+    print(f"=== Scenario A: large scrollback HistoryBuf({ynum}, {xnum}, 0) ===")
+    hb = HistoryBuf(ynum, xnum, 0)
+    line = make_line(xnum)
+    base = rss_bytes()
+    marks = [2048, 4096, 6144, 8192, 10240, 50000, 99999, 100000]
+    pushed = 0
+    prev = 0.0
+    for target in marks:
+        while pushed < target:
+            hb.push(line); pushed += 1
+        delta = mib(rss_bytes() - base)
+        step = delta - prev
+        print(f"  pushed={pushed:>7} RSS_delta={delta:8.3f} MiB  step=+{step:6.3f}  count={hb.count}")
+        prev = delta
+    before = rss_bytes()
+    for _ in range(30000):
+        hb.push(line)
+    print(f"  +30000 beyond cap: RSS_delta={mib(rss_bytes()-before):+.3f} MiB  count={hb.count}")
+
+def scenario_default(ynum=2000, xnum=80, n=500000):
+    from kitty.fast_data_types import HistoryBuf
+    print(f"=== Scenario B: default HistoryBuf({ynum}, {xnum}, 0), push {n} ===")
+    hb = HistoryBuf(ynum, xnum, 0)
+    line = make_line(xnum)
+    base = rss_bytes()
+    for _ in range(n):
+        hb.push(line)
+    print(f"  pushed={n} total_RSS_growth={mib(rss_bytes()-base):.3f} MiB  count={hb.count}")
+
+def scenario_pager(ynum=2000, xnum=80, pager_mib=8, n=200000):
+    from kitty.fast_data_types import HistoryBuf
+    sz = pager_mib * 1024 * 1024
+    print(f"=== Scenario C: pager HistoryBuf({ynum}, {xnum}, {pager_mib}MiB), push {n} ===")
+    hb = HistoryBuf(ynum, xnum, sz)
+    line = make_line(xnum)
+    for _ in range(n):
+        hb.push(line)
+    txt = hb.pagerhist_as_text()
+    print(f"  pushed={n} grid_count={hb.count} pagerhist_as_text_len={len(txt)} (cap={sz})")
+
+SCN = {"growth": scenario_growth, "default": scenario_default, "pager": scenario_pager}
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in SCN:
+        print(f"Python {sys.version.split()[0]}  PAGE_SIZE={PAGE}")
+        SCN[sys.argv[1]]()
+    else:
+        # Run each scenario in a fresh subprocess for clean, isolated RSS deltas.
+        for name in ("growth", "default", "pager"):
+            subprocess.run([sys.executable, __file__, name],
+                           env={**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", ".")})
+```
+
+### A.6 Cross-validation harness — `/tmp/hb_mem_probe.c` (full source)
+
+Save this listing to `/tmp/hb_mem_probe.c` and build/run it as described in A.3. It `#include`s the **real**
+`kitty/data-types.h`, so the struct sizes are the actual compiled sizes (this is how `sizeof(LineAttrs)==4` is
+established — nothing is assumed), and it replicates `add_segment()`'s `calloc` shape.
+
+```c
+/*
+ * Standalone C cross-validation of kitty's scrollback per-segment allocation.
+ *
+ * It INCLUDES the real kitty/data-types.h so the struct sizes
+ * (GPUCell, CPUCell, LineAttrs) are the *actual compiled* sizes -- nothing is
+ * assumed. It then replicates add_segment() from kitty/history.c:
+ *     calloc(1, xnum*2048*sizeof(CPUCell) + xnum*2048*sizeof(GPUCell)
+ *               + 2048*sizeof(LineAttrs))
+ * touches every page, and reads RSS from /proc/self/statm to confirm the
+ * per-segment step reflects the C allocator (not Python overhead).
+ *
+ * Build from the kitty repo root:
+ *   gcc -I kitty -I "$(python3 -c 'import sysconfig;print(sysconfig.get_path("include"))')" \
+ *       /tmp/hb_mem_probe.c -o /tmp/hb_mem_probe
+ *   /tmp/hb_mem_probe
+ */
+#include "data-types.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SEGMENT_SIZE 2048
+
+static long rss_bytes(void) {
+    FILE *f = fopen("/proc/self/statm", "r");
+    long size = 0, resident = 0;
+    if (f) { if (fscanf(f, "%ld %ld", &size, &resident) != 2) resident = 0; fclose(f); }
+    return resident * sysconf(_SC_PAGESIZE);
+}
+
+static size_t per_segment_bytes(size_t xnum) {
+    size_t cpu = xnum * SEGMENT_SIZE * sizeof(CPUCell);
+    size_t gpu = xnum * SEGMENT_SIZE * sizeof(GPUCell);
+    return cpu + gpu + SEGMENT_SIZE * sizeof(LineAttrs);
+}
+
+static void probe(size_t xnum) {
+    size_t seg = per_segment_bytes(xnum);
+    long before = rss_bytes();
+    char *p = calloc(1, seg);              /* same shape as add_segment()'s calloc */
+    if (!p) { fprintf(stderr, "calloc failed\n"); exit(1); }
+    long page = sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < seg; i += (size_t)page) p[i] = 1;   /* touch every page */
+    long after = rss_bytes();
+    printf("xnum=%-3zu per-segment=%zu B = %.4f MiB | formula 2048*(xnum*32+%zu) | measured RSS step=%.4f MiB\n",
+           xnum, seg, seg / (1024.0 * 1024.0), sizeof(LineAttrs),
+           (after - before) / (1024.0 * 1024.0));
+    free(p);
+}
+
+int main(void) {
+    printf("sizeof(GPUCell)=%zu sizeof(CPUCell)=%zu sizeof(LineAttrs)=%zu (per-line = xnum*32 + %zu)\n",
+           sizeof(GPUCell), sizeof(CPUCell), sizeof(LineAttrs), sizeof(LineAttrs));
+    probe(80);
+    probe(200);
+    return 0;
+}
+```
 
 ---
 
