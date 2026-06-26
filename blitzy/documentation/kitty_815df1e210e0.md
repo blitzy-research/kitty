@@ -58,7 +58,7 @@ content while new output arrives.
 flowchart TD
     A["Child process output<br/>(enormous text, fast)"] --> B["VT parser<br/>kitty/vt-parser.c"]
     B --> C["Screen ops<br/>kitty/screen.c"]
-    C --> D["LineBuf — active screen<br/>O(1) scroll by rotating line_map<br/>kitty/line-buf.c"]
+    C --> D["LineBuf — active screen<br/>line_map shift, no cell-grid copy<br/>cost = O(scroll-region height)<br/>kitty/line-buf.c"]
     D -->|"line scrolls off the top<br/>INDEX_UP -> historybuf_add_line<br/>screen.c:L1552-1567"| E["HistoryBuf<br/>circular buffer of ynum lines<br/>across 2048-row segments<br/>history.c"]
     E -->|"count == ynum?<br/>evict oldest FIRST,<br/>THEN advance head<br/>history.c:L279-281"| F["PagerHistoryBuf<br/>ANSI / UTF-8 byte ring<br/>history.c + 3rdparty/ringbuf"]
     F -->|"capacity == maximum_size?<br/>can't extend -> overwrite oldest"| G["FIFO byte overwrite<br/>ringbuf_memcpy_into<br/>ringbuf.c:L212"]
@@ -128,8 +128,11 @@ out new segments when a command pours out enormous text in a short time?
 
 A line enters history when it scrolls off the top of the active screen. The
 `INDEX_UP(add_to_history)` macro in `kitty/screen.c:L1552-1567` does three things
-per scrolled‑off line: it rotates the active screen's `line_map` in O(1)
-(`linebuf_index`, `kitty/screen.c:L1553`), hands the displaced line to history
+per scrolled‑off line: it shifts the active screen's `line_map` and `line_attrs`
+entries — a cheap move that copies no cell‑grid data but costs O(scroll‑region
+height), **not** O(1), because `linebuf_index` loops over the scroll region
+shifting one map/attrs entry per row (`linebuf_index`, `kitty/line-buf.c:L316-327`,
+called at `kitty/screen.c:L1553`), hands the displaced line to history
 via `historybuf_add_line(self->historybuf, …)` (`kitty/screen.c:L1558`), and
 increments a per‑frame counter `history_line_added_count++`
 (`kitty/screen.c:L1559` — important for Q4).
@@ -226,16 +229,25 @@ after 2048 pushes -> count=2048
 after 2049 pushes -> count=2049
 after 3000 pushes -> count=3000
 count_final=3000 (expect 3000, capped at ynum)
-line(0)    most-recent = '2999' (expect '2999')
-line(2047) at seg0 top = '952'
-line(2048) into seg1   = '951'
-line(2999) oldest      = '0' (expect '0')
-all 3000 lines readable & correct (proves 2nd segment carved): True
+line(0   ) value='2999' -> physical row 2999 (segment 1)
+line(951 ) value='2048' -> physical row 2048 (segment 1)
+line(2047) value='952' -> physical row  952 (segment 0)
+line(2048) value='951' -> physical row  951 (segment 0)
+line(2999) value='0' -> physical row    0 (segment 0)
+all 3000 lines readable & correct (proves segment 1 was carved): True
 ```
 
-(`hb.line(i)` is **reverse‑indexed** — line `0` is the most recent, line
-`ynum-1` the oldest; `index_of`, `kitty/history.c:L152-159`. Hence
-`line(i) == str(2999 - i)`.)
+**Reading these samples — a line _number_ is not a physical _row_ number.**
+`hb.line(i)` is **reverse‑indexed**: line `0` is the most recent, line `ynum-1`
+the oldest (`index_of`, `kitty/history.c:L152-159`). With `start_of_data == 0`
+and a full buffer, the *physical* row backing `line(i)` is `ynum-1-i`, the value
+stored there is `str(ynum-1-i)`, and the segment that row lives in is
+`(ynum-1-i) / 2048`. Concretely, `line(2048)` reads physical row
+`3000-1-2048 = 951`, which is still in **segment 0**; the sample that actually
+lands in **segment 1** is `line(951)`, which reads physical row `2048` — the
+first row of the second segment. So `line(951) == '2048'` is the explicit
+segment‑1 read, while `line(2048) == '951'` is a segment‑0 read despite its
+larger line number.
 
 ### 1.5 Rationale (why)
 
@@ -462,7 +474,7 @@ dropped outright** — `pagerhist_write_bytes` returns `false` immediately if
 | `push` (steady state) | **O(1)** | — | — |
 | Carve a segment (`calloc`) | one alloc of `xnum·2048` cells + attrs | first time a row crosses a 2048 boundary, while below `ynum` | at most `ceil(ynum / 2048)` segments, ever |
 | Pager ring growth (`memcpy`) | O(current ring bytes) | when free space is insufficient **and** capacity `< maximum_size` | grows in **≥1 MiB** steps, up to `maximum_size` |
-| Pager at ceiling (FIFO overwrite) | **O(1)** per write | every write once `capacity == maximum_size` | fixed at `maximum_size` |
+| Pager at ceiling (FIFO overwrite) | **O(bytes written)** — fixed capacity; no allocation, no copy of the retained ring | every write once `capacity == maximum_size` | fixed at `maximum_size` |
 | Oversized single write | **dropped** (no‑op) | when one write `> maximum_size` | — |
 
 ### 3.6 Runtime observation
@@ -492,7 +504,10 @@ Under a sustained flood, the system passes through an **initial growth ramp**
 (carving segments every 2048 lines, growing the ring in ≥1 MiB steps) and then
 reaches a **fixed‑memory steady state** in which *no allocation happens at all* —
 `HistoryBuf` overwrites physical rows circularly and the ring overwrites its
-oldest bytes FIFO, both O(1). Counter‑intuitively, this means a long flood is
+oldest bytes FIFO — neither path allocates or copies data it is *keeping* (a
+pager write still costs O(bytes written) to copy the *incoming* bytes via
+`ringbuf_memcpy_into`, `3rdparty/ringbuf/ringbuf.c:L211-238`, but nothing already
+retained is moved). Counter‑intuitively, this means a long flood is
 *smoother* deep into the stream than at the very beginning, because all the
 one‑time allocation costs are behind it. The only "hesitations" are (a) the
 periodic, amortized segment `calloc` (which the default 2000‑line scrollback
@@ -616,13 +631,23 @@ The pager ring allocates similarly: it starts at `MIN(1 MiB, pagerhist_sz)`
 
 ### 5.2 Wrapping — continuation flags and rewrap‑on‑resize
 
-Line continuation (soft wrapping) is not stored as separate lines; it is carried
-in `LineAttrs`. The last cell of a wrapped line has `next_char_was_wrapped`
-set, and the following line is marked `is_continued` — `linebuf_init_line`
-derives `is_continued` from the previous line's `next_char_was_wrapped`
-(`kitty/line-buf.c:L141`, computed at `L145`). This is the same flag the pager
-serialization consults to decide whether to emit `\n` (Q2,
-`kitty/history.c:L270`).
+Line continuation (soft wrapping) is not stored as separate lines; it is tracked
+by **two distinct pieces of metadata that live in two different structures**.
+The wrap itself is recorded on the *cell*: `next_char_was_wrapped` is a one‑bit
+field of the union `CellAttrs` (`kitty/data-types.h:L196-209`, the bit at
+`L206`), and `CellAttrs` is embedded in every `GPUCell` as its `attrs` member
+(`kitty/data-types.h:L216-220`, `attrs` at `L219`). So the flag set on the
+**last cell** of a soft‑wrapped row is `GPUCell.attrs.next_char_was_wrapped` — it
+is *not* a field of `LineAttrs`. The *following* row is instead marked as a
+continuation by a **separate** bit, `is_continued`, which belongs to the union
+`LineAttrs` (`kitty/data-types.h:L231-239`, the bit at `L233`); `LineAttrs`
+carries `is_continued`, `has_dirty_text`, `has_image_placeholders`, and
+`prompt_kind`, but never `next_char_was_wrapped`. The link between the two is
+`linebuf_init_line`, which derives a row's `LineAttrs.is_continued` from the
+*previous* row's last cell's `GPUCell.attrs.next_char_was_wrapped`
+(`kitty/line-buf.c:L141-145`, computed at `L145`). It is this same per‑cell
+`next_char_was_wrapped` flag that the pager serialization consults to decide
+whether to emit a trailing `\n` (Q2, `kitty/history.c:L270`).
 
 When the window is resized, history must be **reflowed** to the new column count.
 `historybuf_rewrap` (`kitty/history.c:L594-614`) handles this:
@@ -697,7 +722,10 @@ Tracing a flood from empty to saturated:
 
 After step 5, **peak memory is bounded and flat**: roughly `ynum` lines of cell
 grid plus `maximum_size` bytes of serialized text. Both tiers then recycle in
-place with O(1) operations. The "evolution" of the structures under sustained
+place with no further allocation — physical rows are reused circularly and the
+pager ring overwrites its oldest bytes FIFO (each write copying only its own
+incoming bytes, never anything already retained). The "evolution" of the
+structures under sustained
 pressure is therefore a finite ramp followed by a steady state — they grow to
 their configured limits and then stop, trading the *oldest* data for the
 *newest* rather than consuming ever more memory.
@@ -762,6 +790,7 @@ from kitty_tests import filled_line_buf, filled_cursor
 
 YNUM = 3000          # > 2048 => requires a 2nd 2048-row segment
 XNUM = 5
+SEGMENT_SIZE = 2048  # kitty/history.c:L15
 hb = HistoryBuf(YNUM, XNUM)
 print("ynum=%d xnum=%d count_initial=%d" % (hb.ynum, hb.xnum, hb.count))
 
@@ -781,13 +810,20 @@ for n in sorted(checkpoints):
     print("after %4d pushes -> count=%d" % (n, checkpoints[n]))
 
 print("count_final=%d (expect %d, capped at ynum)" % (hb.count, YNUM))
-print("line(0)    most-recent = %r (expect '2999')" % str(hb.line(0)).rstrip())
-print("line(2047) at seg0 top = %r" % str(hb.line(2047)).rstrip())
-print("line(2048) into seg1   = %r" % str(hb.line(2048)).rstrip())
-print("line(2999) oldest      = %r (expect '0')" % str(hb.line(2999)).rstrip())
+
+# hb.line(i) is REVERSE-indexed (index_of, kitty/history.c:L152-159): line 0 is the
+# most recent, line ynum-1 the oldest. With start_of_data==0 and a full buffer the
+# PHYSICAL row backing line(i) is (YNUM-1-i), and that row lives in segment
+# (YNUM-1-i)//SEGMENT_SIZE. So the line NUMBER is not the physical row number.
+def phys_row(i):
+    return YNUM - 1 - i
+for i in (0, 951, 2047, 2048, 2999):
+    pr = phys_row(i)
+    print("line(%-4d) value=%r -> physical row %4d (segment %d)" % (
+        i, str(hb.line(i)).rstrip(), pr, pr // SEGMENT_SIZE))
 
 ok = all(str(hb.line(i)).rstrip() == str(YNUM - 1 - i) for i in range(YNUM))
-print("all %d lines readable & correct (proves 2nd segment carved): %s" % (YNUM, ok))
+print("all %d lines readable & correct (proves segment 1 was carved): %s" % (YNUM, ok))
 ```
 
 Captured output:
@@ -800,11 +836,12 @@ after 2048 pushes -> count=2048
 after 2049 pushes -> count=2049
 after 3000 pushes -> count=3000
 count_final=3000 (expect 3000, capped at ynum)
-line(0)    most-recent = '2999' (expect '2999')
-line(2047) at seg0 top = '952'
-line(2048) into seg1   = '951'
-line(2999) oldest      = '0' (expect '0')
-all 3000 lines readable & correct (proves 2nd segment carved): True
+line(0   ) value='2999' -> physical row 2999 (segment 1)
+line(951 ) value='2048' -> physical row 2048 (segment 1)
+line(2047) value='952' -> physical row  952 (segment 0)
+line(2048) value='951' -> physical row  951 (segment 0)
+line(2999) value='0' -> physical row    0 (segment 0)
+all 3000 lines readable & correct (proves segment 1 was carved): True
 ```
 
 ### Observation 2 — eviction → pager handoff + ANSI serialization
@@ -1017,13 +1054,15 @@ Primary source locations cited above, at HEAD `815df1e210e0`:
 | `alloc_historybuf` | `kitty/history.c:L577-579` |
 | `historybuf_rewrap` — fast‑path triple `memcpy` | `kitty/history.c:L594-614` (`L597`,`L600-604`) |
 | Struct layouts (`HistoryBufSegment`/`PagerHistoryBuf`/`HistoryBuf`) | `kitty/data-types.h:L262-290` |
+| `CellAttrs.next_char_was_wrapped` (per-cell, inside `GPUCell.attrs`) | `kitty/data-types.h:L196-209` (bit `L206`); `GPUCell` `L216-220` |
+| `LineAttrs.is_continued` (per-line) | `kitty/data-types.h:L231-239` (bit `L233`) |
 | `history_line_added_count` — init / inc / reset | `kitty/screen.c:L122` / `L1559` / `L2600` |
 | `INDEX_UP(add_to_history)` macro | `kitty/screen.c:L1552-1567` |
 | Scroll‑while‑writing anchor (twice) | `kitty/screen.c:L2716`, `L2761` |
 | `alloc_historybuf` wiring of both limits | `kitty/screen.c:L130` |
 | Interactive scroll clamp | `kitty/screen.c:L4111` |
-| `linebuf_index` — O(1) `line_map` rotate | `kitty/line-buf.c:L317-325` |
-| `linebuf_init_line` — `is_continued` from prev wrap flag | `kitty/line-buf.c:L141` |
+| `linebuf_index` — `line_map`/`line_attrs` shift (cost O(scroll-region height), no cell-grid copy) | `kitty/line-buf.c:L316-327` |
+| `linebuf_init_line` — derives `LineAttrs.is_continued` from prev cell's `GPUCell.attrs.next_char_was_wrapped` | `kitty/line-buf.c:L141-145` |
 | Ring header "FIFO implementation" / `ringbuf_memcpy_into` | `3rdparty/ringbuf/ringbuf.c:L2` / `L212` |
 | Ring FIFO‑overwrite contract | `3rdparty/ringbuf/ringbuf.h:L148` |
 | Capacity vs. buffer‑size (+1 reserved byte) | `3rdparty/ringbuf/ringbuf.h:L44-49` |
