@@ -1,7 +1,7 @@
 # How Kitty Moves Keyboard Input Through Its Core Components
 
 **Subject:** the [kitty](https://github.com/kovidgoyal/kitty) terminal emulator by Kovid Goyal
-**Pinned commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (git‑confirmed `HEAD`, *"Wire up applying of font config"*)
+**Pinned source commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (*"Wire up applying of font config"*) — the revision every `file:line` reference below is anchored to. It is an ancestor of the delivery branch's current `HEAD`, which adds only this one documentation file on top of it (the diff against the pinned commit is the single addition `A blitzy/documentation/kitty_815df1e210e0.md`), so all Kitty source files are unchanged from the pinned commit.
 **Method:** runtime‑grounded — the conclusions below are derived from behaviour that **consistently appears** while a freshly built Kitty is running under its `--debug-input` trace. Source code is consulted only to *interpret and confirm* what was observed; every claim is anchored to a `file:line` at the commit above.
 
 ---
@@ -203,17 +203,17 @@ Because writing/reading the PTY happen on a separate thread from parsing/renderi
 flowchart TD
     K[Key press in default shell window] --> G["GLFW backend / key_callback()<br/>kitty/glfw.c:430 → on_key_input ev :439"]
     G --> OKI["on_key_input()<br/>kitty/keys.c:166<br/>emits first debug trace :176"]
-    OKI --> SC{"Shortcut?<br/>boss.py:1408 dispatch_possible_special_key<br/>keys.c:231 'handled as shortcut'"}
+    OKI --> SC{"Shortcut?<br/>kitty/boss.py:1408 dispatch_possible_special_key<br/>kitty/keys.c:231 'handled as shortcut'"}
     SC -- "Yes: handled as shortcut" --> NOOUT[No bytes sent to child]
     SC -- "No" --> ENC["encode_glfw_key_event()<br/>kitty/keys.c:251 (legacy vs CSI-u)"]
-    ENC --> SCHED["schedule_write_to_child()<br/>keys.c:253/259 → child-monitor.c:372<br/>trace: 'sent key as text / encoded key to child'"]
-    SCHED --> WTC["write_to_child() — I/O thread<br/>child-monitor.c:1443 (POLLOUT :1540)"]
+    ENC --> SCHED["schedule_write_to_child()<br/>kitty/keys.c:253/259 → kitty/child-monitor.c:372<br/>trace: 'sent key as text / encoded key to child'"]
+    SCHED --> WTC["write_to_child() — I/O thread<br/>kitty/child-monitor.c:1443 (POLLOUT :1540)"]
     WTC --> CHILD[Child shell processes bytes, emits output]
-    CHILD --> RB["read_bytes() — I/O thread io_loop<br/>child-monitor.c:1481 → 1337 (POLLIN :1531)"]
-    RB --> PARSE["parse_input → do_parse → parse_worker — main thread<br/>child-monitor.c:1236/451/438/181"]
+    CHILD --> RB["read_bytes() — I/O thread io_loop<br/>kitty/child-monitor.c:1481 → 1337 (POLLIN :1531)"]
+    RB --> PARSE["parse_input → do_parse → parse_worker — main thread<br/>kitty/child-monitor.c:1236/451/438/181"]
     PARSE --> VT["VT state machine<br/>kitty/vt-parser.c:236 screen_draw_text (consume_normal)"]
     VT --> SCREEN["Screen model update (grid/cursor)<br/>kitty/screen.c + line/history/cursor"]
-    SCREEN --> RENDER["render() — main thread, repaint_delay-gated<br/>child-monitor.c:1237 → 871 (:874-876)"]
+    SCREEN --> RENDER["render() — main thread, repaint_delay-gated<br/>kitty/child-monitor.c:1237 → 871 (:874-876)"]
     RENDER --> SHADERS["GPU draw: draw_cells_* glDrawArraysInstanced<br/>kitty/shaders.c:577/579/868"]
     SHADERS --> DISPLAY[Buffer swap → display updates]
 %% Observed via --debug-input / --debug-rendering / --dump-bytes; trace sink kitty/logging.c:56/61
@@ -234,7 +234,7 @@ flowchart TD
 
 ## Notes on method and fidelity
 
-* All line references are anchored to commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. The commit hash is git‑confirmed; the repository's root readme is `README.asciidoc`.
+* All line references are anchored to the pinned source commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, which exists in the repository history as an ancestor of the current branch `HEAD`; the repository's root readme is `README.asciidoc`.
 * Conclusions rest on behaviour that **recurred identically across repeated key presses**; code was used to interpret and confirm those observations, not to substitute for them.
 * The investigation used only temporary artifacts outside the repository (a launch/capture helper, a STDERR trace log, a `--dump-bytes` file), all removed afterward. No source file in the repository was modified, and this Markdown document is the only file added.
 
