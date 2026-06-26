@@ -315,13 +315,23 @@ window via `kitten @ send-text $'yes hello\r'`, traced for ~1 second with the sa
   mean ~827, min 2, max 19,346; **8,182 of 9,769 streaming reads returned < 1 KB**. This is far
   below the ~0.87–1 MiB *requested*.
 - **Observation method:** the distribution of `read(10, ...)` return values in `trace_yes.log`.
-- **Code citation / rationale (the crucial distinction):** the *request* size is kitty's 1 MiB cap
-  (`BUF_SZ`, `kitty/vt-parser.c:18`, via `kitty/vt-parser.c:1457` → `kitty/child-monitor.c:1345`),
-  but the *returned* size is bounded by the **kernel tty/line‑discipline buffer**, not by kitty.
-  The Linux `N_TTY` line discipline buffers on the order of a few KB (`N_TTY_BUF_SIZE = 4096`; see
-  External corroboration), so each `read()` drains at most roughly that much and returns
-  immediately, which is why per‑read counts cluster well under 1 KB even though kitty offered ~1
-  MiB. The throughput is achieved by reading *often* (Q3b), not by reading *huge* chunks.
+- **Code citation / rationale (the crucial distinction):** kitty always *requests* up to its own 1
+  MiB cap. `read_bytes()` (`kitty/child-monitor.c:1337`) reads into the buffer returned by
+  `vt_parser_create_write_buffer()`, whose size is `*sz = BUF_SZ - self->write.offset`
+  (`kitty/vt-parser.c:1457`) with `BUF_SZ = 1 MiB` (`kitty/vt-parser.c:18`), and passes that size
+  straight to `read(fd, buf, available_buffer_space)` (`kitty/child-monitor.c:1345`). The number of
+  bytes that actually *come back*, however, is not chosen by kitty: a `read()` on the PTY master
+  returns whatever the kernel tty/PTY stack happens to have buffered at that instant. Because kitty
+  drains the master very frequently (Q3b), little tends to accumulate between successive reads, so
+  in this run the returns *clustered* in the hundreds-of-bytes-to-few-KB range (median 667; 8,182 of
+  9,769 reads < 1 KB). That clustering is a *typical distribution*, not a hard limit: when more had
+  accumulated between reads, a single `read()` returned as much as 19,346 bytes (~19 KB). The Linux
+  `N_TTY` line discipline keeps its *canonical read buffer* small (`N_TTY_BUF_SIZE = 4096`; see
+  External corroboration), which helps explain why the *typical* per-read amounts are small, but
+  4096 is the line-discipline read-buffer size, not a ceiling on a PTY-master `read()`: total
+  PTY/driver buffering is delivered in tty buffer chunks, so a single read can exceed it (as the
+  19,346-byte read shows). The throughput is therefore achieved by reading *often* (Q3b), not by
+  reading *huge* chunks.
 
 ### Q3(d) — The integer file descriptor kitty uses for the PTY master
 
@@ -454,10 +464,15 @@ corroboration**, never as a substitute for the code.
   with the terminal emulator holding the master and the shell's controlling terminal being the
   slave. This corroborates Q1(d): kitty held the master (`fd 10 -> /dev/pts/ptmx`) while the shell
   used `/dev/pts/0`.
-- **Line-discipline buffering (~4 KB).** The Linux `N_TTY` line discipline buffers input in a
-  kernel buffer on the order of a few KB (`N_TTY_BUF_SIZE` is 4096). This corroborates Q3(c): each
-  `read()` returns at most roughly a few KB (observed median 667 bytes) regardless of kitty's ~1
-  MiB request cap, because the bound is the kernel tty buffer, not kitty's buffer.
+- **Line-discipline buffering (small, ~4 KB canonical buffer).** The Linux `N_TTY` line discipline
+  keeps its canonical read buffer small (`N_TTY_BUF_SIZE` is 4096). This corroborates Q3(c) only in
+  the limited sense that line-discipline buffering is *small*, which is why the per-`read()` returns
+  *typically* stayed in the hundreds-of-bytes-to-few-KB range (observed median 667 bytes) rather
+  than approaching kitty's ~1 MiB request cap. It is not a hard upper bound on what a single
+  PTY-master `read()` can return: total PTY/driver buffering is delivered in tty buffer chunks and
+  can exceed 4 KB; in this run a single `read()` returned as much as 19,346 bytes. The number of
+  bytes returned is governed by what the kernel tty/PTY stack has buffered at read time, not by
+  kitty's buffer.
 
 ---
 
@@ -479,8 +494,9 @@ every **3 ms** (`input_delay`, `kitty/options/definition.py:878`), in **`consume
 (`kitty/vt-parser.c:1367`), whose `switch (self->vte_state)` separates `VTE_NORMAL` printable text
 from `VTE_ESC/CSI/OSC/DCS/APC/PM/SOS` escape and control sequences (`kitty/vt-parser.c:1375-1393`).
 
-For a low-volume command (**`echo test123`**) kitty issued a single small `read()` returning tens
-to low-hundreds of bytes; for a high-volume stream (**`yes hello`**) it entered a tight
+For a low-volume command (**`echo test123`**) kitty issued a few small `read()` calls (four in
+this run, returning 23/47/114/194 bytes, tens to low-hundreds of bytes each); for a high-volume
+stream (**`yes hello`**) it entered a tight
 `poll()`/`read()` loop reading ~9,000+ times per second with per-read counts in the hundreds of
 bytes (kernel-tty-bounded), while the 1 MiB buffer plus the `vt_parser_has_space_for_input` gate
 (`kitty/child-monitor.c:1501`) provided back-pressure — visible here as the shrinking `read()`
