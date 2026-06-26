@@ -46,13 +46,13 @@ The analysis walks the concrete **create → run → resize → close** sequence
 
 kitty is built from three languages that divide labor by performance and ergonomics:
 
-- **Python** — orchestration, configuration, and high-level lifecycle policy (the `Boss` singleton, `Window`, `Tab`, `WindowList`, the `Child` wrapper).
-- **C11** — the performance hot paths: the terminal `Screen` model (`kitty/screen.c`), GLFW/windowing glue (`kitty/glfw.c`), and the **child monitor** (`kitty/child-monitor.c`) that owns PTY I/O, child-process bookkeeping, and rendering ticks.
-- **Go** — CLI tooling (`kitten`s and remote control), which is not on the window resize/lifecycle hot path and is therefore out of scope for this analysis.
+- **Python** (`requires-python = ">=3.8"` `[pyproject.toml:L2]`) — orchestration, configuration, and high-level lifecycle policy (the `Boss` singleton, `Window`, `Tab`, `WindowList`, the `Child` wrapper).
+- **C11** (compiled with `-std=c11` `[setup.py:L492]`) — the performance hot paths: the terminal `Screen` model (`kitty/screen.c`), GLFW/windowing glue (`kitty/glfw.c`), and the **child monitor** (`kitty/child-monitor.c`) that owns PTY I/O, child-process bookkeeping, and rendering ticks.
+- **Go** (`go 1.22` `[go.mod:L3]`) — CLI tooling (`kitten`s and remote control), which is not on the window resize/lifecycle hot path and is therefore out of scope for this analysis.
 
 The lifecycle logic relevant to this document lives almost entirely in the Python orchestration layer and the C child monitor. The child monitor runs a **three-thread architecture**:
 
-- **Main thread** — GLFW event handling and rendering. It runs `Window.set_geometry`, the C `process_pending_resizes`, the C `parse_input` (which performs final parses and fires `death_notify`), and `report_reaped_pids`. This is the only thread that calls back into Python.
+- **Main thread** — GLFW event handling and rendering. It runs `Window.set_geometry` `[kitty/window.py:L850]`, the C `process_pending_resizes` `[kitty/child-monitor.c:L1042]`, the C `parse_input` `[kitty/child-monitor.c:L450-L451]` (which performs final parses and fires `death_notify` `[kitty/child-monitor.c:L522]`), and `report_reaped_pids` `[kitty/child-monitor.c:L949-L958]`. This is the only thread that calls back into Python (the death-notify, reaped-pid, and resize entry points above are the Python-facing calls).
 - **I/O thread** — the function `io_loop` `[kitty/child-monitor.c:L1481]`, created via `pthread_create(..., io_loop, ...)` `[kitty/child-monitor.c:L291]` and named `"KittyChildMon"` `[kitty/child-monitor.c:L1489]`. It polls PTY/signal/wakeup file descriptors, reads child output, reaps `SIGCHLD`, and promotes/removes children.
 - **Talk thread** — peer/remote-control message handling, created via `pthread_create(..., talk_loop, ...)` `[kitty/child-monitor.c:L256,L286]`. Not on the resize path.
 
@@ -69,7 +69,7 @@ self.last_resized_at = 0.                          # [kitty/window.py:L562]
 self.created_at = time_ns()                        # [kitty/window.py:L564]
 self.child_is_launched = False                     # [kitty/window.py:L578]
 self.last_reported_pty_size = (-1, -1, -1, -1)     # [kitty/window.py:L579]
-self.id = add_window(tab.os_window_id, tab.id, self.title)  # [kitty/window.py:L587]
+self.id: int = add_window(tab.os_window_id, tab.id, self.title)  # [kitty/window.py:L587]
 self.destroyed = False                             # [kitty/window.py:L597]
 ```
 
@@ -91,14 +91,14 @@ Because it is a `WeakValueDictionary` `[kitty/boss.py:L344]`, a `Window` that is
 self.id_map: Dict[int, WindowType] = {}              # [kitty/window_list.py:L148]
 ```
 
-This strong reference is what actually keeps `Window` objects alive while they belong to a tab; the weak Boss map and this strong per-tab map together form a two-tier ownership model.
+The assignment `self.id_map[window.id] = window` `[kitty/window_list.py:L339]` is a strong-valued dictionary entry, so it is what actually keeps `Window` objects alive while they belong to a tab; the weak Boss map `[kitty/boss.py:L344]` and this strong per-tab map together form a two-tier ownership model. (The execution order — this per-tab insertion happens *after* the Boss/C registration, during layout — is detailed in [R1](#2-r1--windows-appear-registration).)
 
 **(d) C `children[]` + `add_queue[]` — the three-thread engine arrays.** The child monitor stores child-process bookkeeping in fixed-size arrays:
 
 ```c
-static Child children[MAX_CHILDREN];   // live, polled children   [kitty/child-monitor.c:L82]
-static Child scratch[MAX_CHILDREN];    //                          [kitty/child-monitor.c:L83]
-static Child add_queue[MAX_CHILDREN], remove_queue[MAX_CHILDREN]; static unsigned long remove_notify[MAX_CHILDREN];  // [kitty/child-monitor.c:L84]
+static Child children[MAX_CHILDREN] = {{0}};   // live, polled children                       [kitty/child-monitor.c:L82]
+static Child scratch[MAX_CHILDREN] = {{0}};    // snapshot of children[] for lock-free parsing  [kitty/child-monitor.c:L83]
+static Child add_queue[MAX_CHILDREN] = {{0}}, remove_queue[MAX_CHILDREN] = {{0}}, remove_notify[MAX_CHILDREN] = {{0}};  // [kitty/child-monitor.c:L84]
 ```
 
 Each `Child` struct carries exactly the fields needed to key off the window id and to manage the PTY and screen:
@@ -131,8 +131,9 @@ The diagram below summarizes the create → run → resize → close path that t
 
 ```mermaid
 flowchart TD
-    A["Window appears: Window.__init__ id=add_window()<br/>boss.add_child -> child_monitor.add_child"] --> B["C: child enqueued in add_queue<br/>(INCREF screen, under children_mutex)"]
-    B --> C["I/O thread promotes add_queue -> children[]<br/>registers pollfd (POLLIN)"]
+    A["Window appears (Tab.new_window): Child.fork (PTY) -> Window.__init__ id=add_window()<br/>then boss.add_child -> child_monitor.add_child  (BEFORE layout, per tabs.py L534)"] --> B["C: child enqueued in add_queue<br/>(INCREF screen, under children_mutex)"]
+    B --> B2["_add_window -> layout.add_window -> WindowList.add_window<br/>strong per-tab id_map[id]=window (layout may resize)"]
+    B2 --> C["I/O thread promotes add_queue -> children[]<br/>registers pollfd (POLLIN)"]
     C --> D["Resize: Window.set_geometry()<br/>guard: if self.destroyed: return"]
     D --> E["screen.resize + on_resize watcher<br/>dedup vs last_reported_pty_size"]
     E --> F["resize_pty(id, rows, cols, w, h)<br/>FIND fd in children then add_queue"]
@@ -146,7 +147,7 @@ flowchart TD
     M --> N["boss.on_child_death: window_id_map.pop(id, None)<br/>tab.remove_window, window.destroy()"]
 ```
 
-The key structural observation — which the next six sections elaborate — is that registration is a **two-step enqueue → promote**, removal is **deferred and flagged**, and every cross-layer lookup is **tolerant of absence**. Together these let the Main thread, the I/O thread, and the Python object graph hold momentarily inconsistent views of "what is alive" and reconcile them lazily, without any lock spanning the Python↔C boundary.
+The key structural observation — which the next six sections elaborate — is that registration runs **fork → register-in-C → layout** (with the Boss/C registration deliberately *before* layout), and the C boundary itself uses a **two-step enqueue → promote**; removal is **deferred and flagged**; and every cross-layer lookup is **tolerant of absence**. Together these let the Main thread, the I/O thread, and the Python object graph hold momentarily inconsistent views of "what is alive" and reconcile them lazily, without any lock spanning the Python↔C boundary.
 
 ---
 
@@ -154,58 +155,63 @@ The key structural observation — which the next six sections elaborate — is 
 
 > *Scenario step: "When a new window is created and immediately used to run a command..."*
 
-### 2.1 Mechanism: the two-step enqueue → promote registration
+### 2.1 Mechanism: `Tab.new_window`'s registration order (fork → register → layout → promote)
 
-When the user opens a new window, registration ripples through all four registries in a deliberate order. Tracing the path:
+The orchestration lives in `Tab.new_window` `[kitty/tabs.py:L504]`, and its **order is load-bearing**. Reading the method body top to bottom `[kitty/tabs.py:L524-L536]`, registration ripples through the four registries as follows.
 
-**Step 1 — Python `Window` gets its id.** `Window.__init__` calls `add_window(...)` to obtain the integer id that every other layer will key off `[kitty/window.py:L587]`. A new window is created through `Tab.new_window` `[kitty/tabs.py:L504]`.
-
-**Step 2 — the per-tab strong registry records it.** `WindowList.add_window` appends to the ordered list and then inserts into the strong id map:
-
-```python
-self.all_windows.append(window)        # [kitty/window_list.py:L338]
-self.id_map[window.id] = window        # [kitty/window_list.py:L339]
-```
-
-(method `WindowList.add_window` begins at `[kitty/window_list.py:L329]`). This strong reference `[kitty/window_list.py:L339]` is what keeps the `Window` alive once it belongs to a tab.
-
-**Step 3 — the child PTY is forked.** In the `Child` wrapper, `fast_data_types.spawn(...)` returns the child pid, and the wrapper records the pid and the PTY master fd:
+**Step 1 — the child PTY is forked first.** `new_window` opens by calling `self.launch_child(...)` `[kitty/tabs.py:L524-L528]`. `launch_child` `[kitty/tabs.py:L437]` constructs the `Child` wrapper and immediately forks it — `ans = Child(...)` then `ans.fork()` `[kitty/tabs.py:L495-L496]`. Inside `fork`, `fast_data_types.spawn(...)` returns the child pid `[kitty/child.py:L333]` and the wrapper records the pid and the PTY master fd:
 
 ```python
 self.pid = pid                  # [kitty/child.py:L337]
 self.child_fd = master          # [kitty/child.py:L338]
 ```
 
-A readiness pipe is also established; its write end is stored as `self.terminal_ready_fd = ready_write_fd` `[kitty/child.py:L343]`. This pipe is the synchronization handle the child blocks on until kitty signals that the terminal geometry is known (closed in R2's first-resize handshake).
+`fork` also establishes a **readiness pipe** via `os.pipe()` `[kitty/child.py:L283]`: the read end is made inheritable to the child `[kitty/child.py:L285]` while kitty keeps the write end as `self.terminal_ready_fd = ready_write_fd` `[kitty/child.py:L343]`. The forked child blocks on this pipe before running its command — in the child branch of `spawn` it calls `wait_for_terminal_ready(ready_read_fd)` `[kitty/child.c:L152]`, which loops on `read(fd, &data, 1)` `[kitty/child.c:L71-L77]`; the in-code comment states it is waiting "for READY_SIGNAL which indicates kitty has setup the screen object" `[kitty/child.c:L150]`. kitty releases the child later, in R2's first-resize handshake, by closing the write end (see [R2](#3-r2--resize--sigwinch-propagation--rapid-succession-coalescing)). This is precisely why *"a window created and immediately used to run a command"* is coupled to the first resize.
 
-**Step 4 — the Boss wires Python ↔ C.** `Boss.add_child` `[kitty/boss.py:L585]` asserts the child actually forked (`window.child.pid is not None and window.child.child_fd is not None` `[kitty/boss.py:L586]`), hands the id/pid/fd/screen to the C child monitor, and registers the window in the weak process-wide map:
+**Step 2 — the Python `Window` is constructed and gets its id.** With an already-forked child in hand, `new_window` constructs `window = Window(self, child, ...)` `[kitty/tabs.py:L529-L533]`. `Window.__init__` obtains the integer id that every other layer keys off via `self.id = add_window(...)` `[kitty/window.py:L587]`.
+
+**Step 3 — the Boss registers the child, deliberately *before* layout.** `new_window` next calls `get_boss().add_child(window)` `[kitty/tabs.py:L535]`. This call is placed *before* per-tab/layout insertion on purpose; the source says so in the immediately preceding comment — `# Must add child before laying out so that resize_pty succeeds` `[kitty/tabs.py:L534]`. `Boss.add_child` `[kitty/boss.py:L585]` asserts the child actually forked (`window.child.pid is not None and window.child.child_fd is not None` `[kitty/boss.py:L586]`), hands the id/pid/fd/screen to the C child monitor, and registers the window in the weak process-wide map:
 
 ```python
 self.child_monitor.add_child(window.id, window.child.pid, window.child.child_fd, window.screen)  # [kitty/boss.py:L587]
 self.window_id_map[window.id] = window                                                            # [kitty/boss.py:L588]
 ```
 
-**Step 5 — the C side *enqueues* (does not directly touch the live array).** The C `add_child` `[kitty/child-monitor.c:L305]` takes the mutex, performs a capacity check, parses the arguments, *increments the screen refcount*, appends to the **add queue**, and wakes the I/O thread:
+**Step 4 — the C side *enqueues* (it does not touch the live array).** `child_monitor.add_child` `[kitty/child-monitor.c:L305]` takes the mutex, performs a capacity check, zeroes the target queue slot to `EMPTY_CHILD`, parses the arguments straight into that slot through the `A(attr)` address macro, *increments the screen refcount*, advances the queue count, unlocks, and wakes the I/O thread. The exact body is `[kitty/child-monitor.c:L307-L320]`:
 
 ```c
-children_mutex(lock);                                  // [kitty/child-monitor.c:L307]
-if (self->count + add_queue_count >= MAX_CHILDREN) {   // capacity check [kitty/child-monitor.c:L308]
-    ...
-} else {
-    add_queue[add_queue_count] = (Child){.id = id, .pid = pid, .fd = fd, .screen = screen};  // parse "kiiO" [kitty/child-monitor.c:L311]
-    INCREF_CHILD(add_queue[add_queue_count]);          // [kitty/child-monitor.c:L316]
-    add_queue_count++;                                 // [kitty/child-monitor.c:L317]
+children_mutex(lock);                                                       // [kitty/child-monitor.c:L307]
+if (self->count + add_queue_count >= MAX_CHILDREN) { PyErr_SetString(PyExc_ValueError, "Too many children"); children_mutex(unlock); return NULL; }  // [kitty/child-monitor.c:L308]
+add_queue[add_queue_count] = EMPTY_CHILD;                                   // [kitty/child-monitor.c:L309]
+#define A(attr) &add_queue[add_queue_count].attr                            // [kitty/child-monitor.c:L310]
+if (!PyArg_ParseTuple(args, "kiiO", A(id), A(pid), A(fd), A(screen))) {     // [kitty/child-monitor.c:L311]
+    children_mutex(unlock);
+    return NULL;
 }
-children_mutex(unlock);
-wakeup_io_loop(self, false);                           // [kitty/child-monitor.c:L319]
+#undef A                                                                    // [kitty/child-monitor.c:L315]
+INCREF_CHILD(add_queue[add_queue_count]);                                   // [kitty/child-monitor.c:L316]
+add_queue_count++;                                                          // [kitty/child-monitor.c:L317]
+children_mutex(unlock);                                                     // [kitty/child-monitor.c:L318]
+wakeup_io_loop(self, false);                                                // [kitty/child-monitor.c:L319]
 ```
 
-**Step 6 — the I/O thread *promotes* the queued child into the live array.** Later, on its own schedule, the I/O thread runs `add_children`, moving entries from `add_queue[]` into the live `children[]` array, registering a pollable file descriptor, and incrementing the live count:
+Note there is no `else` branch and no aggregate `(Child){...}` initializer: the capacity check returns early on failure `[kitty/child-monitor.c:L308]`, and the fields are filled in place by `PyArg_ParseTuple` writing through `A(attr) → &add_queue[add_queue_count].attr` `[kitty/child-monitor.c:L310-L311]`.
+
+**Step 5 — the per-tab strong registry records it (during layout).** Only *after* the Boss/C registration does `new_window` call `self._add_window(window, ...)` `[kitty/tabs.py:L536]`. `_add_window` `[kitty/tabs.py:L499]` invokes `self.current_layout.add_window(self.windows, window, ...)` `[kitty/tabs.py:L500]`; the layout in turn calls `all_windows.add_window(...)` `[kitty/layout/base.py:L318]` (for splits, `[kitty/layout/splits.py:L507,L510]`), which reaches `WindowList.add_window` `[kitty/window_list.py:L329]`. That method appends to the ordered list and inserts into the strong id map:
+
+```python
+self.all_windows.append(window)        # [kitty/window_list.py:L338]
+self.id_map[window.id] = window        # [kitty/window_list.py:L339]
+```
+
+This strong reference `[kitty/window_list.py:L339]` is what keeps the `Window` alive while it belongs to a tab. Because layout — which can trigger a resize — runs *here*, after the child is already registered in C, that resize's `resize_pty` lookup can find the child; this is exactly the invariant the `[kitty/tabs.py:L534]` comment protects.
+
+**Step 6 — the I/O thread *promotes* the queued child into the live array.** Later, on its own schedule, the I/O thread runs `add_children` `[kitty/child-monitor.c:L1281]`, moving entries from `add_queue[]` into the live `children[]` array, registering a pollable file descriptor, and incrementing the live count:
 
 ```c
-children[self->count] = add_queue[i];                                 // promote   [kitty/child-monitor.c:L1281-L1289]
-children_fds[EXTRA_FDS + self->count].fd = children[self->count].fd;  // register pollfd
-children_fds[EXTRA_FDS + self->count].events = POLLIN;                // [kitty/child-monitor.c:L1286-L1287]
+children[self->count] = add_queue[add_queue_count];                   // promote   [kitty/child-monitor.c:L1284]
+children_fds[EXTRA_FDS + self->count].fd = children[self->count].fd;  // register pollfd [kitty/child-monitor.c:L1286]
+children_fds[EXTRA_FDS + self->count].events = POLLIN;                // [kitty/child-monitor.c:L1287]
 self->count++;                                                        // [kitty/child-monitor.c:L1288]
 ```
 
@@ -216,7 +222,7 @@ The registration is split into **enqueue (any thread, under the mutex)** and **p
 - **The Python/Main thread never blocks on the I/O thread.** `add_child` only needs to append to a queue and signal a wakeup `[kitty/child-monitor.c:L319]`; it does not wait for the I/O thread to wire up polling. This keeps window creation snappy even while the I/O thread is busy reading other children's output.
 - **The screen survives the cross-thread handoff.** The `INCREF_CHILD` on enqueue `[kitty/child-monitor.c:L316]` raises the `Screen`'s Python refcount *before* the object is visible to the I/O thread, so even if Python were to drop its own reference immediately, the screen cannot be deallocated out from under the C engine. This is the front half of the reference-counting idiom whose back half (release at death) appears in [R4](#5-r4--keep-vs-discard-at-child-death).
 
-The most consequential side effect of this design — and the reason later lookups must scan two lists — is the **intermediate state it creates**: between Step 4 and Step 6 a window is simultaneously **registered in Python (`window_id_map`, `id_map`) and present in the C `add_queue[]`, but absent from the live `children[]` array.** Any code that runs in this window (a resize, a close) must therefore tolerate the child being "known but not yet live." That tolerance is exactly the dual-list scan documented in [R3](#4-r3--gone-before-everything-finished-reacting-stale-target-tolerance) and [R6](#7-r6--resolving-conflicting-alive-vs-gone-views).
+The most consequential side effect of this design — and the reason later lookups must scan two lists — is the **intermediate state it creates**: between the C enqueue (Step 4) and the I/O-thread promotion (Step 6), the child is present in the C `add_queue[]` but **absent from the live `children[]` array**, while in Python it is already in the Boss weak `window_id_map` (registered in Step 3) and, once layout runs (Step 5), in the per-tab `id_map` as well. Any code executing in this interval — most importantly the resize that layout *itself* triggers in Step 5, which is the very reason `add_child` must precede `_add_window` per the `[kitty/tabs.py:L534]` comment — must therefore tolerate the child being "known but not yet live." That tolerance is exactly the dual-list scan (`children[]` then `add_queue[]`) documented in [R3](#4-r3--gone-before-everything-finished-reacting-stale-target-tolerance) and [R6](#7-r6--resolving-conflicting-alive-vs-gone-views).
 
 ---
 
@@ -244,7 +250,7 @@ This guard is the front line of stale-target tolerance, examined further in [R3]
 ```python
 current_pty_size = (
     self.screen.lines, self.screen.columns,
-    max(0, right - left), max(0, bottom - top))      # [kitty/window.py:L857-L859]
+    max(0, new_geometry.right - new_geometry.left), max(0, new_geometry.bottom - new_geometry.top))  # [kitty/window.py:L857-L859]
 ```
 
 **(4) Deduplicate, then propagate.** The PTY is resized **only when the size actually changed** versus the cached last-reported size:
@@ -274,7 +280,7 @@ def mark_terminal_ready(self) -> None:        # [kitty/child.py:L362]
     self.terminal_ready_fd = -1               # [kitty/child.py:L364]
 ```
 
-Closing this fd is the signal that releases the child to run with a known geometry — which is precisely why "a window created and *immediately* used to run a command" is coupled to the first resize.
+Closing this fd `[kitty/child.py:L363]` is what releases the child, which has been blocked in `wait_for_terminal_ready` `[kitty/child.c:L152]`, to run with a known geometry — which is precisely why "a window created and *immediately* used to run a command" is coupled to the first resize.
 
 **(6) C-side resize + the `TIOCSWINSZ` ioctl.** `resize_pty` `[kitty/child-monitor.c:L591]` parses the tuple as `"kHHHH"` → `(window_id, ws_row, ws_col, ws_xpixel, ws_ypixel)` `[kitty/child-monitor.c:L597]`, takes the mutex, finds the fd by the dual-list `FIND` macro (children first, add_queue second — see R3), and calls `pty_resize(fd, &dim)`. `pty_resize` issues the kernel ioctl in a retry loop:
 
@@ -299,7 +305,7 @@ pty_resize(int fd, struct winsize *dim) {     // [kitty/child-monitor.c:L577]
 
 kitty's `"kHHHH"` argument tuple and the `TIOCSWINSZ` ioctl follow the canonical kernel interface. The Linux `TIOCSWINSZ(2const)` man page documents that `struct winsize` carries `ws_row`, `ws_col`, `ws_xpixel`, and `ws_ypixel`, that **"When the window size changes, a `SIGWINCH` signal is sent to the foreground process group,"** and that on error `-1` is returned with `errno` set (Linux man-pages, `TIOCSWINSZ(2const)`). This maps one-to-one onto kitty's four trailing unsigned-short fields `[kitty/child-monitor.c:L597]` and the `EBADF`/`ENOTTY`/`EINTR` handling in `pty_resize` `[kitty/child-monitor.c:L579-L582]`. In other words, kitty does *not* deliver `SIGWINCH` itself — it asks the kernel to update the tty's window size, and the kernel delivers `SIGWINCH` to the child's foreground process group as a side effect of `TIOCSWINSZ`.
 
-It is worth noting that resize-signal *timing* is a genuine, mechanism-inherent concern at the kernel level (a documented historical Linux race allowed `SIGWINCH` to fire before the tty `winsize` was updated, later fixed by ordering the size assignment before signal delivery). This validates the user's interest in timing and reinforces why kitty layers its own ordering/debounce discipline (below and in [R5](#6-r5--timing-threading-and-lock-discipline)) on top of the kernel behavior.
+Because the kernel — not kitty — emits `SIGWINCH` as a side effect of `TIOCSWINSZ` (per the man page above), signal-delivery *timing* is governed by the kernel and is outside kitty's direct control. This is precisely why kitty layers its *own* ordering and debounce discipline on top of the kernel behavior: the per-window `last_reported_pty_size` value-diff `[kitty/window.py:L861]`, the live-resize debounce `[kitty/child-monitor.c:L1042-L1075]` (below), and the lock-free notification ordering analyzed in [R5](#6-r5--timing-threading-and-lock-discipline). The user's interest in how timing affects signal delivery is therefore well-founded — and every timing guarantee this document makes is kitty's own, grounded in the cited code rather than in any external kernel-version behavior.
 
 ### 3.3 Mechanism: rapid-succession coalescing / debounce
 
@@ -391,7 +397,7 @@ break;
 
 The unifying rationale is that kitty treats "target absent / fd stale" as an **ordinary, expected outcome of concurrency**, not as an error condition. Because the window can be destroyed on the Main thread while the I/O thread still holds an fd (or vice versa), there is no instant at which all four registries are guaranteed mutually consistent. Rather than attempt to enforce such an instant with a heavyweight cross-layer lock — which would serialize the very operations that need to be fast — kitty makes every reaction *idempotent under absence*:
 
-- The **id indirection** means a stale id can only "find nothing"; it can never dereference freed memory, because nothing in the resize path follows a raw pointer to a possibly-freed `Window` or `Screen`.
+- The **id indirection** — every cross-layer reference keys off the integer `self.id` `[kitty/window.py:L587]`, and the C resize path looks the child up *by that id* `[kitty/child-monitor.c:L606-L607]` rather than following a raw pointer — means a stale id can only "find nothing"; it can never dereference freed memory.
 - The **dual-list scan** `[kitty/child-monitor.c:L606-L607]` closes the specific window of inconsistency created by R1's enqueue → promote split: a child known to Python but not yet in `children[]` is still found in `add_queue[]`.
 - The **errno tolerance** `[kitty/child-monitor.c:L581]` closes the residual race where the fd was valid at lookup but closed before the ioctl.
 
@@ -427,9 +433,11 @@ The third argument to `do_parse(...)` is `true` — the `flush` flag — at `[ki
 The `Screen` object is shared across the Main and I/O threads, so its lifetime is governed by explicit refcount macros:
 
 ```c
-#define FREE_CHILD(x) Py_CLEAR((x).screen); x = EMPTY_CHILD;   // [kitty/child-monitor.c:L105-L110]
-#define INCREF_CHILD(x) Py_INCREF((x).screen);
-#define DECREF_CHILD(x) Py_DECREF((x).screen);
+#define FREE_CHILD(x) \
+    Py_CLEAR((x).screen); x = EMPTY_CHILD;              // [kitty/child-monitor.c:L105-L106]
+#define XREF_CHILD(x, OP) OP(x.screen);                 // [kitty/child-monitor.c:L108]
+#define INCREF_CHILD(x) XREF_CHILD(x, Py_INCREF)        // [kitty/child-monitor.c:L109]
+#define DECREF_CHILD(x) XREF_CHILD(x, Py_DECREF)        // [kitty/child-monitor.c:L110]
 ```
 
 (the macro block spans `[kitty/child-monitor.c:L105-L110]`). The lifecycle is deterministic:
@@ -452,7 +460,7 @@ The keep/discard split is principled:
 - **Kept:** the already-parsed screen content — scrollback and the last frame — because the flush parse `[kitty/child-monitor.c:L521]` runs *before* teardown. A user who runs a command that prints output and then exits still sees that output; it is not lost to a race between "child exited" and "window torn down."
 - **Discarded:** the live PTY file descriptor and the per-child C bookkeeping slot, released by `cleanup_child` (closing the fd) and `FREE_CHILD` `[kitty/child-monitor.c:L525]`, plus the Python-side cycle broken in `Window.destroy` `[kitty/window.py:L1570-L1571]`.
 
-The reason refcounting is used rather than a simpler "free on death" is precisely the multi-threading: the I/O thread might still be mid-read of a screen at the moment the Main thread decides to tear it down. The `INCREF` at enqueue and `FREE_CHILD` at death bracket the screen's cross-thread visibility, so the screen is freed *exactly once* and *only* when no thread can still reach it — never while a parse is in flight.
+The reason refcounting is used rather than a simpler "free on death" is the multi-threading: the I/O thread can still be mid-parse of a screen at the moment the Main thread decides to tear it down. The `INCREF_CHILD` at enqueue `[kitty/child-monitor.c:L316]` and the matching `FREE_CHILD` — which is a `Py_CLEAR` `[kitty/child-monitor.c:L105-L106]` — at death `[kitty/child-monitor.c:L525]` bracket the screen's cross-thread visibility; combined with the per-pass `INCREF_CHILD` `[kitty/child-monitor.c:L480]` / `DECREF_CHILD` `[kitty/child-monitor.c:L528-L532]` around each parse, every `Py_INCREF` is matched by a `Py_DECREF`. From these balanced refcount operations it follows that the `Screen`'s Python refcount only reaches zero — the point at which CPython deallocates the object — once no thread still holds a reference; we therefore infer the screen is released exactly once, and never while a parse is in flight.
 
 ---
 
@@ -466,7 +474,7 @@ To recap the concurrency model from [Section 1](#1-architecture--registries-over
 
 - **I/O thread** — `io_loop` `[kitty/child-monitor.c:L1481]`, created at `[kitty/child-monitor.c:L291]`, named `"KittyChildMon"` `[kitty/child-monitor.c:L1489]`.
 - **Talk thread** — `talk_loop`, created at `[kitty/child-monitor.c:L256,L286]`.
-- **Main thread** — GLFW/render; the only thread that calls into Python.
+- **Main thread** — GLFW/render; the only thread that calls into Python (the `death_notify` callback `[kitty/child-monitor.c:L522]` and `report_reaped_pids` `[kitty/child-monitor.c:L949-L958]` are issued from here).
 
 A single non-recursive mutex, the `children_mutex` macro `[kitty/child-monitor.c:L76-L77]`, guards every shared child array. The **non-recursive** property is not incidental — it is the design constraint that forces the lock-free death-notification pattern below.
 
@@ -525,7 +533,7 @@ Reaped pids are surfaced to Python on the **Main-thread tick**, decoupled from t
 
 ### 6.5 Rationale: split work so the render thread never blocks on PTY I/O
 
-The threading split exists so the **render/Main thread never blocks on PTY reads or `waitpid`**: all blocking I/O and reaping happen on the I/O thread, while the Main thread only does fast, bounded work (apply a debounced resize, drain a remove queue, fire notifications). The `needs_removal` flag is the hinge: it is a *deferred* signal set under the lock by whichever thread first detects death (EOF or `SIGCHLD`), and the heavyweight teardown + Python notification are deferred to controlled, lock-free points on the owning thread. Timing thus affects *when* a death becomes visible to Python (at the next tick, after the next loop drain) but never *whether* state stays coherent — because the order is fixed: detect → flag (locked) → drain (locked) → flush + notify (lock-free) → reap surfaced on tick.
+The threading split exists so the **render/Main thread never blocks on PTY reads or `waitpid`**: the blocking PTY reads (`read_bytes` on EOF detection `[kitty/child-monitor.c:L1531]`) and the reaping (`waitpid(-1, &status, WNOHANG)` `[kitty/child-monitor.c:L1418]`) both run inside `io_loop` on the I/O thread `[kitty/child-monitor.c:L1481]`, while the Main thread only does fast, bounded work (apply a debounced resize `[kitty/child-monitor.c:L1042]`, drain a remove queue / fire notifications in `parse_input` `[kitty/child-monitor.c:L450-L451]`). The `needs_removal` flag is the hinge: it is a *deferred* signal set under the lock by whichever thread first detects death (EOF or `SIGCHLD`), and the heavyweight teardown + Python notification are deferred to controlled, lock-free points on the owning thread. Timing thus affects *when* a death becomes visible to Python (at the next tick, after the next loop drain) but never *whether* state stays coherent — because the order is fixed: detect → flag (locked) → drain (locked) → flush + notify (lock-free) → reap surfaced on tick.
 
 ---
 
@@ -535,9 +543,9 @@ The threading split exists so the **render/Main thread never blocks on PTY reads
 
 Yes — and the entire design anticipates them. There are three loci where views can legitimately disagree:
 
-1. **C `children[]` vs `add_queue[]`** — a not-yet-promoted child is in one list but not the other (the R1 enqueue → promote window).
-2. **C arrays vs Python `window_id_map`** — Python may still hold a window the C engine has already removed, or vice versa.
-3. **Boss `window_id_map` vs per-tab `WindowList.id_map`** — the weak process map and the strong per-tab map can momentarily differ.
+1. **C `children[]` vs `add_queue[]`** `[kitty/child-monitor.c:L82,L84]` — a not-yet-promoted child is in the add queue but not yet the live array (the R1 enqueue → promote window), which is why the `FIND` lookup scans `children[]` then `add_queue[]` `[kitty/child-monitor.c:L606-L607]`.
+2. **C arrays vs Python `window_id_map`** `[kitty/boss.py:L344]` — Python may still hold a window id the C engine has already removed (death detected and drained on the I/O thread `[kitty/child-monitor.c:L1531-L1535]` before `on_child_death` runs), or, in the R1 window, hold a window the C side has only enqueued.
+3. **Boss `window_id_map` vs per-tab `WindowList.id_map`** `[kitty/boss.py:L344]``[kitty/window_list.py:L148]` — the weak process map and the strong per-tab map can momentarily differ (e.g., the weak map entry is created in `Boss.add_child` at Step 3 while the per-tab entry is created later, during layout at Step 5 — see [R1](#2-r1--windows-appear-registration)).
 
 kitty reconciles all three with **tolerant lookups** rather than synchronized state.
 
@@ -563,7 +571,8 @@ The `pop(window_id, None)` `[kitty/boss.py:L883]` returns `None` if Python has a
 The per-tab strong map mirrors the same tolerance. `WindowList.remove_window` `[kitty/window_list.py:L373]` removes from the ordered list inside a `try/except ValueError` and pops from the id map `None`-safely:
 
 ```python
-def remove_window(self, window: WindowType) -> ...:   # [kitty/window_list.py:L373]
+def remove_window(self, x: WindowOrId) -> None:        # [kitty/window_list.py:L373]
+    q = self.id_map[x] if isinstance(x, int) else x    # [kitty/window_list.py:L375]
     try:
         self.all_windows.remove(q)                     # [kitty/window_list.py:L377]
     except ValueError:
@@ -615,7 +624,7 @@ These three combine into four crisp, quotable answers to the scenario:
 
 | Scenario question | Crisp answer | Anchor citation |
 |-------------------|--------------|-----------------|
-| How is a window registered? (R1) | Two-step **enqueue → promote**: Python registers + C enqueues under the mutex; the I/O thread promotes into the live array later. This is *why* dual-list scans exist. | `[kitty/child-monitor.c:L305-L319,L1281-L1289]` |
+| How is a window registered? (R1) | Ordered **fork → `Window`/id → `Boss.add_child` (C enqueue + weak map) → layout/per-tab insertion → I/O-thread promote**. The Boss/C registration deliberately precedes layout so a layout-triggered resize can still find the child; the C boundary itself is a two-step enqueue → promote, which is *why* dual-list scans exist. | `[kitty/tabs.py:L524-L536]``[kitty/child-monitor.c:L305-L319,L1281-L1289]` |
 | What if the window is gone mid-reaction? (R3) | Every reaction is **idempotent under absence** — `destroyed` guard, dual-list no-op + log, `EBADF`/`ENOTTY` tolerance. | `[kitty/window.py:L851-L852]``[kitty/child-monitor.c:L610,L581]` |
 | What state is kept? (R4) | **Flush-before-notify**: `do_parse(..., flush=true)` runs *before* `death_notify`, so the child's last output is preserved; the live fd and bookkeeping are discarded. | `[kitty/child-monitor.c:L521-L522]` |
 | How does timing affect signal delivery? (R5) | **Lock-free `death_notify`**: the non-recursive mutex must be released before notifying Python, because the Python callback re-enters this C module. | `[kitty/child-monitor.c:L518-L522]` |
@@ -624,9 +633,9 @@ The deepest rationale is that kitty refuses to put a lock across the Python↔C 
 
 ### 8.2 Optional dynamic-verification notes (corroboration only)
 
-The conclusions above stand entirely on static evidence; the following is **optional corroboration** that may be performed **inside the user-specified Docker container** (`andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0...` from `ghcr.io/scaleapi/swe-atlas`), never in the planning environment. kitty ships in-source instrumentation that makes the resize path directly observable, so no new code is needed:
+The conclusions above stand entirely on static evidence; the following is **optional corroboration only**. Per the binding rule, building and running kitty is a permitted *methodology*, not a source of truth; and per the user-specified setup instructions it is performed inside the user-specified Docker container image (not in the planning environment). The build/run specifics in this subsection are therefore drawn from the setup instructions and from kitty's own build files — not asserted as code behavior — while every *mechanism* claim remains grounded in the source citations of Sections 1–7. kitty ships in-source instrumentation that makes the resize path directly observable, so no new code is needed:
 
-- **Build:** `python3 setup.py` (equivalently the `Makefile` `all:` target). The container's toolchain (Python 3.x, Go, a C11 compiler, harfbuzz/freetype/fontconfig) is sufficient; a clean build exits 0.
+- **Build:** `python3 setup.py` — this is exactly the `Makefile` `all:` target `[Makefile:L12-L13]`. kitty's build/runtime dependencies (`python >= 3.8`, `harfbuzz >= 2.2.0`, `freetype`, `fontconfig`) are catalogued in `[docs/build.rst:L76,L83-L91]`, and the C extensions compile with `-std=c11` `[setup.py:L492]`. Per the setup instructions, the user-specified container image bundles a sufficient toolchain, so no installation against the repository is needed.
 - **Run with `--debug-rendering`** and exercise rapid create → run a command → drag-resize → close cycles. On the **first** reported size you will see the `Child launched` line `[kitty/window.py:L871]`; on each subsequent genuine resize the exact line printed is:
 
   ```
@@ -643,7 +652,7 @@ The conclusions above stand entirely on static evidence; the following is **opti
 
   from `log_error(...)` `[kitty/child-monitor.c:L610]`. Seeing this line (rather than a crash) during an aggressive close-while-resizing test corroborates R3's tolerance directly.
 
-- **Cleanup discipline:** any temporary observation script must live **outside** the repository (e.g., under `/tmp`) or be deleted afterward, so that `git status` reports only the new untracked `blitzy/` artifact and no modification to any kitty source file. Building from source produces only gitignored artifacts and does not dirty the tree.
+- **Cleanup discipline:** any temporary observation script must live **outside** the repository (e.g., under `/tmp`) or be deleted afterward, so that `git status` reports only the new untracked `blitzy/` artifact and no modification to any kitty source file. Building from source produces only artifacts that are already gitignored — e.g. `*.so`, `/build/`, and `/kitty/launcher/kitt*` `[.gitignore:L1,L14,L18]` — so it does not dirty the tree.
 
 > **Methodological note.** Per the binding rule that *the code is the source of truth*, dynamic observation is treated strictly as confirmation of statically-derived conclusions. No claim in Sections 1–7 depends on runtime output; the `--debug-rendering` strings above are themselves quoted from the source `[kitty/window.py:L873]``[kitty/child-monitor.c:L610]`.
 
@@ -660,7 +669,7 @@ All citations resolve against commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` 
 | Window liveness timestamps | `last_resized_at`, `created_at` | `[kitty/window.py:L562,L564]` |
 | First-launch gate | `child_is_launched = False` | `[kitty/window.py:L578]` |
 | Resize-dedup cache | `last_reported_pty_size = (-1,-1,-1,-1)` | `[kitty/window.py:L579]` |
-| Window id (lingua franca) | `self.id = add_window(...)` | `[kitty/window.py:L587]` |
+| Window id (lingua franca) | `self.id: int = add_window(...)` | `[kitty/window.py:L587]` |
 | Teardown guard field | `destroyed = False` | `[kitty/window.py:L597]` |
 | Resize entry point | `Window.set_geometry` | `[kitty/window.py:L850]` |
 | Stale-target Python guard (R3) | `if self.destroyed: return` | `[kitty/window.py:L851-L852]` |
@@ -692,9 +701,17 @@ All citations resolve against commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` 
 | Per-tab remove (R6) | `WindowList.remove_window` | `[kitty/window_list.py:L373]` |
 | Tolerant list remove | `all_windows.remove(q)` / `except ValueError` | `[kitty/window_list.py:L377-L379]` |
 | `None`-safe id pop (R6) | `id_map.pop(q.id, None)` | `[kitty/window_list.py:L380]` |
-| Tab-level new window | `Tab.new_window` | `[kitty/tabs.py:L504]` |
+| Tab-level new window (orchestration) | `Tab.new_window` | `[kitty/tabs.py:L504]` |
+| R1 registration order (body) | fork → `Window` → `add_child` → `_add_window` | `[kitty/tabs.py:L524-L536]` |
+| Fork-first child launch | `launch_child`; `ans = Child(...)`; `ans.fork()` | `[kitty/tabs.py:L437,L495-L496]` |
+| Construct `Window` (already-forked child) | `window = Window(self, child, ...)` | `[kitty/tabs.py:L529-L533]` |
+| **Register child before layout (R1 rationale)** | `# Must add child before laying out so that resize_pty succeeds`; `get_boss().add_child(window)` | `[kitty/tabs.py:L534,L535]` |
+| Per-tab insertion via layout | `_add_window` → `current_layout.add_window(...)` | `[kitty/tabs.py:L499-L500,L536]` |
 | Tab-level remove chain | `Tab.remove_window`; `windows.remove_window`; C `remove_window(...)` | `[kitty/tabs.py:L580,L581,L583]` |
+| Layout → `WindowList.add_window` | `Layout.add_window`; `all_windows.add_window(...)` | `[kitty/layout/base.py:L290,L318]``[kitty/layout/splits.py:L507,L510]` |
+| PTY fork: spawn returns pid | `pid = fast_data_types.spawn(...)` | `[kitty/child.py:L333]` |
 | PTY fork: pid/fd | `self.pid = pid`; `self.child_fd = master` | `[kitty/child.py:L337-L338]` |
+| Readiness pipe create + inheritability | `os.pipe()`; read end inheritable to child | `[kitty/child.py:L283,L285]` |
 | Readiness pipe handle | `self.terminal_ready_fd = ready_write_fd` | `[kitty/child.py:L343]` |
 | Release child to run | `mark_terminal_ready`; `os.close(...)`; `= -1` | `[kitty/child.py:L362-L364]` |
 
@@ -755,8 +772,20 @@ All citations resolve against commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` 
 | Accumulate resize events (R2) | `framebuffer_size_callback`; `last_resize_event_at = monotonic()`; `num_of_resize_events++` | `[kitty/glfw.c:L330,L338,L340]` |
 | Screen resize target (R2) | `screen_resize(Screen*, lines, columns)` | `[kitty/screen.c:L346]` |
 | Python `resize` wrapper (R2) | `resize(...)` → `screen_resize(self, a, b)`; `MND(resize, METH_VARARGS)` | `[kitty/screen.c:L3929,L3932,L4842]` |
+| Child-side readiness wait (R1) | `wait_for_terminal_ready`; `read(fd, &data, 1)` loop; "Wait for READY_SIGNAL..." comment | `[kitty/child.c:L71-L77,L150,L152]` |
 
-### 9.4 External reference (kernel behavior only)
+### 9.4 Build & configuration files (Section 1.1 language facts + Section 8.2 methodology)
+
+| Claim / role | Locus | Citation |
+|--------------|-------|----------|
+| Python version floor | `requires-python = ">=3.8"` | `[pyproject.toml:L2]` |
+| Go toolchain version | `go 1.22` | `[go.mod:L3]` |
+| C standard for extensions | `-std=c11` | `[setup.py:L492]` |
+| Build command (`all:` target) | `python3 setup.py` | `[Makefile:L12-L13]` |
+| Build/runtime dependencies | `python >= 3.8`, `harfbuzz >= 2.2.0`, `freetype`, `fontconfig` | `[docs/build.rst:L76,L83-L91]` |
+| Build artifacts are gitignored | `*.so`, `/build/`, `/kitty/launcher/kitt*` | `[.gitignore:L1,L14,L18]` |
+
+### 9.5 External reference (kernel behavior only)
 
 | Claim | Source |
 |-------|--------|
