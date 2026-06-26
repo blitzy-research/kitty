@@ -192,7 +192,7 @@ The experiment uses the pure, side-effect-free Python binding `encode_key_for_tt
 typedef enum { SHIFT=1, ALT=2, CTRL=4, SUPER=8, HYPER=16, META=32, CAPS_LOCK=64, NUM_LOCK=128} ModifierMasks;
 ```
 
-Lock modifiers are stripped in legacy mode (`kitty/key_encoding.c:36`): `if (!key_encoding_flags) mods &= ~GLFW_LOCK_MASK;`. And the "legacy mode" predicate is (`kitty/key_encoding.c:152`): `bool legacy_mode = !ev->report_all_event_types && !ev->disambiguate;`. The reported modifier field follows the **xterm convention `value = 1 + bitmask`**, so **Ctrl+Shift = `1 + (CTRL|SHIFT)` = `1 + (4|1)` = `1 + 5` = `6`** — matching the `;6` field observed in Section 4. **Rationale:** the modifier value in a `CSI u` sequence is never the raw bitmask; it is always `1 + bitmask`.
+Lock modifiers are stripped in legacy mode (`kitty/key_encoding.c:36`): `if (!key_encoding_flags) mods &= ~GLFW_LOCK_MASK;`. The modifier **value** is assembled from those masks and serialized in `convert_glfw_mods` (`kitty/key_encoding.c:35-48`); the decisive step is `kitty/key_encoding.c:47`, which writes the field as **`value + 1`**: `snprintf(ev->mods.encoded, sizeof(ev->mods.encoded), "%u", ev->mods.value + 1);`. This is the xterm convention the protocol mandates (`docs/keyboard-protocol.rst:184-187`: *"the modifier value is encoded as a decimal number which is `1 + actual modifiers`"*), so **Ctrl+Shift = `1 + (CTRL|SHIFT)` = `1 + (4|1)` = `1 + 5` = `6`** — matching the `;6` field observed in Section 4. **Rationale:** the modifier value in a `CSI u` sequence is never the raw bitmask; the `+ 1` is applied literally at `kitty/key_encoding.c:47` and is corroborated verbatim by the published spec at `docs/keyboard-protocol.rst:184-187`. (The separate `legacy_mode = !ev->report_all_event_types && !ev->disambiguate` predicate at `kitty/key_encoding.c:152` lives inside `encode_function_key` and governs the *functional-key* path — not the printable keys whose encoding is analyzed in Section 5(c).)
 
 ### 2.14 Functional-key name → CSI-u codepoint map
 
@@ -439,24 +439,28 @@ after RIS: main=0, alt=0
 ### Raw captured stdout (for full fidelity)
 
 ```text
-== ROUND TRIP ==
-1 start (main, no flags)   cur=0 reply=b'\x1b[?0u' CtrlShift+a='\x1b[97;6u'
-2 push CSI>1u (main)       cur=1 reply=b'\x1b[?1u' CtrlShift+a='\x1b[97;6u'
-3 DECSET 1049 -> alt       cur=0 reply=b'\x1b[?0u' CtrlShift+a='\x1b[97;6u'
-4 push CSI>8u (alt)        cur=8 reply=b'\x1b[?8u' CtrlShift+a='\x1b[97;6u'
-5 DECRST 1049 -> main      cur=1 reply=b'\x1b[?1u' CtrlShift+a='\x1b[97;6u'
-== FLAG-DEPENDENT ENCODING ==
-plain a       flags0='a'          flags1='a'          flags8='\x1b[97u'
-Ctrl+a        flags0='\x01'       flags1='\x1b[97;5u' flags8='\x1b[97;5u'
-Ctrl+Shift+a  flags0='\x1b[97;6u' flags1='\x1b[97;6u' flags8='\x1b[97;6u'
-== STACK EXHAUSTION ==
-after push 1..12: current=12
-value BEFORE each of 12 pops: [12, 11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0]
-after popping past empty: current=0
-== CROSS-BUFFER LEAKAGE ==
-main=3; alt fresh=0; alt exhausted=12; back to main=3
-== ISOLATION BREAKDOWN: RIS ==
-after RIS: main=0, alt=0
+== ROUND TRIP (questions e + b) ==
+  1 start (main, no flags)     cur=0 reply=b'\x1b[?0u' CtrlShift+a='\x1b[97;6u'
+  2 push CSI>1u (main)         cur=1 reply=b'\x1b[?1u' CtrlShift+a='\x1b[97;6u'
+  3 DECSET 1049 -> alt         cur=0 reply=b'\x1b[?0u' CtrlShift+a='\x1b[97;6u'
+  4 push CSI>8u (alt)          cur=8 reply=b'\x1b[?8u' CtrlShift+a='\x1b[97;6u'
+  5 DECRST 1049 -> main        cur=1 reply=b'\x1b[?1u' CtrlShift+a='\x1b[97;6u'
+
+== FLAG-DEPENDENT ENCODING (question c) ==
+  plain a       flags0='a'          flags1='a'          flags8='\x1b[97u'
+  Ctrl+a        flags0='\x01'       flags1='\x1b[97;5u' flags8='\x1b[97;5u'
+  Ctrl+Shift+a  flags0='\x1b[97;6u' flags1='\x1b[97;6u' flags8='\x1b[97;6u'
+
+== STACK EXHAUSTION (question d) ==
+  after push 1..12: current=12
+  value BEFORE each of 12 pops: [12, 11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0]
+  after popping past empty: current=0
+
+== CROSS-BUFFER LEAKAGE (question f) ==
+  main=3; alt fresh=0; alt exhausted=12; back to main=3
+
+== ISOLATION BREAKDOWN: RIS (question g) ==
+  after RIS: main=0, alt=0
 ```
 
 ---
@@ -478,7 +482,7 @@ From Table 4.1: main holds `1` after step 2; the alternate starts **fresh at `0`
 - Under **flag 1** (disambiguate): plain `a` is still the literal `a`, but **Ctrl+a** becomes the unambiguous `\x1b[97;5u`.
 - Under **flag 8** (report-all-keys, which implies flag 1): **even plain `a`** becomes `\x1b[97u`.
 
-**Rationale:** the numeric `97` is `ord('a')`. The modifier field is the xterm-style `1 + bitmask` (`kitty/key_encoding.c:11`). Flag 1 only rewrites keys that would otherwise be *ambiguous*; flag 8 reports *every* key as a `CSI u` sequence (`docs/keyboard-protocol.rst:264-312`). The C predicate `legacy_mode = !report_all_event_types && !disambiguate` (`kitty/key_encoding.c:152`) gates this behavior.
+**Rationale:** the numeric `97` is `ord('a')`, and the modifier field is the xterm-style `1 + bitmask` computed in `convert_glfw_mods` (`kitty/key_encoding.c:35-48`) and emitted as `value + 1` at `kitty/key_encoding.c:47` (`snprintf(..., ev->mods.value + 1)`) — the rule the protocol states at `docs/keyboard-protocol.rst:184-187`. The flag bits that select each Table 4.2 column are mapped in `encode_glfw_key_event` (`kitty/key_encoding.c:414-423`): bit `1` → `disambiguate`, bit `8` → `report_text` (the protocol's *report-all-keys*). Printable-key encoding then flows through `encode_key` (`kitty/key_encoding.c:367-396`): with **no** modifiers and **no** report-all flag, a plain `a` is emitted as its literal UTF-8 byte, but once bit `8` is set the same `a` is forced through `serialize(..., 'u')` → `\x1b[97u`; when a modifier is present the legacy gate `!disambiguate && !report_text` routes **Ctrl+a** into `encode_printable_ascii_key_legacy` (`kitty/key_encoding.c:291-318`) as the C0 control `\x01`, whereas flag `1` or flag `8` bypasses that gate and serializes to `\x1b[97;5u`. **Ctrl+Shift+a has no legacy representation** — `encode_printable_ascii_key_legacy` matches none of its modifier cases and returns `0` (`kitty/key_encoding.c:305-317`), so `encode_key` always falls through to `serialize(..., 'u')`, which is precisely why its bytes are invariant across all three states. (The `legacy_mode` predicate at `kitty/key_encoding.c:152` governs the *functional-key* path in `encode_function_key`, not these printable keys.)
 
 ### (d) Stack exhaustion
 
@@ -506,7 +510,7 @@ Ctrl+Shift+a is **inherently ambiguous**: its legacy byte would collide with oth
 - **plain `a`** stays the literal `a` under flags 0 and 1, but becomes `\x1b[97u` under flag 8 (report-all-keys).
 - **Ctrl+a** is the C0 control `\x01` in legacy mode, but becomes `\x1b[97;5u` once flag 1 *or* flag 8 is active.
 
-The modifier value follows the xterm convention `1 + bitmask` with `SHIFT=1, CTRL=4` (`kitty/key_encoding.c:11`), so **Ctrl+Shift = `1 + (4|1)` = `1 + 5` = `6`**, matching the observed `;6` field. Ctrl+a alone is `1 + 4 = 5`, matching `;5`.
+The modifier value follows the xterm convention `1 + bitmask` — the masks `SHIFT=1, CTRL=4` are defined at `kitty/key_encoding.c:11`, and the `+ 1` is applied at `kitty/key_encoding.c:47` (`snprintf(..., ev->mods.value + 1)`; the protocol states the same rule at `docs/keyboard-protocol.rst:184-187`). So **Ctrl+Shift = `1 + (4|1)` = `1 + 5` = `6`**, matching the observed `;6` field, and Ctrl+a alone is `1 + 4 = 5`, matching `;5`.
 
 ### "No flags reported (current = 0)" vs. "stack empty"
 
@@ -555,14 +559,20 @@ This in-repo C behavior matches the **published Kitty Keyboard Protocol specific
 - `:311-334` — `pyencode_key_for_tty` / `encode_key_for_tty` binding
 
 **`kitty/key_encoding.c`**
-- `:11` — modifier masks (`SHIFT=1, ALT=2, CTRL=4, SUPER=8, ...`)
+- `:11` — modifier masks (`SHIFT=1, ALT=2, CTRL=4, SUPER=8, ...`) — raw mask values only
+- `:35-48` — `convert_glfw_mods`: assembles the modifier bitmask from the masks above
+- `:47` — the `1 + bitmask` implementation: `snprintf(ev->mods.encoded, sizeof(ev->mods.encoded), "%u", ev->mods.value + 1);`
 - `:36` — lock-modifier stripping in legacy mode (`if (!key_encoding_flags) mods &= ~GLFW_LOCK_MASK;`)
-- `:152` — `legacy_mode = !report_all_event_types && !disambiguate`
+- `:291-318` — `encode_printable_ascii_key_legacy` (legacy printable `a`/Ctrl+a; returns `0` for Ctrl+Shift+a)
+- `:367-396` — `encode_key` dispatcher: literal/UTF-8 vs. legacy printable vs. `serialize(..., 'u')` fallback
+- `:414-423` — `encode_glfw_key_event`: maps flag bits → `disambiguate`(1)/`report_all_event_types`(2)/`report_alternate_key`(4)/`report_text`(8)/`embed_text`(16)
+- `:152` — `legacy_mode = !report_all_event_types && !disambiguate` (functional-key path, inside `encode_function_key`)
 
 **`key_encoding.json`**
 - `:25` — `"ENTER": "z"`; `:27` — `"ESCAPE": "y"` (functional-key → CSI-u letter map)
 
 **`docs/keyboard-protocol.rst`**
+- `:184-187` — the modifier-encoding rule: "the modifier value is encoded as a decimal number which is `1 + actual modifiers`" (e.g. ctrl+shift → `1 + 0b101 = 6`)
 - `:264-312` — authoritative protocol semantics: set/query/push/pop sequences, the flag-bit table, the **separate-stacks mandate** ("Terminals must maintain separate stacks for the main and alternate screens"), pop-empties-resets-all-flags, push-when-full-evicts-oldest, and the editor rationale note
 
 **Test harness (reused read-only)**
@@ -582,4 +592,8 @@ The published **Kitty Keyboard Protocol** specification (`docs/keyboard-protocol
   In this environment, `python3 test.py key_encoding_flags_stack` also reports **OK** (a Go toolchain is present at `/usr/bin/go`, `go1.24.4`, and the kitty launcher is built). `test.py` routes through `kitty_tests/main.py`, whose runner scans Go test packages too: `go_exe()` is `shutil.which('go') or ''` (`kitty_tests/main.py:146`) and `run_go(...)` is invoked unconditionally (`kitty_tests/main.py:270`). On a checkout **without** Go on `PATH`, that path raises `SystemExit('go executable not found, ...')` (`kitty_tests/main.py:198`) *before* the Python test runs — which is why, on a Go-less machine, the **unittest** entry point above is the way to run the same regression. The library-level keyboard experiment itself needs only the compiled C extension and pure Python; the Go layer is irrelevant to it.
 - **Transient artifacts.** The build outputs `kitty/fast_data_types.so` and `build/` are transient and are **not committed** (both are covered by `.gitignore`). The experiment script in Section 3 is presented inside this document only and is **not** written to the repository as a separate file.
 - **Determinism.** Every byte sequence in Section 4 is deterministic and reproducible by running the Section 3 script (`python3 kkp_experiment.py`) from the repository root after building the `.so`.
+
+### Safety and vulnerability-category applicability
+
+This deliverable is **Markdown-only** and adds no runtime code to the repository, so the usual code-level vulnerability categories are **not applicable**: there is no SQL (no SQL injection), no HTML/JS rendering surface (no XSS), no filesystem path handling (no path traversal), no (de)serialization of untrusted input (no unsafe deserialization), no cryptographic operations (no crypto misuse), and no C/memory or concurrency code introduced by this document (no memory-safety bugs and no data-race/race-condition surface). The single embedded Python snippet in Section 3 is strictly **read-only**: it drives the existing `kitty_tests` harness and the already-compiled in-memory encoder, reads flag state, and prints to stdout — it **writes no files**, opens no network connections, spawns no subprocesses, runs no shell commands, and mutates nothing in the repository or on disk. The document itself contains no secrets, credentials, tokens, or destructive commands.
 
