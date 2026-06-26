@@ -172,7 +172,7 @@ ligatures are being disabled:
 ```c
 // kitty/fonts.c  (shape)
 812  if (num_features && !disable_ligature) num_features--; // the last feature is always -calt
-813  hb_shape(font, harfbuzz_buffer, group_state.features, num_features);
+813  hb_shape(font, harfbuzz_buffer, fobj->ffs_hb_features, num_features);
 ```
 
 So in the default case the `-calt` entry is dropped before `hb_shape`, HarfBuzz applies its own
