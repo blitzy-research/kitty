@@ -22,9 +22,9 @@ The precise boundary is the call to the event loop. In the per-window app runner
 Two complementary tracks were used, with the **static source reading taking precedence**:
 
 1. **Static source tracing (authoritative).** Each subsystem was read directly at commit `815df1e210e0…` and every claim carries a citation. Where line numbers were ambiguous they were re-verified with `sed`/`grep` before citing.
-2. **Sanctioned build-and-run (illustrative).** kitty was compiled and launched from this exact source tree inside the provided toolchain to capture *runtime-observed* values (the GL version/renderer string, and the computed cell geometry). Runtime numbers were observed **headless under Xvfb with Mesa's software rasterizer**, so they are **environment-dependent** and are always presented next to the source location that computes them — never as intrinsic properties of kitty. No tracked source file was modified to gather them (`git status` remained clean).
+2. **Sanctioned build-and-run (illustrative).** kitty was compiled and launched from this exact source tree inside the provided toolchain to capture *runtime-observed* values (the GL **version** string, and the computed cell geometry). Runtime numbers were observed **headless under Xvfb** (where Mesa falls back to its software GL path because no GPU is present), so they are **environment-dependent** and are always presented next to the source location that computes them — never as intrinsic properties of kitty. Note that kitty captures only the GL **version** string via `glGetString(GL_VERSION)` `[kitty/gl.c:L46]` and does **not** query the GL renderer (`GL_RENDERER`) during startup. No tracked source file was modified to gather them (`git status` remained clean).
 
-> **On runtime numbers:** a value such as a GL renderer string or a DPI is a property of the *host's GPU/driver/display*, not of kitty. The code that *computes / requests* such a value is the invariant; the observed number merely illustrates one environment.
+> **On runtime numbers:** a value such as the GL version string or a DPI is a property of the *host's GPU/driver/display*, not of kitty. The code that *computes / requests* such a value is the invariant; the observed number merely illustrates one environment.
 
 ## Central causal chain (the thesis this document proves)
 
@@ -36,7 +36,7 @@ Read right-to-left this is the *initialization order*; read left-to-right it is 
 
 kitty is a **three-language** project, and the split matters for understanding startup:
 
-- **C (C11)** carries the performance-critical hot paths: the GLFW bridge `[kitty/glfw.c]`, the OpenGL loader `[kitty/gl.c]`, the font / cell-metric engine `[kitty/fonts.c]`, the VT parser, and the screen model.
+- **C (C11)** carries the performance-critical hot paths: the GLFW bridge `[kitty/glfw.c]`, the OpenGL loader `[kitty/gl.c]`, the font / cell-metric engine `[kitty/fonts.c]`, the VT parser, and the screen model. The C11 standard is enforced by the build via `std = '' if is_openbsd else '-std=c11'` `[setup.py:L492]`.
 - **Python (≥ 3.8)** carries startup *orchestration*, configuration parsing, and extensibility `[pyproject.toml:L2 requires-python = ">=3.8"]`. The startup sequence is driven from `kitty/main.py`.
 - **Go (1.22)** carries the static CLI tooling under `tools/` `[go.mod:L3 go 1.22]`; it is not on the pre-first-frame render path.
 
@@ -47,9 +47,9 @@ The consequence, visible throughout this document, is that **orchestration decis
 ## Table of contents
 
 1. [R1 — Build & launch from source](#r1--build--launch-from-source)
-2. [R2 — Early-startup trace: launcher → entry points → orchestrator](#r2--early-startup-trace-launcher--entry-points--orchestrator)
+2. [R2 — Early-startup trace: launcher to entry points to orchestrator](#r2--early-startup-trace-launcher-to-entry-points-to-orchestrator)
 3. [R3 — Rendering backend actually selected (GLFW platform + OpenGL contract + GLAD)](#r3--rendering-backend-actually-selected-glfw-platform--opengl-contract--glad)
-4. [R4 — Font system setup (discovery → rasterization → shaping → glyph cache)](#r4--font-system-setup-discovery--rasterization--shaping--glyph-cache)
+4. [R4 — Font system setup (discovery to rasterization to shaping to glyph cache)](#r4--font-system-setup-discovery-to-rasterization-to-shaping-to-glyph-cache)
 5. [R5 — Display configuration detected (content-scale, DPI, fractional scaling)](#r5--display-configuration-detected-content-scale-dpi-fractional-scaling)
 6. [R6 — Text-rendering capabilities / cell metrics](#r6--text-rendering-capabilities--cell-metrics)
 7. [R7 — The dependency chain before the first frame](#r7--the-dependency-chain-before-the-first-frame)
@@ -71,7 +71,7 @@ The canonical build is a single command, `python3 setup.py`, wired through the t
 
 > **Build note for this host:** the canonical build was run as `python3 setup.py build --ignore-compiler-warnings`. The default build uses `-Werror`; on this toolchain (gcc 15 + recent `wayland-protocols`) a `-Wswitch` warning in vendored `glfw/wl_window.c` is promoted to an error, so the project-provided `--ignore-compiler-warnings` flag is required. This is a build *option*, not a source edit.
 
-The build emits the native launcher at **`kitty/launcher/kitty`**. `build_launcher()` `[setup.py:build_launcher() L1230]` compiles the two launcher translation units — iterating over `('kitty/launcher/main.c', 'kitty/launcher/single-instance.c')` `[setup.py:L1289]` — and links them into `dest = os.path.join(launcher_dir, 'kitty')` `[setup.py:L1295]`. The application name itself is the constant `appname: str = 'kitty'` `[kitty/constants.py:L23]`.
+The build emits the native launcher at **`kitty/launcher/kitty`**. The output directory is set to `launcher_dir = 'kitty/launcher'` `[setup.py:L2099]` and passed to `build_launcher(args, launcher_dir=launcher_dir)` `[setup.py:L2120]`. `build_launcher()` `[setup.py:build_launcher() L1230]` compiles the two launcher translation units — iterating over `('kitty/launcher/main.c', 'kitty/launcher/single-instance.c')` `[setup.py:L1289]` — and links them into `dest = os.path.join(launcher_dir, 'kitty')` `[setup.py:L1295]`. The application name itself is the constant `appname: str = 'kitty'` `[kitty/constants.py:L23]`.
 
 ### Toolchain & native-library prerequisites resolved during the build
 
@@ -84,7 +84,7 @@ The build resolves native dependencies through `pkg-config`:
 
 ### How the launcher actually starts Python (source build)
 
-The compiled `kitty` binary **embeds CPython**. In a *source* build the `FROM_SOURCE` variant is compiled `[kitty/launcher/main.c:L179]`, and `run_embedded()` `[kitty/launcher/main.c:run_embedded() L177-220]` initializes the interpreter explicitly rather than going through the normal `python` startup:
+The compiled `kitty` binary **embeds CPython**. In a *source* build the build system adds `-DFROM_SOURCE` — `elif bundle_type == 'source': cppflags.append('-DFROM_SOURCE')` `[setup.py:L1251-1252]` — so the `FROM_SOURCE` variant is compiled `[kitty/launcher/main.c:L179]`, and `run_embedded()` `[kitty/launcher/main.c:run_embedded() L177-220]` initializes the interpreter explicitly rather than going through the normal `python` startup:
 
 1. `Py_PreInitialize(&preconfig)` with UTF-8 mode `[kitty/launcher/main.c:L190]`.
 2. `config.parse_argv = 0` `[kitty/launcher/main.c:L194]` (the launcher controls argv itself).
@@ -108,7 +108,7 @@ Building this tree and running the launcher reports `kitty 0.35.2 created by Kov
 
 ---
 
-## R2 — Early-startup trace: launcher → entry points → orchestrator
+## R2 — Early-startup trace: launcher to entry points to orchestrator
 
 ### The pure-Python entry (also used by `python -m kitty`)
 
@@ -253,17 +253,17 @@ Platform init backends correspondingly: `glfw/x11_init.c`, `glfw/wl_init.c`, `gl
 
 ### 6. Runtime observation
 
-The actual GL version/renderer string is formatted by `gl_version_string()` `[kitty/gl.c:gl_version_string() L41-49]` from `glGetString(GL_VERSION)` `[kitty/gl.c:L46]` plus the GLAD-detected major/minor, and printed when `--debug-rendering` is set `[kitty/gl.c:L72]`.
+The actual GL **version** string is formatted by `gl_version_string()` `[kitty/gl.c:gl_version_string() L41-49]` from `glGetString(GL_VERSION)` `[kitty/gl.c:L46]` plus the GLAD-detected major/minor, and printed when `--debug-rendering` is set `[kitty/gl.c:L72]`. `gl_version_string()` reads **only** `GL_VERSION`; it never calls `glGetString(GL_RENDERER)`, so **no renderer string is captured** by this path. (In this codebase `GL_RENDERER` appears solely as a Python-constant export, `C(GL_RENDERER)` `[kitty/shaders.c:L1258]`, and is not queried during startup.)
 
 Running this build **headless under Xvfb** with `--debug-rendering` produced:
 
 ```text
-[0.128] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
+[0.126] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
 ```
 
-Interpretation, tied to the code:
+(The leading `[0.126]` is a monotonic timestamp and varies per run.) Interpretation, tied to the code:
 
-- This is **Mesa's software rasterizer (llvmpipe) under Xvfb** — the renderer string is a property of the *host/driver/display*, **not** of kitty, and would read differently on real GPU hardware. Source of the string: `[kitty/gl.c:L46-47]`.
+- The captured value is the **`GL_VERSION` string**, not a renderer name. Its `Mesa 25.2.8-…` substring is part of what `glGetString(GL_VERSION)` returns under this Xvfb/Mesa environment; the actual **renderer** (the `GL_RENDERER` string — e.g. a software-rasterizer name on a GPU-less host) is **not captured** by `gl_version_string()` `[kitty/gl.c:L41-49]` and is therefore **environment-dependent / not recorded here**. Source of the captured string: `[kitty/gl.c:L46-47]`.
 - The `(Core Profile)` substring confirms that the forward-compatible request `[kitty/glfw.c:L1129]` yields a **core profile** here.
 - kitty requested GL major 3 / minor 1 on Linux `[kitty/data-types.h:L20-24]`; the driver provided **4.5**, which satisfies the minimum-version check `[kitty/gl.c:L73-74]` (4 ≥ 3).
 
@@ -276,7 +276,7 @@ Interpretation, tied to the code:
 ---
 
 
-## R4 — Font system setup (discovery → rasterization → shaping → glyph cache)
+## R4 — Font system setup (discovery to rasterization to shaping to glyph cache)
 
 ### Entry from the orchestrator
 
@@ -309,7 +309,7 @@ Keying the group on `(size, dpi_x, dpi_y)` is why the same configured font can p
 ### Stage 4 — Rasterization
 
 - **FreeType (Linux/BSD)** in `kitty/freetype.c`: faces are opened with `FT_New_Face(...)` `[kitty/freetype.c:L282]`, sized with `set_size_for_face(...)` `[kitty/freetype.c:set_size_for_face() L190]`, glyphs loaded with `FT_Load_Glyph(...)` `[kitty/freetype.c:L116]`, rasterized in `render_bitmap(...)` `[kitty/freetype.c:render_bitmap() L507]`, and laid into cells by `render_glyphs_in_cells(...)` `[kitty/freetype.c:render_glyphs_in_cells() L675]`.
-- **CoreText (macOS)** rasterizes via `kitty/core_text.m`.
+- **CoreText (macOS)** rasterizes via `kitty/core_text.m`: `render_glyphs()` `[kitty/core_text.m:render_glyphs() L700-710]` draws into a gray `CGBitmapContextCreate` buffer `[kitty/core_text.m:L704]` with `CTFontDrawGlyphs(...)` `[kitty/core_text.m:L709]`, reached from the cell-layout entry `render_glyphs_in_cells()` `[kitty/core_text.m:render_glyphs_in_cells() L918-922]`.
 
 ### Stage 5 — Shaping (HarfBuzz)
 
@@ -317,7 +317,7 @@ Shaping uses a process-wide HarfBuzz buffer `harfbuzz_buffer` `[kitty/fonts.c:L4
 
 ### Stage 6 — Glyph cache / GPU texture atlas
 
-Shaped, rasterized glyphs are cached as sprites in a hash table: `find_or_create_sprite_position(...)` `[kitty/glyph-cache.c:find_or_create_sprite_position() L34]` (entry type `SpritePosition` via `SpritePositionHead` `[kitty/glyph-cache.c:L13]`) and `find_or_create_glyph_properties(...)` `[kitty/glyph-cache.c:L73]`. The GPU sprite map (texture atlas) is allocated **per cell size**: `send_prerendered_sprites_for_window()` `[kitty/fonts.c:send_prerendered_sprites_for_window() L1521]` calls `alloc_sprite_map(fg->cell_width, fg->cell_height)` `[kitty/fonts.c:L1524]`. sRGB-correct compositing of glyph coverage uses the gamma tables in `kitty/srgb_gamma.h`.
+Shaped, rasterized glyphs are cached as sprites in a hash table: `find_or_create_sprite_position(...)` `[kitty/glyph-cache.c:find_or_create_sprite_position() L34]` (entry type `SpritePosition` via `SpritePositionHead` `[kitty/glyph-cache.c:L13]`) and `find_or_create_glyph_properties(...)` `[kitty/glyph-cache.c:L73]`. The GPU sprite map (texture atlas) is allocated **per cell size**: `send_prerendered_sprites_for_window()` `[kitty/fonts.c:send_prerendered_sprites_for_window() L1521]` calls `alloc_sprite_map(fg->cell_width, fg->cell_height)` `[kitty/fonts.c:L1524]`. sRGB-correct compositing of glyph coverage uses the gamma tables in `kitty/srgb_gamma.h`, included by the shader layer at `[kitty/shaders.c:L13]`; the per-channel lookup is `srgb_color()` → `srgb_lut[color]` `[kitty/shaders.c:L35-36]`, and the LUT is uploaded to the cell and border shader programs as the `gamma_lut` uniform `[kitty/shaders.c:L226]`, `[kitty/shaders.c:L1086]`.
 
 ### Rationale — *why* this pipeline
 
@@ -358,7 +358,7 @@ So **on macOS the factor is 72.0** and **on Linux/BSD it is 96.0** `[kitty/glfw.
 
 ### Fractional scaling (Wayland)
 
-On Wayland the compositor only delivers the scale **after** the surface is shown, so kitty cannot use a temporary window there. Instead it reads the **primary-monitor / focused-window** scale up-front `[kitty/glfw.c:L1187-1196]`, then re-reads after the window is shown and **reloads fonts if the DPI changed** `[kitty/glfw.c:L1232-1239]`. (Wayland fractional scaling is delivered via the `fractional-scale-v1` protocol; the code here is authoritative for kitty's handling of it.)
+On Wayland the compositor only delivers the scale **after** the surface is shown, so kitty cannot use a temporary window there. Instead it reads the **primary-monitor / focused-window** scale up-front `[kitty/glfw.c:L1187-1196]`, then re-reads after the window is shown and **reloads fonts if the DPI changed** `[kitty/glfw.c:L1232-1239]`. Wayland fractional scaling uses the `fractional-scale-v1` protocol: the manager is bound in the registry handler via `wl_registry_bind(..., &wp_fractional_scale_manager_v1_interface, 1)` `[glfw/wl_init.c:L585-586]`; a per-surface object is then created and a listener attached `[glfw/wl_window.c:L590-596]`; and the compositor-preferred scale arrives in the `fractional_scale_preferred_scale()` listener callback `[glfw/wl_window.c:L545-560]`.
 
 ### points → pixels conversion
 
@@ -440,8 +440,9 @@ This is where the thesis is proven. Walking the actual startup path inside `crea
 4. **Inside `load_fonts_data`.** `load_fonts_data(double font_sz_in_pts, double dpi_x, double dpi_y)` `[kitty/fonts.c:load_fonts_data() L1530]` → `font_group_for(...)` `[kitty/fonts.c:L1531]` → (on a new group) `initialize_font_group(...)` `[kitty/fonts.c:L1495]` → `calc_cell_metrics(...)` `[kitty/fonts.c:L1511]` → fills `cell_width / cell_height / baseline / underline_* / strikethrough_*` `[kitty/fonts.c:L419-420]`.
 5. **Size the real window from the cells, then create GL.** The window pixel size is computed from the cell metrics via `get_window_size(...)` `[kitty/glfw.c:L1203]`; the **real window** is created `[kitty/glfw.c:L1208]`, the temp window destroyed `[kitty/glfw.c:L1209]`, the context made current `[kitty/glfw.c:L1211]`, **`gl_init()` (GLAD)** run `[kitty/glfw.c:L1212]`, and `glEnable(GL_FRAMEBUFFER_SRGB)` set `[kitty/glfw.c:L1214]`.
 6. **Compile shaders (first window).** The `load_programs` callback — which is `load_all_shaders` `[kitty/main.py:load_all_shaders() L82-87]` — is invoked `[kitty/glfw.c:L1242-1245]`.
+7. **Allocate the glyph atlas and pre-render the initial sprites (still pre-first-frame).** The created window's font data is bound — `w->fonts_data = fonts_data` `[kitty/glfw.c:L1264]` — and then, **before `create_os_window()` returns**, `send_prerendered_sprites_for_window(w)` `[kitty/glfw.c:L1273]` runs. That function `[kitty/fonts.c:send_prerendered_sprites_for_window() L1521-1527]` allocates the GPU sprite map (texture atlas) sized to the cell via `alloc_sprite_map(fg->cell_width, fg->cell_height)` `[kitty/fonts.c:L1524]` (defined at `[kitty/shaders.c:alloc_sprite_map() L51]`, declared `[kitty/data-types.h:L426]`), then calls `send_prerendered_sprites(fg)` `[kitty/fonts.c:L1525]`. `send_prerendered_sprites()` `[kitty/fonts.c:send_prerendered_sprites() L1449-1473]` renders the blank cell and the built-in sprites and **uploads each to the GPU** through the `current_send_sprite_to_gpu` macro `[kitty/fonts.c:L21]` → `send_sprite_to_gpu(...)` `[kitty/shaders.c:send_sprite_to_gpu() L147-155]`, whose `glTexSubImage3D` call `[kitty/shaders.c:L155]` performs the texture upload.
 
-After this, the cell grid and the (about-to-be-filled) glyph atlas exist, the GL pipeline is live, and control can return up to `_run_app` to start the event loop `[kitty/main.py:L234]` that draws the first frame.
+After this, the cell grid **and the populated glyph atlas** exist (the initial sprites were uploaded to the GPU in step 7), the GL pipeline is live, and control can return up to `_run_app` to start the event loop `[kitty/main.py:L234]` that draws the first frame.
 
 ### The points→pixels coupling (why DPI propagates into cell metrics)
 
@@ -476,7 +477,7 @@ Anchored on `_main()` `[kitty/main.py:_main() L441-521]` and `create_os_window()
 3. **Signal masking** — `mask_kitty_signals_process_wide()` `[kitty/main.py:L513]` (before backend threads start).
 4. **GLFW init + backend selection** — `init_glfw(...)` `[kitty/main.py:L514]`, backend chosen at `[kitty/main.py:L96]`.
 5. **Box-drawing scale + font registration** — `set_scale(...)` `[kitty/main.py:L248]`, `set_font_family(...)` `[kitty/main.py:L251]` (font discovery + descriptor registration; no metrics yet).
-6. **`create_os_window`** — GL hints `[kitty/glfw.c:L1127-1129]` → DPI detect via temp window `[kitty/glfw.c:L1198-1200]` → `load_fonts_data` → `calc_cell_metrics` `[kitty/glfw.c:L1202]`, `[kitty/fonts.c:L373-422]` → real window `[kitty/glfw.c:L1208]` → `gl_init` (GLAD) `[kitty/glfw.c:L1212]`, `[kitty/gl.c:L51-77]` → shader compile `[kitty/glfw.c:L1242-1245]`.
+6. **`create_os_window`** — GL hints `[kitty/glfw.c:L1127-1129]` → DPI detect via temp window `[kitty/glfw.c:L1198-1200]` → `load_fonts_data` → `calc_cell_metrics` `[kitty/glfw.c:L1202]`, `[kitty/fonts.c:L373-422]` → real window `[kitty/glfw.c:L1208]` → `gl_init` (GLAD) `[kitty/glfw.c:L1212]`, `[kitty/gl.c:L51-77]` → shader compile `[kitty/glfw.c:L1242-1245]` → bind `w->fonts_data` `[kitty/glfw.c:L1264]` → **allocate glyph atlas + pre-render initial sprites to the GPU** via `send_prerendered_sprites_for_window` `[kitty/glfw.c:L1273]` → `alloc_sprite_map` `[kitty/fonts.c:L1524]` + `send_prerendered_sprites` `[kitty/fonts.c:L1525]`, `[kitty/fonts.c:L1449-1473]` → GPU upload `[kitty/shaders.c:L147-155]`.
 7. **Boss created** — `boss = Boss(...)` `[kitty/main.py:L226]`, then `boss.start(...)` `[kitty/main.py:L227]`.
 8. **Event loop** — `boss.child_monitor.main_loop()` `[kitty/main.py:L234]` → **first frame**.
 9. **Shutdown ordering** — `boss.destroy()` `[kitty/main.py:L236]`, then `free_font_data()` `[kitty/main.py:L255]` (must precede GL/FreeType/FontConfig finalize), then `glfw_terminate()` `[kitty/main.py:L520]`.
@@ -497,7 +498,7 @@ Runtime values were captured **headless under Xvfb with Mesa software GL at `fon
 | Font pixel size | `font_sz_in_pts · ydpi / 72` | `[kitty/glfw.c:L671]` | ≈ `14.67 px` |
 | `cell_width` / `cell_height` | `calc_cell_metrics` stores | `[kitty/fonts.c:L419]` | `9 px` / `18 px` |
 | `baseline` / underline / strikethrough | `calc_cell_metrics` stores | `[kitty/fonts.c:L420]` | font+DPI-dependent |
-| Runtime GL version / renderer string | `gl_version_string()` (`glGetString(GL_VERSION)`) | `[kitty/gl.c:L46-47]` | `'4.5 (Core Profile) Mesa 25.2.8-…'` |
+| Runtime GL **version** string (renderer **not** captured) | `gl_version_string()` — `glGetString(GL_VERSION)` only | `[kitty/gl.c:L46-47]` | `'4.5 (Core Profile) Mesa 25.2.8-…'` |
 
 ### Rationale — *why* this is the order
 
@@ -526,9 +527,11 @@ graph TD
     K --> L["Size real window from cells<br/>get_window_size<br/>glfw.c:L1203-1208"]
     L --> M["gl_init: GLAD loads GL pointers<br/>enforce min version<br/>glfw.c:L1212 / gl.c:L51-77"]
     M --> N["Compile shaders<br/>load_all_shaders / load_programs<br/>glfw.c:L1242-1245 / main.py:L82-87"]
-    N --> O["Cell grid + glyph atlas ready<br/>first frame can render<br/>main.py:main_loop L234"]
+    N --> P["Bind fonts_data + pre-render glyph atlas<br/>send_prerendered_sprites_for_window<br/>alloc_sprite_map + GPU upload (glTexSubImage3D)<br/>glfw.c:L1264,L1273 / fonts.c:L1521-1527,L1449-1473 / shaders.c:L51,L147-155"]
+    P --> O["Cell grid + glyph atlas populated<br/>first frame can render<br/>main.py:main_loop L234"]
     %% Causal chain: cell metrics depend on font metrics + DPI, which depend on
     %% the window/monitor, which depends on the selected GLFW backend.
+    %% Pre-render step (N->P->O) fills the glyph atlas on the GPU before the first frame.
 ```
 
 ### Edge cases / failure modes
@@ -551,7 +554,7 @@ kitty fails **loudly and early** rather than degrading; each guard has a single 
 ## Methodology & limitations
 
 - **Static-source-grounded facts (authoritative):** every backend-selection rule, OpenGL contract, DPI formula, font-pipeline stage, and cell-metric computation cited above was read directly from the source at commit `815df1e210e0…`. These are invariant properties of this codebase.
-- **Runtime-observed facts (illustrative):** the GL version/renderer string (`'4.5 (Core Profile) Mesa 25.2.8-…'`) and the cell geometry (`9 × 18 px` at `font_size=11`, content-scale `1.0`, `96` DPI) were captured by building this tree and running the launcher **headless under Xvfb with Mesa's software rasterizer**. These numbers depend on the **host's GPU/driver/display** and would differ on other hardware (e.g. a real GPU would report a vendor renderer string; a HiDPI display would report a higher content-scale and DPI, and a correspondingly larger cell). Each runtime number is presented next to the source location that computes it.
+- **Runtime-observed facts (illustrative):** the GL **version** string (`'4.5 (Core Profile) Mesa 25.2.8-…'`, from `glGetString(GL_VERSION)` `[kitty/gl.c:L46]`) and the cell geometry (`9 × 18 px` at `font_size=11`, content-scale `1.0`, `96` DPI) were captured by building this tree and running the launcher **headless under Xvfb** (where Mesa uses its software GL path because no GPU is present). These numbers depend on the **host's GPU/driver/display** and would differ on other hardware (e.g. a real GPU would report a different `GL_VERSION` string; the GL **renderer** (`GL_RENDERER`) is **not** captured by kitty's startup path `[kitty/gl.c:L41-49]`; a HiDPI display would report a higher content-scale and DPI, and a correspondingly larger cell). Each runtime number is presented next to the source location that computes it.
 - **Platform coverage:** the analysis covers **macOS (Cocoa / NSGL)** and **Linux/BSD (X11 / GLX and Wayland / EGL)**. kitty has **no Windows windowing backend**, so none is described.
 - **No source modification:** producing this document did **not** modify any tracked source file. The build/run used to gather runtime evidence is non-mutating (all build artifacts are git-ignored), and `git status` showed only this new document under `blitzy/documentation/`.
 
