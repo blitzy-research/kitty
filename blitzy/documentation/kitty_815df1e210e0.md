@@ -15,18 +15,22 @@
 | Repository | `kitty` (terminal emulator, Kovid Goyal) |
 | HEAD commit | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` |
 | Document filename | `kitty_815df1e210e0.md` — derived from the source branch name `kitty_815df1e210e0` (the `<source_branch_name>.md` rule) |
-| Build driver | `python3 setup.py` (a C extension + the Go `kitten` binary; `pyproject.toml` declares `requires-python = ">=3.8"`, `go.mod` declares `go 1.22`) |
+| Reference image (build/run env) | `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`) — the authoritative toolchain + native-library environment |
+| Build command (run + result) | `python3 setup.py --ignore-compiler-warnings` — **executed in this environment and succeeded (exit code 0)**, finishing with `Linking kitty/fast_data_types ... done`. Builds a C extension + the Go `kitten` binary (`pyproject.toml` `requires-python = ">=3.8"`, `go.mod` `go 1.22`). The `--ignore-compiler-warnings` flag is **required** on this host because wayland-protocols 1.45 adds `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values that trip `-Werror=switch` in `glfw/wl_window.c` (system-library drift, not a code defect). All build artifacts are git-ignored, so the source tree stays clean. |
 | Toolchain present | gcc 15.2.0, Python 3.13.7, Go 1.23.4, pkg-config; native libs HarfBuzz, FreeType, FontConfig, libpng, OpenGL/Mesa, GLFW |
 | GPU / GL backend | Mesa **llvmpipe** software rasterizer (`LLVM 20.1.8`), OpenGL **4.5 (Core Profile)** |
-| Headless mechanism | `xvfb-run` virtual X server (no physical display) |
+| Headless mechanism (actual) | `xvfb-run` virtual X server (`DISPLAY=:99`, no physical display) → kitty selects the **GLFW X11 backend** (`glfw-x11.so`) because `WAYLAND_DISPLAY` is unset and this is not macOS (`init_glfw`, `kitty/main.py:96`; `detect_if_wayland_ok`, `kitty/constants.py:196-204`). Confirmed live by `debug_config`'s `Running under: X11` line (see Q2). |
+| Headless backend vs AAP plan | The AAP anticipated the **GLFW Null / OSMesa** backend for headless runs. `libOSMesa.so` *is* installed on this host, but it was **not** the path taken: `init_glfw` only ever selects `cocoa`/`wayland`/`x11`, and under `xvfb` the **x11** backend is chosen, with **llvmpipe** supplying software GL 4.5. GLFW-Null/OSMesa is a valid alternative headless route but is not what produced the captures below. |
 | Resolved default font | `font_family monospace` → **DejaVu Sans Mono** on this host |
 
 ### How the diagnostics were produced
 
-kitty was already compiled in the environment (artifacts `kitty/launcher/kitty`,
-`kitty/fast_data_types.so`, `kitty/glfw-*.so` — all git-ignored). All verbose output was enabled
-through **runtime CLI flags only**; no source default was changed and **no `kitty.conf` was
-written**. Runs were isolated to throw-away directories so nothing persisted:
+kitty was built from source in this environment with `python3 setup.py --ignore-compiler-warnings`
+(exit code 0 — see the Methodology table), producing the git-ignored artifacts
+`kitty/launcher/kitty`, `kitty/fast_data_types.so`, and `kitty/glfw-x11.so`/`kitty/glfw-wayland.so`.
+All verbose output was then enabled through **runtime CLI flags only**; no source default was
+changed and **no `kitty.conf` was written**. Runs were isolated to throw-away directories so
+nothing persisted:
 
 ```sh
 export KITTY_CONFIG_DIRECTORY=/tmp/blitzy_kitty_conf   # left EMPTY → built-in defaults only
@@ -75,8 +79,10 @@ exact format of the debug font string (noted in Q2).
 
 All instrumentation was transient: CLI flags, `+runpy` scripts kept under `/tmp`, and ephemeral
 text samples persist nothing. No `kitty.conf` was created, no source default was edited, and the
-compiled artifacts are git-ignored. The completion state of the source tree is a clean
-`git status --porcelain` showing only this one new document.
+compiled artifacts are git-ignored. The delivered state of the source tree is a **clean working
+tree** — `git status --porcelain` is **empty** — with this document committed in the delivery
+commit; `git diff <baseline>..HEAD --name-status` shows exactly one change,
+`A  blitzy/documentation/kitty_815df1e210e0.md`.
 
 ---
 
@@ -92,7 +98,7 @@ configures HarfBuzz, computes metrics, and lays out the GPU atlas. The handoff i
 [`set_font_family`](../../kitty/fonts/render.py) →
 [`set_font_data`](../../kitty/fonts/render.py):
 
-```
+```python
 # kitty/fonts/render.py
 173  def set_font_family(opts: Optional[Options] = None, override_font_size: Optional[float] = None) -> None:
 ...
@@ -305,17 +311,61 @@ Font resolution happens during `set_font_family` inside `boss.start`; the diagno
 *already-resolved* faces; and only afterward does the render loop spin up. So the diagnostics
 provably reflect the selections **before** any normal text rendering.
 
-**Runtime configuration values that confirm the selections.** With no `kitty.conf`, the effective
-values are the schema defaults in `kitty/options/definition.py`: `font_family monospace` (`:35`),
-`bold_font/italic_font/bold_italic_font auto`, `force_ltr no` (`:64`), `disable_ligatures never`
-(`:115`, so `calt` stays on per Q1), empty `font_features` (`:136`), empty `symbol_map` (`:84`).
-kitty can also print these at runtime via the `debug_config` action (`kitty/debug_config.py:231`,
-emitting `OpenGL:` and a `Fonts:` block built from the same `identify_for_debug()` strings) —
-useful corroboration, though note this is a Boss method (`kitty/boss.py:3060`) reached from inside
-a running instance, **not** a `--debug-config` CLI flag (no such flag exists in
-`kitty/cli.py`; the available debug flags are `--debug-rendering`/`--debug-gl` at `:989`,
-`--debug-input`/`--debug-keyboard` at `:996`, and `--debug-font-fallback` at `:1002`). The
-authoritative "before rendering" evidence is therefore the startup `dump_font_debug()` above.
+**Runtime configuration values that confirm the selections (reproduced).** With no `kitty.conf`,
+the effective values are the schema defaults in `kitty/options/definition.py`. Driving kitty's own
+interpreter (`kitty +runpy`) to print the resolved `Options` reproduces the required confirming
+values exactly:
+
+```text
+##### Q2: RESOLVED DEFAULT CONFIG (kitty.options.types.defaults) #####
+  font_family      = FontSpec(family='', style='', postscript_name='', full_name='', system='monospace', axes=(), variable_name='', created_from_string='')
+  bold_font        = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+  italic_font      = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+  bold_italic_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+  font_size        = 11.0
+  font_features    = {}
+  force_ltr        = False
+  symbol_map       = {}
+  narrow_symbols   = {}
+  disable_ligatures = 0
+```
+
+These are precisely the values that confirm the selections *before* rendering: `font_family`
+resolves to the system `monospace` alias (→ DejaVu Sans Mono, the family shown in the `Text fonts:`
+block above); `bold_font`/`italic_font`/`bold_italic_font` are `auto` (derived from the family);
+`force_ltr` is `False` (so per-run RTL applies, per Q1); `font_features`, `symbol_map`, and
+`narrow_symbols` are all empty; and `disable_ligatures` is `0` (the `never` enum, so `calt` stays
+on). Schema locators: `font_family` `:35`, `force_ltr` `:64`, `symbol_map` `:84`, `narrow_symbols`
+`:99`, `disable_ligatures` `:115`, `font_features` `:136`.
+
+The same resolved faces are independently confirmed by kitty's `debug_config` action
+(`kitty/debug_config.py:231`), reproduced here against the default options (the version/uname/lsb
+header lines it also prints are elided for brevity):
+
+```text
+Running under: X11
+OpenGL:
+Frozen: False
+Fonts:
+  medium: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
+  bold: DejaVuSansMono-Bold: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:0
+  italic: DejaVuSansMono-Oblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf:0
+  bi: DejaVuSansMono-BoldOblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf:0
+```
+
+The `Fonts:` block — built from the same `identify_for_debug()` strings as `dump_font_debug`
+(`kitty/debug_config.py:260-263`) — shows `medium/bold/italic/bi` all resolved to the DejaVu Sans
+Mono family, matching the `Text fonts:` capture earlier in this answer. (`OpenGL:` is blank in *this*
+particular dump only because it was produced inside the font-test harness, which has no live GL
+context; the live string `'4.5 (Core Profile) Mesa 25.2.8-…'` is the one captured in the
+`--debug-gl` run in Q4. `Running under: X11` reflects the xvfb/X11 GLFW backend actually used — see
+Methodology.) Note that `debug_config` is a **Boss runtime method** (`kitty/boss.py:3060`) reached
+from inside a running instance, **not** a `--debug-config` CLI flag: no such flag exists in
+`kitty/cli.py`, where the available debug flags are `--debug-rendering`/`--debug-gl` at `:989`,
+`--debug-input`/`--debug-keyboard` at `:996`, and `--debug-font-fallback` at `:1002`. Because
+`dump_font_debug()` is invoked at `kitty/main.py:228-229` *before* the render loop, the
+authoritative "before rendering" evidence is that startup dump, and the resolved option values
+above corroborate it.
 
 
 ---
@@ -412,10 +462,14 @@ here, so the raw font-derived values stand.
 pre-rendered decoration sprites are the **underline styles** (straight, double, curly, dotted,
 dashed — `render_special` dispatch at `kitty/fonts/render.py:317`), the **strikethrough**, the
 **missing-glyph** box, and three **cursor** glyphs (`prerender_function`, `:364-391`). There is
-**no separate "overline" sprite** in this pre-render set — an SGR overline is drawn directly in the
-fragment shader rather than via a cell sprite. So in startup *debug output* the overline has no
-distinct metric; the relevant decoration metrics are the underline/strikethrough position and
-thickness above.
+**no separate "overline" sprite** in this pre-render set, and — verified by a repository-wide
+search at this revision — **no source-supported overline rendering path exists at all**: the only
+`overline` token anywhere in the tree is an unrelated X11 keysym→Unicode mapping
+(`glfw/xkb-compat-shim.h:135`), and the cell shaders sample only underline and strikethrough
+sprites (`underline_pos`/`strike_pos`, `kitty/cell_vertex.glsl:183-185`; the
+`// ... decorations (cursor, underline, strikethrough)` blend at `kitty/cell_fragment.glsl:129-136`).
+So in startup *debug output* the overline simply has no distinct metric; the decoration metrics
+that do appear are the underline/strikethrough position and thickness above.
 
 **Grapheme clusters do not change the grid math.** Combining marks are stored on the base cell in
 `cc_idx[]` (`kitty/line.c`) and re-emitted into the shaping run via `codepoint_for_mark`; a wide
@@ -523,12 +577,20 @@ and sets `*error = 2` once `z >= MIN(UINT16_MAX, max_array_len)`. The tiny-textu
 reproduces this precisely: with `xnum=4, max_y=2`, slot assignment fills row 0, then row 1, then
 jumps to layer `z=1`.
 
-**Primary and fallback glyphs share one atlas.** Sprite positions are keyed on the shaped glyph(s)
-via the glyph cache (`SpritePosition` in `kitty/glyph-cache.h:13-19`,
-`find_or_create_sprite_position` `:23-24`). The key is the glyph index/ligature/cell-count tuple, not
-the font, so glyphs from the configured family and from fallback faces (e.g. the `Noto Sans CJK
-JP` and `Noto Color Emoji` faces seen in Q2) all consume slots from the same `(x,y,z)` sequence as
-they are first shaped.
+**Primary and fallback glyphs share one atlas — but the cache table is per-font.** The sharing is
+at the *allocator* level, not the *lookup* level, and the distinction matters. Each `Font` owns its
+**own** sprite-position cache — a per-`Font` member `SpritePosition *sprite_position_hash_table`
+(`kitty/fonts.c:61`) — keyed by the **glyph-id(s) / ligature-index / cell-count** tuple
+(`find_or_create_sprite_position(&font->sprite_position_hash_table, glyphs, glyph_count,
+ligature_index, cell_count, …)`, `kitty/fonts.c:259`; key fields in `SpritePositionHead`,
+`kitty/glyph-cache.h:13-24`). What *is* shared is the enclosing `FontGroup`'s **single** sprite
+tracker (`GPUSpriteTracker sprite_tracker`, `kitty/fonts.c:88`): when a glyph key is first inserted
+into a given font's table (`created == true`), `sprite_position_for` (`kitty/fonts.c:256-266`)
+stamps the new entry with the tracker's *current* `(x, y, z)` and then calls `do_increment`
+(`kitty/fonts.c:242-253`) to advance that one shared cursor. So glyphs from the configured family
+and from fallback faces (e.g. the `Noto Sans CJK JP` and `Noto Color Emoji` faces seen in Q2) each
+keep their own per-font lookup table, yet they all draw their slots from the **same** `(x, y, z)`
+sequence in the **same** atlas, in the order they are first shaped.
 
 **Readiness: the GL version line is the "atlas is ready" signal.** `kitty/gl.c:72` prints the
 GL version string under `--debug-rendering`/`--debug-gl` once the context is created and the
@@ -559,8 +621,11 @@ that is the truthful readiness log for this headless run, and the absence of the
 
 - **No dedicated "overline" decoration sprite** exists in the startup pre-render set
   (`prerender_function`, `kitty/fonts/render.py:364`). The pre-rendered decorations are the
-  underline styles, strikethrough, missing-glyph box, and cursor glyphs; an SGR overline is drawn
-  in the shader, so it has no distinct cell-metric in debug output (Q3).
+  underline styles, strikethrough, missing-glyph box, and cursor glyphs; a repository-wide search
+  at this revision found **no source-supported overline rendering path** (the cell shaders sample
+  only underline and strikethrough sprites — `kitty/cell_vertex.glsl:183-185`,
+  `kitty/cell_fragment.glsl:129-136`), so the overline has no distinct cell-metric in debug output
+  (Q3).
 
 - **Headless / software-renderer caveats.** Runs used `xvfb` + Mesa **llvmpipe**, so the GL
   readiness string (Q4) names a software renderer; the device texture maxima (16384 / 2048) and
@@ -583,7 +648,9 @@ that is the truthful readiness log for this headless run, and the absence of the
 
 - **Restoration.** All instrumentation was via runtime CLI flags and ephemeral, out-of-tree
   `+runpy` scripts and text samples. No `kitty.conf` was written and no source default was changed;
-  compiled artifacts are git-ignored. The source tree ends clean apart from this single document.
+  compiled artifacts are git-ignored. `git status --porcelain` is empty (clean working tree) and
+  `git diff <baseline>..HEAD --name-status` reports only
+  `A  blitzy/documentation/kitty_815df1e210e0.md`.
 
 ---
 
@@ -594,12 +661,13 @@ For convenience, the principal locators cited above (verified against HEAD
 
 | File | Lines | Role |
 |------|-------|------|
-| `kitty/fonts.c` | 18, 42, 44, 45, 237-253, 257, 268-280, 294-325, 457-468, 481-492, 672-688, 786-813, 373-419, 1458, 1755-1757 | shaping features, fallback, metrics finalization, atlas tracker |
+| `kitty/fonts.c` | 18, 42, 44, 45, 61, 88, 237-280, 294-325, 457-468, 481-492, 672-688, 786-813, 373-419, 1458, 1755-1757 | shaping features, fallback, metrics finalization, atlas tracker, per-font glyph cache + shared sprite tracker |
 | `kitty/fonts/render.py` | 161-170, 173-191, 203-317, 364-401 | Python orchestration, debug dump, decoration sprites |
 | `kitty/freetype.c` | 92, 387-403, 738-742 | unit→pixel, cell metrics, debug font string (Linux) |
 | `kitty/core_text.m` | 96, 966-967 | CoreText font string (macOS) |
 | `kitty/fontconfig.c` | 276, 312, 362-364, 444, 463 | Linux font matching / fallback |
 | `kitty/shaders.c` | 32, 51-69, 86-90 | GL-limit query, atlas allocation, copy-path warning |
+| `kitty/cell_vertex.glsl` / `cell_fragment.glsl` | vtx:183-185; frag:129-136 | decoration sprite sampling — underline + strikethrough only (no overline path) |
 | `kitty/gl.c` | 42-48, 72 | GL version readiness log |
 | `kitty/glyph-cache.h` / `.c` | h:13-24, c:34-53 | glyph→sprite-position cache |
 | `kitty/main.py` | 227-234, 249 | startup ordering, flag wiring |
