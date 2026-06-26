@@ -3,7 +3,7 @@
 > **Research deliverable** — a code-archaeology analysis of the [`kovidgoyal/kitty`](https://github.com/kovidgoyal/kitty) terminal emulator.
 >
 > **Commit under analysis:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`).
-> Every line/symbol citation in this document resolves against this commit. Where a citation is given as `[path:Lxxx]`, the line number was verified against the source at this exact commit; should a different checkout shift line numbers, resolve the citation by the named function/symbol and against this commit.
+> Every line/symbol citation in this document resolves against this commit. Citations are written inline in the form `path:Lnnn` (a source file path and an `L`-prefixed line number); each line number was verified against the source at this exact commit. Should a different checkout shift line numbers, resolve the citation by its named function/symbol against this commit.
 >
 > **Nature of this document:** This is an analysis-only deliverable. It changes no product behavior, adds no code, and is grounded entirely in kitty's own source — *the code is the source of truth*. The single external reference used (the Linux `TIOCSWINSZ(2const)` man page) is cited only to validate the kernel-level PTY-resize → `SIGWINCH` mechanism that kitty builds upon.
 
@@ -378,7 +378,7 @@ If neither list contains the id (`fd == -1`), `resize_pty` does **not** raise �
 
 ### 4.3 Mechanism: stale-fd `ioctl` tolerance
 
-Even when an fd *is* found, it may be stale — the child may have died and the fd been closed between the lookup and the ioctl, on another thread. `pty_resize` tolerates this:
+Even when an fd *is* found, the descriptor may no longer be a usable tty by the time the `ioctl` actually runs — so `pty_resize` tolerates `EBADF` and `ENOTTY` defensively rather than treating them as errors:
 
 ```c
 if (ioctl(fd, TIOCSWINSZ, dim) == -1) {
@@ -399,7 +399,7 @@ The unifying rationale is that kitty treats "target absent / fd stale" as an **o
 
 - The **id indirection** — every cross-layer reference keys off the integer `self.id` `[kitty/window.py:L587]`, and the C resize path looks the child up *by that id* `[kitty/child-monitor.c:L606-L607]` rather than following a raw pointer — means a stale id can only "find nothing"; it can never dereference freed memory.
 - The **dual-list scan** `[kitty/child-monitor.c:L606-L607]` closes the specific window of inconsistency created by R1's enqueue → promote split: a child known to Python but not yet in `children[]` is still found in `add_queue[]`.
-- The **errno tolerance** `[kitty/child-monitor.c:L581]` closes the residual race where the fd was valid at lookup but closed before the ioctl.
+- The **errno tolerance** `[kitty/child-monitor.c:L581]` absorbs fd-level staleness *defensively*: `resize_pty` actually holds `children_mutex` across both the lookup and the `ioctl` `[kitty/child-monitor.c:L598-L611]`, and the only fd-closing path (`cleanup_child`'s `safe_close`, reached through `remove_children`) runs under that *same* mutex `[kitty/child-monitor.c:L1306-L1309,L1492-L1495]` — so kitty's own teardown cannot close this fd between lookup and ioctl. The `EBADF`/`ENOTTY` tolerance therefore guards the case where the located descriptor is simply no longer a valid tty when `ioctl(TIOCSWINSZ)` executes, not an intra-kitty lookup-vs-close race.
 
 The three guards are layered defensively from cheapest to most specific: the Python `destroyed` check `[kitty/window.py:L851-L852]` drops most stale work before it crosses into C; the dual-list no-op `[kitty/child-monitor.c:L610]` absorbs id-level absence; and the ioctl errno tolerance `[kitty/child-monitor.c:L581]` absorbs fd-level staleness that slips past the first two.
 
@@ -460,7 +460,7 @@ The keep/discard split is principled:
 - **Kept:** the already-parsed screen content — scrollback and the last frame — because the flush parse `[kitty/child-monitor.c:L521]` runs *before* teardown. A user who runs a command that prints output and then exits still sees that output; it is not lost to a race between "child exited" and "window torn down."
 - **Discarded:** the live PTY file descriptor and the per-child C bookkeeping slot, released by `cleanup_child` (closing the fd) and `FREE_CHILD` `[kitty/child-monitor.c:L525]`, plus the Python-side cycle broken in `Window.destroy` `[kitty/window.py:L1570-L1571]`.
 
-The reason refcounting is used rather than a simpler "free on death" is the multi-threading: the I/O thread can still be mid-parse of a screen at the moment the Main thread decides to tear it down. The `INCREF_CHILD` at enqueue `[kitty/child-monitor.c:L316]` and the matching `FREE_CHILD` — which is a `Py_CLEAR` `[kitty/child-monitor.c:L105-L106]` — at death `[kitty/child-monitor.c:L525]` bracket the screen's cross-thread visibility; combined with the per-pass `INCREF_CHILD` `[kitty/child-monitor.c:L480]` / `DECREF_CHILD` `[kitty/child-monitor.c:L528-L532]` around each parse, every `Py_INCREF` is matched by a `Py_DECREF`. From these balanced refcount operations it follows that the `Screen`'s Python refcount only reaches zero — the point at which CPython deallocates the object — once no thread still holds a reference; we therefore infer the screen is released exactly once, and never while a parse is in flight.
+The reason refcounting is used rather than a simpler "free on death" is the multi-threading: the `Screen` is shared between the **I/O thread**, which reads PTY bytes into the parser's write buffer via `read_bytes` `[kitty/child-monitor.c:L1337,L1531]` (it reads, it does not parse), and the **Main thread**, which performs the actual parsing via `do_parse` inside `parse_input` `[kitty/child-monitor.c:L450-L451,L521,L530]`. Because `parse_input` snapshots the child entries under the mutex and then parses (or finalizes) them *after releasing the mutex* `[kitty/child-monitor.c:L478-L483]`, the I/O thread can be concurrently reading into — or, on EOF/`SIGCHLD`, marking for removal `[kitty/child-monitor.c:L1532-L1536]` — the very screen the Main thread is about to tear down. The `INCREF_CHILD` at enqueue `[kitty/child-monitor.c:L316]` and the matching `FREE_CHILD` — which is a `Py_CLEAR` `[kitty/child-monitor.c:L105-L106]` — at death `[kitty/child-monitor.c:L525]` bracket the screen's cross-thread visibility; combined with the per-pass `INCREF_CHILD` `[kitty/child-monitor.c:L480]` / `DECREF_CHILD` `[kitty/child-monitor.c:L528-L532]` around each parse, every `Py_INCREF` is matched by a `Py_DECREF`. From these balanced refcount operations it follows that the `Screen`'s Python refcount only reaches zero — the point at which CPython deallocates the object — once no thread still holds a reference; we therefore infer the screen is released exactly once, and never while a parse is in flight.
 
 ---
 
