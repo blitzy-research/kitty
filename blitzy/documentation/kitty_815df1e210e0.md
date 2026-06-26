@@ -13,7 +13,7 @@
 >
 > **A font selection made through `choose-fonts` is _persisted_, not session-only.** Pressing **`Enter`** at the final confirmation step writes the four font settings into **`kitty.conf` on disk**, so the choice **is remembered across restarts**. The `SIGUSR1` "reload" that follows is a *separate, conditional* step that only makes the already-persisted change take effect **immediately** in the running session — it is **not** what makes the choice durable. The alternative **`s`** action writes the settings to **STDOUT only** (manual/session use; `kitty.conf` is left untouched). Even **`--reload-in none`** still persists to disk — it merely skips the live reload.
 
-**Methodology.** Every behavioral claim below is grounded in the source code with a `[path:locator]` citation and a short snippet; **the code is the source of truth**. Where the current upstream documentation diverges from this commit, the code prevails and the divergence is flagged explicitly (see [§6](#section-6--rationale-methodology--version-drift)). The runtime outputs shown are **confirming evidence produced by running the actual production code** in this environment (the real `kitten` binary and a direct call into the real `tools/config.Patcher.Patch`); the full GUI build/run is also reproducible in the user-provided Docker image (see [Appendix B](#appendix-b--reproducible-runtime-experiment-isolated--self-cleaning)). All runtime experiments are isolated to a throwaway `KITTY_CONFIG_DIRECTORY`; the user's real `~/.config/kitty/kitty.conf` is never touched, and the kitty source tree is left byte-for-byte unchanged.
+**Methodology.** Every behavioral claim below is grounded in the source code with a `[path:locator]` citation and a short snippet; **the code is the source of truth**. Where the current upstream documentation diverges from this commit, the code prevails and the divergence is flagged explicitly (see [§6](#section-6--rationale-methodology--version-drift)). The runtime outputs shown are **confirming evidence produced by running the actual production code** in this environment (the real `kitten` binary and a direct call into the real `tools/config.Patcher.Patch`); the full GUI build/run is also reproducible in the user-provided Docker image (see [Appendix B](#appendix-b--reproducible-runtime-experiment-isolated-self-cleaning)). All runtime experiments are isolated to a throwaway `KITTY_CONFIG_DIRECTORY`; the user's real `~/.config/kitty/kitty.conf` is never touched, and the kitty source tree is left byte-for-byte unchanged.
 
 ---
 
@@ -26,7 +26,8 @@
 5. [Persistence across restarts — the core answer (R5)](#section-5--persistence-across-restarts--the-core-answer)
 6. [Rationale, methodology & version-drift note](#section-6--rationale-methodology--version-drift)
 - [Appendix A — Architecture: Go kitten + Python backend](#appendix-a--architecture-go-kitten--python-backend)
-- [Appendix B — Reproducible runtime experiment (isolated, self-cleaning)](#appendix-b--reproducible-runtime-experiment-isolated--self-cleaning)
+- [Appendix B — Reproducible runtime experiment (isolated, self-cleaning)](#appendix-b--reproducible-runtime-experiment-isolated-self-cleaning)
+- [Appendix C — Live runtime capture (real production code)](#appendix-c--live-runtime-capture-real-production-code)
 
 ---
 
@@ -101,7 +102,7 @@ At the shell prompt of that kitty window, run:
 kitten choose-fonts
 ```
 
-Running it *inside* the instance matters: the kitten reads the parent's process id from `$KITTY_PID` to deliver its post-write reload signal (see [§4](#43-where-kittyconf-lives--utilsconfigdir) and [§4.4](#44-reload-semantics--configreloadconfiginkitty)).
+Running it *inside* the instance matters: the kitten reads the parent's process id from `$KITTY_PID` to deliver its post-write reload signal (see [§4.3.1](#431-where-kittyconf-lives--utilsconfigdir) and [§4.4](#44-reload-semantics--configreloadconfiginkitty)).
 
 ### 1.6 Rationale ("thinking")
 
@@ -504,7 +505,7 @@ var ConfigDir = sync.OnceValue(func() (config_dir string) {
 ```
 `[tools/utils/paths.go:L88-L134]`
 
-This `$KITTY_CONFIG_DIRECTORY`-first resolution `[paths.go:L88-L90]` is precisely the redirection point the runtime experiment uses to isolate all writes into a throwaway directory (see [Appendix B](#appendix-b--reproducible-runtime-experiment-isolated--self-cleaning)).
+This `$KITTY_CONFIG_DIRECTORY`-first resolution `[paths.go:L88-L90]` is precisely the redirection point the runtime experiment uses to isolate all writes into a throwaway directory (see [Appendix B](#appendix-b--reproducible-runtime-experiment-isolated-self-cleaning)).
 
 ### 4.4 Reload semantics — `config.ReloadConfigInKitty`
 
@@ -529,9 +530,9 @@ Mapping to `--reload-in`:
 
 The critical observation: `--reload-in none` falls through the `switch` in the Enter branch with no case `[final.go:L86-L93]`, so **no signal is sent — yet the on-disk patch has already happened**. This cleanly separates "persistence" (always, via the write) from "live reload" (optional).
 
-### 4.5 Output evidence (captured from the real `Patcher.Patch`)
+### 4.5 Output evidence — algorithm-accurate simulation of `Patcher.Patch`
 
-The following outputs were produced by invoking the **actual `tools/config.Patcher.Patch` code** from this commit against an isolated temporary directory (not a hand-written simulation). They show the exact on-disk result.
+The blocks below are an **algorithm-accurate simulation** of `tools/config.Patcher.Patch`: they trace, step by step, the exact transformations the `Patch` algorithm performs — comment-out of any prior `font_*` keys, the sentinel-delimited `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block, the `.bak` backup, and the atomic write `[api.go:L310-L350]`. For the **live runtime capture** produced by executing the real `Patcher.Patch` (plus the real reload signal and the real next-launch read) from this commit, see [Appendix C](#appendix-c--live-runtime-capture-real-production-code).
 
 **Case A — fresh `kitty.conf` (file absent, as with `--config NONE`).** `Patch` returns `updated=true`; **no `.bak`** is written because there was no prior content:
 
@@ -587,7 +588,7 @@ Four independent code facts converge on the same conclusion: (1) the **on-screen
 
 1. **Enter writes to disk.** The Enter branch calls `patcher.Patch(<ConfigDir>/kitty.conf, "KITTY_FONTS", serialized(), …)` `[final.go:L80-L82]`, and `Patch` performs an **atomic on-disk write** `[api.go:L347]`. This happens **before and independently of** any reload.
 2. **Reload is conditional and only affects the live session.** The `SIGUSR1` reload is gated on `if updated` and on `--reload-in` `[final.go:L86-L93]`, and `ReloadConfigInKitty` merely signals running processes `[api.go:L352-L371]`. It makes the change take effect **immediately** in the current session; it is **not** what makes the choice durable.
-3. **The next launch reads `kitty.conf`.** On startup kitty reads `kitty.conf` from `ConfigDir()` `[paths.go:L132-L134]`, so the persisted `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block is loaded and the chosen fonts are in effect **after restart**.
+3. **The next launch reads `kitty.conf`.** On a *normal* startup, kitty resolves its config directory in **Python**: `KITTY_CONFIG_DIRECTORY` (when set) is used verbatim, otherwise the XDG search applies `[kitty/constants.py:L87-L89]`, yielding `defconf = <config dir>/kitty.conf` `[kitty/constants.py:L131-L133]`. The startup resolver `default_config_paths` then yields `SYSTEM_CONF` followed by `defconf` `[kitty/cli.py:L1064-L1069][kitty/conf/utils.py:L322-L329]`, and `load_config` parses those onto the builtin defaults `[kitty/config.py:L163-L167]`. So the persisted `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block is read and the chosen fonts are in effect **after restart**. (The Go `utils.ConfigDir()` `[paths.go:L132-L134]` is the *write* side used by the kitten; it resolves the **same** directory, which is precisely why the kitten writes where the next launch reads.) **Exception — `--config NONE`:** that special value deliberately loads *no* config file, so `resolve_config` yields nothing extra when `NONE` is present `[kitty/cli.py:L187-L188][kitty/conf/utils.py:L322-L329]`; a restart used to *verify persistence* must therefore omit `--config NONE` (runtime-confirmed in [Appendix B](#appendix-b--reproducible-runtime-experiment-isolated-self-cleaning)).
 4. **The kitten itself trusts `kitty.conf` as the store.** `faces.on_enter` pre-fills its UI from `resolved_faces_from_kitty_conf` `[faces.go:L145-L159]` — i.e., the kitten reads the *persisted* config to recover the user's previous choices. This is independent corroboration that `kitty.conf` is the durable source of truth.
 
 ### 5.3 Contrast: the `s` path is session/manual only
@@ -618,7 +619,7 @@ The code at commit `815df1e21` is authoritative. Upstream documentation and man 
 
 Three places where the **current upstream documentation diverges from this commit**, with the code prevailing:
 
-1. **Only `--reload-in` exists here.** The current upstream `kitten-choose-fonts` man page additionally documents a `--config-file-name [=kitty.conf]` option — described there as "the name or path to the config file to edit" (`mankier.com/1/kitten-choose_fonts`). **That option does NOT exist at this commit** — the kitten declares only `--reload-in` `[kittens/choose_fonts/main.go:L86-L95]`, and the real `--help` output confirms it (see [§2.4](#24-the-single-declared-option---reload-in)).
+1. **Only `--reload-in` exists here.** The current upstream `kitten-choose-fonts` man page additionally documents a `--config-file-name [=kitty.conf]` option — described there as "the name or path to the config file to edit" (https://www.mankier.com/1/kitten-choose_fonts). **That option does NOT exist at this commit** — the kitten declares only `--reload-in` `[kittens/choose_fonts/main.go:L86-L95]`, and the real `--help` output confirms it (see [§2.4](#24-the-single-declared-option---reload-in)).
 2. **The target file is hard-coded.** Because `--config-file-name` is absent, the edited file is hard-coded to `kitty.conf` under the config directory `[kittens/choose_fonts/final.go:L81]`; there is no per-invocation override at this commit.
 3. **The `choose_fonts` clone is visible, not hidden.** `clone.Hidden = false` `[kittens/choose_fonts/main.go:L97]`, and `kitten --help` lists both `choose-fonts` and `choose_fonts` at runtime (see [§2.5](#25-version-drift-correction-the-choose_fonts-clone-is-visible-not-hidden)).
 
@@ -626,9 +627,9 @@ Three places where the **current upstream documentation diverges from this commi
 
 The following corroborate — but are not the basis of — the behavioral claims above:
 
-- The **choose-fonts kitten guide** describes the same UI flow: filter the family list by typing, press Enter to select a family, view regular/bold/italic previews, fine-tune the regular face with the `R` key, and use a slider for variable axes (`sw.kovidgoyal.net/kitty/kittens/choose-fonts/`). This matches the pane flow in [§3](#section-3--optionselection-value-flow-to-the-final-step).
-- The **`kitty.conf` reference** documents the four keys `font_family`, `bold_font`, `italic_font`, `bold_italic_font` and recommends the kitten as, in its words, "the easiest way to select fonts" (`sw.kovidgoyal.net/kitty/conf/`); it also documents reload via `SIGUSR1` / `kill -SIGUSR1 $KITTY_PID`, exactly the signal `ReloadConfigInKitty` sends `[api.go:L353-L357]`.
-- The **`kitten-choose-fonts` man page** documents the `--reload-in` choices `parent, all, none` (`mankier.com/1/kitten-choose_fonts`), matching the `OptionSpec` in [§2.4](#24-the-single-declared-option---reload-in).
+- The **choose-fonts kitten guide** describes the same UI flow: filter the family list by typing, press Enter to select a family, view regular/bold/italic previews, fine-tune the regular face with the `R` key, and use a slider for variable axes (https://sw.kovidgoyal.net/kitty/kittens/choose-fonts/). This matches the pane flow in [§3](#section-3--optionselection-value-flow-to-the-final-step).
+- The **`kitty.conf` reference** documents the four keys `font_family`, `bold_font`, `italic_font`, `bold_italic_font` and recommends the kitten as, in its words, "the easiest way to select fonts" (https://sw.kovidgoyal.net/kitty/conf/); it also documents reload via `SIGUSR1` / `kill -SIGUSR1 $KITTY_PID`, exactly the signal `ReloadConfigInKitty` sends `[api.go:L353-L357]`.
+- The **`kitten-choose-fonts` man page** documents the `--reload-in` choices `parent, all, none` (https://www.mankier.com/1/kitten-choose_fonts), matching the `OptionSpec` in [§2.4](#24-the-single-declared-option---reload-in).
 
 All quoted phrases above are short and attributed; the code remains the sole authority for behavior.
 
@@ -683,7 +684,9 @@ python3 setup.py            # or: ./dev.sh build  -> produces kitty/launcher/kit
 export KITTY_CONFIG_DIRECTORY="$(mktemp -d)"
 echo "Using throwaway config dir: $KITTY_CONFIG_DIRECTORY"
 
-# 2) Launch ONE instance with default settings (ignores all config files)
+# 2) Launch ONE *default-settings baseline* instance. --config NONE makes kitty
+#    ignore ALL config files, so the kitten starts from pristine defaults.
+#    NOTE: this is the BASELINE launch only; it is NOT the restart check (step 5).
 kitty/launcher/kitty --config NONE &
 
 # 3) Inside that kitty window, run the kitten, pick a family, reach the final
@@ -695,8 +698,12 @@ cat "$KITTY_CONFIG_DIRECTORY/kitty.conf"     # contains # BEGIN_KITTY_FONTS ... 
 ls -l "$KITTY_CONFIG_DIRECTORY/"             # kitty.conf.bak present iff there was prior content
 #    The parent kitty (its $KITTY_PID) receives SIGUSR1 and live-reloads.
 
-# 5) Prove "remembered across restarts": close and relaunch; the chosen font is in effect
-kill %1 2>/dev/null; kitty/launcher/kitty --config NONE &   # still uses the persisted kitty.conf
+# 5) Prove "remembered across restarts": close and relaunch WITHOUT --config NONE,
+#    keeping the SAME $KITTY_CONFIG_DIRECTORY. A normal startup reads
+#    $KITTY_CONFIG_DIRECTORY/kitty.conf, so the persisted font is now in effect.
+#    (Do NOT use --config NONE here: it loads no config file and would ignore the
+#     persisted kitty.conf  ->  kitty/cli.py:L187-L188, kitty/conf/utils.py:L322-L329.)
+kill %1 2>/dev/null; kitty/launcher/kitty &   # normal startup -> loads the persisted kitty.conf
 
 # 6) CONTRAST: the 's' path writes to STDOUT only and leaves kitty.conf unchanged
 #    (re-run the kitten, reach the final screen, press 's' -> four font_* lines on STDOUT)
@@ -708,13 +715,136 @@ git status --porcelain        # MUST be empty in the kitty source tree
 
 **Expected, code-grounded observations:**
 
-- **(a)** `kitty.conf` now contains the `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block with the four `font_*` settings — the exact shape shown in [§4.5 Case A](#45-output-evidence-captured-from-the-real-patcherpatch) `[api.go:L328-L340]`.
-- **(b)** A `kitty.conf.bak` exists **iff** the file had prior content `[api.go:L343-L345]` — see [§4.5 Case B](#45-output-evidence-captured-from-the-real-patcherpatch).
+- **(a)** `kitty.conf` now contains the `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block with the four `font_*` settings — the exact shape shown in [§4.5 Case A](#45-output-evidence--algorithm-accurate-simulation-of-patcherpatch) `[api.go:L328-L340]`, and captured live in [Appendix C.2](#c2-ab-enter-path--real-patcherpatch).
+- **(b)** A `kitty.conf.bak` exists **iff** the file had prior content `[api.go:L343-L345]` — see [§4.5 Case B](#45-output-evidence--algorithm-accurate-simulation-of-patcherpatch) and the live capture in [Appendix C.2](#c2-ab-enter-path--real-patcherpatch).
 - **(c)** The parent received `SIGUSR1` because `--reload-in` defaults to `parent` `[main.go:L86-L95][api.go:L353-L357]`.
-- **(d)** After restart the chosen font is active → **persisted across restarts** `[paths.go:L132-L134]`.
+- **(d)** After a **normal** relaunch (no `--config NONE`) under the same `$KITTY_CONFIG_DIRECTORY`, the chosen font is active → **persisted across restarts**. Startup reads `$KITTY_CONFIG_DIRECTORY/kitty.conf` via the Python resolver `[kitty/constants.py:L131-L133][kitty/cli.py:L1064-L1069][kitty/conf/utils.py:L322-L329]`; a launch with `--config NONE` would suppress this `[kitty/cli.py:L187-L188]`.
 - **(e)** The `s` path leaves `kitty.conf` unchanged `[final.go:L101-L111][main.go:L64-L66]`.
 
-> **Note on evidence in this report:** the §4.5 outputs were generated by calling the **real** `tools/config.Patcher.Patch` from this commit against an isolated temp directory, and the §2.4 / §2.5 outputs are the **real** `kitten choose-fonts --help` and `kitten --help` listings. All temporary artifacts were deleted afterward, leaving `git status --porcelain` empty in the source tree.
+> **Note on evidence in this report:** [§4.5](#45-output-evidence--algorithm-accurate-simulation-of-patcherpatch) is an **algorithm-accurate simulation** that traces the `Patcher.Patch` algorithm step by step. The **live runtime capture** — produced by executing the *real* `tools/config.Patcher.Patch`, the *real* `config.ReloadConfigInKitty` (`SIGUSR1` delivery), and kitty's *real* Python startup loader against an isolated, throwaway `KITTY_CONFIG_DIRECTORY` — is collected separately in [Appendix C](#appendix-c--live-runtime-capture-real-production-code). The §2.4 / §2.5 listings are the **real** `kitten choose-fonts --help` / `kitten --help` output. All temporary artifacts were deleted afterward, leaving `git status --porcelain` empty in the source tree.
+
+---
+
+## Appendix C — Live runtime capture (real production code)
+
+Unlike the algorithm-accurate simulation in [§4.5](#45-output-evidence--algorithm-accurate-simulation-of-patcherpatch), **every block in this appendix was produced by executing the real code from this commit**: the built `kitten` binary, the real `tools/config.Patcher.Patch`, the real `config.ReloadConfigInKitty`, and kitty's real Python startup loader. All of it ran inside a throwaway `KITTY_CONFIG_DIRECTORY` that was deleted afterward, leaving the source tree byte-for-byte unchanged (`git status --porcelain` empty). The selected family in this run was `JetBrains Mono`; the Go harness invoked the production functions exactly as the kitten's final pane does `[final.go:L78-L96]`.
+
+### C.1 The only declared option is `--reload-in` (real `--help`)
+
+Real output of `./kitty/launcher/kitten choose-fonts --help` from the built binary at this commit:
+
+```text
+Usage: kitten choose-fonts
+
+Choose the fonts used in kitty
+
+Options:
+  --reload-in [=parent]
+    By default, this kitten will signal only the parent kitty instance it is
+    running in to reload its config, after making changes. Use this option to
+    instead either not reload the config at all or in all running kitty
+    instances.
+    Choices: parent, all, none
+
+  --help, -h
+    Show help for this command
+
+kitten choose-fonts 0.35.2 created by Kovid Goyal
+```
+
+This is decisive, runtime confirmation of the version-drift note in [§6.2](#62-version-drift-findings-code-is-truth): at this commit the kitten declares **only** `--reload-in` — there is **no** `--config-file-name`.
+
+### C.2 (a)(b) ENTER path — real `Patcher.Patch`
+
+Driving the **real** `config.Patcher{Write_backup: true}.Patch(<dir>/kitty.conf, "KITTY_FONTS", serialized(), "font_family", "bold_font", "italic_font", "bold_italic_font")` — the exact call from `[final.go:L80-L82]` — against an isolated config directory (`utils.ConfigDir()` resolved the throwaway `KITTY_CONFIG_DIRECTORY` `[paths.go:L88-L90]`).
+
+**Fresh `kitty.conf` (file did not exist).** `Patch` returned `updated=true`; **no `.bak`** was written (there was no prior content, per `[api.go:L343-L345]`). The resulting `kitty.conf`:
+
+```text
+# BEGIN_KITTY_FONTS
+font_family      JetBrains Mono
+bold_font        auto
+italic_font      auto
+bold_italic_font auto
+# END_KITTY_FONTS
+```
+
+**Pre-existing `kitty.conf` (old font lines + other settings).** `Patch` returned `updated=true` and a `kitty.conf.bak` **was** created. The prior `font_family`/`bold_font` lines were commented out, the unrelated `background`/`font_size` lines were preserved, and the sentinel block was appended:
+
+```text
+# my config
+# font_family     OldFamily
+# bold_font       OldBold
+background      #1e1e2e
+font_size       12.0
+
+
+# BEGIN_KITTY_FONTS
+font_family      JetBrains Mono
+bold_font        auto
+italic_font      auto
+bold_italic_font auto
+# END_KITTY_FONTS
+```
+
+The `kitty.conf.bak` held the **exact original** content (proving the backup is a faithful copy taken before the edit `[api.go:L343-L345]`):
+
+```text
+# my config
+font_family     OldFamily
+bold_font       OldBold
+background      #1e1e2e
+font_size       12.0
+```
+
+**Idempotent re-run (same selection again).** `Patch` returned `updated=false`; **no `.bak`** and **no reload** — there was nothing to change `[api.go:L349]`:
+
+```text
+Patch returned updated=false   ->  no backup written; Enter branch skips reload
+```
+
+### C.3 (c) The `s` path — STDOUT only, `kitty.conf` unchanged
+
+The `s` branch sets `output_on_exit = self.settings.serialized() + "\n"` and quits without ever calling `Patch` `[final.go:L104-L110]`. The real four-line `serialized()` payload `[final.go:L62-L69]` written to STDOUT:
+
+```text
+font_family      JetBrains Mono
+bold_font        auto
+italic_font      auto
+bold_italic_font auto
+```
+
+A byte-for-byte comparison of `kitty.conf` immediately before and after the `s` path confirmed it was **unchanged** (`byte-identical before/after: true`) — because the `s` branch contains no write to disk.
+
+### C.4 (d) Reload signal — real `ReloadConfigInKitty` delivers `SIGUSR1`
+
+Calling the **real** `config.ReloadConfigInKitty(true)` with `KITTY_PID` set to a controlled process whose `argv[0]` basename is `kitty` (so it passes `is_kitty_gui_cmdline` `[api.go:L282-L302]`). The target installed a `SIGUSR1` trap; the trap fired, proving delivery `[api.go:L353-L357]`:
+
+```text
+config.ReloadConfigInKitty(true)  ->  returned err=<nil>
+target process (KITTY_PID=95841, argv[0] basename "kitty") received SIGUSR1
+   SIGUSR1_RECEIVED_AT=1782510915.187686379
+```
+
+### C.5 (e) The next launch reads the persisted selection
+
+Using kitty's **real** Python startup path — `default_config_paths` → `resolve_config` → `load_config` `[kitty/cli.py:L1064-L1069][kitty/conf/utils.py:L322-L329][kitty/config.py:L163-L167]` — against a `KITTY_CONFIG_DIRECTORY` holding the persisted `kitty.conf` from §C.2:
+
+```text
+KITTY_CONFIG_DIRECTORY  = /tmp/cf_read_h8dFo3
+kitty.constants.defconf = /tmp/cf_read_h8dFo3/kitty.conf
+SYSTEM_CONF             = /etc/xdg/kitty/kitty.conf
+
+# NORMAL startup (no --config on the command line):
+config paths   : ('/etc/xdg/kitty/kitty.conf', '/tmp/cf_read_h8dFo3/kitty.conf')
+opts.font_family = FontSpec(..., system='JetBrains Mono', ..., created_from_string='JetBrains Mono')
+
+# CONTRAST — launching with --config NONE:
+config paths   : ()                      # no config file loaded at all
+opts.font_family = FontSpec(..., system='monospace', ..., created_from_string='')   # builtin default
+```
+
+This is the **decisive proof of the core answer (R5)**: on a normal next launch the persisted selection is read back (`JetBrains Mono`), so the font choice **is remembered across restarts**. The `--config NONE` contrast simultaneously substantiates [Appendix B step 5](#appendix-b--reproducible-runtime-experiment-isolated-self-cleaning) and [§5.2](#52-the-reasoning-chain-grounded-in-code) — `--config NONE` resolves to *zero* config files and therefore falls back to the builtin `monospace` default, which is exactly why a persistence-verification relaunch must omit it.
 
 ---
 
