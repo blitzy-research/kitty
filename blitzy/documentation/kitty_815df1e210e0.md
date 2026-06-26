@@ -56,20 +56,22 @@ lines** that are allocated **lazily, on demand**:
   — `kitty/data-types.h:L262-L266`.
 
 The grid grows one segment at a time. `segment_for()` is the function that maps a logical line index `y` to its
-backing segment, and it is the **grow trigger** — `kitty/history.c:L37-L42`:
+backing **segment number** (`seg_num`), and it is the **grow trigger** — `kitty/history.c:L36-L42`:
 
 ```c
-static HistoryBufSegment*
+static index_type
 segment_for(HistoryBuf *self, index_type y) {
     index_type seg_num = y / SEGMENT_SIZE;
-    while (UNLIKELY(seg_num >= self->num_segments && SEGMENT_SIZE * self->num_segments < self->ynum))
-        add_segment(self);                                   // kitty/history.c:L39
-    return self->segments + seg_num;
+    while (UNLIKELY(seg_num >= self->num_segments && SEGMENT_SIZE * self->num_segments < self->ynum)) add_segment(self);
+    if (UNLIKELY(seg_num >= self->num_segments)) fatal("Out of bounds access to history buffer line number: %u", y);
+    return seg_num;
 }
 ```
 
 A new segment is created only when a line index crosses into a not-yet-allocated 2048-line block **and** the
-total allocated capacity is still below `ynum`. That second clause is what makes the memory *bounded*.
+total allocated capacity is still below `ynum`. That second clause is what makes the memory *bounded*. The `L40` guard
+`fatal()`s only on a genuinely out-of-range line index (`y ≥ ynum`) — never during normal push or eviction,
+where `seg_num` always lies within the already-allocated segments.
 
 ### 1.2 The per-line and per-segment byte cost (derivation)
 
@@ -308,14 +310,21 @@ The backing ring buffer is the vendored `ringbuf`, included at `kitty/history.c:
 at the repository root** (a sibling of `kitty/`), *not* inside `kitty/`.
 
 **Observable as:** with `HistoryBuf(2000, 80, 8 MiB)` and 200,000 lines pushed, the **grid `count` stayed flat
-at 2000** while `pagerhist_as_text()` returned **≈ 8,362,586 characters** — the pager ring filled to its
-configured **8 MiB cap** (`maximum_size = 8,388,608` bytes). The returned length sits *just under* the byte cap
-(a byte ring buffer never reports itself 100 % full) and varies by a few KiB run-to-run (e.g. 8,362,586–
-8,371,242) with the wrap position:
+at 2000** while the pager ring filled to its configured **8 MiB cap** (`maximum_size = 8,388,608` bytes). In a
+**clean measurement** — a minimal process that imports only `fast_data_types` — `pagerhist_as_text()` returns
+**exactly 8,388,608 characters**, i.e. **100 % of the configured cap**, reproducibly (a 4 MiB cap likewise
+returns exactly **4,194,304**). The cap is genuinely reachable: `ringbuf_new(capacity)` makes the usable
+capacity exactly `capacity` (`3rdparty/ringbuf/ringbuf.c:L56,L89-L93`), and for this all-ASCII content
+`pagerhist_as_text()` decodes the ring's used bytes 1:1 (`kitty/history.c:L485-L494`). The slightly-lower,
+run-to-run-varying lengths reported by the Appendix A.5 harness (**≈ 8,362,586–8,371,348**) are an artifact of
+*that measuring process's* heap state — the identical 200,000-line workload returns exactly the cap in a minimal
+process but a few KiB short inside the larger harness, and the figure drifts between runs. The shortfall is
+therefore **not** an intrinsic ring-buffer property (the ring does reach 100 % of its cap) and **not** a function
+of wrap position:
 
 | Configuration | Lines pushed | Grid `count` | `pagerhist_as_text()` length |
 |---|---|---|---|
-| `HistoryBuf(2000, 80, 8 MiB)` | 200,000 | 2,000 (flat) | **≈ 8,362,586 chars** (fills the 8 MiB cap = 8,388,608 B) |
+| `HistoryBuf(2000, 80, 8 MiB)` | 200,000 | 2,000 (flat) | **8,388,608 chars** = exactly the 8 MiB cap in a clean process (the A.5 harness reports **≈ 8,362,586–8,371,348**, a measuring-process heap-state artifact) |
 
 This proves the pager history is a **distinct, independently-bounded growth axis** that the grid's `count`
 metric does not reflect — you must monitor it separately (e.g. via `pagerhist_as_text()` length or process RSS).
@@ -324,7 +333,7 @@ metric does not reflect — you must monitor it separately (e.g. via `pagerhist_
 
 | Event | Code trigger | What memory monitoring shows |
 |---|---|---|
-| New segment allocated | `add_segment` via `segment_for` (`kitty/history.c:L37-L42`, guard `kitty/history.c:L39`) | **+5.0 MiB RSS step** at each 2048 crossing |
+| New segment allocated | `add_segment` via `segment_for` (`kitty/history.c:L36-L42`, guard `kitty/history.c:L39`) | **+5.0 MiB RSS step** at each 2048 crossing |
 | Ring saturates | `count == ynum` in `historybuf_push` (`kitty/history.c:L279-L282`) | **flat** RSS — eviction, no allocation |
 | Pager history grows | `pagerhist_extend` (`kitty/history.c:L90-L101`) in ≥1 MiB chunks, ≤ 4 GiB−1 | **separate, bounded** RSS/text-length growth |
 
@@ -463,7 +472,9 @@ listings below.)
   large `HistoryBuf(100000,80,0)` → ~5 MiB steps at each 2048 boundary (first, cleanest step **+5.008 MiB**);
   +30k beyond the cap → ~0 growth; default `HistoryBuf(2000,80,0)` + 500k lines → **≈ 4.891 MiB** total with
   `count` capped at 2000; `HistoryBuf(2000,80,8 MiB)` + 200k lines → `pagerhist_as_text()` length
-  **≈ 8,362,586** chars (just under the 8,388,608-byte cap, varies a few KiB run-to-run).
+  **8,388,608** chars (exactly the 8,388,608-byte cap) in a clean process; the A.5 harness reports
+  **≈ 8,362,586–8,371,348** because its larger process footprint perturbs the heap — a measuring-process
+  artifact that varies run-to-run, not an intrinsic ring property.
 - All scripts remain in `/tmp`; the kitty source tree stays byte-for-byte unchanged.
 
 ### A.4 Code locator index (all at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`)
@@ -472,7 +483,7 @@ listings below.)
 |---|---|
 | Segment size (2048) | `kitty/history.c:L15` |
 | Segment allocation (`add_segment`, contiguous `calloc`) | `kitty/history.c:L17-L29` (calloc at `:L25`) |
-| Grow trigger (`segment_for`) | `kitty/history.c:L37-L42` (guard `:L39`) |
+| Grow trigger (`segment_for`) | `kitty/history.c:L36-L42` (guard `:L39`) |
 | Pager init / alloc / extend | `kitty/history.c:L67`, `:L70-L80`, `:L90-L101` (newsz `:L93`) |
 | `create_historybuf` / arg parse | `kitty/history.c:L117-L133` (`add_segment` `:L127`, `alloc_pagerhist` `:L130`); parse `:L138` |
 | Push / eviction / saturation | `kitty/history.c:L276-L284` (branch `:L279-L282`) |
