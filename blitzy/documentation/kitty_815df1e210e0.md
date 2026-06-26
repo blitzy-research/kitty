@@ -10,7 +10,7 @@
 
 When you press a key in the default shell inside Kitty, the observable runtime behaviour reveals a clear, repeatable pipeline:
 
-1. **Which parts receive the input first?** The **OS / display server → GLFW windowing backend** receive the key first. On Linux this is the X11/XKB layer inside `glfw/`, whose callback (`key_callback`, `kitty/glfw.c:430`) hands the event to `on_key_input` (`kitty/glfw.c:439`). This is demonstrable because the *first* per‑key lines in the trace are the low‑level XKB lines (`Loading new XKB keymaps`, `Press xkb_keycode: …`), immediately followed by Kitty's own `on_key_input:` line.
+1. **Which parts receive the input first?** The **OS / display server → GLFW windowing backend** receive the key first. On Linux this is the X11/XKB layer inside `glfw/`, whose callback (`key_callback`, `kitty/glfw.c:430`) hands the event to `on_key_input` (`kitty/glfw.c:439`). This is demonstrable because, for every key, the windowing backend's own per-key line `Press xkb_keycode: …` (`glfw/xkb_glfw.c:875`) appears in the trace *immediately before* Kitty's own `on_key_input:` line, whereas the one-time `Loading new XKB keymaps` line (`glfw/xkb_glfw.c:672`) is XKB-backend initialization emitted only when a keymap is (re)loaded — not on each keypress.
 2. **Which parts handle the intermediate processing?** Kitty's **keyboard layer** `kitty/keys.c` (`on_key_input`, `kitty/keys.c:166`) tests the event against shortcuts (via the Python **Boss**, `kitty/boss.py:1408`), then **encodes** it (`encode_glfw_key_event`, `kitty/keys.c:251`) and **schedules a write to the child PTY**. The bytes are flushed to the shell on a dedicated **I/O thread** (`kitty/child-monitor.c`), the shell's response is **read back** on that same thread, and the bytes are **parsed** by the VT state machine (`kitty/vt-parser.c`) which updates the **in‑memory screen model** (`kitty/screen.c`).
 3. **How is the updated display produced?** On the **main thread**, `render()` (`kitty/child-monitor.c:871`, coalesced by `repaint_delay`) walks the screen model and issues GPU draw calls in `kitty/shaders.c` (`draw_cells_*` → `glDrawArraysInstanced`, `kitty/shaders.c:579`), drawing glyph textures produced by `kitty/freetype.c`/`kitty/glyph-cache.c`; a buffer swap then makes the change visible.
 
@@ -34,12 +34,14 @@ The build (`def build()`, `setup.py:1084`) compiles the C extension and the laun
 
 ### Run under tracing, headless
 
-The container has no physical display, so the GUI (GLFW + OpenGL) was launched inside a virtual X display, with the trace redirected to a file **outside** the repository tree:
+The container has no physical display, so the GUI (GLFW + OpenGL) was launched inside a **virtual X display created by `xvfb-run -a`**, with the trace redirected to a file **outside** the repository tree:
 
 ```bash
-DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 \
+LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
   ./kitty/launcher/kitty --config NONE --debug-input bash 2>/tmp/kitty-trace.log
 ```
+
+`xvfb-run -a` starts a fresh Xvfb server on an unused display number and exports `DISPLAY` for the wrapped process (so no pre-existing X server needs to already be running); `LIBGL_ALWAYS_SOFTWARE=1` makes Mesa use its `llvmpipe` software OpenGL implementation, since the container has no GPU.
 
 * `--debug-input` (alias `--debug-keyboard`, defined `kitty/cli.py:996`, doc string *"Print out key and mouse events as they are received."* `kitty/cli.py:999`) is the primary tracing mechanism.
 * `bash` is launched as the **child** process — the "default shell" (resolved to the user's login shell, else `/bin/sh`, `kitty/constants.py:181`).
@@ -64,14 +66,14 @@ Each recurring trace line was matched to the exact function that emits it (see �
 
 **Answer: the operating system / display server, surfaced through the GLFW windowing backend embedded in Kitty's `glfw/` tree.** On Linux this is the X11 + **XKB** layer (`glfw/xkb_glfw.c`), with optional IME composition (`glfw/ibus_glfw.c`).
 
-**What the runtime shows.** With `--debug-input`, the *earliest* lines for every key press are the low‑level windowing/XKB lines, which appear **before** anything Kitty‑specific:
+**What the runtime shows.** With `--debug-input`, the line that *consistently* appears immediately before every `on_key_input:` line is the GLFW/XKB backend's own per-key line — `Press xkb_keycode: …` (for releases, `Release xkb_keycode: …`). A press of `a`, for example, produces these two lines in this exact order:
 
 ```
-[4.569] Loading new XKB keymaps
-[4.576] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[6.915] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[6.915] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
 ```
 
-These originate in the GLFW/XKB backend; they are made visible because the `--debug-keyboard` option sets the `GLFW_DEBUG_KEYBOARD` init hint (`kitty/glfw.c:1444`). The backend translates the hardware *keycode* (`xkb_keycode: 0x26`) into a symbol/`text` and a GLFW key id (`glfw_key: 97 (a)`).
+The per-key `Press`/`Release xkb_keycode: …` line is emitted by `glfw_xkb_handle_key_event` (`glfw/xkb_glfw.c:864`; the line itself at `glfw/xkb_glfw.c:875`); these lines are made visible because the `--debug-keyboard` option sets the `GLFW_DEBUG_KEYBOARD` init hint (`kitty/glfw.c:1444`). The backend translates the hardware *keycode* (`xkb_keycode: 0x26`) into a symbol/`text` and a GLFW key id (`glfw_key: 97 (a)`). A separate, **one-time** setup line — `Loading new XKB keymaps` (`glfw/xkb_glfw.c:672`, emitted by `glfw_xkb_compile_keymap`) — appears only at startup and whenever the keymap is (re)loaded, *not* for each keystroke: across this run of 39 key presses it appeared only twice, both before the first keystroke, and never again while keys were being typed. It therefore reflects XKB-backend initialization, not per-key handling.
 
 **Hand‑off into Kitty.** GLFW then invokes the key callback that Kitty registered with `glfwSetKeyboardCallback(glfw_window, key_callback)` (`kitty/glfw.c:1292`). That callback, `key_callback` (`kitty/glfw.c:430`), forwards the event to Kitty's own keyboard entry point **only once the window is ready** — `if (is_window_ready_for_callbacks() && !ev->fake_event_on_focus_change) on_key_input(ev);` (`kitty/glfw.c:439`, guard at `kitty/glfw.c:202`). The application reaches this state by handing control to the C event loop at startup via `boss.child_monitor.main_loop()` (`kitty/main.py:234`).
 
@@ -146,19 +148,19 @@ glDrawArraysInstanced(GL_TRIANGLE_FAN, 0, 4, screen->lines * screen->columns);  
 
 ## (e) Observed trace evidence and the rationale per stage
 
-Each row pairs a **consistently observed** signal with the code that produces it and the reason it supports the conclusion. Trace lines are quoted verbatim (de‑colourised; the logger prefixes each with a `[seconds]` timestamp, `kitty/logging.c:56`).
+Each row pairs a **consistently observed** signal with the code that produces it and the reason it supports the conclusion. The per-key trace lines below are quoted verbatim — de-colourised, and with the leading `[seconds]` timestamp that the logger prefixes to each line (`kitty/logging.c:56`) omitted for readability; the `--dump-bytes` entry below is a summary of the raw child byte stream rather than a single verbatim trace line.
 
 ### Stage 1 — windowing / XKB receives first
-> `Loading new XKB keymaps`
 > `Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)`
+> *(one-time, at startup / keymap reload only — not per keypress):* `Loading new XKB keymaps`
 
-* **Code:** `glfw/xkb_glfw.c`; visible via `GLFW_DEBUG_KEYBOARD` (`kitty/glfw.c:1444`); callback `key_callback` (`kitty/glfw.c:430`) → `on_key_input` (`kitty/glfw.c:439`).
-* **Rationale:** these lines precede every `on_key_input:` line, proving the windowing layer decodes the hardware event before Kitty's logic runs.
+* **Code:** per-key `Press`/`Release xkb_keycode: …` emitted by `glfw_xkb_handle_key_event` (`glfw/xkb_glfw.c:864`; line at `glfw/xkb_glfw.c:875`); the one-time `Loading new XKB keymaps` by `glfw_xkb_compile_keymap` (`glfw/xkb_glfw.c:672`); all visible via `GLFW_DEBUG_KEYBOARD` (`kitty/glfw.c:1444`); callback `key_callback` (`kitty/glfw.c:430`) → `on_key_input` (`kitty/glfw.c:439`).
+* **Rationale:** the per-key `Press xkb_keycode: …` line precedes every `on_key_input:` line, proving the windowing layer decodes the hardware event before Kitty's logic runs. `Loading new XKB keymaps` is a keymap-load/initialization line (observed only twice across 39 key presses, both before the first keystroke), so it is *not* per-key evidence.
 
 ### Stage 2 — keyboard handling / encoding
 > `on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a`
 > `on_key_input: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd`
-> `on_key_input: … action: RELEASE … ignoring as keyboard mode does not support encoding this event`
+> `on_key_input: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event`
 
 * **Code:** trace at `kitty/keys.c:176`; shortcut test → `kitty/boss.py:1408`; encode at `kitty/keys.c:251`; the three outcomes at `kitty/keys.c:253-254`, `:259-261`, `:271`.
 * **Rationale:** the printable `a` is sent as its literal byte; **Enter** is *encoded* (to `0x0d`) rather than sent literally — observable proof that this stage transforms the event into a terminal byte sequence. Releases are dropped, showing the active keyboard mode governs what is emitted.
