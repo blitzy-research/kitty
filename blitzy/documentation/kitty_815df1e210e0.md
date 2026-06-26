@@ -218,6 +218,17 @@ flowchart TD
 > branch (`SIGCHLD` → `waitpid` → teardown → exit 0) is **Layer A** (Q5, Q6, Q2a). The bottom branch
 > (`OSC 133;D` → `shell_prompt_marking` → `handle_cmd_end`) is **Layer B** (Q7, Q4, Q2b).
 
+**Rationale.** The success path above is not an assumed sequence — it is the composition of three
+independently code-cited paths, and every numbered step names the exact file and line that implements it, so the
+narrative *is* the code's own control flow. The **output** path (the child writes the PTY slave → `read_bytes`
+reads the master → VT parser → GPU cells; steps 2–5, **Q8**) is why the program's "few clear lines" surface in
+the window. The **Layer A** lifecycle path (clean exit → kernel `SIGCHLD` → `reap_children`/`waitpid` →
+`on_child_death` teardown → `main_loop()` returns → process exits 0; steps 6–9, **Q5/Q6/Q2a**) is how Kitty
+observes the child's termination and why its *own* exit code is 0. And — only when the program is run as a
+command inside an integrated shell — the **Layer B** status path (`OSC 133;D;<code>` → `shell_prompt_marking` →
+`handle_cmd_end`; **Q7/Q4/Q2b**) is how that command's exit status becomes the completion message. Each
+subsequent section (Q2a–Q8) drills into one of these steps with its own citation and reasoning.
+
 ---
 
 
@@ -413,23 +424,49 @@ def handle_cmd_end(self, exit_status: str = '') -> None:
     cmd.body = f'Command {s} finished with status: {exit_status}.\nClick to focus.'
 ```
 
-**Dispatch — only the `'D'` (command-finished) marker reaches it.**
+**Dispatch — all three OSC 133 marks are demultiplexed here; `'D'` is the only one that supplies an exit status.**
+
+The C parser calls `cmd_output_marking` with a *distinct* Python value for each mark:
+
+```c
+// kitty/screen.c — shell_prompt_marking dispatches each OSC 133 mark with a different Python object:
+//   'A' (prompt start):         CALLBACK("cmd_output_marking", "O",  Py_False)             // kitty/screen.c:L2338
+//   'C' (command-output start): CALLBACK("cmd_output_marking", "OO", Py_True, cmdline)     // kitty/screen.c:L2347
+//   'D' (command finished):     CALLBACK("cmd_output_marking", "Os", Py_None, exit_status) // kitty/screen.c:L2350-L2352
+```
 
 ```python
 # kitty/window.py:L1453
 def cmd_output_marking(self, is_start: Optional[bool], cmdline: str = '') -> None:
-    if is_start:
-        ...                      # 'A'/'C' markers: record start time and command line
-    else:
-        self.handle_cmd_end(cmdline)   # kitty/window.py:L1461  ('D' marker; is_start is None)
+    if is_start:                       # only 'C' (Py_True) is truthy -> takes this branch
+        ...                            # record the command-output start time and the command line
+    else:                              # both 'A' (Py_False) and 'D' (Py_None) are falsy -> fall through here
+        self.handle_cmd_end(cmdline)   # kitty/window.py:L1460-L1461
+
+# kitty/window.py:L1408
+def handle_cmd_end(self, exit_status: str = '') -> None:
+    if self.last_cmd_output_start_time == 0.:   # kitty/window.py:L1409-L1410
+        return                                  # no command-output start pending -> early no-op (the bare-'A' case)
+    ...
+    # kitty/window.py:L1429  -> only past this guard is the message body built
 ```
 
-**Rationale.** `cmd_output_marking` is the demultiplexer for the three OSC 133 marks. The `'A'` and `'C'` marks
-arrive with a truthy `is_start` and only record the prompt/command start time and the command line. The `'D'`
-mark arrives with `is_start = None` (Python `None`, the falsy `else` branch), carrying the exit status in the
-`cmdline` parameter, and is routed to `handle_cmd_end`. Inside `handle_cmd_end`, `kitty/window.py:L1429` is the
-single line that turns `exit_status` into the message string. Hence `handle_cmd_end` is **the** status→message
-function. (See **Q7** for how the status reaches `cmd_output_marking` in the first place.)
+**Rationale.** `cmd_output_marking` is the demultiplexer for the three OSC 133 marks, and the C side hands it a
+*distinct* Python value for each (`kitty/screen.c`): the `'A'` prompt-start mark sends **`Py_False`**
+(`kitty/screen.c:L2338`), the `'C'` command-output-start mark sends **`Py_True`** together with the command line
+(`kitty/screen.c:L2347`), and the `'D'` command-finished mark sends **`Py_None`** together with the exit-status
+string (`kitty/screen.c:L2350-L2352`). In `cmd_output_marking`, only the truthy `'C'` value takes the
+`if is_start:` branch, where it records the command-output start time and the command line. Both *falsy* values —
+`'A'` (`Py_False`) and `'D'` (`Py_None`) — fall through to the `else:` branch and therefore **both call**
+`handle_cmd_end` (`kitty/window.py:L1460-L1461`); it is **not** the case that only `'D'` reaches the function.
+What distinguishes them is the guard at the top of `handle_cmd_end` — `if self.last_cmd_output_start_time == 0.:
+return` (`kitty/window.py:L1409-L1410`): a preceding `'C'` sets that field non-zero, so a following `'D'`
+proceeds and builds the message, whereas a bare `'A'` with no command-output start pending hits the guard and
+returns early (a no-op). Hence `'D'` is **the only marker that supplies an exit status** and actually produces
+the notification, even though it is not the only marker that *reaches* `handle_cmd_end`. Inside that function,
+`kitty/window.py:L1429` is the single line that turns `exit_status` into the message string — so
+`handle_cmd_end` is **the** status→message function. (See **Q7** for how the status reaches `cmd_output_marking`
+in the first place.)
 
 ---
 
