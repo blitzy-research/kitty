@@ -168,21 +168,29 @@ Two facts fall straight out of this:
 
 ### 1.2 Lazy, contiguous segment allocation (the code)
 
-Physical storage is not one giant array. `init_line` resolves a row index to a
-segment through `segment_for` (`kitty/history.c:L36-42`):
+Physical storage is not one giant array. `init_line` resolves a row index to its
+backing cells through the `*_lineptr` helpers, which call `segment_for`
+(`kitty/history.c:L36-42`) to locate the owning segment:
 
 ```c
-static HistoryBufSegment*
+static index_type
 segment_for(HistoryBuf *self, index_type y) {
     index_type seg_num = y / SEGMENT_SIZE;                                       // L38
     while (seg_num >= self->num_segments && SEGMENT_SIZE * self->num_segments < self->ynum)
         add_segment(self);                                                       // L39  (grow)
     if (seg_num >= self->num_segments) fatal("...");                             // L40  (abort)
-    return self->segments + seg_num;
+    return seg_num;                                                              // L41  (segment index)
 }
 ```
 
-with `#define SEGMENT_SIZE 2048` (`kitty/history.c:L15`). Each segment is **one
+Note that `segment_for` returns the *segment index*, not a pointer. The per-cell
+pointer arithmetic — `self->segments[seg_num].which + y * stride` — lives in the
+`seg_ptr` macro (`kitty/history.c:L44-48`), which is expanded by
+`cpu_lineptr`/`gpu_lineptr`/`attrptr` (`kitty/history.c:L51/L56/L62`); those are
+what `init_line` (`kitty/history.c:L162`) calls to point a `Line` at its backing
+cells.
+
+Here `#define SEGMENT_SIZE 2048` (`kitty/history.c:L15`). Each segment is **one
 contiguous `calloc`** (`add_segment`, `kitty/history.c:L17-29`): a single block
 sized `cpu_cells_size + gpu_cells_size + SEGMENT_SIZE * sizeof(LineAttrs)`
 (`kitty/history.c:L25`), into which the `gpu_cells` and `line_attrs` pointers are
