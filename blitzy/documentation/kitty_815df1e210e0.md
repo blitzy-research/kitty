@@ -47,9 +47,9 @@ The analysis followed five steps, in order:
 | Python | 3.13.7 (`/usr/bin/python3`) |
 | C compiler | `gcc-13` 13.4.0 (`CC=gcc-13`) |
 | Go | 1.22.12 (satisfies `go.mod` `go 1.22`) |
-| Test env vars | `CI=true`, `LANG=LC_ALL=en_US.UTF-8` |
+| Test env vars | `CI=true`, `LANG=en_US.UTF-8`, `LC_ALL=en_US.UTF-8` |
 
-The project floor is `requires-python = ">=3.8"` (`pyproject.toml:L2`) and `go 1.22` (`go.mod:L3`); the versions above satisfy both. The findings are scoped to this revision and this Linux/X11 configuration.
+The project floor is `requires-python = ">=3.8"` (`pyproject.toml:L2`) and `go 1.22` (`go.mod:L3`); the versions above satisfy both. The Go module also declares an existing test/assertion dependency, `github.com/google/go-cmp v0.6.0` (`go.mod:L11`), which this documentation task leaves unchanged. The findings are scoped to this revision and this Linux/X11 configuration.
 
 ### 1.4 Cleanliness guarantee
 
@@ -543,13 +543,19 @@ The following recipe mirrors CI and reproduces every observation above. The casc
 
 ```bash
 # 1) Provision toolchain (mirrors .github/workflows/ci.py:install_deps; add libssl-dev + pkg-config + Go 1.22)
+#    zsh is included because ci.py installs it (ci.py:install_deps apt list); without zsh the two
+#    zsh shell-integration tests skip, giving 6 skips instead of the documented 4-skip baseline (see Section 9.2).
 sudo apt-get update
-sudo apt-get install -y pkg-config build-essential libssl-dev \
+sudo apt-get install -y pkg-config build-essential libssl-dev zsh \
   libgl1-mesa-dev libxi-dev libxrandr-dev libxinerama-dev ca-certificates \
   libxcursor-dev libxcb-xkb-dev libdbus-1-dev libxkbcommon-dev libharfbuzz-dev libx11-xcb-dev \
   libpng-dev liblcms2-dev libfontconfig-dev libxkbcommon-x11-dev libcanberra-dev libxxhash-dev uuid-dev \
   libsimde-dev libsystemd-dev
-python3 -m pip install Pillow pygments
+#    ci.py also installs `bash dash systemd-coredump gdb`; of these only zsh affects the documented
+#    skip baseline, so bash/dash/systemd-coredump/gdb are optional for reproducing this analysis.
+# Pillow + pygments via pip. On the Ubuntu system Python (PEP 668, "externally-managed-environment"),
+# a plain `pip install` is blocked; use a virtualenv, or pass --break-system-packages as this container image did:
+python3 -m pip install --break-system-packages Pillow pygments
 # install Go 1.22.x and put it on PATH (matches go.mod 'go 1.22')
 
 # 2) Build (produces fast_data_types.so, glfw-x11.so, rsync.so, launcher kitty + kitten)
@@ -561,15 +567,17 @@ python3 setup.py build --verbose
 ./test.py --module check_build
 
 # 4) Cascade experiments on an ISOLATED COPY (never the source!)
-tar -C <repo> -cf - --exclude=.git . | (mkdir -p /tmp/kitty_copy && tar -C /tmp/kitty_copy -xf -)
-cd /tmp/kitty_copy
+repo="$PWD"                                   # repository root (run steps 2-3 from here first)
+tmp="$(mktemp -d /tmp/kitty_copy.XXXXXX)"     # unique scratch dir, never a fixed path
+trap 'rm -rf "$tmp"' EXIT                     # cleanup guaranteed even on error or interrupt
+tar -C "$repo" -cf - --exclude=.git . | tar -C "$tmp" -xf -
+cd "$tmp"
 mv kitty/fast_data_types.so{,.HIDDEN};   ./test.py;                                             mv kitty/fast_data_types.so{.HIDDEN,}
 mv kittens/transfer/rsync.so{,.HIDDEN};  ./test.py; ./test.py --module check_build;             mv kittens/transfer/rsync.so{.HIDDEN,}
 mv kitty/glfw-x11.so{,.HIDDEN};          ./test.py --module check_build; ./test.py --module glfw; mv kitty/glfw-x11.so{.HIDDEN,}
 
 # 5) Cleanup — leave the repo byte-for-byte unchanged
-rm -rf /tmp/kitty_copy
-cd <repo> && git clean -dfX && git status --short   # must be empty
+cd "$repo" && git clean -dfX && git status --short   # must be empty (the EXIT trap already removed "$tmp"; git clean removes only gitignored build artifacts)
 ```
 
 > Note: `git clean -dfX` removes only gitignored files (the build artifacts). The tracked tree is unaffected, and `git status --short` must print nothing — the cleanliness guarantee of §1.4.
