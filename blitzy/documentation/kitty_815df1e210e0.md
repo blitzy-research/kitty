@@ -18,13 +18,13 @@ This document answers four questions plus one observation:
 
 - **One engine, two buffers.** A single header-only, macro-parameterized template — `kitty/rewrap.h` — contains the entire rewrap algorithm (`rewrap_inner`, `kitty/rewrap.h:L57`). It has **no `.c` counterpart**; it is `#include`d exactly twice: once by the visible-screen buffer (`kitty/line-buf.c:L583`) and once by the scrollback buffer (`kitty/history.c:L592`). The two buffers are just two macro specializations of the same code.
 - **Wrap state is authoritatively per-cell.** The single source of truth for "this line soft-wrapped into the next" is the `next_char_was_wrapped` bit on the **last cell** of a line (`kitty/data-types.h:L206`). It is deliberately excluded from `SGR_MASK` (`kitty/data-types.h:L214`) so that resetting colors/styles never erases it.
-- **The per-line flag is *derived*, not stored.** The line-level `is_continued` attribute (`kitty/data-types.h:L233`) is **recomputed on every line initialization** from the *previous physical line's* last-cell flag — `kitty/line-buf.c:L145` for the screen and `kitty/history.c:L168` for history. At this **raw buffer level** the derivation is **index-relative**, so the first line of a buffer derives `is_continued == false`. The `Screen` access layer adds one targeted exception: for the **main-screen top line** it bridges the newest history line's wrap flag, setting `is_continued = true` when history ends in a wrap (`kitty/screen.c:L2835-L2837`, `kitty/history.c:L184-L186`) — see Section 4.5. This corrects the derived *flag* at the seam but does **not** merge the two buffers for rewrap.
+- **The per-line flag is *derived*, not stored.** The line-level `is_continued` attribute (`kitty/data-types.h:L233`) is **recomputed on every line initialization** from the *previous physical line's* last-cell flag — `kitty/line-buf.c:L145` for the screen and `kitty/history.c:L168` for history. At this **raw buffer level** the derivation is **index-relative**, so the first line of a buffer derives `is_continued == false`. The `Screen` access layer adds one targeted exception: for the **main-screen top line** it bridges the newest history line's wrap flag, setting `is_continued = true` when history ends in a wrap (`kitty/screen.c:L2835-L2837`, `kitty/history.c:L184-L187`) — see Section 4.5. This corrects the derived *flag* at the seam but does **not** merge the two buffers for rewrap.
 - **History and screen are rewrapped as two *independent* sequences.** History is rewrapped first, entirely on its own, with **no overflow sink and no cursor tracking** (`rewrap_inner(self, other, self->count, NULL, NULL, ...)`, `kitty/history.c:L611`). The screen is rewrapped *afterward*, in a separate pass, with the live history as an overflow sink and with cursor trackers (`kitty/line-buf.c:L617`, invoked from `kitty/screen.c:L384`).
 - **Overflow spills from screen into scrollback.** When the screen rewrap fills the destination grid, completed top lines are pushed into history via the `next_dest_line` macro's history path (`kitty/rewrap.h:L29-L33`, `historybuf_add_line` at `kitty/rewrap.h:L32`).
 - **The alternate screen discards overflow.** The alt buffer is rewrapped with a `NULL` history sink (`kitty/screen.c:L394`), so its overflow is dropped — correct for full-screen apps whose content is transient.
 - **Some paths skip rewrap entirely.** The enlarged-window scrollback fill copies history rows back onto the screen *without* re-running rewrap on the rejoined content (`kitty/screen.c:L428-L438`), and the current prompt is copied back verbatim, also without reflow (`kitty/screen.c:L444-L461`).
 - **Trailing blanks are trimmed on hard-broken lines.** A line that does *not* soft-wrap has its trailing blank cells trimmed (`kitty/rewrap.h:L70`); legitimate trailing spaces on a hard-broken line are therefore dropped.
-- **Net effect on the user's observation.** Because the two buffers reflow their fragments independently, and because two paths skip reflow, a single logical line that straddles the history↔screen boundary (or that is restored from history/prompt copy-back) is **not guaranteed to be rejoined and reflowed as one stream** — which is exactly why logical line boundaries are not always preserved.
+- **Net effect on the user's observation.** Because the two buffers reflow their fragments independently (history alone via `rewrap_inner(self, other, self->count, NULL, NULL, ...)`, `kitty/history.c:L611`; the screen afterward, `kitty/screen.c:L384`), and because two paths skip reflow (the enlarged-window fill, `kitty/screen.c:L428-L438`, and the prompt copy-back, `kitty/screen.c:L444-L461`), a single logical line that straddles the history↔screen boundary (or that is restored from history/prompt copy-back) is **not guaranteed to be rejoined and reflowed as one stream** — which is exactly why logical line boundaries are not always preserved.
 
 ---
 
@@ -34,7 +34,7 @@ This document answers four questions plus one observation:
 - [2. The shared rewrap engine (`kitty/rewrap.h`)](#2-the-shared-rewrap-engine-kittyrewraph)
 - [3. Per-buffer macro specialization (`LineBuf` vs `HistoryBuf`)](#3-per-buffer-macro-specialization-linebuf-vs-historybuf)
 - [4. The dual continuation model (the heart of the answer)](#4-the-dual-continuation-model-the-heart-of-the-answer)
-- [5. Screen ↔ history coordination during resize](#5-screen--history-coordination-during-resize)
+- [5. Screen and history coordination during resize](#5-screen-and-history-coordination-during-resize)
 - [6. Cursor and prompt preservation](#6-cursor-and-prompt-preservation)
 - [7. Inventory of potential continuation-propagation issues](#7-inventory-of-potential-continuation-propagation-issues)
 - [8. Empirical confirmation (the test oracle)](#8-empirical-confirmation-the-test-oracle)
@@ -49,7 +49,7 @@ Terminal emulators distinguish two kinds of line endings. A **soft wrap** occurs
 
 ## 1. Resize entry point and orchestration trace
 
-This section answers **Question 1** at the orchestration level: where does a resize begin, and in what order are the buffers rewrapped? (The algorithm itself is dissected in Sections 2–4.) All citations are to `kitty/screen.c`.
+This section answers **Question 1** at the orchestration level: where does a resize begin (the `resize()` binding, `kitty/screen.c:L3928-L3935`), and in what order are the buffers rewrapped (the `screen_resize()` orchestrator, `kitty/screen.c:L346-L463`)? (The algorithm itself is dissected in Sections 2–4.) All remaining citations in this section are to `kitty/screen.c`.
 
 ### 1.1 The entry point: the `resize()` Python binding
 
@@ -81,7 +81,7 @@ Two helpers wrap the actual rewrap calls:
 
 ### 1.4 The precise order inside `screen_resize` (the crux of Question 3)
 
-The ordering of operations inside `screen_resize` is what makes the screen/history interaction work the way it does:
+The ordering of operations inside `screen_resize` (`kitty/screen.c:L346-L463`) is what makes the screen/history interaction work the way it does:
 
 1. **Optional dummy-char insertion.** If the cursor sits at column 0 on a blank `OUTPUT_START` line, a dummy `'<'` char is inserted so reflow does not discard that line (`kitty/screen.c:L353-L361`, insertion at `kitty/screen.c:L358`). It is removed again near the end (`kitty/screen.c:L439-L442`).
 2. **Cursor tracking seeded.** Three `CursorTrack` records are initialized from the *before* positions — the live cursor, the main saved cursor, and the alt saved cursor (`kitty/screen.c:L363-L365`).
@@ -133,7 +133,7 @@ The central architectural fact is that `kitty/rewrap.h` is a **header-only templ
 - by the visible-screen buffer at `kitty/line-buf.c:L583` (using the default macros), and
 - by the scrollback buffer at `kitty/history.c:L592` (after redefining the macros, `kitty/history.c:L582-L590`).
 
-A single body of code therefore drives **both** the visible-screen rewrap and the scrollback rewrap; the per-buffer differences are injected purely through macros (Section 3).
+A single body of code (`rewrap_inner`, `kitty/rewrap.h:L57`) therefore drives **both** the visible-screen rewrap (included at `kitty/line-buf.c:L583`) and the scrollback rewrap (included at `kitty/history.c:L592`); the per-buffer differences are injected purely through macros (Section 3).
 
 ### 2.2 The function signature
 
@@ -154,7 +154,7 @@ copy_range(Line *src, index_type src_at, Line* dest, index_type dest_at, index_t
 }
 ```
 
-`copy_range` (`kitty/rewrap.h:L44-L48`) copies the **CPU cells** (character data, `kitty/rewrap.h:L46`) and the **GPU cells** (attributes, `kitty/rewrap.h:L47`) together. This matters because the wrap flag `next_char_was_wrapped` lives inside the GPU cell's `attrs` (`kitty/data-types.h:L206`, `kitty/data-types.h:L219`). Copying CPU+GPU in lockstep is *why* wrap state survives the copy at cell granularity.
+`copy_range` (`kitty/rewrap.h:L44-L48`) copies the **CPU cells** (character data, `kitty/rewrap.h:L46`) and the **GPU cells** (attributes, `kitty/rewrap.h:L47`) together. This matters because the wrap flag `next_char_was_wrapped` lives inside the GPU cell's `attrs` (`kitty/data-types.h:L206`, `kitty/data-types.h:L219`). Copying CPU+GPU in lockstep is *why* ordinary per-cell attributes (character, color, style, width, marks) are carried across the copy at cell granularity. The wrap flag is the one exception: although it physically rides along inside the copied GPU cell, the engine does **not** rely on it surviving verbatim. It reads the source's flag as the continuation predicate (`kitty/rewrap.h:L66`), clears it on a continued source line *before* copying so it cannot leak into the destination interior (`kitty/rewrap.h:L72`), and **reconstructs** the destination's wrap markers at the new wrap/hard-break positions via `next_dest_line` (`kitty/rewrap.h:L26`, emitted at `kitty/rewrap.h:L81` and `kitty/rewrap.h:L93`). In other words, `copy_range` preserves the *cells*; the *continuation marker* has its own read-clear-reconstruct lifecycle (Sections 2.5–2.6).
 
 ### 2.4 The cursor tracker and the continuation predicate
 
@@ -221,7 +221,7 @@ Step by step:
 
 Two design decisions in this engine explain the whole continuation model:
 
-1. **Wrap state survives because cells are copied whole.** Since `copy_range` memcpys the GPU cell (where `next_char_was_wrapped` lives) alongside the CPU cell (`kitty/rewrap.h:L46-L47`), the per-cell wrap bit is carried verbatim from source to destination. Reflow never has to "re-derive" wrap state from scratch — it reads it off the cells it is already moving.
+1. **The *source's* continuation is read off the cells, never re-derived.** The engine never recomputes whether a source line wrapped — it reads the authoritative per-cell `next_char_was_wrapped` bit directly off the source's last cell via `is_src_line_continued()` (`kitty/rewrap.h:L41`, evaluated at `kitty/rewrap.h:L66`), which `copy_range` keeps available by moving the GPU cell alongside the CPU cell (`kitty/rewrap.h:L46-L47`). The bit is *not*, however, propagated verbatim into the destination interior: on a continued source line the engine deliberately clears the source's trailing wrap flag before copying (`kitty/rewrap.h:L72`) so it cannot leak into the middle of the reflowed stream. The destination's own markers are rebuilt independently (point 2).
 2. **Destination wrap markers are *reconstructed*, not copied positionally.** The engine emits `next_dest_line(true)` for an internal wrap (`kitty/rewrap.h:L81`) and `next_dest_line(false)` for a hard break (`kitty/rewrap.h:L93`). In other words, it reads the *per-cell* continuation of the *source* and rebuilds the *per-line* wrap markers of the *destination* at the new width. This source-cell→destination-line reconstruction is the essence of reflow, and it is the basis of the dual continuation model dissected in Section 4.
 
 
@@ -246,6 +246,7 @@ The same `rewrap_inner` body behaves differently for the visible screen and the 
 The mechanism by which screen overflow becomes scrollback is entirely inside the default `next_dest_line` macro:
 
 ```c
+#ifndef next_dest_line
 #define next_dest_line(continued) \
     linebuf_set_last_char_as_continuation(dest, dest_y, continued); \
     if (dest_y >= dest->ynum - 1) { \
@@ -259,6 +260,7 @@ The mechanism by which screen overflow becomes scrollback is entirely inside the
     } else dest_y++; \
     linebuf_init_line(dest, dest_y); \
     set_dest_line_attrs(dest_y);
+#endif
 ```
 
 (`kitty/rewrap.h:L24-L38`.) When the destination is already on its last row (`dest_y >= dest->ynum - 1`), the buffer is scrolled (`linebuf_index`, `kitty/rewrap.h:L28`) and — **only if `historybuf != NULL`** — the scrolled-off top line is pushed into scrollback via `historybuf_add_line(historybuf, dest->line, as_ansi_buf)` (`kitty/rewrap.h:L29-L33`, the key call at `kitty/rewrap.h:L32`). This single `historybuf != NULL` guard is the precise reason that **main-screen** overflow becomes scrollback (sink passed at `kitty/screen.c:L384`) while **alt-screen** overflow is discarded (`NULL` passed at `kitty/screen.c:L394`).
@@ -279,10 +281,15 @@ The `LineBuf` include site has **no** macro redefinitions before it, so these de
 
 ```c
 #define BufType HistoryBuf
+
 #define map_src_index(y) ((src->start_of_data + y) % src->ynum)
+
 #define init_src_line(src_y) init_line(src, map_src_index(src_y), src->line);
+
 #define next_dest_line(cont) { history_buf_set_last_char_as_continuation(dest, 0, cont); LineAttrs *lap = attrptr(dest, historybuf_push(dest, as_ansi_buf)); *lap = src->line->attrs; }
+
 #define first_dest_line next_dest_line(false);
+
 #include "rewrap.h"
 ```
 
@@ -396,7 +403,7 @@ history_buf_endswith_wrap(HistoryBuf *self) {
 }
 ```
 
-(`kitty/history.c:L184-L186`.) `index_of(self, 0)` is the **newest** history line — by the reverse-indexing convention documented at `kitty/history.c:L153-L159` (line number `0` is the *last* line in the ring buffer), this is precisely the history line that sits logically just above screen row 0. So `history_buf_endswith_wrap()` reads that line's **last-cell** `next_char_was_wrapped` flag — the authoritative per-cell wrap bit of Section 4.1. If the newest history line soft-wrapped, the main-screen top line is marked `is_continued = true` at `kitty/screen.c:L2837`.
+(`kitty/history.c:L184-L187`.) `index_of(self, 0)` is the **newest** history line — by the reverse-indexing convention documented at `kitty/history.c:L153-L159` (line number `0` is the *last* line in the ring buffer), this is precisely the history line that sits logically just above screen row 0. So `history_buf_endswith_wrap()` reads that line's **last-cell** `next_char_was_wrapped` flag — the authoritative per-cell wrap bit of Section 4.1. If the newest history line soft-wrapped, the main-screen top line is marked `is_continued = true` at `kitty/screen.c:L2837`.
 
 This wrapper is what display/access actually flows through: `init_line()` is invoked by the visual-line accessor `visual_line_()` (`kitty/screen.c:L2843`) and the range accessor `range_line_()` (`kitty/screen.c:L2856`). Consequently, **at the screen-access level the top main-screen line correctly reports `is_continued == true` when it continues the last history line** — the raw index-0 `false` of Section 4.4 is corrected for precisely this seam.
 
@@ -449,12 +456,12 @@ flowchart LR
 
 The per-cell `next_char_was_wrapped` flag is **content-anchored and authoritative**: it travels with the cell it belongs to (carried by `copy_range`, `kitty/rewrap.h:L46-L47`) and survives style resets (`kitty/data-types.h:L214`). The per-line `is_continued` attribute is a **convenience view**, recomputed from a neighbor's position in the *current buffer layout* (`kitty/line-buf.c:L145`; `kitty/history.c:L168`).
 
-Because that **raw buffer-level** view is **index-relative**, a line at **index 0** of a buffer derives `is_continued == false` from its own initializer (the ternary's `false` branch at `kitty/line-buf.c:L145`; the `else` branch at `kitty/history.c:L170`) — it has no in-buffer predecessor to read. Taken alone, this would mean the **top line of the screen** that logically continues the **last line of history** is mislabeled as a hard break. kitty avoids that for the common case with the `Screen`-level seam correction of Section 4.5: when the screen is read through `init_line()`/`visual_line_()`, the main-screen top line's `is_continued` is set `true` if the newest history line ends in a wrap (`kitty/screen.c:L2835-L2837`; `kitty/history.c:L184-L186`), so the *derived flag* is truthful at that seam. What the correction does **not** do is merge the two buffers for rewrap — it adjusts a per-line flag at access time, not the independent two-sequence reflow itself (Section 5). The residual index-relative gaps that the correction does *not* cover — the alternate screen's top line and history's own oldest line — are the seed of the boundary-mismatch problem developed in Section 7.
+Because that **raw buffer-level** view is **index-relative**, a line at **index 0** of a buffer derives `is_continued == false` from its own initializer (the ternary's `false` branch at `kitty/line-buf.c:L145`; the `else` branch at `kitty/history.c:L170`) — it has no in-buffer predecessor to read. Taken alone, this would mean the **top line of the screen** that logically continues the **last line of history** is mislabeled as a hard break. kitty avoids that for the common case with the `Screen`-level seam correction of Section 4.5: when the screen is read through `init_line()`/`visual_line_()`, the main-screen top line's `is_continued` is set `true` if the newest history line ends in a wrap (`kitty/screen.c:L2835-L2837`; `kitty/history.c:L184-L187`), so the *derived flag* is truthful at that seam. What the correction does **not** do is merge the two buffers for rewrap — it adjusts a per-line flag at access time, not the independent two-sequence reflow itself (Section 5). The residual index-relative gaps that the correction does *not* cover — the alternate screen's top line and history's own oldest line — are the seed of the boundary-mismatch problem developed in Section 7.
 
 
 ---
 
-## 5. Screen ↔ history coordination during resize
+## 5. Screen and history coordination during resize
 
 This section answers **Question 3** and proves the "two independent sequences" claim that underlies **Question 4**.
 
@@ -506,11 +513,11 @@ Putting the order from Section 1.4 together with the arguments above:
 1. History is rewrapped **entirely on its own** (`kitty/screen.c:L375` → `kitty/history.c:L611` with `NULL, NULL`).
 2. The screen is rewrapped **afterward, as a separate pass** (`kitty/screen.c:L384` → `kitty/line-buf.c:L617`).
 
-Therefore a **single logical line that straddles the history↔screen boundary** — its head sitting in scrollback, its tail on the visible screen, joined logically by `next_char_was_wrapped` on the last history cell — is **never merged into one stream before rewrap**. Each buffer reflows *its own fragment* to the new width, independently. The boundary cell's wrap flag is preserved within history, but the screen's **rewrap pass** (a separate `rewrap_inner` invocation) begins at its own row 0 with no knowledge that row 0 logically continues the bottom of history — so the *reflow* of the two fragments is genuinely independent. One nuance, established in Section 4.5, must be kept distinct from this: although the rewrap pass itself ignores the seam, the **derived `is_continued` flag** that callers later read for the main-screen top line *is* corrected at access time (`kitty/screen.c:L2835-L2837`, consulting `history_buf_endswith_wrap`, `kitty/history.c:L184-L186`). That correction makes the per-line continuation *flag* truthful at the seam; it does **not** rejoin and re-reflow the straddling logical line as one stream — which is the actual cause of the boundary behavior analyzed in Section 7.
+Therefore a **single logical line that straddles the history↔screen boundary** — its head sitting in scrollback, its tail on the visible screen, joined logically by `next_char_was_wrapped` on the last history cell — is **never merged into one stream before rewrap**. Each buffer reflows *its own fragment* to the new width, independently. The boundary cell's wrap flag is preserved within history, but the screen's **rewrap pass** (a separate `rewrap_inner` invocation) begins at its own row 0 with no knowledge that row 0 logically continues the bottom of history — so the *reflow* of the two fragments is genuinely independent. One nuance, established in Section 4.5, must be kept distinct from this: although the rewrap pass itself ignores the seam, the **derived `is_continued` flag** that callers later read for the main-screen top line *is* corrected at access time (`kitty/screen.c:L2835-L2837`, consulting `history_buf_endswith_wrap`, `kitty/history.c:L184-L187`). That correction makes the per-line continuation *flag* truthful at the seam; it does **not** rejoin and re-reflow the straddling logical line as one stream — which is the actual cause of the boundary behavior analyzed in Section 7.
 
 ### 5.5 Rationale: the design tradeoff
 
-Treating the two buffers as independent passes is **simpler and cheaper**: history can be reflowed once into a fresh ring buffer and then treated as immutable, and the screen rewrap is a self-contained operation that only needs history as a downstream *sink* for overflow, never as an upstream *source* to be re-joined. The cost is that **perfect logical-line continuity across the history↔screen seam is sacrificed** — kitty does not reconstruct the single logical line that spans the boundary and reflow it as a unit. This is a deliberate engineering choice (favoring immutable, independently-shaped buffers), and it is the architectural root of the user's observation, developed concretely in Section 7.
+Treating the two buffers as independent passes (history alone at `kitty/history.c:L611`, the screen afterward at `kitty/screen.c:L384`) is **simpler and cheaper**: history can be reflowed once into a fresh ring buffer and then treated as immutable, and the screen rewrap is a self-contained operation that only needs history as a downstream *sink* for overflow (`kitty/rewrap.h:L29-L33`), never as an upstream *source* to be re-joined. The cost is that **perfect logical-line continuity across the history↔screen seam is sacrificed** — kitty does not reconstruct the single logical line that spans the boundary and reflow it as a unit. This is a deliberate engineering choice (favoring immutable, independently-shaped buffers), and it is the architectural root of the user's observation, developed concretely in Section 7.
 
 
 ---
@@ -589,7 +596,7 @@ for (; y < (int)self->main_linebuf->ynum; y++) {
 
 ### 6.6 Two paths that skip rewrap
 
-Two restoration paths copy content back onto the screen **without** re-running the rewrap engine — important for Section 7:
+Two restoration paths copy content back onto the screen **without** re-running the rewrap engine (the enlarged-window fill, `kitty/screen.c:L428-L438`, and the prompt copy-back, `kitty/screen.c:L444-L461`) — important for Section 7:
 
 - **Enlarged-window scrollback fill.** Gated by the `scrollback_fill_enlarged_window` option (`kitty/screen.c:L428`). When the window grew, the loop pops lines back from history and places them on the screen:
 
@@ -623,7 +630,7 @@ This section answers **Question 4** and directly addresses the user's observatio
 | (a) | **Independent two-sequence rewrap** | `kitty/screen.c:L375`; `kitty/history.c:L611` (`NULL, NULL`); `kitty/screen.c:L384` | History and screen are reflowed in two separate passes; a logical line spanning the boundary is never merged before rewrap. **Primary cause.** |
 | (b) | **No-re-rewrap enlarged-window fill** | `kitty/screen.c:L428-L438` | History rows are popped back onto the screen and copied as-is; the rejoined content is not reflowed to the new width. |
 | (c) | **Prompt copy-back without reflow** | `kitty/screen.c:L444-L461` | Saved prompt lines are restored verbatim; if the width changed they are not reflowed. |
-| (d) | **Index-relative `is_continued` derivation (raw buffer level)** | `kitty/line-buf.c:L145`; `kitty/history.c:L168-L170`; seam correction at `kitty/screen.c:L2835-L2837`, `kitty/history.c:L184-L186` | At the raw buffer level the first line of a buffer derives `is_continued == false`. The `Screen` wrapper corrects this for the main-screen top line (bridging the last history wrap flag), so the residual gap is at **un-bridged** edges — the alt-screen top line and history's own oldest line — and the correction is a display-time flag fix, not a rewrap merge. |
+| (d) | **Index-relative `is_continued` derivation (raw buffer level)** | `kitty/line-buf.c:L145`; `kitty/history.c:L168-L170`; seam correction at `kitty/screen.c:L2835-L2837`, `kitty/history.c:L184-L187` | At the raw buffer level the first line of a buffer derives `is_continued == false`. The `Screen` wrapper corrects this for the main-screen top line (bridging the last history wrap flag), so the residual gap is at **un-bridged** edges — the alt-screen top line and history's own oldest line — and the correction is a display-time flag fix, not a rewrap merge. |
 | (e) | **Pager-history oldest-line heuristic** | `kitty/history.c:L174` | The oldest history line's continuation is *guessed* from whether the ring buffer ends in a newline; the guess can be wrong. |
 | (f) | **Trailing-blank trimming on hard-broken lines** | `kitty/rewrap.h:L70` | Trailing spaces on a hard-broken line are dropped; the trim is "blunt" (no wide-char readjustment). |
 
@@ -633,7 +640,7 @@ History is rewrapped alone, with `NULL` overflow sink and `NULL` cursor tracker 
 
 ### 7.2 (b) Enlarged-window fill copies without reflowing
 
-When the window is enlarged and `scrollback_fill_enlarged_window` is on, the loop at `kitty/screen.c:L431-L437` pops rows out of history (`historybuf_pop_line`, `kitty/screen.c:L432`) and copies them onto the screen (`linebuf_copy_line_to`, `kitty/screen.c:L434`) **without** invoking `rewrap_inner` on the rejoined screen+history content. Those rows were shaped for the *previous* width during the earlier history rewrap; placing them back on a now-wider screen means their wrap boundaries reflect the old width, not the new one.
+When the window is enlarged and `scrollback_fill_enlarged_window` is on, the loop at `kitty/screen.c:L431-L437` pops rows out of history (`historybuf_pop_line`, `kitty/screen.c:L432`) and copies them onto the screen (`linebuf_copy_line_to`, `kitty/screen.c:L434`) **without** invoking `rewrap_inner` on the rejoined screen+history content. Note that by this point history has *already* been rewrapped to the **new** width — `realloc_hb(self->historybuf, self->historybuf->ynum, columns, ...)` reshapes it to the new `columns` (`kitty/screen.c:L375`) and installs it (`kitty/screen.c:L377`) earlier in `screen_resize`, before this fill runs — so each popped row is individually shaped at the *new* width; stale old-width geometry is **not** the issue. The actual problem is that those rows were shaped during the **independent history-only rewrap pass** (`rewrap_inner(self, other, self->count, NULL, NULL, ...)`, `kitty/history.c:L611`), and the fill copies them back onto the screen one row at a time (`linebuf_copy_line_to`, `kitty/screen.c:L434`) **without** merging them with the existing screen content and re-running `rewrap_inner` over the combined logical stream. A logical line that straddles the history↔screen seam is therefore restored as two independently-wrapped fragments rather than reflowed as one unit at the new width.
 
 ### 7.3 (c) Prompt copy-back is verbatim
 
@@ -643,7 +650,7 @@ The prompt lines saved by `prevent_current_prompt_from_rewrapping` are restored 
 
 At the **raw buffer level**, both initializers derive `is_continued` from the *previous physical line by buffer index*: `kitty/line-buf.c:L145` (ternary returns `false` for `idx == 0`) and `kitty/history.c:L168` (with the `num == 0` branch returning `false` at `kitty/history.c:L170`). So a buffer's first line derives `is_continued == false` from its own initializer, even when it logically continues content in the other buffer.
 
-This raw value is **not** what every consumer sees, however. The visible screen is read through the `Screen` wrapper `init_line()` (`kitty/screen.c:L2833-L2840`), which **corrects the one boundary that matters most**: for the main-screen top line (`y == 0 && self->linebuf == self->main_linebuf`) it sets `is_continued = true` when `history_buf_endswith_wrap()` reports the newest history line's last cell is wrapped (`kitty/history.c:L184-L186`). Because the display accessors `visual_line_()` (`kitty/screen.c:L2843`) and `range_line_()` (`kitty/screen.c:L2856`) flow through this wrapper, the top main-screen line *does* report `is_continued == true` when it continues the last history line (this is exactly the seam established in Section 4.5).
+This raw value is **not** what every consumer sees, however. The visible screen is read through the `Screen` wrapper `init_line()` (`kitty/screen.c:L2833-L2840`), which **corrects the one boundary that matters most**: for the main-screen top line (`y == 0 && self->linebuf == self->main_linebuf`) it sets `is_continued = true` when `history_buf_endswith_wrap()` reports the newest history line's last cell is wrapped (`kitty/history.c:L184-L187`). Because the display accessors `visual_line_()` (`kitty/screen.c:L2843`) and `range_line_()` (`kitty/screen.c:L2856`) flow through this wrapper, the top main-screen line *does* report `is_continued == true` when it continues the last history line (this is exactly the seam established in Section 4.5).
 
 Two qualifications keep this a real issue rather than dissolving it:
 
@@ -660,7 +667,7 @@ For a non-continued (hard-broken) line, the engine trims trailing `BLANK_CHAR` c
 
 ### 7.7 Synthesis: how these produce the user's symptom
 
-The user's observation — *logical line boundaries are not always preserved* — is the combined effect of (a), (b), and (c). The architecture reflows **fragments independently** ((a), the two-pass design proven by the `NULL, NULL` history call at `kitty/history.c:L611` versus the live-history + tracker call at `kitty/line-buf.c:L617`), and two restoration paths **skip reflow entirely** ((b) at `kitty/screen.c:L428-L438` and (c) at `kitty/screen.c:L444-L461`). At exactly the seams where these behaviors meet — the history↔screen boundary, the lines refilled on enlargement, the restored prompt — a span that was one logical line at the old width can end up split (or, symmetrically, content can appear joined where it should break), because no single pass ever sees and reflows that logical line as a whole at the new width. Issues (d) and (e) compound the symptom at the buffer edges that are **not** bridged: kitty's `Screen` wrapper does correct the *derived* `is_continued` for the main-screen top line (Section 4.5), but the alternate screen's top line and history's own oldest line have no such bridge, so there the derived per-line `is_continued` can still disagree with the *authoritative* per-cell flag; and (f) can additionally alter content (dropped trailing spaces) on hard-broken lines.
+The user's observation — *logical line boundaries are not always preserved* — is the combined effect of (a), (b), and (c). The architecture reflows **fragments independently** ((a), the two-pass design proven by the `NULL, NULL` history call at `kitty/history.c:L611` versus the live-history + tracker call at `kitty/line-buf.c:L617`), and two restoration paths **skip reflow entirely** ((b) at `kitty/screen.c:L428-L438` and (c) at `kitty/screen.c:L444-L461`). At exactly the seams where these behaviors meet — the history↔screen boundary, the lines refilled on enlargement, the restored prompt — a span that was one logical line before the resize can end up split (or, symmetrically, content can appear joined where it should break), because no single pass ever sees and reflows that logical line as a whole at the new width. Issues (d) and (e) compound the symptom at the buffer edges that are **not** bridged: kitty's `Screen` wrapper does correct the *derived* `is_continued` for the main-screen top line (Section 4.5), but the alternate screen's top line and history's own oldest line have no such bridge, so there the derived per-line `is_continued` can still disagree with the *authoritative* per-cell flag; and (f) can additionally alter content (dropped trailing spaces) on hard-broken lines.
 
 To restate the scope boundary explicitly: this analysis **identifies and explains** these behaviors with exact locations; it proposes **no changes** to kitty, in keeping with the read-only mandate of this task.
 
@@ -669,7 +676,7 @@ To restate the scope boundary explicitly: this analysis **identifies and explain
 
 ## 8. Empirical confirmation (the test oracle)
 
-kitty ships a reflow test suite that asserts **exact** continuation-flag tuples after a rewrap. Because the tests pin the precise outcome, they are an authoritative oracle for the per-cell → per-line derivation of Section 4 and the overflow-to-scrollback behavior of Section 5. The relevant tests were **built and executed** for this analysis (results in Section 8.4); the assertions cited below are read directly from the source.
+kitty ships a reflow test suite (`kitty_tests/datatypes.py` and `kitty_tests/screen.py`) that asserts **exact** continuation-flag tuples after a rewrap (e.g. the narrower-resize tuple at `kitty_tests/datatypes.py:L392`). Because the tests pin the precise outcome, they are an authoritative oracle for the per-cell → per-line derivation of Section 4 and the overflow-to-scrollback behavior of Section 5 (the `historybuf` assertion at `kitty_tests/screen.py:L289`). The relevant tests were **built and executed** for this analysis (results in Section 8.4); the assertions cited below are read directly from the source.
 
 ### 8.1 Unit tests — `kitty_tests/datatypes.py`
 
