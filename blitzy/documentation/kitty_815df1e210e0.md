@@ -619,7 +619,7 @@ The code at commit `815df1e21` is authoritative. Upstream documentation and man 
 
 Three places where the **current upstream documentation diverges from this commit**, with the code prevailing:
 
-1. **Only `--reload-in` exists here.** The current upstream `kitten-choose-fonts` man page additionally documents a `--config-file-name [=kitty.conf]` option — described there as "the name or path to the config file to edit" (https://www.mankier.com/1/kitten-choose_fonts). **That option does NOT exist at this commit** — the kitten declares only `--reload-in` `[kittens/choose_fonts/main.go:L86-L95]`, and the real `--help` output confirms it (see [§2.4](#24-the-single-declared-option---reload-in)).
+1. **Only `--reload-in` exists here.** The current upstream `kitten-choose-fonts` man page additionally documents a `--config-file-name [=kitty.conf]` option — described there as "the name or path to the config file to edit" (https://www.mankier.com/1/kitten-choose-fonts). **That option does NOT exist at this commit** — the kitten declares only `--reload-in` `[kittens/choose_fonts/main.go:L86-L95]`, and the real `--help` output confirms it (see [§2.4](#24-the-single-declared-option---reload-in)).
 2. **The target file is hard-coded.** Because `--config-file-name` is absent, the edited file is hard-coded to `kitty.conf` under the config directory `[kittens/choose_fonts/final.go:L81]`; there is no per-invocation override at this commit.
 3. **The `choose_fonts` clone is visible, not hidden.** `clone.Hidden = false` `[kittens/choose_fonts/main.go:L97]`, and `kitten --help` lists both `choose-fonts` and `choose_fonts` at runtime (see [§2.5](#25-version-drift-correction-the-choose_fonts-clone-is-visible-not-hidden)).
 
@@ -629,7 +629,7 @@ The following corroborate — but are not the basis of — the behavioral claims
 
 - The **choose-fonts kitten guide** describes the same UI flow: filter the family list by typing, press Enter to select a family, view regular/bold/italic previews, fine-tune the regular face with the `R` key, and use a slider for variable axes (https://sw.kovidgoyal.net/kitty/kittens/choose-fonts/). This matches the pane flow in [§3](#section-3--optionselection-value-flow-to-the-final-step).
 - The **`kitty.conf` reference** documents the four keys `font_family`, `bold_font`, `italic_font`, `bold_italic_font` and recommends the kitten as, in its words, "the easiest way to select fonts" (https://sw.kovidgoyal.net/kitty/conf/); it also documents reload via `SIGUSR1` / `kill -SIGUSR1 $KITTY_PID`, exactly the signal `ReloadConfigInKitty` sends `[api.go:L353-L357]`.
-- The **`kitten-choose-fonts` man page** documents the `--reload-in` choices `parent, all, none` (https://www.mankier.com/1/kitten-choose_fonts), matching the `OptionSpec` in [§2.4](#24-the-single-declared-option---reload-in).
+- The **`kitten-choose-fonts` man page** documents the `--reload-in` choices `parent, all, none` (https://www.mankier.com/1/kitten-choose-fonts), matching the `OptionSpec` in [§2.4](#24-the-single-declared-option---reload-in).
 
 All quoted phrases above are short and attributed; the code remains the sole authority for behavior.
 
