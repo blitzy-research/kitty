@@ -73,7 +73,7 @@ Each recurring trace line was matched to the exact function that emits it (see �
 [6.915] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
 ```
 
-The per-key `Press`/`Release xkb_keycode: …` line is emitted by `glfw_xkb_handle_key_event` (`glfw/xkb_glfw.c:864`; the line itself at `glfw/xkb_glfw.c:875`); these lines are made visible because the `--debug-keyboard` option sets the `GLFW_DEBUG_KEYBOARD` init hint (`kitty/glfw.c:1444`). The backend translates the hardware *keycode* (`xkb_keycode: 0x26`) into a symbol/`text` and a GLFW key id (`glfw_key: 97 (a)`). A separate, **one-time** setup line — `Loading new XKB keymaps` (`glfw/xkb_glfw.c:672`, emitted by `glfw_xkb_compile_keymap`) — appears only at startup and whenever the keymap is (re)loaded, *not* for each keystroke: across this run of 39 key presses it appeared only twice, both before the first keystroke, and never again while keys were being typed. It therefore reflects XKB-backend initialization, not per-key handling.
+The per-key `Press`/`Release xkb_keycode: …` line is emitted by `glfw_xkb_handle_key_event` (`glfw/xkb_glfw.c:864`; the line itself at `glfw/xkb_glfw.c:875`); these lines are made visible because the `--debug-keyboard` option sets the `GLFW_DEBUG_KEYBOARD` init hint (`kitty/glfw.c:1444`). The backend translates the hardware *keycode* (`xkb_keycode: 0x26`) into a symbol/`text` and a GLFW key id (`glfw_key: 97 (a)`). A separate, **one-time** setup line — `Loading new XKB keymaps` (`glfw/xkb_glfw.c:672`, emitted by `glfw_xkb_compile_keymap`) — appears only at startup and whenever the keymap is (re)loaded, *not* for each keystroke: across this whole exploration session of 39 key presses — the 21‑event, three‑round consistency test described above plus the additional `a`+Enter ("command not found") and `echo hello`+Enter (screen read‑back) demonstrations shown below — it appeared only twice, both before the first keystroke, and never again while keys were being typed. It therefore reflects XKB-backend initialization, not per-key handling.
 
 **Hand‑off into Kitty.** GLFW then invokes the key callback that Kitty registered with `glfwSetKeyboardCallback(glfw_window, key_callback)` (`kitty/glfw.c:1292`). That callback, `key_callback` (`kitty/glfw.c:430`), forwards the event to Kitty's own keyboard entry point **only once the window is ready** — `if (is_window_ready_for_callbacks() && !ev->fake_event_on_focus_change) on_key_input(ev);` (`kitty/glfw.c:439`, guard at `kitty/glfw.c:202`). The application reaches this state by handing control to the C event loop at startup via `boss.child_monitor.main_loop()` (`kitty/main.py:234`).
 
@@ -112,7 +112,7 @@ The child shell processes the bytes and emits output, which the **same I/O threa
 
 ### 4. Parsing — `kitty/vt-parser.c` (main thread)
 
-Parsing of the read bytes happens back on the **main thread**: the main loop calls `parse_input(self)` (`kitty/child-monitor.c:1236`) → `parse_input` (`kitty/child-monitor.c:451`) → `do_parse` (`kitty/child-monitor.c:438`), which drives `parse_func`, set to `parse_worker` (`kitty/child-monitor.c:181`) and defined in `kitty/vt-parser.c:1496`. The VT/escape‑sequence state machine routes printable characters to the screen via `screen_draw_text(self->screen, &ch, 1)` (`kitty/vt-parser.c:226`, inside `consume_normal`, `kitty/vt-parser.c:230`), and interprets control/escape sequences (modes in `kitty/modes.h`, character sets in `kitty/charsets.c`).
+Parsing of the read bytes happens back on the **main thread**: the main loop calls `parse_input(self)` (`kitty/child-monitor.c:1236`) → `parse_input` (`kitty/child-monitor.c:451`) → `do_parse` (`kitty/child-monitor.c:438`), which drives `parse_func`, set to `parse_worker` (`kitty/child-monitor.c:181`) and defined in `kitty/vt-parser.c:1496`. The VT/escape‑sequence state machine routes a printable run to the screen via `screen_draw_text` from inside `consume_normal` (`kitty/vt-parser.c:230`), whose call passes the freshly UTF‑8‑decoded text — `screen_draw_text(self->screen, self->utf8_decoder.output.storage, self->utf8_decoder.output.pos)` at `kitty/vt-parser.c:236`. (The single‑character form `screen_draw_text(self->screen, &ch, 1)` at `kitty/vt-parser.c:226` is a different call site: the single‑byte‑control path in `dispatch_single_byte_control`, `kitty/vt-parser.c:224`.) The parser also interprets control/escape sequences (modes in `kitty/modes.h`, character sets in `kitty/charsets.c`).
 
 ### 5. Screen model — `kitty/screen.c`
 
@@ -155,7 +155,7 @@ Each row pairs a **consistently observed** signal with the code that produces it
 > *(one-time, at startup / keymap reload only — not per keypress):* `Loading new XKB keymaps`
 
 * **Code:** per-key `Press`/`Release xkb_keycode: …` emitted by `glfw_xkb_handle_key_event` (`glfw/xkb_glfw.c:864`; line at `glfw/xkb_glfw.c:875`); the one-time `Loading new XKB keymaps` by `glfw_xkb_compile_keymap` (`glfw/xkb_glfw.c:672`); all visible via `GLFW_DEBUG_KEYBOARD` (`kitty/glfw.c:1444`); callback `key_callback` (`kitty/glfw.c:430`) → `on_key_input` (`kitty/glfw.c:439`).
-* **Rationale:** the per-key `Press xkb_keycode: …` line precedes every `on_key_input:` line, proving the windowing layer decodes the hardware event before Kitty's logic runs. `Loading new XKB keymaps` is a keymap-load/initialization line (observed only twice across 39 key presses, both before the first keystroke), so it is *not* per-key evidence.
+* **Rationale:** the per-key `Press xkb_keycode: …` line precedes every `on_key_input:` line, proving the windowing layer decodes the hardware event before Kitty's logic runs. `Loading new XKB keymaps` is a keymap-load/initialization line (observed only twice across the whole 39‑keypress session — the 21‑event consistency test of §(b) plus the additional demos — both before the first keystroke), so it is *not* per-key evidence.
 
 ### Stage 2 — keyboard handling / encoding
 > `on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a`
@@ -164,7 +164,7 @@ Each row pairs a **consistently observed** signal with the code that produces it
 
 * **Code:** trace at `kitty/keys.c:176`; shortcut test → `kitty/boss.py:1408`; encode at `kitty/keys.c:251`; the three outcomes at `kitty/keys.c:253-254`, `:259-261`, `:271`.
 * **Rationale:** the printable `a` is sent as its literal byte; **Enter** is *encoded* (to `0x0d`) rather than sent literally — observable proof that this stage transforms the event into a terminal byte sequence. Releases are dropped, showing the active keyboard mode governs what is emitted.
-* **Note on formatting:** the `on_key_input:` line and the following `sent …`/`ignoring …` text appear on one physical line because the `on_key_input` format string ends with a trailing space and no newline (`kitty/keys.c:176`); the dispatch `debug(...)` call supplies the terminating newline (`kitty/keys.c:254`/`:261`).
+* **Note on formatting:** the `on_key_input:` line and the following `sent …`/`ignoring …` text appear on one physical line because the `on_key_input` format string ends with a trailing space and no newline (`kitty/keys.c:176`); the terminating newline is supplied by the dispatch `debug(...)` call, but at a different point per path: for the **text** path it is built into the message itself at `kitty/keys.c:254` (`debug("sent key as text to child: %s\n", …)`), whereas for the **encoded** path the message at `kitty/keys.c:261` (`debug("sent encoded key to child: ")`) carries no newline — the literal `debug("\n")` is emitted at `kitty/keys.c:268`, after the per-byte print loop (`:262-267`). The `ignoring …` message carries its own newline at `kitty/keys.c:271`.
 
 ### Stage 3–5 — write to child, child echoes, read back (I/O thread)
 > raw bytes captured by `--dump-bytes`: bash prompt, `\e]133;…` / `\e]7;kitty-shell-cwd://…` shell‑integration sequences, `\e[?2004h`, and `bash: a: command not found`
@@ -176,7 +176,7 @@ Each row pairs a **consistently observed** signal with the code that produces it
 > screen grid read back via `kitten @ get-text`:
 > `…# echo hello` / `hello` / `…#`
 
-* **Code:** `parse_input` (`kitty/child-monitor.c:1236` → `:451` → `do_parse` `:438` → `parse_worker` `kitty/vt-parser.c:1496`); text routed via `screen_draw_text` (`kitty/vt-parser.c:226`); grid in `kitty/screen.c`.
+* **Code:** `parse_input` (`kitty/child-monitor.c:1236` → `:451` → `do_parse` `:438` → `parse_worker` `kitty/vt-parser.c:1496`); printable text routed via `screen_draw_text` inside `consume_normal` (`kitty/vt-parser.c:236`); grid in `kitty/screen.c`.
 * **Rationale:** the grid contains both the echoed command and its output, proving the parser fed the child's bytes into the screen model — the state the renderer consumes.
 
 ### Stage 8 — render (main thread, GPU)
@@ -211,7 +211,7 @@ flowchart TD
     WTC --> CHILD[Child shell processes bytes, emits output]
     CHILD --> RB["read_bytes() — I/O thread io_loop<br/>child-monitor.c:1481 → 1337 (POLLIN :1531)"]
     RB --> PARSE["parse_input → do_parse → parse_worker — main thread<br/>child-monitor.c:1236/451/438/181"]
-    PARSE --> VT["VT state machine<br/>kitty/vt-parser.c:226 screen_draw_text"]
+    PARSE --> VT["VT state machine<br/>kitty/vt-parser.c:236 screen_draw_text (consume_normal)"]
     VT --> SCREEN["Screen model update (grid/cursor)<br/>kitty/screen.c + line/history/cursor"]
     SCREEN --> RENDER["render() — main thread, repaint_delay-gated<br/>child-monitor.c:1237 → 871 (:874-876)"]
     RENDER --> SHADERS["GPU draw: draw_cells_* glDrawArraysInstanced<br/>kitty/shaders.c:577/579/868"]
