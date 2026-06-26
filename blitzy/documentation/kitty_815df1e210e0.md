@@ -83,6 +83,17 @@ SUM:                            655          22985          10495         143605
 --------------------------------------------------------------------------------
 ```
 
+> **Reproducibility note.** The capture above measures kitty's *own* tracked source at the time of
+> observation. Two parts of it are not byte-stable across runs *by design*: `cloc`'s header timing/rate
+> (`T=0.81 s …`) is recomputed every invocation, and the `SUM` line depends on the tree's exact file
+> set. In particular, this very document is itself a tracked Markdown file under `blitzy/documentation/`,
+> so a naive re-run of `./count-lines-of-code` in the destination repository also counts *these* lines —
+> adding one file to the `Markdown` row and nudging `SUM` upward by however long this file currently is.
+> The stable, deliverable-independent figure is kitty's own source: **655 files / 143,605 code**, exactly
+> as shown once this document is excluded. Crucially, the per-language **code** figures the analysis
+> relies on — Go 47,437, Python 46,249, C 28,898, C/C++ Header 3,508, GLSL 506 — are unaffected and
+> reproduce exactly either way.
+
 By this **official `cloc` code-line method** (which *excludes* the vendored GLFW C under `glfw/`),
 the ranking is **Go (47,437) > Python (46,249) > C (28,898) + C/C++ Header (3,508) = 32,406 > GLSL
 (506)**. Measured this way, C is only the *third* largest body of code. Raw line counts (including
