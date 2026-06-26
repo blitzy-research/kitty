@@ -1,4 +1,4 @@
-# How kitty Transfers Files Efficiently over SSH/TTY
+# How kitty 0.35.2 (commit 815df1e21) Transfers Files Efficiently over SSH/TTY
 
 **Analysis revision:** kitty **0.35.2**, commit **`815df1e21`** (git branch `kitty_815df1e210e0`).
 
@@ -22,7 +22,7 @@ A note on method: kitty is a polyglot monorepo. The terminal **core** is C + Pyt
 
 ## Build & Run
 
-kitty is built from source with its custom `setup.py` orchestrator, which compiles the C extensions, regenerates Go code from the C/Python sources, and produces the static `kitten` Go binary plus the `tools/rsync` engine used for the empirical section.
+kitty is built from source with its custom `setup.py` orchestrator, whose `build()` step compiles the C extensions and the transfer kitten's C sources, regenerates the Go code from the C/Python sources, and produces the static `kitten` Go binary plus the `tools/rsync` engine used for the empirical section `[setup.py:1084-1095]`. Concretely, `build()` calls `compile_c_extension(...)` for the `kitty/fast_data_types` core and then `compile_kittens(...)` `[setup.py:1090-1095]`; `compile_kittens` builds the `kittens/transfer/rsync` C binding against `libxxhash` `[setup.py:985-992]`; `update_go_generated_files` runs `gen/go_code.py` through the freshly built launcher to emit the generated Go sources `[setup.py:1102-1116]`; and `build_static_kittens` invokes `go build` to produce the static `kitten` binary `[setup.py:1130-1160]`.
 
 **Canonical build command (mandated in this environment):**
 
@@ -30,9 +30,9 @@ kitty is built from source with its custom `setup.py` orchestrator, which compil
 CI=true python3 setup.py build --ignore-compiler-warnings
 ```
 
-The `--ignore-compiler-warnings` flag is **required in this environment** purely to bypass an *unrelated* GLFW Wayland `-Werror=switch` compile error triggered by newer `wayland-protocols` enums. That is a GUI‑only concern and has **nothing to do with file transfer**; the transfer subsystem (C parser, Python orchestrator, Go client, Go rsync engine) compiles cleanly. The build is what generates the Go constant that ties the protocol together — `const FileTransferCode int = 5113` `[constants_generated.go:10]` — so building first is a prerequisite for any Go‑level evidence.
+The `--ignore-compiler-warnings` flag is **required in this environment** purely to bypass an *unrelated* GLFW Wayland `-Werror=switch` compile error triggered by newer `wayland-protocols` enums. That is a GUI-only concern and has **nothing to do with file transfer**; the transfer subsystem (C parser, Python orchestrator, Go client, Go rsync engine) compiles cleanly. Building first matters because the Go constant that ties the protocol together is *generated* during the build rather than hand-written: `gen/go_code.py` imports `FILE_TRANSFER_CODE` from the compiled C extension `[gen/go_code.py:575]` and emits `const FileTransferCode int = {FILE_TRANSFER_CODE}` `[gen/go_code.py:597]`, materializing the single C definition `#define FILE_TRANSFER_CODE 5113` `[kitty/control-codes.h:233]` (exposed to Python at `[kitty/data-types.c:596]`). So building first is a prerequisite for any Go-level evidence.
 
-**Toolchain used:** `python3` 3.12.x–3.13.x (the repo targets Python ≥3.8 per `pyproject.toml`), `go` 1.22.x–1.23.x (`go.mod` declares `go 1.22`), and `gcc` 13.x–15.x. The `tools/rsync` engine uses the pure‑Go `github.com/zeebo/xxh3 v1.0.2` for hashing (no CGO), so Go‑level evidence needs only the Go toolchain.
+**Toolchain (source-declared minimums vs. host observations).** The repository pins its toolchain floor in tracked manifests: Python `>=3.8` `[pyproject.toml:2]` and `go 1.22` `[go.mod:3]`, with `tools/rsync` hashing supplied by the pure-Go `github.com/zeebo/xxh3 v1.0.2` `[go.mod:16]` (no CGO), so Go-level evidence needs only the Go toolchain. The host actually used to build and run for this analysis observed `python3` 3.12-3.13, `go` 1.22-1.23, and `gcc` 13-15; these are environment observations, not source facts, and the source-declared minimums cited above are what the build requires.
 
 **Tests (green on the built tree):**
 
@@ -164,7 +164,7 @@ flowchart LR
     FT --> DISK
 ```
 
-**Rationale to carry forward:** the design's defining choice is that the protocol *is* terminal output. Riding the TTY device means the transfer survives anything that faithfully relays a terminal — nested SSH sessions, `tmux`, even a serial line — which the protocol spec calls out explicitly `[docs/file-transfer-protocol.rst:5]`. The cost of that choice (escape‑code framing and base64 encoding) is exactly what Q2 and Q4 describe.
+**Rationale to carry forward:** the design's defining choice is that the protocol *is* terminal output. Riding the TTY device means the transfer survives anything that faithfully relays a terminal: nested SSH sessions and even a serial line, which the protocol spec calls out explicitly `[docs/file-transfer-protocol.rst:4-7]` and the transfer kitten's own docs echo `[docs/kittens/transfer.rst:14-16]`. The cost of that choice (escape-code framing and base64 encoding) is exactly what Q2 and Q4 describe.
 
 ---
 
@@ -384,14 +384,14 @@ The receiver distinguishes file‑transfer traffic from clipboard writes, shell�
 #define FILE_TRANSFER_CODE 5113     // [kitty/control-codes.h:233]
 ```
 
-The VT parser's `case FILE_TRANSFER_CODE:` `[kitty/vt-parser.c:547]` routes precisely those OSC codes to file transmission, and nothing else lands there — clipboard uses **OSC 52**, shell integration uses **OSC 133**, so they dispatch elsewhere. **That numeric tag is the demultiplexer.** It is the reason a stream that simultaneously carries your prompt, your program's output, a clipboard copy, *and* a file transfer never confuses one for another: each OSC code is keyed by its number.
+The VT parser's `case FILE_TRANSFER_CODE:` `[kitty/vt-parser.c:547-549]` routes precisely those OSC codes to file transmission, and nothing else lands there: clipboard uses **OSC 52** and shell integration uses **OSC 133**, which the parser dispatches in their own separate cases `[kitty/vt-parser.c:531-536]`, so they land elsewhere. **That numeric tag is the demultiplexer.** It is the reason a stream that simultaneously carries your prompt, your program's output, a clipboard copy, *and* a file transfer never confuses one for another: each OSC code is keyed by its number.
 
 **Why a single constant works across three languages — kitty's "single source of truth" codegen.** The same `5113` is used by the C parser, the Python core, and the Go client because the Go constant is *generated from the C `#define`*, not retyped:
 
 - C defines it: `#define FILE_TRANSFER_CODE 5113` `[kitty/control-codes.h:233]`.
 - C exposes it to Python: `PyModule_AddIntMacro(m, FILE_TRANSFER_CODE);` `[kitty/data-types.c:596]`.
 - The Go code generator reads it from the Python C‑extension and emits a Go constant: `from kitty.fast_data_types import FILE_TRANSFER_CODE` `[gen/go_code.py:575]` → `const FileTransferCode int = {FILE_TRANSFER_CODE}` `[gen/go_code.py:597]`.
-- The build therefore produces `const FileTransferCode int = 5113` `[constants_generated.go:10]`.
+- At build time the code generator therefore emits the concrete line `const FileTransferCode int = 5113` into a generated Go source from that template `[gen/go_code.py:597]`; that emitted file is build output (git-ignored), not tracked source, so the authoritative citations are the tracked ones above.
 
 When the Go client serializes a command for the wire, it writes that generated constant — never a literal: `ans.WriteString(strconv.Itoa(kitty.FileTransferCode))` `[kittens/transfer/ftc.go:168]`. So there is exactly one place the number `5113` is authored (the C header), and C, Python, and Go are guaranteed to agree.
 
@@ -493,7 +493,7 @@ The sequence is: `os.Lstat` the existing partial file `[kittens/transfer/receive
 
 There is **no separate resume journal, offset database, or `.part` metadata sidecar.** The resume state is the partial destination file's **own bytes**: on restart, the receiver simply re‑signs whatever it has, and the rsync exchange naturally fills in the rest. This is an elegant consequence of the rsync design rather than a bolted‑on feature — "where the file already matches, don't send it" is exactly what resuming an interrupted transfer needs, with no extra bookkeeping to keep consistent or to corrupt.
 
-**Why the simple (non‑rsync) path cannot resume.** Without `--transmit-deltas`, an incoming regular file is received in `simple` mode, where the destination is created/truncated up front (an `os.Create`‑style open zeroes any prior contents). With the prior bytes discarded, there is nothing to resume *from* — the transfer necessarily restarts from zero. Only the rsync path preserves and re‑uses the existing bytes, which is precisely why resumption and delta efficiency are the same feature. The user‑facing documentation describes the same behavior — delta transfers update an existing file and thereby resume partial transfers `[docs/kittens/transfer.rst:77-84]`.
+**Why the simple (non-rsync) path cannot resume.** Without `--transmit-deltas`, an incoming regular file is received in `simple` mode, where the destination is created/truncated up front: the Go receiver takes the non-diff branch and calls `os.Create(self.expanded_local_path)` `[kittens/transfer/receive.go:181-188]`, and the Python core opens the regular file with `os.O_TRUNC` among its open flags `[kitty/file_transmission.py:541-547]`, so either way any prior contents are zeroed. With the prior bytes discarded there is nothing to resume *from*, and the transfer necessarily restarts from zero. Only the rsync path preserves and re-uses the existing bytes, which is precisely why resumption and delta efficiency are the same feature. The resume behavior itself is stated directly in the `--transmit-deltas` help text, which says that using the rsync algorithm to update an existing file is also what enables 'automatically resuming partial transfers' `[kittens/transfer/main.py:115-120]`; the user-facing delta-transfer docs corroborate only the narrower point that this mode transfers the differences between files, with a performance caveat for small files or fast networks `[docs/kittens/transfer.rst:77-84]`.
 
 > Note the `> 4096` threshold `[kittens/transfer/receive.go:407]`: if fewer than ~4 KiB already exist, the signature/delta overhead would not pay for itself, so kitty just sends the file. This dovetails with the option's own caveat that deltas can *degrade* performance on fast links or tiny files `[kittens/transfer/main.py:120]`.
 
@@ -575,7 +575,7 @@ if found_hash {
 
 In our experiment, blocks 0–511 and 513–1023 are byte‑identical in v1 and v2, so every one of them passes both levels and is emitted as a reference; only block 512 fails to match and is sent as literal `OpData`.
 
-**The takeaway:** the delta's size tracks the size of the *change*, not the size of the *file*. A 256‑byte edit cost ~1 KB of delta regardless of whether the file was 1 MiB or 1 GiB; the only file‑size‑dependent cost is the signature, and even that is ~2 % of a full re‑send here.
+**The takeaway:** the delta's literal payload tracks the *changed block(s)*, not the whole file, but the block size itself scales with the file size. `NewPatcher` sets the block size to `round(sqrt(file_size))`, capped at `MaxBlockSize` = 1 MiB `[tools/rsync/api.go:271-277]`, `[tools/rsync/api.go:29]`. In this experiment the 1 MiB file yields a 1,024-byte block, so the single changed block costs ~1 KiB of literal `OpData`. A 1 GiB file, by contrast, yields `round(sqrt(1,073,741,824)) = 32,768`-byte blocks, so the *same* 256-byte edit would land in one 32 KiB block and ship ~32 KiB of literal data, not ~1 KiB. So the literal delta is proportional to the changed block(s) (with block size = `round(sqrt(file_size))` capped at 1 MiB), and the signature is the other, separately file-size-dependent, cost (here ~2 % of a full re-send).
 
 ### Methodology and repository hygiene (stated honestly)
 
@@ -585,5 +585,5 @@ The measurement exercised the **real in‑tree engine**, not a copy. A scratch G
 
 ## Summary
 
-kitty makes file transfer over SSH efficient by combining two ideas. First, it carries the transfer **in the terminal byte stream itself** as `OSC 5113` escape codes `[kitty/control-codes.h:233]`, `[kitty/vt-parser.c:547-549]`, so it needs no side channel and works across any link that relays a TTY; the numeric `5113` tag is the demultiplexer that keeps transfer data distinct from clipboard and shell‑integration output, and that one value is shared across C, Python, and Go by code generation `[gen/go_code.py:575,597]`, `[constants_generated.go:10]`. Second, when the receiver already has the file, it runs **rsync‑style delta transfer** `[tools/rsync/algorithm.go:31-205]`, `[tools/rsync/api.go:270-279]`: a compact signature plus a delta that references unchanged blocks via a fast weak‑checksum filter confirmed by a strong XXH3‑64 hash `[tools/rsync/algorithm.go:556-563]`. Resumption needs no journal because the partial file's own bytes are the resume state `[kittens/transfer/receive.go:404-425]`, and atomic temp‑file renames `[kitty/file_transmission.py:392,405]` guarantee the destination is never left half‑written. The net effect, measured against the real engine, is that a 256‑byte edit in a 1 MiB file moved **97.94 %** fewer bytes than a naive re‑send, with a sha256‑verified result.
+kitty makes file transfer over SSH efficient by combining two ideas. First, it carries the transfer **in the terminal byte stream itself** as `OSC 5113` escape codes `[kitty/control-codes.h:233]`, `[kitty/vt-parser.c:547-549]`, so it needs no side channel and works across any link that relays a TTY; the numeric `5113` tag is the demultiplexer that keeps transfer data distinct from clipboard and shell‑integration output, and that one value is shared across C, Python, and Go by code generation `[gen/go_code.py:575,597]`. Second, when the receiver already has the file, it runs **rsync‑style delta transfer** `[tools/rsync/algorithm.go:31-205]`, `[tools/rsync/api.go:270-279]`: a compact signature plus a delta that references unchanged blocks via a fast weak‑checksum filter confirmed by a strong XXH3‑64 hash `[tools/rsync/algorithm.go:556-563]`. Resumption needs no journal because the partial file's own bytes are the resume state `[kittens/transfer/receive.go:404-425]`, and atomic temp‑file renames `[kitty/file_transmission.py:392,405]` guarantee the destination is never left half‑written. The net effect, measured against the real engine, is that a 256‑byte edit in a 1 MiB file moved **97.94 %** fewer bytes than a naive re‑send, with a sha256‑verified result.
 
