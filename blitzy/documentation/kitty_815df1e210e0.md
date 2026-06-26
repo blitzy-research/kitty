@@ -253,12 +253,20 @@ precisely:
 - **While running:** `srwxr-xr-x ... /tmp/kitty-rc-demo.sock` (the leading `s` denotes a socket).
 - **Clean exit** (the window's child process ended, kitty closed the window and quit *normally*): the
   socket file was **gone** — the `atexit` handler ran.
-- **Signal kill** (`SIGTERM`/`SIGKILL`): the socket file **persisted** as a *stale* socket, because
-  Python `atexit` handlers do not run on signal-based termination. (This is why community guidance
-  recommends deleting stale sockets before relaunch.)
+- **Caught signals** (`SIGINT`/`SIGTERM`/`SIGHUP`): the socket file was **gone** — kitty installs a
+  C-level signal handler that catches these (`KITTY_HANDLED_SIGNALS` includes `SIGTERM`
+  [`kitty/child-monitor.c:L121`]) and converts them into a *graceful* shutdown
+  (`case SIGINT: case SIGTERM: case SIGHUP:` → `kill_signal` [`kitty/child-monitor.c:L1365-L1368`]).
+  Because the Python interpreter then exits normally, the `atexit` cleanup runs and the file is removed.
+  (Verified live: `kill -TERM <kitty_pid>` left `/tmp` clean.)
+- **Hard kill** (`SIGKILL`) **or a crash**: the socket file **persisted** as a *stale* socket, because
+  `SIGKILL` cannot be caught and the `atexit` handler never runs. (Verified live: `kill -9 <kitty_pid>`
+  left the `s…`-mode socket behind — which is why community guidance recommends deleting stale sockets
+  before relaunch.)
 
 The rationale: cleanup is performed by **kitty's own `atexit` handler**, not by the OS. A graceful exit
-leaves `/tmp` clean; a crash can leave a stale file behind.
+— including one triggered by a *caught* signal (`SIGINT`/`SIGTERM`/`SIGHUP`) — leaves `/tmp` clean; only
+an uncatchable `SIGKILL` or a crash can leave a stale file behind.
 
 ### 2.5 Putting it together — the answer to "was I looking in the wrong place?"
 
@@ -744,12 +752,14 @@ passwords, which are redacted per security policy; recall that common env vars a
   (They appear alphabetically in the output because of `sort_keys=True`.)
 - **Each tab** carries `id`, `title`, `is_active`/`is_focused`, the `layout` and its `layout_opts` /
   `layout_state`, `enabled_layouts`, `active_window_history`, `groups`, and a `windows` list.
-- **Each window** carries `id`, `title`, `cwd`, `pid`, `cmdline`, and `env` — and additionally
-  `foreground_processes`, `at_prompt`, `columns`/`lines`, `created_at`, `last_cmd_exit_status`,
-  `user_vars`, and `is_self` (true for the window in which the command itself runs; here `false` since
-  the command came over the socket). This per-window detail is what the docs describe as a tree of OS
-  windows → tabs → windows, each with id/title/cwd/pid/cmdline [`docs/remote-control.rst:L83-90`], and it
-  is what powers `kitten @ ... --match` selection.
+- **Each window** carries the keys assembled by `Window.as_dict()` [`kitty/window.py:L694`] — 17 in
+  all: `id`, `title`, `cwd`, `pid`, `cmdline`, and `env`, plus `is_active`/`is_focused` (mirroring the
+  OS-window/tab focus flags), `last_reported_cmdline`, `foreground_processes`, `at_prompt`,
+  `columns`/`lines`, `created_at`, `last_cmd_exit_status`, `user_vars`, and `is_self` (true for the
+  window in which the command itself runs; here `false` since the command came over the socket). This
+  per-window detail is what the docs describe as a tree of OS windows → tabs → windows, each with
+  id/title/cwd/pid/cmdline [`docs/remote-control.rst:L83-90`], and it is what powers
+  `kitten @ ... --match` selection.
 
 
 ---
@@ -966,7 +976,10 @@ echo -en '\eP@kitty-cmd{not valid json}\e\\' | socat - unix:/tmp/kitty-rc-demo.s
 # because the orchestrator and other unrelated processes must not be touched.
 kill "$pid" 2>/dev/null
 # A clean exit triggers the atexit handler that removes the socket file (kitty/boss.py:L181).
-# A signal-kill can leave a stale socket, so remove it explicitly only if it still remains:
+# Note: `kill "$pid"` sends SIGTERM, which kitty catches and turns into a graceful shutdown
+# (kitty/child-monitor.c:L1365-1368), so the atexit cleanup still runs and the socket is removed.
+# Only an uncatchable SIGKILL (kill -9) or a crash leaves a stale socket; the guard below removes
+# it explicitly just in case:
 [ -S /tmp/kitty-rc-demo.sock ] && rm -f /tmp/kitty-rc-demo.sock
 # Then delete any temporary capture scripts.
 ```
@@ -1007,7 +1020,7 @@ point.)*
 | Request / response framers | `kitty/remote_control.py:L308-L310` (ASCII send), `kitty/remote_control.py:L52-L53` (UTF-8 response); `tools/cmd/at/socket_io.go:L82-L83,L107` |
 | Wire frame spec | `docs/rc_protocol.rst:L8-L19`, runnable example `docs/rc_protocol.rst:L42` |
 | Socket-creation gate (4 modes incl. `password`) | `kitty/boss.py:L364` |
-| Socket factory + atexit cleanup | `kitty/boss.py:L177-181`; `kitty/utils.py:L379` |
+| Socket factory + atexit cleanup | `kitty/boss.py:L177-181`; `kitty/utils.py:L379`; caught-signal → graceful exit `kitty/child-monitor.c:L121,L1365-1368` |
 | `{kitty_pid}` templating / auto-append | `kitty/main.py:L325-343` (esp. L329-331) |
 | Abstract socket (no FS entry) | `kitty/utils.py:L502,L514` |
 | Destination resolution (`--to` → env → TTY) | `kitty/remote_control.py:L267-273,L271`; `tools/cmd/at/main.go:L372` |
@@ -1018,7 +1031,7 @@ point.)*
 | Authorization gate | `kitty/boss.py:L623-633`; `docs/remote-control.rst:L243` |
 | Dynamic dispatch | `kitty/rc/base.py:L449-L456,L459-L462`, base class `kitty/rc/base.py:L319` |
 | `ls` handler | `kitty/rc/ls.py:L45-46,L48,L57,L58-75,L76,L79` |
-| OS-window tree | `kitty/boss.py:L432`; `docs/remote-control.rst:L83-90` |
+| OS-window / window tree | `kitty/boss.py:L432`; per-window keys `kitty/window.py:L694` (`Window.as_dict`); `docs/remote-control.rst:L83-90` |
 | Response envelope | `kitty/remote_control.py:L213,L216,L258-260` |
 | Env producers | `kitty/child.py:L211,L216,L244-249`; `kitty/tabs.py:L491` |
 | Env consumers | `shell-integration/bash/kitty.bash:L215-216`; `tools/cmd/at/main.go:L372` |
