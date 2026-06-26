@@ -38,6 +38,15 @@
    the incoming command is parsed and routed to the `ls` handler; (iv) the JSON that comes back from a
    *real* `ls` call — plus the logging behavior.
 
+> **How this document is organized.** The required topics are all covered, in the order a command
+> actually travels through the system. For readability they are presented as **twelve numbered sections
+> plus an appendix** rather than as a flat list: the overview (§1) and the four-layer "why `/tmp` looked
+> empty" explanation (§2) are split apart; transport, wire frame, ingest, parse/authorize/route, the
+> `ls` handler, shell integration, and logging follow as §3–§9; the end-to-end flowchart is §10; and the
+> reproducible build-and-capture method (§11 + Appendix A) and the closing extension-point orientation
+> (§12) round it out. No required topic is omitted — the section count differs only in how the same
+> material is grouped.
+
 ## TL;DR — the short answers (each expanded, with rationale, below)
 
 - **(a)** Neither a pipe nor (by default) a socket. kitty supports **two transports**, chosen on the
@@ -159,9 +168,16 @@ if args.listen_on and self.allow_remote_control in ('y', 'socket', 'socket-only'
 
 Two consequences:
 
-1. **No `--listen-on`/`listen_on` ⇒ no socket.** The default configuration enables RC over the
-   controlling TTY only; `self.listening_on` stays `''` and no socket file is ever created. A user who
-   runs a normal kitty and then greps `/tmp` will find nothing, because there is nothing to find.
+1. **No `--listen-on`/`listen_on` ⇒ no socket** — but mind the distinction between *transport* and
+   *authorization*. When RC is **enabled** yet no address is requested, `self.listening_on` stays `''`,
+   no socket file is created, and the client simply falls back to the controlling-TTY transport
+   [`kitty/remote_control.py:L267-L273`]. Separately, in the **default configuration**
+   `allow_remote_control` is `'no'` [`kitty/options/definition.py:L2969`], so RC is **disabled
+   entirely**: the gate above is never satisfied (no socket), *and* even a TTY-delivered command is
+   refused by the authorization check (§6.2). The user docs say so plainly — for control to work,
+   `allow_remote_control` or `remote_control_password` must be enabled
+   [`docs/remote-control.rst:L20-L22`]. Either way, a user who runs a normal (default) kitty and then
+   greps `/tmp` will find nothing, because there is nothing to find.
 2. **`--listen-on` is ignored unless the mode permits it.** The gate accepts exactly **four** modes:
    `'y'` (the normalized form of `yes`/`true`), `'socket'`, `'socket-only'`, and `'password'`
    [`kitty/boss.py:L364`].
@@ -246,8 +262,10 @@ leaves `/tmp` clean; a crash can leave a stale file behind.
 
 ### 2.5 Putting it together — the answer to "was I looking in the wrong place?"
 
-Most likely the user was running a **default** kitty (no `--listen-on`), so **there was never a socket
-to find** — in-window control was flowing over the controlling TTY (§1.2, §3). If a socket *was*
+Most likely the user was running a kitty **without `--listen-on`**, so **there was never a socket to
+find**. In the default configuration RC is off entirely (`allow_remote_control=no`), so no socket is
+created [`kitty/options/definition.py:L2969`]; and even with RC *enabled* but no address requested,
+in-window control travels over the controlling TTY rather than a socket (§1.2, §3). If a socket *was*
 configured, the file may have been **PID-templated** (different name), **abstract** (no file), or
 **already removed** at exit. All four layers point the same way: a static `/tmp` search is the wrong
 instrument for locating kitty's RC channel.
@@ -339,8 +357,15 @@ const cmd_escape_code_suffix = "\x1b\\"            // L83
 ### 4.2 The runnable `socat` example, reproduced and annotated
 
 The protocol docs ship a one-liner that performs an entire `@ ls` exchange with nothing but shell tools
-[`docs/rc_protocol.rst:L42`]. Reproduced **verbatim** (only the socket path is pointed at our live
-instance):
+[`docs/rc_protocol.rst:L42`]. Here it is **verbatim** — exactly as shipped, on a single line and
+targeting the docs' own `unix:/tmp/test` socket:
+
+```sh
+echo -en '\eP@kitty-cmd{"cmd":"ls","version":[0,14,2]}\e\\' | socat - unix:/tmp/test | awk '{ print substr($0, 13, length($0) - 14) }' | jq -c '.data | fromjson' | jq .
+```
+
+The same command, re-formatted across lines for readability (identical bytes, still the docs'
+`unix:/tmp/test` socket — **not** the live instance):
 
 ```sh
 echo -en '\eP@kitty-cmd{"cmd":"ls","version":[0,14,2]}\e\\' \
@@ -349,6 +374,9 @@ echo -en '\eP@kitty-cmd{"cmd":"ls","version":[0,14,2]}\e\\' \
   | jq -c '.data | fromjson' \
   | jq .
 ```
+
+The **live variant** — the identical pipeline pointed at our running instance's
+`unix:/tmp/kitty-rc-demo.sock` — is shown in Appendix §11.3.
 
 Stage by stage:
 
@@ -513,7 +541,14 @@ Key behaviors:
 - The payload must be **valid JSON** and a **dict containing a `version` field**; otherwise the command
   is ignored. JSON failures are logged: *"Failed to parse JSON payload of remote command, ignoring it"*
   (~`L61`) and *"JSON payload of remote command is invalid …"* (~`L64`).
-- `pcmd.pop('password', None)` removes any password before dispatch (~`L67`).
+- `pcmd.pop('password', None)` (~`L67`) strips only the **unencrypted, top-level `password`** field, and
+  it does so *before* any decryption — a plaintext password sent in the clear is never trusted.
+  Password-based RC does **not** lose its password, however: the client's encrypter places the password
+  *inside* the encrypted payload (`cmd['password'] = self.password` [`kitty/remote_control.py:L428`]);
+  when `parse_cmd` decrypts, it **replaces `pcmd` with the decrypted JSON**
+  (`pcmd = json.loads(data)` [`kitty/remote_control.py:L75-L77`]), so that password survives and is read
+  later by the authorization check (`pw = pcmd.get('password', '')`
+  [`kitty/remote_control.py:L188-L202`]).
 - For the **encrypted** path (used with `remote_control_password`), `parse_cmd` decrypts using the
   protocol version (`RC_ENCRYPTION_PROTOCOL_VERSION`) and AES-256-GCM, and enforces a **±5-minute
   timestamp replay window**: `abs(delta) > 5 * 60 * 1e9` nanoseconds [`kitty/remote_control.py:L80-81`].
@@ -835,24 +870,35 @@ The complete journey of `kitten @ ls`, from the client's transport choice to the
 
 ```mermaid
 flowchart TD
-    A["kitten @ ls (client)"] --> B{"--to or KITTY_LISTEN_ON set?<br/>remote_control.py:L267-273"}
-    B -->|yes| C["SocketIO: connect to socket address<br/>remote_control.py:L383"]
-    B -->|no| D["RCIO: write to controlling TTY/PTY<br/>remote_control.py:L383"]
-    C --> E["Build DCS frame:<br/>ESC P @kitty-cmd + JSON + ESC backslash<br/>encode_send remote_control.py:L308-310"]
+    A["kitten @ ls (client)"] --> B{"--to or KITTY_LISTEN_ON set?<br/>kitty/remote_control.py:L267-L273"}
+    B -->|yes| C["SocketIO: connect to socket address<br/>kitty/remote_control.py:L383"]
+    B -->|no| D["RCIO: write to controlling TTY/PTY<br/>kitty/remote_control.py:L383"]
+    C --> E["Build DCS frame:<br/>ESC P @kitty-cmd + JSON + ESC backslash<br/>encode_send kitty/remote_control.py:L308-L310"]
     D --> E
-    E --> F["C child-monitor: accept socket peer / detect prefix<br/>KITTY_CMD_PREFIX child-monitor.c:L1650, memcmp L1686"]
-    F --> G["Socket: Boss.peer_message_received boss.py:L776<br/>TTY: Boss.handle_remote_cmd boss.py:L849"]
-    G --> H["_handle_remote_command boss.py:L590<br/>from_socket = peer_id > 0"]
-    H --> I["parse_cmd remote_control.py:L56<br/>JSON + version + optional decrypt + 5-min replay check"]
-    I --> J{"authorized?<br/>boss.py:L623-633"}
+    E -->|socket transport| FS["C child-monitor: accept socket peer,<br/>detect KITTY_CMD_PREFIX<br/>kitty/child-monitor.c:L1650, memcmp L1686"]
+    FS --> GS["callback into Python: peer_message_received<br/>kitty/child-monitor.c:L504"]
+    GS --> HS["Boss.peer_message_received<br/>kitty/boss.py:L776-L792"]
+    HS --> Z["_handle_remote_command<br/>kitty/boss.py:L590<br/>from_socket = peer_id > 0"]
+    E -->|TTY transport| FT["terminal VT parser sees the DCS,<br/>dispatch cmd to handle_remote_cmd<br/>kitty/vt-parser.c:L603"]
+    FT --> GT["Window.handle_remote_cmd<br/>kitty/window.py:L1279-L1280"]
+    GT --> HT["Boss.handle_remote_cmd<br/>kitty/boss.py:L849-L852"]
+    HT --> Z
+    Z --> I["parse_cmd kitty/remote_control.py:L56<br/>JSON + version + optional decrypt + 5-min replay check"]
+    I --> J{"authorized?<br/>kitty/boss.py:L623-L633"}
     J -->|no| K["log_error and reject"]
-    J -->|yes| L["handle_cmd remote_control.py:L213"]
-    L --> M["command_for_name('ls')<br/>import_module kitty.rc.ls<br/>rc/base.py:L449-456 -> ls = LS() rc/ls.py:L79"]
-    M --> N["LS.response_from_kitty rc/ls.py:L48<br/>calls boss.list_os_windows boss.py:L432"]
-    N --> O["json.dumps(tree) rc/ls.py:L76<br/>wrapped as {ok:true, data:...} remote_control.py:L258-260"]
-    O --> P["response DCS frame returned to client<br/>encode_response_for_peer remote_control.py:L53"]
+    J -->|yes| L["handle_cmd kitty/remote_control.py:L213"]
+    L --> M["command_for_name ls:<br/>import_module kitty.rc.ls<br/>kitty/rc/base.py:L449-L456 then ls = LS() kitty/rc/ls.py:L79"]
+    M --> N["LS.response_from_kitty kitty/rc/ls.py:L48<br/>calls boss.list_os_windows kitty/boss.py:L432"]
+    N --> O["json.dumps tree kitty/rc/ls.py:L76<br/>wrapped as ok:true / data:... kitty/remote_control.py:L258-L260"]
+    O --> P["response DCS frame returned to client<br/>encode_response_for_peer kitty/remote_control.py:L52-L53"]
 ```
 
+The two server-ingest branches are deliberately distinct (§5). A **socket** peer is accepted and
+prefix-matched by the C child-monitor, which calls back into Python's `peer_message_received` (§5.1); an
+**in-window/PTY** command is instead recognized by the terminal's escape-code (VT) parser and handed to
+`Window.handle_remote_cmd`, which forwards to `Boss.handle_remote_cmd` (§5.2). The TTY path does **not**
+pass through the child-monitor. Both branches reconverge at `_handle_remote_command`
+[`kitty/boss.py:L590`], after which parsing, authorization, and routing are shared.
 
 ---
 
@@ -884,6 +930,7 @@ xvfb-run -a ./kitty/launcher/kitty --config NONE \
   --listen-on unix:/tmp/kitty-rc-demo.sock \
   --start-as=minimized \
   sh -c 'sleep 300' &
+pid=$!     # capture the exact PID we just spawned, for a safe, targeted cleanup later (see 11.5)
 ```
 
 Verify the real socket: `ls -l /tmp/kitty-rc-demo.sock` → `srwxr-xr-x ... /tmp/kitty-rc-demo.sock`
@@ -915,10 +962,12 @@ echo -en '\eP@kitty-cmd{not valid json}\e\\' | socat - unix:/tmp/kitty-rc-demo.s
 ### 11.5 Clean up
 
 ```sh
-# Kill ONLY the exact kitty process group/PIDs you spawned (never a broad pkill).
-# A clean exit triggers the atexit handler that removes the socket file (kitty/boss.py:L181);
-# a signal-kill leaves a stale socket, so remove it explicitly if present:
-rm -f /tmp/kitty-rc-demo.sock
+# Kill ONLY the exact PID captured at launch ($pid); never a broad pkill/killall,
+# because the orchestrator and other unrelated processes must not be touched.
+kill "$pid" 2>/dev/null
+# A clean exit triggers the atexit handler that removes the socket file (kitty/boss.py:L181).
+# A signal-kill can leave a stale socket, so remove it explicitly only if it still remains:
+[ -S /tmp/kitty-rc-demo.sock ] && rm -f /tmp/kitty-rc-demo.sock
 # Then delete any temporary capture scripts.
 ```
 
@@ -954,20 +1003,20 @@ point.)*
 
 | Concern | Primary citations |
 |---|---|
-| Transport selector (one handler, two transports) | `kitty/remote_control.py:L383`, `:L369`; `tools/cmd/at/main.go:L280` |
-| Request / response framers | `kitty/remote_control.py:L308-310` (ASCII send), `:L52-53` (UTF-8 response); `tools/cmd/at/socket_io.go:L82-83,L107` |
-| Wire frame spec | `docs/rc_protocol.rst:L8-19`, runnable example `:L42` |
+| Transport selector (one handler, two transports) | `kitty/remote_control.py:L383`, `kitty/remote_control.py:L369`; `tools/cmd/at/main.go:L280` |
+| Request / response framers | `kitty/remote_control.py:L308-L310` (ASCII send), `kitty/remote_control.py:L52-L53` (UTF-8 response); `tools/cmd/at/socket_io.go:L82-L83,L107` |
+| Wire frame spec | `docs/rc_protocol.rst:L8-L19`, runnable example `docs/rc_protocol.rst:L42` |
 | Socket-creation gate (4 modes incl. `password`) | `kitty/boss.py:L364` |
 | Socket factory + atexit cleanup | `kitty/boss.py:L177-181`; `kitty/utils.py:L379` |
 | `{kitty_pid}` templating / auto-append | `kitty/main.py:L325-343` (esp. L329-331) |
 | Abstract socket (no FS entry) | `kitty/utils.py:L502,L514` |
 | Destination resolution (`--to` → env → TTY) | `kitty/remote_control.py:L267-273,L271`; `tools/cmd/at/main.go:L372` |
 | Server ingest — C child-monitor | `kitty/child-monitor.c:L46,L504,L1614,L1632,L1650,L1686` |
-| Server ingest — Python entry points | `kitty/boss.py:L776` (socket), `:L849` (TTY), `:L792` (peer log) |
+| Server ingest — Python entry points | `kitty/boss.py:L776` (socket), `kitty/boss.py:L849` (TTY), `kitty/boss.py:L792` (peer log) |
 | Convergence point | `kitty/boss.py:L590` |
 | Parse + replay window | `kitty/remote_control.py:L56,L78-82` |
 | Authorization gate | `kitty/boss.py:L623-633`; `docs/remote-control.rst:L243` |
-| Dynamic dispatch | `kitty/rc/base.py:L449-456,L459-462`, base class `:L319` |
+| Dynamic dispatch | `kitty/rc/base.py:L449-L456,L459-L462`, base class `kitty/rc/base.py:L319` |
 | `ls` handler | `kitty/rc/ls.py:L45-46,L48,L57,L58-75,L76,L79` |
 | OS-window tree | `kitty/boss.py:L432`; `docs/remote-control.rst:L83-90` |
 | Response envelope | `kitty/remote_control.py:L213,L216,L258-260` |
