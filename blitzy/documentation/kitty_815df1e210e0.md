@@ -178,9 +178,11 @@ window.child.child_fd, window.screen)` (`kitty/boss.py:587`), and the I/O thread
      `resolved_shell()`. This is why Q1(c) is reported strictly **as observed from `ps`**, with no
      assumed `-` prefix.
   2. **Where `--posix` comes from.** It is *not* something you typed; it is appended by kitty's
-     **bash shell integration**. On Linux, `Child.fork()` calls `modify_shell_environ(...)`
-     (`kitty/child.py:266`), which routes to `setup_bash_env()`
-     (`kitty/shell_integration.py:70`); that function does `argv.insert(1, '--posix')`
+     **bash shell integration**. On Linux, `Child.fork()` — via `get_final_env()`
+     (`kitty/child.py:233`, which `fork()` invokes at `kitty/child.py:292`) — calls
+     `modify_shell_environ(...)` (`kitty/child.py:267`; imported just above at `kitty/child.py:266`),
+     which dispatches through `ENV_MODIFIERS['bash']` (`kitty/shell_integration.py:176`) to
+     `setup_bash_env()` (`kitty/shell_integration.py:70`); that function does `argv.insert(1, '--posix')`
      (`kitty/shell_integration.py:146`) and points `ENV` at kitty's `kitty.bash` integration
      script so bash sources it in POSIX mode. Hence the observed argv `["/bin/bash", "--posix"]`.
 
