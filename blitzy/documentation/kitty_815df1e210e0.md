@@ -77,12 +77,12 @@ before any comparison happens.
 **Walking a single side.** `walk` takes a base directory, the ignore patterns, and the output
 collections. It absolutizes the base (`filepath.Abs`) and traverses with `filepath.WalkDir`
 (`kittens/diff/collect.go:L260-294`, specifically `L261-265`). For every entry it consults the
-`allowed` gate (`collect.go:L269`); when an entry is **not** allowed, a **directory** returns
+`allowed` gate (`kittens/diff/collect.go:L269`); when an entry is **not** allowed, a **directory** returns
 `fs.SkipDir` — pruning the entire subtree — while a disallowed **file** is simply skipped
-(`collect.go:L270-275`). Directories themselves are never recorded as comparable items
-(`collect.go:L276-278`). For each surviving file, its key is computed **relative to the walked root**
-via `filepath.Rel(base, path)` (`collect.go:L283`) and stored into the name set and the
-name→path / path→name maps (`collect.go:L287-291`).
+(`kittens/diff/collect.go:L270-275`). Directories themselves are never recorded as comparable items
+(`kittens/diff/collect.go:L276-278`). For each surviving file, its key is computed **relative to the walked root**
+via `filepath.Rel(base, path)` (`kittens/diff/collect.go:L283`) and stored into the name set and the
+name→path / path→name maps (`kittens/diff/collect.go:L287-291`).
 
 **What counts as "allowed".** `allowed` returns `false` when the file's base name matches any ignore
 pattern, using Go's `filepath.Match(pattern, filepath.Base(path))` (`kittens/diff/collect.go:L230-238`,
@@ -97,17 +97,17 @@ pairing:
 common_names := left_names.Intersect(right_names)
 ```
 
-at `collect.go:L306`. For each common name it reads both files via `data_for_path`; if the byte
-contents differ it records a change with `add_change` (`collect.go:L308-319`). If the contents are
-**identical but the file mode differs**, it still records a change (`collect.go:L320-330`) — a mode
+at `kittens/diff/collect.go:L306`. For each common name it reads both files via `data_for_path`; if the byte
+contents differ it records a change with `add_change` (`kittens/diff/collect.go:L308-319`). If the contents are
+**identical but the file mode differs**, it still records a change (`kittens/diff/collect.go:L320-330`) — a mode
 flip is a real difference worth showing.
 
 ### Observable verification
 
 The directory walk is directly exercised by `TestDiffCollectWalk`
-(`kittens/diff/collect_test.go:L19-54`). It builds a temporary tree (`collect_test.go:L20-31`), walks
-it with the ignore patterns `["*~", "#*#", "b"]` (`collect_test.go:L42`), and asserts the resulting
-names are exactly `{d, e, f/g, h space}` (`collect_test.go:L33`). That single assertion proves several
+(`kittens/diff/collect_test.go:L19-54`). It builds a temporary tree (`kittens/diff/collect_test.go:L20-31`), walks
+it with the ignore patterns `["*~", "#*#", "b"]` (`kittens/diff/collect_test.go:L42`), and asserts the resulting
+names are exactly `{d, e, f/g, h space}` (`kittens/diff/collect_test.go:L33`). That single assertion proves several
 behaviors at once:
 
 - Backup files (`e~`) and emacs auto-save files (`#d#`) are excluded by the `*~` and `#*#` globs.
@@ -135,20 +135,20 @@ identical content ⇒ identical MD5 ⇒ confirmed-equal bytes ⇒ rename.
 ### Rationale / mechanism
 
 After the name-intersection pairing of [Q1](#q1--directory-file-pairing), the "leftovers" on each side
-are computed by set subtraction: `removed := left_names.Subtract(common_names)` (`collect.go:L332`)
-and `added := right_names.Subtract(common_names)` (`collect.go:L333`). These are the only candidates a
+are computed by set subtraction: `removed := left_names.Subtract(common_names)` (`kittens/diff/collect.go:L332`)
+and `added := right_names.Subtract(common_names)` (`kittens/diff/collect.go:L333`). These are the only candidates a
 rename could possibly involve.
 
 To match candidates efficiently, the kitten precomputes a hash for every added and every removed file
 into two maps (`ahash`, `rhash`) using `hash_for_path` (`kittens/diff/collect.go:L334-346`).
 `hash_for_path` reads the bytes once (via the cached `data_for_path`) and returns
-`md5.Sum(...)` of them (`collect.go:L106-116`, the hash at `L112`; the `crypto/md5` import is at
-`collect.go:L6`). MD5 is used here **not for security but as a fast content fingerprint** — a cheap way
+`md5.Sum(...)` of them (`kittens/diff/collect.go:L106-116`, the hash at `L112`; the `crypto/md5` import is at
+`kittens/diff/collect.go:L6`). MD5 is used here **not for security but as a fast content fingerprint** — a cheap way
 to find candidate matches without comparing every removed file against every added file byte-by-byte.
 
 The match loop is where the "magic" is demystified
 (`kittens/diff/collect.go:L347-364`): for each removed file's hash `rh`, it scans the added hashes; on
-a hash hit (`ah == rh`, `collect.go:L350`) it **re-reads both files and confirms they are byte-for-byte
+a hash hit (`ah == rh`, `kittens/diff/collect.go:L350`) it **re-reads both files and confirms they are byte-for-byte
 equal**:
 
 ```go
@@ -156,11 +156,11 @@ if ld == rd {
     self.add_rename(left_path_map[name], right_path_map[n])
 ```
 
-at `collect.go:L353-354`, after which the matched addition is discarded from the `added` set
-(`collect.go:L355`). The byte-equality check is the guard against the astronomically unlikely case of
+at `kittens/diff/collect.go:L353-354`, after which the matched addition is discarded from the `added` set
+(`kittens/diff/collect.go:L355`). The byte-equality check is the guard against the astronomically unlikely case of
 an MD5 collision — so the recorded rename is *exact*, never merely "probably the same file." If no
-confirmed match is found, the file is recorded as a removal via `add_removal` (`collect.go:L361-363`).
-Any additions left unmatched after the loop become genuine adds via `add_add` (`collect.go:L365-367`).
+confirmed match is found, the file is recorded as a removal via `add_removal` (`kittens/diff/collect.go:L361-363`).
+Any additions left unmatched after the loop become genuine adds via `add_add` (`kittens/diff/collect.go:L365-367`).
 
 **Why this looks magical but isn't:** there is *no filename heuristic*, no similarity threshold, no
 fuzzy scoring. Matching is content-hash plus exact-byte comparison, so the outcome is fully
@@ -198,18 +198,18 @@ corrupting the layout.
 `mimetypes_cache`, `data_cache`, and `hash_cache` (each `string → string`), `size_cache`
 (`string → int64`), `lines_cache` and `highlighted_lines_cache` (each `string → []string`), and
 `is_text_cache` (`string → bool`). They are all constructed in `init_caches`
-(`collect.go:L26-37`), which sets `const sz = 4096` (`collect.go:L29`) and calls
-`utils.NewLRUCache[...](sz)` seven times (`collect.go:L30-36`).
+(`kittens/diff/collect.go:L26-37`), which sets `const sz = 4096` (`kittens/diff/collect.go:L29`) and calls
+`utils.NewLRUCache[...](sz)` seven times (`kittens/diff/collect.go:L30-36`).
 
 **The layered, lazily-populated pipeline.** The base layer is `data_for_path`
 (`kittens/diff/collect.go:L65-70`), which performs a single `os.ReadFile` and stores the bytes as a
-**zero-copy string view** through `utils.UnsafeBytesToString` (`collect.go:L67-68`) — avoiding a copy
+**zero-copy string view** through `utils.UnsafeBytesToString` (`kittens/diff/collect.go:L67-68`) — avoiding a copy
 of potentially large file contents. Every other accessor builds on it:
 
-- `hash_for_path` derives the MD5 fingerprint (`collect.go:L106-116`).
+- `hash_for_path` derives the MD5 fingerprint (`kittens/diff/collect.go:L106-116`).
 - `lines_for_path` derives sanitized, split lines: `text_to_lines(sanitize(...))`
-  (`collect.go:L138-146`, the transform at `L144`).
-- `highlighted_lines_for_path` returns syntax-colored lines when available (`collect.go:L148-157`).
+  (`kittens/diff/collect.go:L138-146`, the transform at `L144`).
+- `highlighted_lines_for_path` returns syntax-colored lines when available (`kittens/diff/collect.go:L148-157`).
 
 **The correctness safeguard.** `highlighted_lines_for_path` does *not* blindly trust the highlight
 cache. It returns the cached highlighted lines **only if** they exist **and** their count matches the
@@ -221,7 +221,7 @@ if ans, found := highlighted_lines_cache.Get(path); found && len(ans) == len(pla
 }
 ```
 
-at `collect.go:L153-156`. The *why*: highlighting runs **asynchronously and in parallel** (see
+at `kittens/diff/collect.go:L153-156`. The *why*: highlighting runs **asynchronously and in parallel** (see
 [Q4](#q4--multiple-file-processing-parallelism) / [Q5](#q5--parallel-highlight-concurrency-safety)),
 so at render time a file's highlight may be missing or — momentarily — out of sync with its plain
 lines. Because the side-by-side layout aligns left and right by line index, a mismatched line count
@@ -231,8 +231,8 @@ colored-but-misaligned one.
 **The generic cache.** All seven instances are the generic `LRUCache[K, V]` in
 `tools/utils/cache.go`, whose struct is a `map[K]V` plus a `sync.RWMutex`, a `max_size`, and a
 `*list.List` for recency ordering (`tools/utils/cache.go:L13-18`). The workhorse is `GetOrCreate`
-(`cache.go:L39-58`): it first reads under a read lock (`cache.go:L40-42`); on a miss it calls the
-`create` function (`cache.go:L46`), then takes the **write lock** to store the value, push the key to
+(`tools/utils/cache.go:L39-58`): it first reads under a read lock (`tools/utils/cache.go:L40-42`); on a miss it calls the
+`create` function (`tools/utils/cache.go:L46`), then takes the **write lock** to store the value, push the key to
 the front of the recency list, and — crucially — **evict the least-recently-used entry** when the list
 exceeds `max_size`:
 
@@ -241,9 +241,9 @@ k := self.lru.Remove(self.lru.Back()) // when lru.Len() > max_size
 delete(self.data, k.(K))
 ```
 
-at `cache.go:L51-54`. This fixed-4096 eviction is what bounds memory regardless of how many files a
-directory diff touches. `Get` reads under a read lock (`cache.go:L25-30`), and `MustGetOrCreate`
-(`cache.go:L60-72`) is the error-free variant used by `is_path_text` and `mimetype_for_path`.
+at `tools/utils/cache.go:L51-54`. This fixed-4096 eviction is what bounds memory regardless of how many files a
+directory diff touches. `Get` reads under a read lock (`tools/utils/cache.go:L25-30`), and `MustGetOrCreate`
+(`tools/utils/cache.go:L60-72`) is the error-free variant used by `is_path_text` and `mimetype_for_path`.
 
 ---
 
@@ -260,25 +260,25 @@ them until the channel is drained.
 
 **The worker pool.** `Context.Parallel(start, stop, fn)` lives at
 `tools/utils/images/utils.go:L27-56`. It computes `count = stop - start` and returns immediately if
-there is nothing to do (`utils.go:L28-31`). The worker count defaults to `runtime.NumCPU()` when not
+there is nothing to do (`tools/utils/images/utils.go:L28-31`). The worker count defaults to `runtime.NumCPU()` when not
 explicitly set, and is capped at `count` so it never spawns more workers than items
-(`utils.go:L33-39`). It then builds a **buffered channel** sized to `count`, pushes every index
-`start..stop` into it, and **closes** it (`utils.go:L41-45`). Finally it launches `procs` goroutines,
-each running `fn(c)`, and joins them with a `sync.WaitGroup` (`utils.go:L47-55`). Because the channel
+(`tools/utils/images/utils.go:L33-39`). It then builds a **buffered channel** sized to `count`, pushes every index
+`start..stop` into it, and **closes** it (`tools/utils/images/utils.go:L41-45`). Finally it launches `procs` goroutines,
+each running `fn(c)`, and joins them with a `sync.WaitGroup` (`tools/utils/images/utils.go:L47-55`). Because the channel
 is pre-filled and closed, each worker simply ranges over it; the channel hands out each index to
 exactly one worker.
 
 **Parallel diffing.** `diff(jobs, context_count)` (`kittens/diff/patch.go:L352-377`) builds an
-`images.Context` (`patch.go:L354`) and a buffered `results` channel (`patch.go:L360`), then calls
-`ctx.Parallel(0, len(jobs), ...)` (`patch.go:L361`). Each worker pulls a job index, runs
-`do_diff(job.file1, job.file2, context_count)` (`patch.go:L365`), and pushes the result onto the
-channel (`patch.go:L366`). After the pool finishes, the results are gathered into a
-`map[string]*Patch` keyed by the left path (`patch.go:L370-375`).
+`images.Context` (`kittens/diff/patch.go:L354`) and a buffered `results` channel (`kittens/diff/patch.go:L360`), then calls
+`ctx.Parallel(0, len(jobs), ...)` (`kittens/diff/patch.go:L361`). Each worker pulls a job index, runs
+`do_diff(job.file1, job.file2, context_count)` (`kittens/diff/patch.go:L365`), and pushes the result onto the
+channel (`kittens/diff/patch.go:L366`). After the pool finishes, the results are gathered into a
+`map[string]*Patch` keyed by the left path (`kittens/diff/patch.go:L370-375`).
 
 **Parallel highlighting.** `highlight_all(paths)` (`kittens/diff/highlight.go:L217-228`) calls
-`ctx.Parallel(0, len(paths), ...)` (`highlight.go:L219`); each worker pulls an index `i`
-(`highlight.go:L220`), highlights `paths[i]` via `highlight_file` (`highlight.go:L221-222`), and on
-success stores the colored lines into the highlight cache (`highlight.go:L224`).
+`ctx.Parallel(0, len(paths), ...)` (`kittens/diff/highlight.go:L219`); each worker pulls an index `i`
+(`kittens/diff/highlight.go:L220`), highlights `paths[i]` via `highlight_file` (`kittens/diff/highlight.go:L221-222`), and on
+success stores the colored lines into the highlight cache (`kittens/diff/highlight.go:L224`).
 
 **Which files get diff jobs.** The per-file `diff_job` list is assembled by `generate_diff`
 (`kittens/diff/ui.go:L142-159`), which walks the collection and enqueues a job **only for `"diff"`-typed
@@ -301,7 +301,7 @@ The disjoint-key property is the linchpin of the whole design.
 
 **Distinct-key partitioning.** In `highlight_all` (`kittens/diff/highlight.go:L217-228`), the worker
 body is `for i := range nums { path := paths[i]; ...; highlighted_lines_cache.Set(path, ...) }`
-(`highlight.go:L220-224`). Because `Context.Parallel` hands each index to exactly one worker (see
+(`kittens/diff/highlight.go:L220-224`). Because `Context.Parallel` hands each index to exactly one worker (see
 [Q4](#q4--multiple-file-processing-parallelism)), each `i` — and therefore each `path`, and therefore
 each cache key — is processed by exactly one goroutine. There is structurally no way for two workers
 to write the same key.
@@ -320,22 +320,22 @@ and while other goroutines may also be writing — is a data race. **It is safe 
 the highlighter guarantees disjoint keys**: every worker writes a *different* map key, so there is
 never a concurrent write to the *same* entry, and during the parallel highlight phase `highlight_all`
 is the only writer to `highlighted_lines_cache`. (By contrast, `GetOrCreate` takes the full write lock
-for its mutations — `cache.go:L39-58` — because it also mutates the shared recency list.) This is a
+for its mutations — `tools/utils/cache.go:L39-58` — because it also mutates the shared recency list.) This is a
 deliberate optimization: skipping the write lock avoids serializing the highlight workers on a single
 mutex, and the correctness obligation it creates (disjoint keys) is satisfied by the partitioning
 above. The line-count safeguard in `highlighted_lines_for_path` (see
-[Q3](#q3--caching-pipeline--efficiency), `collect.go:L153`) provides a second layer of protection, so
+[Q3](#q3--caching-pipeline--efficiency), `kittens/diff/collect.go:L153`) provides a second layer of protection, so
 even a not-yet-written highlight degrades to plain lines rather than a corrupt render.
 
 **The per-file highlighter.** For completeness, `highlight_file`
 (`kittens/diff/highlight.go:L161-215`) selects a chroma lexer via `lexers.Match`
-(`highlight.go:L175`) with a content-analysis fallback `lexers.Analyse` (`highlight.go:L178`),
-coalesces tokens with `chroma.Coalesce` (`highlight.go:L184`), tokenizes with `lexer.Tokenise`
-(`highlight.go:L205`), and formats through `chroma.FormatterFunc(ansi_formatter)`
-(`highlight.go:L209`). The chroma packages are imported at `highlight.go:L17-19`. The custom
-`ansi_formatter` (`highlight.go:L84-159`) emits SGR escape sequences and — importantly —
-**independently formats each line of a multiline token** (`highlight.go:L138-156`); the in-code
-comment explains why (`highlight.go:L138-139`): pagers like `less` reset SGR formatting at line
+(`kittens/diff/highlight.go:L175`) with a content-analysis fallback `lexers.Analyse` (`kittens/diff/highlight.go:L178`),
+coalesces tokens with `chroma.Coalesce` (`kittens/diff/highlight.go:L184`), tokenizes with `lexer.Tokenise`
+(`kittens/diff/highlight.go:L205`), and formats through `chroma.FormatterFunc(ansi_formatter)`
+(`kittens/diff/highlight.go:L209`). The chroma packages are imported at `kittens/diff/highlight.go:L17-19`. The custom
+`ansi_formatter` (`kittens/diff/highlight.go:L84-159`) emits SGR escape sequences and — importantly —
+**independently formats each line of a multiline token** (`kittens/diff/highlight.go:L138-156`); the in-code
+comment explains why (`kittens/diff/highlight.go:L138-139`): pagers like `less` reset SGR formatting at line
 boundaries, so each line must carry its own color codes to render correctly in isolation.
 
 ---
@@ -356,43 +356,43 @@ diff.
 file is an image, `false` if it is the same file as `/dev/null` (an empty-side sentinel), and
 otherwise reads the bytes and returns `utf8.ValidString(data)` — i.e., a file is "text" if it is valid
 UTF-8. The verdict is memoized in `is_text_cache` via `MustGetOrCreate`. The image test `is_image`
-(`collect.go:L82-84`) simply checks for an `"image/"` mimetype prefix.
+(`kittens/diff/collect.go:L82-84`) simply checks for an `"image/"` mimetype prefix.
 
 **The dispatcher.** `render` (`kittens/diff/render.go:L696-770`) computes two booleans per entry:
 `is_binary := !is_path_text(path)`, promoted to `true` when a `"diff"` entry's *other* side is
-non-text (`render.go:L706-709`), and `is_img` derived from `is_image` on either side
-(`render.go:L710`). It then switches on the entry type (`render.go:L712`):
+non-text (`kittens/diff/render.go:L706-709`), and `is_img` derived from `is_image` on either side
+(`kittens/diff/render.go:L710`). It then switches on the entry type (`kittens/diff/render.go:L712`):
 
-- `case "diff"` (`render.go:L713`): if binary → `image_lines` when it is an image
-  (`render.go:L716`) else `binary_lines` (`render.go:L718`); otherwise the text path `lines_for_diff`
-  (`render.go:L721`).
-- `case "add"` (`render.go:L726`) and `case "removal"` (`render.go:L739`): the same image/binary
-  branch, otherwise `all_lines` for the single present side (`render.go:L734`, `render.go:L747`).
-- `case "rename"` (`render.go:L752`): `rename_lines` (`render.go:L753`).
-- `default` (`render.go:L757`): returns an "Unknown change type" error (`render.go:L758`).
+- `case "diff"` (`kittens/diff/render.go:L713`): if binary → `image_lines` when it is an image
+  (`kittens/diff/render.go:L716`) else `binary_lines` (`kittens/diff/render.go:L718`); otherwise the text path `lines_for_diff`
+  (`kittens/diff/render.go:L721`).
+- `case "add"` (`kittens/diff/render.go:L726`) and `case "removal"` (`kittens/diff/render.go:L739`): the same image/binary
+  branch, otherwise `all_lines` for the single present side (`kittens/diff/render.go:L734`, `kittens/diff/render.go:L747`).
+- `case "rename"` (`kittens/diff/render.go:L752`): `rename_lines` (`kittens/diff/render.go:L753`).
+- `default` (`kittens/diff/render.go:L757`): returns an "Unknown change type" error (`kittens/diff/render.go:L758`).
 
 **The branch leaves.**
 
 - `image_lines` (`kittens/diff/render.go:L333-392`) **prepares** the image entry but does **not** emit
   any graphics itself: it builds a header of the form `"Dimensions: WxH"` and a human-readable size
-  using `image_collection.ResolutionOf` (`render.go:L342`) and the size text (`render.go:L344`),
-  reserves the logical image rows via `image_lines_offset` (`render.go:L352`), fills a
-  "Loading image..." placeholder while the load is pending (`render.go:L364`), records the per-side
-  image **keys** (`render.go:L370`, `render.go:L374`), and tags the logical line `IMAGE_LINE`
-  (`render.go:L390`). The **actual** graphics-protocol placement happens later, during drawing:
+  using `image_collection.ResolutionOf` (`kittens/diff/render.go:L342`) and the size text (`kittens/diff/render.go:L344`),
+  reserves the logical image rows via `image_lines_offset` (`kittens/diff/render.go:L352`), fills a
+  "Loading image..." placeholder while the load is pending (`kittens/diff/render.go:L364`), records the per-side
+  image **keys** (`kittens/diff/render.go:L370`, `kittens/diff/render.go:L374`), and tags the logical line `IMAGE_LINE`
+  (`kittens/diff/render.go:L390`). The **actual** graphics-protocol placement happens later, during drawing:
   `draw_image_pair` / `draw_image` (`kittens/diff/ui.go:L319-337`) call
   `image_collection.PlaceImageSubRect` (`tools/tui/graphics/collection.go:L155-181`), which builds a
-  `GRT_action_display` graphics command and writes it to the loop (`collection.go:L177-180`).
+  `GRT_action_display` graphics command and writes it to the loop (`tools/tui/graphics/collection.go:L177-180`).
 - `binary_lines` (`kittens/diff/render.go:L446`) emits a single `"Binary file: <human-readable size>"`
-  line per side (`render.go:L452`) and **no content diff**.
+  line per side (`kittens/diff/render.go:L452`) and **no content diff**.
 - `rename_lines` (`kittens/diff/render.go:L684-694`) emits the single message
-  `"The file <old> was renamed to <new>"` (`render.go:L688`) and no content diff.
+  `"The file <old> was renamed to <new>"` (`kittens/diff/render.go:L688`) and no content diff.
 
 **Tie-back to the runtime.** Images are loaded **asynchronously** by `load_all_images`
 (`kittens/diff/ui.go:L190-211`) into an `image_collection`; while the load is pending the placeholder
 text "Loading image..." is shown, and once the load completes the kitten re-renders and the image is
 emitted to the terminal via kitty's graphics protocol (APC escape codes) **during drawing**
-(`draw_image_pair` / `draw_image`, `ui.go:L319-337`). This is why image entries appear in two stages
+(`draw_image_pair` / `draw_image`, `kittens/diff/ui.go:L319-337`). This is why image entries appear in two stages
 at runtime (see [Q7](#q7--full-runtime-flow-end-to-end) and the [appendix](#how-this-was-verified)).
 
 
@@ -415,44 +415,44 @@ back to the main thread, which re-renders the side-by-side view as results arriv
 ### Rationale / mechanism — tracing the journey
 
 1. **Entry & validation.** `main` (`kittens/diff/main.go:L102-175`) loads configuration
-   (`main.go:L104`), then requires exactly two arguments — returning
-   `"You must specify exactly two files/directories to compare"` otherwise (`main.go:L108-110`). It
-   resolves the diff backend with `set_diff_command` (`main.go:L111`), initializes all caches with
-   `init_caches()` (`main.go:L114`), and registers a `defer` that removes any temporary remote
-   directories on exit (`main.go:L116-120`).
+   (`kittens/diff/main.go:L104`), then requires exactly two arguments — returning
+   `"You must specify exactly two files/directories to compare"` otherwise (`kittens/diff/main.go:L108-110`). It
+   resolves the diff backend with `set_diff_command` (`kittens/diff/main.go:L111`), initializes all caches with
+   `init_caches()` (`kittens/diff/main.go:L114`), and registers a `defer` that removes any temporary remote
+   directories on exit (`kittens/diff/main.go:L116-120`).
 2. **Remote (SSH) inputs (edge case).** Each argument passes through `get_remote_file`
-   (`main.go:L92`, `L121`/`L125`); an `ssh:`-prefixed input (`main.go:L93`) is fetched by
-   `get_ssh_file` (`main.go:L51`) into a fresh temp directory (`os.MkdirTemp`, `main.go:L52`) via an
-   `ssh ... tar` pipeline (`main.go:L61`). That temp directory is exactly what the deferred
+   (`kittens/diff/main.go:L92`, `L121`/`L125`); an `ssh:`-prefixed input (`kittens/diff/main.go:L93`) is fetched by
+   `get_ssh_file` (`kittens/diff/main.go:L51`) into a fresh temp directory (`os.MkdirTemp`, `kittens/diff/main.go:L52`) via an
+   `ssh ... tar` pipeline (`kittens/diff/main.go:L61`). That temp directory is exactly what the deferred
    `os.RemoveAll` cleans up.
 3. **More validation & loop setup.** Both inputs must be the same kind (`isdir(left) != isdir(right)`
-   is an error, `main.go:L129-131`) and must exist (`main.go:L132-137`). The kitten creates the event
-   loop with `loop.New()` (`main.go:L138`), enables mouse tracking (`main.go:L139`), constructs the
-   `Handler{left, right, lp}` (`main.go:L143`), and wires callbacks: `OnInitialize` (a closure that
-   calls `h.initialize()`, `main.go:L144-151`) and `OnWakeup = h.on_wakeup` (`main.go:L152`), among
-   others, before calling `lp.Run()` (`main.go:L163`).
+   is an error, `kittens/diff/main.go:L129-131`) and must exist (`kittens/diff/main.go:L132-137`). The kitten creates the event
+   loop with `loop.New()` (`kittens/diff/main.go:L138`), enables mouse tracking (`kittens/diff/main.go:L139`), constructs the
+   `Handler{left, right, lp}` (`kittens/diff/main.go:L143`), and wires callbacks: `OnInitialize` (a closure that
+   calls `h.initialize()`, `kittens/diff/main.go:L144-151`) and `OnWakeup = h.on_wakeup` (`kittens/diff/main.go:L152`), among
+   others, before calling `lp.Run()` (`kittens/diff/main.go:L163`).
 4. **Async kickoff.** `Handler.initialize` (`kittens/diff/ui.go:L114-140`) creates a buffered
-   `async_results` channel of size 32 (`ui.go:L132`) and launches a background goroutine that calls
+   `async_results` channel of size 32 (`kittens/diff/ui.go:L132`) and launches a background goroutine that calls
    `create_collection(left, right)`, pushes an `AsyncResult` onto the channel, and calls
-   `lp.WakeupMainThread()` (`ui.go:L133-137`).
+   `lp.WakeupMainThread()` (`kittens/diff/ui.go:L133-137`).
 5. **Collection.** `create_collection` (`kittens/diff/collect.go:L371-405`) dispatches to
-   `collect_files` for two directories (`collect.go:L386`) — performing the [Q1](#q1--directory-file-pairing)
+   `collect_files` for two directories (`kittens/diff/collect.go:L386`) — performing the [Q1](#q1--directory-file-pairing)
    pairing and [Q2](#q2--rename-detection-the-magic) rename detection — or records a single
-   `add_change` for two plain files (`collect.go:L401`); finally `finalize()` stable-sorts the paths by
-   name (`collect.go:L403`).
+   `add_change` for two plain files (`kittens/diff/collect.go:L401`); finally `finalize()` stable-sorts the paths by
+   name (`kittens/diff/collect.go:L403`).
 6. **Wakeup drain.** When woken, `on_wakeup` (`kittens/diff/ui.go:L161-177`) drains the
-   `async_results` channel (`ui.go:L165`) and dispatches each result to `handle_async_result`.
+   `async_results` channel (`kittens/diff/ui.go:L165`) and dispatches each result to `handle_async_result`.
 7. **Fan-out.** `handle_async_result` (`kittens/diff/ui.go:L245-275`) is the hub. On a `COLLECTION`
-   result (`ui.go:L247`) it stores the collection and invokes the three producer methods —
-   `generate_diff()` (`ui.go:L249`), `highlight_all()` (`ui.go:L250`), and `load_all_images()`
-   (`ui.go:L251`). On a `DIFF` result (`ui.go:L252`) it stores the diff map, computes statistics,
-   renders, and draws the screen (`ui.go:L253-268`). `IMAGE_RESIZE` (`ui.go:L269`) and
-   `IMAGE_LOAD`/`HIGHLIGHT` (`ui.go:L272`) trigger a re-render (`ui.go:L271`, `ui.go:L273`). Note that
-   the three methods do **not** all spawn a job unconditionally: `generate_diff` (`ui.go:L142-159`)
-   and `highlight_all` (`ui.go:L179-188`) **always** launch a goroutine that posts a `DIFF` /
-   `HIGHLIGHT` result, whereas `load_all_images` (`ui.go:L190-211`) first counts image paths and
-   spawns its `IMAGE_LOAD` goroutine **only when `self.image_count > 0`** (the guard at `ui.go:L202`,
-   goroutine at `ui.go:L204-209`) — so a diff with no images produces just two async jobs. Each
+   result (`kittens/diff/ui.go:L247`) it stores the collection and invokes the three producer methods —
+   `generate_diff()` (`kittens/diff/ui.go:L249`), `highlight_all()` (`kittens/diff/ui.go:L250`), and `load_all_images()`
+   (`kittens/diff/ui.go:L251`). On a `DIFF` result (`kittens/diff/ui.go:L252`) it stores the diff map, computes statistics,
+   renders, and draws the screen (`kittens/diff/ui.go:L253-268`). `IMAGE_RESIZE` (`kittens/diff/ui.go:L269`) and
+   `IMAGE_LOAD`/`HIGHLIGHT` (`kittens/diff/ui.go:L272`) trigger a re-render (`kittens/diff/ui.go:L271`, `kittens/diff/ui.go:L273`). Note that
+   the three methods do **not** all spawn a job unconditionally: `generate_diff` (`kittens/diff/ui.go:L142-159`)
+   and `highlight_all` (`kittens/diff/ui.go:L179-188`) **always** launch a goroutine that posts a `DIFF` /
+   `HIGHLIGHT` result, whereas `load_all_images` (`kittens/diff/ui.go:L190-211`) first counts image paths and
+   spawns its `IMAGE_LOAD` goroutine **only when `self.image_count > 0`** (the guard at `kittens/diff/ui.go:L202`,
+   goroutine at `kittens/diff/ui.go:L204-209`) — so a diff with no images produces just two async jobs. Each
    spawned goroutine posts a typed `AsyncResult` and wakes the main thread, which is how its work
    re-enters the single-threaded render path safely.
 8. **Diffing & rendering.** The parallel `diff` ([Q4](#q4--multiple-file-processing-parallelism))
@@ -509,48 +509,48 @@ the highlight to the bytes that actually differ.
 ### Rationale / mechanism
 
 **Provenance.** The file header states it was copied from the Go stdlib's `internal/diff/diff.go`
-(`kittens/diff/diff.go:L1-2`). The doc comment that explains the approach is at `diff.go:L21-48`: the
-**unique-line anchors** idea (`diff.go:L32-38`), the **O(n log n) vs O(n²)** guarantee
-(`diff.go:L39-40`), and the relationship to "patience diff" along with why that name is avoided
-(`diff.go:L42-48`).
+(`kittens/diff/diff.go:L1-2`). The doc comment that explains the approach is at `kittens/diff/diff.go:L21-48`: the
+**unique-line anchors** idea (`kittens/diff/diff.go:L32-38`), the **O(n log n) vs O(n²)** guarantee
+(`kittens/diff/diff.go:L39-40`), and the relationship to "patience diff" along with why that name is avoided
+(`kittens/diff/diff.go:L42-48`).
 
 **The driver.** `Diff(oldName, old, newName, new, num_of_context_lines)` (`kittens/diff/diff.go:L49-167`)
-short-circuits identical inputs to a `nil` slice (`diff.go:L50-51`) — no output. Otherwise it iterates
-over the matches returned by `tgs(x, y)` (`diff.go:L74`) and, for each anchor, **expands the matching
+short-circuits identical inputs to a `nil` slice (`kittens/diff/diff.go:L50-51`) — no output. Otherwise it iterates
+over the matches returned by `tgs(x, y)` (`kittens/diff/diff.go:L74`) and, for each anchor, **expands the matching
 region**:
 
 - backward, while the preceding lines on both sides are equal:
   `for start.x > done.x && start.y > done.y && x[start.x-1] == y[start.y-1] { start.x--; start.y-- }`
-  (`diff.go:L85-88`);
+  (`kittens/diff/diff.go:L85-88`);
 - forward, while the following lines on both sides are equal:
   `for end.x < len(x) && end.y < len(y) && x[end.x] == y[end.y] { end.x++; end.y++ }`
-  (`diff.go:L90-93`).
+  (`kittens/diff/diff.go:L90-93`).
 
 **Splitting into lines.** `lines(x)` (`kittens/diff/diff.go:L172-182`) splits on `\n` via
-`strings.SplitAfter` (`diff.go:L173`) and appends the BSD/GNU-style "No newline at end of file" note
-when the final line lacks a trailing newline (`diff.go:L179`).
+`strings.SplitAfter` (`kittens/diff/diff.go:L173`) and appends the BSD/GNU-style "No newline at end of file" note
+when the final line lacks a trailing newline (`kittens/diff/diff.go:L179`).
 
 **The unique-line LCS.** `tgs(x, y)` (`kittens/diff/diff.go:L192-263`) returns the index pairs of the
 longest common subsequence of lines that appear exactly once in each of `x` and `y`. Its provenance is
 attributed in-code to **Algorithm A from Thomas G. Szymanski, "A Special Case of the Maximal Common
-Subsequence Problem," Princeton TR #170 (January 1975)** (`diff.go:L188-191`, available at
-`https://research.swtch.com/tgs170.pdf`; the "Apply Algorithm A" step is at `diff.go:L229`). The
-routine frames the search with sentinels `{len(x), len(y)}` (`diff.go:L254`) and `{0, 0}`
-(`diff.go:L262`).
+Subsequence Problem," Princeton TR #170 (January 1975)** (`kittens/diff/diff.go:L188-191`, available at
+`https://research.swtch.com/tgs170.pdf`; the "Apply Algorithm A" step is at `kittens/diff/diff.go:L229`). The
+routine frames the search with sentinels `{len(x), len(y)}` (`kittens/diff/diff.go:L254`) and `{0, 0}`
+(`kittens/diff/diff.go:L262`).
 
 **Intra-line region detection.** Once a line is known to have changed, `changed_center(left, right)`
 (`kittens/diff/patch.go:L86-99`) narrows the highlight to the bytes that differ: it finds the common
-prefix length (`ans.offset`, `patch.go:L90-91`), the common suffix length (`patch.go:L92-94`), and the
-differing middle sizes (`ans.left_size`, `ans.right_size`, `patch.go:L95-96`). `Chunk.finalize`
+prefix length (`ans.offset`, `kittens/diff/patch.go:L90-91`), the common suffix length (`kittens/diff/patch.go:L92-94`), and the
+differing middle sizes (`ans.left_size`, `ans.right_size`, `kittens/diff/patch.go:L95-96`). `Chunk.finalize`
 computes one center per changed line, but only when the chunk has equal counts on both sides
-(`left_count == right_count`, `patch.go:L101-107`, the guard at `L102`).
+(`left_count == right_count`, `kittens/diff/patch.go:L101-107`, the guard at `L102`).
 
 **External backends, and how `auto` resolves.** The kitten can also shell out to an external differ.
 The command templates are `GIT_DIFF = "git diff --no-color --no-ext-diff --exit-code -U_CONTEXT_
 --no-index --"` (`kittens/diff/patch.go:L21`) and `DIFF_DIFF = "diff -p -U _CONTEXT_ --"`
-(`patch.go:L22`). `find_differ` prefers `git` (`patch.go:L36`), then GNU `diff` (`patch.go:L38`), then
-the built-in algorithm (`patch.go:L34-42`); `set_diff_command` maps the configured value
-`auto`/`builtin`/`diff`/`git`/custom (`patch.go:L44-62`). The built-in anchored diff documented above
+(`kittens/diff/patch.go:L22`). `find_differ` prefers `git` (`kittens/diff/patch.go:L36`), then GNU `diff` (`kittens/diff/patch.go:L38`), then
+the built-in algorithm (`kittens/diff/patch.go:L34-42`); `set_diff_command` maps the configured value
+`auto`/`builtin`/`diff`/`git`/custom (`kittens/diff/patch.go:L44-62`). The built-in anchored diff documented above
 is the **guaranteed fallback** when no external differ is available. In the build container `auto`
 resolves to `git` (git is present), but the built-in algorithm is documented here because it is the
 in-repo, self-contained implementation and the always-available fallback.
@@ -563,9 +563,9 @@ in-repo, self-contained implementation and the always-available fallback.
 Per the project's "code is the source of truth" rule, **source reading is the primary basis** for
 every claim above. To *corroborate* (never to override) the source, the kitten was built and run, and
 its Go tests executed, inside the Go 1.22 build container. Build/run is for observation only; **no
-repository file was modified**, and every temporary fixture and script used for observation lived
-outside the repository tree and was deleted afterward, leaving only this document as a new untracked
-file.
+existing repository file was modified**, and every temporary fixture and script used for observation
+lived outside the repository tree and was deleted afterward, so this document is the **sole addition**
+to the repository.
 
 ### Build tooling (how the kitten is produced)
 
@@ -604,24 +604,24 @@ matched the source exactly:
 
 - **Q1 pairing:** the changed text file rendered as a unified-style text diff with a hunk header
   (`@@ -1,3 +1,3 @@`) and the single changed line; the **identical** file was **absent** from the view
-  (corroborating the `nil`-diff short-circuit, `diff.go:L49-52`); the add/removal files rendered as
+  (corroborating the `nil`-diff short-circuit, `kittens/diff/diff.go:L49-52`); the add/removal files rendered as
   "This file was added" / "This file was removed"; entries were ordered alphabetically by name
-  (corroborating `finalize`, `collect.go:L403`).
+  (corroborating `finalize`, `kittens/diff/collect.go:L403`).
 - **Q2 rename:** the content-identical pair rendered as a **single paired entry** (both names shown
   together, no content diff), clearly distinct from the separate add/removal entries — corroborating
-  the content-hash + byte-equality rename match (`collect.go:L347-364`) and `rename_lines`
-  (`render.go:L684-694`).
+  the content-hash + byte-equality rename match (`kittens/diff/collect.go:L347-364`) and `rename_lines`
+  (`kittens/diff/render.go:L684-694`).
 - **Q6 binary:** the binary file rendered as `Binary file: 4 KB` / `Binary file: 8 KB` with no content
-  diff — corroborating `binary_lines` (`render.go:L446-452`).
+  diff — corroborating `binary_lines` (`kittens/diff/render.go:L446-452`).
 - **Q6 image:** the PNG rendered with a `Dimensions: WxH` + size header and a transient
   "Loading image..." placeholder — corroborating the `image_lines` *preparation* step
-  (`render.go:L333-392`) — while the captured terminal byte-stream contained kitty
+  (`kittens/diff/render.go:L333-392`) — while the captured terminal byte-stream contained kitty
   graphics-protocol APC escapes (`ESC _ G ...`) emitted at **draw** time, corroborating
-  `draw_image_pair` (`ui.go:L319-337`) → `PlaceImageSubRect` (`collection.go:L155-181`); image
-  loading itself is asynchronous via `load_all_images` (`ui.go:L190-211`).
+  `draw_image_pair` (`kittens/diff/ui.go:L319-337`) → `PlaceImageSubRect` (`tools/tui/graphics/collection.go:L155-181`); image
+  loading itself is asynchronous via `load_all_images` (`kittens/diff/ui.go:L190-211`).
 - **Q7 async pipeline:** the view briefly displayed "Calculating diff, please wait..." before results
   appeared, and image entries updated in a second pass — corroborating the
-  `COLLECTION → DIFF/HIGHLIGHT (+ conditional IMAGE_LOAD)` fan-out (`ui.go:L245-275`), where the
+  `COLLECTION → DIFF/HIGHLIGHT (+ conditional IMAGE_LOAD)` fan-out (`kittens/diff/ui.go:L245-275`), where the
   `IMAGE_LOAD` job only appears because the fixture contained an image.
 
 > **Honesty note.** The `go test` output above is real captured output. The `kitten diff` observations
@@ -634,14 +634,14 @@ matched the source exactly:
 
 | Question | Primary source (verified) | Runtime corroboration |
 |----------|---------------------------|-----------------------|
-| Q1 Directory file-pairing | `collect.go:L260-294` (`walk`), `collect.go:L296-369` (`collect_files`, intersection at `L306`); `collect.go:L230-238` (`allowed`) | `TestDiffCollectWalk`; changed vs. identical vs. add/removal entries observed |
-| Q2 Rename detection | `collect.go:L347-364` (match loop), `collect.go:L106-116` (`hash_for_path`, MD5 at `L112`) | content-identical pair shown as one rename entry |
-| Q3 Caching pipeline | `collect.go:L20-37` (7 caches, cap 4096), `collect.go:L65-157` (accessors); `tools/utils/cache.go:L13-72` | served implicitly by repeated render/scroll |
-| Q4 Multiple-file parallelism | `tools/utils/images/utils.go:L27-56` (`Parallel`); `patch.go:L352-377` (diff); `highlight.go:L217-228` (highlight) | multi-file directory diff processed |
-| Q5 Parallel-highlight safety | `highlight.go:L217-228` (disjoint keys); `tools/utils/cache.go:L32-37` (`Set` RLock) | highlighted multi-file output |
-| Q6 Binary & image handling | `render.go:L696-770` (dispatch); `collect.go:L86-104` (`is_path_text`); `render.go:L333-392` (`image_lines` *prepares*) / `render.go:L446` / `render.go:L684`; actual placement at draw: `ui.go:L319-337` → `collection.go:L155-181` | "Binary file: …", "Dimensions: …", graphics APC escapes |
-| Q7 Full runtime flow | `main.go:L102-175`; `ui.go:L114-275` (async pipeline) | "Calculating diff…" then staged results |
-| Q8 Diff matching regions | `diff.go:L21-263` (anchored diff, `tgs`); `patch.go:L86-99` (`changed_center`) | hunk header + changed line observed; `nil` for identical |
+| Q1 Directory file-pairing | `kittens/diff/collect.go:L260-294` (`walk`), `kittens/diff/collect.go:L296-369` (`collect_files`, intersection at `L306`); `kittens/diff/collect.go:L230-238` (`allowed`) | `TestDiffCollectWalk`; changed vs. identical vs. add/removal entries observed |
+| Q2 Rename detection | `kittens/diff/collect.go:L347-364` (match loop), `kittens/diff/collect.go:L106-116` (`hash_for_path`, MD5 at `L112`) | content-identical pair shown as one rename entry |
+| Q3 Caching pipeline | `kittens/diff/collect.go:L20-37` (7 caches, cap 4096), `kittens/diff/collect.go:L65-157` (accessors); `tools/utils/cache.go:L13-72` | served implicitly by repeated render/scroll |
+| Q4 Multiple-file parallelism | `tools/utils/images/utils.go:L27-56` (`Parallel`); `kittens/diff/patch.go:L352-377` (diff); `kittens/diff/highlight.go:L217-228` (highlight) | multi-file directory diff processed |
+| Q5 Parallel-highlight safety | `kittens/diff/highlight.go:L217-228` (disjoint keys); `tools/utils/cache.go:L32-37` (`Set` RLock) | highlighted multi-file output |
+| Q6 Binary & image handling | `kittens/diff/render.go:L696-770` (dispatch); `kittens/diff/collect.go:L86-104` (`is_path_text`); `kittens/diff/render.go:L333-392` (`image_lines` *prepares*) / `kittens/diff/render.go:L446` / `kittens/diff/render.go:L684`; actual placement at draw: `kittens/diff/ui.go:L319-337` → `tools/tui/graphics/collection.go:L155-181` | "Binary file: …", "Dimensions: …", graphics APC escapes |
+| Q7 Full runtime flow | `kittens/diff/main.go:L102-175`; `kittens/diff/ui.go:L114-275` (async pipeline) | "Calculating diff…" then staged results |
+| Q8 Diff matching regions | `kittens/diff/diff.go:L21-263` (anchored diff, `tgs`); `kittens/diff/patch.go:L86-99` (`changed_center`) | hunk header + changed line observed; `nil` for identical |
 
 ### Caveat
 
