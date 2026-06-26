@@ -43,7 +43,7 @@ The rest of this document follows the data in dependency order: connection state
 
 The kitten never re-implements SSH. Instead it **wraps** the user's `ssh` command: it discovers the real `ssh` binary, injects extra `-o` options to enable OpenSSH's native *connection multiplexing*, optionally wires up an *askpass* helper so kitty can answer prompts through its own UI, prepares the controlling terminal, appends a remote command, and then `exec`s `ssh`. The connection driver that orchestrates all of this is `run_ssh()` at `kittens/ssh/main.go:L597-L798`.
 
-**Discovering `ssh` and its version.** The path to `ssh` is resolved once and memoized via `SSHExe` (`kittens/ssh/utils.go:L22`), and the OpenSSH version is parsed once from `ssh -V` output using the regex `OpenSSH_(\d+).(\d+)` inside the memoized `GetSSHVersion()` (`kittens/ssh/utils.go:L210-L227`, regex at `kittens/ssh/utils.go:L215`).
+**Discovering `ssh` and its version.** The path to `ssh` is resolved once and memoized via `SSHExe` (`kittens/ssh/utils.go:L22`), and the OpenSSH version is parsed once from `ssh -V` output using the regex `OpenSSH_(\d+).(\d+)` inside the memoized `GetSSHVersion()` (`kittens/ssh/utils.go:L210-L222`, regex at `kittens/ssh/utils.go:L215`).
 
 **Parsing the destination.** `get_destination()` (`kittens/ssh/main.go:L46-L69`) accepts both the `ssh://user@host:port` URL form and the bare `user@host` form, extracting username, hostname and port.
 
