@@ -90,7 +90,7 @@ Re-using one authenticated SSH session for many kitty windows is the whole point
 
 ### Answer
 
-The kitten generates a **per-session, one-time password** and the entire payload, and places them in a **POSIX shared-memory (SHM) segment** with owner-only permissions. The only thing that ever travels over the wire is a short *reference* to that segment — never the credentials themselves. This is orchestrated by `bootstrap_script()` at `kittens/ssh/main.go:L422-L484`.
+The kitten generates a **per-session, one-time password** (`pw`) and the full payload (the base64 tar, hostname, username), and places them in a **POSIX shared-memory (SHM) segment** with owner-only permissions. The **bulk payload — the tar archive — stays in that SHM segment and is never placed on the command line**. What *does* get transmitted is a short, one-time **token** of the form `id:pwfile:pw`, which names the segment (`pwfile`), carries the request id (`id`) and the one-time password (`pw`); depending on the code path this token is either baked into the remote bootstrap command line or pushed to the kitty terminal via a DCS escape (detailed below, and revisited in Q9). This is orchestrated by `bootstrap_script()` at `kittens/ssh/main.go:L422-L484`.
 
 **Building the secret payload.** Inside `bootstrap_script()`:
 
@@ -108,13 +108,20 @@ err = data_shm.Flush()                                                          
 // ...
 cd.shm_name = data_shm.Name()                                                                      // L458
 ```
-(`kittens/ssh/main.go:L446-L458`.) The reference that the remote will use is assembled into a `sensitive_data` map containing only `REQUEST_ID`, `DATA_PASSWORD` and `PASSWORD_FILENAME` (`kittens/ssh/main.go:L460`) — i.e. an `id` / `pw` / `pwfile` pointer, *not* the tar or the credentials.
+(`kittens/ssh/main.go:L446-L458`.) The one-time token is assembled into a `sensitive_data` map containing `REQUEST_ID`, `DATA_PASSWORD` and `PASSWORD_FILENAME` (`kittens/ssh/main.go:L460`). Note carefully: `DATA_PASSWORD` **is the actual one-time password `pw`**, so this token is *not* a mere opaque pointer — it carries the password itself. What it does **not** contain is the tar payload, which remains in the SHM segment.
+
+How that token reaches its destination depends on `cd.request_data` (the flag computed during reuse/askpass setup — see Q6):
+
+- **Request-data path (`cd.request_data == true`).** The token is copied into the substitution map `sd` (`kittens/ssh/main.go:L475-L478`) and substituted into the bootstrap script by `prepare_script()` (`kittens/ssh/main.go:L482`). `wrap_bootstrap_script()` then encodes that script (base64 for Python, `tr`-substitution for POSIX `sh` — `kittens/ssh/main.go:L486-L508`; see Q7) and the encoded result is appended to the `ssh` argv (`cmd = append(cmd, cd.rcmd...)` at `kittens/ssh/main.go:L753`). **So on this path the one-time `pw` *does* appear — base64- or `tr`-encoded — in the command line passed to `ssh`, and therefore in the command `sshd` runs under the remote login shell.** The remote `bootstrap.sh` then echoes the same `id:pwfile:pw` token back to the kitty terminal over `/dev/tty` to fetch the payload (`shell-integration/ssh/bootstrap.sh:L92-L95`).
+- **Askpass / master path (`cd.request_data == false`).** The token is *not* substituted into the script (`sd` is the plain clone of `replacements` without `sensitive_data`). Instead, after spawning `ssh`, the kitten sends `id=…:pwfile=…:pw=…` to its **local** kitty terminal via a DCS escape over the controlling TTY (`kittens/ssh/main.go:L761-L766`).
 
 **The SHM primitive.** The underlying `SharedMemory` class lives in `kitty/shm.py`. Its name is randomised (`name = prefix + secrets.token_hex(nbytes)`, `kitty/shm.py:L31`), it defaults to permission mode `S_IREAD | S_IWRITE` = `0o600` (`kitty/shm.py:L51`) with default prefix `'kitty-'` (`kitty/shm.py:L52`), and it is opened with `os.O_CREAT | os.O_EXCL` (`kitty/shm.py:L62`). Data is length-prefixed using a 4-byte big-endian unsigned integer (`size_fmt = '!I'` at `kitty/shm.py:L46`, `num_bytes_for_size` at `kitty/shm.py:L47`), via `write_data_with_size` (`kitty/shm.py:L115`) and `read_data_with_size` (`kitty/shm.py:L122`); the segment can be removed with `unlink()` (`kitty/shm.py:L175`). The terminal-side helper `create_shared_memory()` mirrors this on the Python side: it `json.dumps` the data, sizes a `SharedMemory(size=len(db)+SharedMemory.num_bytes_for_size, ...)`, calls `write_data_with_size`, and registers `atexit.register(shm.unlink)` so the segment is cleaned up (`kittens/ssh/utils.py:L87-L97`).
 
 ### Why it is built this way
 
-Command-line arguments and environment variables are **not private**: any process running as any user can read another process's `argv` and environment through `ps` or `/proc/<pid>/{cmdline,environ}`. Passing a password that way would expose it to every local user for the lifetime of the `ssh` process. A shared-memory segment created with `O_CREAT | O_EXCL` and mode `0o600` is, by contrast, a *private side channel*: only processes running as the same user can open it, it cannot be silently clobbered or symlink-raced into existence (the `O_EXCL` guarantees creation), and — as Q9 details — it is unlinked on first read so it can be consumed exactly once. The wire therefore carries only a harmless `id:pwfile:pw` pointer; the real secret stays in kernel-managed, owner-only memory.
+Command-line arguments and environment variables are **not private**: any process running as any user can read another process's `argv` and environment through `ps` or `/proc/<pid>/{cmdline,environ}`, and they typically persist for the lifetime of the process. The bulk of what must reach the remote is the **payload** — a gzipped, base64-encoded tar (terminfo, shell integration, the serialised environment) that is far too large and binary to pass as a command-line argument — and the same SHM JSON also holds the one-time `pw` itself (`kittens/ssh/main.go:L439-L444`). Putting *all of that* in a shared-memory segment created with `O_CREAT | O_EXCL` and mode `0o600` keeps it out of `argv`/env entirely: only processes running as the same user can open it, it cannot be silently clobbered or symlink-raced into existence (`O_EXCL` guarantees creation), and — as Q9 details — it is unlinked on first read so it can be consumed exactly once.
+
+The design does **not** try to keep the small `id:pwfile:pw` token off the wire — and indeed it cannot, because that token is how the remote (or the kitten) tells the kitty terminal *which* segment to hand over. On the request-data path the token is encoded into the bootstrap script that becomes the `ssh` command line (`kittens/ssh/main.go:L475-L482`, `L486-L508`, `L753`), so the one-time `pw` is visible — encoded — in `argv` on both ends; on the askpass/master path it is sent to the local kitty terminal via a DCS escape instead (`kittens/ssh/main.go:L761-L766`). That exposure is deliberately acceptable because the password is **single-use**: it unlocks exactly one read of an owner-only segment that is then unlinked, and `get_ssh_data()` additionally binds it to the matching `KITTY_PID-WINDOW_ID` request id (Q9). Once that one read happens, the leaked `pw` is worthless. In short: the *bulk* secret never leaves owner-only memory, while the *one-time* token is allowed to transit precisely because compromising it buys an attacker nothing after the legitimate read.
 
 ---
 
@@ -161,7 +168,7 @@ h.Mode |= 0o600  // L269
 - the user's `+copy` files, if any (`kittens/ssh/main.go:L282-L287`);
 - the generated `data.sh` env script (`kittens/ssh/main.go:L321`; see `serialize_env` below);
 - `bootstrap-utils.sh`, but only when `script_type == "sh"` (`kittens/ssh/main.go:L324-L328`);
-- the shell-integration tree, **excluding** the `ssh/*` bootstrap files themselves and the legacy `zsh/kitty.zsh` (`kittens/ssh/main.go:L329-L341`);
+- when shell integration is enabled (i.e. `ksi != ""` — the effective `KITTY_SHELL_INTEGRATION` value returned by `serialize_env()` is non-empty), the shell-integration tree, **excluding** the `ssh/*` bootstrap files themselves (they are sent as command-line args instead) and the legacy `zsh/kitty.zsh` backward-compat file; this whole block is gated by `if ksi != "" { ... }` at `kittens/ssh/main.go:L329-L341`;
 - optionally a `version` marker plus the `kitty`/`kitten` binaries when `remote_kitty != no` (`kittens/ssh/main.go:L342-L354`);
 - terminfo: `home/.terminfo/kitty.terminfo` (`kittens/ssh/main.go:L355`) and `home/.terminfo/x/<DefaultTermName>` (`kittens/ssh/main.go:L357`).
 
@@ -341,7 +348,7 @@ Putting the pieces together, here is the full lifecycle from `kitty +kitten ssh 
    err = c.Start()                         // L756
    ```
    (`kittens/ssh/main.go:L753-L756`.)
-9. **Hand off the SHM pointer (askpass/master path).** When `!cd.request_data` (i.e. the remote will *not* request data over the TTY), the kitten itself sends the pointer to the kitty terminal via a DCS escape:
+9. **Hand off the one-time token (askpass/master path).** When `!cd.request_data` (i.e. the remote will *not* request data over the TTY), the kitten itself sends the one-time `id:pwfile:pw` token to the kitty terminal via a DCS escape:
 
    ```go
    if !cd.request_data {                                                                                  // L761
@@ -365,27 +372,27 @@ sequenceDiagram
     participant R as Remote bootstrap (shell-integration/ssh)
 
     U->>K: kitty +kitten ssh host
-    K->>K: main() guards env + tty (L800-832)
-    K->>K: run_ssh: parse dest, load config (L597-799)
-    K->>K: connection_sharing_args -o ControlMaster=auto (L121-145)
-    K->>S: master_is_functional? ssh -O check (L656-662)
+    K->>K: main() guards env + tty (L800-L832)
+    K->>K: run_ssh: parse dest, load config (L597-L799)
+    K->>K: connection_sharing_args -o ControlMaster=auto (L121-L145)
+    K->>S: master_is_functional? ssh -O check (L656-L662)
     alt functional master exists OR askpass supported
-        K->>K: need_to_request_data = false (L663-665)
+        K->>K: need_to_request_data = false (L663-L665)
     end
-    K->>K: bootstrap_script: build tar, create SHM 0o600 + pw (L422-484)
-    K->>K: wrap_bootstrap_script: base64 (py) / tr-substitution (sh) (L486-509)
-    K->>S: start ssh child with rcmd (L753-758)
+    K->>K: bootstrap_script: build tar, create SHM 0o600 + pw (L422-L484)
+    K->>K: wrap_bootstrap_script: base64 (py) / tr-substitution (sh) (L486-L509)
+    K->>S: start ssh child with rcmd (L753-L758)
     alt askpass / master path
-        K->>T: DCSToKitty "ssh" id:pwfile:pw (L761-775)
+        K->>T: DCSToKitty "ssh" id:pwfile:pw (L761-L775)
     else request-data-over-tty path
         R->>T: dcs_to_kitty ssh id:pwfile:pw over /dev/tty
     end
-    T->>T: handle_remote_ssh -> get_ssh_data (validate pw+id) (window L1289, utils L115-148)
+    T->>T: handle_remote_ssh -> get_ssh_data (validate pw+id) (window L1289, utils L115-L148)
     T->>R: KITTY_DATA_START / OK / base64 tar (254-byte lines) / KITTY_DATA_END
-    R->>R: untar to $HOME tmp, compile_terminfo tic -x (bootstrap-utils L18-47)
-    R->>R: mv_files_and_dirs, prepare_for_exec (L9-16, L192-219)
-    R->>U: exec login shell with shell integration (L221-251)
-    K->>T: drain_potential_tty_garbage echo canary (L530-563)
+    R->>R: untar to $HOME tmp, compile_terminfo tic -x (bootstrap-utils L18-L47)
+    R->>R: mv_files_and_dirs, prepare_for_exec (L9-L16, L192-L219)
+    R->>U: exec login shell with shell integration (L221-L251)
+    K->>T: drain_potential_tty_garbage echo canary (L530-L563)
 ```
 
 ### Why it is built this way
@@ -448,7 +455,7 @@ if rq_id != request_id:
 2. **Owner + permission re-verification on read** — both readers re-check uid/gid and exact `0o600` mode before trusting the contents (`kittens/ssh/main.go:L75-L81`, `kittens/ssh/utils.py:L107-L111`).
 3. **Single-read unlink** — the segment is unlinked as part of the read (`shm.ReadWithSizeAndUnlink` on the Go side; `shm.unlink()` first thing on the Python side, `kittens/ssh/utils.py:L106`), so only one consumer can ever obtain the data.
 4. **Password + request-id binding** — `get_ssh_data()` ties the payload to this exact kitty window via the one-time `pw` and the `KITTY_PID-WINDOW_ID` id (`kittens/ssh/utils.py:L131-L133`).
-5. **Credentials never on the command line or env** — only the `id:pwfile:pw` pointer travels over the wire (`kittens/ssh/main.go:L460`, `kittens/ssh/main.go:L762`); the actual tar and password live only in the SHM segment.
+5. **Bulk payload confined to SHM; the transmitted token is single-use** — the tar payload (terminfo, shell integration, serialised env) is held only in the owner-only SHM segment and is never placed on the command line. The one-time token `id:pwfile:pw` *is* transmitted, and the `pw` it carries is the real one-time password, not an opaque handle: on the request-data path it is substituted into the bootstrap script that becomes the `ssh` argv (`kittens/ssh/main.go:L460`, `L475-L482`, `L486-L508`, `L753`) and is echoed back by the remote (`shell-integration/ssh/bootstrap.sh:L92-L95`); on the askpass/master path the kitten pushes it to the kitty terminal via DCS (`kittens/ssh/main.go:L761-L766`). This is safe rather than contradictory because the password is single-use: the segment is unlinked on the first read (property #3) and the read is bound to `KITTY_PID-WINDOW_ID` (property #4), so a captured `pw` confers at most one read of an already-consumed segment.
 
 ### Why it is built this way
 
