@@ -48,8 +48,9 @@ load. The mechanisms stack as follows:
   kitty sends *back* to the child (graphics ACKs, query replies, etc.) is queued in a
   per-`Screen` write buffer `[kitty/screen.h:114-116]`, drained with **non-blocking** writes
   that **retain** the remainder on `EAGAIN` `[kitty/child-monitor.c:1463]`, and bounded by a
-  **100 MB hard ceiling** `[kitty/child-monitor.c:341-342]` (the only place write-back data is
-  dropped).
+  **100 MB hard ceiling** `[kitty/child-monitor.c:341-342]` (the *backlog-overflow* drop path; a
+  genuine write error *separately* discards the queued buffer `[kitty/child-monitor.c:1464-1465]`,
+  and both are distinct from the normal `EAGAIN` retain-and-retry).
 - **Graphics data has its own bounds.** Stored images obey a **320 MB storage quota** with
   **LRU eviction** `[kitty/graphics.c:25,290-300]`, plus hard per-transfer (`EFBIG`, 400 MB
   `[kitty/graphics.c:521,533]`), per-dimension (`EINVAL`, 10000 px
@@ -72,7 +73,12 @@ and unit tests.
 ## §1 — Orientation: kitty's Threaded I/O Architecture
 
 To understand where flow control happens, it helps to know that reading bytes and parsing them
-are done on **different threads**, decoupled by the shared bounded buffer introduced above.
+are done on **different threads**: the I/O thread runs `io_loop()` `[kitty/child-monitor.c:1481]`
+(started via `pthread_create` `[kitty/child-monitor.c:291]`) and performs the raw
+`read_bytes()`/`write_to_child()` `[kitty/child-monitor.c:1336-1357,1443]`, whereas the VT parser's
+`run_worker()` `[kitty/vt-parser.c:1417]` is driven from the render/main thread through
+`parse_worker()` `[kitty/screen.c:4775-4776]`. The two sides are decoupled by the shared bounded
+buffer introduced above `[kitty/vt-parser.c:18]`.
 
 - **The I/O thread** lives in `kitty/child-monitor.c`. It owns the `poll()` loop over the child
   PTY file descriptors and performs the raw `read()`/`write()` of bytes. The read path is
@@ -93,10 +99,12 @@ are done on **different threads**, decoupled by the shared bounded buffer introd
   `kitty/screen.c` (covered in §4–§5).
 
 **Why this framing matters.** Because reading and parsing are decoupled by a *shared, bounded
-buffer*, flow control is naturally expressed as **buffer-space negotiation** between two parties:
-the I/O thread is the *producer* of bytes into the buffer, and the parser is the *consumer*. The
-I/O thread asks "is there room?" before each read, and acts on the answer. That single question —
-and the fixed size of the buffer behind it — is what makes the 1 MB buffer the control point for
+buffer* `[kitty/vt-parser.c:18]`, flow control is naturally expressed as **buffer-space
+negotiation** between two parties: the I/O thread is the *producer* of bytes into the buffer, and
+the parser is the *consumer*. The I/O thread asks "is there room?" before each read — concretely,
+`vt_parser_has_space_for_input()` `[kitty/vt-parser.c:1477-1481]` — and acts on the answer by
+gating `POLLIN` `[kitty/child-monitor.c:1501]`. That single question — and the fixed size of the
+buffer behind it `[kitty/vt-parser.c:18]` — is what makes the 1 MB buffer the control point for
 the entire read path. The next section follows that negotiation step by step.
 
 ---
@@ -190,10 +198,11 @@ read side**: when the 1 MB buffer fills, kitty stops requesting reads `[kitty/ch
 and stops performing them `[kitty/child-monitor.c:1342]`; it never discards already-produced child
 output.
 
-*Why is it built this way?* A fixed-size buffer combined with a conditional `POLLIN` and an
-early-return read is a deliberate **"do not read what you cannot store"** design. It converts
-application-level buffer pressure into **OS-level flow control** — the canonical, lossless way to
-backpressure a pipe or PTY. Because the slave end stays blocking, the kernel does the throttling for
+*Why is it built this way?* A fixed-size buffer `[kitty/vt-parser.c:18]` combined with a conditional
+`POLLIN` `[kitty/child-monitor.c:1501]` and an early-return read `[kitty/child-monitor.c:1342]` is a
+deliberate **"do not read what you cannot store"** design. It converts application-level buffer
+pressure into **OS-level flow control** — the canonical, lossless way to backpressure a pipe or PTY.
+Because the slave end stays blocking `[kitty/child.py:170-171]`, the kernel does the throttling for
 free: kitty does not need a timer, a rate limiter, or a discard policy on the read side. The
 producer is naturally paced to the rate at which kitty can parse and render.
 
@@ -248,12 +257,13 @@ batches aligned to the render cadence. Critically, when input is arriving fast a
 full (within 16 KB), the time-based delay is **bypassed** by the third clause of
 `[kitty/vt-parser.c:1425]`, so the parser drains promptly to free space.
 
-*Why is it built this way?* Delaying the drain by a few milliseconds **amortizes** parsing and
-rendering over larger batches, which is far more efficient under load than reacting byte-by-byte
-(each render is expensive relative to a few milliseconds of accumulation). At the same time, the
-near-full bypass guarantees the time-based delay can never starve the buffer into overflow: the
-throttle and the §2 flow-control buffer **cooperate** — the delay optimizes the common case, and the
-16 KB margin protects the worst case.
+*Why is it built this way?* Delaying the drain by a few milliseconds — the `input_delay` clause of
+`[kitty/vt-parser.c:1425]` — **amortizes** parsing and rendering over larger batches, which is far
+more efficient under load than reacting byte-by-byte (each render is expensive relative to a few
+milliseconds of accumulation). At the same time, the near-full bypass (`read.sz + 16*1024 > BUF_SZ`)
+`[kitty/vt-parser.c:1425]` guarantees the time-based delay can never starve the 1 MB buffer
+`[kitty/vt-parser.c:18]` into overflow: the throttle and the §2 flow-control buffer **cooperate** —
+the delay optimizes the common case, and the 16 KB margin protects the worst case.
 
 ---
 
@@ -291,7 +301,10 @@ if (screen->write_buf_used + sz > 100 * 1024 * 1024) {              // kitty/chi
 ```
 
 `[kitty/child-monitor.c:341-342]` — when the queued total would exceed **100 MB**, kitty logs the
-message and **drops the new data**. This is the **only** place write-back data is discarded.
+message and **drops the new data**. This is the *backlog-overflow* drop path; it is **not** the only
+place write-back data leaves the queue — a *genuine write error* separately discards the queued
+buffer (see §4.3, `[kitty/child-monitor.c:1464-1465]`), and both of these exceptional paths are
+distinct from the normal `EAGAIN` retain-and-retry case `[kitty/child-monitor.c:1463]`.
 
 ### 4.3 Draining with non-blocking writes and `EAGAIN` retention
 
@@ -342,13 +355,14 @@ be confused with the normal congested case:
 2. **Genuine write error:** a non-`EAGAIN` error from `write()` discards the queued buffer with a
    `perror` `[kitty/child-monitor.c:1464-1465]`.
 
-*Why is it built this way?* A single I/O thread services *all* children. If it blocked on a write to
-one congested child, every other window would stall. Non-blocking writes + remainder retention +
-`POLLOUT`-gating keep that one thread responsive to all children regardless of any single child's
-read rate. The 100 MB cap is a **safety valve**: if a child never reads kitty's responses (e.g., a
-buggy program that floods queries but never consumes replies), the buffer would otherwise grow without
-bound; the cap trades correctness-under-abuse for bounded memory, and announces it in the log rather
-than failing silently.
+*Why is it built this way?* A single I/O thread (`io_loop()` `[kitty/child-monitor.c:1481]`) services
+*all* children. If it blocked on a write to one congested child, every other window would stall.
+Non-blocking writes + remainder retention `[kitty/child-monitor.c:1463]` + `POLLOUT`-gating
+`[kitty/child-monitor.c:1503]` keep that one thread responsive to all children regardless of any
+single child's read rate. The 100 MB cap is a **safety valve**: if a child never reads kitty's
+responses (e.g., a buggy program that floods queries but never consumes replies), the buffer would
+otherwise grow without bound; the cap trades correctness-under-abuse for bounded memory, and announces
+it in the log rather than failing silently `[kitty/child-monitor.c:341-342]`.
 
 ---
 
@@ -510,11 +524,13 @@ The honest answer is *both*, split cleanly along a "normal overload vs. exceptio
 ### 7.3 Rationale
 
 The design favors **silent, lossless adaptation** for the *normal* overload case — a producer that is
-simply faster than the consumer — and reserves **explicit signals** for *exceptional* conditions:
-oversized or invalid graphics requests, a pathological 100 MB write backlog, or a real I/O error.
-This is the precise answer to "silently or visible signs": **mostly silent, with targeted signals
-where silence would hide a genuine problem** (a request the client got wrong, or a backlog/error the
-client ought to know about).
+simply faster than the consumer (kernel read backpressure `[kitty/child-monitor.c:1501,1342]`, LRU
+image eviction `[kitty/graphics.c:290-300]`, and `EAGAIN` retention `[kitty/child-monitor.c:1463]`) —
+and reserves **explicit signals** for *exceptional* conditions: oversized or invalid graphics requests
+`[kitty/graphics.c:533,695,1573]`, a pathological 100 MB write backlog `[kitty/child-monitor.c:342]`,
+or a real I/O error `[kitty/child-monitor.c:1464]`. This is the precise answer to "silently or visible
+signs": **mostly silent, with targeted signals where silence would hide a genuine problem** (a request
+the client got wrong, or a backlog/error the client ought to know about).
 
 ---
 
