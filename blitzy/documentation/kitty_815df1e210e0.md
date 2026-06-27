@@ -643,7 +643,7 @@ The `choose-fonts` kitten is **Go-native** but delegates font enumeration and pr
 
 - **Go side spawns the Python worker.** `backend.go`'s `start()` resolves the kitty executable via `utils.KittyExe()` (falling back to `Which("kitty")`; the error message mentions `KITTY_PATH_TO_KITTY_EXE`), then runs it with `+runpy` to launch the Python entry point:
   ```go
-  exe := utils.KittyExe()                       // [backend.go:L33]  (fallback Which("kitty") [L34])
+  exe := utils.KittyExe()                       // [backend.go:L33]  (fallback Which("kitty") [L34-L36])
   // error text references KITTY_PATH_TO_KITTY_EXE  [backend.go:L38]
   cmd := exec.Command(exe, "+runpy",
   	"from kittens.choose_fonts.backend import main; main()")  // [backend.go:L41]
@@ -805,7 +805,7 @@ Patch returned updated=false   ->  no backup written; Enter branch skips reload
 
 ### C.3 (c) The `s` path — STDOUT only, `kitty.conf` unchanged
 
-The `s` branch sets `output_on_exit = self.settings.serialized() + "\n"` and quits without ever calling `Patch` `[final.go:L104-L110]`. The real four-line `serialized()` payload `[final.go:L62-L69]` written to STDOUT:
+The `s` branch sets `output_on_exit = self.settings.serialized() + "\n"` and quits without ever calling `Patch` `[final.go:L104-L110]`. The real four-line `serialized()` payload `[final.go:L63-L70]` written to STDOUT:
 
 ```text
 font_family      JetBrains Mono
