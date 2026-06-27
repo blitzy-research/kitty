@@ -549,7 +549,7 @@ Key behaviors:
 
 - The payload must be **valid JSON** and a **dict containing a `version` field**; otherwise the command
   is ignored. JSON failures are logged: *"Failed to parse JSON payload of remote command, ignoring it"*
-  (~`L61`) and *"JSON payload of remote command is invalid …"* (~`L64`).
+  (`L62`) and *"JSON payload of remote command is invalid …"* (`L65`).
 - `pcmd.pop('password', None)` (~`L67`) strips only the **unencrypted, top-level `password`** field, and
   it does so *before* any decryption — a plaintext password sent in the clear is never trusted.
   Password-based RC does **not** lose its password, however: the client's encrypter places the password
@@ -669,8 +669,8 @@ Two important details:
 
 ```python
 # kitty/remote_control.py (handle_cmd, L213)
-c = command_for_name(cmd['cmd'])         # ~L221  -> the LS instance
-ans = c.response_from_kitty(...)         # ~L246  -> the ls JSON string
+c = command_for_name(cmd['cmd'])         # ~L222  -> the LS instance
+ans = c.response_from_kitty(...)         # ~L247  -> the ls JSON string
 response = {'ok': True}                  # ~L258
 response['data'] = ans                   # ~L260
 ```
@@ -854,7 +854,7 @@ Remote-control failures are surfaced through kitty's `log_error()` helper, which
 standard error / log stream. The call sites on the RC path are:
 
 - **JSON parse failures** in `parse_cmd()`: *"Failed to parse JSON payload of remote command, ignoring
-  it"* (~`kitty/remote_control.py:L61`) and *"JSON payload of remote command is invalid …"* (~`L64`).
+  it"* (`kitty/remote_control.py:L62`) and *"JSON payload of remote command is invalid …"* (`L65`).
 - **Top-level parse failure** in `_handle_remote_command()`: *"Failed to parse remote command with
   error: …"* (~`kitty/boss.py:L605`).
 - **Malformed peer frames** in `peer_message_received()`: *"Malformatted remote control message received
@@ -868,7 +868,7 @@ standard error / log stream. The call sites on the RC path are:
 [0.491] Failed to parse JSON payload of remote command, ignoring it
 ```
 
-This is the live `log_error` from `kitty/remote_control.py:L61`. The client received an empty response,
+This is the live `log_error` from `kitty/remote_control.py:L62`. The client received an empty response,
 and kitty continued running — malformed RC input is logged and dropped, never fatal.
 
 For deeper diagnostics, kitty offers a debug build with extra event-loop logging:
