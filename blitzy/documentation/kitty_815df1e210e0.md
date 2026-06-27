@@ -188,7 +188,7 @@ while encoded_data:
     encoded_data = encoded_data[line_sz:]
 yield b'KITTY_DATA_END\n'        # L148
 ```
-(`kittens/ssh/utils.py:L117-L148`.) On the remote, `read_base64_from_tty()` reads lines until it sees `KITTY_DATA_END` (`shell-integration/ssh/bootstrap.sh:L97`, terminator check at L99), and `untar_and_read_env()` pipes the decoded stream straight into tar: `read_base64_from_tty | base64_decode | command tar "xpzf" "-" "-C" "$tdir"` (`shell-integration/ssh/bootstrap.sh:L113`), after first `mktemp`-ing a staging dir under `$HOME` with `umask 000` (`shell-integration/ssh/bootstrap.sh:L108-L111`).
+(`kittens/ssh/utils.py:L117-L148`.) On the remote, `read_base64_from_tty()` reads lines until it sees `KITTY_DATA_END` (`shell-integration/ssh/bootstrap.sh:L97`, terminator check at L99), and `untar_and_read_env()` pipes the decoded stream straight into tar: `read_base64_from_tty | base64_decode | command tar "xpzf" "-" "-C" "$tdir"` (`shell-integration/ssh/bootstrap.sh:L113`), after first `mktemp`-ing a staging dir under `$HOME` (`shell-integration/ssh/bootstrap.sh:L108`) with `umask 000` (`shell-integration/ssh/bootstrap.sh:L112`).
 
 ### Why it is built this way
 
