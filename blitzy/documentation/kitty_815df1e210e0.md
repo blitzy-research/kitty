@@ -158,10 +158,11 @@ double-negative.** This is the subtle part, and the code (not intuition) is the 
 `init_fonts` creates all three feature objects as *disable* strings:
 
 ```c
-// kitty/fonts.c  (init_fonts)
-1755  if (!create_feature("-liga", LIGA_FEATURE)) return false;
-1756  if (!create_feature("-dlig", DLIG_FEATURE)) return false;
-1757  if (!create_feature("-calt", CALT_FEATURE)) return false;
+// kitty/fonts.c  (init_fonts) — create_feature is a statement-macro (defined :1750-1754)
+// that runs hb_feature_from_string(...) into hb_features[where] and `return false;`s on failure
+1755  create_feature("-liga", LIGA_FEATURE);
+1756  create_feature("-dlig", DLIG_FEATURE);
+1757  create_feature("-calt", CALT_FEATURE);
 ```
 
 `init_font` then appends a trailing `-calt` to *every* face's feature list
@@ -282,7 +283,7 @@ same code point kitty's own test harness uses as its default emoji trial (`kitty
 | Startup invocation | `kitty/main.py:228-229` `if args.debug_font_fallback: dump_font_debug()` | between `boss.start` (`:227`) and `child_monitor.main_loop` (`:234`) |
 | Flag plumbing | `kitty/cli.py:1002` (`--debug-font-fallback`) → `kitty/main.py:249` `set_options(...)` → `kitty/state.c:740` `global_state.debug_font_fallback = …` → `kitty/state.h:16` `debug_fonts` macro | |
 | Config dump (resolved values) | `kitty/debug_config.py:231` `debug_config` (`:258` `OpenGL:`, `:260-263` `Fonts:` loop) — a Boss runtime action (`kitty/boss.py:3060`), **not** a CLI flag | |
-| Option schema | `kitty/options/definition.py`: `font_family` `:35`, `force_ltr` `:64`, `symbol_map` `:84`, `narrow_symbols` `:99`, `disable_ligatures` `:115`, `font_features` `:136` | |
+| Option schema | `kitty/options/definition.py`: `font_family` `:35`, `force_ltr` `:64`, `symbol_map` `:84`, `narrow_symbols` `:99`, `disable_ligatures` `:115`, `font_features` `:135` | |
 
 ### (c) Rationale
 
@@ -351,7 +352,7 @@ block above); `bold_font`/`italic_font`/`bold_italic_font` are `auto` (derived f
 `force_ltr` is `False` (so per-run RTL applies, per Q1); `font_features`, `symbol_map`, and
 `narrow_symbols` are all empty; and `disable_ligatures` is `0` (the `never` enum, so `calt` stays
 on). Schema locators: `font_family` `:35`, `force_ltr` `:64`, `symbol_map` `:84`, `narrow_symbols`
-`:99`, `disable_ligatures` `:115`, `font_features` `:136`.
+`:99`, `disable_ligatures` `:115`, `font_features` `:135`.
 
 The same resolved faces are independently confirmed by kitty's `debug_config` action
 (`kitty/debug_config.py:231`), reproduced here against the default options (the version/uname/lsb
@@ -443,7 +444,7 @@ cluster cell.
 | Baseline / underline / strikethrough derivation | `kitty/freetype.c:387-403` `cell_metrics` (baseline `:391`, underline pos `:392`, underline thk `:393`, strikethrough fallback `:398`, strikethrough thk `:403`) |
 | Metric finalization + clamps + `modify_font` | `kitty/fonts.c:373-419` `calc_cell_metrics` (`fatal()` bounds via `MIN_WIDTH 2`/`MIN_HEIGHT 4`/`MAX_DIM 1000`; `sprite_tracker_set_layout` at `:418`; stores `fg->cell_width/cell_height/baseline/underline_*/strikethrough_*`) |
 | Metrics → decoration pre-render | `kitty/fonts.c:1458` `PyObject_CallFunction(prerender_function, "IIIIIIIffdd", cell_width, cell_height, baseline, underline_position, underline_thickness, strikethrough_position, strikethrough_thickness, cursor_beam_thickness, cursor_underline_thickness, dpi_x, dpi_y)` |
-| Decoration sprite renderers | `kitty/fonts/render.py`: `render_special` `:284` (underline-position clamp `:298`, style dispatch `:317`, thickness clamp `:316`), `add_line` `:203`, `add_dline` `:211`, `add_curl` `:231`, `add_dots` `:267`, `add_dashes` `:276`, `prerender_function` `:364` (underline sprites `range(1, NUM_UNDERLINE_STYLES+1)` `:391`) |
+| Decoration sprite renderers | `kitty/fonts/render.py`: `render_special` `:284` (underline-position clamp `:297`, style dispatch `:317`, thickness clamp `:316`), `add_line` `:203`, `add_dline` `:211`, `add_curl` `:231`, `add_dots` `:267`, `add_dashes` `:276`, `prerender_function` `:364` (underline sprites `range(1, NUM_UNDERLINE_STYLES+1)` `:391`) |
 | Grapheme-cluster cell storage | `kitty/line.c` combining marks in `cc_idx[]` emitted via `codepoint_for_mark` (`:46`, `:204`, `:214`); cell width via `wcwidth_std` (`kitty/line.c:12`, `:348`) |
 | Combining/width handling | `kitty/screen.c:663` `draw_combining_char`; `wcwidth-std.h` include `:27` |
 
@@ -560,7 +561,7 @@ To make the wrap order explicit, the same allocator over a deliberately tiny tex
 | shaders.c own statics | `kitty/shaders.c:32` `static GLint max_texture_size = 0, max_array_texture_layers = 0;` (distinct from the `fonts.c:44` statics; pushed across via `sprite_tracker_set_limits`) |
 | Limit clamp | `kitty/fonts.c:237` `sprite_tracker_set_limits` → `:239` `max_array_len = MIN(0xfffu, max_array_len_)` (cap = 4095) |
 | Page geometry | `kitty/fonts.c:276` `sprite_tracker_set_layout` → `:277` `xnum = MIN(MAX(1u, max_texture_size/cell_width), UINT16_MAX)`, `:278` `max_y = … / cell_height`, `:279` `ynum = 1`, `:280` `x = y = z = 0` |
-| Position assignment | `kitty/fonts.c:257` `sprite_position_for` (assigns current `(x,y,z)`, then `do_increment`); `:268-269` `sprite_tracker_current_layout` returns `(xnum, ynum, z)` |
+| Position assignment | `kitty/fonts.c:257` `sprite_position_for` (assigns current `(x,y,z)`, then `do_increment`); `:269-271` `sprite_tracker_current_layout` returns `(xnum, ynum, z)` |
 | Capacity advance / exhaustion | `kitty/fonts.c:242-253` `do_increment` (`x++`; row-full → `y++`, grow `ynum` up to `max_y`; col-full → `z++`; `*error = 2` when `z >= MIN(UINT16_MAX, max_array_len)`) |
 | Glyph→sprite cache | `kitty/glyph-cache.h:13-19` `SpritePosition { bool rendered, colored; sprite_index x, y, z; }`; `:23-24` `find_or_create_sprite_position`; impl `kitty/glyph-cache.c:34` |
 | Readiness log | `kitty/gl.c:72` `if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", …, gl_version_string())`; helper `gl_version_string` `:42-48` builds `"'<GL_VERSION>' Detected version: <maj>.<min>"` |
@@ -689,6 +690,6 @@ For convenience, the principal locators cited above (verified against HEAD
 | `kitty/cli.py` | 989, 996, 1002 | `--debug-*` flag definitions |
 | `kitty/state.c` / `state.h` | c:726-740, h:13-16 | debug-flag plumbing, print macros |
 | `kitty/debug_config.py` | 231, 258-263 | resolved config dump (Boss action) |
-| `kitty/options/definition.py` | 35, 64, 84, 99, 115, 136 | option schema defaults |
+| `kitty/options/definition.py` | 35, 64, 84, 99, 115, 135 | option schema defaults |
 | `kitty/line.c` / `kitty/screen.c` | line:12,46,204,214,348; screen:27,663 | grapheme-cluster cell storage / width |
 
