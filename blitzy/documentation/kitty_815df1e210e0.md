@@ -108,6 +108,19 @@ Evaluating the formula:
 | 80  | `80*32+4`  = **2564** | `2048*2564`  = **5,251,072**  | **5.008 MiB** |
 | 200 | `200*32+4` = **6404** | `2048*6404` = **13,115,392** | **12.508 MiB** |
 
+> **Reconciling with the intuitive "+1" formula (why this document uses `+4`).** A natural first guess reads
+> `LineAttrs` as its one-byte `uint8_t val` member and arrives at `per-line = xnum*32 + 1`, i.e.
+> `per-segment = 2048*(xnum*32+1)` → **2561 B/line, 5,244,928 B = 5.001953 MiB ≈ 5.002 MiB @ 80 cols** and
+> **6401 B/line, 13,109,248 B = 12.501953 MiB ≈ 12.502 MiB @ 200 cols**. That guess is **incorrect for the
+> compiled layout**: the union's anonymous struct ends in the enum-typed bitfield `PromptKind prompt_kind : 2`
+> (`PromptKind` is an `enum`, `kitty/data-types.h:L230`), which forces an `int`-sized (4-byte) storage unit, so
+> `sizeof(LineAttrs)` is **4, not 1** — confirmed by compiling a probe against the real header (Appendix A.2/A.6:
+> `sizeof(LineAttrs)=4`). The governing methodology is **code as the source of truth, no assumptions**, so this
+> document uses the verified compiled value: `per-line = xnum*32 + 4`, giving **2564 B/line → 5,251,072 B =
+> 5.007812 MiB ≈ 5.008 MiB @ 80 cols** and **6404 B/line → 13,115,392 B = 12.507812 MiB ≈ 12.508 MiB @ 200 cols**.
+> The 3-byte-per-line (≈ 6 KiB-per-segment) difference between the two models is exactly `2048*(4−1)` and is the
+> only thing separating the two sets of numbers; every measured RSS step below matches the **`+4`** figures.
+
 So each freshly allocated segment adds **~5.0 MiB at 80 columns** (the "~5 MiB step") and **~12.5 MiB at 200
 columns**. The total grid capacity is `ynum` lines, where:
 
@@ -310,21 +323,27 @@ The backing ring buffer is the vendored `ringbuf`, included at `kitty/history.c:
 at the repository root** (a sibling of `kitty/`), *not* inside `kitty/`.
 
 **Observable as:** with `HistoryBuf(2000, 80, 8 MiB)` and 200,000 lines pushed, the **grid `count` stayed flat
-at 2000** while the pager ring filled to its configured **8 MiB cap** (`maximum_size = 8,388,608` bytes). In a
-**clean measurement** — a minimal process that imports only `fast_data_types` — `pagerhist_as_text()` returns
-**exactly 8,388,608 characters**, i.e. **100 % of the configured cap**, reproducibly (a 4 MiB cap likewise
-returns exactly **4,194,304**). The cap is genuinely reachable: `ringbuf_new(capacity)` makes the usable
-capacity exactly `capacity` (`3rdparty/ringbuf/ringbuf.c:L56,L89-L93`), and for this all-ASCII content
-`pagerhist_as_text()` decodes the ring's used bytes 1:1 (`kitty/history.c:L485-L494`). The slightly-lower,
-run-to-run-varying lengths reported by the Appendix A.5 harness (**≈ 8,362,586–8,371,348**) are an artifact of
-*that measuring process's* heap state — the identical 200,000-line workload returns exactly the cap in a minimal
-process but a few KiB short inside the larger harness, and the figure drifts between runs. The shortfall is
-therefore **not** an intrinsic ring-buffer property (the ring does reach 100 % of its cap) and **not** a function
-of wrap position:
+at 2000** while the pager ring filled to its configured **8 MiB cap** (`maximum_size = 8,388,608` bytes), and
+`pagerhist_as_text()` returns **exactly 8,388,608 characters** — **100 % of the configured cap** — reproducibly
+(a 4 MiB cap likewise returns exactly **4,194,304**; both confirmed across repeated runs this session). The cap
+is genuinely reachable: `ringbuf_new(capacity)` makes the usable capacity exactly `capacity`
+(`3rdparty/ringbuf/ringbuf.c:L56,L89-L93`), and for this all-ASCII content `pagerhist_as_text()` decodes the
+ring's used bytes 1:1 (`kitty/history.c:L485-L494`).
+
+> **Reproducibility note — retain the `LineBuf` (live-view lifetime).** The exact-cap result is reliable **only
+> if the harness keeps the source `LineBuf` alive for as long as the pushed `Line` is used.** `LineBuf.line()`
+> returns a **live view into the underlying buffer** (`kitty/line-buf.c:L171-L172`: "the Line Object is a live
+> view into the underlying buffer. And only a single line object can be used at a time."). If a harness obtains
+> the `Line` but lets its backing `LineBuf` fall out of scope, the view aliases memory that may be reclaimed or
+> reused, and the eviction path can then serialize corrupted or truncated text into the pager — surfacing as a
+> **nondeterministic, run-to-run-varying shortfall** of a few KiB under the cap. That shortfall is a **harness
+> lifetime bug, not** an intrinsic ring-buffer property and **not** a function of wrap position. The corrected
+> Appendix A.5 harness returns `(lb, line)` and retains `lb` for the entire push loop, which yields the exact cap
+> **deterministically** (verified repeatedly this session), as the table shows:
 
 | Configuration | Lines pushed | Grid `count` | `pagerhist_as_text()` length |
 |---|---|---|---|
-| `HistoryBuf(2000, 80, 8 MiB)` | 200,000 | 2,000 (flat) | **8,388,608 chars** = exactly the 8 MiB cap in a clean process (the A.5 harness reports **≈ 8,362,586–8,371,348**, a measuring-process heap-state artifact) |
+| `HistoryBuf(2000, 80, 8 MiB)` | 200,000 | 2,000 (flat) | **8,388,608 chars** = exactly the 8 MiB cap (corrected A.5 harness retaining `lb`; reproducible across runs) |
 
 This proves the pager history is a **distinct, independently-bounded growth axis** that the grid's `count`
 metric does not reflect — you must monitor it separately (e.g. via `pagerhist_as_text()` length or process RSS).
@@ -415,6 +434,34 @@ current `HEAD`. No tracked kitty source, test, configuration, or reference-docum
 `kitty/`, `kitty_tests/`, `docs/`, `3rdparty/`, `setup.py`, or any dependency manifest) was created, modified,
 or deleted relative to the baseline.
 
+**Reconciling "source pinning" with "deliverable committed" (the contract, made verifiable).** Producing this
+deliverable *necessarily* advances `HEAD` past the pinned source commit: the document has to be written into
+`blitzy/documentation/` and committed for it to exist in the destination repository at all. So `HEAD` is *not*
+expected to equal `815df1e210e0…`; instead, the pinned source commit is required to be an **ancestor** of
+`HEAD`, with **zero source diffs** between them. That is exactly the state here, and any reviewer can confirm it
+in three commands (run from the repository root):
+
+```console
+$ git merge-base --is-ancestor 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD ; echo "exit=$?"
+exit=0                                          # pinned source commit IS an ancestor of HEAD
+
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md  # the ONLY change is this deliverable
+
+$ git status --porcelain
+                                                # empty output == clean working tree, no stray edits
+```
+
+The first command proves the analysed source is reachable and unmodified; the second proves the *only* delta
+introduced on top of it is this single Markdown file (no file under `kitty/`, `kitty_tests/`, `docs/`,
+`3rdparty/`, or `setup.py` appears); the third proves nothing is uncommitted. A reviewer who needs to run the
+**source-locator checks** against an exactly-pinned tree can do so without any reset — either inspect the pinned
+blob directly (e.g. `git show 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1:kitty/history.c`) or check out the pinned
+commit in a throwaway worktree (`git worktree add /tmp/kitty_pin 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`); both
+yield byte-for-byte the source this document cites. In short: **`HEAD` being a documentation commit is the
+required outcome, not a violation** — the pinned commit is its ancestor with no source changes, which is the
+precise, machine-checkable meaning of "the source repository is unchanged and the analysis is pinned."
+
 ---
 
 ## Appendix — cross-validation & reproduction notes
@@ -472,9 +519,9 @@ listings below.)
   large `HistoryBuf(100000,80,0)` → ~5 MiB steps at each 2048 boundary (first, cleanest step **+5.008 MiB**);
   +30k beyond the cap → ~0 growth; default `HistoryBuf(2000,80,0)` + 500k lines → **≈ 4.891 MiB** total with
   `count` capped at 2000; `HistoryBuf(2000,80,8 MiB)` + 200k lines → `pagerhist_as_text()` length
-  **8,388,608** chars (exactly the 8,388,608-byte cap) in a clean process; the A.5 harness reports
-  **≈ 8,362,586–8,371,348** because its larger process footprint perturbs the heap — a measuring-process
-  artifact that varies run-to-run, not an intrinsic ring property.
+  **8,388,608** chars (exactly the 8,388,608-byte cap), reproduced **deterministically** by the corrected A.5
+  harness — which retains the `LineBuf` that backs the live `Line` view (`kitty/line-buf.c:L171-L172`), the
+  prerequisite for a reliable exact-cap result (a 4 MiB cap likewise returns exactly **4,194,304**).
 - All scripts remain in `/tmp`; the kitty source tree stays byte-for-byte unchanged.
 
 ### A.4 Code locator index (all at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`)
@@ -534,16 +581,22 @@ def mib(b):
 
 def make_line(xnum):
     from kitty.fast_data_types import LineBuf, Cursor
+    # IMPORTANT: LineBuf.line(0) returns a *live view* into the LineBuf's backing
+    # buffer (kitty/line-buf.c:L171-L172 -- "the Line Object is a live view into the
+    # underlying buffer. And only a single line object can be used at a time."). If
+    # the LineBuf were allowed to be garbage-collected while the Line is still in use,
+    # the view would dangle and pushed content could be corrupted. So we return BOTH
+    # and the caller MUST retain `lb` for the entire lifetime of `line`.
     lb = LineBuf(1, xnum)
     line = lb.line(0)
     line.set_text("x" * xnum, 0, xnum, Cursor())
-    return line
+    return lb, line
 
 def scenario_growth(ynum=100000, xnum=80):
     from kitty.fast_data_types import HistoryBuf
     print(f"=== Scenario A: large scrollback HistoryBuf({ynum}, {xnum}, 0) ===")
     hb = HistoryBuf(ynum, xnum, 0)
-    line = make_line(xnum)
+    lb, line = make_line(xnum)   # retain lb: line is a live view into it (line-buf.c:L171-L172)
     base = rss_bytes()
     marks = [2048, 4096, 6144, 8192, 10240, 50000, 99999, 100000]
     pushed = 0
@@ -564,7 +617,7 @@ def scenario_default(ynum=2000, xnum=80, n=500000):
     from kitty.fast_data_types import HistoryBuf
     print(f"=== Scenario B: default HistoryBuf({ynum}, {xnum}, 0), push {n} ===")
     hb = HistoryBuf(ynum, xnum, 0)
-    line = make_line(xnum)
+    lb, line = make_line(xnum)   # retain lb: line is a live view into it (line-buf.c:L171-L172)
     base = rss_bytes()
     for _ in range(n):
         hb.push(line)
@@ -575,7 +628,7 @@ def scenario_pager(ynum=2000, xnum=80, pager_mib=8, n=200000):
     sz = pager_mib * 1024 * 1024
     print(f"=== Scenario C: pager HistoryBuf({ynum}, {xnum}, {pager_mib}MiB), push {n} ===")
     hb = HistoryBuf(ynum, xnum, sz)
-    line = make_line(xnum)
+    lb, line = make_line(xnum)   # retain lb: line is a live view into it (line-buf.c:L171-L172)
     for _ in range(n):
         hb.push(line)
     txt = hb.pagerhist_as_text()
