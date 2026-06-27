@@ -31,8 +31,8 @@
    in `/tmp` for a socket turn up nothing — is the path dynamic, or was that the wrong place to look?
 3. **(c) Shell-integration "without explicit configuration".** The docs say RC works without explicit
    setup when shell integration is active. What is the mechanism — the same socket, or PTY/TTY
-   behavior? Where are the environment variables that the shell-integration scripts set actually
-   consumed?
+   behavior? Where are the environment variables that the shell-integration scripts reference actually
+   set, and where are they consumed?
 4. **(d) End-to-end trace incl. logging.** Four concrete artifacts: (i) the *real* socket path kitty
    creates; (ii) what the protocol messages look like *on the wire*; (iii) *where in the Python code*
    the incoming command is parsed and routed to the `ls` handler; (iv) the JSON that comes back from a
@@ -62,9 +62,10 @@
   `atexit` handler [`kitty/boss.py:L177-L181`]. The default in-window transport uses the controlling
   TTY, so nothing appears under `/tmp`.
 - **(c)** In-window RC "just works" because the command rides the window's **controlling TTY** as an
-  escape code — no socket, no configuration. The environment variables the shell-integration scripts
-  set (`KITTY_PID`, `KITTY_WINDOW_ID`) drive **prompt/title** features, **not** RC transport
-  [`shell-integration/bash/kitty.bash:L215-L216`]. The variable that *does* drive transport,
+  escape code — no socket, no configuration. The environment variables `KITTY_PID` and
+  `KITTY_WINDOW_ID` — **set by kitty core** [`kitty/child.py:L244`, `kitty/tabs.py:L491`] and **read by
+  the shell-integration scripts** [`shell-integration/bash/kitty.bash:L215-L216`] — drive
+  **prompt/title** features, **not** RC transport. The variable that *does* drive transport,
   `KITTY_LISTEN_ON`, is exported by kitty **only when a socket is actually configured** and is consumed
   by the `kitten @` client [`kitty/remote_control.py:L271`, `tools/cmd/at/main.go:L372`].
 - **(d)** All four artifacts are captured live below: the real socket path
@@ -143,7 +144,7 @@ answer to "is it a socket or a pipe?" is "either — and it doesn't change what 
 > directory, but two of them (`__init__.py` and `base.py`) are infrastructure, not commands
 > (`ls -1 kitty/rc/*.py | wc -l` = 41). Every command module follows the same
 > `message_to_kitty()` / `response_from_kitty()` contract defined by the `RemoteCommand` base class
-> [`kitty/rc/base.py:L319`]. This uniformity is exactly what makes adding a new command easy (see §10).
+> [`kitty/rc/base.py:L319`]. This uniformity is exactly what makes adding a new command easy (see §12).
 
 ---
 
@@ -766,8 +767,8 @@ passwords, which are redacted per security policy; recall that common env vars a
 
 ## 8. Shell integration and "without explicit configuration"  [CODE-DERIVED]
 
-This section closes the user's specific trace gap: *they saw shell-integration scripts setting
-environment variables but could not find where those variables were consumed.* The resolution is that
+This section closes the user's specific trace gap: *they saw shell-integration scripts referencing
+environment variables but could not find where those variables were set or consumed.* The resolution is that
 there are **two different sets of variables with two different jobs**, and conflating them is what made
 the trace seem to dead-end.
 
@@ -814,8 +815,10 @@ The variables fan out to **two distinct consumers**:
   if [[ -n "$SSH_TTY" || -n "$SSH2_TTY$KITTY_WINDOW_ID" ]]; then              # L216
   ```
 
-  (The zsh and fish integrations use the same variables equivalently.) These are exactly the variables
-  the user saw being set — and they are consumed *here*, for cosmetics/identity, which is why the trail
+  (The zsh integration reads the same variables equivalently
+  [`shell-integration/zsh/kitty-integration:L249-L251`]; the fish integration at this commit does
+  **not** reference `KITTY_PID`/`KITTY_WINDOW_ID`.) These are exactly the variables the user saw the
+  scripts use — and they are consumed *here*, for cosmetics/identity, which is why the trail
   did not lead to the RC machinery.
 
 - **The `kitten @` client** reads `KITTY_LISTEN_ON` to pick the **socket transport** (§3):
