@@ -19,7 +19,7 @@
 
 | # | Question | Short answer | Primary citation |
 |---|----------|--------------|------------------|
-| **Q1** | What is the end-to-end success flow? | Launcher → `Boss` builds the `ChildMonitor` → `Child.fork()` opens a PTY and `spawn`s the program (native `fork`+`execvp`) → the program writes to the PTY slave → Kitty reads the PTY master, parses it, renders cells → the program exits 0 → the kernel raises `SIGCHLD` → `ChildMonitor` reaps it with `waitpid` → window torn down per `close_on_child_death` → `main_loop()` returns → Kitty exits 0. | `kitty/child.py:L276`, `kitty/child-monitor.c:L1418`, `kitty/main.py:L234-L236` |
+| **Q1** | What is the end-to-end success flow? | Launcher → `Boss` builds the `ChildMonitor` → `Child.fork()` opens a PTY and `spawn`s the program (native `fork`+`execvp`) → the program writes to the PTY slave → Kitty reads the PTY master, parses it, renders cells → the program exits 0 → the kernel raises `SIGCHLD` → `ChildMonitor` reaps it with `waitpid` → window torn down per `close_on_child_death` → `main_loop()` returns → Kitty exits 0. | `kitty/child.py:L276`, `kitty/child-monitor.c:L1418`, `kitty/main.py:L233-L236` |
 | **Q2a** | What is **Kitty's own** process exit code when the child exits 0? | **`0`** — purely because `main()` returns without raising `SystemExit` on a clean run; it is **not** copied from the child's status. | `kitty/main.py:L524-L531` |
 | **Q2b** | What is the full, literal completion **message**? | `Command {cmdline} finished with status: {exit_status}.\nClick to focus.` (the `notify_on_cmd_finish` notification body; **off by default**). The `+hold` path shows a separate `Press Enter or Esc to exit` prompt. | `kitty/window.py:L1429`, `tools/tui/hold.go:L26` |
 | **Q3** | Which subsystem tracks the child process? | The **`ChildMonitor`** C extension. | `kitty/child-monitor.c:L49-L62`, `kitty/boss.py:L370-L371` |
@@ -248,7 +248,7 @@ finally:
 ```
 
 ```python
-# kitty/main.py:L513-L521  (_main wraps run_app; finally only cleans up GLFW / ssh masters)
+# kitty/main.py:L515-L521  (_main wraps run_app; finally only cleans up GLFW / ssh masters)
 try:
     with setup_profiling():
         run_app(opts, cli_opts, bad_lines, talk_fd)
@@ -750,7 +750,7 @@ When a program is launched with `kitty +hold` / `--hold`, a small Go wrapper run
 window open with the `Press Enter or Esc to exit` prompt (**Q2b**, secondary message). The wiring:
 
 ```python
-# kitty/entry_points.py:L27   def hold(args: List[str]) -> NoReturn:
+# kitty/entry_points.py:L27   def hold(args: List[str]) -> None:   (re-execs via os.execvp at L30, so it never returns in practice)
 # kitty/entry_points.py:L29   args = ['kitten', '__hold_till_enter__'] + args[1:]
 # kitty/entry_points.py:L159  namespaced_entry_points['hold'] = hold
 ```
