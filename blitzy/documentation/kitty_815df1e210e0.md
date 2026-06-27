@@ -94,6 +94,9 @@ $ python3 setup.py ; echo "exit=$?"
 glfw/wl_window.c: In function 'xdgToplevelHandleConfigure':
 glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT' not handled in switch [-Werror=switch]
 glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_RIGHT' not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_TOP' not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM' not handled in switch [-Werror=switch]
+cc1: all warnings being treated as errors
 exit=1
 ```
 
@@ -103,11 +106,11 @@ Xvfb provides no GPU, so Mesa must fall back to its **llvmpipe** software raster
 
 ```
 Vendor: Mesa (0xffffffff)
-Device: llvmpipe (LLVM 20.1.2, 256 bits) (0xffffffff)
+Device: llvmpipe (LLVM 20.1.8, 256 bits) (0xffffffff)
 Version: 25.2.8
 Max core profile version: 4.5
-OpenGL renderer string: llvmpipe (LLVM 20.1.2, 256 bits)
-OpenGL core profile version string: 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.2
+OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits)
+OpenGL core profile version string: 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2
 ```
 
 This **4.5 core** context comfortably exceeds kitty's Linux floor of **OpenGL 3.1** (see [correction #1](#3-code-as-truth-corrections)).
@@ -224,7 +227,7 @@ Captured with `--debug-rendering` (file `launch_rendering.log`):
 [0.514] OS Window created
 [0.541] Failed to open systemd user bus with error: Connection refused
 [0.552] Child launched
-[0.404] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.2' Detected version: 4.5
+[0.404] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
 ```
 
 Each line maps to its source:
@@ -411,7 +414,7 @@ Captured in `launch_fontfallback.log`:
 [0.159]   Bold: DejaVuSansMono-Bold: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:0
 [0.159]   Italic: DejaVuSansMono-Oblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf:0
 [0.159]   Bold-Italic: DejaVuSansMono-BoldOblique: /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf:0
-[0.174] U+1f600 emoji_presentation Face(family=DejaVu Sans style=Book ps_name=DejaVuSans path=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ttc_index=0 variant=False named_instance=False scalable=True color=False)
+[0.174] U+1f600 emoji_presentation Face(family=Noto Color Emoji style=Regular ps_name=NotoColorEmoji path=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf ttc_index=0 variant=False named_instance=False scalable=False color=True)
 ```
 
 **Rationale:** the font system reports the concrete faces fontconfig resolved for the default monospace family (Normal/Bold/Italic/Bold-Italic = DejaVuSansMono variants) and a **fallback** chosen for an emoji codepoint (U+1F600) not present in the primary face. This proves font discovery (`_fc_match(...)` `[kitty/fontconfig.c:L269]`), face loading/rasterization (`FT_Load_Glyph(...)` `[kitty/freetype.c:L116]`), and the fallback path are live. The `Text fonts:` header ties directly to `[kitty/fonts/render.py:L163]`. (The four monospace faces and their exact `/usr/share/fonts/truetype/dejavu/` paths were reproduced during the investigation.)
@@ -421,7 +424,7 @@ Captured in `launch_fontfallback.log`:
 Reusing the GL version line from [Q1](#4-q1--startup-systems-headless):
 
 ```
-[0.404] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.2' Detected version: 4.5
+[0.404] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
 ```
 
 **Rationale:** a valid GL context (software llvmpipe) was created and accepted by the version gate `[kitty/gl.c:L72-L74]`, which is the prerequisite for compiling shaders (`compile_program(...)` `[kitty/shaders.c:L1168]`) and uploading the glyph atlas (`find_or_create_sprite_position(...)` `[kitty/glyph-cache.c:L34]`). With `--debug-rendering`, GL calls are additionally error-checked — the post-callback `gladSetGLPostCallback(check_for_gl_error)` is installed in `gl_init` `[kitty/gl.c:L52-L62]` — so a run that completes without a GL-error abort is itself evidence the render pipeline is functioning. Per [correction #3](#3-code-as-truth-corrections), kitty prints the **version** (which contains "Mesa"); the **"llvmpipe"** renderer string is confirmed by the external `glxinfo -B`, not by kitty.
