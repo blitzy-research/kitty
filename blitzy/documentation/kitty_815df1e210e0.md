@@ -428,7 +428,7 @@ return accumulate_st_terminated_esc_code(self, dispatch);
 header** so the parser can keep treating the remaining bytes as a fresh OSC 52, then recurses:
 
 ```c
-// kitty/vt-parser.c:388-389
+// kitty/vt-parser.c:389-390
 self->buf[self->read.pos++] = '5'; self->buf[self->read.pos++] = '2';
 self->buf[self->read.pos++] = ';'; self->buf[self->read.pos++] = ';';
 ```
@@ -448,7 +448,7 @@ on-disk temporary file once it grows past a threshold:
 
 ```python
 # kitty/clipboard.py:29   self.file: Union[io.BytesIO, IO[bytes]] = io.BytesIO()
-# kitty/clipboard.py:32-35  (rollover_if_needed)
+# kitty/clipboard.py:33-36  (rollover_if_needed)
 if isinstance(self.file, io.BytesIO) and self.file.tell() + sz > self.max_size:
     before = self.file.getvalue()
     self.file = TemporaryFile()
@@ -464,7 +464,7 @@ rollover_size: int = 16 * 1024 * 1024, max_size: int = -1,
 
 So small clipboard data lives entirely in RAM; very large data spills to disk and is later streamed back out
 in `io.DEFAULT_BUFFER_SIZE` pieces by `create_chunker` (`kitty/clipboard.py:52-65`, the `chunker()` at
-`:60`). An overall cap is also enforced — `write_base64_data` stops accepting data, logs, and sets
+`:57`). An overall cap is also enforced — `write_base64_data` stops accepting data, logs, and sets
 `max_size_exceeded` once the configured `clipboard_max_size` is hit (`kitty/clipboard.py:321-323`).
 
 The OSC 5522 path (`is_partial=None`) is the structured analog: `parse_osc_5522`
@@ -507,7 +507,7 @@ On the **first** call (`iter == NULL`) it lazily fetches the Python producer —
 `bytes` chunk back to GLFW:
 
 ```c
-// kitty/glfw.c:2156-2159
+// kitty/glfw.c:2155-2159
 PyObject *ret = PyObject_CallFunctionObjArgs(iter, NULL);
 if (ret == NULL) return ans;
 ans.data = PyBytes_AS_STRING(ret);   // BORROWED pointer into the bytes' storage
@@ -979,7 +979,7 @@ flowchart TD
         E --> F["clipboard_control + CALLBACK<br/>PyObject_CallMethod<br/>screen.c:87-91,2305-2307"]
         F --> G["Window.clipboard_control(memoryview, is_partial)<br/>window.py:1391-1395"]
         G --> H["parse_osc_52 / parse_osc_5522:<br/>base64 decode → NEW bytes (copy-out)<br/>clipboard.py:319,406,339"]
-        H --> I["Tempfile: RAM → disk at 16 MiB<br/>clipboard.py:26,32-35,237"]
+        H --> I["Tempfile: RAM → disk at 16 MiB<br/>clipboard.py:26,33-36,237"]
         H --> J["memmove buffer compaction<br/>ONLY AFTER callback returns<br/>vt-parser.c:1441"]
     end
     B -. "shared 1 MiB buffer, pthread_mutex (vt-parser.c:18,206)" .-> D
@@ -1043,7 +1043,7 @@ All line numbers anchored to HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 | Copy-out of leftover bytes (fresh `bytes`) | `kitty/clipboard.py:286`, `:296` |
 | Synchronous base64 decode into new `bytes` | `kitty/clipboard.py:319` |
 | `clipboard_max_size` truncation guard | `kitty/clipboard.py:321-323` |
-| `Tempfile` RAM→disk rollover | `kitty/clipboard.py:26`, `:32-35`; default `rollover_size=16 MiB` `:237` |
+| `Tempfile` RAM→disk rollover | `kitty/clipboard.py:26`, `:33-36`; default `rollover_size=16 MiB` `:237` |
 | Outbound chunker (DEFAULT_BUFFER_SIZE) | `kitty/clipboard.py:52-65` |
 | C-extension `Screen` stub | `kitty/fast_data_types.pyi:1109` |
 
