@@ -85,11 +85,16 @@ decref_pyobj` at `kitty/glfw.c:2159`, `:2133`) because GLFW may hold the data pa
 Remote-control/peer messages are **copied** with the `"y#"` format (`kitty/child-monitor.c:504`) precisely
 because their C buffer is `free()`d immediately afterward (`:505`).
 
-Finally, **kittens are separate processes**. They do *not* receive in-process callbacks; they exchange data
-with the parent kitty over **terminal escape codes / the remote-control protocol** — a kitten returns its
-result by writing a DCS escape sequence to stdout (`kittens/runner.py:103`–`:105`), and the parent's
-`talk_thread` feeds remote-control commands into `Boss.peer_message_received` (`kitty/boss.py:776`). This is
-the architectural crux that distinguishes "events to kittens" from "in-process Python callbacks."
+Finally, **kittens are separate processes**. They do *not* receive in-process callbacks in their own address
+space; they exchange data with the parent kitty over **terminal escape codes / the remote-control protocol**.
+A kitten returns its result by writing a DCS escape sequence to its stdout (`kittens/runner.py:102-105`); the
+parent reads those bytes off the PTY and the **VT parser** dispatches them (`kitty/vt-parser.c:603-605`) into
+the in-process callback `Window.handle_kitten_result` (`kitty/window.py:1294-1302`). Escape-code remote
+control (`@kitty-cmd`) travels the same parser path to `Window.handle_remote_cmd` → `Boss.handle_remote_cmd`
+(`kitty/window.py:1279-1280`, `kitty/boss.py:849-852`). A *separate* transport — the single-instance
+**socket** drained off the `talk_thread` — is what feeds peer messages into `Boss.peer_message_received`
+(`kitty/boss.py:776`); it is **not** the path a kitten's terminal escape codes take. This is the
+architectural crux that distinguishes "events to kittens" from "in-process Python callbacks."
 
 ---
 
@@ -817,19 +822,36 @@ discussed so far? The short answer: **they are two architecturally distinct mech
 
 ### 8.1 In-process callbacks (inside the main kitty process, on the main thread, under the GIL)
 
-Two kinds of events are delivered as **in-process C→Python calls**:
+**Three** kinds of events are delivered as **in-process C→Python calls**, all on the main thread under the
+GIL. Two of them ride the *terminal byte stream* (and so arrive through the `io_thread` → parser pipeline of
+Sections 2–3); the third rides a *socket* (and so arrives through the `talk_thread`):
 
-- **Clipboard** — `clipboard_control` → `Window.clipboard_control` (Sections 3). Runs on the main thread,
-  under the GIL, via the `CALLBACK` macro (`kitty/screen.c:87-91`).
-- **Peer / remote-control messages** — the `talk_thread` only *enqueues* peer messages; the **main** thread
-  drains the queue (`kitty/child-monitor.c:485-515`) and dispatches each one into Python:
+- **Clipboard (terminal byte stream)** — `clipboard_control` → `Window.clipboard_control` (Section 3), via
+  the `CALLBACK` macro (`kitty/screen.c:87-91`).
+- **Terminal DCS dispatch (terminal byte stream): kitten results + escape-code remote control.** When the
+  parser encounters a kitty DCS sequence (`\x1bP@kitty-…`), `dispatch_dcs` strips the leading `@` and hands
+  the rest to `parse_kitty_dcs` (`kitty/vt-parser.c:654-655`, `:586`), which matches the `kitty-` prefix
+  (`kitty/vt-parser.c:600-601`) and routes by sub-prefix: `cmd{` → `handle_remote_cmd`
+  (`kitty/vt-parser.c:603`) and `kitten-result|` → `handle_kitten_result` (`kitty/vt-parser.c:605`). The
+  dispatch macro wraps the payload in a **zero-copy** `memoryview` and calls `screen_handle_kitty_dcs`
+  (`kitty/vt-parser.c:595`), which fires the `CALLBACK` into the bound `Window` (`kitty/screen.c:2441-2442`).
+  On the Python side these land as `Window.handle_remote_cmd` → `get_boss().handle_remote_cmd`
+  (`kitty/window.py:1279-1280`) — which calls `_handle_remote_command` and returns a response
+  (`kitty/boss.py:849-852`, defined at `:590`) — and `Window.handle_kitten_result`, which base85-decodes the
+  JSON result and runs its processors (`kitty/window.py:1294-1302`). **This is the path a kitten's escape-code
+  output actually takes.**
+- **Socket peer / single-instance remote-control messages (socket).** The `talk_thread` only *enqueues* peer
+  messages arriving on kitty's single-instance/remote-control **socket**; the **main** thread drains the queue
+  (`kitty/child-monitor.c:485-515`) and dispatches each one into Python with a **copy** (`y#`), freeing the C
+  buffer immediately afterward:
 
   ```c
-  // kitty/child-monitor.c:504
+  // kitty/child-monitor.c:504-505
   resp = PyObject_CallMethod(global_state.boss, "peer_message_received", "y#KO", ...);
+  free(msg->data);
   ```
 
-  The canonical C→Python "boss" dispatch macro generalizes this pattern:
+  The canonical C→Python "boss" dispatch macro generalizes the call pattern:
 
   ```c
   // kitty/state.h:284-288
@@ -838,11 +860,14 @@ Two kinds of events are delivered as **in-process C→Python calls**:
       if (cret_ == NULL) { PyErr_Print(); } else Py_DECREF(cret_); }
   ```
 
-The Python handler is `Boss.peer_message_received` (`kitty/boss.py:776`). For a remote-control message it
-recognizes the DCS-framed command — prefix `b'\x1bP@kitty-cmd'` (`kitty/boss.py:781`) and terminator
-`b'\x1b\\'` (`kitty/boss.py:782`) — strips the framing, and calls `_handle_remote_command`
-(`kitty/boss.py:785`, defined at `:590`). All of this executes **inside the main kitty process** on the main
-thread, holding the GIL.
+  The Python handler is `Boss.peer_message_received` (`kitty/boss.py:776`). For a remote-control peer message
+  it recognizes the DCS-framed command — prefix `b'\x1bP@kitty-cmd'` (`kitty/boss.py:781`) and terminator
+  `b'\x1b\\'` (`kitty/boss.py:782`) — strips the framing, and calls `_handle_remote_command`
+  (`kitty/boss.py:785`, defined at `:590`). **This socket path is distinct from the terminal-DCS path above:**
+  it is how a *separate process* speaking the remote-control protocol over the socket reaches the boss — not
+  how a kitten's stdout escape codes reach it.
+
+All three execute **inside the main kitty process** on the main thread, holding the GIL.
 
 ### 8.2 Separate-process kittens (escape codes / remote-control protocol)
 
@@ -865,22 +890,42 @@ sys.stdout.buffer.write(b'\x1b\\')
 
 That is: serialize the result to JSON → base85-encode → wrap in a `\x1bP@kitty-kitten-result|...\x1b\\` DCS
 sequence. The parent kitty receives those bytes through the very same `io_thread` → parser → main-thread
-pipeline described in Sections 2–3, and remote-control commands a kitten issues arrive at
-`Boss.peer_message_received` (`kitty/boss.py:776`) over the socket handled by the `talk_thread`.
+pipeline described in Sections 2–3: the **VT parser** recognizes the `@kitty-kitten-result|` DCS sub-prefix
+(`kitty/vt-parser.c:605`), `screen_handle_kitty_dcs` fires the in-process callback
+(`kitty/screen.c:2441-2442`), and `Window.handle_kitten_result` base85-decodes the result and runs its
+processors (`kitty/window.py:1294-1302`). Remote-control commands that a kitten (or any program) emits **as
+terminal escape codes** — `\x1bP@kitty-cmd…\x1b\\`, built by `kitty.remote_control.encode_send`
+(`kitty/remote_control.py:308-310`) — travel the identical parser path (`kitty/vt-parser.c:603`) to
+`Window.handle_remote_cmd` (`kitty/window.py:1279-1280`) → `Boss.handle_remote_cmd` (`kitty/boss.py:849-852`).
+This is **not** the `talk_thread` / `Boss.peer_message_received` socket route (Section 8.1): that route serves
+the single-instance **socket**, whereas a kitten's bytes arrive over the **terminal byte stream**.
 
 ### 8.3 The architectural distinction, stated plainly
 
-- **In-process events** (clipboard, peer dispatch) reach Python via **direct C→Python function calls** on the
-  main thread, under the GIL (`kitty/screen.c:87-91`, `kitty/child-monitor.c:504`, `kitty/state.h:284`).
-- **Kittens** reach the core via the **inter-process byte stream** — terminal escape codes and the
-  remote-control protocol (`kittens/runner.py:103-105`, `kitty/boss.py:776`) — never via in-process callbacks.
+- **Delivery mechanism vs. transport.** Every event ultimately reaches Python through a **direct C→Python
+  function call** on the main thread, under the GIL (`kitty/screen.c:87-91`, `kitty/state.h:284`). What
+  differs is the **transport** that carries the event to that call:
+  - **Terminal byte stream** (clipboard, and kitten results / escape-code remote control): bytes are read by
+    the `io_thread`, parsed on the main thread, and dispatched as `Window` callbacks
+    (`kitty/screen.c:2305-2307` for clipboard; `kitty/vt-parser.c:603-605` → `kitty/screen.c:2441-2442` →
+    `kitty/window.py:1279-1280` / `:1294-1302` → `kitty/boss.py:849-852` for the kitten/DCS path).
+  - **Socket** (single-instance / peer remote control): bytes are read by the `talk_thread`, enqueued, and
+    drained on the main thread into `Boss.peer_message_received` (`kitty/child-monitor.c:504`,
+    `kitty/boss.py:776`).
+- **Kittens are separate processes.** A kitten cannot be *called* in-process in kitty's address space; it
+  runs out-of-process (`kittens/runner.py:87`, `:110`, `:194`) and communicates **only** over the terminal
+  byte stream / remote-control protocol (`kittens/runner.py:102-105`). The parent then turns those received
+  bytes into the in-process `Window.handle_kitten_result` / `Window.handle_remote_cmd` callbacks above — it
+  never invokes the kitten's own code in-process, and a kitten's escape codes are **never** routed through the
+  socket `Boss.peer_message_received` handler.
 
 **Rationale.** Running kittens out-of-process isolates them: a crash, a slow operation, or arbitrary
 third-party kitten code cannot corrupt kitty's address space, block its main thread directly, or interfere
 with the GIL. The price is that all kitten ↔ core communication is serialized through the byte stream/socket,
 which is exactly the protocol kitty already speaks. This is the complete answer to "how does the core deliver
-events and data to kittens": **it doesn't call them in-process — it talks to them over escape codes /
-remote control, process to process.**
+events and data to kittens": **it doesn't call the kitten in-process — it talks to it over escape codes /
+remote control, process to process, and turns the bytes it receives back into in-process `Window` callbacks
+on the main thread.**
 
 
 ---
@@ -900,10 +945,15 @@ remote control, process to process.**
    callbacks under the GIL (`kitty/vt-parser.c:1417`), while the pure-C **`io_thread`** and **`talk_thread`**
    never touch Python (`kitty/child-monitor.c:55`, `:1481`, `:1805`). A mutex guards the buffer and is
    **released around the callback** (`kitty/vt-parser.c:1431-1433`), safe because the producer writes ahead.
-3. **Event delivery to kittens.** In-process events (clipboard, peer/remote-control) are **direct C→Python
-   calls** on the main thread (`kitty/screen.c:87-91`, `kitty/child-monitor.c:504`, `kitty/state.h:284`).
-   **Kittens are separate processes** that communicate over **escape codes / remote control**
-   (`kittens/runner.py:103-105`, `kitty/boss.py:776`) — not via in-process callbacks.
+3. **Event delivery to kittens.** Every event reaches Python as a **direct C→Python call** on the main
+   thread; what differs is the **transport**. Clipboard and **kitten results / escape-code remote control**
+   ride the **terminal byte stream** — the parser dispatches kitty DCS sequences (`kitty/vt-parser.c:603-605`)
+   via `screen_handle_kitty_dcs` (`kitty/screen.c:2441-2442`) into `Window.handle_kitten_result`
+   (`kitty/window.py:1294-1302`) and `Window.handle_remote_cmd` → `Boss.handle_remote_cmd`
+   (`kitty/window.py:1279-1280`, `kitty/boss.py:849-852`). Single-instance/peer remote control rides the
+   **socket**, drained on the main thread into `Boss.peer_message_received` (`kitty/child-monitor.c:504`,
+   `kitty/boss.py:776`). **Kittens are separate processes** (`kittens/runner.py:102-105`) — kitty never calls
+   them in-process; it exchanges bytes with them and turns those bytes into the `Window` callbacks above.
 4. **Expensive C-side operation (scrollback scan).** It runs on the **main thread holding the GIL**
    (no GIL-release macros in `kitty/history.c` or `kitty/screen.c`), so it **defers every Python-visible
    event** (input + remote control) until it returns — a "GIL convoy" (reasoned inference) — while
@@ -1035,7 +1085,24 @@ All line numbers anchored to HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 | Inbound write copies (`y#`) | `kitty/glfw.c:2180` (`write_clipboard_data`) |
 | Python producer | `kitty/clipboard.py:138` (`Clipboard.__call__`) |
 
-**Kitten / event delivery**
+**Event delivery — terminal byte-stream / DCS (kitten results + escape-code remote control)**
+
+| Claim | Evidence |
+|---|---|
+| Kitten launched as a separate process | `kittens/runner.py:87` (`launch`), `:110` (`run_kitten`), `:194` (`main`) |
+| Kitten result emitted as a `@kitty-kitten-result` DCS escape to stdout | `kittens/runner.py:102-105` |
+| Escape-code remote-control framing (`@kitty-cmd`) | `kitty/remote_control.py:308-310` (`encode_send`) |
+| DCS entry: leading `@` stripped, routed to `parse_kitty_dcs` | `kitty/vt-parser.c:654-655`, `:586` |
+| `kitty-` prefix match | `kitty/vt-parser.c:600-601` |
+| Sub-prefix `cmd{` → `handle_remote_cmd` | `kitty/vt-parser.c:603` |
+| Sub-prefix `kitten-result` (pipe-terminated) → `handle_kitten_result` | `kitty/vt-parser.c:605` |
+| Zero-copy `memoryview` built + `screen_handle_kitty_dcs` invoked | `kitty/vt-parser.c:595` |
+| `screen_handle_kitty_dcs` → `CALLBACK` into the bound `Window` | `kitty/screen.c:2441-2442` |
+| `Window.handle_remote_cmd` → `get_boss().handle_remote_cmd` | `kitty/window.py:1279-1280` |
+| `Boss.handle_remote_cmd` → `_handle_remote_command` + response | `kitty/boss.py:849-852` (`_handle_remote_command` `:590`) |
+| `Window.handle_kitten_result` (base85-decode JSON, run processors) | `kitty/window.py:1294-1302` |
+
+**Event delivery — socket / peer (single-instance) remote control**
 
 | Claim | Evidence |
 |---|---|
@@ -1043,8 +1110,6 @@ All line numbers anchored to HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 | Peer dispatch copies via `y#`; buffer freed after | `kitty/child-monitor.c:504`, `:505` |
 | `call_boss` macro | `kitty/state.h:284-288` |
 | `Boss.peer_message_received` + DCS framing | `kitty/boss.py:776`, prefix `:781`, terminator `:782`, `_handle_remote_command` `:785`/`:590` |
-| Kitten launcher (separate process) | `kittens/runner.py:87` (`launch`), `:110` (`run_kitten`), `:194` (`main`) |
-| Kitten result via DCS escape to stdout | `kittens/runner.py:102-105` |
 
 **Background corroboration (non-authoritative)**
 
