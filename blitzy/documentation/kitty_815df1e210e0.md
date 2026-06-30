@@ -321,7 +321,7 @@ sequences — it emits the `\x1bP@kitty-kitten-result|` prefix [kittens/runner.p
 terminator `\x1b\\` [kittens/runner.py:L105]. The clipboard kitten is exactly such a standalone
 process: `kittens/clipboard/main.py` guards `raise SystemExit('This should be run as kitten clipboard')`
 [kittens/clipboard/main.py:L83], reads STDIN to the clipboard or emits clipboard contents with
-`--get-clipboard`, and per its documentation "even works over SSH" [docs/kittens/clipboard.rst:L14].
+`--get-clipboard`, and per its documentation "even works over SSH" [docs/kittens/clipboard.rst:L15].
 Because such a kitten is a separate process talking over the escape protocol, its data takes the very
 same OSC path analyzed in Section 3 — there is no shared-memory back-channel.
 
