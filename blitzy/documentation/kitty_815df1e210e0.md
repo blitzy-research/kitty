@@ -7,21 +7,34 @@
 
 kitty splits its runtime between a performance-critical **C core** (screen state, the VT escape-code
 parser, PTY I/O) and a **Python layer** (window/tab orchestration, features, and the "kittens"
-subsystem). This document answers how data crosses that boundary while many things happen at once —
-high-throughput child output, concurrent I/O, rendering, and remote control. The thesis, established
-from the source and defended throughout, is fourfold: **(1)** *all* Python executes on a single
-GIL-holding **main thread**; concurrency is delegated to pure-C `pthread` workers coordinated by
-mutexes, not by releasing the GIL; **(2)** cross-boundary payloads (e.g. the clipboard) move as a
-**transient, read-only, zero-copy `memoryview`** into the parser's 1 MiB buffer, so anything the
-Python side wants to keep must be **copied**; **(3)** small versus very large clipboard transfers are
-the difference between a **single dispatch** and a **chunked state machine** (a 256 KiB boundary, a
-partial-chunk code, and `52;;` re-injection) with Python-side on-disk spill and a size limit that
-**stops accepting further data once crossed** (rather than cropping to an exact size); and
-**(4)** expensive main-thread work — the user's example of scanning a huge scrollback — **serializes
-everything behind it**, delaying in-process event delivery, stalling rendering, and ultimately
-engaging I/O backpressure, while memory stays bounded by fixed-size buffers. The only genuine race
-surface under load is therefore **C-level buffer coordination plus latency/ordering effects**, not
-Python-level data races.
+subsystem); the two layers meet through a single compiled extension module, `kitty.fast_data_types`
+[kitty/data-types.c:L469], built and linked by `compile_c_extension(...)` [setup.py:L1091]. This
+document answers how data crosses that boundary while many things happen at once — high-throughput
+child output, concurrent I/O, rendering, and remote control. The thesis, established from the source
+and defended throughout, is fourfold: **(1)** *all* Python executes on a single GIL-holding **main
+thread**, while the two pure-C worker threads declared together as `pthread_t io_thread, talk_thread;`
+[kitty/child-monitor.c:L55] never call the Python C API; concurrency is delegated to those `pthread`
+workers coordinated by mutexes such as `children_lock`/`talk_lock` [kitty/child-monitor.c:L87], **not**
+by releasing the GIL — the sole `Py_BEGIN_ALLOW_THREADS` in the entire C core is the
+data-path-irrelevant `num_users` syscall [kitty/utmp.c:L17], and the main loop never drops the GIL
+while waiting for events [kitty/glfw.c:L2102]; **(2)** cross-boundary payloads (e.g. the clipboard)
+move as a **transient, read-only, zero-copy `memoryview`** — `PyMemoryView_FromMemory(..., PyBUF_READ)`
+[kitty/vt-parser.c:L461] — into the parser's 1 MiB buffer (`BUF_SZ` [kitty/vt-parser.c:L18]), so
+anything the Python side wants to keep must be **copied** [kitty/clipboard.py:L286]; **(3)** small
+versus very large clipboard transfers are the difference between a **single dispatch**
+[kitty/vt-parser.c:L457] and a **chunked state machine** — a 256 KiB boundary (`MAX_ESCAPE_CODE_LENGTH`
+[kitty/vt-parser.c:L21]), a partial-chunk code (`code = -52` [kitty/vt-parser.c:L533]), and `52;;`
+re-injection (`continue_osc_52` [kitty/vt-parser.c:L386]) — with Python-side on-disk spill
+[kitty/clipboard.py:L32] and a size limit that **stops accepting further data once crossed** (rather
+than cropping to an exact size) [kitty/clipboard.py:L318,L323]; and **(4)** expensive main-thread
+work — the user's example of scanning a huge scrollback [kitty/history.c:L348] — **serializes
+everything behind it**, delaying in-process event delivery (`parse_input` cannot run
+[kitty/child-monitor.c:L451]), stalling rendering [kitty/child-monitor.c:L1237], and ultimately
+engaging I/O backpressure [kitty/child-monitor.c:L1501], while memory stays bounded by fixed-size
+buffers [kitty/vt-parser.c:L18]. The only genuine race surface under load is therefore **C-level
+buffer coordination** — the parser lock in `run_worker` [kitty/vt-parser.c:L1417] — **plus
+latency/ordering effects**, not Python-level data races, which are foreclosed by the single
+GIL-holding thread [kitty/utmp.c:L17], [kitty/glfw.c:L2102].
 
 ## Methodology note
 
@@ -88,9 +101,9 @@ I/O concurrency with C threads coordinated by mutexes — `children_lock` and `t
 macro [kitty/child-monitor.c:L74] — rather than by releasing the GIL for parallel Python.
 
 > **Citation correction (verified):** the `screen_mutex` macro is defined in
-> **`kitty/child-monitor.c:L74`** — `#define screen_mutex(op, which) pthread_mutex_##op(&screen->which##_buf_lock)` —
+> `kitty/child-monitor.c` [kitty/child-monitor.c:L74] — `#define screen_mutex(op, which) pthread_mutex_##op(&screen->which##_buf_lock)` —
 > and operates on the per-screen `pthread_mutex_t write_buf_lock` declared at
-> **`kitty/screen.h:L116`**. It is *not* defined in `screen.c`.
+> `kitty/screen.h` [kitty/screen.h:L116]. It is *not* defined in `screen.c`.
 
 A transient one-shot helper thread also exists for large blocking writes to a child
 [kitty/child-monitor.c:L965,L1002], but it likewise touches no Python — it only moves bytes — so it
@@ -121,16 +134,18 @@ screen events is the `CALLBACK` macro [kitty/screen.c:L87]:
 ```
 
 Each `Screen` holds a `callbacks` object — the owning Python `Window` — and `CALLBACK` invokes a named
-method on it with `PyObject_CallMethod`. So when the parser recognizes an event (a clipboard operation,
+method on it with `PyObject_CallMethod` [kitty/screen.c:L87]. So when the parser recognizes an event (a clipboard operation,
 a title change, a file-transfer command, …) it calls *straight into* the Window's Python method on the
 same thread, under the GIL.
 
-**Why this matters:** the crossing is **synchronous and in-line**. There is no queue, no hand-off to a
-worker thread, and no asynchronous callback scheduling at this boundary — control and data move from C
+**Why this matters:** the crossing is **synchronous and in-line** — `CALLBACK` is a direct
+`PyObject_CallMethod` with no intervening queue [kitty/screen.c:L87]. There is no hand-off to a
+worker thread and no asynchronous callback scheduling at this boundary — control and data move from C
 to Python and back within a single call, on the main thread, while the GIL is held. The immediate
 consequences are that **ordering is exactly parse order** (events reach Python in the byte order they
 appeared in the child's output stream) and that **the parser is blocked inside the callback**: until
-the Python method returns, the C parser cannot advance. Both facts are load-bearing for Sections 3–7.
+the Python method returns, the C parser cannot advance, because parsing itself runs on that same main
+thread [kitty/child-monitor.c:L451]. Both facts are load-bearing for Sections 3–7.
 
 ---
 
@@ -200,7 +215,7 @@ void clipboard_control(Screen *self, int code, PyObject *data) {
 
 ### 3.5 Crossing into Python
 
-The negative/positive code and the memoryview arrive at the Window's Python entry point:
+The negative/positive code and the memoryview arrive at the Window's Python entry point [kitty/window.py:L1391]:
 
 ```python
 def clipboard_control(self, data: memoryview, is_partial: Optional[bool] = False) -> None:
@@ -246,7 +261,7 @@ cap.
 
 A subtle but important detail lives in the base64 decoder. Base64 decodes in 4-byte groups, so a chunk
 boundary can leave 1–3 trailing bytes that belong with the next chunk. kitty preserves them by
-**copying them out** of the transient view:
+**copying them out** of the transient view [kitty/clipboard.py:L286]:
 
 ```python
 self.current_leftover_bytes = memoryview(bytes(mv[-extra:]))
@@ -280,9 +295,10 @@ flowchart TD
 **Why the distinction matters:** the small/large split is precisely the boundary between *one borrowed
 view* and *a sequenced chunk protocol with on-disk spill and a size limit*. Small payloads incur zero
 copying; large or hostile payloads can never force unbounded in-memory growth, because the parser
-buffer is fixed at 1 MiB, the Python accumulator spills to disk at 16 MiB, and once the accumulated size
-crosses the `clipboard_max_size` guard kitty **stops accepting further decoded chunks** (§3.6) — bounding
-further growth even though it does not crop the stored data to an exact size. The behavior is bounded by
+buffer is fixed at 1 MiB [kitty/vt-parser.c:L18], the Python accumulator spills to disk at 16 MiB
+[kitty/clipboard.py:L32], and once the accumulated size crosses the `clipboard_max_size` guard kitty
+**stops accepting further decoded chunks** (§3.6) [kitty/clipboard.py:L318,L323] — bounding further
+growth even though it does not crop the stored data to an exact size. The behavior is bounded by
 construction at every stage.
 
 ---
@@ -322,10 +338,12 @@ calls `wakeup_main_loop()`. The **main thread** drains that queue *inside* `pars
 forwards remote-control payloads to `_handle_remote_command`.
 
 **Why this matters:** on a single Python thread, "delivery" means **scheduling**, not concurrency. An
-in-process callback is delivered the instant the parser reaches it; a queued peer message is delivered
-only when the main thread next returns to its drain point. Nothing on the Python side runs truly in
-parallel, so event delivery is **serialized and ordered** — and, crucially, it can be *delayed* by
-whatever else the main thread is doing. That delay is the subject of Section 5.
+in-process callback is delivered the instant the parser reaches it via the synchronous `CALLBACK`
+[kitty/screen.c:L87]; a queued peer message is delivered only when the main thread next returns to its
+drain point inside `parse_input` [kitty/child-monitor.c:L487-L504]. Nothing on the Python side runs
+truly in parallel — the single GIL-holding thread is the only one that runs Python [kitty/utmp.c:L17],
+[kitty/glfw.c:L2102] — so event delivery is **serialized and ordered**, and, crucially, it can be
+*delayed* by whatever else the main thread is doing. That delay is the subject of Section 5.
 
 ---
 
@@ -338,10 +356,12 @@ bounded buffers rather than growth.**
 
 ### 5.1 Why a scrollback scan is a main-thread, GIL-held operation
 
-Scrollback lives in the C `HistoryBuf`, and its scanning/reflow methods run entirely on the main thread
-with the GIL held — there is **no** `Py_BEGIN_ALLOW_THREADS` anywhere in `kitty/history.c` (verified
-count: zero). These methods do, however, differ in *how much* Python work each performs per line, and
-it would be inaccurate to describe them all as per-line callback loops:
+Scrollback lives in the C `HistoryBuf`, and its scanning/reflow methods (e.g. `as_ansi`
+[kitty/history.c:L348]) run entirely on the main thread that performs parsing
+[kitty/child-monitor.c:L451] with the GIL held — there is **no** `Py_BEGIN_ALLOW_THREADS` anywhere in
+`kitty/history.c` (verified count: zero; the C core's only GIL release is the unrelated `num_users`
+syscall in `kitty/utmp.c` [kitty/utmp.c:L17]). These methods do, however, differ in *how much* Python
+work each performs per line, and it would be inaccurate to describe them all as per-line callback loops:
 
 - **`as_ansi`** [kitty/history.c:L348] is the canonical per-line case: it loops over **every** stored
   line (`for (... i < self->count ...)` [kitty/history.c:L353]), builds **one Python object per line**
@@ -366,16 +386,17 @@ it would be inaccurate to describe them all as per-line callback loops:
 
 **Why the distinction still supports the same conclusion:** what these operations share is not a
 per-line callback shape but that each runs **on the main thread with the GIL held** while doing work
-proportional to the scrollback size — whether that work is a per-line callback (`as_ansi`, and
-`as_text_history_buf` via `as_text_generic`), a single large bytes-to-Unicode decode
-(`pagerhist_as_text`), or a bulk C reflow (`rewrap`). Because none of them releases the GIL, any of them
-can hold the main thread for the full duration of the scan — which is exactly what matters for event
-delivery, examined next.
+proportional to the scrollback size — whether that work is a per-line callback (`as_ansi`
+[kitty/history.c:L348], and `as_text_history_buf` [kitty/history.c:L509] via `as_text_generic`), a
+single large bytes-to-Unicode decode (`pagerhist_as_text` [kitty/history.c:L486]), or a bulk C reflow
+(`rewrap` [kitty/history.c:L617]). Because none of them releases the GIL, any of them can hold the main
+thread for the full duration of the scan — which is exactly what matters for event delivery, examined
+next.
 
 ### 5.2 Consequences while a scan runs
 
-Because the main thread is the *only* thread that runs Python or parses input, a long scan blocks all
-of it. The observable effects:
+Because the main thread is the *only* thread that runs Python or parses input [kitty/child-monitor.c:L451],
+a long scan blocks all of it. The observable effects:
 
 | Effect | Mechanism | Evidence |
 |--------|-----------|----------|
@@ -384,9 +405,10 @@ of it. The observable effects:
 | `io_thread` keeps reading **until the 1 MiB buffer fills**, then **backpressure** engages | POLLIN is requested only while the parser has space: `vt_parser_has_space_for_input(...) ? POLLIN : 0` | [kitty/child-monitor.c:L1501], [kitty/vt-parser.c:L1477] |
 | Remote-control messages are queued but **not drained** | `talk_loop`/`queue_peer_message` keep queueing in C, but the drain — `parse_input` calling `peer_message_received` per message — waits for the main thread | [kitty/child-monitor.c:L1653-L1669], [kitty/child-monitor.c:L487-L504], [kitty/boss.py:L776] |
 
-When the parser buffer fills, the `io_thread` stops requesting `POLLIN` for that child, the child's
-PTY write buffer fills, and the **child process blocks** on its next write — classic backpressure that
-throttles the producer instead of growing kitty's memory.
+When the parser buffer [kitty/vt-parser.c:L18] fills, the `io_thread` stops requesting `POLLIN` for
+that child — `vt_parser_has_space_for_input(...) ? POLLIN : 0` [kitty/child-monitor.c:L1501],
+[kitty/vt-parser.c:L1477] — the child's PTY write buffer fills, and the **child process blocks** on its
+next write — classic backpressure that throttles the producer instead of growing kitty's memory.
 
 ### 5.3 How memory is handled during the scan
 
@@ -398,11 +420,13 @@ that arrives during the scan accumulates only in the **bounded 1 MiB parser buff
 [kitty/vt-parser.c:L18] until backpressure engages.
 
 **Why the pressure shows up as latency, not memory growth:** a per-line scan such as `as_ansi`
-transiently builds *one* Python string per line, passes it to the callback, and clears it (`Py_CLEAR(ans)`
-follows the per-line callback in `as_ansi`); and none of the scrollback methods enqueues a growing list
-of per-event Python objects (`pagerhist_as_text` returns a single decoded string, `rewrap` returns
-`None`). So an expensive scan manifests as **delayed delivery and I/O backpressure**, with memory held
-flat by the segmented scrollback and the fixed parser buffer — exactly the behavior the user asked about.
+transiently builds *one* Python string per line, passes it to the callback, and clears it — `Py_CLEAR(ans)`
+follows the per-line callback in `as_ansi` [kitty/history.c:L363]; and none of the scrollback methods
+enqueues a growing list of per-event Python objects (`pagerhist_as_text` returns a single decoded string
+[kitty/history.c:L493], `rewrap` returns `None` [kitty/history.c:L623]). So an expensive scan manifests
+as **delayed delivery and I/O backpressure**, with memory held flat by the segmented scrollback
+[kitty/history.c:L18] and the fixed parser buffer [kitty/vt-parser.c:L18] — exactly the behavior the user
+asked about.
 
 ---
 
@@ -485,8 +509,10 @@ What remains under load is the C coordination already mapped in Section 6:
 | Child set & peer queue | `children_lock`, `talk_lock` | [kitty/child-monitor.c:L87] |
 | Read admission / backpressure | `vt_parser_has_space_for_input` gating POLLIN | [kitty/vt-parser.c:L1477], [kitty/child-monitor.c:L1501] |
 
-Beyond these mutex-mediated buffers, "load" manifests only as **latency and ordering** — delayed
-delivery and engaged backpressure (Sections 5–6) — not as corruption.
+Beyond these mutex-mediated buffers — chiefly the parser lock in `run_worker` [kitty/vt-parser.c:L1417]
+— "load" manifests only as **latency and ordering**: delayed delivery and engaged backpressure
+(Sections 5–6) [kitty/child-monitor.c:L1501], not corruption, precisely because the single GIL-holding
+thread [kitty/utmp.c:L17] forecloses Python-level data races.
 
 ### 7.3 The partial-chunk state machine is safe *because* dispatch is single-threaded
 
@@ -534,11 +560,13 @@ scrollback segment size/allocator are at
 `[kitty/screen.h:L116]`), not in `screen.c`, was confirmed by `grep`.
 
 **Build/run corroboration.** The conclusions in this document are derived purely from reading the cited
-source. The static evidence enumerated above — a single `Py_BEGIN_ALLOW_THREADS` in the whole C core,
-zero GIL releases in `history.c`, the read-only RAII memoryview, and the explicit lock discipline in
-`run_worker` — is self-contained and sufficient to support every claim, so no dynamic build/run was
-required to reach them. Per the governing constraints, the source repository is left unmodified; the
-only file written is this analysis document, and no temporary artifacts were committed.
+source. The static evidence enumerated above — a single `Py_BEGIN_ALLOW_THREADS` in the whole C core
+[kitty/utmp.c:L17], zero GIL releases in `history.c` (whose scan methods such as `as_ansi`
+[kitty/history.c:L348] run under the held GIL), the read-only RAII memoryview [kitty/vt-parser.c:L461],
+and the explicit lock discipline in `run_worker` [kitty/vt-parser.c:L1417] — is self-contained and
+sufficient to support every claim, so no dynamic build/run was required to reach them. Per the governing
+constraints, the source repository is left unmodified; the only file written is this analysis document,
+and no temporary artifacts were committed.
 
 This document describes observed behavior only and intentionally proposes no changes, fixes, or
 optimizations to any of the mechanisms analyzed above.
