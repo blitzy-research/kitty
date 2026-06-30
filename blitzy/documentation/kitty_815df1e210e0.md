@@ -92,9 +92,9 @@ macro [kitty/child-monitor.c:L74] — rather than by releasing the GIL for paral
 > and operates on the per-screen `pthread_mutex_t write_buf_lock` declared at
 > **`kitty/screen.h:L116`**. It is *not* defined in `screen.c`.
 
-A transient one-shot helper thread also exists for large blocking writes to a child, but it likewise
-touches no Python — it only moves bytes — so it does not affect the single-GIL-thread invariant and is
-mentioned here only for completeness.
+A transient one-shot helper thread also exists for large blocking writes to a child
+[kitty/child-monitor.c:L965,L1002], but it likewise touches no Python — it only moves bytes — so it
+does not affect the single-GIL-thread invariant and is mentioned here only for completeness.
 
 ---
 
