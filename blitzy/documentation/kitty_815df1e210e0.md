@@ -238,7 +238,7 @@ $ grep -aE 'sent key as text|sent encoded key|ignoring as keyboard' cap.err | he
 - **Enter** took the **encoded** path → `sent encoded key to child: 0xd ` — i.e. a single byte `0x0d` (ASCII **CR**), printed through the `else { debug("0x%x ", …); }` branch at `kitty/keys.c:L266` because CR is non‑printable. `0xd` is the exact byte handed to the PTY for Enter under the default (legacy) keyboard mode.
 - Every **RELEASE** (and the bare modifier keys `ctrl`/`shift`, which report `glfw key: 0xe062`/`0xe061`) fell through to `ignoring as keyboard mode does not support encoding this event` (`kitty/keys.c:L271`) — nothing is sent for them.
 
-A Python‑side counterpart, `KeyboardHandler.debug_print` (`kitty/keys.py:L242-L245`, gated by `b.args.debug_keyboard`), prints additional keyboard diagnostics when the terminal is in a keyboard‑reporting mode; the simple keys here stayed on the C legacy path above.
+A Python‑side counterpart, `Mappings.debug_print` (`kitty/keys.py:L242-L245`, gated by `b.args.debug_keyboard`), prints additional keyboard diagnostics when the terminal is in a keyboard‑reporting mode; the simple keys here stayed on the C legacy path above.
 
 ### 4.4 The child round‑trip → VT parser → screen model ("before the screen updates")
 
