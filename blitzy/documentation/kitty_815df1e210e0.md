@@ -95,9 +95,8 @@ headless run used throughout this document.
 
 Dependency floors, for context (from `docs/build.rst`, `pyproject.toml`, `go.mod`):
 
-- `docs/build.rst:83` → `python >= 3.8`
-- `docs/build.rst:84` → `harfbuzz >= 2.2.0`
-- `docs/build.rst:90` → freetype; `docs/build.rst:91` → fontconfig
+- `docs/build.rst:83` requires `python >= 3.8`; `docs/build.rst:84` requires `harfbuzz >= 2.2.0` (each stated on those lines as an RST bulleted list item in double-backtick code markup)
+- `docs/build.rst:90` and `docs/build.rst:91` list `freetype` and `fontconfig` (both "not needed on macOS")
 - `pyproject.toml:2` → `requires-python = ">=3.8"`
 - `go.mod:3` → `go 1.22`
 
@@ -744,6 +743,11 @@ Re-reading each question and confirming every sub-part is addressed by content a
 - [x] **Q4d — Screen-update evidence.** §8.4: GLSL cell program (`kitty/shaders.c:217`) + buffer
   swap via `swap_window_buffers` (`kitty/glfw.c:1802`) and `glfwSwapBuffers`
   (`kitty/glfw.c:1221`) (citation correction noted and verified).
+- [x] **Q4e — Log/console messages that confirm the display system.** §8.5 gathers the
+  console evidence verbatim: the GL-context line (`kitty/gl.c:72`), `OS Window created`
+  (`kitty/glfw.c:1321`), and the `Text fonts:` block (`kitty/fonts/render.py:163`), plus the
+  computed `columns: 71`, `lines: 22` grid from `kitten @ ls` (§8.2).
+
 - [x] **Build/run preamble present with real exit codes.** §4.2 `BUILD_EXIT=0`; §4.3
   `RUN_EXIT=0`; §5 `RUN_EXIT=0`.
 - [x] **Read-only + cleanup.** All observation scripts/logs were created only under `/tmp`
