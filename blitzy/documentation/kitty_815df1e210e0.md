@@ -4,7 +4,7 @@
 
 This document answers that question **empirically**. The runtime observations below were produced by **building kitty's native extension and running it**, not by reading code alone; the few points the observation harness did not exercise are grounded in the source and are explicitly flagged as *verified-by-reading, not by running* rather than asserted as runtime facts. The relevant subsystem — the `HistoryBuf` object in `kitty/history.c` together with its embedded pager ring buffer (`pagerhist`) — was driven under a simulated high-volume burst using throwaway instrumentation scripts, and the captured console output is quoted verbatim in fenced blocks alongside the exact command that produced it. Every factual/numeric claim is tied either to a quoted output block or to a precise `file:line` citation.
 
-- **Commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`).
+- **Source commit (oracle tree):** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (source branch `kitty_815df1e210e0`). Every `file:line` citation below refers to *this* commit's source tree, which is left completely unmodified. Note that this document is delivered on a separate branch whose `HEAD` carries **documentation-only** commits stacked on top of the source commit, so `git rev-parse HEAD` on the delivery branch will report a *different* hash than `815df1e…`; that is expected and does **not** affect any citation, because a `git diff` of the delivery `HEAD` against `815df1e…` touches only this Markdown file — no oracle/source file (`kitty/history.c`, `kitty/screen.c`, headers, etc.) differs.
 - **Read-only investigation.** No existing source file was modified. The only artifact produced is this document. Observation scripts lived under `/tmp/instr` (outside the repository) and were deleted afterward; the compiled extension `kitty/fast_data_types.so` and `build/` are gitignored (`.gitignore:L1` `*.so`, `.gitignore:L14` `/build/`).
 
 The five parts of the question are answered explicitly as **OBJ-1** through **OBJ-5**, followed by a coverage pass and a list of the points that could *not* be verified by running (and are therefore flagged rather than asserted, per the exactness rule).
@@ -52,7 +52,7 @@ has num_segments attr: False (expect False)
 
 So the constructor is `HistoryBuf(ynum, xnum, [pagerhist_sz_bytes])` — **`ynum` first** (matching `PyArg_ParseTuple(args, "II|I", &ynum, &xnum, &pagerhist_sz)` at `kitty/history.c:L138`), and `num_segments` is confirmed absent from the Python object.
 
-**Observe.** Four throwaway Python scripts and one C probe were authored under `/tmp/instr` (never in the repository) and run from the repository root with `PYTHONPATH=.` so the `kitty` package resolves. They drive `HistoryBuf.push` (and, for OBJ-4, a full `Screen`) in tight loops that simulate the burst, and capture `count`, pager length/content, resident memory (`resource.getrusage(RUSAGE_SELF).ru_maxrss`), and per-push timings (`time.perf_counter_ns`). The scripts were deleted after capture, leaving the repository unchanged.
+**Observe.** Four throwaway Python scripts and one C probe were authored under `/tmp/instr` (never in the repository) and run from the repository root with `PYTHONPATH=.` so the `kitty` package resolves. They drive `HistoryBuf.push` (and, for OBJ-4, a full `Screen`) in tight loops that simulate the burst, and capture `count`, pager length/content, resident memory (`resource.getrusage(RUSAGE_SELF).ru_maxrss`), and per-push timings (`time.perf_counter_ns`). **The complete, verbatim source of all five harnesses (`sizes.c`, `obj1_obj3.py`, `obj2.py`, `obj4.py`, `obj5.py`) is reproduced in [Appendix A](#appendix-a--temporary-observation-scripts-verbatim-source)** so each producing command can be recreated exactly and every quoted output block re-derived. The scripts were deleted after capture, leaving the repository unchanged.
 
 **A note on determinism.** The OBJ-2, OBJ-4, OBJ-5 outputs and the `sizes.c` probe are **deterministic** and are quoted exactly. For OBJ-1/OBJ-3 the *segment-boundary structure* and the *shape* of the timing/memory behavior are stable and reproducible, but the exact **RSS figures and per-push nanosecond timings are environment- and run-specific**; the block quoted below is a **real captured run in this container**, presented as representative (see the "Unverifiable / environment-specific" section).
 
@@ -147,6 +147,7 @@ after 8 pushes count=5  pagerhist len=0  bytes=b''
 The answer comes from the **per-push timings** in the same `obj1_obj3.py` run quoted under OBJ-1. The relevant lines are the boundary pushes and the distribution summary:
 
 ```
+$ PYTHONPATH=. python3 /tmp/instr/obj1_obj3.py    # same run as OBJ-1; excerpt of the boundary pushes + summary
 push#  2047 count=  2048 segments=1 RSS=   28672 KB dt=     310 ns   <- last push before a new segment
 push#  2048 count=  2049 segments=2 RSS=   28672 KB dt=   13997 ns   <- carves segment 2
 push#  4096 count=  4097 segments=3 RSS=   40960 KB dt=   19937 ns   <- carves segment 3
@@ -275,5 +276,250 @@ PYTHONPATH=. python3 /tmp/instr/obj4.py         # OBJ-4 concurrent scroll
 PYTHONPATH=. python3 /tmp/instr/obj5.py         # OBJ-5 wrapping/retention
 ```
 
-All observation scripts lived under `/tmp/instr` (outside the repository) and were removed after capture; `kitty/fast_data_types.so` and `build/` are gitignored, leaving the source tree unchanged.
+All observation scripts lived under `/tmp/instr` (outside the repository) and were removed after capture; `kitty/fast_data_types.so` and `build/` are gitignored, leaving the source tree unchanged. **The full verbatim source of each script is embedded in [Appendix A](#appendix-a--temporary-observation-scripts-verbatim-source) below**, so the harness can be recreated exactly (`mkdir -p /tmp/instr`, paste each file, then run the commands above).
+
+
+---
+
+## Appendix A — Temporary observation scripts (verbatim source)
+
+The throwaway harnesses referenced throughout this document are reproduced here **verbatim**, so that every producing command can be recreated and each quoted output block re-derived. To reproduce: build the extension (see [Methodology](#methodology-build--run-first-then-write)), then `mkdir -p /tmp/instr`, save each file below at the path shown in its heading, and run the commands from the repository root with `PYTHONPATH=.`. These files existed only under `/tmp/instr` (outside the repository) and were deleted after capture — none of them is committed to the source tree.
+
+The four Python scripts import `kitty.fast_data_types` (built as `kitty/fast_data_types.so`). `obj4.py` additionally reuses the `Callbacks` (`kitty_tests/__init__.py:L39`) and `parse_bytes` (`kitty_tests/__init__.py:L30`) helpers from the test package, and `obj5.py` reuses the `create_lbuf` construction pattern from `kitty_tests/datatypes.py:L29`.
+
+> **Determinism note (repeated from Methodology).** `sizes.c`, `obj2.py`, `obj4.py`, and `obj5.py` are deterministic: re-running them reproduces their quoted output blocks byte-for-byte. `obj1_obj3.py` reproduces the same *structure* (count pinning at `ynum`; segment boundaries at 2048/4096/6144/8192; ~12–13 MB RSS steps; boundary pushes several× the median with rarer off-boundary spikes), but its absolute RSS figures and per-push nanosecond timings are environment- and run-specific, so a fresh run will print different absolute numbers than the representative block quoted under OBJ-1/OBJ-3 (see the [Unverifiable / environment-specific](#unverifiable-by-running--environment-specific-flagged-not-asserted) section).
+
+### `/tmp/instr/sizes.c` — exact allocation math (OBJ-1)
+
+Producing command: `gcc -I kitty $(python3-config --includes) /tmp/instr/sizes.c -o /tmp/instr/sizes && /tmp/instr/sizes` — output quoted under [OBJ-1](#obj-1--fill-stretch-and-carving-new-segments).
+
+```c
+// Measures the exact byte sizes of the cell/attr structs and the resulting
+// per-segment allocation used by add_segment() in kitty/history.c.
+// Compile: gcc -I kitty $(python3-config --includes) /tmp/instr/sizes.c -o /tmp/instr/sizes
+#include <stdio.h>
+#include "data-types.h"
+
+// Mirror the compile-time constant from kitty/history.c:L15
+#define SEGMENT_SIZE 2048
+
+int main(void) {
+    const size_t xnum = 200;  // representative wide terminal
+    printf("sizeof(CPUCell)=%zu\n", sizeof(CPUCell));
+    printf("sizeof(GPUCell)=%zu\n", sizeof(GPUCell));
+    printf("sizeof(LineAttrs)=%zu\n", sizeof(LineAttrs));
+    // Exactly the expression calloc'd in add_segment (kitty/history.c:L25):
+    //   xnum*SEGMENT_SIZE*sizeof(CPUCell) + xnum*SEGMENT_SIZE*sizeof(GPUCell)
+    //   + SEGMENT_SIZE*sizeof(LineAttrs)
+    size_t per_segment = xnum * SEGMENT_SIZE * (sizeof(CPUCell) + sizeof(GPUCell))
+                         + SEGMENT_SIZE * sizeof(LineAttrs);
+    printf("per-segment bytes @xnum=200 = %zu (%.2f MiB)\n",
+           per_segment, per_segment / (1024.0 * 1024.0));
+    return 0;
+}
+```
+
+### `/tmp/instr/obj1_obj3.py` — fill / carve + per-push timings (OBJ-1, OBJ-3)
+
+Producing command: `PYTHONPATH=. python3 /tmp/instr/obj1_obj3.py` — output quoted under [OBJ-1](#obj-1--fill-stretch-and-carving-new-segments) and (as a timing excerpt) [OBJ-3](#obj-3--does-it-transition-smoothly-or-hesitate).
+
+```python
+# OBJ-1 (fill / "stretch" / carve new segments) and OBJ-3 (smooth vs. hesitate).
+# Build a HistoryBuf well above the default scrollback so the 2048-line segment
+# boundary is crossed several times, and push a burst while sampling count, the
+# inferred segment count, resident memory (RSS high-water mark), and per-push time.
+import math
+import resource
+import time
+from kitty.fast_data_types import HistoryBuf, LineBuf, Cursor
+
+YNUM, XNUM = 10240, 200      # 10240 == 5 * SEGMENT_SIZE(2048); well above default 2000
+N = YNUM + 10                # push a few past capacity to show count pinning + eviction
+
+
+def rss_kb():
+    # ru_maxrss is the peak resident set size in KiB on Linux (monotonic high-water mark)
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
+hb = HistoryBuf(YNUM, XNUM)
+lb = LineBuf(1, XNUM)
+c = Cursor()
+c.x = 0
+lb.line(0).set_text('x' * XNUM, 0, XNUM, c)   # a full-width line of real content
+line = lb.line(0)
+
+# Sample points: head, the first segment boundary neighbourhood, the later
+# boundaries, and the capacity/eviction tail.
+boundaries = {2047, 2048, 2049, 4096, 6144, 8192}
+show = {0, 1} | boundaries | {YNUM - 1, YNUM, YNUM + 1, YNUM + 8}
+
+rss0 = rss_kb()
+times = [0] * N
+for i in range(N):
+    t0 = time.perf_counter_ns()
+    hb.push(line)
+    dt = time.perf_counter_ns() - t0
+    times[i] = dt
+    count = hb.count
+    # num_segments is not exposed to Python; infer it analytically.
+    seg = math.ceil(min(count, YNUM) / 2048)
+    if i in show:
+        print(f"push#{i:>6} count={count:>6} segments={seg} RSS={rss_kb():>8} KB dt={dt:>8} ns")
+
+rssF = rss_kb()
+print(f"FINAL count {hb.count} ==ynum {hb.count == YNUM} RSS growth KB {rssF - rss0}")
+
+srt = sorted(times)
+mn = srt[0]
+md = srt[len(srt) // 2]
+p99 = srt[min(len(srt) - 1, int(len(srt) * 0.99))]
+mx = srt[-1]
+print(f"push-time distribution: min={mn} ns  median={md} ns  p99={p99} ns  max={mx} ns")
+slow_i = max(range(N), key=lambda k: times[k])
+print(f"slowest push at # {slow_i} = {times[slow_i]} ns")
+```
+
+### `/tmp/instr/obj2.py` — segmented storage ↔ pager ring buffer (OBJ-2)
+
+Producing command: `PYTHONPATH=. python3 /tmp/instr/obj2.py` — output quoted under [OBJ-2](#obj-2--the-quiet-interaction-segmented-storage--pager-ring-buffer).
+
+```python
+# OBJ-2: the quiet interaction between the segmented in-memory ring and the
+# pager ring buffer. Push past capacity and watch pagerhist fill only on eviction.
+import kitty.fast_data_types as f
+from kitty.fast_data_types import HistoryBuf, LineBuf, Cursor
+
+XNUM = 10
+
+
+def make_line(lb, text):
+    """Return a width-XNUM Line holding `text`, right-padded with explicit
+    spaces so the full cell width is retained by line_as_ansi (blank/NUL cells
+    would be trimmed by xlimit_for_line; explicit spaces are not)."""
+    c = Cursor()
+    c.x = 0
+    padded = text.ljust(XNUM)
+    lb.line(0).set_text(padded, 0, len(padded), c)
+    return lb.line(0)
+
+
+# ynum=5, xnum=10, and a 1 MiB pager. NB: the 3rd ctor arg is in BYTES,
+# so 1<<20 == 1,048,576 bytes (see the "Two runtime corrections" section).
+hb = HistoryBuf(5, XNUM, 1 << 20)
+lb = LineBuf(1, XNUM)
+
+print("=== Phase A: ring filling (count 1..ynum) ===")
+for i in range(5):
+    hb.push(make_line(lb, f"line{i}"))
+    print(f"push line{i}: count={hb.count}  pagerhist len={len(hb.pagerhist_as_bytes())}")
+
+print("=== Phase B: ring FULL, evictions begin ===")
+for i in range(5, 8):
+    hb.push(make_line(lb, f"line{i}"))
+    b = hb.pagerhist_as_bytes()
+    print(f"push line{i}: count={hb.count}  pagerhist len={len(b)}  bytes={b!r}")
+
+print("=== Phase C: default pager sz=0 discards ===")
+hb2 = HistoryBuf(5, XNUM)  # no third arg -> pagerhist_sz=0 -> pager disabled
+lb2 = LineBuf(1, XNUM)
+for i in range(8):
+    hb2.push(make_line(lb2, f"line{i}"))
+b = hb2.pagerhist_as_bytes()
+print(f"after 8 pushes count={hb2.count}  pagerhist len={len(b)}  bytes={b!r}")
+```
+
+### `/tmp/instr/obj4.py` — concurrent scroll while ingesting (OBJ-4)
+
+Producing command: `PYTHONPATH=. python3 /tmp/instr/obj4.py` — output quoted under [OBJ-4](#obj-4--scrolling-through-old-output-while-new-data-floods-in).
+
+```python
+# OBJ-4: scrolling through old output while new data floods in.
+# scrolled_by is a Screen-layer viewport index; HistoryBuf.count is storage.
+# They are independent: ingestion keeps advancing count while the user is parked.
+from kitty.fast_data_types import Screen
+from kitty_tests import Callbacks, parse_bytes
+
+LINES, COLS, SCROLLBACK = 5, 20, 1000
+
+
+def make_screen():
+    c = Callbacks()
+    # Screen(callbacks, lines, columns, scrollback, cell_w, cell_h, 0, callbacks)
+    return Screen(c, LINES, COLS, SCROLLBACK, 10, 20, 0, c)
+
+
+def feed(s, start, n):
+    """Feed n newline-terminated rows 'row{start}'..'row{start+n-1}'."""
+    data = ''.join(f'row{i}\r\n' for i in range(start, start + n)).encode()
+    parse_bytes(s, data)
+
+
+def newest(s):
+    hb = s.historybuf
+    return str(hb.line(0)) if hb.count else None
+
+
+L = 42  # label field width
+s = make_screen()
+print(f"{'initial:'.ljust(L)}scrolled_by={s.scrolled_by}  historybuf.count={s.historybuf.count}")
+
+feed(s, 0, 40)
+print(f"{'after burst-1 (40 lines):'.ljust(L)}scrolled_by={s.scrolled_by}  count={s.historybuf.count}  newest_in_hist={newest(s)!r}")
+
+s.scroll(10, True)   # scroll up 10 lines
+print(f"{'user scrolls up 10 (scroll(10,True)):'.ljust(L)}scrolled_by={s.scrolled_by}  count={s.historybuf.count}  (count UNCHANGED by scrolling)")
+
+feed(s, 40, 30)      # 30 more rows arrive WHILE the user is scrolled up
+print(f"{'after burst-2 (30 lines) WHILE scrolled:'.ljust(L)}scrolled_by={s.scrolled_by}  count={s.historybuf.count}  newest_in_hist={newest(s)!r}")
+
+s.scroll(10000, False)  # scroll back down to the bottom (clamped)
+print(f"{'after scroll to bottom:'.ljust(L)}scrolled_by={s.scrolled_by}  count={s.historybuf.count}")
+```
+
+### `/tmp/instr/obj5.py` — allocation, wrapping, retention (OBJ-5)
+
+Producing command: `PYTHONPATH=. python3 /tmp/instr/obj5.py` — output quoted under [OBJ-5](#obj-5--how-allocation-wrapping-and-retention-really-behave).
+
+```python
+# OBJ-5: how allocation, wrapping (continuation lines), and retention behave.
+# 'AAAAAAAA' exactly fills width 8, so it is marked continued (wrapped) into
+# 'bbb'; 'CCCCCCCC' is a separate plain line.
+from kitty.fast_data_types import LineBuf, HistoryBuf, Cursor
+
+
+def create_lbuf(*lines):
+    """Same construction pattern as kitty_tests/datatypes.py:create_lbuf."""
+    maxw = max(map(len, lines))
+    ans = LineBuf(len(lines), maxw)
+    for i, l0 in enumerate(lines):
+        ans.line(i).set_text(l0, 0, len(l0), Cursor())
+        if i > 0:
+            # line i continues line i-1 iff the previous line fully filled the width
+            ans.set_continued(i, len(lines[i - 1]) == maxw)
+    return ans
+
+
+lb = create_lbuf('AAAAAAAA', 'bbb', 'CCCCCCCC')
+print('LineBuf.is_continued:', [lb.is_continued(i) for i in range(lb.ynum)])
+
+# Retention: push all three (fits: ynum=3), collect as_ansi pieces oldest->newest
+hb = HistoryBuf(3, 8)
+for i in range(lb.ynum):
+    hb.push(lb.line(i))
+pieces = []
+hb.as_ansi(pieces.append)
+print('HistoryBuf.as_ansi pieces:', pieces)
+print('concatenated:', repr(''.join(pieces)))
+
+# Reverse indexing: line(0) is the newest line in the buffer
+print('stored round-trip (reverse index, 0=newest):',
+      [str(hb.line(i)) for i in range(hb.count)])
+
+# Eviction into a pager: push a wrapped line then a plain line past capacity
+hb2 = HistoryBuf(1, 8, 1 << 20)
+for i in range(lb.ynum):
+    hb2.push(lb.line(i))
+print('pager eviction of wrapped+plain:', hb2.pagerhist_as_bytes())
+```
 
