@@ -8,21 +8,49 @@ It is an **evidence-backed investigation**: every behavioral claim below is pair
 
 ## Critical context an onboarding reader must know first
 
-**1. The SSH-kitten runtime is Go, not Python.** All of the mechanisms discussed here live in `kittens/ssh/main.go`. The Python module `kittens/ssh/main.py` and `kittens/ssh/utils.py` hold **only option/config definitions** — they contain no part of the runtime session-setup pipeline. The Go file is the driver; `kittens/ssh/main.go` imports the generated `kitty` constants package at `[kittens/ssh/main.go:15]` and is what actually assembles the tarball, writes the shared-memory object, generates and encodes the bootstrap script, and spawns `ssh`.
+**1. The SSH-kitten pipeline spans THREE runtime actors — only the local *client driver* is pure Go, and `utils.py` is NOT option-only.** A common onboarding trap is "the SSH kitten is all Go." In fact the mechanisms are split across three processes, and one of them is Python running *inside the kitty terminal*:
 
-The two file sizes make the split concrete:
+- **The local kitten *driver* (Go, `kittens/ssh/main.go`)** — the client that runs when you type `kitty +kitten ssh host`. It assembles the tarball, writes the shared-memory object, generates and encodes the bootstrap script, and spawns `ssh`. It imports the generated `kitty` constants package at `[kittens/ssh/main.go:15]`.
+- **The kitty *terminal* (Python) — the DCS data responder.** When the remote side (or the driver) asks kitty for the setup data over the tty, kitty's VT parser dispatches the `ssh|` DCS message to `handle_remote_ssh`, which calls `get_ssh_data` **in `kittens/ssh/utils.py`**. So `kittens/ssh/utils.py` contains terminal-side *runtime*, not just options: it reads the shared-memory object (Python `read_data_from_shared_memory`), validates the password and request id, and streams the tarball back over the tty.
+- **The remote *bootstrap* (POSIX shell / Python, `shell-integration/ssh/bootstrap.sh` or `.py`)** — runs on the remote host, reads the streamed data over the tty, unpacks it, compiles terminfo, and re-execs the login shell.
+
+`kittens/ssh/utils.py` therefore holds the terminal-side SSH runtime helpers — `create_shared_memory`, `read_data_from_shared_memory`, and `get_ssh_data` — proven by their definitions:
 
 ```bash
-wc -c kittens/ssh/main.go kittens/ssh/main.py
+grep -n 'def create_shared_memory\|def read_data_from_shared_memory\|def get_ssh_data' kittens/ssh/utils.py
 ```
 
 ```
-27308 kittens/ssh/main.go
-10345 kittens/ssh/main.py
-37653 total
+87:def create_shared_memory(data: Any, prefix: str) -> str:
+100:def read_data_from_shared_memory(shm_name: str) -> Any:
+115:def get_ssh_data(msgb: memoryview, request_id: str) -> Iterator[bytes]:
 ```
 
-The larger Go file is the runtime; the smaller Python file is options only.
+The terminal wires that handler in: `handle_remote_ssh` imports and drives `get_ssh_data` `[kitty/window.py:1289-1291]`, and the `ssh|` DCS is registered in C at `[kitty/vt-parser.c:608]`:
+
+```bash
+sed -n '1289,1291p' kitty/window.py; sed -n '608p' kitty/vt-parser.c
+```
+
+```
+    def handle_remote_ssh(self, msg: memoryview) -> None:
+        from kittens.ssh.utils import get_ssh_data
+        for line in get_ssh_data(msg, f'{os.getpid()}-{self.id}'):
+    dispatch("ssh|", handle_remote_ssh, 0)
+```
+
+Only **`kittens/ssh/main.py`** is genuinely option/config-only: its `main()` merely raises, and it exists to expose `option_text`/`definition` to the config hooks:
+
+```bash
+sed -n '224,225p' kittens/ssh/main.py
+```
+
+```
+def main(args: List[str]) -> Optional[str]:
+    raise SystemExit('This should be run as kitten ssh')
+```
+
+The Go driver is still the largest single piece and does all the local packing/encoding/spawning work — `kittens/ssh/main.go` is 27308 bytes vs 10345 for `main.py` — but the credential read-back and tarball streaming happen in the kitty terminal's Python (`utils.py`, 12003 bytes), not in Go and not on the remote (see Q1/Q8/Q9).
 
 **2. The Go kitten cannot be built from a bare checkout.** It requires two build-time-generated artifacts:
 
@@ -51,18 +79,33 @@ Python 3.13.7
 
 ### EV0 — a bare checkout does not build (proves the generation prerequisite)
 
-With the two generated artifacts temporarily absent (they are git-ignored, so this simulates a bare checkout):
+The two artifacts are **git-ignored generated files**, so the *committed* tree does not contain them. To observe the failure safely and **read-only** — without disturbing the warmed working tree that the rest of the evidence uses — export the committed tree with `git archive` into a throwaway directory **outside** the repository and build there:
 
 ```bash
-go build ./kittens/ssh/
+git archive HEAD | tar -x -C /tmp/blitzy_bare_checkout    # committed tree only; the generated files are git-ignored, so absent
+cd /tmp/blitzy_bare_checkout
+go build ./kittens/ssh/ ; echo "exit=$?"
 ```
 
 ```
 kittens/ssh/main.go:15:2: package kitty is not in std (/usr/local/go/src/kitty)
 tools/tui/shell_integration/data.go:19:12: pattern data_generated.bin: no matching files found
+exit=1
 ```
 
-The command exits non-zero. The first line is the missing generated `kitty` constants package; the second is the missing `//go:embed data_generated.bin`. Both are created by `python setup.py build`.
+The build exits `1`. The first line is the missing generated `kitty` constants package (imported at `[kittens/ssh/main.go:15]`); the second is the missing `//go:embed data_generated.bin` (`[tools/tui/shell_integration/data.go:19]`). Both are created by `python setup.py build`.
+
+**Contrast — this is specifically a *bare-checkout* result, not the warmed tree.** In the built/warmed tree used for EV1–EV9 (where `setup.py build` has already generated `constants_generated.go` and `data_generated.bin`), the identical command **succeeds**:
+
+```bash
+go build ./kittens/ssh/ ; echo "exit=$?"
+```
+
+```
+exit=0
+```
+
+So a plain `go build ./kittens/ssh/` fails **only** on a checkout that lacks the generated files; once the artifacts exist it builds cleanly. EV0 reproduces the bare state deliberately, via the throwaway `git archive` copy above.
 
 ### EV1 — after generation, the SSH-kitten test suite passes
 
@@ -103,7 +146,143 @@ grep -nE 'VersionString|SSHControlMasterTemplate|DefaultTermName' constants_gene
 
 ### EV3–EV8 — deeper artifacts via an in-package observation harness
 
-EV3–EV8 were captured with a **temporary** Go test file placed in `kittens/ssh/` (in `package ssh`, so it can call the unexported functions), then run with `go test` and **removed afterward** — the repository is left byte-for-byte unchanged (`git status --porcelain` is empty). The harness called `connection_sharing_args`, `get_remote_command`, `bootstrap_script` (with `dont_create_shm=false`), `make_tarfile`, `read_data_from_shared_memory`, and `tui.DCSToKitty`, printing the values quoted in the per-question sections below. Each capture is shown next to the claim it supports.
+EV3–EV8 were captured with a **temporary** Go test file placed in `kittens/ssh/` (in `package ssh`, so it can call the unexported functions), then run with `go test` and **removed afterward** — the repository is left byte-for-byte unchanged (`git status --porcelain` is empty). To make every EV3–EV8 capture fully reproducible, the exact harness source is reproduced verbatim here; re-create it at `kittens/ssh/blitzy_adhoc_test_observe_test.go`, run the command below, then delete it:
+
+```go
+// TEMPORARY observation harness — placed in kittens/ssh/ (package ssh) so it can
+// call the unexported functions, run with `go test`, then removed.
+package ssh
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+
+	"kitty/tools/tui"
+)
+
+func TestBlitzyObserveEV3(t *testing.T) {
+	args, err := connection_sharing_args(424242)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("EV3>>>", strings.Join(args, " "))
+}
+
+func TestBlitzyObserveEV4(t *testing.T) {
+	cd := basic_connection_data()
+	if err := get_remote_command(cd); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("EV4>>> script_type:", cd.script_type)
+	total := 0
+	for _, x := range cd.rcmd {
+		total += len(x)
+	}
+	fmt.Printf("EV4>>> rcmd: %d elems, %d bytes total\n", len(cd.rcmd), total)
+	fmt.Printf("EV4>>> rcmd[0..3]: %q %q %q %q\n", cd.rcmd[0], cd.rcmd[1], cd.rcmd[2], cd.rcmd[3])
+	enc := cd.rcmd[4]
+	if len(enc) > 60 {
+		enc = enc[:60]
+	}
+	fmt.Printf("EV4>>> encoded_script prefix: %q\n", enc)
+	for _, line := range strings.Split(cd.bootstrap_script, "\n") {
+		ls := strings.TrimSpace(line)
+		if strings.HasPrefix(ls, "request_data=") || strings.HasPrefix(ls, "dcs_to_kitty \"ssh\"") {
+			fmt.Printf("EV4>>> bootstrap line: %s\n", ls)
+		}
+	}
+}
+
+func TestBlitzyObserveEV5(t *testing.T) {
+	cd := basic_connection_data("interpreter=python3")
+	if err := get_remote_command(cd); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("EV5>>> script_type:", cd.script_type)
+	fmt.Printf("EV5>>> rcmd[0..2]: %q %q %q\n", cd.rcmd[0], cd.rcmd[1], cd.rcmd[2])
+	fmt.Printf("EV5>>> unwrap: %s\n", cd.rcmd[3])
+	enc := cd.rcmd[4]
+	if len(enc) > 28 {
+		enc = enc[:28]
+	}
+	fmt.Println("EV5>>> encoded prefix:", enc)
+}
+
+func TestBlitzyObserveEV6(t *testing.T) {
+	cd := basic_connection_data()
+	cd.dont_create_shm = false
+	if err := bootstrap_script(cd); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("EV6>>> shm_name:", cd.shm_name)
+	fsname := data_shm.FileSystemName()
+	if st, err := os.Stat(fsname); err == nil {
+		fmt.Printf("EV6>>> stat %s -> %s mode=0%o\n", fsname, st.Mode().String(), st.Mode().Perm())
+	} else {
+		fmt.Printf("EV6>>> stat err: %s\n", err)
+	}
+	d1, err1 := read_data_from_shared_memory(cd.shm_name)
+	fmt.Printf("EV6>>> read #1: ok=%v bytes=%d\n", err1 == nil, len(d1))
+	_, err2 := read_data_from_shared_memory(cd.shm_name)
+	fmt.Printf("EV6>>> read #2 (after unlink): err=%v\n", err2)
+}
+
+func TestBlitzyObserveEV7(t *testing.T) {
+	cd := basic_connection_data()
+	data, err := make_tarfile(cd, os.LookupEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("EV7>>> gzip size: %d bytes\n", len(data))
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gr)
+	n := 0
+	var lines []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+		lines = append(lines, fmt.Sprintf("  %s (%d bytes, mode 0%o)", hdr.Name, hdr.Size, hdr.Mode))
+	}
+	sort.Strings(lines) // stable ordering: make_tarfile iterates a map, so raw order varies
+	fmt.Printf("EV7>>> %d entries\n", n)
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+}
+
+func TestBlitzyObserveEV8(t *testing.T) {
+	dcs, err := tui.DCSToKitty("ssh", "id=testing:pwfile=/kssh-123-abc:pw=deadbeefcafe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("EV8>>> %q\n", dcs)
+}
+```
+
+Run all six at once (the single run that produced every EV3–EV8 quote below), then remove the file:
+
+```bash
+go test -run TestBlitzyObserveEV -v -count=1 ./kittens/ssh/
+rm kittens/ssh/blitzy_adhoc_test_observe_test.go   # leave the repo unchanged
+```
+
+Each per-question section below quotes the relevant `EVn>>>` line(s) from that single run; the `# temporary harness` comment on the per-section commands refers to exactly this file.
 
 > Note on dynamic values: process id, the random shared-memory suffix, and exact byte counts differ per run. The values quoted below are from **this** run; the literals and structure are stable. My Go toolchain is `go1.22.12` (any `1.22.x` satisfies `go 1.22` in `[go.mod:3]`).
 
@@ -111,34 +290,35 @@ EV3–EV8 were captured with a **temporary** Go test file placed in `kittens/ssh
 
 ## Q1 — Shared-memory credential passing
 
-**Mechanism.** Rather than putting the per-session password and the shell-integration payload on the `ssh` command line or in the environment (both observable by other processes), the kitten mints a random password, packs it with the tarball into a JSON blob, and writes that blob into a POSIX shared-memory object created with owner-only permissions. Only the object's *name* travels to the remote side; the remote reads the object once and it is then unlinked.
+**Mechanism.** The large setup payload (the shell-integration tarball plus a per-session password) must reach the remote side without ever sitting on the `ssh` command line or in the environment, where another local process could read it via `/proc`. The kitten's answer: the **Go driver writes the payload into a LOCAL POSIX shared-memory object** (`0600`) on the machine running kitty. Crucially, **it is not the remote that reads this object** — the remote never touches `/dev/shm`. Instead, the shm object *name* (`pwfile`), a one-time password (`pw`), and a request id (`id`) are handed to the **kitty terminal's own Python DCS handler**, which reads the local shm, validates `pw`/`id`, and streams the tarball to the remote over the controlling tty. The remote receives the tarball as base64 bytes over the tty (see Q3/Q9), not from shared memory.
 
-**Code trace.** In `bootstrap_script` `[kittens/ssh/main.go:422]`:
+**Code trace — the local Go write (`bootstrap_script` `[kittens/ssh/main.go:422]`).**
 
 - A per-session token is minted with `pw, err := secrets.TokenHex()` `[kittens/ssh/main.go:431]`.
 - The payload is assembled `[kittens/ssh/main.go:439-442]` as `data := map[string]string{ "tarfile": base64.StdEncoding.EncodeToString(tfd), "pw": pw, "hostname": cd.hostname_for_match, "username": cd.username }` (the tarball is base64-encoded at `[kittens/ssh/main.go:440]`).
 - It is serialized with `json.Marshal(data)` `[kittens/ssh/main.go:444]`.
-- The shared-memory object is created with `data_shm, err = shm.CreateTemp(fmt.Sprintf("kssh-%d-", os.Getpid()), uint64(len(encoded_data)+8))` `[kittens/ssh/main.go:446]` — note the `kssh-<pid>-` name prefix and the `+8` slack (the writer prepends a 4-byte size; `NUM_BYTES_FOR_SIZE = 4` at `[tools/utils/shm/shm.go:116]`).
+- The shared-memory object is created **locally** with `data_shm, err = shm.CreateTemp(fmt.Sprintf("kssh-%d-", os.Getpid()), uint64(len(encoded_data)+8))` `[kittens/ssh/main.go:446]` — note the `kssh-<pid>-` name prefix and the `+8` slack (the writer prepends a 4-byte size; `NUM_BYTES_FOR_SIZE = 4` at `[tools/utils/shm/shm.go:116]`).
 - The bytes are written with `shm.WriteWithSize(data_shm, encoded_data, 0)` `[kittens/ssh/main.go:448]`, which writes a 4-byte big-endian length prefix then the data (`WriteWithSize` at `[tools/utils/shm/shm.go:120]`).
 - The object name is recorded (along with the password and request id) in `sensitive_data := map[string]string{"REQUEST_ID": cd.request_id, "DATA_PASSWORD": pw, "PASSWORD_FILENAME": cd.shm_name}` `[kittens/ssh/main.go:460]`.
-- Read-back on the receiving path is `read_data_from_shared_memory` `[kittens/ssh/main.go:72]`, which delegates to `shm.ReadWithSizeAndUnlink`.
 
-**Observed evidence.** Driving `bootstrap_script` with `dont_create_shm=false` and inspecting the object:
+**Code trace — the read-back is the kitty TERMINAL's Python (not Go, not the remote).** The SSH-session read side is `get_ssh_data` in `kittens/ssh/utils.py` `[kittens/ssh/utils.py:115]`, invoked by the terminal's `handle_remote_ssh` `[kitty/window.py:1289-1291]` when the `ssh|` DCS arrives (registered at `[kitty/vt-parser.c:608]`). `get_ssh_data` reads the local shm via the Python `read_data_from_shared_memory` `[kittens/ssh/utils.py:129]` → `[kittens/ssh/utils.py:100-112]`, then validates `if pw != env_data['pw']` `[kittens/ssh/utils.py:130]` and the request id `[kittens/ssh/utils.py:132]` before streaming the tarball. The Go `read_data_from_shared_memory` at `[kittens/ssh/main.go:72]` is a **different** consumer: it backs `add_cloned_env` `[kittens/ssh/main.go:88]` for the `clone_env` feature `[kittens/ssh/main.go:104-105]`, and is not the SSH-session data responder.
+
+**Observed evidence — the Go write and the shm object's on-disk properties.** EV6 drives `bootstrap_script` with `dont_create_shm=false` (so the Go side really creates the object), then probes it with the shm primitive's read-once reader to expose its permissions and unlink-after-read behavior — the Python `read_data_from_shared_memory` enforces the identical `0600`/owner/unlink semantics (see Q8). The exact temporary harness that produced this is reproduced in the **EV3–EV8** section above:
 
 ```bash
-go test -run TestBlitzyObserveEV6 -v ./kittens/ssh/     # temporary harness, since removed
+go test -run TestBlitzyObserveEV6 -v -count=1 ./kittens/ssh/
 ```
 
 ```
-EV6>>> shm_name: kssh-40398-FZFPPIJG726JE
-EV6>>> stat /dev/shm/kssh-40398-FZFPPIJG726JE -> -rw------- mode=0600
-EV6>>> read #1: ok=true bytes=32179
-EV6>>> read #2 (after unlink): err=open /dev/shm/kssh-40398-FZFPPIJG726JE: no such file or directory
+EV6>>> shm_name: kssh-76516-P2JEYRPV44LWU
+EV6>>> stat /dev/shm/kssh-76516-P2JEYRPV44LWU -> -rw------- mode=0600
+EV6>>> read #1: ok=true bytes=31575
+EV6>>> read #2 (after unlink): err=open /dev/shm/kssh-76516-P2JEYRPV44LWU: no such file or directory
 ```
 
-The object name carries the `kssh-<pid>-` prefix from `[kittens/ssh/main.go:446]` (`kssh-40398-…`, pid 40398 this run). The first read returns the 32179-byte JSON payload; the second read fails because the object was unlinked after the first read (the read-once behavior detailed in Q8).
+The object name carries the `kssh-<pid>-` prefix from `[kittens/ssh/main.go:446]` (`kssh-76516-…`, pid 76516 this run). The first read returns the 31575-byte JSON payload; the second read fails because the object was unlinked after the first read (the read-once behavior detailed in Q8). The pid, the random suffix, and the exact byte count vary per run.
 
-**Rationale.** The credential (`pw`) and the whole tarball never appear in `argv` or the environment — only the shm object *name* is later transmitted (over the tty, see Q9). Because the object is owner-only (`0600`) and read-once, the exposure window for the secret is minimized.
+**Rationale.** The **tarball payload never appears in `argv` or the environment** — it lives only in the local shm object and is streamed over the tty *after* the kitty terminal validates the password and request id. What *does* travel over the DCS/bootstrap path is the small authorization triple — the request id (`id`), the shm object *name* (`pwfile`), and the one-time password (`pw`) — not the payload itself. So it is **not** accurate to say "only the object name travels": the one-time token and path travel too (over the tty as a DCS message, or embedded in the bootstrap script — see Q3/Q9 and the two modes in Q5/Q7). Because the object is owner-only (`0600`), read-once, and the password is single-use, the exposure window for the payload is minimized even though the name and one-time token do travel.
 
 ---
 
@@ -174,7 +354,7 @@ The template's `request_data="REQUEST_DATA"` `[shell-integration/ssh/bootstrap.s
 
 ## Q3 — Archive build and transport
 
-**Mechanism.** All the files the remote side needs — the environment script, the remote-staging utilities, the shell-integration files for every supported shell, the `kitty`/`kitten` wrapper binaries, and the terminfo entries — are packed into a single **gzip-compressed PAX tar** archive. That archive is base64-encoded into the JSON payload (shared memory, Q1) and/or streamed over the tty framed by explicit start/end markers; the remote extracts it with `tar`.
+**Mechanism.** All the files the remote side needs — the environment script, the remote-staging utilities, the shell-integration files for every supported shell, the `kitty`/`kitten` wrapper binaries, and the terminfo entries — are packed into a single **gzip-compressed PAX tar** archive. That archive is base64-encoded as the `tarfile` field of the JSON payload written to the **local** shared-memory object (Q1). When the terminal answers the setup-data DCS request, kitty's Python `get_ssh_data` reads that object and **streams the base64 tarball down the tty to the remote child**, framed by explicit markers in the order `KITTY_DATA_START` → `OK` → base64 lines → `KITTY_DATA_END`; the remote decodes and extracts it with `tar`. (The remote never opens `/dev/shm` — it only reads bytes off the tty; see Q1/Q9.)
 
 **Code trace.** `make_tarfile` `[kittens/ssh/main.go:255]`:
 
@@ -184,7 +364,7 @@ The template's `request_data="REQUEST_DATA"` `[shell-integration/ssh/bootstrap.s
 - The Go standard-library packages used are `archive/tar` `[kittens/ssh/main.go:6]`, `compress/gzip` `[kittens/ssh/main.go:8]`, `encoding/base64` `[kittens/ssh/main.go:9]`, and `encoding/json` `[kittens/ssh/main.go:10]`.
 - Payload encoding: the whole tarball is base64-encoded with `base64.StdEncoding.EncodeToString(tfd)` `[kittens/ssh/main.go:440]` (the `"tarfile"` field of the JSON in Q1).
 
-Transport (remote side, `shell-integration/ssh/bootstrap.sh`): bulk data is framed by `KITTY_DATA_START` `[shell-integration/ssh/bootstrap.sh:144]` … data … `KITTY_DATA_END` `[shell-integration/ssh/bootstrap.sh:99]`, terminated by an `OK` marker `[shell-integration/ssh/bootstrap.sh:141]`. Extraction is `read_base64_from_tty | base64_decode | command tar "xpzf" "-" "-C" "$tdir"` `[shell-integration/ssh/bootstrap.sh:113]` — the `z` in `xpzf` is gzip decompression, matching `gzip.NewWriterLevel` on the sending side.
+**Transport — who writes, who reads, and in what order.** The **writer is the kitty terminal's Python `get_ssh_data`** `[kittens/ssh/utils.py:115]` — *not* the remote script. It yields, in strict order: `KITTY_DATA_START` `[kittens/ssh/utils.py:117]`; then, only after reading the local shm and validating `pw`/`id`, `OK` `[kittens/ssh/utils.py:138]`; then the base64 tarball in 254-byte lines (`line_sz = 254` `[kittens/ssh/utils.py:143]`, loop `[kittens/ssh/utils.py:144-147]`); then `KITTY_DATA_END` `[kittens/ssh/utils.py:148]`. The **remote reader** consumes exactly that order: `get_data` first waits for `KITTY_DATA_START` `[shell-integration/ssh/bootstrap.sh:144]` and then `OK` `[shell-integration/ssh/bootstrap.sh:141]` `[shell-integration/ssh/bootstrap.sh:137-152]`, then `untar_and_read_env` `[shell-integration/ssh/bootstrap.sh:104]` calls `read_base64_from_tty`, which reads base64 lines until the `KITTY_DATA_END` sentinel `[shell-integration/ssh/bootstrap.sh:99]` `[shell-integration/ssh/bootstrap.sh:97-102]`. The Python bootstrap variant does the same in `iter_base64_data` `[shell-integration/ssh/bootstrap.py:172-190]` — `KITTY_DATA_START` `[shell-integration/ssh/bootstrap.py:178]`, `OK` `[shell-integration/ssh/bootstrap.py:183]`, `KITTY_DATA_END` `[shell-integration/ssh/bootstrap.py:188]`. Extraction is `read_base64_from_tty | base64_decode | command tar "xpzf" "-" "-C" "$tdir"` `[shell-integration/ssh/bootstrap.sh:113]` — the `z` in `xpzf` is gzip decompression, matching `gzip.NewWriterLevel` on the sending side. So the correct framing is **`KITTY_DATA_START` → `OK` → base64 tar lines → `KITTY_DATA_END`**: `OK` appears *after* `KITTY_DATA_START` as the terminal's validation-passed signal, not as a trailing terminator.
 
 **Observed evidence.** Building the tarball with `make_tarfile` and listing its entries:
 
@@ -193,26 +373,26 @@ go test -run TestBlitzyObserveEV7 -v ./kittens/ssh/     # temporary harness, sin
 ```
 
 ```
-EV7>>> gzip size: 24034 bytes
+EV7>>> gzip size: 23599 bytes
 EV7>>> 15 entries
-  data.sh (195 bytes, mode 0644)
   bootstrap-utils.sh (8468 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/bash/kitty.bash (17363 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/kitten.fish (286 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish (10409 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/kitty.fish (285 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/zsh/completions/_kitty (280 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/zsh/.zshenv (1880 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/clone-in-kitty.fish (294 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/shell-integration/zsh/kitty-integration (22557 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/kitty/version (6 bytes, mode 0644)
-  home/.local/share/kitty-ssh-kitten/kitty/bin/kitty (4377 bytes, mode 0755)
+  data.sh (195 bytes, mode 0644)
   home/.local/share/kitty-ssh-kitten/kitty/bin/kitten (2761 bytes, mode 0755)
+  home/.local/share/kitty-ssh-kitten/kitty/bin/kitty (4377 bytes, mode 0755)
+  home/.local/share/kitty-ssh-kitten/kitty/version (6 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/bash/kitty.bash (17363 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/clone-in-kitty.fish (294 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/kitten.fish (286 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/kitty.fish (285 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish (10409 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/zsh/.zshenv (1880 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/zsh/completions/_kitty (280 bytes, mode 0644)
+  home/.local/share/kitty-ssh-kitten/shell-integration/zsh/kitty-integration (22557 bytes, mode 0644)
   home/.terminfo/kitty.terminfo (4271 bytes, mode 0644)
   home/.terminfo/x/xterm-kitty (3711 bytes, mode 0644)
 ```
 
-The listing shows, in one archive: `data.sh` (195 bytes), `bootstrap-utils.sh` (8468 bytes) — present because `script_type=="sh"` this run — the **bash** (`kitty.bash`, 17363 bytes), **zsh** (`kitty-integration`, 22557 bytes), and **fish** (`kitty-shell-integration.fish`, plus completions) integration files, the `kitty`/`kitten` wrappers (mode `0755`) plus a 6-byte `version`, and the two terminfo entries (`kitty.terminfo`, and `x/xterm-kitty` — the `DefaultTermName` from EV2). The gzip stream is 24034 bytes this run; that total varies run-to-run because the PAX headers embed timestamps, while the per-entry sizes above are stable.
+(The 15 entries are printed in sorted order because the harness calls `sort.Strings(lines)` — `make_tarfile` iterates a map, so the raw emission order is not stable.) The listing shows, in one archive: `data.sh` (195 bytes), `bootstrap-utils.sh` (8468 bytes) — present because `script_type=="sh"` this run — the **bash** (`kitty.bash`, 17363 bytes), **zsh** (`kitty-integration`, 22557 bytes), and **fish** (`kitty-shell-integration.fish`, plus completions) integration files, the `kitty`/`kitten` wrappers (mode `0755`) plus a 6-byte `version`, and the two terminfo entries (`kitty.terminfo`, and `x/xterm-kitty` — the `DefaultTermName` from EV2). The gzip stream is 23599 bytes this run; that total varies run-to-run because the PAX headers embed timestamps, while the per-entry sizes above are stable.
 
 **Rationale.** A single compressed archive means one round-trip of bulk data instead of many, and PAX format preserves long paths, exact modes (note the `0755` executables), and timestamps. gzip at best-compression keeps the on-wire size small (~24 KB for ~110 KB of files).
 
@@ -262,7 +442,7 @@ go test -run 'TestSSHBootstrapScriptLimit|TestSSHTarfile' -v ./kittens/ssh/
 
 ## Q5 — Connection reuse decision (SSH `ControlMaster` / connection sharing / control path)
 
-**Mechanism.** The kitten uses OpenSSH connection multiplexing. It always emits the control-socket options; then, if connection sharing is enabled *and* a master connection is already alive, it skips the expensive out-of-band data request and simply piggybacks on the existing master.
+**Mechanism.** The kitten uses OpenSSH connection multiplexing. It emits the control-socket options **only when connection sharing is enabled** — in `run_ssh` the control-master args are built and inserted into the `ssh` command line inside `if host_opts.Share_connections { … cmd = slices.Insert(cmd, insertion_point, control_master_args...) }` `[kittens/ssh/main.go:637-646]`. Then, if a master connection is already alive, it skips the expensive out-of-band data request and simply piggybacks on the existing master. (When `Share_connections` is disabled, no control-master options are emitted at all.)
 
 **Code trace.** `connection_sharing_args(kitty_pid int)` `[kittens/ssh/main.go:121]` emits:
 
@@ -312,12 +492,12 @@ The emitted `ControlPath` is `…/kssh-424242-%C`: the `{kitty_pid}` slot became
 - **POSIX-shell path** (covers **sh / bash / zsh / fish**) — `encoded_script = "'" + strings.NewReplacer("'", "\v", "\\", "\f", "\n", "\r", "!", "\b").Replace(cd.bootstrap_script) + "'"` `[kittens/ssh/main.go:505]`, with the `tr`-based unwrap `unwrap_script = 'eval "$(echo "$0" | tr \\\v\\\f\\\r\\\b \\\047\\\134\\\n\\\041)"' ` `[kittens/ssh/main.go:506]`. The comment `[kittens/ssh/main.go:501-503]` explains the choice: `base64` may be absent remotely, so the script is quoted by substituting `'`→`\v`, `\`→`\f`, newline→`\r`, and `!`→`\b` (the last two "for tcsh"), then wrapped in single quotes; the `tr` reverses it (`\047`=`'`, `\134`=`\`, `\n`=newline, `\041`=`!`).
 - The final command vector is `cd.rcmd = []string{"exec", cd.host_opts.Interpreter, "-c", unwrap_script, encoded_script}` `[kittens/ssh/main.go:508]`.
 
-**Code trace — the remote per-shell handling** (`shell-integration/ssh/bootstrap-utils.sh`, dispatched by `exec_with_shell_integration` on `$shell_name` `[bootstrap-utils.sh:138-151]`):
+**Code trace — the remote per-shell handling** (`shell-integration/ssh/bootstrap-utils.sh`). `exec_login_shell` `[bootstrap-utils.sh:221]` first calls `exec_with_shell_integration` `[bootstrap-utils.sh:229]`, whose `case "$shell_name"` handles **only zsh, fish, and bash** `[bootstrap-utils.sh:138-151]`. POSIX `sh` is deliberately **not** in that dispatch — it is picked up later in the generic login-shell fallback chain (see the `sh` bullet below):
 
 - **zsh** — `exec_zsh_with_integration` `[bootstrap-utils.sh:102]` sets `export ZDOTDIR="$shell_integration_dir/zsh"` `[bootstrap-utils.sh:111]` and `exec "$login_shell" "-l"` `[bootstrap-utils.sh:112]`.
 - **fish** — `exec_fish_with_integration` `[bootstrap-utils.sh:118]` prepends `XDG_DATA_DIRS` `[bootstrap-utils.sh:119-123]`, sets `export KITTY_FISH_XDG_DATA_DIR="$shell_integration_dir"` `[bootstrap-utils.sh:124]`, and `exec "$login_shell" "-l"` `[bootstrap-utils.sh:125]`.
 - **bash** — `exec_bash_with_integration` `[bootstrap-utils.sh:128]` sets `export ENV="$shell_integration_dir/bash/kitty.bash"` `[bootstrap-utils.sh:129]`, `export KITTY_BASH_INJECT="1"` `[bootstrap-utils.sh:130]`, and `exec "$login_shell" "--login" "--posix"` `[bootstrap-utils.sh:135]`.
-- **sh** — `execute_sh_with_posix_env` `[bootstrap-utils.sh:153]` handles POSIX `sh` via the `ENV` mechanism (guarded by `[ "$shell_name" = "sh" ]`).
+- **sh** — handled **not** by `exec_with_shell_integration` but later in `exec_login_shell`'s fallback chain: after `exec_with_shell_integration` returns without exec-ing, it tries `exec -a "-$shell_name" "$login_shell"` `[bootstrap-utils.sh:238]`, then `execute_with_python` `[bootstrap-utils.sh:239]`, then `execute_with_perl` `[bootstrap-utils.sh:240]`, then `execute_sh_with_posix_env` `[bootstrap-utils.sh:241]`. That last function `[bootstrap-utils.sh:153]` — guarded by `[ "$shell_name" = "sh" ]` `[bootstrap-utils.sh:155]` — wires POSIX `sh` integration via the `ENV` mechanism. So `sh` is a later generic-login-shell fallback, distinct from the zsh/fish/bash dispatch.
 
 **Observed evidence — the POSIX-shell (sh) encoding.** With the default interpreter (`sh`):
 
@@ -363,7 +543,7 @@ echo IyEvdXNyL2Jpbi9lbnYgcHl0aG9u | base64 -d
 
 ## Q7 — Full initiation-to-execution trace
 
-**Mechanism.** From `kitty +kitten ssh host`, the Go driver loads config, decides on connection sharing/master reuse, builds the tarball + shm credential + bootstrap script, encodes it, spawns `ssh` with that command, optionally sends the shm pointer over the tty, waits for the child, and drains tty garbage. On the remote host, `bootstrap.sh` reads the framed data (or the shm via the returned request), unpacks the tar, compiles terminfo, stages files, and re-execs the login shell with integration.
+**Mechanism.** From `kitty +kitten ssh host`, the Go driver loads config, decides on connection sharing/master reuse, builds the tarball + local shm credential object + bootstrap script, encodes it, spawns `ssh` with that command, and — in the piggyback/askpass mode — itself emits the DCS setup-data request over the tty (Q9); it then waits for the child and drains tty garbage. The request (whether emitted by the driver or by the remote bootstrap) is answered by the **kitty terminal in Python**, which reads the *local* shm object and streams the tarball down the tty (Q1/Q3). On the remote host, `bootstrap.sh` reads that streamed, framed data **over the tty — it never opens `/dev/shm`** — unpacks the tar, compiles terminfo, stages files, and re-execs the login shell with integration.
 
 **Code trace — local (`run_ssh` `[kittens/ssh/main.go:597]`).**
 
@@ -377,7 +557,7 @@ echo IyEvdXNyL2Jpbi9lbnYgcHl0aG9u | base64 -d
 8. Optional tty request when `!cd.request_data` `[kittens/ssh/main.go:761]` (Q9).
 9. `err = c.Wait()` `[kittens/ssh/main.go:782]`; then `drain_potential_tty_garbage(term)` `[kittens/ssh/main.go:783]`.
 
-**Code trace — remote (`shell-integration/ssh/bootstrap.sh`).** `get_data` `[bootstrap.sh:137-155]` reads the framed data (the `KITTY_DATA_START`/`KITTY_DATA_END`/`OK` markers, Q3), then `untar_and_read_env` `[bootstrap.sh:104]`: it extracts the tar `[bootstrap.sh:113]`, sources `bootstrap-utils.sh` `[bootstrap.sh:115]` and `data.sh` `[bootstrap.sh:116]`, runs `compile_terminfo "$tdir/home"` `[bootstrap.sh:130]` and `mv_files_and_dirs "$tdir/home" "$HOME"` `[bootstrap.sh:131]`. Then `prepare_for_exec` `[bootstrap.sh:157]` and finally `exec_login_shell` `[bootstrap.sh:164]` — defined in `bootstrap-utils.sh` at `[bootstrap-utils.sh:221]`, which re-execs the login shell, using `exec -a "-$shell_name" "$login_shell"` `[bootstrap-utils.sh:238]` to give it a login-shell `argv[0]`.
+**Code trace — remote (`shell-integration/ssh/bootstrap.sh`).** `get_data` `[bootstrap.sh:137-152]` (called at `[bootstrap.sh:155]`) reads the framed data the kitty terminal streams over the tty — in the order `KITTY_DATA_START` → `OK` → base64 → `KITTY_DATA_END` (Q3), waiting for `KITTY_DATA_START` `[bootstrap.sh:144]` then `OK` `[bootstrap.sh:141]` — then calls `untar_and_read_env` `[bootstrap.sh:104]`: it extracts the tar `[bootstrap.sh:113]`, sources `bootstrap-utils.sh` `[bootstrap.sh:115]` and `data.sh` `[bootstrap.sh:116]`, runs `compile_terminfo "$tdir/home"` `[bootstrap.sh:130]` and `mv_files_and_dirs "$tdir/home" "$HOME"` `[bootstrap.sh:131]`. Then `prepare_for_exec` `[bootstrap.sh:157]` and finally `exec_login_shell` `[bootstrap.sh:164]` — defined in `bootstrap-utils.sh` at `[bootstrap-utils.sh:221]`, which re-execs the login shell, using `exec -a "-$shell_name" "$login_shell"` `[bootstrap-utils.sh:238]` to give it a login-shell `argv[0]`.
 
 **Observed evidence.** Two runnable facts substantiate the ends of this trace. First, the whole suite that drives `run_ssh`'s building blocks passes (EV1 above). Second, the archive the remote unpacks is exactly the one `make_tarfile` builds, and it round-trips through the same `tar xpzf` the remote uses — `TestSSHTarfile` `[kittens/ssh/main_test.go:81]` extracts it with `exec.Command("tar", "xpzf", "-", "-C", tdir)` `[kittens/ssh/main_test.go:88]` and asserts the staged files exist:
 
@@ -398,46 +578,57 @@ The 15 staged entries themselves are shown in EV7 (Q3), including `data.sh`, the
 
 ## Q8 — Shared-memory security rationale
 
-**Mechanism.** The shared-memory object is created owner-only and exclusively, its owner and permissions are re-verified on read, and it is destroyed after a single read. Together these keep the credential off `argv`/env and minimize how long it can be read by anyone.
+**Mechanism.** The shm object is created owner-only and exclusively by the Go driver; on read, the **kitty terminal's Python** re-verifies the object's owner and permissions, unlinks it so it can be read only once, and *additionally* checks the one-time password and request id before releasing the payload. Together these keep the payload off `argv`/env and bound how long — and by whom — it can be read.
 
-**Code trace.**
+**Code trace — creation (Go driver).**
 
-- **Read-once.** `read_data_from_shared_memory` `[kittens/ssh/main.go:72]` calls `shm.ReadWithSizeAndUnlink` `[tools/utils/shm/shm.go:142]`. That function runs the file callbacks, then `defer func() { mmap.Close(); _ = mmap.Unlink() }()` `[tools/utils/shm/shm.go:159-162]` — so the object is unlinked (name removed) immediately after the single read completes.
-- **Owner check.** The callback in `read_data_from_shared_memory` enforces `if os.Getuid() != int(stat.Uid) || os.Getgid() != int(stat.Gid) { return fmt.Errorf("Incorrect owner on SHM file") }` `[kittens/ssh/main.go:74-76]`.
-- **Permission check.** `if s.Mode().Perm() != 0o600 { return fmt.Errorf("Incorrect permissions on SHM file") }` `[kittens/ssh/main.go:79-80]`.
 - **Exclusive create at `0600`.** The object is created with `os.OpenFile(path, os.O_EXCL|os.O_CREATE|os.O_RDWR, 0600)` `[tools/utils/shm/shm_fs.go:130]` — `O_EXCL|O_CREATE` guarantees a fresh object (no pre-existing file is reused).
 - **Location.** On Linux the backing dir is `const SHM_DIR = "/dev/shm"` `[tools/utils/shm/specific_linux.go:11]`.
 
-**Observed evidence.** The same EV6 capture demonstrates all three security properties at once:
+**Code trace — the SSH-session read-back (kitty terminal Python).** The session reader is the Python `read_data_from_shared_memory` `[kittens/ssh/utils.py:100]`, called from `get_ssh_data` `[kittens/ssh/utils.py:129]`:
+
+- **Read-once (unlink).** It opens the object read-only and immediately `shm.unlink()` `[kittens/ssh/utils.py:106]`, removing the name so a second open fails.
+- **Owner check.** `if shm.stats.st_uid != os.geteuid() or shm.stats.st_gid != os.getegid():` → `raise ValueError('Incorrect owner on pwfile: …')` `[kittens/ssh/utils.py:107-108]`.
+- **Permission check.** `if mode != stat.S_IREAD | stat.S_IWRITE:` → `raise ValueError('Incorrect permissions on pwfile: …')` `[kittens/ssh/utils.py:110-111]` (`S_IREAD|S_IWRITE` == `0o600`).
+- **Password + request-id gate.** On top of the shm checks, `get_ssh_data` rejects a wrong one-time password with `if pw != env_data['pw']` `[kittens/ssh/utils.py:130]` and a wrong request id at `[kittens/ssh/utils.py:132]` before streaming anything.
+
+The Go `read_data_from_shared_memory` `[kittens/ssh/main.go:72]` enforces the *identical* shm-primitive guarantees — owner check `[kittens/ssh/main.go:74-76]`, `0o600` check `[kittens/ssh/main.go:79-80]`, and read-once via `shm.ReadWithSizeAndUnlink` `[tools/utils/shm/shm.go:142]` whose `defer func() { mmap.Close(); _ = mmap.Unlink() }()` `[tools/utils/shm/shm.go:159-162]` unlinks after the single read — but that Go path serves `clone_env` (Q1), not the SSH session. EV6 uses it as a convenient in-process probe of exactly those guarantees.
+
+**Observed evidence.** EV6 demonstrates the object's on-disk permission and the read-once unlink (the same guarantees the Python session reader enforces):
 
 ```bash
-go test -run TestBlitzyObserveEV6 -v ./kittens/ssh/     # temporary harness, since removed
+go test -run TestBlitzyObserveEV6 -v -count=1 ./kittens/ssh/
 ```
 
 ```
-EV6>>> stat /dev/shm/kssh-40398-FZFPPIJG726JE -> -rw------- mode=0600
-EV6>>> read #1: ok=true bytes=32179
-EV6>>> read #2 (after unlink): err=open /dev/shm/kssh-40398-FZFPPIJG726JE: no such file or directory
+EV6>>> stat /dev/shm/kssh-76516-P2JEYRPV44LWU -> -rw------- mode=0600
+EV6>>> read #1: ok=true bytes=31575
+EV6>>> read #2 (after unlink): err=open /dev/shm/kssh-76516-P2JEYRPV44LWU: no such file or directory
 ```
 
-The `stat` shows `-rw-------` / `mode=0600`, matching the `0600` create at `[tools/utils/shm/shm_fs.go:130]` and the `!= 0o600` guard at `[kittens/ssh/main.go:79-80]`. The object lives under `/dev/shm` per `[tools/utils/shm/specific_linux.go:11]`. The first read succeeds; the second fails with `no such file or directory` — direct proof of the read-once unlink at `[tools/utils/shm/shm.go:159-162]`.
+The `stat` shows `-rw-------` / `mode=0600`, matching the `0600` create at `[tools/utils/shm/shm_fs.go:130]`, the Go `!= 0o600` guard `[kittens/ssh/main.go:79-80]`, and the Python `S_IREAD | S_IWRITE` guard `[kittens/ssh/utils.py:110-111]`. The object lives under `/dev/shm` per `[tools/utils/shm/specific_linux.go:11]`. The first read succeeds; the second fails with `no such file or directory` — direct proof of the read-once unlink (`[tools/utils/shm/shm.go:159-162]` for this Go probe; `[kittens/ssh/utils.py:106]` for the Python session path).
 
-**Rationale.** Because the secret is in an owner-only shm object (not `argv`/env, which are world-visible via `/proc`), and because it is destroyed after one read, another local process has only a tiny window in which even the *owner*'s objects could be read — and cross-user reads are rejected by the owner/permission checks. (The generic POSIX `shm_open(3)`/`shm_overview(7)` semantics — named object with owner + mode bits, `shm_unlink` removing the name so later opens fail — are external framing; the authoritative facts here are the exact `0600`, `O_EXCL|O_CREATE`, the two `Errorf` guards, and the observed second-read failure.)
+**Rationale.** The payload lives in an owner-only shm object rather than in `argv`/env (which are world-visible via `/proc`), and it is destroyed after one read, so the window in which it can be read is tiny and cross-user reads are rejected by the owner/permission checks. The one-time password + request-id gate in `get_ssh_data` `[kittens/ssh/utils.py:130,132]` means that even a process that learned the shm *name* cannot obtain the payload without also presenting the matching one-time `pw` and the current window's request id. This is why the transmitted authorization triple (`id`, `pwfile`, `pw`) does not by itself compromise the payload: the object is already gone after the legitimate single read. (The generic POSIX `shm_open(3)`/`shm_overview(7)` semantics — named object with owner + mode bits, `shm_unlink` removing the name so later opens fail — are external framing; the authoritative facts here are the exact `0600`, `O_EXCL|O_CREATE`, the owner/permission guards on both the Go and Python readers, the pw/id gate, and the observed second-read failure.)
 
 ---
 
 ## Q9 — TTY request/response protocol (DCS escape codes)
 
-**Mechanism.** The kitten and the remote bootstrap talk over the controlling tty using Kitty's private DCS (Device Control String) escape sequences. The local side tells kitty (the terminal) "here is the request id, the shm object name, and the password" so kitty can service the remote's data request; the remote side emits the mirror-image request. Bulk data is sent framed by text markers.
+**Mechanism.** Setup data is exchanged over the controlling tty using Kitty's private DCS (Device Control String) escape sequences, with **three** participants: (1) a *requester* emits a DCS `ssh` message carrying `id`/`pwfile`/`pw`; (2) the **kitty terminal** intercepts that message and, in Python, reads the *local* shm and streams the answer back down the tty to the child; (3) the *remote bootstrap* consumes the streamed bytes. The requester is either the local Go driver or the remote bootstrap, depending on mode (Q5/Q7). Bulk data is framed by text markers.
 
-**Code trace — local.** In `run_ssh`, only when `!cd.request_data` `[kittens/ssh/main.go:761]`, it builds `rq := fmt.Sprintf("id=%s:pwfile=%s:pw=%s", cd.replacements["REQUEST_ID"], cd.replacements["PASSWORD_FILENAME"], cd.replacements["DATA_PASSWORD"])` `[kittens/ssh/main.go:762]`, then `dcs, err = tui.DCSToKitty("ssh", rq)` `[kittens/ssh/main.go:766]` and `term.WriteAllString(dcs)` `[kittens/ssh/main.go:768]`. `DCSToKitty` `[tools/tui/dcs_to_kitty.go:14]` base64-encodes the payload `[tools/tui/dcs_to_kitty.go:15]` and builds `ans := "\x1bP@kitty-" + msgtype + "|" + data` `[tools/tui/dcs_to_kitty.go:16]`, terminated (non-tmux) with `ans += "\033\\"` (ESC `\` = ST) `[tools/tui/dcs_to_kitty.go:25]`.
+**Code trace — who emits the request.**
 
-**Code trace — remote.** `shell-integration/ssh/bootstrap.sh` defines `dcs_to_kitty() { printf "\033P@kitty-$1|%s\033\134" "$(printf "%s" "$2" | base64_encode)" > /dev/tty; }` `[bootstrap.sh:75]` — the same `\033P@kitty-…|<base64>\033\134` frame (`\134` is `\`). It emits the request only when `request_data="1"` `[bootstrap.sh:90-95]`, after `command stty "-echo" < /dev/tty` `[bootstrap.sh:93]`, as `dcs_to_kitty "ssh" "id="REQUEST_ID":pwfile="PASSWORD_FILENAME":pw="DATA_PASSWORD""` `[bootstrap.sh:94]`. Because `base64` may be missing, the remote has a fallback chain: `base64` `[bootstrap.sh:55-57]` → `openssl` `[bootstrap.sh:58-60]` → `b64encode` `[bootstrap.sh:61-63]` → python `[bootstrap.sh:64-67]` → perl `[bootstrap.sh:68-70]` → else `die "base64 executable not present on remote host, ssh kitten cannot function."` `[bootstrap.sh:72]`. Bulk data reply is framed by `KITTY_DATA_START`/`KITTY_DATA_END`/`OK` `[bootstrap.sh:137-155]`. After the child exits, the local side calls `drain_potential_tty_garbage` `[kittens/ssh/main.go:530]` (invoked at `[kittens/ssh/main.go:783]`).
+- *Local emitter (mode `request_data=false`, e.g. piggybacking a live master).* In `run_ssh`, when `!cd.request_data` `[kittens/ssh/main.go:761]`, the driver builds `rq := fmt.Sprintf("id=%s:pwfile=%s:pw=%s", cd.replacements["REQUEST_ID"], cd.replacements["PASSWORD_FILENAME"], cd.replacements["DATA_PASSWORD"])` `[kittens/ssh/main.go:762]`, then `dcs, err = tui.DCSToKitty("ssh", rq)` `[kittens/ssh/main.go:766]` and `term.WriteAllString(dcs)` `[kittens/ssh/main.go:768]`.
+- *Remote emitter (mode `request_data=true`, e.g. a fresh connection).* The remote `bootstrap.sh` emits the mirror request only when `request_data="1"` `[bootstrap.sh:90-95]`, after `command stty "-echo" < /dev/tty` `[bootstrap.sh:93]`, as `dcs_to_kitty "ssh" "id="REQUEST_ID":pwfile="PASSWORD_FILENAME":pw="DATA_PASSWORD""` `[bootstrap.sh:94]`; the Python variant does the same in `send_data_request` `[bootstrap.py:80-81]`, gated by `if request_data:` `[bootstrap.py:292]`.
+
+**Code trace — the DCS frame.** `DCSToKitty` `[tools/tui/dcs_to_kitty.go:14]` base64-encodes the payload `[tools/tui/dcs_to_kitty.go:15]` and builds `ans := "\x1bP@kitty-" + msgtype + "|" + data` `[tools/tui/dcs_to_kitty.go:16]`, terminated (non-tmux) with `ans += "\033\\"` (ESC `\` = ST) `[tools/tui/dcs_to_kitty.go:25]`. The remote emitter uses the identical frame: `dcs_to_kitty() { printf "\033P@kitty-$1|%s\033\134" "$(printf "%s" "$2" | base64_encode)" > /dev/tty; }` `[bootstrap.sh:75]` (`\134` = `\`). Because `base64` may be missing remotely, the remote has a fallback chain: `base64` `[bootstrap.sh:55-57]` → `openssl` `[bootstrap.sh:58-60]` → `b64encode` `[bootstrap.sh:61-63]` → python `[bootstrap.sh:64-67]` → perl `[bootstrap.sh:68-70]` → else `die "base64 executable not present on remote host, ssh kitten cannot function."` `[bootstrap.sh:72]`.
+
+**Code trace — the terminal receives and responds (kitty Python).** The `ssh|` DCS is dispatched by the C VT parser `[kitty/vt-parser.c:608]` to `handle_remote_ssh` `[kitty/window.py:1289]`, which drives `get_ssh_data(msg, f'{os.getpid()}-{self.id}')` `[kitty/window.py:1291]` and writes each yielded line back to the child `[kitty/window.py:1292]`. `get_ssh_data` `[kittens/ssh/utils.py:115]` yields, in order: `KITTY_DATA_START` `[kittens/ssh/utils.py:117]`; then — after reading the local shm and validating `pw`/`id` — `OK` `[kittens/ssh/utils.py:138]`; then the base64 tarball in 254-byte lines `[kittens/ssh/utils.py:143-147]`; then `KITTY_DATA_END` `[kittens/ssh/utils.py:148]`. The remote reader consumes exactly this order (see Q3). After the child exits, the local driver calls `drain_potential_tty_garbage` `[kittens/ssh/main.go:530]` (invoked at `[kittens/ssh/main.go:783]`).
 
 **Observed evidence.** Encoding a sample request with the real `tui.DCSToKitty` (using a fake password `deadbeefcafe`, not a real secret):
 
 ```bash
-go test -run TestBlitzyObserveEV8 -v ./kittens/ssh/     # temporary harness, since removed
+go test -run TestBlitzyObserveEV8 -v -count=1 ./kittens/ssh/
 ```
 
 ```
@@ -454,18 +645,19 @@ echo aWQ9dGVzdGluZzpwd2ZpbGU9L2tzc2gtMTIzLWFiYzpwdz1kZWFkYmVlZmNhZmU= | base64 -
 id=testing:pwfile=/kssh-123-abc:pw=deadbeefcafe
 ```
 
-**Rationale.** DCS sequences are invisible to the user and are intercepted by kitty itself (the `@kitty-` prefix), so the request/response rides the existing tty channel with no extra socket. The `stty -echo` before the remote request prevents the request bytes from being echoed back; the framed `KITTY_DATA_START`/`OK` markers let the remote read an arbitrarily large base64 blob line-by-line without a length header.
+**Rationale.** DCS sequences are invisible to the user and are intercepted by kitty itself (the `@kitty-` prefix), so the request/response rides the existing tty channel with no extra socket. The `stty -echo` before the remote request prevents the request bytes from being echoed back; the framed sequence `KITTY_DATA_START` → `OK` → base64 lines → `KITTY_DATA_END` lets the remote read an arbitrarily large base64 blob line-by-line without a length header (the `OK` after `KITTY_DATA_START` is the terminal signalling that `pw`/`id` validation passed and the payload follows).
 
 ---
 
 ## Cross-file (local ↔ remote) contracts
 
-These four contracts are the seams where the Go driver and the remote scripts must agree exactly:
+These contracts are the seams where the Go driver, the **kitty terminal (Python)**, and the remote scripts must agree exactly:
 
-1. **TTY request contract.** Local `id=%s:pwfile=%s:pw=%s` `[kittens/ssh/main.go:762]` ↔ remote `dcs_to_kitty "ssh" "id="REQUEST_ID":pwfile="PASSWORD_FILENAME":pw="DATA_PASSWORD""` `[shell-integration/ssh/bootstrap.sh:94]`. Both wrap the payload in the same `\x1bP@kitty-ssh|<base64>\x1b\` DCS frame: `[tools/tui/dcs_to_kitty.go:16]` ↔ `[shell-integration/ssh/bootstrap.sh:75]`.
-2. **Shared-memory write/read contract.** Local `shm.WriteWithSize` `[kittens/ssh/main.go:448]` ↔ read-back `read_data_from_shared_memory` → `ReadWithSizeAndUnlink` `[kittens/ssh/main.go:72]` / `[tools/utils/shm/shm.go:142]`. Both agree on the 4-byte size prefix (`NUM_BYTES_FOR_SIZE`).
-3. **Encoding/decoding contract.** Local `strings.NewReplacer("'", "\v", "\\", "\f", "\n", "\r", "!", "\b")` `[kittens/ssh/main.go:505]` ↔ remote `tr`-based unwrap `[kittens/ssh/main.go:506]` executed by the remote interpreter (the `tr \047\134\n\041` reverses `\v\f\r\b`).
-4. **Build-time generation dependency.** `SSHControlMasterTemplate` used at `[kittens/ssh/main.go:135]` ↔ emitted by `gen/go_code.py` `[gen/go_code.py:599]` (value `kssh-{kitty_pid}-{ssh_placeholder}`, sourced from `[kitty/constants.py:188]`) during `python setup.py build` via `update_go_generated_files` `[setup.py:1102]`. Proven necessary by EV0.
+1. **TTY request contract.** The request string `id=%s:pwfile=%s:pw=%s` is emitted by whichever side is the requester: locally by the Go driver `[kittens/ssh/main.go:762]` (mode `request_data=false`), or remotely by `dcs_to_kitty "ssh" "id="REQUEST_ID":pwfile="PASSWORD_FILENAME":pw="DATA_PASSWORD""` `[shell-integration/ssh/bootstrap.sh:94]` / Python `[shell-integration/ssh/bootstrap.py:81]` (mode `request_data=true`). Both wrap the payload in the same `\x1bP@kitty-ssh|<base64>\x1b\` DCS frame: `[tools/tui/dcs_to_kitty.go:16]` ↔ `[shell-integration/ssh/bootstrap.sh:75]`.
+2. **Terminal DCS responder contract.** The kitty terminal receives that `ssh|` DCS — registered in the C VT parser `[kitty/vt-parser.c:608]`, handled by `handle_remote_ssh` `[kitty/window.py:1289-1291]` — and answers with `get_ssh_data` `[kittens/ssh/utils.py:115-148]`, streaming `KITTY_DATA_START` → `OK` → base64 tar lines → `KITTY_DATA_END` to the remote child over the tty. The remote consumes that exact framing in `bootstrap.sh` (`get_data` + `read_base64_from_tty`) `[shell-integration/ssh/bootstrap.sh:97-152]`, or the Python `iter_base64_data` `[shell-integration/ssh/bootstrap.py:172-190]`.
+3. **Shared-memory write/read contract.** The Go driver writes the object locally with `shm.WriteWithSize` `[kittens/ssh/main.go:448]`; the read-back **for the SSH session** is the kitty terminal's Python `read_data_from_shared_memory` `[kittens/ssh/utils.py:100-112]` (called from `get_ssh_data` `[kittens/ssh/utils.py:129]`), which agrees on the 4-byte size prefix (`num_bytes_for_size` `[kitty/shm.py:47]`, `read_data_with_size` `[kitty/shm.py:122]`). (The Go `read_data_from_shared_memory` → `ReadWithSizeAndUnlink` `[kittens/ssh/main.go:72]` / `[tools/utils/shm/shm.go:142]` is the read-back for the separate `clone_env` path — same `NUM_BYTES_FOR_SIZE` prefix, different consumer.)
+4. **Encoding/decoding contract.** Local `strings.NewReplacer("'", "\v", "\\", "\f", "\n", "\r", "!", "\b")` `[kittens/ssh/main.go:505]` ↔ remote `tr`-based unwrap `[kittens/ssh/main.go:506]` executed by the remote interpreter (the `tr \047\134\n\041` reverses `\v\f\r\b`).
+5. **Build-time generation dependency.** `SSHControlMasterTemplate` used at `[kittens/ssh/main.go:135]` ↔ emitted by `gen/go_code.py` `[gen/go_code.py:599]` (value `kssh-{kitty_pid}-{ssh_placeholder}`, sourced from `[kitty/constants.py:188]`) during `python setup.py build` via `update_go_generated_files` `[setup.py:1102]`. Proven necessary by EV0.
 
 
 ---
@@ -498,8 +690,8 @@ Every concrete item named by the question, mapped to its code location and the e
 | `-N -f` (start master) | `[kittens/ssh/main.go:669]` | code trace Q5 |
 | `drain_potential_tty_garbage` | `[kittens/ssh/main.go:530,783]` | code trace Q7/Q9 |
 | `secrets.TokenHex()` | `[kittens/ssh/main.go:431]` | EV6 (pw minted, payload written) |
-| `shm.CreateTemp` (`kssh-%d-`) | `[kittens/ssh/main.go:446]` | EV6 (`kssh-40398-…`) |
-| `shm.WriteWithSize` | `[kittens/ssh/main.go:448]` | EV6 (read-back 32179 bytes) |
+| `shm.CreateTemp` (`kssh-%d-`) | `[kittens/ssh/main.go:446]` | EV6 (`kssh-76516-…`) |
+| `shm.WriteWithSize` | `[kittens/ssh/main.go:448]` | EV6 (read-back 31575 bytes) |
 | `PASSWORD_FILENAME` | `[kittens/ssh/main.go:460]` | EV4 (placeholder), Q9 |
 | `REQUEST_ID` | `[kittens/ssh/main.go:460]` | EV4, Q9 |
 | `DATA_PASSWORD` | `[kittens/ssh/main.go:460]` | EV4, Q9 |
@@ -511,7 +703,7 @@ Every concrete item named by the question, mapped to its code location and the e
 | `KITTY_DATA_END` | `[shell-integration/ssh/bootstrap.sh:99]` | code trace Q3/Q7 |
 | `OK` marker | `[shell-integration/ssh/bootstrap.sh:141]` | code trace Q3/Q7 |
 | `tar "xpzf"` extraction | `[shell-integration/ssh/bootstrap.sh:113]` | EV7 + `TestSSHTarfile` PASS |
-| `archive/tar` / `compress/gzip` (`gzip.BestCompression`) | `[kittens/ssh/main.go:6,8,259,263]` | EV7 (gzip 24034 bytes) |
+| `archive/tar` / `compress/gzip` (`gzip.BestCompression`) | `[kittens/ssh/main.go:6,8,259,263]` | EV7 (gzip 23599 bytes) |
 | `encoding/base64` | `[kittens/ssh/main.go:9,440]` | EV5/EV8 (base64 decode) |
 | `encoding/json` | `[kittens/ssh/main.go:10,444]` | EV6 (JSON payload read back) |
 | `tar.FormatPAX` | `[kittens/ssh/main.go:297,310]` | EV7 (long paths, modes preserved) |
@@ -529,16 +721,20 @@ Every concrete item named by the question, mapped to its code location and the e
 | `compile_terminfo` | `[shell-integration/ssh/bootstrap.sh:130]`, `[bootstrap-utils.sh:18]` | code trace Q7; EV7 (terminfo present) |
 | `mv_files_and_dirs` | `[shell-integration/ssh/bootstrap.sh:131]`, `[bootstrap-utils.sh:9]` | code trace Q7 |
 | `exec_login_shell` (`exec -a "-$shell_name"`) | `[shell-integration/ssh/bootstrap.sh:164]`, `[bootstrap-utils.sh:221,238]` | code trace Q7 |
-| **sh** (`execute_sh_with_posix_env`, `ENV`) | `[bootstrap-utils.sh:153]` | EV4 (`script_type: sh`); EV7 (sh path adds `bootstrap-utils.sh`) |
+| **sh** (`execute_sh_with_posix_env`, `ENV`; `exec_login_shell` fallback at `[bootstrap-utils.sh:241]`, **not** `exec_with_shell_integration`) | `[bootstrap-utils.sh:153,155,241]` | EV4 (`script_type: sh`); EV7 (sh path adds `bootstrap-utils.sh`) |
 | **bash** (`exec_bash_with_integration`, `--login --posix`, `KITTY_BASH_INJECT=1`, `ENV`) | `[bootstrap-utils.sh:128-135]` | EV7 (`bash/kitty.bash`, 17363 bytes) |
 | **zsh** (`exec_zsh_with_integration`, `ZDOTDIR`, `exec … -l`) | `[bootstrap-utils.sh:102-112]` | EV7 (`zsh/kitty-integration`, 22557 bytes) |
 | **fish** (`exec_fish_with_integration`, `XDG_DATA_DIRS`, `KITTY_FISH_XDG_DATA_DIR`, `exec … -l`) | `[bootstrap-utils.sh:118-125]` | EV7 (`fish/kitty-shell-integration.fish`) |
 | **Python path** (`eval(compile(base64…))`) | `[kittens/ssh/main.go:498-499]` | EV5 (unwrap string + base64) |
-| dispatch `exec_with_shell_integration` (case `$shell_name`) | `[bootstrap-utils.sh:138-151]` | code trace Q6 |
+| dispatch `exec_with_shell_integration` (cases **only** zsh/fish/bash) | `[bootstrap-utils.sh:138-151]` | code trace Q6 |
 | bootstrap-script size cap `9000` | `[kittens/ssh/main_test.go:76-77]` | EV9 (observed 5282 < 9000) |
-| `kittens/ssh/main.py` / `utils.py` are option-only (no runtime pipeline) | `kittens/ssh/main.py`, `kittens/ssh/utils.py` | Critical-context `wc -c` (10345 vs 27308 bytes) |
+| `kittens/ssh/main.py` is option/config-only (`main()` raises) | `[kittens/ssh/main.py:224-225]` | Critical-context (`sed` of `main()`) |
+| `kittens/ssh/utils.py` = terminal-side SSH runtime (`get_ssh_data`, Python `read_data_from_shared_memory`, `create_shared_memory`) | `[kittens/ssh/utils.py:87,100,115]` | Critical-context (`grep` of defs); Q1/Q8/Q9 |
+| terminal DCS dispatch `handle_remote_ssh` → `get_ssh_data` | `[kitty/window.py:1289-1291]` | Critical-context; Q9 |
+| `ssh|` DCS registered (C VT parser) | `[kitty/vt-parser.c:608]` | Critical-context; Q9 |
+| Python terminal-side `read_data_from_shared_memory` (unlink + owner/mode + pw/id validation) | `[kittens/ssh/utils.py:100-112,129-133]` | Q1/Q8 |
 
-**Magnitudes (EV9), by name.** bootstrap `rcmd` (sh) total = **5282 bytes** (EV4), well under the **9000**-byte cap at `[kittens/ssh/main_test.go:76]`; shm JSON payload = **32179 bytes** (EV6); gzip tarball = **24034 bytes** (EV7).
+**Magnitudes (EV9), by name.** bootstrap `rcmd` (sh) total = **5282 bytes** (EV4), well under the **9000**-byte cap at `[kittens/ssh/main_test.go:76]`; shm JSON payload = **31575 bytes** (EV6); gzip tarball = **23599 bytes** (EV7).
 
 ---
 
