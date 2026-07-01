@@ -132,6 +132,64 @@ $ python3 /tmp/obs_wide.py
 wcwidth(0x200D) = 0
 ```
 
+### Variation selectors and emoji-presentation width (VS16 `0xfe0f`, VS15 `0xfe0e`)
+
+Beyond ZWJ, two Unicode variation selectors can change a base emoji's **width**, and this commit handles them explicitly — this is the emoji-presentation-width half of the "grapheme/combining handling" the question asks about. Whether a base is *eligible* to be widened or narrowed is decided by `is_emoji_presentation_base` (`kitty/wcwidth-std.h:2942`):
+
+```c
+// kitty/wcwidth-std.h:2942
+is_emoji_presentation_base(uint32_t code) {
+```
+
+The two selectors are named combining-mark constants (`kitty/unicode-data.h:5`):
+
+```c
+// kitty/unicode-data.h:5
+static const combining_type VS15 = 1364, VS16 = 1365;
+```
+
+**VS16 (`0xfe0f`) widens a default-narrow emoji base to width 2; VS15 (`0xfe0e`) narrows it to width 1.** In the draw path this fixup is applied by `draw_combining_char` after the selector has been attached to the preceding cell (`kitty/screen.c:663-701`):
+
+```c
+// kitty/screen.c:679  — VS16 branch: widen the preceding base to width 2
+if (ch == 0xfe0f) {
+    // kitty/screen.c:682
+    if (gpu_cell->attrs.width != 2 && cpu_cell->cc_idx[0] == VS16 && is_emoji_presentation_base(cpu_cell->ch)) {
+        gpu_cell->attrs.width = 2;   // kitty/screen.c:683
+    // ...
+// kitty/screen.c:690  — VS15 branch: narrow the preceding base to width 1
+} else if (ch == 0xfe0e) {
+    // kitty/screen.c:696
+    if (gpu_cell->attrs.width == 2 && cpu_cell->cc_idx[0] == VS15 && is_emoji_presentation_base(cpu_cell->ch)) {
+        gpu_cell->attrs.width = 1;   // kitty/screen.c:697
+```
+
+The stateless width machine encodes the same rule (`kitty/wcswidth.c:47-61`): a trailing `0xfe0f` adds 1 to a width-1 emoji-presentation base, and a trailing `0xfe0e` subtracts 1 from a width-2 base — each guarded by `is_emoji_presentation_base`:
+
+```c
+// kitty/wcswidth.c:46-58  (VS16 / VS15 cases; the is_emoji_presentation_base-guarded bodies span kitty/wcswidth.c:47-61)
+case 0xfe0f: {
+    if (is_emoji_presentation_base(state->prev_ch) && state->prev_width == 1) {
+        ans += 1;
+        state->prev_width = 2;
+    } else state->prev_width = 0;
+} break;
+case 0xfe0e: {
+    if (is_emoji_presentation_base(state->prev_ch) && state->prev_width == 2) {
+        ans -= 1;
+        state->prev_width = 1;
+    } else state->prev_width = 0;
+} break;
+```
+
+**Claims, each next to its single supporting evidence line** (all observed from `/tmp/obs_wide.py`; the selectors are themselves zero-width and only adjust the *preceding* cell):
+
+- **A person/family base emoji `U+1F468` is intrinsically width 2**, so it needs no VS16 widening → `wcwidth(0x1F468) = 2`.
+- **VS16 `0xfe0f` contributes zero width of its own** (its effect is applied to the preceding base by the `is_emoji_presentation_base`-guarded branch above) → `wcwidth(0xFE0F) = 0`.
+- **VS15 `0xfe0e` contributes zero width of its own** (likewise a modifier of the preceding base) → `wcwidth(0xFE0E) = 0`.
+
+**Rationale:** `wcwidth()` reports each codepoint's *own* contribution, so both variation selectors report `0`; their widening/narrowing is applied to the *previous* cell's stored 2-bit width field (`WIDTH_MASK`, `kitty/data-types.h:211`) by the `is_emoji_presentation_base`-guarded code above. In the 1×1 ZWJ scenario the input contains no VS15/VS16, so these branches never fire and the surviving `U+1F466` simply keeps the width-2 it computed from `wcwidth_std` (R2). These selectors are documented here because they are the emoji-presentation-width mechanism the per-codepoint model relies on, and the question asks for the width handling to be covered by name.
+
 ### How the stream is placed under the 1×1 constraint
 
 Autowrap (DECAWM) is on by default:
@@ -436,6 +494,8 @@ print("settled line(0) repr:", repr(str(line0)))
 print("widths:", tuple(line0.width(x) for x in range(5)))
 print("cursor.x = %d" % s.cursor.x)
 c.clear(); parse_bytes(s, b'\x1b[6n'); print("ESC[6n (DSR6/CPR) -> %r" % c.wtcbuf)
+for cp in (0x200D, 0x1F468, 0xFE0F, 0xFE0E):
+    print("wcwidth(0x%04X) = %d" % (cp, f.wcwidth(cp)))
 ```
 
 **Verbatim output:**
@@ -446,6 +506,10 @@ settled codepoints: U+1F9D1 U+200D U+1F33E (count=3)
 widths: (2, 0, 2, 0, 0)
 cursor.x = 4
 ESC[6n (DSR6/CPR) -> b'\x1b[1;5R'
+wcwidth(0x200D) = 0
+wcwidth(0x1F468) = 2
+wcwidth(0xFE0F) = 0
+wcwidth(0xFE0E) = 0
 ```
 
 **Claims + evidence:**
@@ -453,6 +517,12 @@ ESC[6n (DSR6/CPR) -> b'\x1b[1;5R'
 - **With room, both bases are kept and the ZWJ is attached to the first** → `settled codepoints: U+1F9D1 U+200D U+1F33E (count=3)` and `settled line(0) repr: '🧑\u200d🌾'`. Nothing was overwritten because the second base landed in a *different* cell.
 - **Per-codepoint widths sum 2 + 0 + 2 = 4** → `widths: (2, 0, 2, 0, 0)` and `cursor.x = 4`.
 - **The CPR reflects that advance** → `ESC[6n (DSR6/CPR) -> b'\x1b[1;5R'` (raw x = 4, not past the 20-column edge, so reported 1-based as column 5).
+- **ZWJ `U+200D` is zero-width** → `wcwidth(0x200D) = 0`.
+- **A person/family base emoji `U+1F468` is intrinsically width 2** → `wcwidth(0x1F468) = 2`.
+- **The VS16 variation selector `0xFE0F` is itself zero-width** → `wcwidth(0xFE0F) = 0`.
+- **The VS15 variation selector `0xFE0E` is itself zero-width** → `wcwidth(0xFE0E) = 0`.
+
+These four probes confirm the **per-codepoint width model**: the joiner and both variation selectors each report width `0`, while each base carries its own width, so the family/farmer widths sum member-by-member (`2 + 0 + 2 = 4`). The variation selectors report `0` for their *own* contribution even though they can still adjust the *preceding* base's stored width — see the variation-selector subsection under R1 (`is_emoji_presentation_base` at `kitty/wcwidth-std.h:2942`; VS16 `0xfe0f` / VS15 `0xfe0e` fixups at `kitty/screen.c:663-701` and `kitty/wcswidth.c:47-61`).
 
 ### The key contrast (the observable proof)
 
