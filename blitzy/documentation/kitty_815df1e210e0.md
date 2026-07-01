@@ -38,19 +38,51 @@ debug-event-loop:
 	python3 setup.py build $(VVAL) --debug --extra-logging=event-loop
 ```
 
-**COMMAND (exact command run):**
+**COMMAND (exact build wrapper run, capturing the exit status):**
 ```bash
-python3 setup.py build --debug --extra-logging=event-loop
+python3 setup.py build --debug --extra-logging=event-loop > /tmp/blitzy_obs/build.log 2>&1
+echo "BUILD_EXIT=$?"
 ```
 
-**OUTPUT (tail; exit status was 0):**
+**OUTPUT (the complete `/tmp/blitzy_obs/build.log`, 11 lines, followed by the captured exit status):**
 ```text
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
 Package 'wayland-protocols', required by 'virtual:world', not found
 wayland-protocols >= 1.17 is required, found version: not found
 Disabling building of wayland backend
+[1/1] Compiling kitty/data-types.c ...
+ done
+[1/1] Linking kitty/fast_data_types ...
+ done
+kitty/tools/cmd
+BUILD_EXIT=0
 ```
 
-That this build actually compiled in the event-loop/signal logging was verified from `build/compile_commands.json`: `kitty/child-monitor.c` is compiled with the defines `-DDEBUG`, `-DDEBUG_EVENT_LOOP`, and `-DKITTY_DEBUG_BUILD`. The build produces the C extension `kitty/fast_data_types.so` (plus `kitty/glfw-x11.so`, `kitty/launcher/kitty`, and `kitty/launcher/kitten`). The exact log literals are present in the compiled `.so`:
+The trailing `[1/1] Compiling … done` / `[1/1] Linking kitty/fast_data_types … done` lines plus `BUILD_EXIT=0` are the proof the build completed successfully. This invocation was *incremental* (the extension had been built once already, so only `kitty/data-types.c` was recompiled); the two independent checks below prove the event-loop/signal logging is compiled into the extension that is actually loaded at run time.
+
+That `kitty/child-monitor.c` is compiled with the event-loop/debug defines was read directly from the build database:
+
+**COMMAND:**
+```bash
+python3 - <<'PY'
+import json
+d = json.load(open('build/compile_commands.json'))
+for e in d:
+    if e['file'].endswith('child-monitor.c'):
+        cmd = e.get('command') or ' '.join(e.get('arguments', []))
+        print(' '.join(sorted({t for t in cmd.split() if 'DEBUG' in t})))
+        break
+PY
+```
+
+**OUTPUT:**
+```text
+-DDEBUG -DDEBUG_EVENT_LOOP -DKITTY_DEBUG_BUILD
+```
+
+The build produces the C extension `kitty/fast_data_types.so` (plus `kitty/glfw-x11.so`, `kitty/launcher/kitty`, and `kitty/launcher/kitten`). The exact log literals are present in the compiled `.so`:
 
 **COMMAND:**
 ```bash
@@ -80,10 +112,15 @@ launch sh -c "sleep 0.07; true"
 ...
 ```
 
-**COMMAND (exact run command; `Xvfb :99` started first, `timeout 90` wrapper):**
+**COMMAND (start the headless X server first):**
+```bash
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp > /tmp/blitzy_obs/xvfb.log 2>&1 &
+```
+
+**COMMAND (exact run command as executed — `timeout 90` was used as a safety net so the run cannot hang the session):**
 ```bash
 export DISPLAY=:99 TERM=xterm-kitty LANG=C.UTF-8 LC_ALL=C.UTF-8
-./kitty/launcher/kitty --config NONE --debug-rendering -o close_on_child_death=yes \
+timeout 90 ./kitty/launcher/kitty --config NONE --debug-rendering -o close_on_child_death=yes \
     -o confirm_os_window_close=0 --session /tmp/blitzy_obs/session.conf \
     > /tmp/blitzy_obs/run.log 2>&1
 echo "KITTY_EXIT=$?"
@@ -100,33 +137,55 @@ The process exited with status **0** despite the resize conflicts described belo
 
 **COMMAND:**
 ```bash
-echo "SIGWINCH sent to child : $(grep -c 'SIGWINCH sent to child' run.log)"
-echo "Failed to send resize  : $(grep -c 'Failed to send resize signal' run.log)"
-echo "Child launched         : $(grep -c 'Child launched' run.log)"
-echo "OS Window created      : $(grep -c 'OS Window created' run.log)"
-echo "fd unexpectedly closed : $(grep -c 'had its fd unexpectedly closed' run.log)"
-echo "loop tick              : $(grep -c 'loop tick, wakeups_happened' run.log)"
+LOG=/tmp/blitzy_obs/run.log
+echo "SIGWINCH sent to child : $(grep -c 'SIGWINCH sent to child' "$LOG")"
+echo "Failed to send resize  : $(grep -c 'Failed to send resize signal' "$LOG")"
+echo "Child launched         : $(grep -c 'Child launched' "$LOG")"
+echo "OS Window created      : $(grep -c 'OS Window created' "$LOG")"
+echo "fd unexpectedly closed : $(grep -c 'had its fd unexpectedly closed' "$LOG")"
+echo "loop tick              : $(grep -c 'loop tick, wakeups_happened' "$LOG")"
+echo "main loop exiting      : $(grep -c 'main loop exiting' "$LOG")"
 ```
 
 **OUTPUT:**
 ```text
-SIGWINCH sent to child : 47
-Failed to send resize  : 27
+SIGWINCH sent to child : 48
+Failed to send resize  : 21
 Child launched         : 20
 OS Window created      : 1
 fd unexpectedly closed : 0
-loop tick              : 3
+loop tick              : 4
+main loop exiting      : 1
 ```
 
-Interpreting these counts (this interpretation is grounded in `kitty/window.py:864-873`, quoted in O1): `Child launched` is printed **once per window, on that window's first resize only** — the observed **20** exactly matches the 20 launched windows. `SIGWINCH sent to child` is printed on **subsequent** resizes (the two prints are mutually exclusive per resize), so the observed **47** are later resizes triggered by relayout as siblings appear and disappear. `Failed to send resize signal` (**27**) is the race being provoked: a `resize_pty` for a window id that the C child registry no longer holds. `fd unexpectedly closed` was **0** — that `POLLNVAL` edge path (which exists in the code) did not trigger in this run; this is reported honestly and explained in O5.
+Interpreting these counts (this interpretation is grounded in `kitty/window.py:861-873`, quoted in O1): `Child launched` is printed **once per window, on that window's first resize only** — the observed **20** exactly matches the 20 launched windows. `SIGWINCH sent to child` is printed on **subsequent** resizes (the two prints are mutually exclusive per resize), so the observed **48** are later resizes triggered by relayout as siblings appear and disappear. `Failed to send resize signal` (**21**) is the race being provoked: a `resize_pty` for a window id that the C child registry no longer holds. `fd unexpectedly closed` was **0** — that `POLLNVAL` edge path (which exists in the code) did not trigger in this run; this is reported honestly and explained in O5.
 
 ### Environment caveats (required disclosures)
 
-- **No display → headless `Xvfb`.** OpenGL is provided by Mesa software rasterization (the run log records `GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2'`).
+- **No display → headless `Xvfb`.** OpenGL is provided by Mesa software rasterization, recorded in the run log:
+
+  **COMMAND:**
+  ```bash
+  grep -n 'GL version string' /tmp/blitzy_obs/run.log
+  ```
+  **OUTPUT:**
+  ```text
+  113:[0.136] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
+  ```
 - **Wayland backend disabled.** The build prints `Disabling building of wayland backend` (quoted above) because `wayland-protocols >= 1.17` is absent; the run is therefore X11-only.
 - **Remote control not used.** Churn is driven by a startup `--session` file rather than by `kitty @` remote control. (Note: contrary to some environment notes, the Go `kitten` binary *was* built here at `kitty/launcher/kitten`; remote control was nonetheless deliberately avoided in favor of the deterministic session file.)
 - **Python version.** The build and run succeed on this environment's **Python 3.13.7**. For reference, `pyproject.toml:2` declares `requires-python = ">=3.8"`, and the CI matrix in `.github/workflows/ci.yml` builds/tests on `"3.8"` (`:26`), `"3.9"` (`:34`), and `"3.10"` (`:30`), with docs/lint on `"3.11"` (`:85`).
-- **One harmless startup line.** The run prints `[0.188] Failed to open systemd user bus with error: Connection refused` — expected under `Xvfb` (no systemd session bus) and unrelated to the window/signal machinery.
+- **One harmless startup line.** The run prints a single systemd-bus warning:
+
+  **COMMAND:**
+  ```bash
+  grep -n 'Failed to open systemd user bus' /tmp/blitzy_obs/run.log
+  ```
+  **OUTPUT:**
+  ```text
+  2:[0.169] Failed to open systemd user bus with error: Connection refused
+  ```
+  This is expected under `Xvfb` (no systemd session bus) and is unrelated to the window/signal machinery.
 
 ---
 
@@ -198,11 +257,21 @@ Every resize is dispatched from `kitty/window.py`. The dispatch is guarded so it
                     print(f'[{now:.3f}] Child launched', file=sys.stderr)
 ```
 
-**OBSERVED EVIDENCE (run.log:3,5,7 — `Child launched` printed once per window on first resize; 20 total == 20 windows):**
+**OBSERVED EVIDENCE (`/tmp/blitzy_obs/run.log` lines 3,5,7 — `Child launched` printed once per window on first resize; 20 total == 20 windows):**
 ```text
-[0.190] Child launched
-[0.196] Child launched
-[0.205] Child launched
+[0.171] Child launched
+[0.176] Child launched
+[0.183] Child launched
+```
+
+The producing command (line numbers + content, so the reference is self-contained):
+```bash
+grep -n 'Child launched' /tmp/blitzy_obs/run.log | head -3
+```
+```text
+3:[0.171] Child launched
+5:[0.176] Child launched
+7:[0.183] Child launched
 ```
 
 ### Step 5 — The C resize issues `ioctl(TIOCSWINSZ)`, and the kernel delivers `SIGWINCH`
@@ -223,11 +292,14 @@ pty_resize(int fd, struct winsize *dim) {
                 print(f'[{monotonic():.3f}] SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}', file=sys.stderr)
 ```
 
-**OBSERVED EVIDENCE (run.log:4,6,8 — subsequent resizes; 47 total):**
+**OBSERVED EVIDENCE (`/tmp/blitzy_obs/run.log` lines 4,6,8 — subsequent resizes; 48 total):**
+```bash
+grep -n 'SIGWINCH sent to child' /tmp/blitzy_obs/run.log | head -3
+```
 ```text
-[0.196] SIGWINCH sent to child in window: 1 with size: (22, 34, 306, 396)
-[0.204] SIGWINCH sent to child in window: 2 with size: (11, 35, 315, 198)
-[0.214] SIGWINCH sent to child in window: 1 with size: (11, 34, 306, 198)
+4:[0.176] SIGWINCH sent to child in window: 1 with size: (22, 34, 306, 396)
+6:[0.182] SIGWINCH sent to child in window: 2 with size: (11, 35, 315, 198)
+8:[0.191] SIGWINCH sent to child in window: 1 with size: (11, 34, 306, 198)
 ```
 
 **Summary of O1:** create → `add_child` registers `window.id` in both the C monitor and the Python `WeakValueDictionary` → PTY allocated (`openpty`, master fd + pid stored) → first layout resize marks the child launched (`Child launched`) → `resize_pty` → `ioctl(TIOCSWINSZ)` → kernel `SIGWINCH`; later resizes print `SIGWINCH sent to child in window: N`.
@@ -251,14 +323,29 @@ Because layout keeps issuing resizes as siblings churn, a `resize_pty(id, ...)` 
     } else log_error("Failed to send resize signal to child with id: %lu (children count: %u) (add queue: %zu)", window_id, self->count, add_queue_count);
 ```
 
-**OBSERVED EVIDENCE (run.log:17,19,23 — a departed-window resize; 27 total in this run):**
+**OBSERVED EVIDENCE (`/tmp/blitzy_obs/run.log` lines 21,38,45 — a departed-window resize; 21 total in this run):**
+```bash
+grep -n 'Failed to send resize signal' /tmp/blitzy_obs/run.log | head -3
+```
 ```text
-[0.256] Failed to send resize signal to child with id: 6 (children count: 4) (add queue: 0)
-[0.257] Failed to send resize signal to child with id: 7 (children count: 4) (add queue: 0)
-[0.262] Failed to send resize signal to child with id: 3 (children count: 4) (add queue: 0)
+21:[0.231] Failed to send resize signal to child with id: 3 (children count: 6) (add queue: 0)
+38:[0.301] Failed to send resize signal to child with id: 14 (children count: 5) (add queue: 0)
+45:[0.328] Failed to send resize signal to child with id: 18 (children count: 7) (add queue: 0)
 ```
 
-Note the reported `(children count: 4)` and `(add queue: 0)`: the id is in neither structure — the child left the registry, yet a resize for it was still in flight. Across the run the `children count` in these lines decreases `4 → 3 → 2 → 1` as more children die while relayout keeps dispatching resizes to them.
+Note the reported `(children count: N)` and `(add queue: 0)`: the id is in neither structure — the child left the registry, yet a resize for it was still in flight. The `children count` field is the size of the live `children[]` array *at the instant each failed resize was logged*. The full sequence of those counts across the run's 21 failed-resize lines, in log order, is produced by:
+
+**COMMAND:**
+```bash
+grep -oE 'children count: [0-9]+' /tmp/blitzy_obs/run.log | grep -oE '[0-9]+' | tr '\n' ' '; echo
+```
+
+**OUTPUT:**
+```text
+6 5 7 6 5 5 5 5 5 5 5 5 4 4 4 4 4 4 4 1 1
+```
+
+The distinct values observed are **7, 6, 5, 4, 1**. Note the sequence is *not* monotonic (it rises `6 → 5 → 7` early on): because layout dispatches resizes while children are still being **added** (later tabs filling) *and* being **removed** (early windows already dying) concurrently, the live count both grows and shrinks during the burst. By the end it collapses to **1** as the registry sheds the last dying children while relayout keeps dispatching resizes to them.
 
 ### Case B — A `SIGCHLD` reaped after the window was already removed (the death arrives after the window left the Python map)
 
@@ -273,9 +360,39 @@ The mirror case: the child dies and its death is delivered to Python as `on_chil
             return
 ```
 
-**OBSERVED EVIDENCE:** In this run `close_on_child_death=yes` drove every window's teardown; the process reached `main loop exiting` and exited with status `0` (run.log tail, quoted in O5) — no traceback or crash from a death arriving for an already-removed window. `on_child_death` returning on `window is None` is the guard that makes a late/duplicate death a no-op.
+**Is this `pop → None` branch actually taken in the churn run?** This is a *source-verified conflict path*, and to report honestly I instrumented it directly rather than inferring it from exit status. Using a temporary `usercustomize.py` (injected via `PYTHONPATH`, outside the repository) I wrapped `Boss.on_child_death` to record, for every death, whether the window id was still present in `window_id_map` *before* the `pop` (present) or already gone (would make `pop` return `None`, i.e. absent):
 
-**Summary of O2:** whichever side is "late," the operation is a benign skip: a resize for a vanished child logs `Failed to send resize signal to child with id: N` and returns; a death for a vanished window hits `pop(window_id, None) → None` and returns.
+**COMMAND:**
+```bash
+# usercustomize.py wraps Boss.on_child_death: present = (window_id in self.window_id_map) before pop
+timeout 90 env PYTHONPATH=/tmp/blitzy_obs/inject ./kitty/launcher/kitty --config NONE \
+    --debug-rendering -o close_on_child_death=yes -o confirm_os_window_close=0 \
+    --session /tmp/blitzy_obs/session.conf > /tmp/blitzy_obs/run_instrumented.log 2>&1
+echo "on_child_death calls    : $(grep -cF '[OBS] on_child_death' /tmp/blitzy_obs/run_instrumented.log)"
+echo "PRESENT                 : $(grep -F '[OBS] on_child_death' /tmp/blitzy_obs/run_instrumented.log | grep -c PRESENT)"
+echo "ABSENT (pop returns None): $(grep -F '[OBS] on_child_death' /tmp/blitzy_obs/run_instrumented.log | grep -c ABSENT)"
+```
+
+**OUTPUT:**
+```text
+on_child_death calls    : 20
+PRESENT                 : 20
+ABSENT (pop returns None): 0
+```
+
+Representative per-death records (verbatim `[OBS]` lines; `grep -oE '\[OBS\] on_child_death.*'` strips interleaved stderr):
+
+**OUTPUT:**
+```text
+[OBS-INJECT] patched Boss.on_child_death OK
+[OBS] on_child_death(window_id=3) PRESENT calls=1 present=1 absent=0
+[OBS] on_child_death(window_id=8) PRESENT calls=10 present=10 absent=0
+[OBS] on_child_death(window_id=20) PRESENT calls=20 present=20 absent=0
+```
+
+So in **this** run all **20** deaths found the window still present, and `pop` returned the window every time — the `pop → None` branch was **not directly exercised** by this churn (`ABSENT = 0`). That is the honest, observed result: the discard branch is a **source-verified conflict path** that guards against a death arriving for an already-removed window (a double-notify or a manual close racing the reap), but the specific ordering that yields `None` did not occur in the captured run. What the run *does* confirm is that the surrounding teardown is benign: the process reached `main loop exiting` and exited with status `0` (quoted in O5), with no traceback from any death/removal interleaving.
+
+**Summary of O2:** whichever side is "late," the operation is a benign skip: a resize for a vanished child logs `Failed to send resize signal to child with id: N` and returns (Case A, directly observed **21×**); a death for a vanished window would hit `pop(window_id, None) → None` and return (Case B, a source-verified guard; in this run `on_child_death` fired **20×**, all with the window still **present**, so the `None` branch was not taken).
 
 ---
 
@@ -292,7 +409,7 @@ The Python window registry holds only **weak** references, so once no strong ref
         self.window_id_map: WeakValueDictionary[int, Window] = WeakValueDictionary()
 ```
 
-This is why a stale `on_child_death` (O2 Case B) finds `None`: the window object was already collected, so `pop` returns nothing. The weak map is the "discard" side for the Python layer.
+This is why a stale `on_child_death` (O2 Case B) *would* find `None`: if the window object was already collected, `pop` returns nothing. The weak map is the "discard" side for the Python layer. (As the O2 Case B instrumentation shows, this `None` branch is a source-verified guard that was not itself triggered in the captured run — every one of the 20 deaths found the window still present.)
 
 ### Decision 2 — The C side flags a departing child with `needs_removal` (id-correlated `Child` record)
 
@@ -338,7 +455,7 @@ Below the boss, each tab tracks its own windows in a `WindowList` with `add_wind
         self.id_map: Dict[int, WindowType] = {}
 ```
 
-**OBSERVED EVIDENCE for O3:** windows are dropped cleanly and the whole session tears down without hanging or leaking — the run ends with `main loop exiting` (run.log tail, quoted in O5) and exit status `0`. Tying this to `close_on_child_death=yes`: each child death removes its window; when the last window of the OS window is gone, the loop exits. The decreasing `(children count: 4 → 3 → 2 → 1)` in the O2 evidence is the C registry shedding dead children in real time.
+**OBSERVED EVIDENCE for O3:** windows are dropped cleanly and the whole session tears down without hanging or crashing — the run ends with `main loop exiting` and exit status `0` (both quoted in O4/O5). Tying this to `close_on_child_death=yes`: each child death removes its window; when the last window of the OS window is gone, the loop exits. The `children count` values in the O2 evidence (produced above by the `children count: N` extraction command: `6 5 7 6 5 5 5 5 5 5 5 5 4 4 4 4 4 4 4 1 1`, distinct **7, 6, 5, 4, 1**) are the C registry shedding dead children in real time.
 
 
 ---
@@ -358,31 +475,122 @@ The `SIGWINCH sent to child` line is prefixed with a monotonic timestamp at 3-de
 
 The timing source is `kitty/monotonic.h` (`MONOTONIC_T_1e6` at `:15`, `MONOTONIC_T_1e3` at `:16`), i.e. the `[s.mmm]` prefix on every line.
 
-### Asynchronous, flag-only signal handling via a self-pipe
+### Asynchronous signal arrival, flag-only handling — via `signalfd` on Linux (self-pipe is the non-Linux fallback)
 
-Signals are handled in C on the I/O thread through a self-pipe: the async signal handler writes a byte to a pipe, and the loop later drains it with `read_signals`:
+Signals arrive **asynchronously** (a child can exit at any instant), but kitty never services them inside an async signal handler that touches shared state. *How* the asynchronous arrival is funneled onto the I/O thread is decided at **compile time** by whether `<sys/signalfd.h>` exists:
 
-**SOURCE — `kitty/loop-utils.c:12,22` (the write side of the self-pipe):**
+**SOURCE — `kitty/loop-utils.h:14-18` (the platform switch that defines `HAS_SIGNAL_FD`):**
 ```c
-static int signal_write_fd = -1;
+#ifdef __has_include
+#if __has_include(<sys/signalfd.h>)
+#define HAS_SIGNAL_FD
+#include <sys/signalfd.h>
+#endif
 ```
+
+On **Linux — which is this run's platform — `HAS_SIGNAL_FD` is defined**, so kitty does *not* install an async `sigaction` handler at all. Instead it **blocks** the handled signals process-wide with `sigprocmask(SIG_BLOCK, …)` and reads them synchronously from a pollable `signalfd` file descriptor:
+
+**SOURCE — `kitty/loop-utils.c:39-42` (the `signalfd` branch — the path taken on Linux):**
 ```c
-        ssize_t ret = write(signal_write_fd, buf, sz);
+#ifdef HAS_SIGNAL_FD
+    if (ld->num_handled_signals) {
+        if (sigprocmask(SIG_BLOCK, &ld->signals, NULL) == -1) return false;
+        ld->signal_read_fd = signalfd(-1, &ld->signals, SFD_NONBLOCK | SFD_CLOEXEC);
 ```
 
-**SOURCE — `kitty/loop-utils.c:131` (the drain side, run on the I/O thread):**
+Only on platforms **without** `signalfd` (the `#else` branch — e.g. macOS/BSD) does kitty fall back to the classic **self-pipe trick**: an async `sigaction` handler writes the signal to a pipe whose read end the loop drains. This branch is *not* compiled on Linux:
+
+**SOURCE — `kitty/loop-utils.c:45-54` (the `#else` self-pipe fallback):**
 ```c
+#else
+    ld->signal_fds[0] = -1; ld->signal_fds[1] = -1;
+    if (ld->num_handled_signals) {
+        if (!self_pipe(ld->signal_fds, true)) return false;
+        signal_write_fd = ld->signal_fds[1];
+        ld->signal_read_fd = ld->signal_fds[0];
+        struct sigaction act = {.sa_sigaction=handle_signal, .sa_flags=SA_SIGINFO | SA_RESTART, .sa_mask = ld->signals};
+        for (size_t i = 0; i < ld->num_handled_signals; i++) { if (sigaction(ld->handled_signals[i], &act, NULL) != 0) return false; }
+    }
+#endif
+```
+
+Either way the loop drains the read fd with `read_signals`; on Linux the `HAS_SIGNAL_FD` branch decodes `struct signalfd_siginfo` records:
+
+**SOURCE — `kitty/loop-utils.c:130-133`:**
+```c
+void
 read_signals(int fd, handle_signal_func callback, void *data) {
+#ifdef HAS_SIGNAL_FD
+    static struct signalfd_siginfo fdsi[32];
 ```
 
-The handled set includes `SIGCHLD`:
+I confirmed the `signalfd` branch is the one actually compiled and running here with **two independent checks**.
+
+**(1)** The preprocessor decision, using the same guard as `loop-utils.h`:
+
+**COMMAND:**
+```bash
+cat > /tmp/blitzy_obs/probe_signalfd.c <<'C'
+#include <stdio.h>
+#ifdef __has_include
+#  if __has_include(<sys/signalfd.h>)
+#    define HAS_SIGNAL_FD
+#  endif
+#else
+#  define HAS_SIGNAL_FD
+#endif
+int main(void){
+#ifdef HAS_SIGNAL_FD
+    printf("HAS_SIGNAL_FD=1\n");
+#else
+    printf("HAS_SIGNAL_FD=0\n");
+#endif
+    return 0; }
+C
+cc /tmp/blitzy_obs/probe_signalfd.c -o /tmp/blitzy_obs/probe_signalfd && /tmp/blitzy_obs/probe_signalfd
+```
+
+**OUTPUT:**
+```text
+HAS_SIGNAL_FD=1
+```
+
+**(2)** The *running* emulator actually holds a `signalfd`. With one long-lived window keeping kitty alive, its `/proc/$PID/fd` (the command below resolves `$PID` via `pgrep`) shows a `signalfd` descriptor and the descriptor's `fdinfo` reveals the exact watched-signal mask:
+
+**COMMAND:**
+```bash
+PID=$(pgrep -f 'launcher/kitty --config NONE' | head -1)
+ls -l /proc/$PID/fd | grep -i signalfd
+for f in /proc/$PID/fdinfo/*; do grep -q '^sigmask:' "$f" && { echo "fd $(basename $f) -> $(readlink /proc/$PID/fd/$(basename $f))"; grep '^sigmask:' "$f"; }; done
+```
+
+**OUTPUT:**
+```text
+lrwx------ 1 root root 64 Jul  1 22:27 7 -> anon_inode:[signalfd]
+fd 7 -> anon_inode:[signalfd]
+sigmask:	0000000000014a03
+```
+
+That `sigmask` decodes to exactly kitty's handled-signal set — including `SIGCHLD`:
+
+**COMMAND:**
+```bash
+python3 -c "import signal; m=0x14a03; print(', '.join(signal.Signals(b+1).name for b in range(64) if m&(1<<b)))"
+```
+
+**OUTPUT:**
+```text
+SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM, SIGCHLD
+```
+
+which is precisely `KITTY_HANDLED_SIGNALS`:
 
 **SOURCE — `kitty/child-monitor.c:121`:**
 ```c
 #define KITTY_HANDLED_SIGNALS SIGINT, SIGHUP, SIGTERM, SIGCHLD, SIGUSR1, SIGUSR2, 0
 ```
 
-Crucially, the handler does **no real work** — it only sets boolean flags in a `SignalSet`, so signal delivery can never race with data-structure mutation:
+Crucially, whichever transport a platform uses, the per-signal callback does **no real work** — it only sets boolean flags in a `SignalSet`, so signal handling can never race with child-registry mutation:
 
 **SOURCE — `kitty/child-monitor.c:1359-1372`:**
 ```c
@@ -400,6 +608,13 @@ handle_signal(const siginfo_t *siginfo, void *data) {
         case SIGCHLD:
             ss->child_died = true;
             break;
+```
+
+The callback is invoked from the I/O-thread loop, which reads the signal fd and then acts on the flags:
+
+**SOURCE — `kitty/child-monitor.c:1519`:**
+```c
+                read_signals(children_fds[1].fd, handle_signal, &ss);
 ```
 
 ### `SIGCHLD` coalescing: one signal, a `waitpid(-1, …, WNOHANG)` loop reaps all
@@ -443,25 +658,60 @@ The main thread only **queues** mutations (`add_child` appends to `add_queue`; c
 
 The event-loop build makes each tick observable:
 
-**OBSERVED EVIDENCE (run.log:111-112 — a loop tick and clean shutdown):**
+**OBSERVED EVIDENCE (`/tmp/blitzy_obs/run.log` lines 111-112 — the last loop tick immediately followed by clean shutdown; the `Processing global state…` prefix on line 112 is a harmless stderr-interleaving artifact):**
+```bash
+grep -nE 'loop tick, wakeups_happened|main loop exiting' /tmp/blitzy_obs/run.log | tail -2
+```
 ```text
-[0.462] --------- loop tick, wakeups_happened: 1 ----------
-Processing global stateinput_read: 0, check_for_active_animated_images: 0[0.471] main loop exiting
+111:[0.441] --------- loop tick, wakeups_happened: 1 ----------
+112:Processing global stateinput_read: 0, check_for_active_animated_images: 0[0.448] main loop exiting
 ```
 
 ### The timing race, captured in a single millisecond
 
 The clearest timing evidence is a **same-millisecond pair**: within one relayout pass, the C `resize_pty` cannot find the id (the child already left `children[]`, and its removal has been applied) so it logs `Failed to send resize signal`, and in the *same* Python dispatch the `elif debug_rendering` branch still prints `SIGWINCH sent to child` for that same id. The C view (gone) and the Python view (alive) disagree in the same millisecond:
 
-**OBSERVED EVIDENCE (run.log:17-18 — identical `[0.256]` timestamp, identical id 6):**
+**OBSERVED EVIDENCE (`/tmp/blitzy_obs/run.log` lines 21-22 — identical `[0.231]` timestamp, identical id 3):**
+```bash
+sed -n '21p;22p' /tmp/blitzy_obs/run.log
+```
 ```text
-[0.256] Failed to send resize signal to child with id: 6 (children count: 4) (add queue: 0)
-[0.256] SIGWINCH sent to child in window: 6 with size: (11, 34, 306, 198)
+[0.231] Failed to send resize signal to child with id: 3 (children count: 6) (add queue: 0)
+[0.231] SIGWINCH sent to child in window: 3 with size: (10, 35, 315, 180)
 ```
 
-This exact adjacency (a `Failed to send resize signal to child with id: N` immediately followed by a same-timestamp `SIGWINCH sent to child in window: N` for the same `N`) occurred **25 times** in this run; other instances include id 7 at `[0.257]`, id 3 at `[0.262]`, id 11 at `[0.307]`, and id 14 at `[0.334]`. The measured timestamp delta within each pair is **0 ms** (both prints are in the same synchronous relayout, straddling the C boundary where the registries disagree).
+To measure how often this exact adjacency occurs (a `Failed…` line immediately followed by a same-timestamp `SIGWINCH…` for the same id) and the timestamp delta within each pair, the run log was analyzed with a temporary script:
 
-**Summary of O4:** signals are async, coalesced, and flag-only (`handle_signal` → `child_died`; `waitpid(-1,…,WNOHANG)` loop); all registry mutation is synchronous and serialized at the tick top (`remove_children` then `add_children` under `children_lock`); the `[s.mmm]` prefixes expose the disagreement in time.
+**COMMAND:**
+```bash
+python3 - /tmp/blitzy_obs/run.log <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+ts    = re.compile(r'\[(\d+\.\d+)\]')
+fail  = re.compile(r'Failed to send resize signal to child with id: (\d+)')
+winch = re.compile(r'SIGWINCH sent to child in window: (\d+)')
+pairs = []
+for i in range(len(lines) - 1):
+    f, tf = fail.search(lines[i]), ts.search(lines[i])
+    w, tw = winch.search(lines[i+1]), ts.search(lines[i+1])
+    if f and tf and w and tw and f.group(1) == w.group(1) and tf.group(1) == tw.group(1):
+        pairs.append((tf.group(1), f.group(1), round((float(tw.group(1)) - float(tf.group(1))) * 1000, 3)))
+print("same_ms_same_id_adjacent_pairs =", len(pairs))
+print("distinct_delta_ms              =", sorted({p[2] for p in pairs}))
+print("first_pairs (ts,id,delta_ms)   =", pairs[:4])
+PY
+```
+
+**OUTPUT:**
+```text
+same_ms_same_id_adjacent_pairs = 20
+distinct_delta_ms              = [0.0]
+first_pairs (ts,id,delta_ms)   = [('0.231', '3', 0.0), ('0.301', '14', 0.0), ('0.328', '18', 0.0), ('0.340', '18', 0.0)]
+```
+
+So this same-millisecond disagreement occurred **20 times** in this run, and the measured timestamp delta within every pair is **0.0 ms** (`distinct_delta_ms = [0.0]`) — both prints land in the same synchronous relayout pass, straddling the C boundary where the two registries momentarily disagree.
+
+**Summary of O4:** signals arrive asynchronously and coalesce, but on Linux they are blocked (`sigprocmask`) and drained synchronously from a `signalfd` on the I/O thread (self-pipe only on non-`signalfd` platforms), where the callback is flag-only (`handle_signal` → `child_died`; then the `waitpid(-1,…,WNOHANG)` loop); all registry mutation is synchronous and serialized at the tick top (`remove_children` then `add_children` under `children_lock`); the `[s.mmm]` prefixes expose the disagreement in time.
 
 ---
 
@@ -478,9 +728,12 @@ When a resize targets an id absent from both `children[]` and `add_queue[]`, `re
     } else log_error("Failed to send resize signal to child with id: %lu (children count: %u) (add queue: %zu)", window_id, self->count, add_queue_count);
 ```
 
-**OBSERVED EVIDENCE (run.log:17):**
+**OBSERVED EVIDENCE (`/tmp/blitzy_obs/run.log` line 21):**
+```bash
+sed -n '21p' /tmp/blitzy_obs/run.log
+```
 ```text
-[0.256] Failed to send resize signal to child with id: 6 (children count: 4) (add queue: 0)
+[0.231] Failed to send resize signal to child with id: 3 (children count: 6) (add queue: 0)
 ```
 
 ### Resolution point 2 — `on_child_death` pop→`None` discard (Python thinks the window is gone)
@@ -494,14 +747,20 @@ When a death arrives for a window no longer in the map, `pop(window_id, None)` y
             return
 ```
 
+As reported under O2 Case B, this resolution point is a **source-verified conflict path**: direct instrumentation of `on_child_death` in the churn run recorded 20 deaths, **all** with the window still present (`ABSENT (pop returns None): 0`), so the `None`-discard branch guards against a race (double-notify / manual-close-vs-reap) that this particular run did not provoke. Resolution point 1 (the `resize_pty` id-not-found skip), by contrast, *was* directly observed **21×**.
+
 ### Both resolve benignly — proven by exit status 0
 
-The decisive evidence that these conflicts resolve without crashing is that the process completed normally despite **27** `Failed to send resize signal` conflicts:
+The decisive evidence that these conflicts resolve without crashing is that the process completed normally despite **21** `Failed to send resize signal` conflicts:
 
-**OBSERVED EVIDENCE (exit status + clean shutdown):**
+**OBSERVED EVIDENCE (exit status + clean shutdown marker):**
+```bash
+cat /tmp/blitzy_obs/kitty_exit.txt
+grep -o '\[[0-9.]*\] main loop exiting' /tmp/blitzy_obs/run.log
+```
 ```text
 KITTY_EXIT=0
-[0.471] main loop exiting
+[0.448] main loop exiting
 ```
 
 ### Edge cases that feed the same discard path (with evidence, including one honestly-absent line)
@@ -519,7 +778,17 @@ KITTY_EXIT=0
                           children[i].needs_removal = true;
   ```
 
-  `read_bytes` (`kitty/child-monitor.c:1337`) returns `len != 0` (`kitty/child-monitor.c:1355`), i.e. false at EOF. This is the normal teardown path exercised throughout this run (every one of the 20 short-lived children ended this way, driving the observed removals).
+  `read_bytes` (`kitty/child-monitor.c:1337`) returns `len != 0` (`kitty/child-monitor.c:1355`), i.e. false at EOF — a **source-described** removal path that sets `needs_removal`. Whether this branch fired for every child cannot be asserted here: this run was launched with `close_on_child_death=yes`, which enables a **second** removal trigger — when a child exits, `reap_children` reaps it by pid and calls `mark_child_for_removal(self, pid)`:
+
+  **SOURCE — `kitty/child-monitor.c:1418,1422` (the `SIGCHLD`-reap removal path enabled by `close_on_child_death`):**
+  ```c
+          pid = waitpid(-1, &status, WNOHANG);
+  ```
+  ```c
+              if (enable_close_on_child_death) mark_child_for_removal(self, pid);
+  ```
+
+  Both the PTY-EOF branch and the `SIGCHLD`-reap branch converge on the same `needs_removal` flag, so from the outside the removal is observed but *which* branch fired first for a given child cannot be distinguished without instrumenting the C loop (which the read-only scope forbids). What **is** directly observable is that all 20 children were removed and their deaths delivered — `on_child_death` fired **20×** (instrumented under O2 Case B) — and that the invalid-fd `POLLNVAL` branch did **not** fire (`0`, shown below). This document therefore does **not** claim all 20 children exited specifically via the EOF branch; it reports EOF as a source-verified path and the `SIGCHLD`-reap path as the trigger that `close_on_child_death=yes` explicitly enables.
 
 - **Unexpectedly-closed fd (`POLLNVAL`).** If a child's fd is found invalid, it is flagged for removal and a specific line is logged:
 
@@ -533,12 +802,19 @@ KITTY_EXIT=0
                       log_error("The child %lu had its fd unexpectedly closed", children[i].id);
   ```
 
-  **OBSERVED EVIDENCE (honest null result):** this line did **not** appear in this run:
+  **OBSERVED EVIDENCE (honest null result):** this line did **not** appear in this run.
+
+  **COMMAND:**
+  ```bash
+  grep -c 'had its fd unexpectedly closed' /tmp/blitzy_obs/run.log
+  ```
+
+  **OUTPUT:**
   ```text
-  $ grep -c 'had its fd unexpectedly closed' run.log
   0
   ```
-  Reported exactly as observed (rule: report even absence): the `POLLNVAL` path exists and its literal is compiled into `fast_data_types.so`, but under `Xvfb` with `close_on_child_death=yes` the children closed cleanly via `POLLIN|POLLHUP` EOF, not via an invalidated fd, so this branch was not exercised.
+
+  Reported exactly as observed (rule: report even absence): the `POLLNVAL` path exists and its literal is compiled into `fast_data_types.so` (proven by the `strings` check in "How this was observed"), but it was not exercised in this run — the children's fds were never found invalid. How the teardown *was* driven is analyzed just below.
 
 - **Shutdown (mark all, then remove).** At loop shutdown every remaining child is flagged and removed in one pass:
 
@@ -548,7 +824,7 @@ KITTY_EXIT=0
     remove_children(self);
   ```
 
-  The corresponding observed end-of-run marker is `[0.471] main loop exiting` (quoted above).
+  The corresponding observed end-of-run marker is `[0.448] main loop exiting` (quoted above).
 
 - **Supporting removal helpers.** By pid on reap: `mark_child_for_removal` (`kitty/child-monitor.c:1386`); on a UI close request: `mark_child_for_close` (`kitty/child-monitor.c:541`), which scans `children[]` then `add_queue[]` and sets `needs_removal`; and `hangup` (`kitty/child-monitor.c:1294`) delivers `SIGHUP` to the child's process group during removal. All roads set the same `needs_removal` flag consumed by `remove_children` (`kitty/child-monitor.c:1313`) at the next tick.
 
@@ -562,7 +838,7 @@ KITTY_EXIT=0
 kitty's design aligns with well-established systems-programming practice; its own code and the observed behavior above remain the source of truth. Three alignments are worth naming:
 
 - **`SIGCHLD` reaping with a `waitpid(-1, …, WNOHANG)` loop.** Because Unix does not queue `SIGCHLD`, the canonical remedy for a burst of exits is to loop `waitpid` with `WNOHANG` until it stops returning positive pids. kitty does exactly this at `kitty/child-monitor.c:1418`, so a coalesced signal still reaps every child.
-- **Async-signal-safe, self-pipe/flag-only handler.** Best practice is that a signal handler should defer real work — only set a flag or write to a pipe. kitty's `handle_signal` sets only `SignalSet` booleans (`kitty/child-monitor.c:1359-1372`) and the real work runs later on the I/O thread after `read_signals` (`kitty/loop-utils.c:131`) drains the self-pipe.
+- **Async-signal-safe, flag-only handling — via `signalfd` on Linux.** Best practice is that signal work be deferred off the async-handler context — only set a flag or drain a descriptor on the event loop. On Linux kitty goes further than the self-pipe trick: it blocks the handled signals (`sigprocmask(SIG_BLOCK, …)`) and reads them from a pollable `signalfd` (`kitty/loop-utils.c:39-42`; `HAS_SIGNAL_FD` guard at `kitty/loop-utils.h:14-18`), reserving the classic self-pipe + `sigaction` handler for non-`signalfd` platforms (`kitty/loop-utils.c:45-54`, the `#else` branch). Either transport funnels into the flag-only callback `handle_signal`, which sets only `SignalSet` booleans (`kitty/child-monitor.c:1359-1372`); the real work runs later on the I/O thread after `read_signals` (`kitty/loop-utils.c:130-133`) drains the fd. The `signalfd` path is the one observed here (`HAS_SIGNAL_FD=1`; `/proc/$PID/fd/7 -> anon_inode:[signalfd]`).
 - **`TIOCSWINSZ`-driven `SIGWINCH`.** The kernel auto-delivers `SIGWINCH` to a PTY's foreground process group only when the size actually changes via `TIOCSWINSZ`; kitty issues exactly that ioctl in `pty_resize` (`kitty/child-monitor.c:579`), and guards the dispatch behind a size-changed check (`kitty/window.py:861`) so redundant resizes are suppressed.
 
 The single most important structural choice — the **queue-and-apply** split (async signals set flags; the I/O thread applies queued adds/removes synchronously under `children_lock` at the top of each tick, `kitty/child-monitor.c:1491-1494`) — is what keeps the two liveness views from corrupting shared state even while they momentarily disagree (O4/O5).
@@ -575,9 +851,9 @@ Every distinct thing the question names is addressed below, each with its sectio
 
 **Question clauses:**
 
-- **"terminal windows appear, resize, and disappear in quick succession"** — the whole document; provoked by the 5-tab / 20-short-lived-window `--session` run (see "How this was observed"). Appear = `Child launched` ×20; resize = `SIGWINCH sent to child` ×47; disappear = `close_on_child_death=yes` teardown ending in `main loop exiting`.
+- **"terminal windows appear, resize, and disappear in quick succession"** — the whole document; provoked by the 5-tab / 20-short-lived-window `--session` run (see "How this was observed"). Appear = `Child launched` ×20; resize = `SIGWINCH sent to child` ×48; disappear = `close_on_child_death=yes` teardown ending in `main loop exiting`.
 - **"a new window is created and immediately used to run a command"** — **O1** (each `launch` window runs `sh -c "…; true"`; `Child launched` at run.log:3,5,7).
-- **"resize events AND signals start flowing"** — **O1** (resize dispatch `kitty/window.py:861-873`) + **O4** (`SIGWINCH` via `TIOCSWINSZ`, `SIGCHLD` via self-pipe). Both resize events and signals are covered explicitly.
+- **"resize events AND signals start flowing"** — **O1** (resize dispatch `kitty/window.py:861-873`) + **O4** (`SIGWINCH` via `TIOCSWINSZ`, `SIGCHLD` delivered through a `signalfd` on Linux — self-pipe on non-`signalfd` platforms). Both resize events and signals are covered explicitly.
 - **"the window is gone before everything has finished reacting"** — **O2** (Case A queued resize for a departed window: `Failed to send resize signal…`; Case B `SIGCHLD` reaped after removal: `on_child_death` pop→`None`).
 - **"how does kitty decide what state to keep and what to discard"** — **O3** (keep = final `do_parse(..., flush=true)` of pending output; discard = `WeakValueDictionary` auto-drop + `needs_removal`).
 - **"how timing affects signal delivery"** — **O4** (async coalesced `SIGCHLD`; flag-only handler; `waitpid` loop).
@@ -592,23 +868,36 @@ Every distinct thing the question names is addressed below, each with its sectio
 | `SIGWINCH` | O1, O4 | `kitty/window.py:873`, `kitty/child-monitor.c:579` (`TIOCSWINSZ`) | `SIGWINCH sent to child in window: 1 …` (run.log:4) |
 | `SIGCHLD` | O4 | `kitty/child-monitor.c:121,1362` | reaped via `child_died` flag → `reap_children` (exit 0) |
 | `TIOCSWINSZ` | O1, best-practice | `kitty/child-monitor.c:579` | drives `SIGWINCH` lines above |
-| `WeakValueDictionary` | O3 | `kitty/boss.py:344` | stale death → `pop → None` return (O2 Case B) |
-| `needs_removal` | O3, O5 | `kitty/child-monitor.c:67,1535,1545,1574` | children count `4→3→2→1` (run.log:17,23,…) |
+| `WeakValueDictionary` | O3 | `kitty/boss.py:344` | auto-drop backs the `pop → None` guard (O2 Case B; source-verified — instrumented `ABSENT=0` this run) |
+| `needs_removal` | O3, O5 | `kitty/child-monitor.c:67,1535,1545,1574` | children count values `6 5 7 6 5 … 4 … 1` (distinct 7,6,5,4,1; run.log:21,38,45,…) |
 | `add_queue` / `remove_queue` | O4 | `kitty/child-monitor.c:1491-1494` (apply), `:305` (queue) | `(add queue: 0)` in the `Failed…` lines |
-| self-pipe / `read_signals` | O4 | `kitty/loop-utils.c:12,22,131` | flag-only handler; loop drains it |
+| `signalfd` (Linux) / self-pipe (fallback) / `read_signals` | O4 | `kitty/loop-utils.h:14-18`, `kitty/loop-utils.c:39-42,45-54,130-133`; call at `kitty/child-monitor.c:1519` | `HAS_SIGNAL_FD=1`; `/proc/$PID/fd/7 -> anon_inode:[signalfd]`; `sigmask 0x14a03` = handled set |
 | `waitpid(-1, …, WNOHANG)` | O4, best-practice | `kitty/child-monitor.c:1418` | coalesced reap; exit 0 |
-| `resize_pty` | O1, O2, O5 | `kitty/child-monitor.c:592,610` | `Failed to send resize signal…` ×27 |
-| `on_child_death` | O2, O5 | `kitty/boss.py:881-885` | benign no-op on `None`; exit 0 |
+| `resize_pty` | O1, O2, O5 | `kitty/child-monitor.c:592,610` | `Failed to send resize signal…` ×21 |
+| `on_child_death` | O2, O5 | `kitty/boss.py:881-885` | instrumented: fired 20×, all `PRESENT`, `pop → None` not taken; `None` branch source-verified; exit 0 |
 
-**Honest null result:** the `POLLNVAL` line `The child %lu had its fd unexpectedly closed` (`kitty/child-monitor.c:1547`) did **not** occur in this run (`grep -c … → 0`); the path exists but was not exercised because children closed via clean EOF (`POLLIN|POLLHUP`).
+**Honest null result:** the `POLLNVAL` line `The child %lu had its fd unexpectedly closed` (`kitty/child-monitor.c:1547`) did **not** occur in this run (`grep -c … → 0`); the invalid-fd path exists but was not exercised. Under `close_on_child_death=yes` each child's exit is removed via the `SIGCHLD`/`reap_children` → `mark_child_for_removal` path (`kitty/child-monitor.c:1418,1422`) and/or the PTY-EOF branch (`POLLIN|POLLHUP`) — both converging on `needs_removal` — neither of which is the invalid-fd `POLLNVAL` condition.
 
-**Evidence discipline:** every count (`47`, `27`, `20`, `1`, `0`, `3`), every timestamp (`[0.256]`, `[0.471]`, …), and the exit status (`0`) is traceable to a pasted `COMMAND` block above and to the captured `/tmp/blitzy_obs/run.log`. Every `file:line` citation was re-grepped against the live tree at branch snapshot `815df1e210e0` before being pasted.
+**Evidence discipline:** every count (`48`, `21`, `20`, `1`, `0`, `4`), every derived value (same-ms pairs `20`, delta `0.0 ms`, children-count sequence), every timestamp (`[0.231]`, `[0.448]`, …), and the exit status (`0`) is traceable to a pasted `COMMAND` block above and to the captured `/tmp/blitzy_obs/run.log`. Every `file:line` citation was re-grepped against the live tree at branch snapshot `815df1e210e0` before being pasted.
 
 ---
 
 ## Reproducibility note
 
-To reproduce: build with `python3 setup.py build --debug --extra-logging=event-loop`; start `Xvfb :99`; then run
-`./kitty/launcher/kitty --config NONE --debug-rendering -o close_on_child_death=yes -o confirm_os_window_close=0 --session <churn-session>`
-with a session file that opens many short-lived windows across several `new_tab`s in `layout grid`. Grep the captured stderr for `Child launched`, `SIGWINCH sent to child`, and `Failed to send resize signal`. Exact counts vary run-to-run with scheduling, but the same **classes** of lines — including same-millisecond `Failed…`/`SIGWINCH…` pairs for one id and a final `main loop exiting` with exit status `0` — reproduce reliably.
+To reproduce, run the three commands below exactly as used to gather this document's evidence — build with event-loop logging, start a headless X server, then run kitty against the churn session file:
+
+**COMMAND:**
+```bash
+# 1. Build with debug + event-loop logging
+python3 setup.py build --debug --extra-logging=event-loop
+# 2. Start a headless X server
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp > /tmp/blitzy_obs/xvfb.log 2>&1 &
+export DISPLAY=:99 TERM=xterm-kitty LANG=C.UTF-8 LC_ALL=C.UTF-8
+# 3. Run kitty under the churn session (5 tabs × 4 short-lived windows = 20 windows, layout grid)
+timeout 90 ./kitty/launcher/kitty --config NONE --debug-rendering \
+    -o close_on_child_death=yes -o confirm_os_window_close=0 \
+    --session /tmp/blitzy_obs/session.conf > /tmp/blitzy_obs/run.log 2>&1
+```
+
+The session file `/tmp/blitzy_obs/session.conf` opens 20 short-lived windows across five `layout grid` tabs (one initial tab plus four `new_tab`s, four `launch sh -c "…; true"` windows each) — the exact 5-tab / 20-window driver used throughout this document. Grep the captured stderr for `Child launched`, `SIGWINCH sent to child`, and `Failed to send resize signal`. Exact counts vary run-to-run with scheduling, but the same **classes** of lines — including same-millisecond `Failed…`/`SIGWINCH…` pairs for one id and a final `main loop exiting` with exit status `0` — reproduce reliably.
 
