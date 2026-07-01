@@ -26,25 +26,35 @@ This document answers six sub-questions, each in its own named section:
 ### 1.2 Investigation premise (read-only + run-the-code-first)
 
 The source tree is treated as **read-only**: no existing file in the repository was
-modified, added, or deleted. The only artifact produced is this Markdown document.
+modified, added, or deleted. The only artifact produced is this Markdown document. This
+is verified with quoted `git` output in §11.6 — the only difference from the source
+baseline `815df1e21` is the addition of this one file, and the working tree is clean
+once it is committed.
 
 Every behavioural, magnitude, or timing claim below is backed by **verbatim output**
 captured by running the *actual* compiled code paths. The observation scripts were
-written under `/tmp/kitty_obs/` (outside the repository tree) and removed after use;
-the repository was verified byte-for-byte unchanged (`git status --porcelain` empty).
+written under `/tmp/kitty_obs/` (outside the repository tree) and removed after use.
 
 ### 1.3 Why the file is named `kitty_815df1e210e0.md`
 
-The deliverable is named for the source branch/commit. The working copy is checked
-out on an operational branch, but the resolved HEAD commit is the source revision
-`815df1e210e0…`, which is the origin of the filename:
+The deliverable is named for the **source revision it documents**, `815df1e210e0…`.
+The working copy is checked out on an operational branch; the source revision is the
+baseline in history against which this document is the only addition (the full
+repository-integrity evidence is in §11.6). The branch name and the identity of the
+source/baseline commit:
 
-```
+```console
 $ git rev-parse --abbrev-ref HEAD
 blitzy-67dd7696-b709-4129-afd9-2c6c534a5de4
-$ git rev-parse HEAD
-815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+$ git log -1 --format='%h %s' 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+815df1e21 Wire up applying of font config
 ```
+
+The current branch is `blitzy-67dd7696-b709-4129-afd9-2c6c534a5de4`; the source
+revision `815df1e21` ("Wire up applying of font config") is the baseline the filename
+derives from and against which the only change is this document (§11.6). (It is *not*
+the current `HEAD`: once this document is committed, `HEAD` advances past the baseline,
+so the stable reference point is the named baseline commit, not a volatile `HEAD`.)
 
 All `file:line` citations in this document refer to the source at commit
 `815df1e210e0…`. Line numbers were re-verified against the on-disk source before
@@ -55,51 +65,92 @@ being quoted; where the pre-scoped line differed from the observed line, the
 
 ## 2. Environment & build evidence
 
-### 2.1 Toolchain
+### 2.1 Toolchain and build
 
 kitty is a three-language system: a **C11** core (compiled into the
 `kitty.fast_data_types` extension module), a **Python** controller/config/kittens
 layer, and **Go** CLI tooling. Building requires a C compiler and the Go compiler —
-<code>docs/build.rst:15</code> states the requirement is "a C compiler and the `go compiler`"; `setup.py:492`
-selects the C standard (`std = '' if is_openbsd else '-std=c11'`); and `go.mod:3`
-pins `go 1.22`. The C extension was already compiled in the container
-(`kitty/fast_data_types.so` present).
+`docs/build.rst:15` states the requirement is "a C compiler and the `go compiler`";
+`setup.py:492` selects the C standard (`std = '' if is_openbsd else '-std=c11'`); and
+`go.mod:3` pins `go 1.22`.
+
+The extension is built with `python setup.py build`. The `--ignore-compiler-warnings`
+flag is required in this container only because gcc 15.2 + wayland-protocols 1.45 add
+enum values not handled in the unrelated glfw Wayland GUI backend — a build-flag
+override, not a source change. Building the C extension succeeds. Because
+`kitty/fast_data_types.so` is a gitignored build artifact, removing it first forces a
+visible re-link without altering the tracked tree:
+
+```console
+$ rm -f kitty/fast_data_types.so
+$ python setup.py build --ignore-compiler-warnings
+[1/1] Linking kitty/fast_data_types ...
+ done
+$ echo "exit=$?"
+exit=0
+```
+
+The build completes with exit status **0** and emits `[1/1] Linking kitty/fast_data_types ...`
+followed by ` done`, regenerating the extension. (A build run when the artifact is
+already up to date is a no-op and prints nothing, also exiting 0.)
 
 ### 2.2 The extension imports, and the parser constants are what the C core defines
 
-Running an in-process script against the built extension confirms the interpreter
-version and the two parser constants that govern the whole clipboard story
-(`/tmp/kitty_obs/obs1_constants.py`):
+**The freshly built extension imports directly, on Python 3.11.15.** Importing it and
+printing the interpreter version:
 
-```
-PYVER: 3.11.15
-VT_PARSER_BUFFER_SIZE: 1048576
-VT_PARSER_MAX_ESCAPE_CODE_SIZE: 262144
-BUF_SZ_is_1MiB: True
-MAX_ESC_is_256KiB: True
-MAX_ESC_eq_BUF/4: True
-clipboard_max_size: 512.0
-clipboard_max_size_type: float
-clipboard_max_size_bytes: 536870912
-get_options_matches: True
+```console
+$ PYTHONPATH=. python -c "import sys, kitty.fast_data_types as f; print('import kitty.fast_data_types ->', f.__name__); print('PYVER', sys.version.split()[0])"
+import kitty.fast_data_types -> kitty.fast_data_types
+PYVER 3.11.15
 ```
 
-- The interpreter is **Python 3.11.15**. CI exercises Python 3.10 and 3.11
-  (`.github/workflows/ci.yml:30`, `.github/workflows/ci.yml:85`).
-- `VT_PARSER_BUFFER_SIZE` is **1048576** = 1 MiB, the parser's double buffer
-  `#define BUF_SZ (1024u*1024u)` at `kitty/vt-parser.c:18` (exported at
-  `kitty/vt-parser.c:1589`).
-- `VT_PARSER_MAX_ESCAPE_CODE_SIZE` is **262144** = 256 KiB, the per-escape cap
-  `#define MAX_ESCAPE_CODE_LENGTH (BUF_SZ / 4u)` at `kitty/vt-parser.c:21` (exported at
-  `kitty/vt-parser.c:1590`); the runtime check `MAX_ESC_eq_BUF/4: True` confirms the
-  `BUF_SZ/4` relationship.
-- `clipboard_max_size` is the float **512.0** (MiB) — i.e. **536870912** bytes. This
-  is the value defined at `kitty/options/types.py:498`
-  (`clipboard_max_size: float = 512.0`). This directly **refutes** the stale external
-  "8 MB" clipboard-limit figure (see §11).
+The interpreter is **Python 3.11.15**. CI exercises Python 3.10 and 3.11
+(`.github/workflows/ci.yml:30`, `.github/workflows/ci.yml:85`).
 
-Using the *observed* integers (1048576, 262144) rather than asserting "1 MiB"/"256 KiB"
-from the `#define`s alone is deliberate: it is the "run the code first" rule in action.
+**`VT_PARSER_BUFFER_SIZE` is 1048576 = 1 MiB — the parser's double buffer.** Reading
+the constant straight from the imported extension:
+
+```console
+$ PYTHONPATH=. python -c "import kitty.fast_data_types as f; v=f.VT_PARSER_BUFFER_SIZE; print('VT_PARSER_BUFFER_SIZE', v); print('is_1_MiB', v == 1024*1024)"
+VT_PARSER_BUFFER_SIZE 1048576
+is_1_MiB True
+```
+
+The observed **1048576** is `#define BUF_SZ (1024u*1024u)` at `kitty/vt-parser.c:18`,
+exported to Python at `kitty/vt-parser.c:1589`.
+
+**`VT_PARSER_MAX_ESCAPE_CODE_SIZE` is 262144 = 256 KiB = `BUF_SZ/4` — the per-escape
+cap.** Reading it and checking the `BUF_SZ/4` relationship at runtime:
+
+```console
+$ PYTHONPATH=. python -c "import kitty.fast_data_types as f; v=f.VT_PARSER_MAX_ESCAPE_CODE_SIZE; print('VT_PARSER_MAX_ESCAPE_CODE_SIZE', v); print('is_256_KiB', v == 256*1024); print('equals_BUFFER_SIZE_div_4', v == f.VT_PARSER_BUFFER_SIZE // 4)"
+VT_PARSER_MAX_ESCAPE_CODE_SIZE 262144
+is_256_KiB True
+equals_BUFFER_SIZE_div_4 True
+```
+
+The observed **262144** is `#define MAX_ESCAPE_CODE_LENGTH (BUF_SZ / 4u)` at
+`kitty/vt-parser.c:21`, exported at `kitty/vt-parser.c:1590`; the
+`equals_BUFFER_SIZE_div_4 True` line confirms the `BUF_SZ/4` relationship live.
+
+**`clipboard_max_size` is the float 512.0 MiB = 536870912 bytes — not the stale
+"8 MB".** Reading it from the options after initialisation:
+
+```console
+$ PYTHONPATH=. python -c "from kitty.fast_data_types import get_options, set_options; from kitty.options.types import Options; set_options(Options()); c=get_options().clipboard_max_size; print('clipboard_max_size', c); print('type', type(c).__name__); print('bytes', int(c*1024*1024))"
+clipboard_max_size 512.0
+type float
+bytes 536870912
+```
+
+`clipboard_max_size` is the float **512.0** (MiB) = **536870912** bytes, the value
+defined at `kitty/options/types.py:498` (`clipboard_max_size: float = 512.0`). This
+directly **refutes** the stale external "8 MB" clipboard-limit figure (see §11).
+
+Reading the *observed* integers (1048576, 262144, 536870912) rather than asserting
+"1 MiB" / "256 KiB" / "8 MB" from a `#define` or an external doc is deliberate — it is
+the "run the code first" rule in action.
 
 ---
 
@@ -112,20 +163,27 @@ other three are pure C. The thread names are set at runtime via `set_thread_name
 
 ### 3.1 The three named threads observed live
 
-Instantiating a `ChildMonitor`, calling `start()`, and triggering a threaded stdin
-write, then reading `/proc/self/task/*/comm`, shows all three named threads plus the
-unnamed main thread (`/tmp/kitty_obs/obs6_threads.py`):
+Instantiating a `ChildMonitor` with a talk fd, calling `start()` (which spawns the I/O
+and talk threads), and spawning a blocked bulk-stdin writer via
+`fast_data_types.thread_write`, then reading `/proc/self/task/*/comm`, shows all three
+named threads plus the unnamed main thread. The script is run via the venv interpreter
+so the main thread's `comm` reflects the interpreter name (`python`):
 
-```
-MAIN_TID: 58452
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs8_threads.py
+MAIN_TID: 94951
 MAIN_THREAD_COMM: python
 NUM_THREADS: 4
-  tid=58452 comm=python (main/GIL-holder)
-  tid=58454 comm=KittyPeerMon
-  tid=58455 comm=KittyChildMon
-  tid=58456 comm=KittyWriteStdin
+  tid=94951 comm=python (main/GIL-holder)
+  tid=94952 comm=KittyPeerMon
+  tid=94953 comm=KittyChildMon
+  tid=94954 comm=KittyWriteStdin
 KITTY_THREAD_NAMES: ['KittyChildMon', 'KittyPeerMon', 'KittyWriteStdin']
 ```
+
+(The thread ids vary per run; the `comm` names and their count do not. Run under the
+`kitty` launcher instead of `python`, the main thread's `comm` is `kitty` — either way
+it is the *unnamed-by-kitty* GIL holder, distinct from the three `Kitty…` worker threads.)
 
 - **`KittyChildMon`** — the I/O thread (`io_loop`), named at `kitty/child-monitor.c:1489`.
   It reads PTY bytes and is **pure C**: it never touches Python objects. It is spawned by
@@ -170,13 +228,14 @@ When PTY output arrives, the pure-C I/O thread `KittyChildMon` reads it into the
 parser's write buffer (`read_bytes` at `kitty/child-monitor.c:1337`) but **never
 touches Python**. The bytes are turned into Python calls only later, on the **main
 thread**, which holds the GIL. That the I/O thread is a distinct, pure-C thread while
-the GIL-holder is a separate unnamed thread is shown directly by the live thread list:
+the GIL-holder is a separate unnamed thread is shown directly by the live thread list
+(the two relevant rows from the `obs8_threads.py` output quoted in full at §3.1):
 
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs8_threads.py   # rows for the main + I/O threads
+  tid=94951 comm=python (main/GIL-holder)
+  tid=94953 comm=KittyChildMon
 ```
-  tid=58452 comm=python (main/GIL-holder)
-  tid=58455 comm=KittyChildMon
-```
-(`/tmp/kitty_obs/obs6_threads.py`)
 
 The actual C→Python call is performed by the `CALLBACK` macro at `kitty/screen.c:87`,
 which invokes `PyObject_CallMethod(self->callbacks, ...)` at `kitty/screen.c:89`. The
@@ -242,16 +301,19 @@ is stored**.
 
 ### 5.1 Small clipboard write — a single, non-partial dispatch that stays in RAM
 
-Feeding the 13-byte sequence `\x1b]52;c;aGk=\x1b\\` (payload `hi`) yields exactly one
-dispatch (`/tmp/kitty_obs/obs2_small.py`):
+Feeding the 13-byte sequence `\x1b]52;c;aGk=\x1b\\` (payload `hi`), with the callback
+forwarding each dispatch to a real `ClipboardRequestManager` exactly as
+`Window.clipboard_control` does, yields exactly one dispatch and leaves the data in RAM:
 
-```
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs2_small.py
 RAW_PAYLOAD: b'hi' len= 2
 BASE64: aGk=
 OSC_BYTES_LEN: 13
 NUM_DISPATCHES: 1
 DISPATCH n=1 type=memoryview len=6 is_partial=False readonly=True
-FINAL_WRITE_STATE: ('final', 'BytesIO', 2, False)
+FINAL_STORE_TYPE: BytesIO
+FINAL_STORE_BYTES: 2
 ```
 
 - The data crosses as a **`memoryview`** (`type=memoryview`), not a copy, of length 6
@@ -259,36 +321,44 @@ FINAL_WRITE_STATE: ('final', 'BytesIO', 2, False)
   `PyBUF_READ` at `kitty/vt-parser.c:461`.
 - There is exactly **one** dispatch and it is **non-partial** (`is_partial=False`).
 - The manager consumes it immediately; the `WriteRequest.tempfile.file` is still an
-  in-memory `io.BytesIO` holding the 2 decoded bytes (`'BytesIO', 2`). Small payloads
-  never leave RAM. The in-memory start is `self.file … = io.BytesIO()` at
-  `kitty/clipboard.py:29`.
+  in-memory `io.BytesIO` holding the 2 decoded bytes (`FINAL_STORE_TYPE: BytesIO`,
+  `FINAL_STORE_BYTES: 2`). Small payloads never leave RAM. The in-memory start is
+  `self.file … = io.BytesIO()` at `kitty/clipboard.py:29`.
 
 ### 5.2 Large clipboard write — repeated partial dispatches + rollover to disk
 
-Feeding a **20 MiB** payload (base64 ≈ 27.96 MiB) produces a *sequence* of dispatches
-and forces the backing store from RAM onto disk (`/tmp/kitty_obs/obs3_large.py`):
+Feeding a **20 MiB** payload (base64 ≈ 27.96 MiB) via `obs3_large.py` — which feeds the
+OSC 52 write to a `Screen` and forwards each dispatch to a real
+`ClipboardRequestManager` exactly as `Window.clipboard_control` does — produces a
+*sequence* of dispatches and forces the backing store from RAM onto disk. The script is
+invoked once; its labelled output is split per claim below, each slice quoted next to
+the claim it supports.
 
-```
+The payload sizes and the parse wall-time:
+
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs3_large.py   # payload + parse setup
 DECODED_TARGET_BYTES: 20971520
 BASE64_LEN: 27962028
 OSC_TOTAL_BYTES: 27962037
 MAX_ESCAPE_CODE_SIZE: 262144
-PARSE_WALL_SECONDS: 0.055
+PARSE_WALL_SECONDS: 0.05
+```
+
+The decoded target is **20971520** bytes (20 MiB); base64-encoded it is **27962028**
+bytes and the whole OSC 52 sequence is **27962037** bytes; the parser digests it in
+**0.05 s**.
+
+**(a) It arrives as many partial dispatches, then one final.**
+
+```console
+# same obs3_large.py run — dispatch counts
 NUM_DISPATCHES: 27
 NUM_PARTIAL(is_partial=True): 26
 NUM_FINAL(is_partial=False): 1
-FIRST_CHUNK_LEN: 1048570
-SECOND_CHUNK_LEN: 1048572
-LAST_CHUNK_LEN: 699186
-MAX_CHUNK_LEN: 1048572
-TEMPFILE_FIRST_TYPE: BytesIO
-ROLLOVER_AT_DISPATCH: 22
-ROLLOVER_SIZE_BYTES_AT_FLIP: 17301417
-FINAL_WRITE_STATE: ('final', 'BufferedRandom', 20971520, False)
-clipboard_max_size_MiB: 512.0
 ```
 
-**(a) It arrives as many partial dispatches, then one final.** The large write
+The large write
 crosses as **27** separate `clipboard_control` calls — **26 partial** (`is_partial=True`)
 followed by **1 final** (`is_partial=False`). The `is_partial` flag transitions
 `True … True → False` on the last chunk, which is exactly the condition
@@ -296,7 +366,17 @@ followed by **1 final** (`is_partial=False`). The `is_partial` flag transitions
 `kitty/clipboard.py:422` (accumulate) versus `self.handle_write_request(wr)` at
 `kitty/clipboard.py:425` on the final chunk.
 
-**(b) The chunk size is ~1 MiB, bounded by `BUF_SZ` — not 256 KiB.** Observed chunks
+**(b) The chunk size is ~1 MiB, bounded by `BUF_SZ` — not 256 KiB.**
+
+```console
+# same obs3_large.py run — per-chunk memoryview lengths
+FIRST_CHUNK_LEN: 1048570
+SECOND_CHUNK_LEN: 1048572
+LAST_CHUNK_LEN: 699186
+MAX_CHUNK_LEN: 1048572
+```
+
+Observed chunks
 are `FIRST_CHUNK_LEN: 1048570` and `MAX_CHUNK_LEN: 1048572`, i.e. essentially
 `BUF_SZ` = 1048576 (§2.2), **not** `MAX_ESCAPE_CODE_SIZE` = 262144. The reason is in
 `accumulate_st_terminated_esc_code` at `kitty/vt-parser.c:395`: if the ST terminator
@@ -312,7 +392,19 @@ is up to ~1 MiB. So **262144 is the partial-dispatch *trigger threshold*, while 
 (`kitty/vt-parser.c:416`) and recurses (`kitty/vt-parser.c:417`). (This refines the naive "≤256 KiB partials"
 reading; see §11.)
 
-**(c) The Python accumulator spills from RAM to disk at 16 MiB.** The backing store
+**(c) The Python accumulator spills from RAM to disk at 16 MiB.**
+
+```console
+# same obs3_large.py run — RAM->disk rollover and final store
+TEMPFILE_FIRST_TYPE: BytesIO
+ROLLOVER_AT_DISPATCH: 22
+ROLLOVER_SIZE_BYTES_AT_FLIP: 17301417
+FINAL_STORE_TYPE: BufferedRandom
+FINAL_STORE_BYTES: 20971520
+MAX_SIZE_EXCEEDED: False
+```
+
+The backing store
 begins as `BytesIO` (`TEMPFILE_FIRST_TYPE: BytesIO`) and rolls over to an on-disk
 temp file at dispatch 22, once the accumulated size crosses the rollover threshold
 (`ROLLOVER_AT_DISPATCH: 22`, `ROLLOVER_SIZE_BYTES_AT_FLIP: 17301417` ≈ 16.5 MiB). The
@@ -320,11 +412,19 @@ threshold is `rollover_size: int = 16 * 1024 * 1024` at `kitty/clipboard.py:237`
 passed to `Tempfile(max_size=rollover_size)` at `kitty/clipboard.py:243`; the rollover
 itself is `if isinstance(self.file, io.BytesIO) and self.file.tell() + sz > self.max_size:`
 at `kitty/clipboard.py:33`, replacing the buffer with `self.file = TemporaryFile()` at
-`kitty/clipboard.py:35`. The final store type is `BufferedRandom` (the Python type of
-a POSIX `tempfile.TemporaryFile()`), holding exactly **20971520** bytes = the full
-20 MiB, with `max_size_exceeded=False`.
+`kitty/clipboard.py:35`. The final store type is `BufferedRandom` (`FINAL_STORE_TYPE:
+BufferedRandom`, the Python type of a POSIX `tempfile.TemporaryFile()`), holding exactly
+**20971520** bytes (`FINAL_STORE_BYTES: 20971520`) = the full 20 MiB, with
+`MAX_SIZE_EXCEEDED: False`.
 
-**(d) The cap is 512.0 MiB, not 8 MB.** The run reports `clipboard_max_size_MiB: 512.0`
+**(d) The cap is 512.0 MiB, not 8 MB.**
+
+```console
+# same obs3_large.py run — clipboard size cap
+clipboard_max_size_MiB: 512.0
+```
+
+The run reports `clipboard_max_size_MiB: 512.0`
 (`kitty/options/types.py:498`); the 20 MiB payload is far below it, so nothing is
 truncated. Truncation would set the `max_size_exceeded` flag in `write_base64_data`
 (`kitty/clipboard.py:316`), which sets `self.max_size_exceeded = True` at
@@ -431,25 +531,47 @@ s->cpu_cells = calloc(1, cpu_cells_size + gpu_cells_size + SEGMENT_SIZE * sizeof
 Per cell that is `sizeof(GPUCell) + sizeof(CPUCell)` = 20 + 12 = **32 bytes**, fixed by
 static assertions `static_assert(sizeof(GPUCell) == 20, …)` at `kitty/data-types.h:221`
 and `static_assert(sizeof(CPUCell) == 12, …)` at `kitty/data-types.h:228`. So an
-80-column scrollback should cost ≈ 80 × 32 = 2560 bytes/line. Measuring resident
-memory (`VmRSS`) while populating a scrollback at two sizes confirms linear scaling
-(`/tmp/kitty_obs/obs5_scrollback.py`):
+80-column scrollback should cost ≈ 80 × 32 = 2560 bytes/line.
 
-```
+`obs5_mem.py` measures resident memory (`VmRSS`) while populating an 80-column
+scrollback at two sizes; the script is invoked once and its labelled output is split
+per claim below. The three raw `VmRSS` readings — empty, after 500k lines, after 1M
+lines:
+
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs5_mem.py   # RSS at 0, 500k, 1M lines (80 cols)
 COLS: 80 SCROLLBACK: 4000000
-RSS0_kb: 25596 RSS_500k_kb: 1282896 RSS_1M_kb: 2535828
-RSS_delta_500k_bytes: 1287475200
-RSS_delta_1M_bytes: 2570477568
-bytes_per_line_500k: 2575.0
-bytes_per_line_1M: 2570.5
+RSS0_kb: 24324 RSS_500k_kb: 1277596 RSS_1M_kb: 2530528
+```
+
+**500k lines cost ≈ 1.28 GB — 2566.7 bytes/line:**
+
+```console
+# same obs5_mem.py run — cost of the first 500k lines
+RSS_delta_500k_bytes: 1283350528
+bytes_per_line_500k: 2566.7
+```
+
+**1M lines cost ≈ 2.57 GB — 2566.4 bytes/line:**
+
+```console
+# same obs5_mem.py run — cost of 1M lines
+RSS_delta_1M_bytes: 2566352896
+bytes_per_line_1M: 2566.4
+```
+
+**The marginal cost is constant (2566.0 bytes/line) and matches the 2560 theoretical:**
+
+```console
+# same obs5_mem.py run — marginal cost of the 2nd 500k vs the theoretical per-line cost
 incremental_bytes_per_line_2nd_500k: 2566.0
 theoretical_cell_bytes_per_line(80*(20+12)): 2560
 ```
 
-At 500k lines the delta is **1,287,475,200** bytes (**2575.0** bytes/line); at 1M lines
-it is **2,570,477,568** bytes (**2570.5** bytes/line); the incremental cost of the
+At 500k lines the delta is **1,283,350,528** bytes (**2566.7** bytes/line); at 1M lines
+it is **2,566,352,896** bytes (**2566.4** bytes/line); the incremental cost of the
 second 500k lines is **2566.0** bytes/line. The per-line cost is essentially constant
-(≈ 2570, i.e. the theoretical 2560 plus ~10 bytes for amortized `LineAttrs` and
+(≈ 2566, i.e. the theoretical 2560 plus ~6 bytes for amortized `LineAttrs` and
 rounding), which is exactly the **linear** scaling implied by `kitty/history.c:23`-`25`.
 So "managing memory" for a large scrollback means holding gigabytes: **1M lines ≈ 2.57 GB**
 resident.
@@ -458,41 +580,59 @@ resident.
 
 `kitty/screen.c` contains **no** `Py_BEGIN_ALLOW_THREADS` at all — confirmed by
 `grep -rln Py_BEGIN_ALLOW_THREADS kitty/*.c`, which returns only `kitty/utmp.c`. So
-every screen/scrollback scan runs with the GIL held. Timing the canonical text
-extraction over 1,000,000 history lines
+every screen/scrollback scan runs with the GIL held. `obs6_scan.py` times the canonical
+text extraction over 1,000,000 history lines
 (`kitty.window.as_text(screen, add_history=True)`, which calls
 `screen.as_text_non_visual` at `kitty/screen.c:3491` and
 `screen.as_text_for_history_buf` at `kitty/screen.c:3495`):
 
-```
-SCAN_wall_seconds: 0.462
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs6_scan.py
+SCAN_wall_seconds: 0.424
 SCAN_total_logical_lines: 1000001
 SCAN_total_chars: 51000000
 ```
 
-The scan of 1M lines takes **0.462 s** of wall-clock on the calling (main) thread,
-producing 1,000,001 logical lines / 51,000,000 characters. For that entire 0.462 s the
+The scan of 1M lines takes **0.424 s** of wall-clock on the calling (main) thread,
+producing 1,000,001 logical lines / 51,000,000 characters. For that entire 0.424 s the
 main thread is inside the C scan and is doing nothing else.
 
 ### 7.3 Event delivery is blocked for the full duration of the expensive work
 
-To make the "affects how events are delivered to kittens" claim concrete, a background
-Python thread (standing in for event delivery) timestamps itself as fast as it can
-while the main thread performs a **pure-C history rewrap** — a 1-column resize, which
-triggers `realloc_hb` → `historybuf_rewrap` (`kitty/screen.c:217`-`221`) with no
-per-line Python callback:
+To make the "affects how events are delivered to kittens" claim concrete, `obs7_rewrap.py`
+runs a background Python thread (standing in for event delivery) that timestamps itself
+as fast as it can while the main thread performs a **pure-C history rewrap** — a
+1-column resize, which triggers `realloc_hb` → `historybuf_rewrap`
+(`kitty/screen.c:217`-`221`) with no per-line Python callback. The script is invoked
+once; its labelled output is split per claim below.
 
+The rewrap runs for **1.214 s** on the main thread:
+
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs7_rewrap.py   # 1-col resize -> pure-C historybuf_rewrap
+REWRAP_wall_seconds: 1.214
 ```
-REWRAP_wall_seconds: 1.286
-WORKER_samples: 1033629
+
+Undisturbed, the background worker samples essentially continuously — over a million
+samples with a **median inter-sample gap of 0.000000 s**:
+
+```console
+# same obs7_rewrap.py run — the background worker's normal sampling cadence
+WORKER_samples: 1031971
 WORKER_median_gap_seconds: 0.000000
-WORKER_max_gap_seconds: 1.281
+```
+
+But its single **longest stall was 1.209 s — 99.6 % of the rewrap duration**:
+
+```console
+# same obs7_rewrap.py run — the worker's longest stall vs the rewrap duration
+WORKER_max_gap_seconds: 1.209
 max_gap_over_rewrap_ratio: 0.996
 ```
 
-The rewrap takes **1.286 s**. During normal operation the worker records timestamps
+The rewrap takes **1.214 s**. During normal operation the worker records timestamps
 essentially continuously (`WORKER_median_gap_seconds: 0.000000`), but its **largest
-gap was 1.281 s** — **99.6 %** of the rewrap duration. In other words, the background
+gap was 1.209 s** — **99.6 %** of the rewrap duration. In other words, the background
 thread could not run *at all* for essentially the whole expensive operation, because
 the GIL-holding C scan never yielded. This is the direct, measured link between
 "doing something expensive" and "how events are delivered to kittens": while the main
@@ -511,10 +651,12 @@ keeps arriving meanwhile, the 1 MiB parser buffer fills and `POLLIN` backpressur
 
 The clipboard `memoryview` is a *window* over the parser's C buffer
 (`PyMemoryView_FromMemory(..., PyBUF_READ)` at `kitty/vt-parser.c:461`), not a copy.
-Ownership therefore matters the instant Python receives it. It is **read-only**, and
-attempting to mutate it raises immediately (`/tmp/kitty_obs/obs4_memoryview.py`):
+Ownership therefore matters the instant Python receives it. `obs4_memoryview.py`
+exercises all three ownership facts in one run (invoked once below, its labelled output
+split per claim). It is **read-only**, and attempting to mutate it raises immediately:
 
-```
+```console
+$ PYTHONPATH=. python /tmp/kitty_obs/obs4_memoryview.py   # read-only flag + attempted mutation
 readonly: True
 write_error: 'cannot modify read-only memory'
 ```
@@ -524,16 +666,19 @@ past the call and the parser reuses the buffer, the retained view silently shows
 *new* bytes. The same retained view returned the first payload immediately after the
 dispatch, then a *different* payload after more parsing:
 
-```
+```console
+# same obs4_memoryview.py run — a retained view reflects the parser's later buffer reuse
 retained_content_right_after: b'c;QUFBQUFBQUE='
 retained_content_later: b'c;WlpaWlpaWlo='
 retained_changed_after_more_parsing: True
 ```
 
 The correct, ownership-safe pattern is to **copy during the call** (`data.tobytes()` /
-decode), which yields an independent object:
+decode), which yields an independent object that stays correct even after the buffer is
+reused:
 
-```
+```console
+# same obs4_memoryview.py run — a copy taken during the call stays correct afterwards
 copied_tobytes: b'c;QUFBQUFBQUE='
 copy_still_correct: True
 ```
@@ -555,7 +700,7 @@ thread precisely *because* they never touch Python objects.
 ### 8.3 Timing — GIL-serialized dispatch, `input_delay` batching, and the `Py_DECREF`
 
 Timing matters because Python work is serialized: a long main-thread operation delays
-everything else (§7.3, max gap 1.281 s). Hand-off timing is shaped by the `input_delay`
+everything else (§7.3, max gap 1.209 s). Hand-off timing is shaped by the `input_delay`
 throttle (`kitty/vt-parser.c:1425`, §6.3). Ownership timing also shows up per call: the
 C core `Py_DECREF`s the callback's return value right after the call
 (`kitty/screen.c:90`), so the returned `PyObject*`'s lifetime is exactly one dispatch.
@@ -639,19 +784,19 @@ and `file:line` citations.
 
 | Item to cover | Where answered | Key evidence |
 |---|---|---|
-| **Q1** — cross-language data movement under load | §4 | `KittyChildMon` vs `python` GIL-holder (obs6); `CALLBACK`/`Py_DECREF` `kitty/screen.c:87`,`:90`; JSON+base85 `kittens/runner.py:101`-`102` |
-| **Q2** — clipboard crossing small vs. large | §5 | small: `NUM_DISPATCHES: 1`, `type=memoryview len=6 is_partial=False readonly=True` (obs2); large: `NUM_DISPATCHES: 27`, rollover `BytesIO`→`BufferedRandom` (obs3) |
+| **Q1** — cross-language data movement under load | §4 | `KittyChildMon` vs `python` GIL-holder (obs8_threads); `CALLBACK`/`Py_DECREF` `kitty/screen.c:87`,`:90`; JSON+base85 `kittens/runner.py:101`-`102` |
+| **Q2** — clipboard crossing small vs. large | §5 | small: `NUM_DISPATCHES: 1`, `type=memoryview len=6 is_partial=False readonly=True` (obs2_small); large: `NUM_DISPATCHES: 27`, rollover `BytesIO`→`BufferedRandom` (obs3_large) |
 | **Q3** — transfer under contention | §6 | lock release `kitty/vt-parser.c:1431`-`1433`; `input_delay` `kitty/vt-parser.c:1425`; backpressure `kitty/child-monitor.c:1501` |
-| **Q4** — expensive scrollback scan effect | §7 | linear memory `bytes_per_line_1M: 2570.5` (obs5); scan `SCAN_wall_seconds: 0.462`; starvation `WORKER_max_gap_seconds: 1.281` |
-| **Q5** — where timing/concurrency/ownership matter | §8 | `readonly: True`, `'cannot modify read-only memory'` (obs4); parser mutex `kitty/vt-parser.c:206`; GIL contrast `kitty/utmp.c:17`-`23` |
-| **Q6** — runtime-only races | §9 | retained-view change `retained_changed_after_more_parsing: True` (obs4); compaction `kitty/vt-parser.c:1441` |
-| **User example (a): a large clipboard payload** | §5.2 | 20 MiB → 27 dispatches (26 partial + 1 final), ~1 MiB chunks, disk rollover at 16 MiB, cap 512.0 MiB (obs3) |
-| **User example (b): scanning a large scrollback** | §7 | 1M-line scrollback (~2.57 GB RSS), `as_text` scan 0.462 s, rewrap 1.286 s starving a concurrent thread for 1.281 s (obs5) |
+| **Q4** — expensive scrollback scan effect | §7 | linear memory `bytes_per_line_1M: 2566.4` (obs5_mem); scan `SCAN_wall_seconds: 0.424` (obs6_scan); starvation `WORKER_max_gap_seconds: 1.209` (obs7_rewrap) |
+| **Q5** — where timing/concurrency/ownership matter | §8 | `readonly: True`, `'cannot modify read-only memory'` (obs4_memoryview); parser mutex `kitty/vt-parser.c:206`; GIL contrast `kitty/utmp.c:17`-`23` |
+| **Q6** — runtime-only races | §9 | retained-view change `retained_changed_after_more_parsing: True` (obs4_memoryview); compaction `kitty/vt-parser.c:1441` |
+| **User example (a): a large clipboard payload** | §5.2 | 20 MiB → 27 dispatches (26 partial + 1 final), ~1 MiB chunks, disk rollover at 16 MiB, cap 512.0 MiB (obs3_large) |
+| **User example (b): scanning a large scrollback** | §7 | 1M-line scrollback (~2.57 GB RSS, obs5_mem), `as_text` scan 0.424 s (obs6_scan), rewrap 1.214 s starving a concurrent thread for 1.209 s (obs7_rewrap) |
 | In-process (C-API) vs out-of-process (JSON+base85) boundaries | §3.2, §4 | `CALLBACK` `kitty/screen.c:87`; `base64.b85encode(json.dumps(...))` `kittens/runner.py:102` |
-| Zero-copy read-only `memoryview` | §5, §8.1 | `PyMemoryView_FromMemory(..., PyBUF_READ)` `kitty/vt-parser.c:461`; `readonly: True` (obs4) |
-| Three named threads + GIL-holding main thread | §3.1 | `KittyChildMon`/`KittyPeerMon`/`KittyWriteStdin` + `python` (obs6) |
-| `Tempfile` `BytesIO`→on-disk rollover at 16 MiB | §5.2 | `rollover_size … 16 * 1024 * 1024` `kitty/clipboard.py:237`; `ROLLOVER_AT_DISPATCH: 22` (obs3) |
-| `clipboard_max_size` runtime value vs stale "8 MB" | §2.2, §5.2, §11 | `clipboard_max_size: 512.0` (obs1/obs3); `kitty/options/types.py:498` |
+| Zero-copy read-only `memoryview` | §5, §8.1 | `PyMemoryView_FromMemory(..., PyBUF_READ)` `kitty/vt-parser.c:461`; `readonly: True` (obs4_memoryview) |
+| Three named threads + GIL-holding main thread | §3.1 | `KittyChildMon`/`KittyPeerMon`/`KittyWriteStdin` + `python` (obs8_threads) |
+| `Tempfile` `BytesIO`→on-disk rollover at 16 MiB | §5.2 | `rollover_size … 16 * 1024 * 1024` `kitty/clipboard.py:237`; `ROLLOVER_AT_DISPATCH: 22` (obs3_large) |
+| `clipboard_max_size` runtime value vs stale "8 MB" | §2.2, §5.2, §11 | `clipboard_max_size: 512.0` (§2.2 direct import / obs3_large); `kitty/options/types.py:498` |
 
 ---
 
@@ -688,10 +833,10 @@ other anchors matched.
 ### 11.4 The on-disk temp file's Python type
 
 The rollover target is `tempfile.TemporaryFile()` (`kitty/clipboard.py:35`). Its
-observed Python type is `io.BufferedRandom` (`FINAL_WRITE_STATE: ('final', 'BufferedRandom', …)`
-in obs3), which is what `TemporaryFile()` returns on POSIX; this is the same object the
-source refers to as the on-disk temp file — noted to avoid confusion between the
-`tempfile` module name and the runtime type.
+observed Python type is `io.BufferedRandom` (`FINAL_STORE_TYPE: BufferedRandom` in
+obs3_large, §5.2(c)), which is what `TemporaryFile()` returns on POSIX; this is the same
+object the source refers to as the on-disk temp file — noted to avoid confusion between
+the `tempfile` module name and the runtime type.
 
 ### 11.5 Scope and method limitations
 
@@ -711,7 +856,32 @@ source refers to as the on-disk temp file — noted to avoid confusion between t
 
 ### 11.6 Repository left unchanged
 
-All observation scripts lived under `/tmp/kitty_obs/` (outside the tree) and were
-removed after use. `git status --porcelain` shows only this new document under
-`blitzy/documentation/`; no existing source file was modified.
+All observation scripts lived under `/tmp/kitty_obs/` (outside the repository tree) and
+were removed after use; no build artifact is tracked (`kitty/fast_data_types.so` and
+`build/` are gitignored). Two distinct `git` views confirm the source tree is untouched.
+
+**Working-tree cleanliness.** Once this document is committed, the working tree is
+clean — `git status --porcelain --untracked-files=all` prints nothing (no uncommitted
+or untracked files):
+
+```console
+$ git status --porcelain --untracked-files=all
+$
+```
+
+**The only change relative to the source baseline.** Diffing the source/baseline commit
+`815df1e21` against the tree shows exactly one **added** file (`A`) — this document —
+and no modification to any existing source, config, test, or documentation file:
+
+```console
+$ git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 --name-status
+A	blitzy/documentation/kitty_815df1e210e0.md
+```
+
+These are two different notions and are stated separately to avoid the ambiguity of
+conflating them: `git status --porcelain` reports the **working-tree** state (clean —
+nothing uncommitted or untracked) after the deliverable is committed, whereas
+`git diff <baseline> --name-status` reports the **cumulative** difference from the
+source baseline (a single added file). Both agree the existing source tree is
+byte-for-byte unchanged and this deliverable is the sole addition.
 
