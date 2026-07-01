@@ -50,14 +50,15 @@ werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'
 ```
 — `setup.py:491`
 
-Running the default build in this environment fails while compiling the Wayland windowing backend. Command
-and verbatim diagnostic (forcing recompilation of the one translation unit by first removing its git-ignored
-object file `build/glfw-wayland-glfw-wl_window.c.o`):
+Running the default build from a clean tree (`python3 setup.py clean` first) fails while compiling the
+Wayland windowing backend. The full build output was redirected to `build_default.log`; the lines below are
+the **complete, verbatim** output of the `sed` extraction command shown (an explicit line-range slice of that
+log — no elision inside it):
 
 ```console
-$ python3 setup.py build
-...
-[122/122] Compiling kitty/gl-wrapper.c ...
+$ python3 setup.py build > build_default.log 2>&1 ; echo "exit=$?"
+exit=1
+$ sed -n '/wl_window.c: In function/,/being treated as errors/p' build_default.log
 glfw/wl_window.c: In function ‘xdgToplevelHandleConfigure’:
 glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT’ not handled in switch [-Werror=switch]
   668 |         switch (*state) {
@@ -66,16 +67,14 @@ glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAIN
 glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_TOP’ not handled in switch [-Werror=switch]
 glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM’ not handled in switch [-Werror=switch]
 cc1: all warnings being treated as errors
-$ echo $?
-1
 ```
 
 **Claim:** the failure is caused by the host's newer `wayland-protocols` introducing
 `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values that this commit's `switch` does not handle, promoted to a
 hard error by `-pedantic-errors -Werror` (`setup.py:491`). **Evidence:** the four
-`error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_*’ not handled in switch [-Werror=switch]` lines
-followed by `cc1: all warnings being treated as errors`, with exit status `1`. The exact compile command in
-the log carries the `-pedantic-errors -Werror` flags, confirming the source of the promotion.
+`error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_{LEFT,RIGHT,TOP,BOTTOM}’ not handled in switch [-Werror=switch]`
+lines above — each carrying the literal `[-Werror=switch]` suffix that proves `-Werror` is active — followed
+by `cc1: all warnings being treated as errors`, with the build exiting `exit=1`.
 
 ### 1.2 The `--ignore-compiler-warnings` flag produces a clean build
 
@@ -90,32 +89,34 @@ default=Options.ignore_compiler_warnings, action='store_true',
 Re-running with that flag succeeds. This flag is a **legitimate, in-tree build option — not a source
 edit**; no product file was modified to obtain a clean build.
 
+The full build output was redirected to `build_ignore.log`; the block below is the **complete, verbatim**
+output of the `sed` extraction command shown (the linking phase of that log):
+
 ```console
-$ python3 setup.py build --ignore-compiler-warnings
-...
+$ python3 setup.py build --ignore-compiler-warnings > build_ignore.log 2>&1 ; echo "exit=$?"
+exit=0
+$ sed -n '/^\[1\/5\] Linking/,/^ done/p' build_ignore.log
 [1/5] Linking kitty/fast_data_types ...
 [2/5] Linking [x11] kitty/glfw-x11 ...
 [3/5] Linking [wayland] kitty/glfw-wayland ...
 [4/5] Linking kittens/transfer/rsync ...
 [5/5] Linking launcher ...
  done
-$ echo $?
-0
 ```
 
 **Claim:** the flag disables `-Werror` (making `werror` the empty string at `setup.py:491`) and the build
-links cleanly with exit `0`. **Evidence:** the `[1/5] … [5/5] Linking … done` block and exit status `0`.
+links cleanly with exit `0`. **Evidence:** the `[1/5] … [5/5] Linking … done` block above and `exit=0`.
 
 ### 1.3 Artifacts produced
 
 ```console
 $ ls -la kitty/fast_data_types.so kittens/transfer/rsync.so kitty/glfw-x11.so kitty/glfw-wayland.so kitty/launcher/kitten kitty/launcher/kitty
--rwxr-xr-x 1 root root    42824 ... kittens/transfer/rsync.so
--rwxr-xr-x 1 root root  1253792 ... kitty/fast_data_types.so
--rwxr-xr-x 1 root root   451016 ... kitty/glfw-wayland.so
--rwxr-xr-x 1 root root   373896 ... kitty/glfw-x11.so
--rwxr-xr-x 1 root root 15765764 ... kitty/launcher/kitten
--rwxr-xr-x 1 root root    40384 ... kitty/launcher/kitty
+-rwxr-xr-x 1 root root    42824 Jul  1 22:06 kittens/transfer/rsync.so
+-rwxr-xr-x 1 root root  1253792 Jul  1 22:06 kitty/fast_data_types.so
+-rwxr-xr-x 1 root root   451016 Jul  1 22:06 kitty/glfw-wayland.so
+-rwxr-xr-x 1 root root   373896 Jul  1 22:06 kitty/glfw-x11.so
+-rwxr-xr-x 1 root root 15765764 Jul  1 22:07 kitty/launcher/kitten
+-rwxr-xr-x 1 root root    40384 Jul  1 22:06 kitty/launcher/kitty
 ```
 
 The build produces four kitty `.so` extensions plus the Go `kitten` and `kitty` launcher binaries. All are
@@ -169,74 +170,92 @@ The test entry point is executed *through the built launcher*. `test.py`'s sheba
 
 ### 2.2 Verbatim runner output (my observed run)
 
-```console
-$ ./kitty/launcher/kitty +launch test.py
-...
-Ran 145 tests in 26.124s
+The full runner output was redirected to `test_baseline.log`; the three lines below are the **complete,
+verbatim** output of the `grep` command shown (the two `unittest` summary lines and the Go summary line):
 
+```console
+$ ./kitty/launcher/kitty +launch test.py > test_baseline.log 2>&1 ; echo "exit=$?"
+exit=1
+$ grep -E '^Ran [0-9]+ tests|^FAILED|All Go tests' test_baseline.log
+Ran 145 tests in 27.964s
 FAILED (failures=6, skipped=2)
-All Go tests succeeded, ran in 26.2 seconds
+All Go tests succeeded, ran in 28.4 seconds
 ```
 
 - **Python `unittest` summary — Claim:** the suite ran at representative scale — 145 tests. **Evidence:**
-  `Ran 145 tests in 26.124s`.
+  `Ran 145 tests in 27.964s`.
 - **Python result line — Claim:** the run reported 6 failures and 2 skips. **Evidence:**
   `FAILED (failures=6, skipped=2)`.
-- **Go summary — Claim:** all Go tests passed. **Evidence:** `All Go tests succeeded, ran in 26.2 seconds`,
+- **Go summary — Claim:** all Go tests passed. **Evidence:** `All Go tests succeeded, ran in 28.4 seconds`,
   printed by `kitty_tests/main.py:216`.
 
 > **Difference from prior reference values.** A prior reference recorded `Ran 145 tests in 13.642s`,
 > `FAILED (failures=2, skipped=6)`, and `14.1 seconds`. My run has the **same test count (145)** but a
-> different failure/skip split (6 failures / 2 skips) and longer timings. Both differences are explained by
-> environment, below — and neither involves compiled-extension loading.
+> different failure/skip split (6 failures / 2 skips) and longer timings (`27.964s` / `28.4 seconds`). Both
+> differences are explained by environment, below — and neither involves compiled-extension loading.
 
 ### 2.3 The 6 failures (verbatim, and why they are unrelated to extensions)
 
 Two failures are file-mode assertions in the transfer tests:
 
 ```console
-$ grep -E '^FAIL:' test_baseline.log
+$ grep -E '^FAIL: test_transfer' test_baseline.log
 FAIL: test_transfer_receive (kitty_tests.file_transmission.TestFileTransmission.test_transfer_receive)
 FAIL: test_transfer_send (kitty_tests.file_transmission.TestFileTransmission.test_transfer_send)
 ```
 
-The assertion that fails is `self.assertEqual(expected, actual)` at `kitty_tests/file_transmission.py:432`;
-the captured local variables show the difference is a set-gid directory bit — `expected` carries
-`mode='0o42755'` while `actual` carries `mode='0o40755'`:
+The assertion that fails is `self.assertEqual(expected, actual)` at `kitty_tests/file_transmission.py:432`.
+The `AssertionError` carries `unittest`'s unified diff of the two directory listings (`-` lines are the
+`expected` values, `+` lines are the `actual` values); it isolates the difference to exactly two directory
+entries. The block below is the **complete, verbatim** output of the `grep` command shown (the four differing
+diff lines from the `test_transfer_receive` failure):
 
-```
-    actual = {... 'sub': Entry(relpath='sub', mtime=0, mode='0o40755', nlink=2), 'empty': Entry(..., mode='0o40755', ...) ...}
-    expected = {... 'empty': Entry(..., mode='0o42755', ...), 'sub': Entry(..., mode='0o42755', ...) ...}
+```console
+$ sed -n '/^FAIL: test_transfer_receive/,/^====/p' test_baseline.log | grep -E "^[-+]  '(empty|sub)':"
+-  'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2),
++  'empty': Entry(relpath='empty', mtime=0, mode='0o40755', nlink=2),
+-  'sub': Entry(relpath='sub', mtime=0, mode='0o42755', nlink=2),
++  'sub': Entry(relpath='sub', mtime=0, mode='0o40755', nlink=2),
 ```
 
 **Claim:** these are environment-specific file-mode assertions, **not** extension-loading problems.
-**Evidence:** the diff is purely `mode='0o42755'` vs `mode='0o40755'` (the `0o40000` set-gid bit on temp
-directories), raised at `file_transmission.py:432`.
+**Evidence:** the diff is purely `mode='0o42755'` vs `mode='0o40755'` — the two values differ only in the
+`0o2000` set-gid permission bit (`S_ISGID`), which is set in `0o42755` but not in `0o40755`
+(`0o42755 - 0o40755 = 0o2000`); the `0o40000` bit is the directory file-type bit (`S_IFDIR`) common to **both**
+values, not the differing bit. The assertion is raised at `file_transmission.py:432`.
 
 The other four failures are font-selection mismatches:
 
 ```console
+$ grep -E '^FAIL: test_font_selection' test_baseline.log
 FAIL: test_font_selection (kitty_tests.fonts.Selection.test_font_selection) (spec='fira code')
 FAIL: test_font_selection (kitty_tests.fonts.Selection.test_font_selection) (spec='family="fira code"')
 FAIL: test_font_selection (kitty_tests.fonts.Selection.test_font_selection) (spec='ubuntu mono')
 FAIL: test_font_selection (kitty_tests.fonts.Selection.test_font_selection) (spec='family="ubuntu mono"')
 ```
 
-The assertion is `self.ae(expected, actual)` at `kitty_tests/fonts.py:40`; the installed font reports
-different internal names than the test expects:
+The assertion is `self.ae(expected, actual)` at `kitty_tests/fonts.py:40`. Because `runner.tb_locals = True`
+(`kitty_tests/main.py:118`), the traceback prints the full `expected` and `actual` tuples, which show the
+installed font reports different internal names than the test expects. The two lines below are the
+**complete, verbatim** output of the `sed`/`grep` command shown (the `actual` and `expected` locals captured
+from the `spec='fira code'` failure):
 
-```
-AssertionError: Tuples differ: ('FiraCodeRoman-Regular', 'FiraCodeRoman-SemiBold',[46 chars]old') != ('FiraCode-Regular', 'FiraCode-SemiBold', 'FiraCode[25 chars]old')
+```console
+$ sed -n "/^FAIL: test_font_selection.*spec='fira code')$/,/^====/p" test_baseline.log | grep -E "^    (expected|actual) = "
+    actual = ('FiraCode-Regular', 'FiraCode-SemiBold', 'FiraCode-Retina', 'FiraCode-SemiBold')
+    expected = ('FiraCodeRoman-Regular', 'FiraCodeRoman-SemiBold', 'FiraCodeRoman-Regular', 'FiraCodeRoman-SemiBold')
 ```
 
 **Claim:** these are environment-specific font-availability/naming differences, **not** extension-loading
-problems. **Evidence:** `expected` is `('FiraCodeRoman-Regular', …)` while `actual` is
-`('FiraCode-Regular', …)`, raised at `fonts.py:40`.
+problems. **Evidence:** `expected` is
+`('FiraCodeRoman-Regular', 'FiraCodeRoman-SemiBold', 'FiraCodeRoman-Regular', 'FiraCodeRoman-SemiBold')` while
+`actual` is `('FiraCode-Regular', 'FiraCode-SemiBold', 'FiraCode-Retina', 'FiraCode-SemiBold')`, raised at
+`fonts.py:40`.
 
 ### 2.4 The 2 skips (verbatim reasons)
 
 ```console
-$ grep -E 'skipped' test_baseline.log
+$ grep "skipped '" test_baseline.log
 test_ca_certificates (kitty_tests.check_build.TestBuild.test_ca_certificates) ... skipped 'CA certificates are only tested on frozen builds'
 test_fallback_font_not_last_resort (kitty_tests.fonts.Rendering.test_fallback_font_not_last_resort) ... skipped 'Only macOS has a Last Resort font'
 ```
@@ -258,11 +277,14 @@ $ grep -E 'test_(bash|fish|zsh)_integration' test_baseline.log
 test_bash_integration (kitty_tests.shell_integration.ShellIntegration.test_bash_integration) ... ok
 test_fish_integration (kitty_tests.shell_integration.ShellIntegration.test_fish_integration) ... ok
 test_zsh_integration (kitty_tests.shell_integration.ShellIntegration.test_zsh_integration) ... ok
+test_bash_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_bash_integration) ... ok
+test_fish_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_fish_integration) ... ok
+test_zsh_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_zsh_integration) ... ok
 ```
 
 **Claim:** the lower skip count is because `fish`/`zsh` are present and their integration tests ran `ok`.
-**Evidence:** `/usr/bin/fish` and `/usr/bin/zsh` exist, and `test_fish_integration … ok` /
-`test_zsh_integration … ok`.
+**Evidence:** `/usr/bin/fish` and `/usr/bin/zsh` exist, and both `test_fish_integration` and
+`test_zsh_integration` report the `... ok` status marker (shown verbatim in the block above).
 
 **Bottom line for §2:** the suite fully collected and ran **145** tests, which by itself proves that both
 required compiled modules (`fast_data_types`, `rsync`) loaded — no failure or skip relates to extension
@@ -311,8 +333,8 @@ since removed) and ran the runner's real discovery step, `find_all_tests()`, the
 module in `sys.modules`:
 
 ```console
-$ ./kitty/launcher/kitty +launch blitzy_adhoc_test_discovery_trace.py
-...
+$ ./kitty/launcher/kitty +launch blitzy_adhoc_test_discovery_trace.py > discovery_trace.log 2>&1
+$ sed -n '/loaded after discovery/,$p' discovery_trace.log
 === Kitty-specific compiled extension modules loaded after discovery ===
   kittens.transfer.rsync -> kittens/transfer/rsync.so
   kitty.fast_data_types -> kitty/fast_data_types.so
@@ -330,12 +352,12 @@ is discovered) only **one** kitty-specific extension is present — `kitty.fast_
 `.so` in `sys.modules` at that point are Python standard-library extensions, not kitty's:
 
 ```console
-$ ./kitty/launcher/kitty +launch blitzy_adhoc_test_import_trace.py
-...
+$ ./kitty/launcher/kitty +launch blitzy_adhoc_test_import_trace.py > import_trace.log 2>&1
+$ grep -A4 'present in sys.modules' import_trace.log
 === Compiled extension modules (.so) present in sys.modules ===
   _bz2 -> /usr/lib/python3.13/lib-dynload/_bz2.cpython-313-x86_64-linux-gnu.so
   _lzma -> /usr/lib/python3.13/lib-dynload/_lzma.cpython-313-x86_64-linux-gnu.so
-  kitty.fast_data_types -> .../kitty/fast_data_types.so
+  kitty.fast_data_types -> kitty/fast_data_types.so
   termios -> /usr/lib/python3.13/lib-dynload/termios.cpython-313-x86_64-linux-gnu.so
 ```
 
@@ -349,6 +371,7 @@ Tier 2 in §5.)
 The instrumentation explicitly reported that no GLFW backend is imported as a Python module:
 
 ```console
+$ grep 'GLFW backend modules' import_trace.log
 GLFW backend modules python-imported into sys.modules: []
 ```
 
@@ -378,8 +401,7 @@ actually loaded *earlier*, by the line above it. I confirmed this by tracing the
 request for `kitty.fast_data_types` and printing the import stack at that instant:
 
 ```console
-$ ./kitty/launcher/kitty +launch blitzy_adhoc_test_import_trace.py
-
+$ awk '/FIRST import request for: kitty.fast_data_types/{f=1} f&&/FIRST import request for: kitty.window/{exit} f' import_trace.log
 === FIRST import request for: kitty.fast_data_types ===
   __main__.py:7:  main()
   kitty/entry_points.py:192:  namespaced(['+', first_arg[1:]] + sys.argv[2:])
@@ -407,9 +429,9 @@ The base package pulls in the window subsystem a few lines later, forming a seco
 Tracing the first load of `kitty.window` and `kitty.child`:
 
 ```console
+$ awk '/FIRST import request for: kitty.window/{f=1} /^$/{if(f)exit} f' import_trace.log
 === FIRST import request for: kitty.window ===
   kitty_tests/__init__.py:27:  from kitty.window import decode_cmdline, process_remote_print, process_title_from_child
-
 === FIRST import request for: kitty.child ===
   kitty_tests/__init__.py:27:  from kitty.window import decode_cmdline, process_remote_print, process_title_from_child
   kitty/window.py:33:  from .child import ProcessDesc
@@ -427,6 +449,7 @@ The transfer extension enters via a *different* trigger — the runner's eager d
 `file_transmission` test module:
 
 ```console
+$ awk '/FIRST import request for: kittens.transfer.rsync/{f=1} /^$/{if(f)exit} f' discovery_trace.log
 === FIRST import request for: kittens.transfer.rsync ===
   kitty_tests/main.py:64:  m = importlib.import_module(package + '.' + x.partition('.')[0])
   kitty_tests/file_transmission.py:13:  from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc
@@ -448,17 +471,18 @@ a compiled `.so` and re-ran `./kitty/launcher/kitty +launch test.py`.
 
 ```console
 $ mv kitty/fast_data_types.so /tmp/kitty_iso_fast_data_types.so.bak
-$ ./kitty/launcher/kitty +launch test.py
-...
-  File ".../kitty_tests/__init__.py", line 21, in <module>
+$ ./kitty/launcher/kitty +launch test.py > tier1.log 2>&1 ; echo "exit=$?"
+exit=1
+$ tail -n 7 tier1.log
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/__init__.py", line 21, in <module>
     from kitty.config import finalize_keys, finalize_mouse_mappings
-  File ".../kitty/config.py", line 10, in <module>
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty/config.py", line 10, in <module>
     from .conf.utils import BadLine, parse_config_base
-  File ".../kitty/conf/utils.py", line 27, in <module>
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty/conf/utils.py", line 27, in <module>
     from ..fast_data_types import Color
 ModuleNotFoundError: No module named 'kitty.fast_data_types'
-$ echo $?
-1
+$ grep -c '^Ran [0-9]* tests' tier1.log
+0
 ```
 
 **Claim:** removing `fast_data_types.so` aborts the run at base-package import, raising
@@ -469,25 +493,44 @@ failing chain matches the primary import chain from §4.1 exactly.
 
 ### 5.2 Tier 2 — `kittens/transfer/rsync.so`: collection-critical (total failure during discovery)
 
+The full Go-package line is shown verbatim via `grep`; the traceback is then shown via a filter pipeline that
+strips only the Python-internal `<frozen importlib._bootstrap>` / `importlib/__init__.py` frames and the
+`~~~`/`^^^` caret lines for readability — the lines printed below are the **complete, verbatim** output of
+each command shown (real `/tmp/kitty_iso/...` paths, no elision):
+
 ```console
 $ mv kittens/transfer/rsync.so /tmp/kitty_iso_rsync.so.bak
-$ ./kitty/launcher/kitty +launch test.py
-Running under CI: False
-Go packages being tested: ...
-...
-  File ".../kitty_tests/main.py", line 338, in main
+$ ./kitty/launcher/kitty +launch test.py > tier2.log 2>&1 ; echo "exit=$?"
+exit=1
+$ grep '^Go packages being tested:' tier2.log
+Go packages being tested: tools/cmd/at tools/utils/humanize tools/tui/graphics tools/utils/style tools/tui/readline tools/cli tools/simdstring tools/config tools/wcswidth tools/utils/shlex tools/tui/loop tools/tui/sgr tools/tui kittens/hints kittens/ssh tools/themes kittens/transfer tools/utils/shm tools/rsync tools/utils/base85 tools/unicode_names tools/tui/subseq tools/utils tools/tui/shell_integration kittens/diff kittens/hyperlinked_grep
+$ grep -vE '<frozen|importlib/__init__\.py|_bootstrap|~~~|\^\^\^' tier2.log | sed -n '/^Traceback/,/^ModuleNotFoundError/p'
+Traceback (most recent call last):
+  File "/tmp/kitty_iso/kitty/launcher/../../__main__.py", line 7, in <module>
+    main()
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty/entry_points.py", line 192, in main
+    namespaced(['+', first_arg[1:]] + sys.argv[2:])
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty/entry_points.py", line 146, in namespaced
+    func(args[1:])
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty/entry_points.py", line 73, in launch
+    runpy.run_path(exe, run_name='__main__')
+  File "test.py", line 13, in <module>
+    main()
+  File "test.py", line 9, in main
+    getattr(m, 'main')()
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/main.py", line 338, in main
     run_tests()
-  File ".../kitty_tests/main.py", line 279, in run_tests
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/main.py", line 279, in run_tests
     run_python_tests(args, go_proc)
-  File ".../kitty_tests/main.py", line 211, in run_python_tests
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/main.py", line 211, in run_python_tests
     tests = find_all_tests()
-  File ".../kitty_tests/main.py", line 64, in find_all_tests
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/main.py", line 64, in find_all_tests
     m = importlib.import_module(package + '.' + x.partition('.')[0])
-  File ".../kitty_tests/file_transmission.py", line 13, in <module>
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/file_transmission.py", line 13, in <module>
     from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc
 ModuleNotFoundError: No module named 'kittens.transfer.rsync'
-$ echo $?
-1
+$ grep -c '^Ran [0-9]* tests' tier2.log
+0
 ```
 
 **Claim:** removing `rsync.so` lets the base package import, but the run still aborts with **zero** tests —
@@ -504,53 +547,58 @@ calls `find_all_tests()` at `main.py:211`.
 ```console
 $ mv kitty/glfw-x11.so /tmp/kitty_iso_glfw-x11.so.bak
 $ mv kitty/glfw-wayland.so /tmp/kitty_iso_glfw-wayland.so.bak
-$ ./kitty/launcher/kitty +launch test.py
-...
-Ran 145 tests in 16.587s
-
+$ ./kitty/launcher/kitty +launch test.py > tier3.log 2>&1 ; echo "exit=$?"
+exit=1
+$ grep -E '^Ran [0-9]+ tests|^FAILED|All Go tests' tier3.log
+Ran 145 tests in 15.476s
 FAILED (failures=7, errors=1, skipped=2)
-All Go tests succeeded, ran in 16.7 seconds
+All Go tests succeeded, ran in 15.5 seconds
 ```
 
 Unlike Tiers 1–2, the suite **still runs to completion**. Compared to the §2 baseline
 (`failures=6, skipped=2`), Tier 3 adds exactly one error and one failure — both GLFW-specific.
 
-The added **error** is the on-demand `ctypes` load in the GLFW test:
+The added **error** is the on-demand `ctypes` load in the GLFW test. The block below is the **complete,
+verbatim** output of the bounded `awk`/`grep` command shown (it selects the `test_utf_8_strndup` error section
+and keeps the header, the failing frame, its captured locals, and the `OSError` line — the intervening
+Python-internal frames are dropped by the `grep` filter; real `/tmp/kitty_iso/...` paths, no elision):
 
 ```console
+$ awk '/^ERROR: test_utf_8_strndup/{f=1} f; /^OSError:/{if(f)exit}' tier3.log \
+    | grep -E '^ERROR: test_utf_8_strndup|glfw\.py", line 50|^    lib = ctypes\.CDLL|^    backend_utils =|^OSError:'
 ERROR: test_utf_8_strndup (kitty_tests.glfw.TestGLFW.test_utf_8_strndup)
-...
-  File ".../kitty_tests/glfw.py", line 50, in test_utf_8_strndup
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/glfw.py", line 50, in test_utf_8_strndup
     lib = ctypes.CDLL(backend_utils)
-    backend_utils = '.../kitty/glfw-x11.so'
-...
-OSError: .../kitty/glfw-x11.so: cannot open shared object file: No such file or directory
+    backend_utils = '/tmp/kitty_iso/kitty/glfw-x11.so'
+OSError: /tmp/kitty_iso/kitty/glfw-x11.so: cannot open shared object file: No such file or directory
 ```
 
 **Claim:** with the GLFW backends gone, `test_utf_8_strndup` errors when it tries to `dlopen` the backend by
-path. **Evidence:** `OSError: .../kitty/glfw-x11.so: cannot open shared object file: No such file or
-directory`, raised at `kitty_tests/glfw.py:50` (`lib = ctypes.CDLL(backend_utils)`), where `backend_utils`
+path. **Evidence:** `OSError: /tmp/kitty_iso/kitty/glfw-x11.so: cannot open shared object file: No such file
+or directory`, raised at `kitty_tests/glfw.py:50` (`lib = ctypes.CDLL(backend_utils)`), where `backend_utils`
 was assigned from `glfw_path('x11')` at `kitty_tests/glfw.py:49`.
 
-The added **failure** is the build-verification check:
+The added **failure** is the build-verification check. The block below is the **complete, verbatim** output of
+the bounded `awk`/`grep` command shown (same filtering approach — header, failing frame, captured locals, and
+the `AssertionError` line; real `/tmp/kitty_iso/...` paths, no elision):
 
 ```console
+$ awk '/^FAIL: test_glfw_modules/{f=1} f; /^AssertionError:/{if(f)exit}' tier3.log \
+    | grep -E '^FAIL: test_glfw_modules|check_build\.py", line 46|^    self\.assertTrue|^    modules = |^AssertionError:'
 FAIL: test_glfw_modules (kitty_tests.check_build.TestBuild.test_glfw_modules)
-...
-  File ".../kitty_tests/check_build.py", line 46, in test_glfw_modules
+  File "/tmp/kitty_iso/kitty/launcher/../../kitty_tests/check_build.py", line 46, in test_glfw_modules
     self.assertTrue(os.path.isfile(path), f'{path} is not a file')
     modules = ['x11', 'wayland']
-...
-AssertionError: False is not true : .../kitty/glfw-x11.so is not a file
+AssertionError: False is not true : /tmp/kitty_iso/kitty/glfw-x11.so is not a file
 ```
 
 **Claim:** `test_glfw_modules` fails because the expected backend file is absent. **Evidence:**
-`AssertionError: False is not true : .../kitty/glfw-x11.so is not a file`, raised at
+`AssertionError: False is not true : /tmp/kitty_iso/kitty/glfw-x11.so is not a file`, raised at
 `kitty_tests/check_build.py:46` (`self.assertTrue(os.path.isfile(path), f'{path} is not a file')`) with
 `modules = ['x11', 'wayland']`.
 
 **Claim:** the GLFW backends are optional to the run as a whole — their absence leaves all 145 tests
-collected and running, breaking only the two GLFW-specific tests. **Evidence:** `Ran 145 tests in 16.587s`
+collected and running, breaking only the two GLFW-specific tests. **Evidence:** `Ran 145 tests in 15.476s`
 with `FAILED (failures=7, errors=1, skipped=2)` — exactly one more failure and one more error than the
 baseline's `failures=6, skipped=2`.
 
@@ -604,10 +652,10 @@ tests. There is no partial-collection middle ground for the module-scope extensi
 The question names three example categories — **core data types, transfer, windowing**. Each is covered
 below, along with the other categories that bind the core, using the *actual* import sites.
 
-| Test category | Test module(s) | Compiled extension | Binding site (verbatim) |
+| Test category | Test module(s) | Compiled extension | Binding site (import statement) |
 |---|---|---|---|
-| **Core data types** | `kitty_tests/screen.py`, `kitty_tests/datatypes.py`, `kitty_tests/keys.py` | `kitty.fast_data_types` | `from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, VT_PARSER_BUFFER_SIZE, Cursor` (`screen.py:4`); `from kitty.fast_data_types import (` … `)` (`datatypes.py:9`); `import kitty.fast_data_types as defines` (`keys.py:6`) |
-| **Parsing + SIMD** | `kitty_tests/parser.py` | `kitty.fast_data_types` | `from kitty.fast_data_types import (` … `has_avx2,` `has_sse4_2,` … `)` (`parser.py:8`, symbols at `parser.py:13-14`) |
+| **Core data types** | `kitty_tests/screen.py`, `kitty_tests/datatypes.py`, `kitty_tests/keys.py` | `kitty.fast_data_types` | `from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, VT_PARSER_BUFFER_SIZE, Cursor` (`screen.py:4`); `from kitty.fast_data_types import (Color, ColorProfile, HistoryBuf, LineBuf, expand_ansi_c_escapes, parse_input_from_terminal, replace_c0_codes_except_nl_space_tab, strip_csi, truncate_point_for_length, wcswidth, wcwidth)` (multi-line, `datatypes.py:9-21`); `import kitty.fast_data_types as defines` (`keys.py:6`) |
+| **Parsing + SIMD** | `kitty_tests/parser.py` | `kitty.fast_data_types` | `from kitty.fast_data_types import (CURSOR_BLOCK, VT_PARSER_BUFFER_SIZE, base64_decode, base64_encode, has_avx2, has_sse4_2, test_find_either_of_two_bytes, test_utf8_decode_to_sentinel)` (multi-line, `parser.py:8-17`; SIMD symbols `has_avx2`, `has_sse4_2` at `parser.py:13-14`) |
 | **Graphics protocol** | `kitty_tests/graphics.py` | `kitty.fast_data_types` | `from kitty.fast_data_types import base64_decode, base64_encode, has_avx2, has_sse4_2, load_png_data, shm_unlink, shm_write, test_xor64` (`graphics.py:14`) |
 | **Crypto (ECDH / AES-256-GCM)** | `kitty_tests/crypto.py` | `kitty.fast_data_types` | `from kitty.fast_data_types import AES256GCMDecrypt, AES256GCMEncrypt, CryptoError, EllipticCurveKey` (`crypto.py:28`) — **method-scope**, see note |
 | **Transfer** | `kitty_tests/file_transmission.py` | `kittens.transfer.rsync` | `from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc` (`file_transmission.py:13`) — **module-scope** |
@@ -636,7 +684,7 @@ derives the filenames as `f'{name}_vertex.glsl'` (`kitty/shaders.py:54`) and `f'
 (`kitty/shaders.py:55`) — the `Program` class is defined at `kitty/shaders.py:43` and its `compile_program`
 work is performed through the `kitty.fast_data_types` binding.
 
-**Full runnable test-module inventory (24 modules; `main` and `gr` excluded per `main.py:57`):**
+**Full runnable test-module inventory (22 modules; `main` and `gr` excluded per `main.py:57`):**
 `check_build`, `clipboard`, `completion`, `crypto`, `datatypes`, `file_transmission`, `fonts`, `glfw`,
 `graphics`, `keys`, `layout`, `mouse`, `open_actions`, `options`, `parser`, `screen`,
 `search_query_parser`, `shell_integration`, `shm`, `ssh`, `tui`, `utmp` — plus the ever-present base package
@@ -661,7 +709,7 @@ work is performed through the `kitty.fast_data_types` binding.
   produced `ModuleNotFoundError: No module named 'kittens.transfer.rsync'` (`file_transmission.py:13`, via
   `main.py:64`) and no `Ran N tests` line.
 - **Optional / platform — Claim:** the GLFW backends are optional to the run; without them the suite still
-  runs and only the two GLFW-specific tests break. **Evidence:** Tier 3 produced `Ran 145 tests in 16.587s`
+  runs and only the two GLFW-specific tests break. **Evidence:** Tier 3 produced `Ran 145 tests in 15.476s`
   with `FAILED (failures=7, errors=1, skipped=2)` — exactly the baseline plus the GLFW error/failure.
 
 ---
@@ -705,7 +753,7 @@ Re-reading the question and confirming each named item is addressed in the body:
 - [x] **Build the project from source** — §1: default build fails under `-Werror` (`setup.py:491`);
   `--ignore-compiler-warnings` (`setup.py:2003-2004`) yields a clean exit-0 build with all six artifacts.
 - [x] **Execute the test suite at representative scale, capturing real runner output** — §2:
-  `Ran 145 tests in 26.124s`, `FAILED (failures=6, skipped=2)`, `All Go tests succeeded, ran in 26.2 seconds`.
+  `Ran 145 tests in 27.964s`, `FAILED (failures=6, skipped=2)`, `All Go tests succeeded, ran in 28.4 seconds`.
 - [x] **Trace the relationship between the compiled C extensions and test execution (concrete binding code
   path)** — §3.1: `from kitty.fast_data_types import …` at `kitty_tests/__init__.py:22`, plus the
   authoritative `test_loading_extensions` (`check_build.py:28-31`).
