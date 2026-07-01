@@ -85,7 +85,7 @@ if (UNLIKELY(self->columns < self->cursor->x + (unsigned int)char_width)) {
 }
 ```
 
-With `columns == 1` and a width‑2 base, the wrap check `1 < cursor->x + 2` (`kitty/screen.c:821`) is satisfied for **every** base in the sequence — **including the very first one at `x = 0`**, where `1 < 0 + 2` already holds, because a width‑2 glyph can never fit in a single column. Autowrap (DECAWM, mode 7) is **on by default** — the initial mode block sets it true: `static const ScreenModes empty_modes = {0, .mDECAWM=true, .mDECTCEM=true, .mDECARM=true};` (`kitty/screen.c:33`) — so `continue_to_next_line` (`kitty/screen.c:823`, defined at `kitty/screen.c:524`) runs on **each** wrap, pushing the current line into the scrollback ring via `historybuf_add_line` (`kitty/history.c:287`, invoked at `kitty/history.c:342`). Because the first base wraps *before* any cell has been written to the row, the line pushed first is the still‑empty starting row — this is precisely the origin of the empty trailing history entry `hist[3]` seen below; each of the subsequent bases then wraps in turn, pushing the prior, **content‑bearing** base into scrollback. After each wrap the base is written with `s->cp[self->cursor->x].ch = ch;` (`kitty/screen.c:836`); the cursor advances (`kitty/screen.c:837`) and, for a width‑2 base, advances again while marking the GPU width (`kitty/screen.c:838`–`:843`).
+With `columns == 1` and a width‑2 base, the wrap check `1 < cursor->x + 2` (`kitty/screen.c:821`) is satisfied for **every** base in the sequence — **including the very first one at `x = 0`**, where `1 < 0 + 2` already holds, because a width‑2 glyph can never fit in a single column. Autowrap (DECAWM, mode 7) is **on by default** — the initial mode block sets it true: `static const ScreenModes empty_modes = {0, .mDECAWM=true, .mDECTCEM=true, .mDECARM=true};` (`kitty/screen.c:33`) — so `continue_to_next_line` (`kitty/screen.c:823`, defined at `kitty/screen.c:524`) runs on **each** wrap, pushing the current line into the scrollback ring via `historybuf_add_line` (`kitty/history.c:287`, invoked on the autowrap path at `kitty/screen.c:1558`, inside the `INDEX_UP` macro reached via `screen_linefeed` and `screen_index`). Because the first base wraps *before* any cell has been written to the row, the line pushed first is the still‑empty starting row — this is precisely the origin of the empty trailing history entry `hist[3]` seen below; each of the subsequent bases then wraps in turn, pushing the prior, **content‑bearing** base into scrollback. After each wrap the base is written with `s->cp[self->cursor->x].ch = ch;` (`kitty/screen.c:836`); the cursor advances (`kitty/screen.c:837`) and, for a width‑2 base, advances again while marking the GPU width (`kitty/screen.c:838`–`:843`).
 
 Drawing a **single** base into a 1×1 grid confirms this first‑base wrap directly — the row pushed to scrollback is empty and `historybuf.count` is already `1` after just one base:
 
@@ -241,11 +241,17 @@ The column budget determines exactly how many codepoints survive on the visible 
 ZWJ pair U+1F468 U+200D U+1F469 in 1x1 -> visible '👩' | U+1F469 (only woman survives)
 cols=1  -> '👦' (1 cp: U+1F466)
 cols=2  -> '👦' (1 cp: U+1F466)
+cols=3  -> '👦' (1 cp: U+1F466)
+cols=4  -> '👧\u200d👦' (3 cp: U+1F467 U+200D U+1F466)
 cols=5  -> '👧\u200d👦' (3 cp: U+1F467 U+200D U+1F466)
+cols=6  -> '👦' (1 cp: U+1F466)
+cols=7  -> '👦' (1 cp: U+1F466)
+cols=8  -> '👨\u200d👩\u200d👧\u200d👦' (7 cp: U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)
+cols=9  -> '👨\u200d👩\u200d👧\u200d👦' (7 cp: U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)
 cols=10 -> '👨\u200d👩\u200d👧\u200d👦' (7 cp: U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)
 ```
 
-A simpler ZWJ pair `U+1F468 U+200D U+1F469` in 1×1 keeps only the woman `U+1F469` (the last base). As the column count grows, more of the sequence fits before wrapping: 1 codepoint at 1–2 columns, 3 codepoints at 5 columns, and the **full 7 codepoints** at 10 columns (two width‑2 bases per two columns, plus the zero‑width ZWJs). If kitty were doing GB11 clustering, the survivor set would not scale linearly with raw column width like this — it would keep or drop the family as a unit.
+A simpler ZWJ pair `U+1F468 U+200D U+1F469` in 1×1 keeps only the woman `U+1F469` (the last base). For the full family, the number of surviving codepoints does **not** grow smoothly with the column count — it depends on the **exact column geometry and is non‑monotonic**: 1 codepoint at 1–3 columns, 3 codepoints at 4–5 columns, then back down to **just 1 codepoint at 6–7 columns** (fewer than at 4–5), and finally the **full 7 codepoints** at 8–10 columns. The dip at 6–7 columns is the tell‑tale: at those widths the leading bases fill the row up to an exact‑fill boundary — e.g. at 6 columns the man, woman and girl occupy columns 0–5, leaving the cursor at `x = 6` — so the final width‑2 boy base then satisfies the wrap check `6 < 6 + 2` (`kitty/screen.c:821`) and **wraps alone** onto a fresh visible line, leaving only 1 codepoint visible. If kitty were doing GB11 clustering the survivor set would not swing non‑monotonically with raw column width like this; it would keep or drop the family as a unit — so the swing is itself further evidence that retention is **width/geometry‑driven, not grapheme‑driven**.
 
 **Rationale.** Normalization (absent), grapheme breaking (a per‑codepoint combining heuristic), and state reporting (cell‑geometry based) are three *independent* layers here. Their interaction under the 1×1 constraint is what fragments the emoji and produces a cursor‑clamped `ESC[1;2R`: no single layer "understands" the family emoji as one glyph, so the sequence is preserved only as scattered base cells, and the state query can only report the geometry those cells produced.
 
@@ -351,7 +357,7 @@ print("=== Edge cases ===")
 sp, _ = mk(1, 1); sp.draw('\U0001f468\u200d\U0001f469')
 vp = str(sp.line(0))
 print("ZWJ pair U+1F468 U+200D U+1F469 in 1x1 -> visible %r | %s (only woman survives)" % (vp, cps(vp)))
-for cols in (1, 2, 5, 10):
+for cols in range(1, 11):
     sc, _ = mk(1, cols); sc.draw(FAMILY)
     vc = str(sc.line(0))
     print("cols=%-2d -> %r (%d cp: %s)" % (cols, vc, len(vc), cps(vc)))
@@ -413,7 +419,13 @@ DECRQM ESC[?7$p -> b'\x1b[?7;1$y'
 ZWJ pair U+1F468 U+200D U+1F469 in 1x1 -> visible '👩' | U+1F469 (only woman survives)
 cols=1  -> '👦' (1 cp: U+1F466)
 cols=2  -> '👦' (1 cp: U+1F466)
+cols=3  -> '👦' (1 cp: U+1F466)
+cols=4  -> '👧\u200d👦' (3 cp: U+1F467 U+200D U+1F466)
 cols=5  -> '👧\u200d👦' (3 cp: U+1F467 U+200D U+1F466)
+cols=6  -> '👦' (1 cp: U+1F466)
+cols=7  -> '👦' (1 cp: U+1F466)
+cols=8  -> '👨\u200d👩\u200d👧\u200d👦' (7 cp: U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)
+cols=9  -> '👨\u200d👩\u200d👧\u200d👦' (7 cp: U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)
 cols=10 -> '👨\u200d👩\u200d👧\u200d👦' (7 cp: U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)
 Combining cap: 'a'+U+0301..U+0305 -> 'á̂̅' | U+0061 U+0301 U+0302 U+0305 (slot 2 = LAST mark)
 No normalization: 'e'+U+0301 -> 'é' | U+0065 U+0301 ; NFC U+00E9 present? False
@@ -449,7 +461,7 @@ A final confirmation that every sub‑question was answered explicitly, each wit
 | **Q1** — what the buffer keeps under 1×1 | § Q1 | `historybuf.count = 4`; man/woman/girl+ZWJ on wrapped lines | `kitty/screen.c:763`, `:821`, `:33`; `kitty/history.c:287`; `kitty/line.c:466` |
 | **Q2** — what the cell contains | § Q2 | `'👦'` = `U+1F466`, count 1, width 2, cursor `(2,0)` | `kitty/screen.c:836`; `kitty/data-types.h:224,226,198` |
 | **Q3** — the state‑query reply | § Q3 | CPR `ESC[6n` → `b'\x1b[1;2R'`; DSR `b'\x1b[0n'`; size `b'\x1b[4;20;10t'`; DA1 `b'\x1b[?62;c'`; DA2 `b'\x1b[>1;4000;35c'`; XTVERSION `b'\x1bP>|kitty(0.35.2)\x1b\\'`; DECRQM `b'\x1b[?7;1$y'` | `kitty/screen.c:2179`, `:2192`, `:2196`, `:2186`, `:2147`–`:2164`, `:2125`, `:2128`, `:2137`, `:2203`, `:955` |
-| **Q4** — synthesis | § Q4 | no‑norm `U+0065 U+0301` (NFC `U+00E9` absent); no `kitty/text-cache.*`; combining cap `U+0061 U+0301 U+0302 U+0305`; survivor scaling by columns | `kitty/unicode-data.c:11`, `:323`; `kitty/unicode-data.h:5`; `kitty/wcwidth-std.h:10`; `kitty/line.c:466` |
+| **Q4** — synthesis | § Q4 | no‑norm `U+0065 U+0301` (NFC `U+00E9` absent); no `kitty/text-cache.*`; combining cap `U+0061 U+0301 U+0302 U+0305`; survivor count varies non‑monotonically with column geometry | `kitty/unicode-data.c:11`, `:323`; `kitty/unicode-data.h:5`; `kitty/wcwidth-std.h:10`; `kitty/line.c:466` |
 
 **All four sub‑questions are addressed.** Every quoted value — codepoints, counts, cursor coordinates, and control‑sequence reply bytes — is reproduced exactly as captured by building and running kitty headlessly, and every technical claim carries a `file:line` reference to source at HEAD `815df1e210e0`. The investigation was strictly **read‑only**: no existing repository file was changed, temporary scripts under `/tmp` were removed, and after the deliverable commit `git status --porcelain` is empty (the tree differs from its pre‑task baseline only by this newly created, now‑committed answer document).
 
