@@ -426,6 +426,11 @@ If instead you run plain `python3 test.py` (no launcher) with `rsync.so` missing
 comes **even earlier**, verbatim (exit `1`):
 
 ```
+Traceback (most recent call last):
+  File "/app/test.py", line 13, in <module>
+    main()
+  File "/app/test.py", line 9, in main
+    getattr(m, 'main')()
   File "/app/kitty_tests/main.py", line 338, in main
     run_tests()
   File "/app/kitty_tests/main.py", line 270, in run_tests
@@ -434,6 +439,8 @@ comes **even earlier**, verbatim (exit `1`):
     return GoProc(cmd)
   File "/app/kitty_tests/main.py", line 155, in __init__
     env['KITTY_PATH_TO_KITTY_EXE'] = kitty_exe()
+  File "/app/kitty/types.py", line 167, in __call__
+    self._cached_result = self.__wrapped__()
   File "/app/kitty/constants.py", line 67, in kitty_exe
     rpath = getattr(sys, 'kitty_run_data').get('bundle_exe_dir')
 AttributeError: module 'sys' has no attribute 'kitty_run_data'
@@ -831,6 +838,8 @@ observed value is reported as authoritative.
 **Read‑only outcome.** The only persistent change to the repository is this document,
 `blitzy/documentation/kitty_815df1e210e0.md`. All build artifacts (`*.so`, launchers) remain
 gitignored and uncommitted; the temporary probe `/tmp/observe_loaded.py` lives outside the
-repository and was deleted after use; `git status --porcelain` shows only the new `blitzy/`
-tree. No existing repository file was modified.
+repository and was deleted after use. At authoring time `git status --porcelain` showed only
+the new `blitzy/` tree, and at any later point `git diff --name-status 815df1e210e0..HEAD`
+lists exactly one added path (status `A`), `blitzy/documentation/kitty_815df1e210e0.md`. No
+existing repository file was modified.
 
