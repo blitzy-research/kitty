@@ -155,8 +155,22 @@ GLSL_VERSION = 140
 | SIMD string scanning | `kitty/simd-string-128.c`, `kitty/simd-string-256.c` |
 | Global state & non‑blocking PTY I/O thread | `kitty/state.c`, `kitty/child-monitor.c` |
 | macOS integration (Objective‑C) | `kitty/*.m` — e.g. `kitty/core_text.m`, `kitty/cocoa_window.m` |
-| Windowing | `glfw/` |
-| Go tooling | `tools/` |
+
+Windowing and the Go tooling are **not** compiled into `fast_data_types` — the same `setup.py` `build()` (`setup.py:1084`) produces them as **separate** build outputs, so they are listed apart from the extension above:
+
+| Component (built separately — *not* in `fast_data_types`) | How it is built | Output artifact |
+|---|---|---|
+| Windowing (GLFW backend) | `compile_glfw()` (`setup.py:932`, invoked from `build()` at `setup.py:1094`) compiles the `glfw/` sources into a separate extension whose module-name literal is `f'kitty/glfw-{module}'` (`setup.py:953`) | a standalone extension `kitty/glfw-{module}` (here `kitty/glfw-x11.so`), distinct from `fast_data_types` |
+| Go CLI tooling | `build_static_kittens()` (`setup.py:1130`) runs `go build` (`cmd = [go, 'build', '-v']`, `setup.py:1148`) against `src = os.path.abspath('tools/cmd')` (`setup.py:1163`) | the standalone `kitten` binary (`dest = os.path.join(destination_dir or launcher_dir, 'kitten')`, `setup.py:1160`) |
+
+That the build emits three *distinct* artifacts — not one — is directly observable in the built tree:
+```console
+$ ls -1 kitty/fast_data_types.so kitty/glfw-x11.so kitty/launcher/kitten
+kitty/fast_data_types.so
+kitty/glfw-x11.so
+kitty/launcher/kitten
+```
+`kitty/glfw-x11.so` is its own loadable extension separate from `kitty/fast_data_types.so`, and `kitty/launcher/kitten` is a standalone Go binary — neither is linked into `fast_data_types`.
 
 **Reasoning.** Python modules under `kitty/*.py` and `kittens/*.py` read config, wire up event loops, and expose extensibility, but the parse/render/I/O hot paths live behind `fast_data_types`. That the module even exposes `GLSL_VERSION` (a rendering constant) to Python shows how much of the runtime substance sits on the C side of the seam. The two Objective‑C examples named above, `core_text.m` (macOS font rasterization via Core Text) and `cocoa_window.m` (macOS window/event integration), are the platform‑specific analogues of the FreeType/GLFW paths used elsewhere.
 
