@@ -446,6 +446,16 @@ unwrap_script = `'eval "$(echo "$0" | tr \\\v\\\f\\\r\\\b \\\047\\\134\\\n\\\041
 at `kittens/ssh/main.go:506` — i.e. `tr` maps VT→`\047` (`'`), FF→`\134` (`\`), CR→newline,
 BS→`\041` (`!`), restoring the original bytes.
 
+That line is quoted exactly as it appears in the Go source, where `unwrap_script` is a
+back-quoted **raw** string literal, so its triple-backslash sequences are stored verbatim.
+After the login shell interprets that argument for the remote `sh -c`, the command the remote
+actually runs is `eval "$(echo "$0" | tr \v\f\r\b \047\134\n\041)"` — that is, once the
+Go/string escaping is resolved for the remote shell, the effective translation invocation is
+the normalized literal `tr \v\f\r\b \047\134\n\041` (set 1 `\v\f\r\b` = VT/FF/CR/BS; set 2
+`\047\134\n\041` = octal `'`, octal `\`, newline, octal `!`). This normalized form was verified
+by observing the argv that `tr` actually receives after shell processing (full command and
+output in the [appendix](#observed-output-appendix)).
+
 This mapping was reproduced by running the exact replacer over a sample string containing
 `'`, `\`, newline, and `!`, and hex-dumping the result (full command and output in the
 [appendix](#observed-output-appendix)):
@@ -771,7 +781,9 @@ These are supporting mechanisms referenced by the flow above, included for compl
 
 ## Observed Output appendix
 
-All commands were run from the repository root at HEAD `815df1e21`. Output is quoted verbatim.
+Commands were run from the repository root on the documentation branch whose source tree
+matches code revision `815df1e21` (only this document differs from that source commit). Output
+is quoted verbatim.
 Temporary observation scripts were created outside the repository tree (under `/tmp`) and
 removed afterward; the repository working tree is unchanged apart from this document.
 
@@ -835,6 +847,22 @@ ORIG hex : 6563686f20276869270a666f6f216261725c62617a
 ENC  hex : 6563686f200b68690b0d666f6f086261720c62617a
 DEC  hex : 6563686f20276869270a666f6f216261725c62617a
 ```
+
+To confirm the *normalized* remote decode — i.e. what the remote shell hands to `tr` **after**
+it interprets the escaping in the back-quoted `unwrap_script` (`kittens/ssh/main.go:506`) — a
+throwaway `sh -c` reproduction replaced `tr` with a stub that prints its argv. The
+single-quoted `unwrap_script` body the inner `sh -c` receives is
+`eval "$(echo "$0" | tr \\\v\\\f\\\r\\\b \\\047\\\134\\\n\\\041)"`; the observed argv was:
+
+```
+$ UNWRAP='eval "$(echo "$0" | tr \\\v\\\f\\\r\\\b \\\047\\\134\\\n\\\041)"'
+$ sh -c "$UNWRAP" 'ENCODED_SCRIPT_DOLLAR0'      # tr stub prints its argv to stderr
+TR_ARG1=<\v\f\r\b>
+TR_ARG2=<\047\134\n\041>
+```
+
+so the effective remote invocation is the normalized literal `tr \v\f\r\b \047\134\n\041`
+(matching the prose in [Q6](#q6--how-the-bootstrap-is-encoded-with-per-interpreter-character-substitutions-posix-sh-vs-python)).
 
 ### (e) Q1/Q8 shared-memory create + permissions (reproduced)
 
@@ -954,7 +982,8 @@ Re-reading the original question, each distinct sub-question is answered in its 
   controlling TTY): [answered](#q9--the-terminal--remote-dcs-requestresponse-handshake-over-the-controlling-tty).
 
 **Verification note.** All literals the questions ask for are quoted exactly rather than
-paraphrased — e.g. the `0o600` mode; the VT/FF/CR/BS map `0x0b`/`0x0c`/`0x0d`/`0x08`; the
+paraphrased — e.g. the `0o600` mode; the VT/FF/CR/BS map `0x0b`/`0x0c`/`0x0d`/`0x08` and the
+normalized remote decode `tr \v\f\r\b \047\134\n\041`; the
 `254`-byte chunk size; the DCS prefix `\033P@kitty-ssh|`; the payload
 `id=<REQUEST_ID>:pwfile=<PASSWORD_FILENAME>:pw=<DATA_PASSWORD>`; the
 `KITTY_DATA_START`/`OK`/`KITTY_DATA_END` markers; the six connection-sharing options
