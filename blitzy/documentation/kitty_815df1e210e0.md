@@ -97,7 +97,7 @@ VT_PARSER_BUFFER_SIZE = 1048576
 VT_PARSER_BUFFER_SIZE == 1024*1024 : True
 ```
 
-So the whole cross-thread pipe is exactly **`1048576`** bytes (1 MiB), and any single escape code is capped at `MAX_ESCAPE_CODE_LENGTH = BUF_SZ / 4u` = **262144** bytes (`` `kitty/vt-parser.c:21` ``; exposed as `VT_PARSER_MAX_ESCAPE_CODE_SIZE`, confirmed `= 262144` in Section 1).
+So the whole cross-thread pipe is exactly **`1048576`** bytes (1 MiB), and `MAX_ESCAPE_CODE_LENGTH = BUF_SZ / 4u` = **262144** bytes (`` `kitty/vt-parser.c:21` ``; exposed as `VT_PARSER_MAX_ESCAPE_CODE_SIZE`, confirmed `= 262144` in Section 1) is the threshold past which an *unterminated* escape is either chunked (OSC 52 → partial callbacks) or rejected as `escape code too long ... ignoring it` (`` `kitty/vt-parser.c:419` ``) — a *complete* (terminator-delimited) escape is accepted **whole regardless of size**, so this is a floor for handling unterminated overflow, not a hard cap on escape length (see §1.3).
 
 **The GIL boundary.** Only the thread that holds CPython's Global Interpreter Lock may run Python bytecode or call the CPython C-API. The main thread holds the GIL whenever it materializes C data into Python objects or dispatches a callback. The I/O thread does **not** need the GIL to append bytes to the 1 MiB buffer. This asymmetry is the key to Q2a: a long C-side loop on the main thread occupies that thread and therefore **defers** kitty's own Python-level dispatch — which runs on the *same* main thread — while byte **ingestion** on the I/O thread keeps going. The deferral is *same-thread serialization*, not GIL monopoly: the loop still yields the GIL at CPython's switch interval, so a separate Python thread keeps running (measured in §2.1). This is demonstrated directly in Section 2.
 
@@ -184,10 +184,19 @@ Interpretation: the escape `\x1b]52;c;aGVsbG8gY2xpcGJvYXJk\x07` produced exactly
 
 ## 1.3 Small → large divergence #1: the OSC 52 payload is *chunked* by the parser
 
-A large OSC 52 does **not** arrive as one Python object. When the accumulated escape exceeds `MAX_ESCAPE_CODE_LENGTH` (`BUF_SZ / 4u` = 262144), the parser dispatches a **partial** chunk and continues:
+A large OSC 52 does **not** always arrive as one Python object — but the split point is the **1 MiB parser buffer**, not `MAX_ESCAPE_CODE_LENGTH`. The parser first calls `find_st_terminator` (`` `kitty/vt-parser.c:397-404` ``): if the *complete* escape (its `ST`/`BEL` terminator included) is already in the buffer, it is dispatched **whole regardless of size** — the source comment there says to "be generous ... we have a full escape code". Only when the escape is still **unterminated** *and* the accumulation has exceeded `MAX_ESCAPE_CODE_LENGTH` (`BUF_SZ / 4u` = 262144) does the parser fall through to the **partial**-chunk branch and continue. Because the write buffer is `BUF_SZ` (`1048576`) bytes, an unterminated OSC 52 only reaches that branch once it has filled ~1 MiB:
 
 ```
-$ sed -n '406,414p' kitty/vt-parser.c
+$ sed -n '397,414p' kitty/vt-parser.c
+    if (find_st_terminator(self, &pos)) {
+        // technically we should check MAX_ESCAPE_CODE_LENGTH here but lets be generous in what we accept since  we
+        // have a full escape code
+        uint8_t *buf = self->buf + self->read.consumed;
+        size_t sz = pos - self->read.consumed;
+        buf[sz] = 0;  // ensure null termination, this is anyway an ST termination char
+        dispatch(self, buf, sz, false);
+        return true;
+    }
     if (UNLIKELY((pos=self->read.pos - self->read.consumed) > MAX_ESCAPE_CODE_LENGTH)) {
         if (self->vte_state == VTE_OSC && is_osc_52(self)) {
             // null terminate
@@ -209,7 +218,36 @@ clipboard_control fired 2 time(s): 1 partial (is_partial=True), 1 final (is_part
 first callback is_partial = True | last callback is_partial = False
 ```
 
-Interpretation: a **1398112**-byte OSC 52 sequence crossed into Python as **two** callbacks — first `is_partial=True` (a partial chunk emitted the moment the buffer accumulation passed `262144`, per `` `kitty/vt-parser.c:406-414` ``), then a final `is_partial=False`. Small data = one complete dispatch; large data = a stream of partials + a final. The exposed threshold matches the source:
+Interpretation: a **1398112**-byte OSC 52 sequence crossed into Python as **two** callbacks — first `is_partial=True`, then a final `is_partial=False`. The partial is emitted only because the escape is still *unterminated when the 1 MiB write buffer fills*: once the accumulation overflows `BUF_SZ` (`1048576`) the parser dispatches a **1048570**-byte partial chunk (the partial branch at `` `kitty/vt-parser.c:406-414` ``) and continues. Shorter *complete* escapes never take that branch — `find_st_terminator` (`` `kitty/vt-parser.c:397-404` ``) dispatches them whole regardless of size — so `262144` (`MAX_ESCAPE_CODE_LENGTH`) is the branch **floor**, *not* the observed trigger point. A boundary sweep across both thresholds makes the real trigger explicit: escapes up to **1048544** bytes (well past `262144`) still fire **one** complete callback, and the first partial appears only at **1048580** bytes, just past `BUF_SZ`:
+
+```
+$ /opt/kitty-venv/bin/python -c '
+import sys, base64
+sys.path.insert(0, ".")
+from kitty.fast_data_types import Screen, VT_PARSER_BUFFER_SIZE as BUF, VT_PARSER_MAX_ESCAPE_CODE_SIZE as MAXE
+from kitty_tests import Callbacks, parse_bytes
+def probe(raw):
+    esc = b"\x1b]52;c;" + base64.standard_b64encode(b"A"*raw) + b"\x07"
+    cb = Callbacks(); s = Screen(cb, 5, 5, 5, 10, 20, 0, cb); parse_bytes(s, esc)
+    npart = sum(1 for c in cb.cc_buf if c[1])
+    psz = next((len(c[0]) for c in cb.cc_buf if c[1]), 0)
+    return len(esc), len(cb.cc_buf), npart, psz
+print("BUF_SZ =", BUF, "| MAX_ESCAPE_CODE_LENGTH =", MAXE)
+print("escape_total  callbacks  partials  partial_bytes")
+for raw in (196602, 786000, 786400, 786427, 1048576):
+    et, n, np_, ps = probe(raw)
+    print("%-12d  %-9d  %-8d  %d" % (et, n, np_, ps))
+'
+BUF_SZ = 1048576 | MAX_ESCAPE_CODE_LENGTH = 262144
+escape_total  callbacks  partials  partial_bytes
+262144        1          0         0
+1048008       1          0         0
+1048544       1          0         0
+1048580       2          1         1048570
+1398112       2          1         1048570
+```
+
+Small data = one complete dispatch; large data past the 1 MiB buffer = a stream of partials + a final. The `MAX_ESCAPE_CODE_LENGTH` constant that gates that partial branch is itself exposed to Python and matches its source definition (`BUF_SZ / 4u`):
 
 ```
 $ python3 -c "import kitty.fast_data_types as f; print('VT_PARSER_MAX_ESCAPE_CODE_SIZE =', f.VT_PARSER_MAX_ESCAPE_CODE_SIZE); print('== BUF_SZ/4 =', 1048576 // 4)"
@@ -644,5 +682,5 @@ Every distinct sub-part of the question, mapped to where it is answered and the 
 
 ## One-paragraph synthesis
 
-In practice, clipboard and screen data cross from kitty's C core into Python on **one thread** — the main thread, under the GIL. Small data crosses in a single step (one `clipboard_control` callback, one in-memory `io.BytesIO`, a handful of `PyUnicode` strings); very large data is deliberately *fragmented and offloaded* — OSC 52 is chopped into partial callbacks at the 262144-byte escape limit, and the reassembled bytes spill from RAM to an on-disk `TemporaryFile` past 16 MiB. When other parts of the system are busy, a separate I/O thread keeps reading child bytes into the shared 1 MiB buffer without needing the GIL, and the parser drops its lock so ingestion overlaps parsing — so **ingestion continues even while a long C-side scrollback scan occupies the main thread**. That scan (linear in line count: ~0.43 µs and ~2.51 KB per line) runs on the *same* main thread that kitty uses to dispatch events to kittens, which is precisely why *event delivery to kittens is deferred* while *memory grows linearly and is bounded only by the disk-offload paths* — and it is deferral by **same-thread serialization**, not GIL monopoly (a separate Python thread measurably kept running at the ~5 ms switch interval throughout the scan). The seams where this can go wrong are exactly the boundaries kitty engineers around: a deliberately released parser lock, a raw-allocator C buffer touched off-GIL, and a detached writer that copies its payload to sever Python ownership — real, delicate, and (on the paths exercised here) free of memory-safety faults, though a definitive race verdict would require ThreadSanitizer, which the available `--sanitize` build does not provide.
+In practice, clipboard and screen data cross from kitty's C core into Python on **one thread** — the main thread, under the GIL. Small data crosses in a single step (one `clipboard_control` callback, one in-memory `io.BytesIO`, a handful of `PyUnicode` strings); very large data is deliberately *fragmented and offloaded* — an unterminated OSC 52 is chopped into partial callbacks once it overflows the 1 MiB parser buffer (`BUF_SZ = 1048576`, a ~1048570-byte partial), and the reassembled bytes spill from RAM to an on-disk `TemporaryFile` past 16 MiB. When other parts of the system are busy, a separate I/O thread keeps reading child bytes into the shared 1 MiB buffer without needing the GIL, and the parser drops its lock so ingestion overlaps parsing — so **ingestion continues even while a long C-side scrollback scan occupies the main thread**. That scan (linear in line count: ~0.43 µs and ~2.51 KB per line) runs on the *same* main thread that kitty uses to dispatch events to kittens, which is precisely why *event delivery to kittens is deferred* while *memory grows linearly and is bounded only by the disk-offload paths* — and it is deferral by **same-thread serialization**, not GIL monopoly (a separate Python thread measurably kept running at the ~5 ms switch interval throughout the scan). The seams where this can go wrong are exactly the boundaries kitty engineers around: a deliberately released parser lock, a raw-allocator C buffer touched off-GIL, and a detached writer that copies its payload to sever Python ownership — real, delicate, and (on the paths exercised here) free of memory-safety faults, though a definitive race verdict would require ThreadSanitizer, which the available `--sanitize` build does not provide.
 
