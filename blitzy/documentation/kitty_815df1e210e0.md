@@ -92,11 +92,31 @@ flowchart TD
 
 **Build/run platform.** Kitty is a hybrid C + Python + Go project; the terminal core (VT parser,
 screen, child monitor) is C compiled into the `fast_data_types` extension, the application layer
-(`boss`, `window`, `child`) is Python, and the `kitten` CLI is Go. It was built with the project's
-canonical entrypoint (`python3 setup.py`) and the artifacts (`kitty/fast_data_types.so`,
-`kitty/launcher/kitty`, `kitty/launcher/kitten`) were present and runnable. Because Kitty is a GPU
-terminal, GUI runs use a virtual display via `xvfb-run`; the GUI-free OSC 133 path is exercised
-through the PTY unit harness `kitty_tests/shell_integration.py`.
+(`boss`, `window`, `child`) is Python, and the `kitten` CLI is Go. The authoritative
+build-and-run environment for this investigation is the project's specified Docker image
+`andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
+(pulled from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` as a fallback). Kitty
+was built with its canonical entrypoint — `python3 setup.py` (the `Makefile` `all:` target) —
+invoked here as `CFLAGS='-Wno-error=switch' python3 setup.py`. The `-Wno-error=switch` is required
+only because the host's newer `wayland-protocols` adds `xdg_toplevel_state` enum values that
+post-date this pinned kitty's bundled glfw `switch` statement; it keeps `-Werror` for every other
+warning and edits no source. The resulting artifacts (`kitty/fast_data_types.so`,
+`kitty/launcher/kitty`, `kitty/launcher/kitten`) were present and runnable.
+
+Kitty targets a **Python ≥ 3.10** runtime; that requirement is guarded in-source at
+`kitty/constants.py:L231` → `if sys.version_info[:2] < (3, 10):` (a compatibility guard around
+`importlib.resources.files()`), and the environment's `python3` is `3.13.7`, which satisfies it.
+The Go toolchain is `go 1.22` (`go.mod:L3`) and the C is `-std=c11` (`setup.py:L492`).
+
+Because Kitty is a GPU terminal, GUI runs use a virtual display via `xvfb-run`. The test suite is
+invoked through the same canonical entrypoint: `LANG=C.UTF-8 xvfb-run -a python3 setup.py test`.
+The `test` action does not run tests itself — it simply `exec`s the built launcher as
+`kitty +launch test.py` (`setup.py:L2101-L2103` → `os.execl(texe, texe, '+launch', 'test.py')`),
+forwarding no extra arguments. Consequently the GUI-free OSC 133 path used for the observations
+below was exercised module-scoped through the PTY unit harness `kitty_tests/shell_integration.py`,
+run as `LANG=C.UTF-8 xvfb-run -a ./kitty/launcher/kitty +launch test.py --module shell_integration`
+(the `--module` filter is an argument of `test.py`, not of `setup.py test`, so it must be passed to
+the launcher form).
 
 **Two kinds of facts are distinguished throughout:**
 
@@ -170,12 +190,12 @@ To prove the child's status is **not** propagated into Kitty's own exit code, th
 repeated with several child exit statuses:
 
 ```console
-$ # child exits 0
-child exit 0  -> kitty exit code: 0
-$ # child exits 7
-child exit 7  -> kitty exit code: 0
-$ # child exits 42
-child exit 42 -> kitty exit code: 0
+$ LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a ./kitty/launcher/kitty --config NONE sh -c 'printf "line1\nline2\nline3\n"; exit 0' 2>/dev/null; echo "kitty exit code: $?"
+kitty exit code: 0
+$ LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a ./kitty/launcher/kitty --config NONE sh -c 'printf "line1\nline2\nline3\n"; exit 7' 2>/dev/null; echo "kitty exit code: $?"
+kitty exit code: 0
+$ LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a ./kitty/launcher/kitty --config NONE sh -c 'printf "line1\nline2\nline3\n"; exit 42' 2>/dev/null; echo "kitty exit code: $?"
+kitty exit code: 0
 ```
 
 Kitty's own process exits `0` in every case.
@@ -221,11 +241,17 @@ option (see rationale).
 **(c) Observed output:**
 
 The OSC 133 status-transport path that culminates in this message is exercised end-to-end by the
-headless PTY harness `kitty_tests/shell_integration.py`, which asserts the parsed status. All six
-integration tests pass:
+headless PTY harness `kitty_tests/shell_integration.py`. Its `assert_command` helper
+(`kitty_tests/shell_integration.py:L266-L269`) runs a command through the integration and then
+asserts the terminal recorded the parsed status — `L268` →
+`pty.wait_till(lambda: pty.callbacks.last_cmd_exit_status == 0, ...)` and `L269` →
+`pty.wait_till(lambda: pty.callbacks.last_cmd_cmdline == cmd, ...)` — i.e. it waits until
+`last_cmd_exit_status == 0` and `last_cmd_cmdline == cmd` for the just-run command. All six
+integration tests pass (the elapsed time reported on the `Ran 6 tests` line varies per run):
 
 ```console
 $ LANG=C.UTF-8 xvfb-run -a ./kitty/launcher/kitty +launch test.py --module shell_integration
+Running under CI: False
 test_bash_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_bash_integration) ... ok
 test_fish_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_fish_integration) ... ok
 test_zsh_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_zsh_integration) ... ok
@@ -234,7 +260,7 @@ test_fish_integration (kitty_tests.shell_integration.ShellIntegration.test_fish_
 test_zsh_integration (kitty_tests.shell_integration.ShellIntegration.test_zsh_integration) ... ok
 
 ----------------------------------------------------------------------
-Ran 6 tests in 1.408s
+Ran 6 tests in 1.478s
 
 OK
 ```
@@ -459,34 +485,43 @@ Kitty parse & dispatch:
 
 **(c) Observed output:**
 
-*Raw on-the-wire bytes.* A real interactive `bash` was run with Kitty's shipped bash integration
-(`shell-integration/bash/kitty.bash`) sourced as its rcfile, and the integration-built prompt was
-expanded (via bash's `${PS1@P}` prompt-expansion) after commands that exit `0` and `3`. The literal
-OSC 133 `D` bytes emitted are:
+*Raw on-the-wire bytes.* A real interactive `bash` was spawned in a PTY with Kitty's shipped bash
+integration enabled (using the test harness's `safe_env_for_running_shell`, which sets
+`KITTY_SHELL_INTEGRATION=enabled` and sources `shell-integration/bash/kitty.bash`). The command
+`printf 'obs-line-1\nobs-line-2\n'` — which exits `0` — was run, and every complete OSC 133 `C`
+(command start) and `D` (command finished) marker was then extracted verbatim from the raw PTY byte
+stream (`PTY.received_bytes`):
 
 ```console
-$ python3 /tmp/blitzy_obs/osc133_pty_capture2.py
-== after `true` (exit 0): expanded integration PS1 (repr) ==
-  OSC 133;D sequence: b'\x1b]133;D;0\x07'
+$ LANG=C.UTF-8 ./kitty/launcher/kitty +launch /tmp/blitzy_obs/osc133_wire_capture.py
+== recorded by the real C parser via the OSC 133 callback ==
+last_cmd_cmdline     = "printf 'obs-line-1\\nobs-line-2\\n'"
+last_cmd_exit_status = 0
+
+== command-start marker(s) (OSC 133;C) seen on the wire — complete bytes ==
+b"\x1b]133;C;cmdline=printf\\ \\'obs-line-1\\\\nobs-line-2\\\\n\\'\x07"
+  hex: 1b 5d 31 33 33 3b 43 3b 63 6d 64 6c 69 6e 65 3d 70 72 69 6e 74 66 5c 20 5c 27 6f 62 73 2d 6c 69 6e 65 2d 31 5c 5c 6e 6f 62 73 2d 6c 69 6e 65 2d 32 5c 5c 6e 5c 27 07
+
+== command-finished marker(s) (OSC 133;D) seen on the wire — complete bytes ==
+b'\x1b]133;D;0\x07'
   hex: 1b 5d 31 33 33 3b 44 3b 30 07
-
-== after exit 3: expanded integration PS1 (repr) ==
-  OSC 133;D sequence: b'\x1b]133;D;3\x07'
-  hex: 1b 5d 31 33 33 3b 44 3b 33 07
+b'\x1b]133;D;0\x07'
+  hex: 1b 5d 31 33 33 3b 44 3b 30 07
 ```
 
-Byte-for-byte: `1b`=`ESC`, `5d`=`]`, `31 33 33`=`133`, `3b`=`;`, `44`=`D`, `3b`=`;`, `30`=`0`
-(or `33`=`3`), `07`=`BEL`. This is exactly the literal `\e]133;D;$?\a` from bash `L239` with `$?`
-expanded to the real exit status.
+(Two identical `D;0` markers appear because the wire carried one for the prompt already active when
+the capture began and one for the just-run command; both report exit status `0`.)
 
-An interactive run of the same shell also emitted the command-line marker on the wire:
+Byte-for-byte, the `D` marker decodes as `1b`=`ESC`, `5d`=`]`, `31 33 33`=`133`, `3b`=`;`, `44`=`D`,
+`3b`=`;`, `30`=`0`, `07`=`BEL` — exactly the literal `\e]133;D;$?\a` from bash `L239` with `$?`
+expanded to the real exit status `0`. The `C` marker carries the shell-quoted command line (bash
+builds it with `%q` in the `L208` `printf`), which the parser hands to the `cmd_output_marking`
+start branch, where `decode_cmdline` turns it back into the recorded `last_cmd_cmdline` shown above.
 
-```
-b'... \x1b]133;C;cmdline=printf ... \x07 ... obs-line-1\r\nobs-line-2\r\n ...'
-```
-
-*Parsed by the real C code.* Feeding those OSC 133 bytes into the actual compiled VT parser records
-the status (this is the same capture shown under Q4): `OSC 133;D;0` → `last_cmd_exit_status = 0`.
+*Parsed by the real C code.* The `last_cmd_cmdline` and `last_cmd_exit_status = 0` values above were
+recorded by the **actual compiled VT parser** in `fast_data_types` — the capture drives a real
+`Screen` through the OSC 133 callback rather than the observation script computing them. This is the
+same callback path shown under Q4: `OSC 133;D;0` → `last_cmd_exit_status = 0`.
 
 **(d) Rationale:** OSC 133 is the terminal "semantic prompt" protocol (introduced by FinalTerm and
 adopted by iTerm2, VS Code, WezTerm, Ghostty, and Kitty). OSC sequences are framed
@@ -524,14 +559,19 @@ The output does **not** appear on Kitty's own `stdout`.
 Two complementary observations establish this:
 
 1. In the GUI run from Q1, the child printed three lines but **nothing appeared on Kitty's own
-   stdout** (the captured stdout file was empty) — because the child's output goes to the PTY and is
-   rendered into the window, not forwarded to Kitty's stdout:
+   stdout**. Kitty's own `stdout` and `stderr` were redirected to files; after the run the stdout
+   file is empty, because the child's output goes to the PTY and is rendered into the window rather
+   than forwarded to Kitty's own stdout:
    ```console
-   $ LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a ./kitty/launcher/kitty --config NONE \
-         sh -c 'printf "line1\nline2\nline3\n"; exit 0' > /tmp/blitzy_obs/q1_stdout.txt 2>...
-   $ cat /tmp/blitzy_obs/q1_stdout.txt
-   (empty — child output did NOT leak to kitty's own stdout)
+   $ LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a ./kitty/launcher/kitty --config NONE sh -c 'printf "line1\nline2\nline3\n"; exit 0' >/tmp/blitzy_obs/q8_kitty_stdout.txt 2>/tmp/blitzy_obs/q8_kitty_stderr.txt; echo "kitty exit code: $?"
+   kitty exit code: 0
+   $ wc -c /tmp/blitzy_obs/q8_kitty_stdout.txt
+   0 /tmp/blitzy_obs/q8_kitty_stdout.txt
+   $ cat /tmp/blitzy_obs/q8_kitty_stdout.txt
    ```
+   The final `cat` prints nothing at all: Kitty's own `stdout` file is exactly `0` bytes (as `wc -c`
+   reports), confirming the child's `line1`/`line2`/`line3` never leaked to Kitty's stdout — they
+   were routed to the PTY and rendered into the window instead.
 
 2. Feeding the child's printed bytes through the real VT parser into a real `Screen` shows them
    landing in the screen's line buffer (same demo as Q4/Q7):
