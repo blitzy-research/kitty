@@ -403,6 +403,7 @@ cd = CmdDump()
 mixed = b'\x1b]133;A\x1b\\$ \x1bP=1s\x1b\\'
 print("MIXED_INPUT_REPR:", repr(mixed))
 parse_bytes(screen, mixed, cd)
+print("--- dispatched-command trace ---")
 for cmd in cd.get_result():
     print(cmd)
 ```
