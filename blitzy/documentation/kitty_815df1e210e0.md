@@ -26,17 +26,17 @@ python3 setup.py build --verbose
 The package libcrypto was not found on your system
 ```
 
-This is because `setup.py` probes `libcrypto` through `pkg-config` (`setup.py:L253 def libcrypto_flags()` → `setup.py:L275 ldflags = pkg_config('libcrypto', '--libs', ...)`, consumed by the build at `setup.py:L616-L617`). Installing `libssl-dev` (which provides `libcrypto.pc`) resolved it, after which the build completed (`BUILD_DONE rc=0`). **This `libcrypto`/`libssl-dev` prerequisite is required in addition to the apt list at `.github/workflows/ci.py:L84-L91`** — the CI base image already ships it, so it is not repeated in that list.
+This is because `setup.py` probes `libcrypto` through `pkg-config` (`setup.py:L253 def libcrypto_flags()` → `setup.py:L275 ldflags = pkg_config('libcrypto', '--libs', ...)`, consumed by the build at `setup.py:L616-L617`). Installing `libssl-dev` (which provides `libcrypto.pc`) resolved it, after which the build completed (`BUILD_DONE rc=0`). **This `libcrypto`/`libssl-dev` prerequisite is required in addition to the apt install command at `.github/workflows/ci.py:L85-L88`** — the CI base image already ships it, so it is not repeated in that list.
 
-**2. Native dependencies installed** (from `.github/workflows/ci.py:L84-L91`):
+**2. Native dependencies installed.** The authoritative apt command is at `.github/workflows/ci.py:L85-L88` (four implicitly-concatenated string literals that form one `apt-get install` invocation). Quoted **exactly** as implemented, in full:
 
 ```
-libgl1-mesa-dev libxi-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcb-xkb-dev
-libdbus-1-dev libxkbcommon-dev libharfbuzz-dev libx11-xcb-dev libpng-dev liblcms2-dev
-libfontconfig-dev libxkbcommon-x11-dev libcanberra-dev libxxhash-dev uuid-dev libsimde-dev
+sudo apt-get install -y libgl1-mesa-dev libxi-dev libxrandr-dev libxinerama-dev ca-certificates libxcursor-dev libxcb-xkb-dev libdbus-1-dev libxkbcommon-dev libharfbuzz-dev libx11-xcb-dev zsh libpng-dev liblcms2-dev libfontconfig-dev libxkbcommon-x11-dev libcanberra-dev libxxhash-dev uuid-dev libsimde-dev libsystemd-dev zsh bash dash systemd-coredump gdb
 ```
 
-plus, for the headless run and the failed-probe fix: `xvfb mesa-utils libgl1-mesa-dri fonts-dejavu-core golang-go libssl-dev`. Language toolchains: Python `>=3.8` (`pyproject.toml:L2`), Go `1.22` (`go.mod:L3`).
+Note this list is quoted verbatim, so it includes `ca-certificates` (`.github/workflows/ci.py:L85`), `libsystemd-dev`, `bash`, `dash`, `systemd-coredump`, `gdb` (`.github/workflows/ci.py:L88`), and `zsh` **twice** — once at `.github/workflows/ci.py:L86` and again at `.github/workflows/ci.py:L88`. Of these, the subset actually consumed by Kitty's native C build is the graphics/text/X/desktop `-dev` libraries (`libgl1-mesa-dev`, `libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libharfbuzz-dev`, `libpng-dev`, `liblcms2-dev`, `libfontconfig-dev`, `libxxhash-dev`, `uuid-dev`, `libsimde-dev`, `libsystemd-dev`, `libcanberra-dev`, and the `libx*`/`libxcb*`/`libxi`/`libxrandr`/`libxinerama`/`libxcursor`/`libdbus-1` packages); the remaining entries (`ca-certificates`, `zsh`, `bash`, `dash`, `systemd-coredump`, `gdb`) are CI shells, TLS roots, and debugging tooling rather than build inputs.
+
+Beyond that CI list, the headless run and the failed-probe fix additionally require `xvfb mesa-utils libgl1-mesa-dri fonts-dejavu-core golang-go libssl-dev`. Language toolchains: Python `>=3.8` (`pyproject.toml:L2`), Go `1.22` (`go.mod:L3`).
 
 **3. Headless OpenGL bring-up.** Start a virtual framebuffer, point `DISPLAY` at it, and force Mesa's software rasterizer:
 
@@ -62,7 +62,7 @@ OpenGL version string: 4.5 (Compatibility Profile) Mesa 25.2.8-0ubuntu0.24.04.2
 ```
 ./kitty/launcher/kitty --debug-rendering --debug-input --debug-font-fallback \
   -o allow_remote_control=yes --listen-on unix:/tmp/kitty_test.sock \
-  bash --noprofile --norc -c '<prints TERM/COLORTERM/... then sleep>'
+  bash --noprofile --norc /tmp/child.sh   # child script shown verbatim in Q3 item 4
 ```
 
 ---
@@ -115,19 +115,31 @@ Kitty comes up as an ordered chain of subsystems: a native C launcher boots an e
 
 A note on the timestamps: every debug line carries a `[<time>]` prefix because the C debug macros funnel through a single timed printer — `debug_rendering(...)` (`kitty/state.h:L14`), `debug_input(...)` (`kitty/state.h:L15`), and `debug_fonts(...)` (`kitty/state.h:L16`) each expand to `timed_debug_print(__VA_ARGS__)`, which prepends the monotonic time. That is why observed evidence lines look like `[0.137] ...`.
 
-### 1. Native launcher (process entry) — *source-grounded, pre-log bootstrap*
+### 1. Native launcher (process entry) — *first runtime evidence: the `--version` fast path*
 
-**Role:** The OS executes a small native C binary that validates descriptors, resolves paths, and boots an embedded CPython interpreter that will run the rest of Kitty. **This stage runs before any debug logging is initialized, so there is no runtime evidence line — it is grounded in source only.** The entry point is `kitty/launcher/main.c:L439` (`int main(int argc, char *argv[], char* envp[])`); it configures the interpreter via `PyConfig_InitPythonConfig` (`kitty/launcher/main.c:L193`), starts it with `Py_InitializeFromConfig` (`kitty/launcher/main.c:L211`), and hands control to Python with `Py_RunMain()` (`kitty/launcher/main.c:L216`).
+**Role:** The OS executes a small native C binary that validates descriptors, resolves paths, and (for a normal launch) boots an embedded CPython interpreter that runs the rest of Kitty. The entry point is `kitty/launcher/main.c:L439` (`int main(int argc, char *argv[], char* envp[])`); for a normal launch it configures the interpreter via `PyConfig_InitPythonConfig` (`kitty/launcher/main.c:L193`), starts it with `Py_InitializeFromConfig` (`kitty/launcher/main.c:L211`), and hands control to Python with `Py_RunMain()` (`kitty/launcher/main.c:L216`), reached through `run_embedded(&run_data)` (`kitty/launcher/main.c:L464`).
 
-### 2. Python entry-point dispatch
-
-**Role:** Once Python is live, the entry-point module inspects `sys.argv` and routes a GUI launch to `kitty.main.main()`. The dispatcher is `kitty/entry_points.py:L183 def main()`; for a normal launch it does `from kitty.main import main as kitty_main` (`kitty/entry_points.py:L194`) and calls `kitty_main()` (`kitty/entry_points.py:L195`). That the Python layer actually runs is directly observable from the version banner the binary prints:
+**Runtime evidence (native — this proves the launcher, not Python):** the launcher parses the command line in native C *first*, via `handle_fast_commandline(argc, argv)` (`kitty/launcher/main.c:L453`). `--version` is a fast path served entirely there: `if (opts.version_requested)` (`kitty/launcher/main.c:L428`) prints the banner and calls `exit(0)` (`kitty/launcher/main.c:L434`) **before** `run_embedded()` (`kitty/launcher/main.c:L464`) is ever invoked — so no Python code runs for `--version`. The banner therefore demonstrates that the native launcher started and parsed arguments:
 
 ```
 kitty 0.35.2 created by Kovid Goyal
 ```
 
-**Command/stream:** `./kitty/launcher/kitty --version` (stdout). **Citation:** `kitty/entry_points.py:L183`, `kitty/entry_points.py:L194-L195`.
+**Command/stream:** `./kitty/launcher/kitty --version` (stdout, non-TTY). **Citation:** `kitty/launcher/main.c:L428` (the `opts.version_requested` fast path), `kitty/launcher/main.c:L432` (the non-TTY branch `printf("kitty %s created by Kovid Goyal\n", KITTY_VERSION)`), `kitty/launcher/main.c:L434` (`exit(0)`, before `run_embedded()` at `kitty/launcher/main.c:L464`).
+
+### 2. Python entry-point dispatch
+
+**Role:** For a normal launch (i.e. *not* the `--version`/`-v` fast path of item 1), the launcher boots Python and hands off to the entry-point module, which inspects `sys.argv` and routes the invocation. The dispatcher is `kitty/entry_points.py:L183 def main()`: it computes `first_arg` (`kitty/entry_points.py:L188`), looks it up (`kitty/entry_points.py:L189`), routes a `+`-prefixed subcommand to `namespaced(...)` (`kitty/entry_points.py:L192`), and otherwise — a normal GUI launch — does `from kitty.main import main as kitty_main` (`kitty/entry_points.py:L194`) then `kitty_main()` (`kitty/entry_points.py:L195`).
+
+**Runtime evidence the Python layer booted and this dispatcher ran:** the `+runpy` command used in Q2 returns a value that only Python can compute, which requires `main()` to have dispatched the `+runpy` subcommand through `namespaced(...)` (`kitty/entry_points.py:L192`). One line of its captured output (full command and output in Q2) is:
+
+```
+term= 'xterm-kitty'
+```
+
+**Command/stream:** `./kitty/launcher/kitty +runpy '...print("term=",repr(d.term))...'` (stdout). **Citation:** `kitty/entry_points.py:L183`, `kitty/entry_points.py:L188-L192`.
+
+The **normal GUI launch** takes the other branch — `kitty_main()` (`kitty/entry_points.py:L194-L195`). That this branch executed is proven downstream by the whole subsystem cascade in items 4–10 (for example `[0.200] OS Window created`), each line of which is emitted only by `kitty.main.main()` and its callees and is therefore reachable only through this dispatch. **Citation:** `kitty/entry_points.py:L194-L195`.
 
 ### 3. `main()` orchestration — *source-grounded*
 
@@ -291,10 +303,17 @@ The proof that these settings were actually applied is the effective-configurati
 Unknown option: --debug-config
 ```
 
-The real dump was then obtained through the `debug_config` action over remote control (`kitten @ --to <sock> action debug_config`, then read back with `kitten @ --to <sock> get-text --extent all`), captured verbatim from a wide window so nothing is truncated:
+The real dump was then obtained through the `debug_config` action over remote control — `kitten @ --to <sock> action debug_config` (the action is `Boss.debug_config()` at `kitty/boss.py:L3060`, which calls `debug_config(get_options())`), then read back with `kitten @ --to <sock> get-text --extent all`. To keep the long font/OpenGL/PATH lines from wrapping, the window was first widened at runtime with `kitten @ set-font-size 8` (yielding a 133-column grid; this is a live font-size change, **not** a config override). Captured verbatim (ANSI-stripped) through the config-comparison section:
 
 ```
 kitty 0.35.2 (815df1e210) created by Kovid Goyal
+Linux 341b68ee4f91 6.6.122+ #1 SMP Thu Apr  2 09:59:00 UTC 2026 x86_64
+Ubuntu 24.04.2 LTS 341b68ee4f91 /dev/tty
+
+DISTRIB_ID=Ubuntu
+DISTRIB_RELEASE=24.04
+DISTRIB_CODENAME=noble
+DISTRIB_DESCRIPTION="Ubuntu 24.04.2 LTS"
 Running under: X11
 OpenGL: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.2' Detected version: 4.5
 Frozen: False
@@ -306,14 +325,25 @@ Fonts:
 Paths:
   kitty: /tmp/kitty_build/kitty/launcher/kitty
   base dir: /tmp/kitty_build
+  extensions dir: /tmp/kitty_build/kitty
   system shell: /bin/bash
+Loaded config overrides:
+  allow_remote_control yes
+
+Config options different from defaults:
+allow_remote_control yes
+
+Important environment variables seen by the kitty process:
 ```
 
-**Citation:** the dump is produced by `kitty/debug_config.py:L231 def debug_config(opts)`; the `OpenGL:` line is `kitty/debug_config.py:L258` (`p(green('OpenGL:'), opengl_version_string())`), the `Running under:` line is `kitty/debug_config.py:L257`, and the `Frozen:` line is `kitty/debug_config.py:L259`.
+The dump then continues with the kitty process's own environment variables; its first entry, `PATH`, is longer than even the 133-column window and appears wrapped by the scrollback pager (ending `…:/usr/local/>` with a trailing `:` pager prompt), so that trailing section is elided here. It is the *parent kitty process's* environment — the *child shell's* environment is the subject of Q3 and is shown there.
 
-Two things this dump proves:
+**Citation:** the dump is produced by `kitty/debug_config.py:L231 def debug_config(opts)`. In print order: the version line is `kitty/debug_config.py:L235` (`p(version(add_rev=True))`); the `os.uname()` line is `kitty/debug_config.py:L236` (`p(' '.join(os.uname()))`); the `/etc/issue` line is `kitty/debug_config.py:L240-L252`; the `/etc/lsb-release` block is `kitty/debug_config.py:L253-L255`; `Running under:` is `kitty/debug_config.py:L257`; `OpenGL:` is `kitty/debug_config.py:L258` (`p(green('OpenGL:'), opengl_version_string())`); `Frozen:` is `kitty/debug_config.py:L259`; `Fonts:` is `kitty/debug_config.py:L260-L263`; the `Paths:` block is `kitty/debug_config.py:L264-L268` — including `extensions dir:` at `kitty/debug_config.py:L267`; `Loaded config overrides:` is `kitty/debug_config.py:L272-L274`; the `Config options different from defaults:` heading and its list come from `compare_opts(opts, p)` at `kitty/debug_config.py:L275`; and the `Important environment variables seen by the kitty process:` heading is `kitty/debug_config.py:L277`.
 
-- **Pure defaults on first launch.** There is **no** `Config options different from defaults:` section in the output. That section is printed at `kitty/debug_config.py:L75` (`print('Config options different from defaults:')`) *only when* the effective options differ from the built-in defaults. Its absence proves no `kitty.conf` overrides were present — the run used pure defaults.
+Three things this dump proves:
+
+- **The effective config is pure defaults except for the single override deliberately added for capture.** The `Config options different from defaults:` heading is **unconditional** — `compare_opts()` prints it every time at `kitty/debug_config.py:L75` (`print('Config options different from defaults:')`), and `debug_config()` always calls `compare_opts()` at `kitty/debug_config.py:L275`, so its presence or absence proves nothing on its own. What is meaningful is the *list beneath it*: it contains exactly one line, `allow_remote_control yes`, which is precisely the `-o allow_remote_control=yes` override this investigation passed to enable remote-control capture. Every other option therefore equals its built-in default. (The same single override is echoed under `Loaded config overrides:`, populated from `opts.config_overrides` at `kitty/debug_config.py:L272-L274`.)
+- **No user `kitty.conf` was loaded — true first-launch defaults.** The dump has **no** `Loaded config files:` section. That section is printed *only* `if opts.config_paths:` (`kitty/debug_config.py:L269-L271`), so its absence means `opts.config_paths` is empty — i.e. no `kitty.conf` was found or loaded. This — not the always-present "different from defaults" heading — is the correct evidence that the settings are untouched defaults, and it is corroborated by the independently-captured `+runpy` defaults in item 2.
 - **Font config was applied (HEAD-commit relevance).** The HEAD commit `815df1e21` is *"Wire up applying of font config"*. The `Fonts:` section shows the abstract `monospace` default was actually applied and resolved to concrete faces (`DejaVuSansMono` and its bold/italic/bi variants) at startup — the same faces reported by the `--debug-font-fallback` dump in Q1, confirming the font configuration path is live at this commit.
 
 
@@ -335,27 +365,29 @@ This is the literal source line; `os.openpty()` returns the master/slave fd pair
 
 ### 2. Child environment population
 
-**Role:** Before `exec`-ing the shell, Kitty injects environment variables that tell programs what terminal they are running in and how to talk back to Kitty. These were read back live from the running child with `kitten @ --to <sock> ls` (the JSON `env` block), captured as:
+**Role:** Before `exec`-ing the shell, Kitty injects environment variables that tell programs what terminal they are running in and how to talk back to Kitty. These were read back live from the running child with `kitten @ --to <sock> ls`, which emits pretty-printed JSON. The terminal-related keys of the window's `env` object are quoted **verbatim** below, exactly as `kitten @ ls` prints them (alphabetically ordered, 14-space indent); the object's other 17 entries (`HOME`, `PATH`, `DISPLAY`, `SHELL`, and so on) are omitted:
 
 ```
-TERM = 'xterm-kitty'
-COLORTERM = 'truecolor'
-KITTY_PID = '40205'
-KITTY_WINDOW_ID = '1'
-KITTY_LISTEN_ON = 'unix:/tmp/kitty_test.sock'
-TERMINFO = '/tmp/kitty_build/terminfo'
-KITTY_INSTALLATION_DIR = '/tmp/kitty_build'
-KITTY_PUBLIC_KEY = '1:<a*NKRw`(?jD+Sv?M+<X(6~EaOFe3<fY}uuTgve<'
+              "COLORTERM": "truecolor",
+              "KITTY_INSTALLATION_DIR": "/tmp/kitty_build",
+              "KITTY_LISTEN_ON": "unix:/tmp/kitty_test.sock",
+              "KITTY_PID": "624",
+              "KITTY_PUBLIC_KEY": "1:IXg7()8DI`^it|01{aQ|_NENNljMuX?C6I<M9w8g",
+              "KITTY_WINDOW_ID": "1",
+              "TERM": "xterm-kitty",
+              "TERMINFO": "/tmp/kitty_build/terminfo",
 ```
 
-Each variable is grounded in the assignment that produced it:
+Each displayed variable is grounded in the exact assignment that produced it:
 
-- `TERM = 'xterm-kitty'` ← `kitty/child.py:L242` (`env['TERM'] = opts.term`). The value comes from the `term` option whose default is `xterm-kitty` (Q2).
-- `COLORTERM = 'truecolor'` ← `kitty/child.py:L243` (`env['COLORTERM'] = 'truecolor'`), advertising 24-bit color.
-- `KITTY_PID = '40205'` ← `kitty/child.py:L244` (`env['KITTY_PID'] = getpid()`).
-- `TERMINFO = '/tmp/kitty_build/terminfo'` ← `kitty/child.py:L258` (`env['TERMINFO'] = tdir`) in path mode; the alternative direct mode uses `base64_terminfo_data()` at `kitty/child.py:L260` (defined at `kitty/child.py:L184`).
-- `KITTY_INSTALLATION_DIR = '/tmp/kitty_build'` ← `kitty/child.py:L261` (`env['KITTY_INSTALLATION_DIR'] = kitty_base_dir`).
-- `KITTY_PUBLIC_KEY = '1:<a*NKRw`(?jD+Sv?M+<X(6~EaOFe3<fY}uuTgve<'` ← `kitty/child.py:L245` (`env['KITTY_PUBLIC_KEY'] = boss.encryption_public_key`).
+- `TERM` ← `kitty/child.py:L242` (`env['TERM'] = opts.term`); the value comes from the `term` option whose default is `xterm-kitty` (Q2).
+- `COLORTERM` ← `kitty/child.py:L243` (`env['COLORTERM'] = 'truecolor'`), advertising 24-bit color.
+- `KITTY_PID` ← `kitty/child.py:L244` (`env['KITTY_PID'] = getpid()`); its per-session value in this run is `624`.
+- `KITTY_PUBLIC_KEY` ← `kitty/child.py:L245` (`env['KITTY_PUBLIC_KEY'] = boss.encryption_public_key`); a per-session public key (the exact value appears in the JSON above).
+- `KITTY_LISTEN_ON` ← `kitty/child.py:L246-L247` (`if self.add_listen_on_env_var and boss.listening_on:` → `env['KITTY_LISTEN_ON'] = boss.listening_on`); its value is the `--listen-on` socket this run passed.
+- `TERMINFO` ← `kitty/child.py:L258` (`env['TERMINFO'] = tdir`) in path mode; the alternative direct mode uses `base64_terminfo_data()` at `kitty/child.py:L260` (defined at `kitty/child.py:L184`).
+- `KITTY_INSTALLATION_DIR` ← `kitty/child.py:L261` (`env['KITTY_INSTALLATION_DIR'] = kitty_base_dir`).
+- `KITTY_WINDOW_ID` ← `kitty/tabs.py:L491` (`fenv['KITTY_WINDOW_ID'] = str(next_window_id())`); this one is assigned by the tab when the window is created, not in `child.py`.
 
 The `TERM` value `xterm-kitty` is defined by `terminfo/kitty.terminfo`, whose first line is `xterm-kitty|KovIdTTY,` — this is the terminfo entry exported to the child so that `tput`/`ncurses` programs know Kitty's capabilities. Shell integration is layered on top by `kitty/shell_integration.py` (`def modify_shell_environ` at `kitty/shell_integration.py:L218`), which sources the per-shell scripts under `shell-integration/` (directories `bash`, `fish`, `ssh`, and `zsh`).
 
@@ -373,19 +405,49 @@ The parent only releases that block **after** the first layout has sized the PTY
 
 ### 4. Concrete behavior showing the first output was understood and drawn
 
-**Role:** When the shell prints, the bytes travel PTY → parser → screen cells. Concretely: the child-monitor reads the bytes in `read_bytes(...)` (`kitty/child-monitor.c:L1337`) into the VT parser's write buffer; `kitty/vt-parser.c` classifies and dispatches them, routing printable text to `screen_draw_text(...)` at `kitty/vt-parser.c:L236`; and `screen_draw_text(Screen*, const uint32_t*, size_t)` at `kitty/screen.c:L866` writes those characters into the on-screen cells. Because `kitten @ get-text` reads back the **cell buffer** (what is actually drawn), its returning our text is direct proof that parsing and drawing both succeeded. We ran a `bash` child that printed a marker plus its environment and terminal size, then read the drawn screen with `kitten @ --to <sock> get-text`. Captured verbatim:
+**Role:** When the shell prints, the bytes travel PTY → parser → screen cells. Concretely: the child-monitor reads the bytes in `read_bytes(...)` (`kitty/child-monitor.c:L1337`) into the VT parser's write buffer; `kitty/vt-parser.c` classifies and dispatches them, routing printable text to `screen_draw_text(...)` at `kitty/vt-parser.c:L236`; and `screen_draw_text(Screen*, const uint32_t*, size_t)` at `kitty/screen.c:L866` writes those characters into the on-screen cells. Because `kitten @ get-text` reads back the **cell buffer** (what is actually drawn), its returning our text is direct proof that parsing and drawing succeeded.
+
+**The producer.** The child was the small `bash` script from the Method-section run command (`bash --noprofile --norc /tmp/child.sh`), shown here **verbatim** so the exact statements that produced each output line are visible:
+
+```
+#!/bin/bash
+echo "HELLO_FROM_SHELL_12345"
+echo "TERM=[$TERM] COLORTERM=[$COLORTERM] KITTY_PID=[$KITTY_PID] KITTY_WINDOW_ID=[$KITTY_WINDOW_ID] TERMINFO=[$TERMINFO]"
+echo "cols=$(tput cols) lines=$(tput lines)"
+sleep 300
+```
+
+**The composite observation.** Reading the drawn screen with `kitten @ --to <sock> get-text` returned exactly the three lines below. This is **one composite capture**; each line is used as evidence for a *distinct* claim, split out beneath it:
 
 ```
 HELLO_FROM_SHELL_12345
-TERM=[xterm-kitty] COLORTERM=[truecolor] KITTY_PID=[40205] KITTY_WINDOW_ID=[1] TERMINFO=[/tmp/kitty_build/terminfo]
+TERM=[xterm-kitty] COLORTERM=[truecolor] KITTY_PID=[624] KITTY_WINDOW_ID=[1] TERMINFO=[/tmp/kitty_build/terminfo]
 cols=71 lines=22
 ```
 
-Three grounded observations from this single captured block:
+- **Claim — the shell's first output was parsed and drawn into cells.** Produced by the script's `echo "HELLO_FROM_SHELL_12345"`; evidence is line 1 of the capture:
 
-- The first line, `HELLO_FROM_SHELL_12345`, was produced by the shell and read back from the drawn cells — proof the bytes were parsed (`kitty/vt-parser.c:L236`) and drawn (`kitty/screen.c:L866`).
-- The second line shows `TERM=[xterm-kitty]` echoed by the shell itself, independently confirming that the `env['TERM'] = opts.term` assignment (`kitty/child.py:L242`) took effect inside the child.
-- The third line, `cols=71 lines=22`, comes from the shell running `tput cols` / `tput lines`, which query the `xterm-kitty` terminfo through the PTY. These values **match** the `kitten @ ls` JSON geometry (`columns=71 lines=22`), proving the PTY size negotiated by the handshake propagated correctly all the way to the shell.
+  ```
+  HELLO_FROM_SHELL_12345
+  ```
+
+  `kitten @ get-text` reads this back from the drawn **cell buffer**, so the bytes were classified/dispatched by the VT parser (`kitty/vt-parser.c:L236`) and written to cells by `screen_draw_text(...)` (`kitty/screen.c:L866`).
+
+- **Claim — the `TERM` environment variable propagated into the child.** Produced by the script's `echo "TERM=[$TERM] ..."`; evidence is line 2 of the capture:
+
+  ```
+  TERM=[xterm-kitty] COLORTERM=[truecolor] KITTY_PID=[624] KITTY_WINDOW_ID=[1] TERMINFO=[/tmp/kitty_build/terminfo]
+  ```
+
+  The child expanded `$TERM` to `xterm-kitty`, independently confirming the `env['TERM'] = opts.term` assignment (`kitty/child.py:L242`) took effect inside the child. (The same line echoes `KITTY_PID=[624]`, `KITTY_WINDOW_ID=[1]`, and `TERMINFO=[/tmp/kitty_build/terminfo]`, matching the item-2 JSON.)
+
+- **Claim — the PTY size negotiated by the handshake reached the shell.** Produced by the script's `echo "cols=$(tput cols) lines=$(tput lines)"`; evidence is line 3 of the capture:
+
+  ```
+  cols=71 lines=22
+  ```
+
+  `tput cols`/`tput lines` query the `xterm-kitty` terminfo through the PTY; the result `71 × 22` **matches** the `kitten @ ls` JSON geometry (`"columns": 71`, `"lines": 22`), proving the size set by `resize_pty(...)` (`kitty/window.py:L863`) *before* the terminal-ready release (item 3) propagated all the way to the shell.
 
 
 ---
@@ -408,7 +470,7 @@ The underlying font machinery (source-grounded — these are the code paths, not
 
 - **Discovery** — FontConfig selects the face for a family at `kitty/fontconfig.c:L276` (`match = FcFontMatch(NULL, pat, &result)`).
 - **Rasterization** — FreeType renders glyphs into cell bitmaps at `kitty/freetype.c:L675` (`render_glyphs_in_cells(...)`), which calls `FT_Render_Glyph(...)` at `kitty/freetype.c:L904`.
-- **GPU glyph cache/atlas** — rendered glyphs are cached to a texture atlas in `kitty/glyph-cache.c` (the `SpritePosItem` mapping a glyph to its atlas position).
+- **GPU glyph cache/atlas** — rendered glyphs are cached to a texture atlas in `kitty/glyph-cache.c`: the `SpritePosItem` struct that maps a glyph to its atlas position is defined at `kitty/glyph-cache.c:L12-L16`, and cache lookups/insertions go through `find_or_create_sprite_position(...)` at `kitty/glyph-cache.c:L33-L54`.
 
 The `Fonts:` section of the `debug_config` dump (Q2) independently confirms the same four faces were applied.
 
@@ -441,7 +503,7 @@ cols=71 lines=22
 scrollback_lines= 2000
 ```
 
-**Command/stream:** the `+runpy` defaults capture (stdout) from Q2. **Citation:** `kitty/options/definition.py:L372` (`opt('scrollback_lines', '2000', ...)`). The screen model maintains this history in `kitty/screen.c` (the `Screen` object's `historybuf`), and the render path consults the scroll position `scrolled_by` at `kitty/child-monitor.c:L673` when deciding what to draw. So on first launch, **2000 lines of scrollback are available by default**.
+**Command/stream:** the `+runpy` defaults capture (stdout) from Q2. **Citation:** `kitty/options/definition.py:L372` (`opt('scrollback_lines', '2000', ...)`). The screen model maintains this history in `kitty/screen.c`: the `Screen` object's history buffer is allocated at `kitty/screen.c:L130` (`self->historybuf = alloc_historybuf(MAX(scrollback, lines), columns, OPT(scrollback_pager_history_size))`), and the render path consults the scroll position `scrolled_by` at `kitty/child-monitor.c:L673` when deciding what to draw. So on first launch, **2000 lines of scrollback are available by default**.
 
 
 ---
@@ -453,8 +515,8 @@ Re-reading each question and confirming every distinct thing it names is answere
 **Q1 — WHICH systems start up + what you SEE:**
 
 - [x] Xvfb virtual framebuffer set up — recipe in *Method* (`Xvfb :99 -screen 0 1920x1080x24`), corroborated by the `glxinfo` block.
-- [x] Native launcher (process entry) — source-grounded, `kitty/launcher/main.c:L439`.
-- [x] Python entry-point dispatch — `kitty/entry_points.py:L183`; evidence `kitty 0.35.2 created by Kovid Goyal`.
+- [x] Native launcher (process entry) — `kitty/launcher/main.c:L439`; native fast-path runtime evidence `kitty 0.35.2 created by Kovid Goyal` from `--version` (`kitty/launcher/main.c:L428`/`L432`/`L434`, which `exit(0)`s before `run_embedded()` at `kitty/launcher/main.c:L464`).
+- [x] Python entry-point dispatch — `kitty/entry_points.py:L183`/`L188-L195`; runtime evidence the Python layer ran via `+runpy` (`term= 'xterm-kitty'`), with the GUI branch (`kitty/entry_points.py:L194-L195`) proven by the downstream item 4–10 cascade. The `--version` banner is native-launcher evidence (item 1), **not** proof of Python dispatch.
 - [x] `main()` orchestration — source-grounded, `kitty/main.py:L221-L234`, `kitty/main.py:L514`.
 - [x] GLFW / windowing — evidence `[0.200] OS Window created` (`kitty/glfw.c:L1321`).
 - [x] XKB keyboard — evidence `[0.079] Loading new XKB keymaps` (`glfw/xkb_glfw.c:L672`) and `[0.083] Modifier indices ...` (`glfw/xkb_glfw.c:L376`).
@@ -472,7 +534,7 @@ Re-reading each question and confirming every distinct thing it names is answere
 - [x] SOURCES — `kitty.conf` via config dir (`kitty/constants.py:L133`/`L87`), `--config` (`kitty/cli.py:L870`), `--override` (`kitty/cli.py:L876`), merge in `kitty/config.py:L163`.
 - [x] DEFAULT settings — `term`, `font_family`, `font_size`, `scrollback_lines`, `repaint_delay`, `input_delay`, `sync_to_monitor`, each captured via `+runpy` and cited to `kitty/options/definition.py`.
 - [x] How they affect the first window — `TERM`, resolved face, cell size/columns×lines, history size, render cadence.
-- [x] OUTPUT proving applied — the `debug_config` dump incl. the `OpenGL:` line (`kitty/debug_config.py:L258`) and the *absence* of `Config options different from defaults:` (`kitty/debug_config.py:L75`).
+- [x] OUTPUT proving applied — the `debug_config` dump incl. the `OpenGL:` line (`kitty/debug_config.py:L258`); the always-printed `Config options different from defaults:` heading (`kitty/debug_config.py:L75`, called unconditionally at `kitty/debug_config.py:L275`) lists only the deliberate `allow_remote_control yes` override, and the **absence of a `Loaded config files:` section** (printed only `if opts.config_paths:` at `kitty/debug_config.py:L269-L271`) proves no `kitty.conf` was loaded — untouched defaults, corroborated by the `+runpy` capture.
 - [x] `--debug-config` not-a-flag reality — evidence `Unknown option: --debug-config`.
 
 **Q3 — PTY / child env / handshake / first output parsed + drawn:**
@@ -484,9 +546,9 @@ Re-reading each question and confirming every distinct thing it names is answere
 
 **Q4 — FONTS / LAYOUT / SCROLLING / SCREEN UPDATES + confirming messages:**
 
-- [x] FONTS — `Text fonts:` block; FontConfig `kitty/fontconfig.c:L276`, FreeType `kitty/freetype.c:L675`/`L904`, atlas `kitty/glyph-cache.c`.
+- [x] FONTS — `Text fonts:` block; FontConfig `kitty/fontconfig.c:L276`, FreeType `kitty/freetype.c:L675`/`L904`, atlas `kitty/glyph-cache.c:L12-L16` (`SpritePosItem`) / `kitty/glyph-cache.c:L33-L54` (`find_or_create_sprite_position`).
 - [x] LAYOUT — `columns=71 lines=22` grid; `kitty/window.py:L857-L859`.
-- [x] SCROLLING — `scrollback_lines= 2000` (`kitty/options/definition.py:L372`); history in `kitty/screen.c`, `scrolled_by` at `kitty/child-monitor.c:L673`.
+- [x] SCROLLING — `scrollback_lines= 2000` (`kitty/options/definition.py:L372`); history buffer allocated at `kitty/screen.c:L130` (`self->historybuf = alloc_historybuf(...)`), `scrolled_by` at `kitty/child-monitor.c:L673`.
 - [x] SCREEN UPDATES — `SIGWINCH sent to child ...` lines (`kitty/window.py:L873`); render cycle `send_cell_data_to_gpu` (`kitty/child-monitor.c:L714`/`L766`).
 - [x] Confirming log/console messages — every item above is paired with a captured line or an explicit source-grounded note.
 
