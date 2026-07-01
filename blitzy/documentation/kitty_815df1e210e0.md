@@ -145,7 +145,7 @@ computers provided there is a TTY connection between them, such as over SSH.
 **The SSH bootstrap.** The SSH kitten makes `kitten` available on the *remote* host so a remote `kitten transfer` can speak the protocol back through the SSH PTY. This is controlled by the `remote_kitty` option, whose verbatim documentation explains the mechanism:
 
 - `kittens/ssh/main.py:L164` — `opt('remote_kitty', 'if-needed', choices=('if-needed', 'no', 'yes'), long_text='''` — the long text states (verbatim from source): *"kitten is not actually copied to the remote host, instead a small bootstrap script is copied which will download and run kitten when kitten is first executed on the remote host."*
-- `kittens/ssh/main.py:L122` — `opt('shell_integration', 'inherited', long_text='''` — controls remote shell integration, which is what triggers the terminfo/`kitten` bootstrap on the remote side.
+- `kittens/ssh/main.py:L122` — `opt('shell_integration', 'inherited', long_text='''` — its verbatim long text is only *"Control the shell integration on the remote host."* This option governs remote shell integration; it does **not** make `kitten` available and is not the file-transfer bootstrap. Making `kitten` available on the remote host is the job of `remote_kitty` (above), whose copied bootstrap script is what a remote `kitten transfer` relies on.
 
 Because the constant that identifies transfer frames is language-independent (see O3) and the protocol rides the terminal byte stream, the *transport* (SSH vs. a local PTY) is irrelevant to the protocol itself. That is why the protocol can be exercised and captured over a local PTY and the observations apply unchanged to the SSH path.
 
@@ -211,19 +211,21 @@ Putting the observed and documented pieces together, a session proceeds as:
 3. **Payload:** sender → repeated `ac=data ... d=<base64>` then `ac=end_data`.
 4. **Close:** sender → `ac=finish`.
 
-Using the **real** compiled `FileTransmissionCommand.serialize()` (from the built `kitty/fast_data_types` import surface), the exact acknowledgement frames were produced and captured:
+Using the **real** compiled `FileTransmissionCommand.serialize()` (from the built `kitty/fast_data_types` import surface), the exact acknowledgement frames were produced and captured. The script is kept under `/root/blitzy_scratch/` and removed after capture:
 
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/o2_acks.py
+```
 **captured output (the `STARTED` and `OK` acks, real serializer)**
 ```
 STARTED : <ESC>]5113;ac=status;tt=rsync;id=deadbeef;fid=f1;st=U1RBUlRFRA<ESC>\
 OK      : <ESC>]5113;ac=status;id=deadbeef;st=T0s<ESC>\
-```
-
-The status text is carried base64-encoded in the `st=` field (see O6). Decoding confirms the values verbatim:
-```
 st=U1RBUlRFRA  -> b'STARTED'
 st=T0s         -> b'OK'
 ```
+
+The status text is carried base64-encoded in the `st=` field (see O6); the last two lines decode it verbatim to `STARTED` and `OK`.
 
 ### The status vocabulary
 
@@ -266,9 +268,9 @@ The single C definition is surfaced to all three languages, and all three agree 
 - **C → Python.** `kitty/data-types.c:L596` — `PyModule_AddIntMacro(m, FILE_TRANSFER_CODE);` exports the macro as a Python-visible integer. The orchestrator imports it: `kitty/file_transmission.py:L23` — `from kitty.fast_data_types import ESC_OSC, FILE_TRANSFER_CODE, ...`.
 - **C → Go.** `gen/go_code.py:L597` — `const FileTransferCode int = {FILE_TRANSFER_CODE}` is a code-generation template. The `{FILE_TRANSFER_CODE}` placeholder is filled from the C macro's value at generation time, so the Go constant is *derived from* the same C header rather than hard-coded independently. This is why the three layers cannot drift.
 
-Empirically, the string form of the constant that prefixes every frame was captured as `5113`:
+Empirically, the string form of the constant that prefixes every frame was captured as `5113` (this is the first line of the `o3_frames.py` output shown verbatim below):
 
-**captured output (from the real Python serializer)**
+**captured output (first line of `o3_frames.py`)**
 ```
 ftc_prefix (FILE_TRANSFER_CODE as str): 5113
 ```
@@ -281,20 +283,32 @@ The orchestrator emits a frame by serializing the command's fields (with the `OS
 - `kitty/file_transmission.py:L1149` — `data = tuple(payload.get_serialized_fields(prefix_with_osc_code=True))`
 - `kitty/file_transmission.py:L1150` — `queued = window.screen.send_escape_code_to_child(ESC_OSC, data)`
 
-The Go client has the parallel encoder: `kittens/transfer/ftc.go:L163` — `func (self FileTransmissionCommand) Serialize(prefix_with_osc_code ...bool) string {`. Both sides therefore produce byte-identical `OSC 5113 ; key=value ; ... ST` frames; the normative contract they both target is **"Encoding of transfer commands as escape codes"** (`docs/file-transfer-protocol.rst:L540`).
+The Go client has the parallel encoder: `kittens/transfer/ftc.go:L163` — `func (self FileTransmissionCommand) Serialize(prefix_with_osc_code ...bool) string {`. Both sides produce **semantically equivalent** `OSC 5113 ; key=value ; ... ST` frames — the same key names, encodings, and values — but **not** byte-identical ones: field order is not semantically significant, and the two serializers order fields differently.
+
+- The **Go** encoder iterates `ftc_field_map()`, a Go `map`, at `kittens/transfer/ftc.go:L171` (`for name, field := range ftc_field_map()`); Go randomizes map-iteration order, so the emitted field order is not fixed. The Go *send* path additionally hard-codes `id=` first in its frame prefix — `kittens/transfer/send.go:L384` — `self.prefix = fmt.Sprintf("\x1b]%d;id=%s;", kitty.FileTransferCode, self.request_id)`.
+- The **Python** serializer instead emits fields in dataclass-declaration order — `get_serialized_fields` iterates `fields(self)` in the order `ac`, `zip`, `ft`, `tt`, `id`, … (`kitty/file_transmission.py:L293-L324`).
+
+That is exactly why the live Go frame captured in O2 was `id=d6476d88;ac=send` (id first) while the Python serializer emits `ac=send;id=deadbeef` (action first) for the same command. Because the receiver parses order-insensitive `key=value` pairs (O7), both frames deserialize identically. The normative contract they both target is **"Encoding of transfer commands as escape codes"** (`docs/file-transfer-protocol.rst:L540`).
 
 ### Captured session-establishing frames (real serializer)
 
+These frames were produced by driving the **real** `FileTransmissionCommand`
+serializer from the built kitty import surface. The script is kept under
+`/root/blitzy_scratch/` and removed after capture.
+
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/o3_frames.py
+```
 **captured output (verbatim; `<ESC>` = `0x1b`)**
 ```
+ftc_prefix (FILE_TRANSFER_CODE as str): 5113
 send      : <ESC>]5113;ac=send;id=deadbeef<ESC>\
 file rsync: <ESC>]5113;ac=file;tt=rsync;id=deadbeef;fid=f1;n=L3BhdGgvdG8vZGVzdGluYXRpb24<ESC>\
 STARTED   : <ESC>]5113;ac=status;tt=rsync;id=deadbeef;fid=f1;st=U1RBUlRFRA<ESC>\
-```
-The `file` frame's `n=` field base64-decodes to the destination path, matching the spec's `name=/path/to/destination` example at L362:
-```
 n=L3BhdGgvdG8vZGVzdGluYXRpb24 -> b'/path/to/destination'
 ```
+The `file` frame's `n=` field base64-decodes to the destination path, matching the spec's `name=/path/to/destination` example at L362 (`n=L3BhdGgvdG8vZGVzdGluYXRpb24 -> b'/path/to/destination'`).
 
 **Rationale.** A dedicated, rarely-collided OSC number (`5113`) is what lets file-transfer traffic share the terminal byte stream with ordinary output while remaining unambiguously identifiable (see O7). Defining it once in C and deriving the Python and Go constants from that single definition guarantees the sender, the receiver, and the algorithm library all frame and recognize the exact same escape sequence.
 
@@ -321,7 +335,19 @@ kitty modernizes only the **hash suite**, not the algorithm: classic rsync uses 
 
 ### The C core
 
-The same algorithm is implemented in C in `kittens/transfer/algorithm.c` and compiled into the `kittens.transfer.rsync` extension (`rsync.so`). O1's build log shows `kittens/transfer/algorithm.c` compiled and linked with `-lxxhash`. The C core and the Go library are kept API-compatible so either can produce/consume the other's signatures (see O5's parity note).
+The same algorithm is implemented in C in `kittens/transfer/algorithm.c` and compiled into the `kittens.transfer.rsync` extension (`rsync.so`); O1's build log shows `kittens/transfer/algorithm.c` compiled and linked with `-lxxhash`. The C rolling checksum mirrors the Go binding function-for-function:
+
+- `kittens/transfer/algorithm.c:L119-L121` — `typedef struct rolling_checksum { uint32_t alpha, beta, val, l, first_byte_of_previous_window; } rolling_checksum;` — the weak-checksum state.
+- `kittens/transfer/algorithm.c:L126` — `rolling_checksum_full(rolling_checksum *self, uint8_t *data, uint32_t len)` — the whole-block checksum (the C counterpart of Go's `full` at `tools/rsync/algorithm.go:L341`).
+- `kittens/transfer/algorithm.c:L141` — `rolling_checksum_add_one_byte(rolling_checksum *self, uint8_t first_byte, uint8_t last_byte)` — the O(1) incremental update (the C counterpart of Go's `add_one_byte` at `tools/rsync/algorithm.go:L355`); it recomputes `alpha`/`beta` from only the entering and leaving bytes.
+
+The C delta/matching path uses these exactly as rsync prescribes:
+
+- `kittens/transfer/algorithm.c:L255` — `uint32_t weak_hash = rolling_checksum_full(&self->rc, src.buf, src.len);` — the weak hash of each signed block while building the signature.
+- `kittens/transfer/algorithm.c:L728` — `rolling_checksum_add_one_byte(&self->rc, self->buf.data[self->window.pos], self->buf.data[self->window.pos + self->window.sz - 1]);` — slides the `Differ`'s one-byte window in O(1) while scanning the sender's file for block matches.
+- `kittens/transfer/algorithm.c:L735` — `rolling_checksum_full(&self->rc, self->buf.data + self->window.pos, self->window.sz);` — re-seeds the window checksum after emitting/consuming a block.
+
+The C core and the Go library (`tools/rsync/*.go`) are kept API-compatible so either can produce or consume the other's signatures (see O5's parity note). The build's `-lxxhash` link (O1) is the runtime confirmation that the strong per-block hash (XXH3-64) and whole-file checksum (XXH3-128) are provided by xxHash.
 
 ### Observed: the round-trip actually works
 
@@ -419,9 +445,13 @@ The same structures are exposed to the Python orchestrator through the compiled 
 
 ### Observed: the on-wire signature format matches these structures exactly
 
-Signing an 18000-byte file produced a signature of **2712 bytes** over **135 blocks** with a chosen block size of **134** (≈ √18000):
+Signing an 18000-byte file with the **real** compiled `rsync.so` `Patcher` produced a signature of **2712 bytes** over **135 blocks** with a chosen block size of **134** (≈ √18000). The script below (kept under `/root/blitzy_scratch/` and removed after capture) drives the `Patcher` exactly as `kitty_tests/file_transmission.py:run_roundtrip_test` does; the signature block is the head of its output (the same script produces the O10 experiment):
 
-**captured output**
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/rsync_delta.py
+```
+**captured output (signature-structure block)**
 ```
 block size chosen by Patcher         : 134
 number of signature blocks           : 135
@@ -446,7 +476,7 @@ This is a direct empirical confirmation that the wire record equals `BlockHashSi
 
 The wire format uses two/three-letter field names, defined on the dataclass:
 
-- `kitty/file_transmission.py:L251` — `@dataclass` ; `L252` — `class FileTransmissionCommand:` ; fields `L254-L267`, each carrying a short-name in its metadata:
+- `kitty/file_transmission.py:L251` — `@dataclass` ; `L252` — `class FileTransmissionCommand:` ; fields `L254-L268`, each carrying a short-name in its metadata (the `data` payload field `d` is the last one, at `L268` — `data: bytes = field(default=b'', repr=False, metadata={'sname': 'd'})`):
 
 | short-name | field | notes |
 |-----------|-------|-------|
@@ -482,28 +512,38 @@ Chunk payloads (`d=`) are base64-encoded and, per the spec, are kept no larger t
 
 When compression is active the frame carries `zip=zlib`; the spec shows `compression=zlib` examples at L497 and L503.
 
-### Observed data frames (real serializer)
+### Observed data frames (real serializer + real `ZlibCompressor`)
 
-**captured output (an uncompressed data chunk — `d=` is base64)**
-```
-<ESC>]5113;ac=data;id=deadbeef;fid=f1;d=VGhlIHF1aWNrIGJyb3duIGZveAABAg<ESC>\
-```
+The frames below were produced by driving the **real** `FileTransmissionCommand`
+serializer and the **real** `ZlibCompressor` [`kittens/transfer/utils.py:L50`]. The
+full on-wire frame is `<ESC>]` + `serialize(prefix_with_osc_code=True)` + `<ESC>\`,
+exactly as the emission path adds the OSC introducer and `ST` (O3, `L1149-L1150`).
+The script is kept under `/root/blitzy_scratch/` and removed after capture.
 
-**captured output (a zlib-compressed data chunk — note the `zip=zlib` field)**
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/o6_encoding.py
 ```
-<ESC>]5113;ac=data;zip=zlib;id=deadbeef;fid=f1;d=eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg<ESC>\
+**captured output**
 ```
+uncompressed data frame  : <ESC>]5113;ac=data;id=deadbeef;fid=f1;d=VGhlIHF1aWNrIGJyb3duIGZveAABAg<ESC>\
+raw payload              : 512 bytes of 0x78 ("x")
+zlib-compressed payload  : 14 bytes
+zlib-compressed data frame: <ESC>]5113;ac=data;zip=zlib;id=deadbeef;fid=f1;d=eJyrqBgFIxkAAIgQ8AE<ESC>\
+end_data frame           : <ESC>]5113;ac=end_data;id=deadbeef;fid=f1<ESC>\
+finish   frame           : <ESC>]5113;ac=finish;id=deadbeef<ESC>\
 
-**captured output (the frames that bracket the payload)**
-```
-end_data: <ESC>]5113;ac=end_data;id=deadbeef;fid=f1<ESC>\
-finish  : <ESC>]5113;ac=finish;id=deadbeef<ESC>\
-```
-
-A base64 round-trip confirms `d=` really carries the file bytes (here the literal `ABC`):
-```
+zip=zlib d= first two bytes (hex): 789c (real zlib header 0x78 0x9c)
+zlib.decompress(d=) round-trips  : True -> recovered 512 bytes of "x"
 d=QUJD -> b'ABC'
 ```
+
+Reading these:
+
+- The **uncompressed** chunk carries its bytes as base64 in `d=` (`ac=data;id=…;fid=f1;d=<base64>`).
+- The **zlib-compressed** chunk carries the `zip=zlib` field and a `d=` payload that is a *genuine* zlib stream: 512 highly-compressible bytes (`0x78`, i.e. `"x"`) were fed through the real `ZlibCompressor` and came out as **14 bytes**; the `d=` field base64-decodes to bytes beginning `0x78 0x9c` (the standard zlib header), and `zlib.decompress` reconstructs the original 512 bytes exactly (`round-trips = True`). This is the empirical proof that `zip=zlib` payloads are real compressed streams, not raw bytes.
+- `end_data` and `finish` bracket the payload and carry no `d=`.
+- A base64 round-trip on a tiny literal confirms `d=` really carries the file bytes: `d=QUJD -> b'ABC'`.
 
 **Rationale.** Short field names keep per-frame overhead minimal; base64 makes arbitrary binary data safe to embed in a text escape sequence; the 4096-byte cap keeps individual frames small enough to interleave cleanly with terminal output and to fit terminal I/O buffers; and optional zlib compression (`zip=zlib`) shrinks compressible payloads further. All of it is wrapped in the `OSC 5113 ; ... ST` envelope so the receiver's VT parser can pick it out (O7).
 
@@ -535,22 +575,48 @@ This `case` is exactly the line that separates transfer bytes from ordinary outp
 
 (The `DestFile`/`PatchFile` assembly machinery spans roughly `L377-L468`.)
 
-### Observed: the same bytes deserialize back into a command
+### Observed: raw wire frame → prefix strip → deserialized command
 
-The frame the real kitten emitted was fed back through the real deserializer, and through the compiled C `parse_ftc`:
+The receiving side does **not** hand the whole `OSC 5113` frame to Python. The VT
+parser first consumes the numeric OSC code and the `;` that follows it, and only the
+remaining `key=value` payload is dispatched to the file-transmission handler:
 
-**captured output (Python `FileTransmissionCommand.deserialize`)**
+- `kitty/vt-parser.c:L467-L477` — the parser accumulates the digits into `code` and then `if (i > 0) { code = …; if (i < limit && buf[i] == ';') i++; }` — i.e. it advances the read offset `i` past the trailing `;`.
+- `kitty/vt-parser.c:L460-L462` — `START_DISPATCH` builds the payload as `PyMemoryView_FromMemory((char*)buf + i, limit - i, …)`, i.e. **from `buf + i`** — after the `5113;` prefix.
+- `kitty/vt-parser.c:L547-L549` — `case FILE_TRANSFER_CODE:` then `DISPATCH_OSC(file_transmission)` hands that stripped payload to the orchestrator.
+
+So for the captured wire frame `<ESC>]5113;id=d6476d88;ac=send<ESC>\`, what Python's
+`FileTransmissionCommand.deserialize` actually receives is only `id=d6476d88;ac=send`.
+Feeding that stripped payload to the real deserializer (and a data-frame payload to the
+compiled C `parse_ftc`) reproduces the structured command. The script is kept under
+`/root/blitzy_scratch/` and removed after capture:
+
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/o7_deserialize.py
 ```
-captured wire (from kitten): <ESC>]5113;id=d6476d88;ac=send<ESC>\
-deserialized -> action='send' id='d6476d88'
+**captured output**
+```
+raw wire frame (from kitten) : <ESC>]5113;id=d6476d88;ac=send<ESC>\
+payload after prefix strip   : id=d6476d88;ac=send
+deserialize(payload)         : action='send' id='d6476d88'
+parse_ftc(data payload)      : {'ac': 'data', 'id': 'zz', 'fid': 'f1', 'd': 'QUJD'}
+deserialize('5113;'+payload) : action='send' id=''  <- id LOST
 ```
 
-**captured output (the compiled rsync C extension `parse_ftc` on a data frame)**
-```
-{'ac': 'data', 'id': 'zz', 'fid': 'f1', 'd': 'QUJD'}
-```
+The first three lines close the round-trip: the exact bytes emitted on the wire (O2/O3),
+once the parser strips the `5113;` prefix, deserialize back into `action='send'
+id='d6476d88'`. The compiled C `parse_ftc` parses a data-frame payload into
+`{'ac': 'data', 'id': 'zz', 'fid': 'f1', 'd': 'QUJD'}`.
 
-So the exact bytes emitted on the wire (O2/O3) parse cleanly back into the structured command the receiver acts on — the round-trip is closed. As an end-to-end check, the file-transmission test module exercises this send/receive path in full:
+The last line shows **why the prefix must be stripped**: deserializing the *un-stripped*
+content `5113;id=d6476d88;ac=send` returns an **empty** `id`. `parse_ftc`
+[`kittens/transfer/algorithm.c:L916-L943`] scans `key=value` pairs and only begins a new
+key after a `;` once it is already inside a value (`key_length != 0`); the leading `5113`
+has no `=`, so it never resets the key start, and the first real key is read as `5113;id`
+— which matches no field and is silently dropped. That corruption is precisely what the
+VT parser's prefix-stripping prevents, and it is why the deserializer must be fed the
+stripped payload rather than the raw frame. As an end-to-end check, the file-transmission test module exercises this send/receive path in full:
 
 **command**
 ```bash
@@ -587,12 +653,21 @@ When the destination already exists and rsync is in use, the receiver opens the 
 
 ### Observed: the signature is really computed over the on-disk file
 
-**captured output**
+The script below drives the **real** `PatchFile` from `kitty/file_transmission.py` against
+a real on-disk destination file; it is kept under `/root/blitzy_scratch/` and removed after
+capture. The head of its output covers O8 (signature over the existing file); the tail
+covers O9 (temp file + atomic replace):
+
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/resumption.py
+```
+**captured output (O8 head)**
 ```
 dest dir contents BEFORE: ['file.bin']
 existing destination file size: 18000 bytes
 signature computed over existing file: 2712 bytes  (src_file opened = True)
-delta produced by sender: 260 bytes
+delta produced by sender: 233 bytes
 ```
 
 `src_file opened = True` is the observable proof that `open(self.path, 'rb')` at L430 ran against the pre-existing `file.bin`, and the 2712-byte signature (12 + 135×20; see O5) is computed from that file's *current* contents.
@@ -622,16 +697,24 @@ The Go receiver mirrors this exactly:
 
 ### Observed: temp file appears during patch, then vanishes via atomic replace; nothing else is left behind
 
-**captured output**
+This is the **tail** of the same `resumption.py` output shown in O8 (same command,
+`/root/blitzy_scratch/resumption.py`); the O8 head established the signature-over-existing-file
+step, and this tail captures the temp-file + atomic-replace step:
+
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/resumption.py
 ```
-dest dir contents DURING patch (note temp file alongside): ['file.bin', 'tmp4qaq8h48']
-temp file created in destination directory: 'tmp4qaq8h48' (dir=/root/kitty_scratch/o89)
+**captured output (O9 tail)**
+```
+dest dir contents DURING patch (note temp file alongside): ['file.bin', 'tmp3k26qnmb']
+temp file created in destination directory: 'tmp3k26qnmb' (dir=/root/blitzy_scratch/o89)
 dest dir contents AFTER close (atomic replace): ['file.bin']
 final dest == sender's changed content: True
-NO sidecar/journal file present — resumption basis is the on-disk file + its recomputed signature: True
+NO sidecar/journal file present - resumption basis is the on-disk file + its recomputed signature: True
 ```
 
-The directory listing proves the sequence: **BEFORE** = `['file.bin']`; **DURING** the patch a sibling temp file `tmp4qaq8h48` exists alongside `file.bin` in the *same* destination directory (from `tempfile.NamedTemporaryFile(dir=...)` at L392); **AFTER** `close()` only `file.bin` remains — the temp file was atomically renamed over the destination via `os.replace` (L405). At no point does any `.journal`/`.sig`/sidecar file appear.
+The directory listing proves the sequence: **BEFORE** = `['file.bin']`; **DURING** the patch a sibling temp file (`tmp3k26qnmb` in this run — the suffix is randomly generated per run by `tempfile.NamedTemporaryFile`, so it differs each time) exists alongside `file.bin` in the *same* destination directory (from `tempfile.NamedTemporaryFile(dir=...)` at L392); **AFTER** `close()` only `file.bin` remains — the temp file was atomically renamed over the destination via `os.replace` (L405). At no point does any `.journal`/`.sig`/sidecar file appear.
 
 **Rationale.** Writing to a temp file in the *same* directory guarantees the final `os.replace`/`os.Rename` is atomic (same filesystem, no cross-device copy), so a crash can never leave a half-written destination — the old file stays intact until the new one is complete. Storing no separate metadata means there is nothing to keep in sync or to garbage-collect: the file on disk, re-signed on demand, is the single source of truth for what still needs to be sent.
 
@@ -643,9 +726,32 @@ The directory listing proves the sequence: **BEFORE** = `['file.bin']`; **DURING
 
 ### The experiment
 
-A source file of **18000 bytes** was used (deliberately `> 4096` so it is `rsync_capable` per `kittens/transfer/send.go:L131`). It was transferred once to populate the destination; then **35 bytes** in the middle were modified; then it was re-transferred using the rsync delta path (as `--transmit-deltas` selects — `kittens/transfer/main.py:L115`, `docs/kittens/transfer.rst:L80`). Byte accounting was measured by driving the real compiled `rsync.so` `Differ`/`Patcher`.
+A source file of **18000 bytes** was used (deliberately `> 4096` so it is `rsync_capable` per `kittens/transfer/send.go:L131`). It was transferred once to populate the destination; then **35 bytes** in the middle were modified; then it was re-transferred using the rsync delta path (as `--transmit-deltas` selects — `kittens/transfer/main.py:L115`, `docs/kittens/transfer.rst:L80`).
 
-**captured output**
+**Capture method — fallback, explicitly labeled.** As explained in O1, a full GUI/SSH
+round-trip cannot be captured in this headless container (the SSH kitten refuses to run
+outside a kitty window). The **fallback** used here is to drive the *identical* delta code
+paths directly through the real compiled `rsync.so` `Differ`/`Patcher` extension — the same
+extension the GUI orchestrator loads (`kitty/file_transmission.py:L380` — `from kittens.transfer.rsync import Patcher`; `L667-L668` — `from kittens.transfer import rsync` / `self.differ = rsync.Differ()`) and the same
+algorithm the Go client uses over the wire. What this fallback measures is the **delta
+payload the sender would place into `action=data` frames** — i.e. the *literal full-send
+bytes* (Transfer #1, the whole 18000-byte file that a first-time send serializes as `d=`
+base64 chunks) versus the *delta bytes* the `Differ` emits (Transfer #2). These are the
+raw operation bytes **before** the additional terminal-stream framing overhead that O6
+documents (base64 expansion ≈ 4/3, the `<ESC>]5113;ac=data;…;d=` envelope per ≤4096-byte
+chunk, and optional `zip=zlib`). In other words, the numbers below are the *protocol
+payload* the delta mechanism produces, not the exact on-the-wire terminal byte count; the
+framing multiplies both transfers by the same factors, so the *ratio* (and therefore the
+demonstrated saving) is what the experiment establishes.
+
+The script is kept under `/root/blitzy_scratch/` and removed after capture; the O10 block
+is the tail of the same `rsync_delta.py` whose head produced the O5 signature output.
+
+**command**
+```bash
+PATH=/usr/local/go/bin:$PATH /opt/kitty-venv/bin/python /root/blitzy_scratch/rsync_delta.py
+```
+**captured output (O10 tail)**
 ```
 =================== O10: DELTA-EFFICIENCY EXPERIMENT (real rsync.so) ===================
 original (destination) size : 18000 bytes
@@ -659,32 +765,32 @@ TRANSFER #2 (destination exists -> rsync delta, --transmit-deltas):
   block size chosen by Patcher         : 134
   number of signature blocks           : 135
   signature size (sent receiver->sender): 2712 bytes
-  delta size (sent sender->receiver)   : 259 bytes
+  delta size (sent sender->receiver)   : 233 bytes
   literal bytes in delta (total_data_in_delta): 178
   reconstruction correct (recon==changed): True
 
 =================== SUMMARY ===================
   full send literal bytes : 18000
-  delta send total bytes  : 259  (of which literal: 178)
-  reduction (delta vs full): 98.6% fewer bytes
+  delta send total bytes  : 233  (of which literal: 178)
+  reduction (delta vs full): 98.7% fewer bytes
 ```
 
 ### The measured result
 
 | Metric | Transfer #1 (full) | Transfer #2 (delta) |
 |--------|--------------------|--------------------|
-| Bytes sender→receiver | **18000** (all literal) | **259** (delta ops) |
+| Bytes sender→receiver | **18000** (all literal) | **233** (delta ops) |
 | — of which literal data | 18000 | **178** |
 | Signature receiver→sender | — | 2712 |
 | Reconstruction correct | — | **True** |
 
-Transfer #2 sent **259 bytes** of delta versus **18000 bytes** for the full send — a **98.6% reduction** — and correctly reconstructed the modified file. Even counting the receiver→sender signature (2712 bytes) as overhead, the delta path moves ~2971 bytes total versus 18000, still a large saving, and that overhead is what buys the ability to send only 178 literal bytes for a 35-byte edit (the 178 covers the changed region plus the boundary block(s) straddling it).
+Transfer #2 sent **233 bytes** of delta versus **18000 bytes** for the full send — a **98.7% reduction** — and correctly reconstructed the modified file. Even counting the receiver→sender signature (2712 bytes) as overhead, the delta path moves ~2945 bytes total versus 18000, still a large saving, and that overhead is what buys the ability to send only 178 literal bytes for a 35-byte edit (the 178 covers the changed region plus the boundary block(s) straddling it).
 
 ### The mechanism that detected the unchanged portions
 
 The 134 unchanged blocks were represented as **copy operations** (`Block`, type 0 — "copy block index from the existing file unmodified") rather than **literal operations** (`Data`, type 1 — literal bytes), per the delta format in `docs/file-transfer-protocol.rst` (§"The format of signatures and deltas", L409+). Those copies were chosen because the sender's sliding-window **rolling checksum** (weak) matched a receiver block's `WeakHash`, and the **XXH3-64** strong hash then confirmed the match — looked up via `hash_lookup map[uint32][]BlockHash` [`tools/rsync/algorithm.go:L362-L366`] against the `BlockHash` records built at `tools/rsync/algorithm.go:L261`. Only the offsets whose rolling checksum found no confirmed match were emitted as literal `Data`.
 
-This is the same result the canonical rsync literature predicts — e.g., a benchmark updating a 24 MB kernel tarball across versions transferred only tens of bytes rather than the whole file — confirming kitty's implementation behaves as a faithful rsync.
+This is exactly the outcome the rsync-style delta algorithm is designed to produce (O4): many `Block` copy-operations for the unchanged regions and only a few `Data` literal-operations for the edit. It is confirmed here by the measured result itself — **233** delta bytes versus **18000** literal bytes, with the reconstruction verified correct (`reconstruction correct (recon==changed): True`) — not by any external benchmark.
 
 **Rationale.** The savings come entirely from replacing literal bytes with block-index references for the regions that did not change. Because the rolling checksum is testable at every byte offset in O(1) (O4), a small edit that shifts nothing else still lets the sender re-align on the very next unchanged block and resume copying — which is why a 35-byte change costs only ~178 literal bytes, not a re-send of everything after the edit.
 
@@ -693,27 +799,27 @@ This is the same result the canonical rsync literature predicts — e.g., a benc
 ## Cross-file consistency (why the four layers agree)
 
 - **Constant consistency — `FILE_TRANSFER_CODE` = `5113`.** Defined once in C at `kitty/control-codes.h:L233`, surfaced to Python at `kitty/data-types.c:L596` (`PyModule_AddIntMacro`), and templated into Go at `gen/go_code.py:L597` (`const FileTransferCode int = {FILE_TRANSFER_CODE}`). The Python side observed the string form as `5113`; the C→Go template fills the same value, so the three layers cannot drift.
-- **Wire-format parity.** The Python serializer (`kitty/file_transmission.py:L251-L267`, emitted at L1149-L1150) and the Go encoder (`kittens/transfer/ftc.go:L163`) produce the same `key=value;…` frames, both targeting the normative "Encoding of transfer commands as escape codes" (`docs/file-transfer-protocol.rst:L540`). Empirically, the frame the Go `kitten` emitted (`<ESC>]5113;id=d6476d88;ac=send<ESC>\`) deserialized cleanly through the Python `FileTransmissionCommand` (O7).
+- **Wire-format parity.** The Python serializer (`kitty/file_transmission.py:L254-L268`, emitted at L1149-L1150) and the Go encoder (`kittens/transfer/ftc.go:L163`) produce **semantically equivalent, order-insensitive** `key=value;…` frames — the same key names, encodings, and values — both targeting the normative "Encoding of transfer commands as escape codes" (`docs/file-transfer-protocol.rst:L540`). They are not byte-identical: the Go encoder iterates a Go `map` (`ftc.go:L171`) and hard-codes `id=` first (`send.go:L384`), while Python emits dataclass-declaration order (`ac` first), so the same command serializes as `id=…;ac=send` (Go) versus `ac=send;id=…` (Python). Empirically, the frame the Go `kitten` emitted (`<ESC>]5113;id=d6476d88;ac=send<ESC>\`) still deserialized cleanly through the Python `FileTransmissionCommand` (O7), because the parser is order-insensitive.
 - **rsync parity.** The C core (`kittens/transfer/algorithm.c`) and the Go library (`tools/rsync/*.go`) implement the same `BlockHash`/signature/delta format (`tools/rsync/algorithm.go:L177-L183`, `BlockHashSize = 20`). The observed signature size (2712 = 12 + 135×20) matches the spec's byte layout, so either side can produce/consume the other's signatures.
 
 ---
 
 ## Coverage pass
 
-Every objective was answered with **(a)** a real command, **(b)** verbatim captured output, and **(c)** `file:line` citations:
+Every objective was answered with **(a)** a real command — or, where full GUI/SSH capture was infeasible in this headless container, an explicitly-labeled fallback command that drives the *identical* code paths (see the note directly below the table) — **(b)** verbatim captured output, and **(c)** `file:line` citations:
 
 | # | Objective | Command / capture | Key citations |
 |---|-----------|-------------------|---------------|
 | O1 | Build & connect | `setup.py build --verbose` (exit 0, 103 lines; `-lxxhash` link; Go kitten with VCS rev); `kitten transfer --help`; SSH-kitten limitation captured | `setup.py`, `go.mod:L3`, `pyproject.toml:L2`, `kittens/ssh/main.py:L122,L164` |
-| O2 | Handshake initiation | live `<ESC>]5113;...;ac=send<ESC>\`; real `STARTED`/`OK` acks; status enum | `docs/…:L16,L362,L367`, `kitty/file_transmission.py:L166,L203` |
-| O3 | Session-establishing escape sequences | live + serialized `OSC 5113` frames; `ftc_prefix=5113`; emission path | `kitty/control-codes.h:L233`, `kitty/data-types.c:L596`, `gen/go_code.py:L597`, `kitty/file_transmission.py:L23,L1149-L1150`, `docs/…:L540-L548` |
-| O4 | rsync-style delta transfer | `go test ./tools/rsync/` PASS; rolling-checksum functions | `tools/rsync/algorithm.go:L335-L360`, `docs/…:L338,L409` |
+| O2 | Handshake initiation | live `<ESC>]5113;...;ac=send<ESC>\`; real `STARTED`/`OK` acks; status enum | `docs/file-transfer-protocol.rst:L16,L362,L367`, `kitty/file_transmission.py:L166,L203` |
+| O3 | Session-establishing escape sequences | live + serialized `OSC 5113` frames; `ftc_prefix=5113`; emission path | `kitty/control-codes.h:L233`, `kitty/data-types.c:L596`, `gen/go_code.py:L597`, `kitty/file_transmission.py:L23,L1149-L1150`, `docs/file-transfer-protocol.rst:L540-L548` |
+| O4 | rsync-style delta transfer | `go test ./tools/rsync/` PASS; C-core + Go rolling-checksum functions | `kittens/transfer/algorithm.c:L119-L146,L255,L728,L735`, `tools/rsync/algorithm.go:L335-L360`, `docs/file-transfer-protocol.rst:L338,L409` |
 | O5 | Signature/difference data structures | signature = 2712 = 12+135×20; block size 134 | `tools/rsync/algorithm.go:L177-L183,L261,L362-L366`, `tools/rsync/api.go:L31-L43,L47-L61,L270`, `kittens/transfer/rsync.pyi:L24,L38,L45` |
-| O6 | Chunk encoding | captured `ac=data … d=<base64>` and `zip=zlib` frames; `d=QUJD`→`ABC` | `kitty/file_transmission.py:L251-L267,L22`, `kittens/transfer/send.go:L64,L131`, `kittens/transfer/utils.py:L41,L50`, `docs/…:L497,L503` |
+| O6 | Chunk encoding | `o6_encoding.py`: captured `ac=data … d=<base64>` and a real `zip=zlib` frame (round-trips); `d=QUJD`→`ABC` | `kitty/file_transmission.py:L254-L268,L22`, `kittens/transfer/send.go:L64,L131`, `kittens/transfer/utils.py:L41,L50`, `docs/file-transfer-protocol.rst:L497,L503` |
 | O7 | Receiver reassembly & discrimination | VT-parser `case FILE_TRANSFER_CODE`; deserialize + `parse_ftc`; 6/6 tests OK | `kitty/vt-parser.c:L547-L549`, `kitty/file_transmission.py:L377,L441` |
 | O8 | Resumption behavior | signature computed over existing file (`src_file opened=True`, 2712 B) | `kitty/file_transmission.py:L426-L439,L450,L469-L470`, `kittens/transfer/main.py:L117` |
-| O9 | Resumption metadata location | temp file `tmp4qaq8h48` during patch → atomic replace → only `file.bin`; no sidecar | `kitty/file_transmission.py:L392,L405`, `kittens/transfer/receive.go:L91` |
-| O10 | Delta-efficiency evidence | **18000 → 259 bytes = 98.6% fewer**; reconstruction True; Block-vs-Data | `tools/rsync/algorithm.go:L261,L362-L366`, `kittens/transfer/main.py:L115`, `docs/kittens/transfer.rst:L80`, `docs/…:L338` |
+| O9 | Resumption metadata location | temp file (`tmp3k26qnmb` in the quoted run; suffix random per run) during patch → atomic replace → only `file.bin`; no sidecar | `kitty/file_transmission.py:L392,L405`, `kittens/transfer/receive.go:L91` |
+| O10 | Delta-efficiency evidence | **18000 → 233 bytes = 98.7% fewer** (delta payload; direct-`rsync.so` fallback for full GUI/SSH capture); reconstruction True; Block-vs-Data | `tools/rsync/algorithm.go:L261,L362-L366`, `kittens/transfer/main.py:L115`, `docs/kittens/transfer.rst:L80`, `docs/file-transfer-protocol.rst:L338` |
 
 **Explicitly flagged infeasible capture and its fallback:** a full **GUI SSH round-trip** could not be captured because the SSH kitten refuses to run outside a kitty window and the container is headless (`Error: The SSH kitten is meant to run inside a kitty window`, O1). Fallback: the identical protocol code paths were driven directly — the real compiled `kitten` binary under a `pty.fork()` harness (which produced the live `OSC 5113` frame in O2/O3), and the real compiled Python orchestrator and `rsync.so` extension via direct calls (O5–O10). Because the protocol is transport-agnostic (it rides the terminal byte stream regardless of whether that stream is a local PTY or an SSH channel), these observations apply unchanged to the SSH path. All other objectives were captured directly.
 
