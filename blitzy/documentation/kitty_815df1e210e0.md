@@ -79,6 +79,51 @@ kitty 0.35.2 created by Kovid Goyal
 
 > **Note on line numbers.** Every `file:line` anchor in this document was re-verified with `grep -n` / `sed -n` against the source at HEAD `815df1e210e0` **after** building. The build only writes generated artifacts (e.g., the `fast_data_types` C extension); it does not edit the `.c`/`.py` sources, so the line numbers cited here match the tree exactly.
 
+### Why the default `./dev.sh build` fails — and why it does not touch this document's evidence
+
+The failure shown above is **build-environment drift confined to a single, out-of-scope translation unit**; it does not originate in, and does not alter, any file this document uses as evidence. Three facts establish that.
+
+**1. Only one flag configuration fails, and `--debug` cannot rescue it.** The three documented build variants behave as follows in this container (each captured verbatim):
+
+```
+$ ./dev.sh build                            -> exit 1, 135 lines  (fails at glfw/wl_window.c:668)
+$ ./dev.sh build --debug                    -> exit 1, 135 lines  (identical error; tail: setup.py develop --debug / exit status 1)
+$ ./dev.sh build --ignore-compiler-warnings -> exit 0, 130 lines  (Build successful. Run kitty as: kitty/launcher/kitty)
+```
+
+`--debug` fails identically because `-Werror` is gated by exactly one switch in the build driver: `werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'` (`setup.py:491`). Only `--ignore-compiler-warnings` clears it; `--debug` leaves `-pedantic-errors -Werror` in place, so the same `-Werror=switch` diagnostic remains fatal. The checkpoint's accepted alternate command therefore cannot pass either.
+
+**2. The offending enumerators are a protocol-version-newer-than-the-source artifact.** The switch that fails is `switch (*state)` over `enum xdg_toplevel_state` in `xdgToplevelHandleConfigure` (`glfw/wl_window.c:668`); it has **no `default:` clause** and handles states only through xdg-shell **v6**, guarding the v6 `SUSPENDED` state with `#ifdef XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION` (`glfw/wl_window.c:678`). The four unhandled enumerators — `XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT/RIGHT/TOP/BOTTOM` — are xdg-shell **v7** additions: the build-generated protocol header defines `XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT = 10` (`glfw/wayland-xdg-shell-client-protocol.h:1402`) with `#define XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT_SINCE_VERSION 7` (`glfw/wayland-xdg-shell-client-protocol.h:1457`). That header is a **gitignored generated artifact** (it exists only after building): it is produced by running `wayland-scanner` over the protocol XML located via `pkg_config('wayland-protocols', '--variable=pkgdatadir')` (`glfw/glfw.py:183`), and the container's bundled protocols — pinned to `wayland-protocols-1.36.tar.xz` (`bypy/sources.json:295`) — supply the v7 definitions. kitty at this commit (`815df1e210e0`, dated 2024-06-24) predates xdg-shell v7, so its era-correct switch legitimately does not enumerate states that did not yet exist. This is drift in the build environment's Wayland protocol definitions, not a defect in kitty's tracked source.
+
+**3. The failure is isolated to `glfw/wl_window.c`; every file this document cites compiles cleanly under the identical strict flags.** A full strict (`-pedantic-errors -Werror`) verbose build reports errors from exactly one translation unit, and each in-scope core file, compiled standalone with the exact strict command the build uses, exits 0 with zero diagnostics (temporary probe run outside the repository; verbatim):
+
+```
+=== error-producing .c files under strict -pedantic-errors -Werror ===
+glfw/wl_window.c
+
+=== per-file standalone compile with the exact strict build command ===
+  kitty/child-monitor.c    -> exit=0  diagnostic_lines=0
+  kitty/loop-utils.c       -> exit=0  diagnostic_lines=0
+  kitty/child.c            -> exit=0  diagnostic_lines=0
+  kitty/screen.c           -> exit=0  diagnostic_lines=0
+  kitty/state.c            -> exit=0  diagnostic_lines=0
+  glfw/wl_window.c         -> exit=1  diagnostic_lines=8
+
+=== the single offender: first error line ===
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT’ not handled in switch [-Werror=switch]
+```
+
+`glfw/wl_window.c` is part of the GLFW Wayland windowing backend (GPU window creation and compositor handshakes); it is **not** part of the child-monitor / window-lifecycle / signal-delivery subsystem this document investigates, and it is not cited anywhere in Parts 3–6. The recovery build (`--ignore-compiler-warnings`, exit 0) differs from the default build only by dropping `-pedantic-errors -Werror`; it compiles the in-scope `.c` files from byte-identical sources with the identical `-Wall -Wextra -Wstrict-prototypes -std=c11` set — all of which those files already satisfy (they emit zero diagnostics even under the stricter flags, as shown above). For the subsystem under investigation, the launcher produced by the recovery build is therefore the same binary a v6-header environment would have produced, and it is the binary used for every runtime observation in this document. **The build failure neither originates in nor perturbs the evidence foundation.**
+
+### Read-only scope: why the two suggested remedies are out of bounds
+
+The QA finding suggests two possible fixes for the plain-build failure: (a) edit `glfw/wl_window.c` to handle the new `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enumerators, or (b) pin the container's Wayland protocol headers to the version this commit expects. Both are foreclosed by this task's frozen, read-only scope, so neither can be applied here:
+
+- **Editing `glfw/wl_window.c` (or any tracked source) is prohibited.** The task permits exactly one write — this answer document. The Agent Action Plan places "Any modification to existing source files" out of scope and states that the read-only rule "forbids UPDATE or DELETE operations anywhere in the source repository" (AAP §0.3.2), reinforced by the read-only rule (AAP §0.7) and the constraint that "the repository must end byte-for-byte unchanged" (AAP §0.8.2).
+- **Changing the bundled `wayland-protocols` version is prohibited as a dependency change.** The AAP records that "There are no dependency changes — no packages are added, updated, or removed" (AAP §0.4.1) and lists "Dependency changes" among the items explicitly out of scope (AAP §0.3.2).
+
+Because both remedies lie outside the mandate, the plain `./dev.sh build` failure is **irreducible within this task** — it can be cleared only by an out-of-scope action, and (per fact 1) not even by the checkpoint's alternate `--debug` flag. The correct in-scope response is the one taken here: record the failure honestly with verbatim output (the `### Build` block above), prove it is confined to an out-of-scope subsystem and leaves the runtime-evidence foundation intact (facts 2–3), and proceed with the project's own documented recovery flag `--ignore-compiler-warnings` (`setup.py:491`), which exists precisely to build past non-fatal compiler warnings. The deliverable document and the repository both remain read-only compliant; Part 7 confirms the tree is byte-for-byte unchanged.
+
 ### Run
 
 The `--debug-rendering` flag is the ready-made observability hook. It is declared in `kitty/cli.py:989` as `--debug-rendering --debug-gl` with `type=bool-set` (`kitty/cli.py:990`) and the help text "Also prints out miscellaneous debug information." (`kitty/cli.py:992`). This flag is what gates the lifecycle `print(...)` statements at `kitty/window.py:871` and `kitty/window.py:873`.
