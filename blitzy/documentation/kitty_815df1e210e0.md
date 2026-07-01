@@ -44,7 +44,7 @@ The onboarding question breaks into eight distinct sub-questions; each has its o
 
 **The headline correction for a new reader: the diff kitten is implemented in Go, not Python.** The Python `main.py` you might open first is only the `diff.conf`/CLI option schema. The runtime engine is a set of Go files that compile into the statically linked `kitten` binary.
 
-At the pinned commit, `kittens/diff/` contains **ten Git-tracked `.go` files** plus **two small Python files**:
+Per the project's frozen inventory, the diff kitten is **eleven `.go` files plus two small Python files — roughly 3,648 lines** — all compiled into the statically linked `kitten` binary. Grounded to the pinned commit, that resolves precisely: `kittens/diff/` holds **ten Git-tracked, hand-written `.go` files** (3,329 lines) and **two tracked Python files** (319 lines), and a `setup.py build` additionally *generates* `.go` sources into the same directory — so the on-disk `.go` count grows past eleven during a build (detailed under the table). The tracked Go and Python sources and their roles:
 
 | File | Lines | Language | Role |
 |------|------:|----------|------|
@@ -61,7 +61,7 @@ At the pinned commit, `kittens/diff/` contains **ten Git-tracked `.go` files** p
 | `kittens/diff/main.py` | 310 | Python | `diff.conf` option schema + CLI argument definitions |
 | `kittens/diff/__init__.py` | 9 | Python | `syntax_aliases` helper |
 
-That is **3,648 lines total** across the twelve tracked files (verified with `wc -l` on `git ls-files kittens/diff/`). Note: after a build you will also see `cli_generated.go` and `conf_generated.go` in that directory, but those are **gitignored generated artifacts**, not source — which is why the authoritative count is ten hand-written `.go` files, not eleven.
+Those twelve tracked files total **3,648 lines** — the ten hand-written `.go` files sum to **3,329** and the two Python files to **319** (`310` + `9`) — verified with `wc -l` on `git ls-files kittens/diff/`. This reconciles with the frozen **eleven-`.go`-file** inventory as follows: a `setup.py build` adds the **generated** Go sources `cli_generated.go` (`43` lines) and `conf_generated.go` (`289` lines) — `gitignored` build artifacts, not tracked source — bringing the on-disk `.go` count to **twelve** (ten hand-written + two generated). So eleven or more `.go` files are present on disk while building, exactly ten are hand-written and Git-tracked, and the ~3,648-line figure is the tracked hand-written Go plus the two Python files.
 
 Version grounding from `go.mod`: `module kitty` (`go.mod:L1`), `go 1.22` (`go.mod:L3`), and the syntax-highlighting backend `github.com/alecthomas/chroma/v2 v2.14.0` (`go.mod:L7`).
 
@@ -70,7 +70,7 @@ The official docs corroborate the design. The kitten is described as **"A fast s
 **Why it feels fast** comes down to three cooperating design choices, each explored in detail below:
 
 1. **CPU fan-out.** Both diffing and highlighting spread their per-file work across a worker pool sized to the machine's CPU count (`tools/utils/images/utils.go:L27-L56`). → *Q4, Q5*
-2. **An asynchronous, streaming UI.** The collection result arrives first and the screen paints immediately; diffs, highlights, and images then stream in on a channel (`kittens/diff/ui.go:L132`, `L245-L273`), each completion triggering an incremental rerender. → *Q7*
+2. **An asynchronous, streaming UI.** Collection runs first and classifies everything, but the screen initially shows a `Calculating diff, please wait...` placeholder (`kittens/diff/ui.go:L349-L351`); the **first full render happens only when the `DIFF` result arrives**, and highlights and images then stream in on a channel (`kittens/diff/ui.go:L132`, `L245-L273`), each later completion triggering an incremental rerender. → *Q7*
 3. **A layered, path-keyed cache.** Each file is read once, split into lines once, and highlighted once; every later rerender (scroll, resize, changing the number of context lines) re-serves from cache (`kittens/diff/collect.go:L20-L37`). → *Q3, Q8*
 
 The rest of this document traces each of these precisely, quoting the code that implements them.
@@ -121,7 +121,7 @@ added := right_names.Subtract(common_names)     // collect.go:L333
 
 An MD5 hash is computed for each candidate through `hash_for_path` (`kittens/diff/collect.go:L106-L116`), which calls `md5.Sum` (`collect.go:L112`) over the file's bytes and memoizes the result in the `hash_cache` (via `GetOrCreate`). The two loops that populate the per-side hash maps `ahash`/`rhash` live at `collect.go:L334-L346`.
 
-The match loop (`kittens/diff/collect.go:L347-L364`) performs the reclassification. For each removed file it looks for an added file with an equal hash — `if ah == rh` (`collect.go:L350`) — and, on a hash hit, re-reads both files and confirms exact byte equality — `if ld == rd` (`collect.go:L353`). Only then does it call `add_rename` (`collect.go:L354`, defined at `collect.go:L175`) and remove that target from the additions with `added.Discard(n)` (`collect.go:L355`). A removed file with no match becomes `add_removal` (`collect.go:L362`); any additions still left over become `add_add` (`collect.go:L365-L367`).
+The match loop (`kittens/diff/collect.go:L347-L364`) performs the reclassification. For each removed file it looks for an added file with an equal hash — `if ah == rh` (`collect.go:L350`) — and, on a hash hit, fetches both files' data again through `data_for_path` (`collect.go:L351-L352`) — normally a `data_cache` hit rather than a disk re-read, since `hash_for_path` already populated `data_cache` for these paths — then confirms exact byte equality — `if ld == rd` (`collect.go:L353`). Only then does it call `add_rename` (`collect.go:L354`, defined at `collect.go:L175`) and remove that target from the additions with `added.Discard(n)` (`collect.go:L355`). A removed file with no match becomes `add_removal` (`collect.go:L362`); any additions still left over become `add_add` (`collect.go:L365-L367`).
 
 **Reasoning (why this design).** The crux is the **double check: an MD5 hash pre-filter followed by an exact byte-equality comparison.** The hash makes the search cheap — instead of comparing every removed file against every added file byte-by-byte (which would be quadratic in file size), the kitten compares fixed-size hashes and only reads the full bytes when a hash collides. The subsequent `ld == rd` equality check is what makes the result *correct*: even in the astronomically unlikely event of an MD5 collision, two genuinely different files can never be reported as a rename, because the authoritative test is exact content equality, not the hash. This is precisely why a file that was moved (or renamed) but not otherwise edited shows up as a single rename entry rather than a confusing delete-plus-add pair. Note the natural limitation this implies: a rename combined with an edit changes the content, so the hashes differ and the pair is reported as a separate removal and addition — matching the kitten's definition of a rename as an *unchanged* file at a new path.
 
@@ -129,7 +129,7 @@ The match loop (`kittens/diff/collect.go:L347-L364`) performs the reclassificati
 
 ## Q3 — Caching efficiency: from raw contents to highlighted output
 
-**Direct answer.** The kitten declares **seven `LRUCache` instances**, all keyed by file path and all sized `const sz = 4096` (`kittens/diff/collect.go:L29`). They form a layered pipeline — raw bytes feed line-splitting, which feeds highlighting — so each file is read once, split once, and highlighted once, and every subsequent rerender re-serves from cache. The caches differ in their *write* semantics, which determines which of them are bounded by eviction.
+**Direct answer.** The kitten declares **seven `LRUCache` instances**, all keyed by file path and all sized `const sz = 4096` (`kittens/diff/collect.go:L29`). They form a layered pipeline — raw bytes feed line-splitting, which feeds highlighting — so that, once a path has been populated, each file is read, split, and highlighted only once in the normal collection/render flow, and every subsequent rerender re-serves from cache. The caches differ in their *write* semantics, which determines which of them are bounded by eviction.
 
 **The seven caches** are declared at `kittens/diff/collect.go:L20-L24` and initialized in `init_caches()` (`collect.go:L26-L37`):
 
@@ -165,7 +165,7 @@ graph LR
 
 **Consequence:** eviction bounds only the caches populated through `GetOrCreate`. Caches written only via `Set` or `MustGetOrCreate` grow unbounded within a single run — which is acceptable here because the limit is `sz = 4096`, file counts in a diff are modest, and every key is a distinct path (so there is no churn to evict anyway).
 
-**Reasoning (why this design).** The whole point of the layered, path-keyed cache is to do each expensive operation — reading a file, splitting it into lines, syntax-highlighting it — **at most once**, then re-serve the result instantly on every rerender. A diff TUI rerenders constantly: when you scroll, when the terminal is resized, when you change the number of context lines. Without the cache each of those would re-read and re-highlight every visible file; with it, the second and all later renders are pure cache hits. This is a large part of why the kitten "feels fast" once the initial pass completes.
+**Reasoning (why this design).** The whole point of the layered, path-keyed cache is to avoid repeating each expensive operation — reading a file, splitting it into lines, syntax-highlighting it — **once the path has been cached**, then re-serve the result instantly on every rerender. This is a caching optimization rather than a hard singleflight guarantee: `GetOrCreate` checks membership under `RLock`, then computes the value *before* taking the exclusive `Lock` and does not re-check afterward (`tools/utils/cache.go:L39-L58`), so two concurrent misses on the same key can each still compute it. In the normal flow a path is populated during collection, well before the repeated rerenders, so duplicate computation is rare in practice. A diff TUI rerenders constantly: when you scroll, when the terminal is resized, when you change the number of context lines. Without the cache each of those would re-read and re-highlight every visible file; with it, the second and all later renders are pure cache hits. This is a large part of why the kitten "feels fast" once the initial pass completes.
 
 ---
 
@@ -250,7 +250,7 @@ The empirical demonstration of strategy (c)'s hazard is captured in [Appendix Ob
 
 ## Q7 — End-to-end runtime trace: two directories → everything understood
 
-**Direct answer.** `main()` validates arguments and initializes the caches, then hands off to a TUI `Handler`. The handler spawns the collection on a goroutine; the moment collection finishes, the *entire* classification (changes, renames, additions, removals) is known. That single result then triggers diffing, highlighting, and image loading **concurrently**, and each of those completions streams back on a channel to drive an incremental rerender.
+**Direct answer.** `main()` validates arguments and initializes the caches, then hands off to a TUI `Handler`. The handler spawns the collection on a goroutine and immediately paints a `Calculating diff, please wait...` placeholder. The moment collection finishes, the *entire* classification (changes, renames, additions, removals) is known — but the screen is **still on the placeholder**. That single `COLLECTION` result then triggers diffing, highlighting, and image loading **concurrently**; the **first full render appears only when the `DIFF` result comes back**, and later highlight/image completions each stream back on a channel to drive incremental rerenders.
 
 **Startup — `main()` (`kittens/diff/main.go:L102-L175`):**
 
@@ -261,12 +261,12 @@ The empirical demonstration of strategy (c)'s hazard is captured in [Appendix Ob
 5. Reject a directory-vs-file mismatch — `if isdir(left) != isdir(right)` (`main.go:L129`) — with the error string reproduced **exactly**, including its trailing stray apostrophe: `"The items to be diffed should both be either directories or files. Comparing a directory to a file is not valid.'"` (`kittens/diff/main.go:L130`).
 6. Launch the TUI.
 
-**The asynchronous pipeline — `Handler` in `ui.go`.** `Handler.initialize` (`kittens/diff/ui.go:L114`) creates the results channel `self.async_results = make(chan AsyncResult, 32)` (`ui.go:L132`) and spawns `create_collection(self.left, self.right)` on a goroutine (`ui.go:L133-L138`); when collection completes it pushes a `COLLECTION` result.
+**The asynchronous pipeline — `Handler` in `ui.go`.** `Handler.initialize` (`kittens/diff/ui.go:L114`) creates the results channel `self.async_results = make(chan AsyncResult, 32)` (`ui.go:L132`) and spawns `create_collection(self.left, self.right)` on a goroutine (`ui.go:L133-L138`); when collection completes it pushes a `COLLECTION` result. Immediately after spawning that goroutine, `initialize` calls `draw_screen()` (`ui.go:L139`) — but because `self.diff_map` (and `logical_lines`) are still `nil`, `draw_screen` takes its guard branch `if self.logical_lines == nil || self.diff_map == nil || self.collection == nil` (`kittens/diff/ui.go:L349`) and prints the placeholder `` `Calculating diff, please wait...` `` (`kittens/diff/ui.go:L350`), then returns without drawing any file list.
 
 `handle_async_result` (`kittens/diff/ui.go:L245`) switches on the `ResultType` (the constants `COLLECTION`, `DIFF`, `HIGHLIGHT`, `IMAGE_LOAD`, `IMAGE_RESIZE` are declared at `ui.go:L25-L29`):
 
-- on `COLLECTION` (`ui.go:L247`) it concurrently kicks off `generate_diff()` (`ui.go:L249`), `highlight_all()` (`ui.go:L250`), and `load_all_images()` (`ui.go:L251`);
-- on `DIFF` (`ui.go:L252`) it renders and calls `draw_screen()` (`ui.go:L256`, `L268`);
+- on `COLLECTION` (`ui.go:L247`) it concurrently kicks off `generate_diff()` (`ui.go:L249`), `highlight_all()` (`ui.go:L250`), and `load_all_images()` (`ui.go:L251`) — but it does **not** render anything, so the screen stays on the `Calculating diff, please wait...` placeholder;
+- on `DIFF` (`ui.go:L252`) — the **first full render** — it stores `self.diff_map` (`ui.go:L253`), calls `render_diff()` (`ui.go:L256`) and then `draw_screen()` (`ui.go:L268`), which now passes the nil-guard and paints the actual diff;
 - on `IMAGE_LOAD, HIGHLIGHT` (`ui.go:L272`) it performs an incremental `rerender_diff()` (`ui.go:L273`).
 
 ```mermaid
@@ -278,19 +278,20 @@ sequenceDiagram
     participant HL as highlight_all pool
     participant Img as image loading
     Main->>H: launch TUI
+    H->>H: draw_screen() -> "Calculating diff, please wait..." (diff_map == nil)
     H->>Coll: go create_collection(left, right)
-    Coll-->>H: async_results: COLLECTION (changes/renames/adds/removals known)
+    Coll-->>H: async_results: COLLECTION (changes/renames/adds/removals known; screen still placeholder)
     H->>Diff: go generate_diff()
     H->>HL: go highlight_all()
     H->>Img: go load_all_images()
-    Diff-->>H: async_results: DIFF -> render + draw_screen()
+    Diff-->>H: async_results: DIFF -> render_diff() + draw_screen() [FIRST full render]
     HL-->>H: async_results: HIGHLIGHT -> rerender_diff()
     Img-->>H: async_results: IMAGE_LOAD -> rerender_diff()
 ```
 
 **Key insight.** Changes, renames, additions, and removals are "fully understood" the instant the `COLLECTION` result is delivered — that is, when `collect_files` returns, having run Q1's pairing and Q2's rename detection to completion. Everything after that (diffs, syntax highlighting, images) is *progressive enhancement* that streams in asynchronously, each completion nudging the screen to rerender. (`mouse.go` — also Go, `package diff` at `mouse.go:L3`, importing `"kitty"` at `mouse.go:L12` — drives interaction in the same loop; it is context here, not part of the classification path.)
 
-**Reasoning (why this design).** The collection pass is the single authoritative classification step, and it is fast (a directory walk plus set operations plus, for candidates, MD5 hashing). By delivering that result first and only *then* fanning out the heavier per-file work, the UI can paint the complete file list immediately and fill in diff bodies, colors, and images as they become ready. That is exactly the behavior the docs advertise as asynchronous highlighting "for maximum speed" (`docs/kittens/diff.rst:L15-L16`), and it is why the tool feels responsive even on large trees.
+**Reasoning (why this design).** The collection pass is the single authoritative classification step, and it is fast (a directory walk plus set operations plus, for candidates, MD5 hashing). Delivering that result first — while the screen holds the `Calculating diff, please wait...` placeholder — lets the handler fan out the heavier per-file work concurrently; the **first full render appears the moment the `DIFF` result is ready** (`render_diff()` then `draw_screen()`), and syntax colors and images fill in afterward as their results stream back, each `HIGHLIGHT`/`IMAGE_LOAD` completion triggering an incremental `rerender_diff()`. That is exactly the behavior the docs advertise as asynchronous highlighting "for maximum speed" (`docs/kittens/diff.rst:L15-L16`), and it is why the tool feels responsive even on large trees.
 
 ---
 
@@ -316,9 +317,9 @@ GIT_DIFF  = `git diff --no-color --no-ext-diff --exit-code -U_CONTEXT_ --no-inde
 DIFF_DIFF = `diff -p -U _CONTEXT_ --`                                                    // patch.go:L22
 ```
 
-**Cache interplay.** Because `data_cache` guarantees each file is read only once and `lines_cache` guarantees each file is split into lines only once, `Diff`/`do_diff` never re-read or re-split their inputs no matter how many times the view rerenders. The number of context lines shown around each change defaults to `3` — `num_context_lines` default `3` (`kittens/diff/main.py:L37`) — and is what the `_CONTEXT_` placeholder above is substituted with for the external drivers.
+**Cache interplay (scoped to the driver in use).** For the **builtin** Go driver — the `len(diff_cmd) == 0` branch (`kittens/diff/patch.go:L294`) — `run_diff` reads its inputs through `data_for_path` (`patch.go:L295`, `L299`), so those reads are served from `data_cache` and are not repeated on rerender. **External** drivers behave differently: the else branch shells out with `exec.Command` (`patch.go:L315`) and `c.Run()` (`patch.go:L318`), passing the two file paths on the command line (`patch.go:L314`), so the external `git`/`diff`/custom process reads the files **itself**, independently of kitty's `data_cache`. Either way, kitty still uses `lines_cache` after the diff output is produced: `do_diff` calls `lines_for_path` for both sides (`patch.go:L338`, `L342`) to feed `parse_patch` (`patch.go:L346`), so the split-into-lines step is served from cache in **both** driver modes. The net effect is that kitty avoids redundant reading (builtin path) and redundant line-splitting (both modes) across rerenders — not that every file read is eliminated for every driver. The number of context lines shown around each change defaults to `3` — `num_context_lines` default `3` (`kittens/diff/main.py:L37`) — and is what the `_CONTEXT_` placeholder above is substituted with for the external drivers.
 
-**Lineage (web-research corroboration, synthesized).** `kittens/diff/diff.go` is a copy of Go's standard-library `internal/diff` package (the in-source comment block at `diff.go:L21-L48` says so, and the `diff_cmd` help text in `main.py` describes the builtin as the "anchored diff algorithm from the Go standard library"). The upstream Go documentation confirms the naming and rationale: the approach is closely related to what some tools call "patience diff" (after the patience-sorting card game), but the Go authors deliberately avoid that name — they consider it imprecise and note it is often misread as implying a *slower* algorithm, whereas the anchored diff is in fact **faster** than the standard one. As the upstream package doc puts it, it is called an anchored diff because <cite index="1-2">the unique lines anchor the chosen matching regions</cite> (`pkg.go.dev/internal/diff`).
+**Lineage (web-research corroboration, synthesized).** `kittens/diff/diff.go` is a copy of Go's standard-library `internal/diff` package (the in-source comment block at `diff.go:L21-L48` says so, and the `diff_cmd` help text in `main.py` describes the builtin as the "anchored diff algorithm from the Go standard library"). The upstream Go documentation confirms the naming and rationale: the approach is closely related to what some tools call "patience diff" (after the patience-sorting card game), but the Go authors deliberately avoid that name — they consider it imprecise and note it is often misread as implying a *slower* algorithm, whereas the anchored diff is in fact **faster** than the standard one. This matches the in-source comment exactly: the code calls it an anchored diff "because the unique lines anchor the chosen matching regions" (`kittens/diff/diff.go:L35-L36`) and "guarantees to run in O(n log n) time instead of the standard O(n²) time" (`diff.go:L39-L40`); the upstream package is [`internal/diff`](https://pkg.go.dev/internal/diff).
 
 **Reasoning (why this design).** Anchoring on *unique* lines is the key idea: ordinary diffs can waste matches on ubiquitous lines like blank lines or a lone closing brace `}`, producing noisy, hard-to-read hunks. By matching only lines that occur exactly once on each side, the anchored diff lines up the parts a human would recognize as "the same code," yielding cleaner hunks — and, because the longest-common-subsequence step operates over the (few) unique lines rather than all lines, it achieves the `O(n log n)` bound instead of `O(n²)`. The caches complete the picture: they remove all redundant reading and splitting so the algorithm's inputs are always instantly available, which is why re-diffing on rerender costs essentially nothing.
 
@@ -366,9 +367,21 @@ REPO=/tmp/blitzy/kitty/blitzy-5f51bebf-d531-40ac-a4c3-be015e2031ae_83f176
 mkdir -p /tmp/diffobs
 # Copy diff.go out of the repo, renaming only the package line (repo copy untouched):
 sed 's/^package diff/package main/' "$REPO/kittens/diff/diff.go" > /tmp/diffobs/diff.go
-# Add a driver main.go that calls:
-#   Diff("a/hello.go", old, "b/hello.go", new, 3)   with a small edited Go snippet
-#   Diff("a", "same\n", "b", "same\n", 3)            the identical-input case
+# Exact driver main.go: an edited Go snippet, then the identical-input case:
+cat > /tmp/diffobs/main.go <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+	old := "package main\n\nimport \"fmt\"\n\nfunc greet(name string) {\n\tfmt.Println(\"Hello\", name)\n}\n\nfunc main() {\n\tgreet(\"world\")\n}\n"
+	new := "package main\n\nimport \"fmt\"\n\n// greet prints a friendly salutation\nfunc greet(who string) {\n\tfmt.Println(\"Hello\", who)\n\tfmt.Println(\"Welcome!\")\n}\n\nfunc main() {\n\tgreet(\"world\")\n}\n"
+	out := Diff("a/hello.go", old, "b/hello.go", new, 3)
+	fmt.Print(string(out))
+	out2 := Diff("a", "same\n", "b", "same\n", 3)
+	fmt.Printf("len(out)=%d isNil=%v\n", len(out2), out2 == nil)
+}
+EOF
 cd /tmp/diffobs && go mod init diffobs && go build -o diffobs . && ./diffobs
 ```
 
@@ -405,8 +418,40 @@ REPO=/tmp/blitzy/kitty/blitzy-5f51bebf-d531-40ac-a4c3-be015e2031ae_83f176
 mkdir -p /tmp/cacheobs
 # Copy cache.go out of the repo, renaming only the package line (repo copy untouched):
 sed 's/^package utils/package main/' "$REPO/tools/utils/cache.go" > /tmp/cacheobs/cache.go
-# Driver main.go: spawn NumCPU goroutines behind a start barrier (in a repeat loop),
+# Exact driver main.go: spawn 64 goroutines behind a start barrier (in a repeat loop),
 # each calling c.Set(key, []string{key}) with a DISTINCT key.
+cat > /tmp/cacheobs/main.go <<'EOF'
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+)
+
+func main() {
+	fmt.Printf("NumCPU=%d\n", runtime.NumCPU())
+	const workers = 64
+	for iter := 0; iter < 1000000; iter++ {
+		c := NewLRUCache[string, []string](4096)
+		var barrier sync.WaitGroup
+		barrier.Add(1)
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func(k int) {
+				defer wg.Done()
+				barrier.Wait()
+				key := fmt.Sprintf("p-%d-%d", iter, k)
+				c.Set(key, []string{key})
+			}(i)
+		}
+		barrier.Done()
+		wg.Wait()
+	}
+	fmt.Println("no race observed")
+}
+EOF
 cd /tmp/cacheobs && go mod init cacheobs
 go build -o cacheobs . && ./cacheobs                     # plain build
 go build -race -o cacheobs_race . && ./cacheobs_race     # race detector
@@ -418,13 +463,13 @@ Plain build, verbatim (exit status 2):
 NumCPU=128
 fatal error: concurrent map writes
 
-goroutine 113 [running]:
-main.(*LRUCache[...]).Set(0x7, {0xc000482010?, 0x2?}, {0xc000484010?, 0x1, 0x1})
+goroutine 47 [running]:
+main.(*LRUCache[...]).Set(0x7, {0xc0000120b0?, 0x2?}, {0xc000014050?, 0x1, 0x1})
 	/tmp/cacheobs/cache.go:34 +0x85
-main.main.func1(0x6b)
-	/tmp/cacheobs/main.go:23 +0x153
+main.main.func1(0x1d)
+	/tmp/cacheobs/main.go:23 +0x14d
 created by main.main in goroutine 1
-	/tmp/cacheobs/main.go:19 +0x24a
+	/tmp/cacheobs/main.go:19 +0x265
 ```
 
 Race build, verbatim (exit status 2):
@@ -433,35 +478,34 @@ Race build, verbatim (exit status 2):
 NumCPU=128
 ==================
 WARNING: DATA RACE
-Write at 0x00c0001b80f0 by goroutine 70:
+Write at 0x00c0002a40f0 by goroutine 48:
   runtime.mapassign_faststr()
       /usr/local/go/src/runtime/map_faststr.go:203 +0x0
   main.(*LRUCache[go.shape.string,go.shape.[]string]).Set()
       /tmp/cacheobs/cache.go:34 +0xa4
   main.main.func1()
-      /tmp/cacheobs/main.go:23 +0x206
+      /tmp/cacheobs/main.go:23 +0x204
   main.main.gowrap1()
       /tmp/cacheobs/main.go:24 +0x41
 
-Previous write at 0x00c0001b80f0 by goroutine 9:
+Previous write at 0x00c0002a40f0 by goroutine 47:
   runtime.mapassign_faststr()
       /usr/local/go/src/runtime/map_faststr.go:203 +0x0
   main.(*LRUCache[go.shape.string,go.shape.[]string]).Set()
       /tmp/cacheobs/cache.go:34 +0xa4
   main.main.func1()
-      /tmp/cacheobs/main.go:23 +0x206
+      /tmp/cacheobs/main.go:23 +0x204
   main.main.gowrap1()
       /tmp/cacheobs/main.go:24 +0x41
 
-Goroutine 70 (running) created at:
+Goroutine 48 (running) created at:
   main.main()
-      /tmp/cacheobs/main.go:19 +0x390
+      /tmp/cacheobs/main.go:19 +0x3c9
 
-Goroutine 9 (finished) created at:
+Goroutine 47 (running) created at:
   main.main()
-      /tmp/cacheobs/main.go:19 +0x390
+      /tmp/cacheobs/main.go:19 +0x3c9
 ==================
-fatal error: concurrent map writes
 fatal error: concurrent map writes
 fatal error: concurrent map writes
 ```
@@ -479,7 +523,7 @@ Every sub-question of the original onboarding question is answered above:
 | # | Sub-question | Section | Primary evidence |
 |---|--------------|---------|------------------|
 | Q1 | Directory pairing ("what belongs together") | [§Q1](#q1--directory-pairing-deciding-what-belongs-together) | `collect.go:L296`, `L306` (`Intersect`); test `collect_test.go:L19-L54` |
-| Q2 | Rename detection (not delete + add) | [§Q2](#q2--rename-detection-a-rename-not-a-delete--add) | `collect.go:L332-L364`; `md5.Sum` `collect.go:L112` |
+| Q2 | Rename detection (not delete + add) | [§Q2](#q2--rename-detection-a-rename-not-a-delete--an-add) | `collect.go:L332-L364`; `md5.Sum` `collect.go:L112` |
 | Q3 | Caching efficiency (raw → highlighted) | [§Q3](#q3--caching-efficiency-from-raw-contents-to-highlighted-output) | `collect.go:L20-L37`; `cache.go:L32-L72` |
 | Q4 | Multi-file processing (concurrency model) | [§Q4](#q4--multi-file-processing-the-concurrency-model) | `images/utils.go:L27-L56`; `patch.go:L352-L374` |
 | Q5 | Parallel highlighting "without stepping on itself" | [§Q5](#q5--parallel-highlighting-without-stepping-on-itself--and-a-tale-of-three-strategies) | `highlight.go:L217-L228`; Appendix Obs 2; contrast `search.go:L108-L120` |
