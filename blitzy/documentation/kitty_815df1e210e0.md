@@ -36,13 +36,41 @@ extended with `strace` and `xvfb` for syscall tracing and headless GUI launch. T
 tree (this repository, at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`) is bind‑mounted
 into the container.
 
-**Build** (produces the runnable `kitty` binary):
+**Build** (produces the runnable `kitty` binary). The build was run capturing its output to a log
+(`python3 setup.py build > build.log 2>&1; echo "=== EXIT: $? ==="` reported `=== EXIT: 0 ===`).
+A full rebuild compiles 122 C translation units and then links 5 targets. The captured log
+begins (note that units 7 and 10 are the very files this document investigates,
+`kitty/child-monitor.c` and `kitty/vt-parser.c`):
 
 ```
 $ cd /work && export LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=/testtmp GOTMPDIR=/testtmp
-$ python3 setup.py build
-...
-=== EXIT: 0 ===
+$ python3 setup.py build            # output captured to build.log
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[4/122] Compiling [x11] glfw/x11_window.c ...
+[5/122] Compiling kitty/glfw.c ...
+[6/122] Compiling kitty/graphics.c ...
+[7/122] Compiling kitty/child-monitor.c ...
+```
+
+Intermediate compile steps 8–121 are omitted from this excerpt; the log ends with the final
+compile step, the five link steps, and `done`:
+
+```
+[122/122] Compiling kitty/gl-wrapper.c ...
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
+```
+
+The build exits 0; the launcher then runs and reports its version:
+
+```
 $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
@@ -84,7 +112,7 @@ text (routed to `screen_draw_text`) versus escape sequences (CSI/OSC/DCS/APC/PM/
 
 ```mermaid
 flowchart TD
-    A["Shell child (/bin/bash --posix, PID 16512)<br/>writes to PTY slave /dev/pts/0"]
+    A["Shell child (/bin/bash --posix, PID 20285)<br/>writes to PTY slave /dev/pts/0"]
       --> B["PTY master fd = 10 (/dev/pts/ptmx)<br/>self.child_fd, non-blocking<br/>kitty/child.py:338,345"]
     B --> C["io_loop() thread 'KittyChildMon'<br/>poll() on children_fds[EXTRA_FDS + i]<br/>kitty/child-monitor.c:1481,1501"]
     C -->|"POLLIN (gated by buffer space)"| D["read_bytes(fd, screen)<br/>read(fd, buf, available_buffer_space)<br/>kitty/child-monitor.c:1337,1345"]
@@ -106,7 +134,7 @@ The rest of this document walks each question with its citations and captured ou
 | Sub‑part | Value (observed) |
 |---|---|
 | (a) process spawned | `/bin/bash` (the user's login shell) |
-| (b) PID | **16512** |
+| (b) PID | **20285** |
 | (c) exact command line | **`/bin/bash --posix`** |
 | (d) PTY device path | **`/dev/pts/0`** (kitty's master end is `/dev/pts/ptmx`) |
 
@@ -149,22 +177,22 @@ process rather than assumed.
 
 ### Runtime evidence
 
-The live process tree — kitty (PID 16444) and its single child shell:
+The live process tree — kitty (PID 20217) and its single child shell:
 
 ```
-$ ps -o pid,ppid,args --ppid 16444
+$ ps -o pid,ppid,args --ppid 20217
     PID    PPID COMMAND
-  16512   16444 /bin/bash --posix
+  20285   20217 /bin/bash --posix
 ```
 
 The exact argv, byte‑for‑byte (NUL separators shown as `|`), and kitty's own view of the window:
 
 ```
-$ cat /proc/16512/cmdline | tr "\0" "|"; echo
+$ cat /proc/20285/cmdline | tr "\0" "|"; echo
 /bin/bash|--posix|
 
 $ ./kitty/launcher/kitty @ --to unix:/testtmp/obs/kitty.sock ls   # (trimmed)
-pid= 16512
+pid= 20285
 cmdline= ['/bin/bash', '--posix']
 cwd= /work
 ```
@@ -173,26 +201,26 @@ The PTY device path, confirmed three independent ways (the shell's controlling t
 targets of the shell's stdin/stdout/stderr, which are the PTY **slave**):
 
 ```
-$ ps -o tty= -p 16512
+$ ps -o tty= -p 20285
 pts/0
-$ readlink /proc/16512/fd/0     # shell stdin  = PTY slave
+$ readlink /proc/20285/fd/0     # shell stdin  = PTY slave
 /dev/pts/0
-$ readlink /proc/16512/fd/1     # shell stdout = PTY slave
+$ readlink /proc/20285/fd/1     # shell stdout = PTY slave
 /dev/pts/0
-$ readlink /proc/16512/fd/2     # shell stderr = PTY slave
+$ readlink /proc/20285/fd/2     # shell stderr = PTY slave
 /dev/pts/0
 ```
 
 The environment markers that explain the `--posix` command line:
 
 ```
-$ tr "\0" "\n" < /proc/16512/environ | grep -E "KITTY_SHELL_INTEGRATION|^ENV=|KITTY_INSTALLATION_DIR"
+$ tr "\0" "\n" < /proc/20285/environ | grep -E "KITTY_SHELL_INTEGRATION|^ENV=|KITTY_INSTALLATION_DIR"
 KITTY_INSTALLATION_DIR=/work
 KITTY_SHELL_INTEGRATION=enabled
 ENV=/work/shell-integration/bash/kitty.bash
 ```
 
-So: kitty spawned **`/bin/bash --posix`** (PID **16512**), connected to kitty through the PTY
+So: kitty spawned **`/bin/bash --posix`** (PID **20285**), connected to kitty through the PTY
 whose **slave** is **`/dev/pts/0`**; kitty holds the corresponding **master** end (`/dev/pts/ptmx`,
 fd 10 — see Q4).
 
@@ -226,20 +254,20 @@ Attaching `strace` to kitty and typing `echo test123` <Enter> (sent via remote c
 `send-text $'echo test123\r'`), the reads on the PTY master fd 10 were:
 
 ```
-$ strace -f -e trace=read -y -p 16444 -o echo.strace &
+$ strace -f -e trace=read -y -p 20217 -o echo.strace &
 $ ./kitty/launcher/kitty @ --to unix:/testtmp/obs/kitty.sock send-text $'echo test123\r'
 $ grep -E "read\(10<" echo.strace
-16511 read(10</dev/pts/ptmx>, "echo test123\r\n\33[?2004l\r", 1048576) = 23
-16511 read(10</dev/pts/ptmx>, "\33]2;echo test123\7\33]133;C;cmdline"..., 1048553) = 47
-16511 read(10</dev/pts/ptmx>, "\1\33]133;k;start_kitty\7\2\1\33]133;k;e"..., 1048506) = 114
-16511 read(10</dev/pts/ptmx>, "\33[?2004h\33]133;k;start_kitty\7\33]13"..., 1048392) = 185
+20284 read(10</dev/pts/ptmx>, "echo test123\r\n\33[?2004l\r", 1048576) = 23
+20284 read(10</dev/pts/ptmx>, "\33]2;echo test123\7\33]133;C;cmdline"..., 1048553) = 47
+20284 read(10</dev/pts/ptmx>, "\1\33]133;k;start_kitty\7\2\1\33]133;k;e"..., 1048506) = 114
+20284 read(10</dev/pts/ptmx>, "\33[?2004h\33]133;k;start_kitty\7\33]13"..., 1048392) = 185
 ```
 
 **Reading the trace (rationale).**
 
 - **(a) The syscall.** kitty reads the PTY with a plain `read(fd, buf, count)`; `-y` annotates
   the descriptor, so it appears as `read(10</dev/pts/ptmx>, …)`. This is exactly the `read()`
-  call at `kitty/child-monitor.c:1345`, executed on thread `16511` (the `KittyChildMon` /
+  call at `kitty/child-monitor.c:1345`, executed on thread `20284` (the `KittyChildMon` /
   `io_loop` thread — see Q5).
 - **(b) The buffer size.** The third argument is the `count` — the space kitty offers. The very
   first read offers **`1048576`** bytes, which is exactly `BUF_SZ` = `1024*1024` = 1 MiB
@@ -265,8 +293,8 @@ $ grep -E "read\(10<" echo.strace
 | Sub‑part | Value (observed) |
 |---|---|
 | (a) how behaviour changes | From **4 discrete reads** (Q2) to **tens of thousands of back‑to‑back reads**; the io_loop reads continuously as long as data streams, gated by parser buffer space |
-| (b) read frequency | **31,432 reads in 2.031 s ≈ 15,477 reads/second**; mean gap **64.6 µs** between reads; each `read()` call takes **~7–17 µs** (`strace -c`: 9 µs/call) |
-| (c) typical bytes per read | **median 485 bytes, mean 675 bytes** (min 2, max 14,644) — a few hundred bytes per read, **not** ~1 MiB, even though the buffer *offered* is up to 1 MiB |
+| (b) read frequency | **29,370 reads in 2.035 s ≈ 14,429 reads/second**; mean gap **69.3 µs** between reads; each `read()` call takes **~7–14 µs** (`strace -c`: 9 µs/call) |
+| (c) typical bytes per read | **median 586 bytes, mean 728 bytes** (min 2, max 19,322) — a few hundred bytes per read, **not** ~1 MiB, even though the buffer *offered* is up to 1 MiB |
 
 ### Source — why reads batch and what paces them
 
@@ -291,53 +319,105 @@ $ grep -E "read\(10<" echo.strace
 ### Runtime evidence
 
 `strace -f -e trace=read -y -T -tt` while running `yes hello`, then Ctrl‑C. A representative
-window of *consecutive* reads on fd 10 (note the microsecond timestamps ~40–50 µs apart and the
-`<duration>` of ~10 µs each):
+window of *consecutive* reads on fd 10 (note the microsecond timestamps ~40–55 µs apart and the
+`<duration>` of ~7–14 µs each):
 
 ```
-$ strace -f -e trace=read -y -T -tt -p 16444 -o yes.strace &
+$ strace -f -e trace=read -y -T -tt -p 20217 -o yes.strace &
 $ ./kitty/launcher/kitty @ --to unix:/testtmp/obs/kitty.sock send-text $'yes hello\r'
    # ... stream for ~2 s, then send Ctrl-C (send-text $'\x03') ...
 $ grep -E "read\(10<" yes.strace | sed -n '200,209p'
-16511 04:08:01.815278 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1039831) = 411 <0.000010>
-16511 04:08:01.815326 read(10</dev/pts/ptmx>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1039420) = 448 <0.000010>
-16511 04:08:01.815373 read(10</dev/pts/ptmx>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1038972) = 380 <0.000010>
-16511 04:08:01.815421 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1038592) = 371 <0.000009>
-16511 04:08:01.815468 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1038221) = 404 <0.000011>
-16511 04:08:01.815524 read(10</dev/pts/ptmx>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1037817) = 429 <0.000010>
-16511 04:08:01.815572 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1037388) = 357 <0.000010>
-16511 04:08:01.815619 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1037031) = 308 <0.000010>
-16511 04:08:01.815665 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1036723) = 490 <0.000010>
-16511 04:08:01.815715 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1036233) = 572 <0.000010>
+20284 04:49:25.451606 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1048576) = 518 <0.000014>
+20284 04:49:25.451659 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1048058) = 425 <0.000013>
+20284 04:49:25.451705 read(10</dev/pts/ptmx>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1047633) = 378 <0.000011>
+20284 04:49:25.451757 read(10</dev/pts/ptmx>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1047255) = 322 <0.000008>
+20284 04:49:25.451803 read(10</dev/pts/ptmx>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1046933) = 282 <0.000008>
+20284 04:49:25.451843 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1046651) = 252 <0.000013>
+20284 04:49:25.451894 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1046399) = 560 <0.000014>
+20284 04:49:25.451943 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1045839) = 448 <0.000013>
+20284 04:49:25.451999 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1045391) = 448 <0.000011>
+20284 04:49:25.452049 read(10</dev/pts/ptmx>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1044943) = 432 <0.000007>
 ```
 
-Aggregate frequency and per‑call cost (a separate `strace -c` run over the same kind of stream):
+Aggregate per‑call cost (a separate `strace -c` run over the same kind of stream). Note this
+`-c` summary counts `read()` on **all** of kitty's descriptors — the PTY master plus the
+wakeup/signal/eventfd descriptors — so its `calls` total (and the `errors`, which are `EAGAIN`
+on the non‑blocking descriptors) is larger than the PTY‑master‑only count reported below; the
+figure used in the answer is the **9 µs/call** average:
 
 ```
-$ strace -f -e trace=read -c -p 16444 -o yes_c.strace &   # run yes hello, Ctrl-C, detach
+$ strace -f -e trace=read -c -p 20217 -o yes_c.strace &   # run yes hello, Ctrl-C, detach
 $ cat yes_c.strace
 % time     seconds  usecs/call     calls    errors syscall
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.281011           9     31113       234 read
+100.00    0.295365           9     32314       225 read
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.281011           9     31113       234 total
+100.00    0.295365           9     32314       225 total
 ```
 
-Computed distributions over the 31,432 fd‑10 reads in the `-T -tt` capture:
+The summary statistics below were computed from `yes.strace` with the small script `stats.py`
+shown here. It counts **every** `read()` on the PTY master fd — including reads that `strace -f`
+split into `<unfinished ...>` / `<... read resumed>` fragments (paired by thread id) — and reports
+the returned‑byte distribution, the `count` argument offered, and the read cadence derived from
+the `-tt` timestamps:
+
+```python
+#!/usr/bin/env python3
+# stats.py <strace_file> <master_fd> - read distribution + cadence for the PTY master fd.
+import sys, re, statistics
+path, fd = sys.argv[1], sys.argv[2]
+def secs(h, m, s): return int(h)*3600 + int(m)*60 + float(s)
+complete = re.compile(r'^\s*(\d+)\s+(\d\d):(\d\d):(\d\d\.\d+)\s+read\(' + re.escape(fd) +
+                      r'</dev/pts/ptmx>,\s*.*,\s*(\d+)\)\s*=\s*(-?\d+)(.*)$')
+unfin = re.compile(r'^\s*(\d+)\s+(\d\d):(\d\d):(\d\d\.\d+)\s+read\((\d+)<[^>]*>,\s*<unfinished')
+resumed = re.compile(r'^\s*(\d+)\s+(\d\d):(\d\d):(\d\d\.\d+)\s+<\.\.\. read resumed>.*,\s*(\d+)\)\s*=\s*(-?\d+)(.*)$')
+eagain = 0; rets = []; counts = []; times = []; pending = {}
+def record(ret, count, t, tail):
+    global eagain
+    if ret < 0:
+        if 'EAGAIN' in tail: eagain += 1
+        return
+    rets.append(ret); counts.append(count); times.append(t)
+for line in open(path, errors='replace'):
+    m = complete.match(line)
+    if m:
+        record(int(m.group(6)), int(m.group(5)), secs(m.group(2), m.group(3), m.group(4)), m.group(7)); continue
+    m = unfin.match(line)
+    if m:
+        pending[m.group(1)] = (m.group(5) == fd, secs(m.group(2), m.group(3), m.group(4))); continue
+    m = resumed.match(line)
+    if m:
+        info = pending.pop(m.group(1), None)
+        if info and info[0]:
+            record(int(m.group(6)), int(m.group(5)), info[1], m.group(7))
+N = len(rets); span = max(times) - min(times)
+print('returned bytes/read : N=%d min=%d max=%d mean=%d median=%d   (EAGAIN on fd %s = %d)' %
+      (N, min(rets), max(rets), round(sum(rets)/N), round(statistics.median(rets)), fd, eagain))
+print('count arg (offered) : min=%d max=%d mean=%d' % (min(counts), max(counts), round(sum(counts)/len(counts))))
+print('cadence             : span_s=%.3f nreads=%d reads_per_s=%d mean_gap_us=%.1f' %
+      (span, N, round(N/span), (span/(N-1))*1e6))
+```
+
+Running it on the `-T -tt` capture (master fd `10`) produced, verbatim:
 
 ```
-returned bytes/read : N=31178 min=2 max=14644 mean=675 median=485   (EAGAIN on fd 10 = 0)
-count arg (offered) : min=91643 max=1048576 mean=977751
-cadence             : span_s=2.031 nreads=31432 reads_per_s=15477 mean_gap_us=64.6
+$ python3 stats.py yes.strace 10
+returned bytes/read : N=29370 min=2 max=19322 mean=728 median=586   (EAGAIN on fd 10 = 0)
+count arg (offered) : min=696854 max=1048576 mean=1001175
+cadence             : span_s=2.035 nreads=29370 reads_per_s=14429 mean_gap_us=69.3
 ```
+
+The `N=29370` reads the script accounts for equal the total number of `read(10<…>` lines in
+`yes.strace` — 29,123 single‑line completions plus 247 `<unfinished>`/`<resumed>` pairs — so
+every read on the master fd is included.
 
 **Rationale — how this differs from Q2, and why.**
 
 - **Behaviour change.** Under `yes hello` the io_loop stops waiting on human input and instead
-  drains the PTY continuously: **31,432** reads versus **4** for `echo test123`. Reads are issued
-  back‑to‑back (`04:08:01.815278`, `.815326`, `.815373`, … — ~40–50 µs apart) for as long as the
+  drains the PTY continuously: **29,370** reads versus **4** for `echo test123`. Reads are issued
+  back‑to‑back (`04:49:25.451606`, `.451659`, `.451705`, … — ~40–55 µs apart) for as long as the
   stream runs.
-- **Frequency.** ~**15,477 reads/second** in this sample, each call costing ~**9 µs** on average
+- **Frequency.** ~**14,429 reads/second** in this sample, each call costing ~**9 µs** on average
   (`strace -c`). The 3 ms `input_delay` is the *"Delay before input from the program running in
   the terminal is processed"* (`kitty/options/definition.py:878`, default `3` there and
   `input_delay: int = 3` at `kitty/options/types.py:536`); it sets the `poll()` timeout at
@@ -345,16 +425,16 @@ cadence             : span_s=2.031 nreads=31432 reads_per_s=15477 mean_gap_us=64
   is **not** a cap on how often the io_loop `read()`s. The io_loop keeps reading whenever `poll()`
   reports `POLLIN` and the parser has space; fittingly, the option is documented as *"ignored when
   the input buffer is almost full"* — exactly the high‑volume case measured here.
-- **Bytes per read.** The typical read returns only **~485 bytes (median)** — dozens of
+- **Bytes per read.** The typical read returns only **~586 bytes (median)** — dozens of
   `hello\r\n` lines — even though the `count` offered climbs back toward **1,048,576** (`BUF_SZ`).
   The reason: kitty drains the PTY *faster than `yes` can fill it*, so each `read()` returns only
   what accumulated in the kernel PTY buffer since the previous read (a few hundred bytes), not the
   full megabyte on offer. This is the honest, measured result — the buffer **offered** approaches
   1 MiB, but the bytes **returned** are a few hundred per read.
 - **Backpressure, observed.** The `count` argument is not constant: it falls (e.g.
-  `1039831 → 1039420 → 1038972 → …`) as the parser accumulates undrained bytes
+  `1048576 → 1048058 → 1047633 → …`) as the parser accumulates undrained bytes
   (`BUF_SZ - write.offset`) and recovers toward `1048576` when the parser catches up. Over the
-  sample it ranged from **91,643** (parser ~957 KB behind) up to **1,048,576**. Because the parser
+  sample it ranged from **696,854** (parser ~344 KB behind) up to **1,048,576**. Because the parser
   kept up, free space never hit zero, so `POLLIN` was never actually disabled in this run — the
   gate at `kitty/child-monitor.c:1501` exists and is exercised (the shrinking `count` is its
   accounting in action), but full backpressure would only stall reads if the parser fell a full
@@ -365,7 +445,7 @@ cadence             : span_s=2.031 nreads=31432 reads_per_s=15477 mean_gap_us=64
 ## Q4 — The file‑descriptor number kitty uses to read from the PTY master
 
 **Answer:** kitty reads the PTY master through **file descriptor 10** in this launch (kitty
-PID 16444). It is a process‑specific integer, obtained two ways below.
+PID 20217). It is a process‑specific integer, obtained two ways below.
 
 ### Source
 
@@ -381,14 +461,14 @@ PID 16444). It is a process‑specific integer, obtained two ways below.
 The descriptor in kitty's fd table whose target is the PTY master (`/dev/pts/ptmx`):
 
 ```
-$ ls -l /proc/16444/fd | grep -E "ptmx|pts"
-lrwx------ 1 root root 64 Jul  1 04:05 10 -> /dev/pts/ptmx
+$ ls -l /proc/20217/fd | grep -E "ptmx|pts"
+lrwx------ 1 root root 64 Jul  1 04:49 10 -> /dev/pts/ptmx
 ```
 
 Corroborated by the `-y` annotation on every PTY read in the strace captures for Q2 and Q3:
 
 ```
-16511 read(10</dev/pts/ptmx>, ... , 1048576) = 23
+20284 read(10</dev/pts/ptmx>, ... , 1048576) = 23
 ```
 
 Both agree: the master fd is **10**. For completeness, kitty's other descriptors in this launch
@@ -450,18 +530,18 @@ The `read(10</dev/pts/ptmx>, buf, count)` lines quoted for Q2 and Q3 **are** thi
 `read()` at line 1345 — the `count` argument is the `available_buffer_space` handed back by
 `vt_parser_create_write_buffer()` (i.e. `BUF_SZ - write.offset`), which is why it starts at
 `1048576` and shrinks as the parser lags. The reads were all attributed by `strace` to thread
-**16511**, whose OS thread name is **`KittyChildMon`** — the `io_loop()` child‑monitor thread —
+**20284**, whose OS thread name is **`KittyChildMon`** — the `io_loop()` child‑monitor thread —
 confirming that `read_bytes()` runs on kitty's dedicated child‑I/O thread rather than the main or
 render threads:
 
 ```
-$ cat /proc/16444/task/16511/comm
+$ cat /proc/20217/task/20284/comm
 KittyChildMon
-$ for t in $(ls /proc/16444/task); do c=$(cat /proc/16444/task/$t/comm); \
+$ for t in $(ls /proc/20217/task); do c=$(cat /proc/20217/task/$t/comm); \
     case "$c" in llvmpipe*|kitty) ;; *) echo "TID $t = $c";; esac; done
-TID 16509 = kitty:disk$0
-TID 16510 = KittyPeerMon
-TID 16511 = KittyChildMon
+TID 20282 = kitty:disk$0
+TID 20283 = KittyPeerMon
+TID 20284 = KittyChildMon
 ```
 
 (The 32 `llvmpipe-*` threads are the software‑OpenGL rasteriser used under Xvfb; they are
@@ -531,10 +611,10 @@ Every sub‑part of the six questions, with the value and where it is substantia
 
 - [x] **Q1(a) process spawned** — `/bin/bash` (`ps`/`kitty @ ls`; source `kitty/child.c:159`
   `execvp`).
-- [x] **Q1(b) PID** — **16512** (`ps -o pid,ppid,args --ppid 16444`).
-- [x] **Q1(c) exact command line** — **`/bin/bash --posix`** (`/proc/16512/cmdline`;
+- [x] **Q1(b) PID** — **20285** (`ps -o pid,ppid,args --ppid 20217`).
+- [x] **Q1(c) exact command line** — **`/bin/bash --posix`** (`/proc/20285/cmdline`;
   `kitty @ ls`; rationale from `KITTY_SHELL_INTEGRATION`/`ENV` and `kitty/child.py:314`).
-- [x] **Q1(d) PTY device path** — **`/dev/pts/0`** (`ps -o tty=`, `readlink /proc/16512/fd/{0,1,2}`;
+- [x] **Q1(d) PTY device path** — **`/dev/pts/0`** (`ps -o tty=`, `readlink /proc/20285/fd/{0,1,2}`;
   source `kitty/child.c:88` `ttyname_r`).
 - [x] **Q2 read syscall(s)** — `read(10</dev/pts/ptmx>, buf, count)` (strace; source
   `kitty/child-monitor.c:1345`).
@@ -542,13 +622,13 @@ Every sub‑part of the six questions, with the value and where it is substantia
   `kitty/vt-parser.c:18`, `:1457`).
 - [x] **Q2 byte count** — **23** bytes (echo), then **47/114/185** (4 reads, 369 bytes total)
   (strace).
-- [x] **Q3 behaviour change** — from 4 discrete reads to **31,432** continuous reads; io_loop
+- [x] **Q3 behaviour change** — from 4 discrete reads to **29,370** continuous reads; io_loop
   drains as fast as data arrives, gated by parser space (`kitty/child-monitor.c:1501`).
-- [x] **Q3 frequency** — **≈15,477 reads/s**, mean gap **64.6 µs**, **~9 µs/call**
+- [x] **Q3 frequency** — **≈14,429 reads/s**, mean gap **69.3 µs**, **~9 µs/call**
   (strace `-T -tt` and `-c`).
-- [x] **Q3 bytes/read** — **median 485, mean 675** bytes (min 2, max 14,644); `count` offered up
+- [x] **Q3 bytes/read** — **median 586, mean 728** bytes (min 2, max 19,322); `count` offered up
   to **1,048,576** (computed over the strace capture).
-- [x] **Q4 fd number** — **10** → `/dev/pts/ptmx` (`ls -l /proc/16444/fd`; strace `-y`; source
+- [x] **Q4 fd number** — **10** → `/dev/pts/ptmx` (`ls -l /proc/20217/fd`; strace `-y`; source
   `kitty/child.py:338`, `kitty/child-monitor.c:1286`).
 - [x] **Q5 C read function** — **`read_bytes()`** (`kitty/child-monitor.c:1337`, `read()` at
   `:1345`), running on the `KittyChildMon` io_loop thread.
@@ -558,10 +638,10 @@ Every sub‑part of the six questions, with the value and where it is substantia
 
 ### Notes on verifiability
 
-- The PID (16512), the `/dev/pts/0` slave number, and the master fd (10) are **specific to this
+- The PID (20285), the `/dev/pts/0` slave number, and the master fd (10) are **specific to this
   launch** and were read from the live process; they will differ on another run. The commands
   that produced them are shown so they can be reproduced.
-- Under `yes hello`, the bytes **returned** per read are a few hundred (median 485), while the
+- Under `yes hello`, the bytes **returned** per read are a few hundred (median 586), while the
   buffer **offered** (`count`) approaches 1 MiB — reported from measurement, not assumption. Full
   `POLLIN` backpressure (reads pausing) was **not** triggered in this sample because the parser
   kept up; the shrinking `count` argument is the same gate's accounting in action.
