@@ -50,11 +50,14 @@ then was the prose written around that evidence.
 objects until `kitty/fast_data_types.so` is compiled:
 
 ```bash
-CI=true python setup.py build --ignore-compiler-warnings --full
+CI=true python3 setup.py build --ignore-compiler-warnings
 ```
 
-Observed: exit code `0`. The build ran 122 compile steps and 5 link steps with **no
-warnings or errors**. The key lines (verbatim from the build log):
+Observed: exit code `0`. On a clean tree this from-scratch build ran 122 compile steps
+and 5 link steps with **no warnings or errors** (re-running the exact same command once
+the artifacts already exist prints no compile lines, because the build is incremental —
+`setup.py`'s `--full` flag [setup.py:L1905-L1909] would be required to force a rebuild of
+unchanged files). The key lines (verbatim from the build log):
 
 ```
 [1/122] Compiling kitty/screen.c ...
@@ -82,13 +85,13 @@ compile cleanly (no warning lines appear for them above).
 > whenever a dump callback is supplied. **This double-compile is exactly why the
 > dispatched-command trace used throughout this document is observable at all.**
 
-**2. Verify the extension imports.** Observed verbatim (note the real spacing):
+**2. Verify the extension imports.** Observed verbatim:
 
 ```bash
-python -c "import kitty.fast_data_types as f; print('IMPORT OK; has Screen:', hasattr(f,'Screen'), '; has Parser:', hasattr(f,'Parser'))"
+python3 -c "import kitty.fast_data_types as f; print(f'IMPORT OK; has Screen: {hasattr(f, \"Screen\")}; has Parser: {hasattr(f, \"Parser\")}')"
 ```
 ```
-IMPORT OK; has Screen: True ; has Parser: True
+IMPORT OK; has Screen: True; has Parser: True
 ```
 
 Both the `Screen` (screen model) and `Parser` (VT parser) types are present, so the
@@ -172,6 +175,18 @@ until the update ends, at which point changes are applied atomically. While paus
 terminal keeps *processing* incoming text and sequences; only *rendering* is frozen at
 the last state.
 
+> **External sources (terminology only — not kitty-specific).** The synchronized-output
+> feature and its `\x1b[?2026h` / `\x1b[?2026l` (a.k.a. BSU / ESU) control sequences are
+> defined by the community "Synchronized Output" specification — living document at
+> <https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036> (mirrored at
+> <https://github.com/contour-terminal/vt-extensions/blob/master/synchronized-output.md>) —
+> which itself derives from the original iTerm2 proposal at
+> <https://gitlab.com/gnachman/iterm2/-/wikis/synchronized-updates-spec>. That spec is the
+> basis for the "enable keeps rendering the last state while still processing input; disable
+> fetches the latest grid buffer" and "avoid a half-drawn screen" statements above. These
+> references establish standard terminology only; every claim about kitty's *own* behavior
+> in this document is grounded in kitty source citations.
+
 Inside kitty this maps onto `screen_pause_rendering()` [kitty/screen.c:L2506], whose
 snapshot/resume behavior is detailed in Q4. kitty also recognizes the **DCS** form of
 the control — `\x1bP=1s\x1b\\` to start and `\x1bP=2s\x1b\\` to stop — routed in
@@ -213,8 +228,11 @@ There is no single function that "runs" the terminal; the coordination is done b
 
 This split is the "unseen conductor": the I/O thread never blocks on parsing or
 rendering, and the main thread never blocks on `read()`/`write()` syscalls. The
-existence and concurrent operation of these threads is confirmed by the passing
-threading test captured below (`test_parser_threading ... ok`).
+existence of these three threads and their responsibilities is established by the source
+citations in the table above (their entry points `io_loop()`/`main_loop()`/`talk_loop()`).
+The `test_parser_threading` test captured below does **not** itself spawn these threads;
+it validates the write-buffer handoff protocol that the I/O and main threads rely on —
+the mechanism by which one side commits bytes and the other parses them.
 
 ### What decides which event gets handled first — a FIXED `poll()` descriptor ordering
 
@@ -295,15 +313,15 @@ be delayed beyond `input_delay`:
 
 The measured default is `input_delay = 3` ms — `opt('input_delay', '3', ...)`
 [kitty/options/definition.py:L878]. Its own documentation notes it is **"ignored when
-the input buffer is almost full"** [kitty/options/definition.py:L878] (i.e. under
+the input buffer is almost full"** [kitty/options/definition.py:L885] (i.e. under
 surge/backpressure kitty stops waiting and drains — see Q3).
 
-### Observed evidence that the threads run concurrently and correctly
+### Observed evidence: the parser's split-input handoff and dispatch paths
 
 Command:
 
 ```bash
-LANG=C.UTF-8 LC_ALL=C.UTF-8 ./kitty/launcher/kitty +launch test.py parser_threading simple_parsing prompt_marking
+LANG=C.UTF-8 LC_ALL=C.UTF-8 python3 test.py parser_threading simple_parsing prompt_marking
 ```
 
 Verbatim output:
@@ -320,8 +338,13 @@ Ran 3 tests in 0.046s
 OK
 ```
 
-`test_parser_threading ... ok` confirms the parser's worker/threading path executes
-cleanly; `test_simple_parsing ... ok` confirms basic parse→screen dispatch; and
+`test_parser_threading ... ok` confirms the parser correctly reassembles control
+sequences that are **split across successive write-buffer commits** — the create-buffer →
+commit → parse handoff (`test_create_write_buffer` / `test_commit_write_buffer` /
+`test_parse_written_data`) that the I/O and main threads use to pass data across the
+thread boundary — rather than proving the three ChildMonitor threads run concurrently
+(the test is synchronous and does not spawn them; see [kitty_tests/parser.py:L93]);
+`test_simple_parsing ... ok` confirms basic parse→screen dispatch; and
 `test_prompt_marking ... ok` confirms the OSC 133 hint path used in Q3. (The elapsed
 time `0.046s` is the value observed on this run and will vary between runs.)
 
@@ -417,9 +440,13 @@ environment: `setup_bash_env()` [kitty/shell_integration.py:L70],
 `modify_shell_environ()` [kitty/shell_integration.py:L218], which sets
 `env['KITTY_SHELL_INTEGRATION'] = ksi` [kitty/shell_integration.py:L223]. The scripts
 that actually emit the OSC 133 markers live under
-`shell-integration/{bash,zsh,fish,ssh}` (for example `shell-integration/bash/kitty.bash`
-emits the `\e]133;A`, `\e]133;C`, and `\e]133;D` markers that become the
-`shell_prompt_marking` dispatches above).
+`shell-integration/{bash,zsh,fish,ssh}`. For example `shell-integration/bash/kitty.bash`
+emits the command-start marker `\e]133;C` — `builtin printf "\e]133;C;cmdline=%q\a"`
+[shell-integration/bash/kitty.bash:L208] — and, in the prompt strings, the command-end
+and prompt-start markers `\e]133;D` and `\e]133;A`
+[shell-integration/bash/kitty.bash:L239-L240] (`ps1]+="...\e]133;D;$?\a\e]133;A\a..."` at
+L239 and the secondary-prompt `\e]133;A` at L240). These are exactly the markers that
+become the `shell_prompt_marking` dispatches above.
 
 ### Backpressure / flow control: reads pause when the parser buffer is full
 
@@ -450,14 +477,16 @@ Under this backpressure the input-batching delay is intentionally bypassed: the 
 worker gate flushes when the buffer is nearly full —
 `if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ)`
 [kitty/vt-parser.c:L1425] — and `input_delay`'s own docs say it is "ignored when the
-input buffer is almost full" [kitty/options/definition.py:L878].
+input buffer is almost full" [kitty/options/definition.py:L885].
 
 ### Unstable remote / an interrupted "resume": the timeout safety net
 
 The danger case: an application sends "pause" (enter synchronized output) and then the
 connection drops — an unstable/interrupted remote — so the matching "resume" **never
 arrives**. Without a safeguard the screen would freeze forever. kitty bounds this with a
-timeout. Every frame it calls:
+timeout. On every render-preparation pass the child monitor calls
+`screen_check_pause_rendering(WD.screen, now)` once per visible window
+[kitty/child-monitor.c:L729]. That function (defined at [kitty/screen.c:L2489-L2490]):
 
 ```c
 screen_check_pause_rendering(Screen *self, monotonic_t now) {
@@ -468,8 +497,10 @@ screen_check_pause_rendering(Screen *self, monotonic_t now) {
 i.e. once the pause deadline passes, it force-resumes. That deadline uses the default
 timeout when the application supplies none: `if (for_in_ms <= 0) for_in_ms = 2000;` —
 **2000 ms** [kitty/screen.c:L2521]. For context, this is the same class of safety net
-other terminals use (tmux, for instance, uses a 1 second synchronized-output timeout);
-kitty's default is `2000` ms.
+other terminals use — tmux, for instance, "defers flushing pane output until the
+application disables it ... or a 1 second timeout expires" (external, terminology only:
+tmux PR #4744, <https://github.com/tmux/tmux/pull/4744>); kitty's default of `2000` ms is
+grounded in the kitty source citation above.
 
 Malformed transitions are rejected rather than allowed to corrupt state: a "start"
 issued **while already pending**, or a "stop" **while not pending**, is refused —
@@ -549,7 +580,7 @@ The system "keeps rhythm" via two configured cadences plus the structural guaran
 - `repaint_delay = 10` ms [kitty/options/definition.py:L866] paces *rendering*
   (~100 FPS), with `sync_to_monitor = yes` [kitty/options/definition.py:L889] aligning
   frames to the display; `repaint_delay` is itself ignored when there is pending input to
-  minimize latency [kitty/options/definition.py:L866 long_text].
+  minimize latency [kitty/options/definition.py:L873-L874].
 - Single-stream serialization (Q3) keeps *meaning* aligned, and 1 MiB buffer-space
   backpressure [kitty/vt-parser.c:L18, L1481] keeps producer, parser, and renderer from
   running away from one another.
@@ -598,7 +629,7 @@ citations and backed by verbatim observed output.
   [kitty/vt-parser.c:L1451, L1465]; surges are absorbed by the 1 MiB `BUF_SZ`
   [kitty/vt-parser.c:L18] and coalesced wake-ups; "paused then resumed" = synchronized
   output / DEC 2026, `screen_pause_rendering()` [kitty/screen.c:L2506], DCS `=1s`/`=2s`
-  [kitty/vt-parser.c:L639, L644]. *Evidence:* build+import (`IMPORT OK; has Screen: True ; has Parser: True`)
+  [kitty/vt-parser.c:L639, L644]. *Evidence:* build+import (`IMPORT OK; has Screen: True; has Parser: True`)
   and the trace line `('screen_start_pending_mode',)`.
 - [x] **Q2 — The unseen conductor.** `ChildMonitor` + three threads (`io_loop()`
   [kitty/child-monitor.c:L1481], `main_loop()` [kitty/child-monitor.c:L1259],
@@ -607,7 +638,9 @@ citations and backed by verbatim observed output.
   [kitty/child-monitor.c:L183], drain wake-up first [kitty/child-monitor.c:L1515],
   signals second [kitty/child-monitor.c:L1519], PTYs last [kitty/child-monitor.c:L1531];
   batching `input_delay = 3` ms [kitty/options/definition.py:L878;
-  kitty/child-monitor.c:L1562-L1569]. *Evidence:* `test_parser_threading ... ok`.
+  kitty/child-monitor.c:L1562-L1569]. *Evidence:* `test_parser_threading ... ok`
+  (validates the cross-commit parser handoff the I/O and main threads rely on — not
+  thread concurrency).
 - [x] **Q3 — Alignment / backpressure / unstable remote.** One serialized parser routes
   hints and text (`shell_prompt_marking` [kitty/vt-parser.c:L539, L544;
   kitty/screen.c:L2328]) so ordering cannot drift; backpressure via the `POLLIN` gate on
