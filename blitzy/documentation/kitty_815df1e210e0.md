@@ -8,6 +8,8 @@
 version: Version = Version(0, 35, 2)
 ```
 
+**Source branch:** `kitty_815df1e210e0` (the source snapshot / commit prefix is `815df1e210e0`). This investigation was performed against that branch, and the deliverable is named after it: `blitzy/documentation/kitty_815df1e210e0.md`.
+
 ## The question being answered
 
 This document answers the following question, reproduced verbatim:
@@ -44,7 +46,7 @@ python3 setup.py build --debug --extra-logging=event-loop > /tmp/blitzy_obs/buil
 echo "BUILD_EXIT=$?"
 ```
 
-**OUTPUT (the complete `/tmp/blitzy_obs/build.log`, 11 lines, followed by the captured exit status):**
+**OUTPUT (`/tmp/blitzy_obs/build.log` as observed from the build run that recompiled the extension — 11 lines; this block is *build-state dependent*, as the note directly below it demonstrates):**
 ```text
 Package wayland-protocols was not found in the pkg-config search path.
 Perhaps you should add the directory containing `wayland-protocols.pc'
@@ -60,9 +62,34 @@ kitty/tools/cmd
 BUILD_EXIT=0
 ```
 
-The trailing `[1/1] Compiling … done` / `[1/1] Linking kitty/fast_data_types … done` lines plus `BUILD_EXIT=0` are the proof the build completed successfully. This invocation was *incremental* (the extension had been built once already, so only `kitty/data-types.c` was recompiled); the two independent checks below prove the event-loop/signal logging is compiled into the extension that is actually loaded at run time.
+The `[1/1] Compiling … done` / `[1/1] Linking kitty/fast_data_types … done` / `kitty/tools/cmd` lines appear **only when the build actually (re)compiles something** — this block was captured from the run in which `kitty/data-types.c` was recompiled. Those lines are therefore *build-state dependent*. Re-running the exact same command against an already-up-to-date tree recompiles no C sources; what remains is essentially the wayland-protocols diagnostics — and even the Go `kitty/tools/cmd` line may or may not appear — so `wc -l` on the log is itself not fixed (it was observed as **6 lines on one re-run and 7 on another**, differing only by the presence of the `kitty/tools/cmd` line). The reliable, reproducible signals from the re-run are therefore the exit status and the always-present wayland-disable line, not the exact line set:
 
-That `kitty/child-monitor.c` is compiled with the event-loop/debug defines was read directly from the build database:
+**COMMAND (the same build command, re-run on an already-built tree):**
+```bash
+python3 setup.py build --debug --extra-logging=event-loop > /tmp/blitzy_obs/build.log 2>&1
+echo "BUILD_EXIT=$?"
+echo "wayland-disable line present: $(grep -c 'Disabling building of wayland backend' /tmp/blitzy_obs/build.log)"
+```
+
+**OUTPUT:**
+```text
+BUILD_EXIT=0
+wayland-disable line present: 1
+```
+
+Because the exact compile/link lines depend on build state, the **primary, build-state-independent proof** that the debug/event-loop extension is built and loadable is a trio of stable checks that reproduce regardless of whether the current invocation recompiled anything: the exit status (`BUILD_EXIT=0`, above), the presence of the built artifact, and the debug defines baked into the compile database.
+
+**COMMAND (stable check — the built artifact exists):**
+```bash
+test -f kitty/fast_data_types.so && echo "present, size=$(stat -c %s kitty/fast_data_types.so) bytes"
+```
+
+**OUTPUT:**
+```text
+present, size=6285328 bytes
+```
+
+The third stable check — that `kitty/child-monitor.c` is compiled with the event-loop/debug defines — was read directly from the build database:
 
 **COMMAND:**
 ```bash
@@ -360,12 +387,67 @@ The mirror case: the child dies and its death is delivered to Python as `on_chil
             return
 ```
 
-**Is this `pop → None` branch actually taken in the churn run?** This is a *source-verified conflict path*, and to report honestly I instrumented it directly rather than inferring it from exit status. Using a temporary `usercustomize.py` (injected via `PYTHONPATH`, outside the repository) I wrapped `Boss.on_child_death` to record, for every death, whether the window id was still present in `window_id_map` *before* the `pop` (present) or already gone (would make `pop` return `None`, i.e. absent):
+**Is this `pop → None` branch actually taken in the churn run?** This is a *source-verified conflict path*, and to report honestly I instrumented it directly rather than inferring it from exit status. Using a temporary `usercustomize.py` (injected via `PYTHONPATH`, outside the repository) I wrapped `Boss.on_child_death` to record, for every death, whether the window id was still present in `window_id_map` *before* the `pop` (present) or already gone (would make `pop` return `None`, i.e. absent). The full wrapper source is shown first, then the exact command that produced the counts:
+
+**SOURCE — `/tmp/blitzy_obs/inject/usercustomize.py` (temporary instrumentation, outside the repository, removed afterward):**
+```python
+# Temporary observation instrumentation (outside the repository).
+# Python's `site` module auto-imports `usercustomize` at interpreter startup
+# whenever this directory is on PYTHONPATH. To let it `import kitty` at that
+# early point, the repository root must ALSO be on PYTHONPATH.
+# It wraps Boss.on_child_death to record, for every child death, whether the
+# window id was still present in window_id_map *before* the pop(window_id, None).
+import sys
+try:
+    from kitty.boss import Boss
+    _orig = Boss.on_child_death
+    _state = {"calls": 0, "present": 0, "absent": 0}
+
+    def _patched(self, window_id):
+        _state["calls"] += 1
+        present = window_id in self.window_id_map          # checked BEFORE the pop
+        _state["present" if present else "absent"] += 1
+        sys.stderr.write(
+            "[OBS] on_child_death(window_id=%d) %s calls=%d present=%d absent=%d\n"
+            % (window_id, "PRESENT" if present else "ABSENT",
+               _state["calls"], _state["present"], _state["absent"]))
+        sys.stderr.flush()
+        return _orig(self, window_id)                      # delegate to the real method
+
+    Boss.on_child_death = _patched
+    sys.stderr.write("[OBS-INJECT] patched Boss.on_child_death OK\n")
+    sys.stderr.flush()
+except Exception as e:
+    sys.stderr.write("[OBS-INJECT] patch failed: %r\n" % (e,))
+    sys.stderr.flush()
+```
+
+Because `usercustomize.py` is auto-imported during interpreter start-up — *before* kitty puts its own package directory on `sys.path` — the **repository root must be on `PYTHONPATH` alongside the inject directory** so that `from kitty.boss import Boss` resolves at that early point. Concretely, `PYTHONPATH=/tmp/blitzy_obs/inject:$PWD` (with `$PWD` = the repository root). If the repo root is omitted, the wrapper cannot import kitty and prints — verbatim — a patch-failure line and records nothing:
+
+**COMMAND (repo root omitted — reproduces the failure, shown so the path requirement is explicit):**
+```bash
+export DISPLAY=:99 TERM=xterm-kitty LANG=C.UTF-8 LC_ALL=C.UTF-8
+timeout 90 env PYTHONPATH=/tmp/blitzy_obs/inject ./kitty/launcher/kitty --config NONE \
+    --debug-rendering -o close_on_child_death=yes -o confirm_os_window_close=0 \
+    --session /tmp/blitzy_obs/session.conf > /tmp/blitzy_obs/run_broken.log 2>&1
+grep -F '[OBS-INJECT]' /tmp/blitzy_obs/run_broken.log
+echo "on_child_death calls    : $(grep -cF '[OBS] on_child_death' /tmp/blitzy_obs/run_broken.log)"
+```
+
+**OUTPUT:**
+```text
+[OBS-INJECT] patch failed: ModuleNotFoundError("No module named 'kitty'")
+on_child_death calls    : 0
+```
+
+Adding the repo root (`:$PWD`) fixes it. The working command and its counts:
 
 **COMMAND:**
 ```bash
-# usercustomize.py wraps Boss.on_child_death: present = (window_id in self.window_id_map) before pop
-timeout 90 env PYTHONPATH=/tmp/blitzy_obs/inject ./kitty/launcher/kitty --config NONE \
+export DISPLAY=:99 TERM=xterm-kitty LANG=C.UTF-8 LC_ALL=C.UTF-8
+# usercustomize.py (above) wraps Boss.on_child_death: present = (window_id in self.window_id_map) before pop.
+# PYTHONPATH lists the inject dir AND the repo root ($PWD) so usercustomize can `import kitty` at startup.
+timeout 90 env PYTHONPATH=/tmp/blitzy_obs/inject:$PWD ./kitty/launcher/kitty --config NONE \
     --debug-rendering -o close_on_child_death=yes -o confirm_os_window_close=0 \
     --session /tmp/blitzy_obs/session.conf > /tmp/blitzy_obs/run_instrumented.log 2>&1
 echo "on_child_death calls    : $(grep -cF '[OBS] on_child_death' /tmp/blitzy_obs/run_instrumented.log)"
@@ -380,15 +462,23 @@ PRESENT                 : 20
 ABSENT (pop returns None): 0
 ```
 
-Representative per-death records (verbatim `[OBS]` lines; `grep -oE '\[OBS\] on_child_death.*'` strips interleaved stderr):
+Representative per-death records — the injection banner plus the 1st, 10th, and 20th death (verbatim; `sed -n '1p;10p;20p'` selects three of the twenty `[OBS]` lines, which are written to stderr and interleaved into the log):
+
+**COMMAND:**
+```bash
+grep -F '[OBS-INJECT] patched' /tmp/blitzy_obs/run_instrumented.log
+grep -oE '\[OBS\] on_child_death.*' /tmp/blitzy_obs/run_instrumented.log | sed -n '1p;10p;20p'
+```
 
 **OUTPUT:**
 ```text
 [OBS-INJECT] patched Boss.on_child_death OK
 [OBS] on_child_death(window_id=3) PRESENT calls=1 present=1 absent=0
-[OBS] on_child_death(window_id=8) PRESENT calls=10 present=10 absent=0
+[OBS] on_child_death(window_id=5) PRESENT calls=10 present=10 absent=0
 [OBS] on_child_death(window_id=20) PRESENT calls=20 present=20 absent=0
 ```
+
+(The specific window ids at a given call index are scheduling-dependent across runs; the invariant that matters — and that reproduces every run — is `calls=20`, `present=20`, `absent=0`.)
 
 So in **this** run all **20** deaths found the window still present, and `pop` returned the window every time — the `pop → None` branch was **not directly exercised** by this churn (`ABSENT = 0`). That is the honest, observed result: the discard branch is a **source-verified conflict path** that guards against a death arriving for an already-removed window (a double-notify or a manual close racing the reap), but the specific ordering that yields `None` did not occur in the captured run. What the run *does* confirm is that the surrounding teardown is benign: the process reached `main loop exiting` and exited with status `0` (quoted in O5), with no traceback from any death/removal interleaving.
 
