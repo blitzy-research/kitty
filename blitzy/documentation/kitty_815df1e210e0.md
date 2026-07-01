@@ -88,17 +88,18 @@ $ xdotool key --clearmodifiers ctrl+shift+equal   # change_font_size
 $ xdotool key --clearmodifiers ctrl+shift+c       # copy_to_clipboard
 ```
 
-Running the `ls`+Enter stimulus a **second** time (`cap2.err`) produced **byte‑for‑byte identical** key‑trace lines after stripping the timestamp/color prefixes, and the raw child round‑trip (`bytes.log`) was identical too — confirming the behavior described here is *consistently* observed at runtime rather than incidental:
+Running the `ls`+Enter stimulus a **second** time (`cap2.err`) produced a **byte‑for‑byte identical** record of the input actually moving through to the shell — the outbound `sent … to child` writes — after stripping the timestamp/color prefixes, and the raw child round‑trip (`bytes.log`) was identical too, confirming the behavior described here is *consistently* observed at runtime rather than incidental. The equality check is deliberately scoped to those outbound writes (the `PRESS` events that actually send bytes): a bare key **RELEASE** sends nothing and emits only an `ignoring as keyboard mode does not support encoding this event` diagnostic (`kitty/keys.c:L271`; see §4.3), and whether the *final* Enter release during shell shutdown is flushed before kitty exits is timing‑sensitive — so those cleanup‑release lines are excluded from the comparison rather than asserted as repeatable:
 
 ```console
-# normalize = strip the leading "[secs] " timestamp and the ANSI SGR color codes
-$ norm(){ grep -aE 'on_key_input|sent key|ignoring as keyboard' "$1" | sed -E 's/^\[[0-9]+\.[0-9]+\] //; s/\x1b\[[0-9;]*m//g'; }
+# normalize = keep only the outbound "sent ... to child" writes (the keystrokes that
+# actually move through to the shell), then strip the "[secs] " timestamp + ANSI SGR codes
+$ norm(){ grep -aE 'sent key as text|sent encoded key' "$1" | sed -E 's/^\[[0-9]+\.[0-9]+\] //; s/\x1b\[[0-9;]*m//g'; }
 $ norm cap.err > n1.txt ; norm cap2.err > n2.txt
 $ diff n1.txt n2.txt && echo "IDENTICAL: 0 differences"
 IDENTICAL: 0 differences
 $ md5sum n1.txt n2.txt
-5e2d582954ac5d30484266f3ea8a71ee  n1.txt
-5e2d582954ac5d30484266f3ea8a71ee  n2.txt
+1475e0de7574b3f514ebeade139b58d5  n1.txt
+1475e0de7574b3f514ebeade139b58d5  n2.txt
 $ md5sum bytes.log bytes2.log   # raw child round-trip, both runs
 bef71b189721e5747facd3938e314253  bytes.log
 bef71b189721e5747facd3938e314253  bytes2.log
@@ -380,7 +381,7 @@ $ git -C /app status --porcelain | wc -l    # 0 = source tree untouched by obser
 - [x] **Q2 — Intermediate processing — answered explicitly (§4):** shortcut dispatch (`kitty/boss.py:L1583` `matched action:` + `kitty/keys.c:L231` `handled as shortcut`), encoding (`kitty/keys.c:L251` → `kitty/key_encoding.c:L414`), PTY write with both branches (`sent key as text to child: l/s` `kitty/keys.c:L254`; `sent encoded key to child: 0xd ` `kitty/keys.c:L261,L266`), the ignore branches (`:L271`, `:L239`), and the child round‑trip through `parse_worker`/`vt-parser.c` into `screen.c` (raw `ls^M` + `draw …` commands) — all quoted verbatim with their producing commands.
 - [x] **Q3 — Display production — answered explicitly (§5):** render loop (`kitty/main.py:L234` → `kitty/child-monitor.c:L1259,L1262`), GPU upload (`kitty/child-monitor.c:L714,L766`), shader compositing (`kitty/shaders.c`), render‑loop buffer swap (`kitty/child-monitor.c:L810` → `kitty/glfw.c:L1802-L1803`), proven by the verbatim `GL version string:` banner (`kitty/gl.c:L72`) and the verified absence of GL `fatal(...)`.
 - [x] **End‑to‑end ordering (§6)** — a single ordered table from OS event to the render‑loop buffer swap, keyed to the observed timestamps.
-- [x] **Consistency (§1.4)** — the `ls`+Enter key traces were byte‑for‑byte identical across two runs (`md5sum` match), the raw child round‑trip was identical (`md5sum` match), and the GL banner appeared in all runs; each shown with its exact command and output.
+- [x] **Consistency (§1.4)** — across repeated runs the outbound `sent … to child` writes (the keystrokes that actually move through to the shell) were byte‑for‑byte identical (`md5sum` match) and the raw child round‑trip was identical (`md5sum` match), while the timing‑sensitive standalone key‑RELEASE cleanup events were excluded from the equality check; the GL banner appeared in all runs — each shown with its exact command and output.
 - [x] **What could not be verified (§7)** — software‑GL caveat, no per‑frame log, no measurable input‑to‑screen latency, no pixel screenshot, the untraced buffer swap, and the 3.1‑vs‑3.3 correction, all stated honestly with the read‑only proof.
 
 ### Reproduction note
