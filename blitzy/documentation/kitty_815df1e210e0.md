@@ -79,8 +79,8 @@ flowchart TD
     RS --> CD[Build connection_data struct L171-189]
     CD --> CSA[connection_sharing_args L121-145<br/>ControlMaster=auto, ControlPath, ControlPersist]
     CSA --> CHK{ssh -O check<br/>master alive? L658-659}
-    CHK -- yes --> PIGGY[Piggyback: skip data request L663-664]
-    CHK -- no --> FRESH[Fresh connect: request data]
+    CHK -- yes --> PIGGY[Piggyback L663-664: reuse master socket,<br/>REQUEST_DATA=0 so remote does not self-request;<br/>local kitten sends DCS request L761-770]
+    CHK -- no --> FRESH[Fresh connect: remote self-requests data]
     CD --> TAR[make_tarfile L255-366<br/>gzip+tar: shell-integration, terminfo, data.sh]
     TAR --> BS[bootstrap_script L422-484<br/>shm.CreateTemp 0600 + TokenHex password]
     BS --> WRAP[wrap_bootstrap_script L486-509<br/>sh: VT/FF/CR/BS subst; py: base64]
@@ -148,13 +148,34 @@ equals the current window's `KITTY_PID-KITTY_WINDOW_ID`. The Go reader side
 `read_data_from_shared_memory` (`kittens/ssh/main.go:72-85`) reads via
 `shm.ReadWithSizeAndUnlink` — **read-once-and-unlink**.
 
-**Rationale (why shared memory).** A process's command line (`argv`) and environment are
-world-readable via `/proc/<pid>/cmdline` and `/proc/<pid>/environ` on Linux, so putting the
-password there would leak it to any local user. Shared memory on the `/dev/shm` tmpfs keeps
-the secret in owner-only (`0600`) kernel-backed memory: only the filename travels to the
-remote, and the actual secret bytes never leave the local machine and never touch the network.
-This is the same reason the askpass helper reuses the mechanism —
-`shm.CreateTemp("askpass-*", ...)` at `kittens/ssh/askpass.go:55`. See the
+**Rationale — what shared memory actually protects (and what still crosses to the remote).**
+The precise security boundary matters here. Shared memory secures the **local handoff** — from
+the local kitten process to the local kitty terminal — *not* the local↔remote channel. Its job
+is to keep the bulk payload (the base64 tarball) and the data password out of the local kitten's
+command line and environment, where *other local users* might observe them: a process's `argv`
+is exposed to other local users through `/proc/<pid>/cmdline` (world-readable by default on
+Linux), so passing the tarball or password as command-line arguments would leak them to any
+local user. (This is a *local-observability* concern, not a blanket guarantee: `/proc/<pid>/environ`
+is normally readable only by the process owner, and `/proc` can be further restricted via the
+`hidepid` mount option — so the environment is less exposed than `argv`, but the kitten avoids
+both.) The secret therefore lives in an owner-only (`0600`) `/dev/shm` object that only the local
+kitty terminal reads — once — before it serves the data.
+
+It is important **not** to overstate this: the exchange is not filename-only, and the secret
+bytes do cross to the remote. When data is requested, the three identifiers `REQUEST_ID`,
+`DATA_PASSWORD`, and `PASSWORD_FILENAME` (`kittens/ssh/main.go:460`) are substituted into the
+bootstrap script itself (`kittens/ssh/main.go:475-478`) and travel to the remote inside the
+(SSH-encrypted) bootstrap; the remote then echoes them back to the local terminal in the DCS
+request payload (`shell-integration/ssh/bootstrap.sh:92-95`, esp. `:94`). And the bulk payload
+is deliberately transmitted to the remote too: after the local kitty validates the shm object's
+ownership, permissions, password, and request id, `get_ssh_data` streams the base64 tarball to
+the remote in 254-byte chunks (`kittens/ssh/utils.py:138-148`) via `handle_remote_ssh` →
+`write_to_child` (`kitty/window.py:1291-1292`), over the SSH/TTY flow. The data password is thus
+best understood as a **capability token guarding the shm handoff**: it is sent to the remote
+(under SSH encryption) precisely so the remote can prove, back to the local terminal, that it is
+the legitimate bootstrap before the terminal releases the payload — see
+[Q8](#q8--the-shared-memory-security-model). The askpass helper reuses the same shared-memory
+mechanism — `shm.CreateTemp("askpass-*", ...)` at `kittens/ssh/askpass.go:55`. See the
 [Background](#background-external-concepts) note on POSIX `shm_open` for the external framing.
 
 
@@ -285,7 +306,7 @@ struct, `connection_data`, defined at `kittens/ssh/main.go:171-189`. It is popul
 | `hostname_for_match` | `string` | The hostname used to match `Host`/`Match` blocks when resolving options. |
 | `username` | `string` | The remote username. |
 | `echo_on` | `bool` | Whether terminal echo should be on; substituted into the bootstrap as `ECHO_ON`. |
-| `request_data` | `bool` | Whether this connection must request the data payload (false when piggybacking on a live master — see [Q5](#q5--how-the-kitten-decides-fresh-vs-piggyback-ssh-controlmaster-multiplexing)); substituted as `REQUEST_DATA`. |
+| `request_data` | `bool` | Whether the *remote* bootstrap should issue the data request itself (substituted as `REQUEST_DATA`). Set false when piggybacking on a live master (`kittens/ssh/main.go:663-664`) or when kitty's native askpass is in use (`kittens/ssh/main.go:156`); when false, the *local* kitten issues the DCS request instead (`kittens/ssh/main.go:761-770`). Either way the bootstrap is still generated, sent, and executed. See [Q5](#q5--how-the-kitten-decides-fresh-vs-piggyback-ssh-controlmaster-multiplexing). |
 | `literal_env` | `map[string]string` | Environment variables to set literally on the remote. |
 | `listen_on` | `string` | The remote-control listen address (for `forward_remote_control`). |
 | `test_script` | `string` | An optional test hook injected as `TEST_SCRIPT` (used by the integration tests). |
@@ -314,8 +335,15 @@ options, generated artifacts, shm name, and request id.
 
 **Answer.** The kitten enables OpenSSH connection multiplexing, then probes whether a master
 connection is already alive with `ssh -O check`. If a master is alive **and** connection
-sharing is enabled, it **skips the data request** and piggybacks on the existing connection;
-otherwise it makes a fresh connection and requests the data.
+sharing is enabled, it piggybacks on the existing connection by setting `request_data = false`,
+which reuses the already-authenticated master socket (skipping a fresh
+TCP/key-exchange/authentication handshake) and disables only the *remote-side* data request
+(`REQUEST_DATA=0`). Otherwise it makes a fresh connection in which the remote bootstrap issues
+the request itself. Crucially, piggybacking does **not** skip installing the integration:
+either way the bootstrap is still generated, encoded, sent, and executed, and the
+shell-integration data is still transferred for this session — the only difference is that when
+piggybacking, the *local kitten* issues the DCS data request instead of the remote
+(`kittens/ssh/main.go:761-770`).
 
 **The sharing options (`connection_sharing_args`, `kittens/ssh/main.go:121-145`).** It emits
 exactly these six `-o` options:
@@ -356,16 +384,28 @@ if need_to_request_data && host_opts.Share_connections && master_is_functional()
 ```
 
 at `kittens/ssh/main.go:663-664`. So when a master is alive and `Share_connections` is on, the
-kitten sets `need_to_request_data = false` — it will **not** re-send the bootstrap/data,
-because the previous (master) connection already installed everything on the remote.
+kitten sets `need_to_request_data = false`, which becomes `cd.request_data = false`
+(`kittens/ssh/main.go:724`). This does **not** skip the bootstrap or the data transfer. `run_ssh`
+still calls `get_remote_command(&cd)` (`kittens/ssh/main.go:749`), still appends the wrapped
+bootstrap `cd.rcmd` to the ssh command (`kittens/ssh/main.go:753`), and still starts the ssh
+child (`kittens/ssh/main.go:754-756`); and the remote bootstrap still calls `get_data`
+unconditionally (`shell-integration/ssh/bootstrap.sh:155`). What `request_data = false` changes
+is *who initiates the request*: it sets `REQUEST_DATA=0` so the **remote** bootstrap does not
+self-issue the DCS request (guarded by `[ "$request_data" = "1" ]`,
+`shell-integration/ssh/bootstrap.sh:92-95`), and instead the **local kitten** writes the DCS
+request `id=…:pwfile=…:pw=…` to the controlling TTY itself via `tui.DCSToKitty("ssh", rq)`
+(`kittens/ssh/main.go:761-770`).
 
 **Rationale.** With multiplexing, the *first* connection pays the full cost (TCP handshake,
 key exchange, authentication) and becomes the master; subsequent sessions reuse the master's
-socket and skip both the crypto handshake *and* the (already-completed) shell-integration
-bootstrap. Re-installing the integration on every multiplexed session would be wasteful and
-would re-run the whole DCS data exchange for nothing, so the kitten deliberately short-circuits
-it. See the [Background](#background-external-concepts) note on `ControlMaster` for the
-external framing of `auto`, `ControlPersist`, and `ssh -O check`.
+socket and skip *that* setup. What multiplexing changes for the kitten is narrower than
+skipping the bootstrap: the bootstrap is still generated, encoded, sent, and executed on every
+session, and the shell-integration data is still transferred each time. The single behavioral
+change is that `REQUEST_DATA=0` moves the DCS data request from the remote bootstrap to the
+local kitten (`kittens/ssh/main.go:761-770`) — which the local terminal is well-placed to send
+directly since it is already driving the controlling TTY. See the
+[Background](#background-external-concepts) note on `ControlMaster` for the external framing of
+`auto`, `ControlPersist`, and `ssh -O check`.
 
 
 ---
@@ -463,7 +503,9 @@ This ties the previous answers together. The orchestrator is `run_ssh`
 2. **Connection sharing.** If `Share_connections` is on, it appends the multiplexing options
    from `connection_sharing_args` (`kittens/ssh/main.go:121-145`) and probes for a live master
    with `ssh -O check` (`kittens/ssh/main.go:658-659`). If a master is alive it sets
-   `need_to_request_data = false` (`kittens/ssh/main.go:663-664`, see
+   `need_to_request_data = false` (`kittens/ssh/main.go:663-664`) — which disables only the
+   remote-side data request; the bootstrap is still generated, sent, and executed, and the local
+   kitten drives the data request itself (see
    [Q5](#q5--how-the-kitten-decides-fresh-vs-piggyback-ssh-controlmaster-multiplexing)).
 3. **Archive.** `make_tarfile` (`kittens/ssh/main.go:255-366`) builds the in-memory
    gzip+tar(PAX) archive of the shell-integration tree, terminfo, `data.sh`, and (optionally)
@@ -477,21 +519,27 @@ This ties the previous answers together. The orchestrator is `run_ssh`
 5. **Encoding.** `wrap_bootstrap_script` (`kittens/ssh/main.go:486-509`) encodes the script for
    the target interpreter (control-character substitution for `sh`, base64 for `py`) and sets
    `cd.rcmd` (see [Q6](#q6--how-the-bootstrap-is-encoded-with-per-interpreter-character-substitutions-posix-sh-vs-python)).
-   This happens inside `get_remote_command` (`kittens/ssh/main.go:749`).
+   Both steps run inside the `get_remote_command` function (defined at
+   `kittens/ssh/main.go:511-525`), which `run_ssh` invokes at its call site
+   `kittens/ssh/main.go:749`.
 6. **Spawn over the controlling TTY.** `run_ssh` opens the controlling terminal with
    `tty.OpenControllingTerm(tty.SetNoEcho)` (`kittens/ssh/main.go:718`), appends `cd.rcmd` to
    the ssh command (`kittens/ssh/main.go:753`), and starts the ssh child
    (`exec.Command(...).Start()`, ~`kittens/ssh/main.go:754-756`). In the piggyback case
-   (`!cd.request_data`), the *local* kitten itself writes the DCS request
-   `id=…:pwfile=…:pw=…` to the TTY via `tui.DCSToKitty("ssh", rq)`
-   (`kittens/ssh/main.go:761-766`) after setting no-echo — the local counterpart to the
-   request the (already-bootstrapped) remote will not send.
+   (`!cd.request_data`, i.e. reusing a live master), the *local* kitten itself writes the DCS
+   request `id=…:pwfile=…:pw=…` to the TTY via `tui.DCSToKitty("ssh", rq)`
+   (`kittens/ssh/main.go:761-770`) after setting no-echo — because `REQUEST_DATA=0` tells the
+   (still-generated, still-executed) remote bootstrap not to issue that request itself.
 7. **Remote executes the bootstrap.** On the remote, `sshd` runs
    `exec <interpreter> -c <unwrap_script> <encoded_script>`, which decodes and runs
    `bootstrap.sh` or `bootstrap.py`.
-8. **Remote requests data.** The remote frames a DCS request to the *local* kitty terminal:
-   `dcs_to_kitty "ssh" "id=…:pwfile=…:pw=…"` (`shell-integration/ssh/bootstrap.sh:94`, see
-   [Q9](#q9--the-terminal--remote-dcs-requestresponse-handshake-over-the-controlling-tty)).
+8. **Data request.** In the fresh-connection case (`REQUEST_DATA=1`) the remote frames this DCS
+   request to the *local* kitty terminal: `dcs_to_kitty "ssh" "id=…:pwfile=…:pw=…"`
+   (`shell-integration/ssh/bootstrap.sh:92-95`, esp. `:94`). In the piggyback case
+   (`REQUEST_DATA=0`) the identical request is issued by the local kitten instead (step 6), while
+   `get_data` still runs on the remote unconditionally
+   (`shell-integration/ssh/bootstrap.sh:155`). See
+   [Q9](#q9--the-terminal--remote-dcs-requestresponse-handshake-over-the-controlling-tty).
 9. **Local kitty serves.** kitty parses the DCS and calls `handle_remote_ssh`
    (`kitty/window.py:1289`), which imports and iterates `get_ssh_data`
    (`kittens/ssh/utils.py:115-148`): it reads the shm object, re-validates ownership and
@@ -594,7 +642,12 @@ via `shm.ReadWithSizeAndUnlink` (`kittens/ssh/main.go:73`) and the Python side v
 `shm.unlink()` (`kittens/ssh/utils.py:106`). After the first successful read, the name no longer
 exists, so a replay or a second reader cannot obtain the secret.
 
-**Rationale.** Each layer defends a different threat: `0600` + owner check stops another local
+**Rationale.** These mechanisms secure the **local** handoff of the payload from the kitten to
+the kitty terminal against *other local users*; they do not (and are not meant to) protect the
+local↔remote channel — that is SSH's job, and the tarball is deliberately streamed to the remote
+after validation, while the data password is sent to the remote as a capability token (see
+[Q1](#q1--how-shared-memory-passes-the-credentials-data-password--request-id-securely-between-the-local-kitten-and-the-local-kitty-terminal)).
+Within that local boundary, each layer defends a different threat: `0600` + owner check stops another local
 user from reading the payload even if they guess the name; the random name makes guessing
 impractical; `O_EXCL` prevents a pre-created/symlink-style attack; the password + request-id
 handshake ensures the request genuinely corresponds to *this* connection and *this* window; and
@@ -704,8 +757,13 @@ These are supporting mechanisms referenced by the flow above, included for compl
   `copy_cli_generated.go`) are build artifacts produced by code generation, not
   hand-written behavioral code; they are mentioned only for completeness.
 - **`tools/crypto/crypto.go`** provides the curve25519 + base85 encryption used for the
-  *remote-control* command path and the askpass relay (e.g. `b85_decode`, `Encrypt_cmd`); it
-  is distinct from the SSH data password, which is `secrets.TokenHex()`
+  *remote-control* command path (e.g. `Encrypt_cmd` for a `utils.RemoteControlCmd` at
+  `tools/crypto/crypto.go:117`, and the `b85_encode`/`b85_decode` codec at
+  `tools/crypto/crypto.go:47`/`:52`). It is **not** used by the SSH askpass relay: askpass
+  instead uses **shared memory** — the kitten side creates `shm.CreateTemp("askpass-*", ...)`
+  (`kittens/ssh/askpass.go:55`) and the local kitty answers via `handle_remote_askpass`, which
+  opens a `SharedMemory` object (`kitty/window.py:1351-1379`). `tools/crypto` is likewise
+  distinct from the SSH data password, which is `secrets.TokenHex()`
   (`tools/utils/secrets/tokens.go:28`). The base85 codec pairs with the local
   `handle_kitten_result`, which does `base64.b85decode(msg)` (`kitty/window.py:1296`).
 
@@ -850,8 +908,12 @@ and subsequent sessions reuse the established socket and skip that setup. `ssh -
 queries an existing master and succeeds only if one is running. This is exactly what the kitten
 leans on in [Q5](#q5--how-the-kitten-decides-fresh-vs-piggyback-ssh-controlmaster-multiplexing):
 it enables `ControlMaster=auto` with `ControlPersist=yes`, then uses `ssh -O check` to decide
-whether it can piggyback on an already-authenticated master and skip re-installing the
-bootstrap.
+whether it can piggyback on an already-authenticated master. Note that within the kitten,
+piggybacking reuses the master socket (skipping the network/authentication handshake) and
+disables only the *remote-side* data request (`REQUEST_DATA=0`); it does **not** skip
+generating, sending, or executing the bootstrap, and the shell-integration data is still
+transferred — the local kitten simply drives the DCS data request itself in that case (as
+detailed in Q5).
 
 **POSIX shared memory (`shm_open(3)`).** On Linux, POSIX shared-memory objects are implemented
 as files on a dedicated `tmpfs` filesystem normally mounted at `/dev/shm`, so the ordinary
