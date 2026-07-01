@@ -24,11 +24,11 @@ All evidence was gathered inside the user-specified container, on branch `blitzy
 Driving a live terminal UI headlessly was done with a virtual display (**Xvfb**) plus kitty's own **remote control** (`kitty @ send-key` / `kitty @ get-text`); `get-text --extent screen` returns the *verbatim rendered text* of the kitten's screens, which is the authoritative evidence for a TUI.
 
 ```console
-$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe   # headless GL via Xvfb + llvmpipe
-$ export KITTY_CONFIG_DIRECTORY=$(mktemp -d)                            # isolated, disposable config dir
+$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe        # headless GL via Xvfb + llvmpipe
+$ export KITTY_CONFIG_DIRECTORY=$(mktemp -d /tmp/cf_investigation/kitty_conf.XXXXXX)   # isolated, disposable
 $ echo "$KITTY_CONFIG_DIRECTORY"
-/tmp/cf_investigation/kitty_conf.R0ovm0
-$ ls -la "$KITTY_CONFIG_DIRECTORY"                                      # BEFORE baseline: empty, no kitty.conf
+/tmp/cf_investigation/kitty_conf.L5Nn9o
+$ ls -la "$KITTY_CONFIG_DIRECTORY"                                          # BEFORE baseline: empty, no kitty.conf
 total 8
 drwx------ 2 root root 4096 .
 drwxr-xr-x 3 root root 4096 ..
@@ -72,7 +72,22 @@ kitty's build system is `python3 setup.py`; the developer wrapper `dev.sh` deleg
 exec go run bypy/devenv.go "$@"
 ```
 
-In this environment the build had already been produced by the setup step (`./dev.sh build --ignore-compiler-warnings`), yielding the two runnable executables `kitty/launcher/kitty` and `kitty/launcher/kitten`. Validation that the build is runnable:
+The build was run for this checkout with kitty's own supported flag `--ignore-compiler-warnings` (required on Ubuntu 25.10, where a newer `wayland-protocols` adds enum values the vendored `glfw` switch does not yet handle while `setup.py` bakes in `-Werror`; no source is modified). The exact command and its **complete** captured output follow — this run was incremental, so only the one changed C translation unit was recompiled and relinked before the success line (the trailing `...` after `Compiling` is kitty's own progress text, not an elision):
+
+```console
+$ export PATH=$PATH:/usr/local/go/bin GOPATH=$HOME/go CI=true
+$ ./dev.sh build --ignore-compiler-warnings
+[1/1] Compiling kitty/data-types.c ...
+ done
+[1/1] Linking kitty/fast_data_types ...
+ done
+kitty/tools/cmd
+Build successful. Run kitty as: kitty/launcher/kitty
+$ echo "exit=$?"
+exit=0
+```
+
+The build exited `0` with the final line **`Build successful. Run kitty as: kitty/launcher/kitty`**, producing the two runnable executables `kitty/launcher/kitty` and `kitty/launcher/kitten`. Validation that the resulting launcher runs:
 
 ```console
 $ kitty/launcher/kitty --version
@@ -89,7 +104,19 @@ in sequence, which are merged. Use the special value :code:`NONE` to not load
 any config file.
 ```
 
-The exact launch command used (backed by Xvfb, remote control enabled so the kitten can be driven, and the isolated config dir exported):
+Because the host is headless, the Graphics-Protocol preview is backed by a virtual display (**Xvfb**). Xvfb was started and confirmed running *before* launching kitty:
+
+```console
+$ nohup Xvfb :99 -screen 0 1920x1080x24 -ac >/tmp/cf_investigation/xvfb.log 2>&1 &
+$ ps -eo pid,args | grep '[X]vfb :99'
+ 106134 Xvfb :99 -screen 0 1920x1080x24 -ac
+$ DISPLAY=:99 xdpyinfo | head -3
+name of display:    :99
+version number:    11.0
+vendor string:    The X.Org Foundation
+```
+
+The `ps` line proves the Xvfb process (pid `106134`) is running on display `:99`, and `xdpyinfo` proves that display answers. The single kitty instance was then launched with `--config NONE` (default settings), remote control enabled so the kitten can be driven, and the isolated config dir exported:
 
 ```console
 $ kitty --config NONE -o allow_remote_control=yes \
@@ -97,17 +124,25 @@ $ kitty --config NONE -o allow_remote_control=yes \
         /bin/bash --norc --noprofile &
 ```
 
-Confirmation that a single instance is up, running with the isolated config dir, and its process id (the reload-signal target used later):
+Confirmation that **exactly one** OS window/instance is up — the `kitty @ ls` reply is a JSON array whose length is the OS-window count:
 
 ```console
-$ kitty @ --to unix:/tmp/cf_investigation/kitty.sock ls | ...   # window env
-KITTY_PID= 67706
-KITTY_CONFIG_DIRECTORY= /tmp/cf_investigation/kitty_conf.R0ovm0
-KITTY_WINDOW_ID= 1
+$ kitty @ --to unix:/tmp/cf_investigation/kitty.sock ls | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))'
+1
 ```
 
-- **`KITTY_PID = 67706`** — the process id of this default instance; it is the target of the live-reload signal in §7.
-- **`KITTY_CONFIG_DIRECTORY = /tmp/cf_investigation/kitty_conf.R0ovm0`** — the isolated dir is inherited by the window, so any `kitty.conf` written by the kitten lands here.
+The window's environment — read verbatim from that same `kitty @ ls` reply — carries the isolated config dir and the instance's process id (the reload-signal target used later):
+
+```console
+$ kitty @ --to unix:/tmp/cf_investigation/kitty.sock ls \
+    | python3 -c 'import sys,json; e=json.load(sys.stdin)[0]["tabs"][0]["windows"][0]["env"]; [print(f"{k} = {e[k]}") for k in ("KITTY_PID","KITTY_CONFIG_DIRECTORY","KITTY_WINDOW_ID")]'
+KITTY_PID = 106407
+KITTY_CONFIG_DIRECTORY = /tmp/cf_investigation/kitty_conf.L5Nn9o
+KITTY_WINDOW_ID = 1
+```
+
+- **`KITTY_PID = 106407`** — the process id of this default instance; it is the target of the live-reload signal in §7.
+- **`KITTY_CONFIG_DIRECTORY = /tmp/cf_investigation/kitty_conf.L5Nn9o`** — the isolated dir is inherited by the window, so any `kitty.conf` written by the kitten lands here.
 
 ---
 
@@ -115,28 +150,52 @@ KITTY_WINDOW_ID= 1
 
 ### 2.1 The working invocation: `kitten choose-fonts`
 
-From inside the running kitty, the kitten is invoked by running `kitten choose-fonts` (equivalently `kitty +kitten choose-fonts`). Sending that command to the window rendered the kitten's **family-listing** screen (verbatim `get-text`, abbreviated):
+From inside the running kitty, the functional way to invoke the kitten at this commit is `kitten choose-fonts` — the Go binary directly. It is **not** equivalent to `kitty +kitten choose-fonts`: at commit `815df1e21` that `+kitten` form is a **no-op** (it produces no output and does not launch the kitten, because `kittens/choose_fonts/main.py` is empty and `choose_fonts` is not a wrapped kitten). That contrast is proven with its own runtime evidence in §2.2; this section documents the working `kitten choose-fonts` path.
+
+**Claim: invoking `kitten choose-fonts` renders the family-listing screen.** The command was sent to the window, and after the font scan the rendered screen was read back with `get-text --extent screen`. The full screen (verbatim, no lines omitted; trailing spaces trimmed for readability):
 
 ```console
-$ kitty @ ... send-text --match id:1 "kitten choose-fonts\r"   # then, after the font scan:
-$ kitty @ ... get-text --match id:1 --extent screen
+$ kitty @ --to unix:/tmp/cf_investigation/kitty.sock send-text --match id:1 'kitten choose-fonts\r'
+$ kitty @ --to unix:/tmp/cf_investigation/kitty.sock get-text --match id:1 --extent screen
+```
+
+```text
  Cascadia Code         ║                DejaVu Sans Mono
- ...
->DejaVu Sans Mono      ║ Press the Enter key to choose this family
- ...
+ Cascadia Code NF      ║
+ Cascadia Code PL      ║ Styles: Bold, Bold Oblique, Book, Oblique
+ Cascadia Mono         ║
+ Cascadia Mono NF      ║ Press the Enter key to choose this family
+ Cascadia Mono PL      ║
+ Comfy Code            ║ ────────────────── preview ──────────────────
+>DejaVu Sans Mono      ║
+ Fantasque Sans Mono   ║
+ Fira Code             ║
+ Hack                  ║
+ IBM Plex Mono         ║
+ Inconsolata           ║
+ JetBrains Mono        ║
+ JetBrains Mono NL     ║
+ Liberation Mono       ║
+ Noto Mono             ║
+ Noto Sans SignWriting ║
+ Source Code Pro       ║
+ SourceCodeVF          ║
+ Ubuntu Mono           ║
 Family:
 ```
 
-Inside kitty, `kitten` resolves to the **Go** executable in kitty's own `bin` directory (confirmed by `command -v` and `file`):
+The left column is the searchable family list (`>DejaVu Sans Mono` marks the current selection); the right pane previews the highlighted family and shows `Press the Enter key to choose this family`. The bottom `Family:` line is the incremental filter input.
+
+**Claim: inside kitty, `kitten` resolves to the Go executable in kitty's own launcher directory.** Confirmed with `command -v` and `file`, both run inside the kitty window (verbatim, full paths):
 
 ```console
-$ command -v kitten           # run inside the kitty window
-/tmp/.../kitty/launcher/kitten
+$ command -v kitten
+/tmp/blitzy/kitty/blitzy-6a4af589-7e36-4e62-b3ac-bc9a794d3169_d6793b/kitty/launcher/kitten
 $ file "$(command -v kitten)"
-.../kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, ... Go BuildID=..., stripped
+/tmp/blitzy/kitty/blitzy-6a4af589-7e36-4e62-b3ac-bc9a794d3169_d6793b/kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, Go BuildID=-Bc_NsnRpPBojX_KrqzM/vheVIM4VUNPG7Ag6j7Ye/9MDtLjeqzjE9kPqmpEBi/DBbZSZMkPfE4zSBUXjVI, stripped
 ```
 
-So `choose-fonts` is a **Go kitten** compiled into the `kitten` binary — not a Python kitten. This is corroborated by the fact that the kitten's Python entry files are **empty**:
+The `file` output — `ELF 64-bit LSB executable … Go BuildID=…` — confirms `choose-fonts` is a **Go kitten** compiled into the `kitten` binary, not a Python kitten. This is corroborated by the kitten's Python entry files being **empty**:
 
 ```console
 $ wc -c kittens/choose_fonts/main.py kittens/choose_fonts/__init__.py
@@ -236,14 +295,13 @@ func EntryPoint(root *cli.Command) {
 	clone.Name = "choose_fonts"
 ```
 
-Runtime confirmation that the subcommand is registered and dispatchable (this `--help` output is reused in §4):
+Runtime confirmation that the subcommand is registered and dispatchable — `kitten choose-fonts --help` returns the subcommand's own usage header and description. These are the exact opening lines of the output; the **complete** help (the full option surface) is reproduced verbatim in §4:
 
 ```console
 $ kitten choose-fonts --help
-Usage: kitten choose-fonts
+Usage: kitten choose-fonts 
 
 Choose the fonts used in kitty
-...
 ```
 
 > **⚠️ Reported-as-observed nuance #2 — the clone alias is NOT hidden.** `kittens/choose_fonts/main.go:97` sets `clone.Hidden = false`, so the `choose_fonts` alias is **visible**, not a "hidden alias".
@@ -366,7 +424,7 @@ func (self *FontList) on_key_event(event *loop.KeyEvent) (err error) {
 			return self.handler.faces.on_enter(family)
 ```
 
-`faces.on_enter` **seeds** the `faces_settings` struct — this is the value that will ultimately be written. Its four fields, and their observed defaults, are set at `faces.go:152-155`:
+`faces.on_enter` **seeds** the `faces_settings` struct — this is the value that will ultimately be written. Its four fields, and their observed defaults, are set at `kittens/choose_fonts/faces.go:152-155`:
 
 ```go
 // kittens/choose_fonts/faces.go:14-16
@@ -428,7 +486,7 @@ The family list and preview samples are produced by a Python back-end that the G
 	k.cmd = exec.Command(exe, "+runpy", "from kittens.choose_fonts.backend import main; main()")
 ```
 
-That engine is `kittens/choose_fonts/backend.py` (uses `kitty.fonts.*` and `parse_font_spec` to list monospaced families and render samples). Supporting UI files traced during the investigation: `list.go`/`family_list.go` (browse & filter), `face.go` (per-face fine-tuning panel), `graphics.go` (Graphics-Protocol live preview), and `styles.go`/`types.go` (style helpers & shared IPC types). This IPC path produces the family data but is orthogonal to the persistence write.
+That engine is `kittens/choose_fonts/backend.py` (uses `kitty.fonts.*` and `parse_font_spec` to list monospaced families and render samples). Supporting UI files traced during the investigation: `kittens/choose_fonts/list.go`/`kittens/choose_fonts/family_list.go` (browse & filter), `kittens/choose_fonts/face.go` (per-face fine-tuning panel), `kittens/choose_fonts/graphics.go` (Graphics-Protocol live preview), and `kittens/choose_fonts/styles.go`/`kittens/choose_fonts/types.go` (style helpers & shared IPC types). This IPC path produces the family data but is orthogonal to the persistence write.
 
 ---
 
@@ -468,7 +526,7 @@ Those four legend lines are produced here:
 	)
 ```
 
-The four action lines are at `final.go:38` (`Enter`), `:40` (`Esc`), `:42` (`s`), and `:44` (`Ctrl+c`); the `s` and `Enter` lines render `kitty.conf` and `STDOUT` via the `s("italic", …)` styler, which is why the rendered screen shows the plain words `kitty.conf` and `STDOUT`.
+The four action lines are at `kittens/choose_fonts/final.go:38` (`Enter`), `:40` (`Esc`), `:42` (`s`), and `:44` (`Ctrl+c`); the `s` and `Enter` lines render `kitty.conf` and `STDOUT` via the `s("italic", …)` styler, which is why the rendered screen shows the plain words `kitty.conf` and `STDOUT`.
 
 The `Enter` legend — **"Enter to modify kitty.conf and use the new fonts"** — states the two effects proven in §7: *modify kitty.conf* (persist) and *use the new fonts* (apply to session).
 
@@ -526,7 +584,7 @@ $ test -e "$KITTY_CONFIG_DIRECTORY/kitty.conf" && echo EXISTS || echo "kitty.con
 kitty.conf ABSENT (before)
 ```
 
-**After** pressing `Enter`, kitty created a 134-byte `kitty.conf` at mode `0o644` (matching `api.go:311-313`):
+**After** pressing `Enter`, kitty created a 134-byte `kitty.conf` at mode `0o644` (matching `tools/config/api.go:311-313`):
 
 ```console
 $ ls -la "$KITTY_CONFIG_DIRECTORY"
@@ -540,7 +598,7 @@ bold_italic_font auto
 # END_KITTY_FONTS
 ```
 
-This is exactly the `serialized()` four-line payload (`final.go:63-70`) wrapped by the `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` delimiters from `api.go:330`, with values seeded at `faces.go:152-155` (`font_family family="Hack"`, the rest `auto`). After the write the kitten **exited** (the window's foreground process returned to `/bin/bash`), matching `lp.Quit(0)` at `final.go:94`.
+This is exactly the `serialized()` four-line payload (`kittens/choose_fonts/final.go:63-70`) wrapped by the `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` delimiters from `tools/config/api.go:330`, with values seeded at `kittens/choose_fonts/faces.go:152-155` (`font_family family="Hack"`, the rest `auto`). After the write the kitten **exited** (the window's foreground process returned to `/bin/bash`), matching `lp.Quit(0)` at `kittens/choose_fonts/final.go:94`.
 
 ---
 
@@ -611,7 +669,7 @@ After a successful write, the kitten signals kitty to reload, based on `opts.Rel
 				config.ReloadConfigInKitty(false)
 ```
 
-> **⚠️ Reported-as-observed nuance #1 — the `Reload_in` read is at line 87.** The `self.handler.opts.Reload_in` value is read by the `switch` at `final.go:87` (inside the `if updated {` block that begins at `final.go:86`).
+> **⚠️ Reported-as-observed nuance #1 — the `Reload_in` read is at line 87.** The `self.handler.opts.Reload_in` value is read by the `switch` at `kittens/choose_fonts/final.go:87` (inside the `if updated {` block that begins at `kittens/choose_fonts/final.go:86`).
 
 `ReloadConfigInKitty` resolves the target kitty from `KITTY_PID` and sends `SIGUSR1`:
 
@@ -625,11 +683,11 @@ func ReloadConfigInKitty(in_parent_only bool) error {
 					return p.SendSignal(unix.SIGUSR1)
 ```
 
-Running the finalization (family `Source Code Pro`) with the kitten under `strace -f -e trace=kill,tgkill` captured the **exact** signal-send syscall — the kitten sending `SIGUSR1` to the parent kitty PID `67706` (which is the `KITTY_PID` from §1.3):
+Running the finalization (family `Source Code Pro`) with the kitten under `strace -f -e trace=kill,tgkill` captured the **exact** signal-send syscall — the kitten (pid `109984`) sending `SIGUSR1` to the parent kitty PID `106407` (which is the `KITTY_PID` from §1.3):
 
 ```console
 $ grep -E "SIGUSR1" /tmp/cf_investigation/kitten_sig.log
-74782 kill(67706, SIGUSR1) = 0
+109984 kill(106407, SIGUSR1)            = 0
 ```
 
 On the receiving side, kitty's child-monitor turns `SIGUSR1` into a config reload:
@@ -640,42 +698,48 @@ On the receiving side, kitty's child-monitor turns `SIGUSR1` into a config reloa
             ss->reload_config = true;
 ```
 
-*(Note: a manual `kill -USR1 <pid>` does not appear as a strace "--- SIGUSR1 ---" delivery line on the kitty side because kitty consumes handled signals via a signalfd/self-pipe; tracing the **sender** — the kitten — is therefore the correct proof, hence `kill(67706, SIGUSR1) = 0` above.)*
+*(Note: a manual `kill -USR1 <pid>` does not appear as a strace "--- SIGUSR1 ---" delivery line on the kitty side because kitty consumes handled signals via a signalfd/self-pipe; tracing the **sender** — the kitten — is therefore the correct proof, hence `kill(106407, SIGUSR1) = 0` above.)*
 
 ### 7.4 (d) Post-restart confirmation (the definitive proof)
 
-Persistence means the choice survives a **restart**. The original `--config NONE` instance (`KITTY_PID 67706`) was quit, and kitty was relaunched **without** `--config NONE`, pointed at the **same** `KITTY_CONFIG_DIRECTORY` (so the written `kitty.conf` is loaded), with `--debug-font-fallback` to reveal which fonts it actually loaded on startup:
+Persistence means the choice survives a **restart**. The original `--config NONE` instance (`KITTY_PID 106407`) was quit, and kitty was relaunched **without** `--config NONE`, pointed at the **same** `KITTY_CONFIG_DIRECTORY` (so the written `kitty.conf` is loaded), with `--debug-font-fallback` to reveal which fonts it actually loaded on startup:
 
 ```console
-$ kill 67706          # quit original instance
+$ kill 106407          # quit original instance
 $ kitty -o allow_remote_control=yes --listen-on unix:/tmp/cf_investigation/kitty2.sock \
         --debug-font-fallback /bin/bash --norc --noprofile &
-$ grep -iE "Source Code Pro|Regular|Bold|Italic" /tmp/cf_investigation/kitty_restart.log
-[0.158] Text fonts:
-[0.158]   Normal: SourceCodePro-Regular: /root/.local/share/fonts/SourceCodePro-Regular.otf:0
-[0.158]   Bold: SourceCodePro-Semibold: /root/.local/share/fonts/SourceCodePro-Semibold.otf:0
-[0.158]   Italic: SourceCodePro-It: /root/.local/share/fonts/SourceCodePro-It.otf:0
-[0.158]   Bold-Italic: SourceCodePro-SemiboldIt: /root/.local/share/fonts/SourceCodePro-SemiboldIt.otf:0
+$ grep -iE "Text fonts:|Normal:|Bold:|Italic:|Bold-Italic:" /tmp/cf_investigation/kitty_restart.log
+[0.153] Text fonts:
+[0.153]   Normal: SourceCodePro-Regular: /root/.local/share/fonts/SourceCodePro-Regular.otf:0
+[0.153]   Bold: SourceCodePro-Semibold: /root/.local/share/fonts/SourceCodePro-Semibold.otf:0
+[0.153]   Italic: SourceCodePro-It: /root/.local/share/fonts/SourceCodePro-It.otf:0
+[0.153]   Bold-Italic: SourceCodePro-SemiboldIt: /root/.local/share/fonts/SourceCodePro-SemiboldIt.otf:0
 ```
 
 The freshly-started kitty loaded **Source Code Pro** — the family written by the kitten — on startup. This is the persisted choice being applied across a restart.
 
-The config-load pipeline (`kitty/config.py` → typed `Options` in `kitty/options/types.py`) confirms it directly. Loading the persisted file yields the written `font_family`; loading defaults (no file) yields the built-in `monospace`:
+The config-load pipeline (`kitty/config.py` → typed `Options` in `kitty/options/types.py`) confirms it directly. **Claim: loading the persisted file yields the written `font_family`.** The full, unelided `FontSpec` returned:
 
 ```console
 $ kitty +runpy "from kitty.config import load_config; print(load_config('$KITTY_CONFIG_DIRECTORY/kitty.conf').font_family)"
-FontSpec(family='Source Code Pro', ..., created_from_string='family="Source Code Pro"')
-
-$ kitty +runpy "from kitty.config import load_config; print(load_config().font_family)"
-FontSpec(system='monospace')
+FontSpec(family='Source Code Pro', style='', postscript_name='', full_name='', system='', axes=(), variable_name='', created_from_string='family="Source Code Pro"')
 ```
+
+**Claim: loading defaults (no file) yields the built-in `monospace`.** The full, unelided `FontSpec` returned:
+
+```console
+$ kitty +runpy "from kitty.config import load_config; print(load_config().font_family)"
+FontSpec(family='', style='', postscript_name='', full_name='', system='monospace', axes=(), variable_name='', created_from_string='')
+```
+
+The contrast is decisive: the persisted file produces `FontSpec(family='Source Code Pro', …)` while the no-file default produces `FontSpec(…, system='monospace', …)` — the written value is what kitty loads on startup.
 
 ### 7.5 Verdict + reasoning
 
 **Enter PERSISTS the font choice across restarts.** Reasoning, grounded in the observations above:
 
-- **Persist-to-disk:** `Enter` writes the four font settings into `kitty.conf` (`final.go:78-82` → `api.go:330,347`), the file kitty reads at startup. Proven by §7.4: after quitting and relaunching, kitty loaded the written `font_family` (`Source Code Pro`) on startup, and `load_config()` returns the persisted `FontSpec` rather than the default `monospace`. This is what makes the choice survive a restart.
-- **Apply-to-session:** `Enter` *additionally* sends `SIGUSR1` to the running kitty (`final.go:87` → `api.go:352-357`), which sets `reload_config = true` (`child-monitor.c:1373-1374`), live-applying the new fonts to the current session. Proven by §7.3: `74782 kill(67706, SIGUSR1) = 0`.
+- **Persist-to-disk:** `Enter` writes the four font settings into `kitty.conf` (`kittens/choose_fonts/final.go:78-82` → `tools/config/api.go:330,347`), the file kitty reads at startup. Proven by §7.4: after quitting and relaunching, kitty loaded the written `font_family` (`Source Code Pro`) on startup, and `load_config()` returns the persisted `FontSpec` rather than the default `monospace`. This is what makes the choice survive a restart.
+- **Apply-to-session:** `Enter` *additionally* sends `SIGUSR1` to the running kitty (`kittens/choose_fonts/final.go:87` → `tools/config/api.go:352-357`), which sets `reload_config = true` (`kitty/child-monitor.c:1373-1374`), live-applying the new fonts to the current session. Proven by §7.3: `109984 kill(106407, SIGUSR1) = 0`.
 
 These are two distinct effects; `Enter` does both. The choice is therefore **not** merely a current-session change — it is persisted to disk and reloaded on every subsequent startup.
 
@@ -719,7 +783,7 @@ $ [ "$md5_before" = "$md5_after_s" ] && echo "UNCHANGED: $(grep font_family "$KI
 UNCHANGED: font_family      family="Source Code Pro"
 ```
 
-Note the STDOUT payload is the **raw `serialized()`** output — it does **not** carry the `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` wrapper, because that wrapper is added only by `Patcher.Patch` (`api.go:330`) on the `Enter` path. The kitten then exited via `lp.Quit(0)` (`final.go:106`).
+Note the STDOUT payload is the **raw `serialized()`** output — it does **not** carry the `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` wrapper, because that wrapper is added only by `Patcher.Patch` (`tools/config/api.go:330`) on the `Enter` path. The kitten then exited via `lp.Quit(0)` (`kittens/choose_fonts/final.go:106`).
 
 ### 8.2 `Esc` — returns to face selection (no write)
 
@@ -746,7 +810,7 @@ Bold-Italic: JetBrainsMonoNL-SemiBoldItalic
 
 ### 8.3 `Ctrl+c` — aborts, "canceled by user" (no write) — reported as observed
 
-> **⚠️ Reported-as-observed correction — the source is `ui.go`, not `main.go`.** The plan expected `Ctrl+c` to hit a "Killed by signal" death-signal branch (`main.go:58-62`). The observed output was instead `Error: canceled by user`, produced by the handler's own key event:
+> **⚠️ Reported-as-observed correction — the source is `kittens/choose_fonts/ui.go`, not `kittens/choose_fonts/main.go`.** The plan expected `Ctrl+c` to hit a "Killed by signal" death-signal branch (`kittens/choose_fonts/main.go:58-62`). The observed output was instead `Error: canceled by user`, produced by the handler's own key event:
 >
 > ```go
 > // kittens/choose_fonts/ui.go:195-199
@@ -771,9 +835,9 @@ Bold-Italic: JetBrainsMonoNL-SemiBoldItalic
 | Key | Action | Writes `kitty.conf`? | Evidence |
 |-----|--------|----------------------|----------|
 | `Enter` | modify `kitty.conf` + reload | **YES** (persist + apply) | §6, §7 |
-| `s`/`S` | serialized settings → STDOUT | No | §8.1 (`final.go:101-106`) |
-| `Esc` | back to face selection | No | §8.2 (`final.go:73-76`) |
-| `Ctrl+c` | abort, "canceled by user" | No | §8.3 (`ui.go:195-199`) |
+| `s`/`S` | serialized settings → STDOUT | No | §8.1 (`kittens/choose_fonts/final.go:101-106`) |
+| `Esc` | back to face selection | No | §8.2 (`kittens/choose_fonts/final.go:73-76`) |
+| `Ctrl+c` | abort, "canceled by user" | No | §8.3 (`kittens/choose_fonts/ui.go:195-199`) |
 
 Only `Enter` writes `kitty.conf`; persistence is isolated to the `Enter` path.
 
@@ -788,22 +852,22 @@ Every named item from the question, mapped to the section that answers it by nam
 | 1 | **Build the repository** | §1.1–1.2 | `go version` → `go1.22.12`; `go.mod:3` (`go 1.22`); `pyproject.toml:2`; build via `setup.py` / `dev.sh:9` |
 | 2 | **Start a single instance with default settings** | §1.3 | `kitty --config NONE`; `kitty/cli.py:187-188` ("special value `NONE` to not load any config file") |
 | 3 | **Isolate config** (implicit) | §0, §1.3 | `KITTY_CONFIG_DIRECTORY` via `tools/utils/paths.go:88-90`; empty-dir baseline |
-| 4 | **Invoke the `choose-fonts` kitten from inside** | §2.1 | `kitten choose-fonts`; rendered family-listing screen; `file` shows Go ELF |
-| 5 | **Wrapped-kitten dispatch** (`run_kitten_with_metadata`, `wrapped_kitten_names`, `KITTEN_RUNNING_AS_UI`) | §2.2 | `boss.py:1889/1902/1948-1951`; `constants.py:303-305`; **correction #A**: `choose_fonts ∉ wrapped_kitten_names()` (runtime `False`) |
-| 6 | **`+kitten` shell entry / `kittens/runner.py` contrast** | §2.2 | `entry_points.py:118/126-127/164`; empty `main.py`/`__init__.py` (`wc -c` = 0); `+kitten choose-fonts` is a no-op |
-| 7 | **Subcommand registration** | §3 | `tools/cmd/tool/main.go:82`; `main.go:74-77`; clone alias `main.go:96-98` (**nuance #2**: `clone.Hidden = false`) |
-| 8 | **Option parsing** (`--reload-in`, choices `parent, all, none`, default `parent`, `GetOptionValues`) | §4 | `main.go:70-72`, `86-95`, `78-84`; live `--help`; `--config-file` **ABSENT** |
-| 9 | **Value flow to finalization** (`faces_settings`, `faces.on_enter`, `final_pane.on_enter`, handler/panes, state machine, fine-tune keys, backend `+runpy`) | §5 | `faces.go:14-16/118-121/129-136/152-155`; `ui.go:17-23/42-58/81`; `list.go:246-250`; `backend.go:41` |
-| 10 | **Finalization behavior with output** (legend, Enter handler, `Patcher.Patch`, `serialized()`, written `KITTY_FONTS` block) | §6 | `final.go:38/40/42/44`, `63-70`, `78-82`, `94`; `api.go:310-313/330/347`; verbatim 134-byte `kitty.conf` |
+| 4 | **Invoke the `choose-fonts` kitten from inside** | §2.1 | Functional invocation is `kitten choose-fonts` (Go binary; renders the family-listing screen; `file` shows a Go ELF). `kitty +kitten choose-fonts` is **not** equivalent — at this commit it is a no-op (see row 6 and §2.2) |
+| 5 | **Wrapped-kitten dispatch** (`run_kitten_with_metadata`, `wrapped_kitten_names`, `KITTEN_RUNNING_AS_UI`) | §2.2 | `kitty/boss.py:1889/1902/1948-1951`; `kitty/constants.py:303-305`; **correction #A**: `choose_fonts ∉ wrapped_kitten_names()` (runtime `False`) |
+| 6 | **`+kitten` shell entry / `kittens/runner.py` contrast** | §2.2 | `kitty/entry_points.py:118/126-127/164`; empty `main.py`/`__init__.py` (`wc -c` = 0); `+kitten choose-fonts` is a no-op |
+| 7 | **Subcommand registration** | §3 | `tools/cmd/tool/main.go:82`; `kittens/choose_fonts/main.go:74-77`; clone alias `kittens/choose_fonts/main.go:96-98` (**nuance #2**: `clone.Hidden = false`) |
+| 8 | **Option parsing** (`--reload-in`, choices `parent, all, none`, default `parent`, `GetOptionValues`) | §4 | `kittens/choose_fonts/main.go:70-72`, `86-95`, `78-84`; live `--help`; `--config-file` **ABSENT** |
+| 9 | **Value flow to finalization** (`faces_settings`, `faces.on_enter`, `final_pane.on_enter`, handler/panes, state machine, fine-tune keys, backend `+runpy`) | §5 | `kittens/choose_fonts/faces.go:14-16/118-121/129-136/152-155`; `kittens/choose_fonts/ui.go:17-23/42-58/81`; `kittens/choose_fonts/list.go:246-250`; `kittens/choose_fonts/backend.go:41` |
+| 10 | **Finalization behavior with output** (legend, Enter handler, `Patcher.Patch`, `serialized()`, written `KITTY_FONTS` block) | §6 | `kittens/choose_fonts/final.go:38/40/42/44`, `63-70`, `78-82`, `94`; `tools/config/api.go:310-313/330/347`; verbatim 134-byte `kitty.conf` |
 | 11 | **THE persistence question — persist across restart or session-only?** | §7 (verdict §7.5) | before/after diff; **restart** loads `Source Code Pro` (`--debug-font-fallback`); `load_config()` → persisted `FontSpec` vs default `monospace` |
-| 12 | **`SIGUSR1` live reload** (`ReloadConfigInKitty`, `KITTY_PID`) | §7.3 | `final.go:86-91` (**nuance #1**: read at L87); `api.go:352-357`; strace `kill(67706, SIGUSR1) = 0`; `child-monitor.c:1373-1374` |
-| 13 | **`.bak` backup behavior** | §7.2 | `api.go:343-344` (**nuance #3**: no `.bak` on first write; appears on 2nd, `diff` IDENTICAL) |
-| 14 | **`s` / `S` contrast (STDOUT only)** | §8.1 | `final.go:101-106`; `main.go:64-65`; verbatim 110-byte STDOUT; `kitty.conf` UNCHANGED |
-| 15 | **`Esc` contrast (return to selection)** | §8.2 | `final.go:73-76`; faces pane re-rendered; no write |
-| 16 | **`Ctrl+c` contrast (quit / canceled)** | §8.3 | **correction**: `Error: canceled by user` from `ui.go:195-199` (not `main.go:58-62`); no write |
+| 12 | **`SIGUSR1` live reload** (`ReloadConfigInKitty`, `KITTY_PID`) | §7.3 | `kittens/choose_fonts/final.go:86-91` (**nuance #1**: read at L87); `tools/config/api.go:352-357`; strace `kill(106407, SIGUSR1) = 0`; `kitty/child-monitor.c:1373-1374` |
+| 13 | **`.bak` backup behavior** | §7.2 | `tools/config/api.go:343-344` (**nuance #3**: no `.bak` on first write; appears on 2nd, `diff` IDENTICAL) |
+| 14 | **`s` / `S` contrast (STDOUT only)** | §8.1 | `kittens/choose_fonts/final.go:101-106`; `kittens/choose_fonts/main.go:64-65`; verbatim 110-byte STDOUT; `kitty.conf` UNCHANGED |
+| 15 | **`Esc` contrast (return to selection)** | §8.2 | `kittens/choose_fonts/final.go:73-76`; faces pane re-rendered; no write |
+| 16 | **`Ctrl+c` contrast (quit / canceled)** | §8.3 | **correction**: `Error: canceled by user` from `kittens/choose_fonts/ui.go:195-199` (not `kittens/choose_fonts/main.go:58-62`); no write |
 
-**All three required nuances reported as observed:** #1 `Reload_in` read at `final.go:87`; #2 `clone.Hidden = false` (`main.go:97`, alias visible); #3 `.bak` only when `len(raw) > 0` (`api.go:343`, none on first write).
+**All three required nuances reported as observed:** #1 `Reload_in` read at `kittens/choose_fonts/final.go:87`; #2 `clone.Hidden = false` (`kittens/choose_fonts/main.go:97`, alias visible); #3 `.bak` only when `len(raw) > 0` (`tools/config/api.go:343`, none on first write).
 
-**Reported-as-observed deviations from the plan (source is ground truth):** (A) `choose_fonts` is not in `wrapped_kitten_names()` at this commit, so the functional invocation is the Go `kitten choose-fonts` binary and `+kitten choose-fonts` is a no-op; (B) `Ctrl+c` yields `Error: canceled by user` from `ui.go:195-199`; (C) `--debug-config` is unavailable in this build, so `--debug-font-fallback` plus `load_config()` were used to prove startup application.
+**Reported-as-observed deviations from the plan (source is ground truth):** (A) `choose_fonts` is not in `wrapped_kitten_names()` at this commit, so the functional invocation is the Go `kitten choose-fonts` binary and `+kitten choose-fonts` is a no-op; (B) `Ctrl+c` yields `Error: canceled by user` from `kittens/choose_fonts/ui.go:195-199`; (C) `--debug-config` is unavailable in this build, so `--debug-font-fallback` plus `load_config()` were used to prove startup application.
 
 **Verdict (restated):** pressing **`Enter`** at the `choose-fonts` final pane **PERSISTS** the selection across restarts by writing `kitty.conf` (survives restart) **and** live-applies it via `SIGUSR1`. It is not a session-only change.
