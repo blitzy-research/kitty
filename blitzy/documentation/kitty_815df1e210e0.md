@@ -50,7 +50,20 @@ def main(args: List[str]) -> Optional[str]:
     raise SystemExit('This should be run as kitten ssh')
 ```
 
-The Go driver is still the largest single piece and does all the local packing/encoding/spawning work — `kittens/ssh/main.go` is 27308 bytes vs 10345 for `main.py` — but the credential read-back and tarball streaming happen in the kitty terminal's Python (`utils.py`, 12003 bytes), not in Go and not on the remote (see Q1/Q8/Q9).
+The Go driver is still the largest single piece and does all the local packing/encoding/spawning work, while the credential read-back and tarball streaming happen in the kitty terminal's Python (`utils.py`), not in Go and not on the remote (see Q1/Q8/Q9). Their on-disk sizes are measured directly:
+
+```bash
+wc -c kittens/ssh/main.go kittens/ssh/main.py kittens/ssh/utils.py
+```
+
+```
+27308 kittens/ssh/main.go
+10345 kittens/ssh/main.py
+12003 kittens/ssh/utils.py
+49656 total
+```
+
+These sizes confirm the split: `kittens/ssh/main.go` is **27308 bytes** (the largest single piece), `kittens/ssh/main.py` is **10345 bytes** (option/config-only), and the terminal-side `kittens/ssh/utils.py` is **12003 bytes**.
 
 **2. The Go kitten cannot be built from a bare checkout.** It requires two build-time-generated artifacts:
 
@@ -731,7 +744,7 @@ Every concrete item named by the question, mapped to its code location and the e
 | `kittens/ssh/main.py` is option/config-only (`main()` raises) | `[kittens/ssh/main.py:224-225]` | Critical-context (`sed` of `main()`) |
 | `kittens/ssh/utils.py` = terminal-side SSH runtime (`get_ssh_data`, Python `read_data_from_shared_memory`, `create_shared_memory`) | `[kittens/ssh/utils.py:87,100,115]` | Critical-context (`grep` of defs); Q1/Q8/Q9 |
 | terminal DCS dispatch `handle_remote_ssh` → `get_ssh_data` | `[kitty/window.py:1289-1291]` | Critical-context; Q9 |
-| `ssh|` DCS registered (C VT parser) | `[kitty/vt-parser.c:608]` | Critical-context; Q9 |
+| `ssh\|` DCS registered (C VT parser) | `[kitty/vt-parser.c:608]` | Critical-context; Q9 |
 | Python terminal-side `read_data_from_shared_memory` (unlink + owner/mode + pw/id validation) | `[kittens/ssh/utils.py:100-112,129-133]` | Q1/Q8 |
 
 **Magnitudes (EV9), by name.** bootstrap `rcmd` (sh) total = **5282 bytes** (EV4), well under the **9000**-byte cap at `[kittens/ssh/main_test.go:76]`; shm JSON payload = **31575 bytes** (EV6); gzip tarball = **23599 bytes** (EV7).
