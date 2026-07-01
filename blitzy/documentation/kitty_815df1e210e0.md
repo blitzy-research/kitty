@@ -52,6 +52,7 @@ D    = osc133(b'D' + code_bytes)       # command finished, code_bytes = b';42', 
 Key reproduction details:
 
 - The prefix `A + B + C + "some text"` (D excluded) is **51 bytes** — empirically `len(A)=9 len(B)=9 len(C)=24 len(TEXT)=9`, so `9 + 9 + 24 + 9 = 51`.
+- **Terminal width (screen construction).** The `Screen` follows the `create_screen` construction pattern (`kitty_tests/__init__.py:237-240`), but with a column count wide enough that the 9-column `some text` occupies a single row without wrapping (the probes use `cols=80`). Screen width affects **only** the capture and cell-text values, never the byte geometry: the total length and the `D`-marker offset (`51`) / exit-code-digit offset (`59`) are computed from the input byte stream and are **width-independent** (they reproduce even at the literal `create_screen` default `cols=5`), whereas the plain capture `'some text'`, the ANSI capture `'\x1b[m\x1b]133;C\x1b\\some text'`, and the line-0 cell text `'some text'` require a non-wrapping width. (At `cols=5`, `some text` wraps across rows — line 0 becomes `'some '` and the ANSI capture gains an extra `'\x1b[m'` at the wrap point — which does **not** change kitty's OSC 133 handling, only how the drawn text is laid out across cells.)
 - **`ST = ESC \` (two bytes) vs `BEL` (one byte).** All totals below assume the two-byte `ESC \` terminator. Using the one-byte `BEL` (`\x07`) terminator instead would **shift every total down by one byte per marker** (four markers A/B/C/D emitted here → up to 4 bytes shorter), and would shift the `D`-marker offset accordingly. The choice of terminator does not change kitty's *behavior* (both `ESC \` and `BEL` terminate the OSC), only the byte counts.
 - **No space before `;cmdline`.** The `C`-marker bytes must be exactly `\x1b]133;C;cmdline=ls -la\x1b\\` with **no space** between `C` and `;cmdline`. The spaced ASCII diagram above is only for readability. If a space were inserted, the C handler's prefix test `strstr(buf + 1, ";cmdline") == buf + 1` at `kitty/screen.c:2343` would fail and `last_cmd_cmdline` would not resolve to `'ls'`.
 - The `cmdline=ls -la` payload is decoded to the first shell token `'ls'` by `decode_cmdline` (`kitty/window.py:225-228`: `x.partition('=')` then `next(shlex_split(val, True))`).
@@ -80,6 +81,8 @@ The dispatch payload handed to `shell_prompt_marking` is the text **after** `133
 ## 4. Verbatim Observed Output
 
 Three ephemeral probes produced every measured value in this document. They are quoted **verbatim** (unaltered) below. The only environment-specific line is the interpreter banner `PYTHON 3.13.7`; every other value (byte counts, offsets, capture strings, recorded statuses, sentinel) is code-determined and reproduces identically on any supported Python.
+
+Each probe command below is invoked from the repository root with the repository on `PYTHONPATH` (e.g. prefix with `PYTHONPATH="$PWD"`), because the probes import `kitty_tests` / `kitty.window`; without the repository on `sys.path`, `python3 -B /tmp/<probe>.py` would raise `ModuleNotFoundError: No module named 'kitty_tests'`. This affects only import resolution, not any measured value.
 
 ### 4.1 Test-harness driver — `/tmp/osc133_probe.py`
 
