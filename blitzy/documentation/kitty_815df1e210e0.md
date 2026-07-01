@@ -116,7 +116,7 @@ the child's `write()` blocks. This is the core of kitty's inbound backpressure.
 
 **Exact literals (from source).**
 
-> **Source** — `kitty/vt-parser.c:18` and `:21` (the fixed buffer size and the per-escape cap)
+> **Source** — `kitty/vt-parser.c:18` and `:21` (the fixed buffer size and the escape-length guard)
 > ```c
 > #define BUF_SZ (1024u*1024u)
 > // The extra bytes are so loads of large integers such as for AVX 512 dont read past the end of the buffer
@@ -124,8 +124,22 @@ the child's `write()` blocks. This is the core of kitty's inbound backpressure.
 > #define MAX_ESCAPE_CODE_LENGTH (BUF_SZ / 4u)
 > ```
 > - `BUF_SZ` = `1024u*1024u` = **1 MiB = 1 048 576 bytes** — the entire inbound buffer.
-> - `MAX_ESCAPE_CODE_LENGTH` = `BUF_SZ / 4u` = **256 KiB** — the largest single escape code (a single
->   `_G` graphics APC sequence therefore cannot exceed 256 KiB).
+> - `MAX_ESCAPE_CODE_LENGTH` = `BUF_SZ / 4u` = **256 KiB** — a guard against a *single unterminated
+>   (still-accumulating) escape code* growing without bound, and against an over-long CSI sequence; it
+>   is **not** an absolute ceiling on every complete `_G` graphics APC (see the note below).
+>
+> **Note — `MAX_ESCAPE_CODE_LENGTH` is a guard, not a hard per-APC cap.** When the parser finds the ST
+> terminator of an APC/OSC/DCS code it dispatches the *complete* escape **without** checking
+> `MAX_ESCAPE_CODE_LENGTH` — the source is deliberately generous "since we have a full escape code"
+> (`kitty/vt-parser.c:397-404`; comment at `:398-399`). The guard is applied only while the terminator
+> has **not yet** been seen (`kitty/vt-parser.c:406`), where an over-long *unterminated* code is dropped
+> with `REPORT_ERROR("%s escape code too long (%zu bytes), ignoring it", ...)` (`kitty/vt-parser.c:419`);
+> the same constant also bounds CSI sequences (`kitty/vt-parser.c:830`, error "CSI escape too long
+> ignoring and truncating" at `:831`). So `MAX_ESCAPE_CODE_LENGTH` bounds how long kitty will keep
+> *accumulating* an as-yet-unterminated escape (or CSI) before giving up; a complete, ST-terminated `_G`
+> APC is not rejected merely for exceeding 256 KiB. The value is exported to Python as
+> `VT_PARSER_MAX_ESCAPE_CODE_SIZE` (`kitty/vt-parser.c:1590`), distinct from the 1 MiB
+> `VT_PARSER_BUFFER_SIZE` (`:1589`).
 
 > **Source** — `kitty/vt-parser.c:194` (the buffer is a fixed C array, not a growable allocation)
 > ```c
@@ -274,7 +288,8 @@ performance docs describe as a deliberate CPU/throughput trade-off (`docs/perfor
 
 > **Note on what could not be directly timed.** The sub-millisecond `input_delay` *wait* itself is not
 > deterministically observable through the `Screen` test harness, because `test_parse_written_data`
-> calls `parse_worker(screen, &pd, true)` — i.e. with `flush = true` (`kitty/screen.c:4772`), which
+> calls `parse_worker(screen, &pd, true)` — i.e. with `flush = true` (the forced-flush calls are at
+> `kitty/screen.c:4775-4776`; the `test_parse_written_data` wrapper is declared at `:4772`) — which
 > short-circuits condition 1 of the gate at `kitty/vt-parser.c:1425` and forces immediate consumption.
 > The batching delay is exercised only by the live I/O loop (`kitty/child-monitor.c`, which calls the
 > parser with `flush = false`). Accordingly, the ground truth for the throttle timing is the constant
@@ -337,8 +352,9 @@ The separate blocking bulk-stdin path runs on its own thread and reports partial
 **Graphics responses ride this exact path.** A graphics command's reply is produced by
 `grman_handle_command` and written with `write_escape_code_to_child(self, ESC_APC, response)`
 (`kitty/screen.c:1050`), where the APC prefix is `"\033_"` (`kitty/screen.c:971`) and the suffix is
-`"\033\\"`. `write_escape_code_to_child` calls `schedule_write_to_child` (the 100 MiB-capped path)
-when a real window is attached (`kitty/screen.c:979`). So graphics acks/errors are queued into the
+`"\033\\"`. `write_escape_code_to_child` (declared at `kitty/screen.c:979`) calls `schedule_write_to_child`
+(the 100 MiB-capped path) when a real window is attached — the `if (self->window_id)` branch at
+`kitty/screen.c:983-987`. So graphics acks/errors are queued into the
 same `write_buf` and subject to the same ceiling as any other write-back.
 
 **Observed output (capturing the bytes kitty writes back).** Using the test-child sink
@@ -406,9 +422,10 @@ the `EINVAL` branch). The verbatim protocol error responses kitty writes back ar
 
 > **Observed output** — graphics overflow error responses (as written back through the APC channel)
 > ```text
-> R4 graphics  | input = _G a=T,f=24,t=d,s=1,v=1,i=1;<~6000B payload> (direct RGB, oversized)
+> $ python3 s3_s4_writeback_graphics.py
+> R4 graphics  | input = _G a=T,f=24,t=d,s=1,v=1,i=1 with 6000-byte direct RGB payload (oversized)
 > R4 graphics  | wtcbuf bytes = b'\x1b_Gi=1;EFBIG:Too much data\x1b\\'
-> R4 graphics  | input = _G a=T,f=100,t=d,S=400000001,i=2;... (PNG declared size 400000001 > MAX_DATA_SZ)
+> R4 graphics  | input = _G a=T,f=100,t=d,S=400000001,i=2 (PNG declared size 400000001 > MAX_DATA_SZ=400000000)
 > R4 graphics  | wtcbuf bytes = b'\x1b_Gi=2;EINVAL:PNG data size too large\x1b\\'
 > ```
 
@@ -425,22 +442,22 @@ graphics-data overload signalled **visibly** back to the sending program (see R6
 | Concern | File · function / macro | Line(s) | Exact literal |
 |---|---|---|---|
 | Inbound buffer size | `kitty/vt-parser.c` · `#define BUF_SZ` | `:18` | `#define BUF_SZ (1024u*1024u)` |
-| Per-escape cap | `kitty/vt-parser.c` · `#define MAX_ESCAPE_CODE_LENGTH` | `:21` | `#define MAX_ESCAPE_CODE_LENGTH (BUF_SZ / 4u)` |
+| Escape-length guard | `kitty/vt-parser.c` · `#define MAX_ESCAPE_CODE_LENGTH` | `:21` | `#define MAX_ESCAPE_CODE_LENGTH (BUF_SZ / 4u)` |
 | The fixed buffer | `kitty/vt-parser.c` · parser state | `:194` | `alignas(BUF_EXTRA) uint8_t buf[BUF_SZ + BUF_EXTRA];` |
 | "Has space?" predicate (pause) | `kitty/vt-parser.c` · `vt_parser_has_space_for_input` | `:1477-1481` | `ans = self->read.sz + self->write.pending < BUF_SZ;` |
-| Throttle / coalesce gate | `kitty/vt-parser.c` · `run_worker` | `:1425` | `if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ) {` |
+| Throttle / coalesce gate | `kitty/vt-parser.c` · `run_worker` | `:1425` | `if (flush \|\| pd->time_since_new_input >= OPT(input_delay) \|\| self->read.sz + 16 * 1024 > BUF_SZ) {` |
 | Resume flag | `kitty/vt-parser.c` · `run_worker` | `:1438` | `pd->write_space_created = self->read.sz >= BUF_SZ;` |
 | Buffer size export | `kitty/vt-parser.c` | `:1589` | `PyModule_AddIntConstant(module, "VT_PARSER_BUFFER_SIZE", BUF_SZ)` |
 | Read-gate (arm `POLLIN`) | `kitty/child-monitor.c` · I/O poll loop | `:1501` | `... .events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;` |
 | Read path (no-space guard) | `kitty/child-monitor.c` · `read_bytes` | `:1337-1342` | `if (!available_buffer_space) return true;` |
 | Write buffer + 100 MiB cap | `kitty/child-monitor.c` · `schedule_write_to_child_generic` | `:323`, `:341-342` | `if (screen->write_buf_used + sz > 100 * 1024 * 1024) { log_error("Too much data being sent to child with id: %lu, ignoring it", id); ...` |
-| Drain gate (arm `POLLOUT`) | `kitty/child-monitor.c` · I/O poll loop | `:1503` | `... .events |= (screen->write_buf_used ? POLLOUT  : 0);` |
+| Drain gate (arm `POLLOUT`) | `kitty/child-monitor.c` · I/O poll loop | `:1503` | `... .events \|= (screen->write_buf_used ? POLLOUT  : 0);` |
 | Drain dispatch | `kitty/child-monitor.c` · I/O poll loop | `:1539-1540` | `if (... .revents & POLLOUT) { write_to_child(children[i].fd, children[i].screen); }` |
 | Blocking bulk-stdin write | `kitty/child-monitor.c` · `thread_write` | `:965-984` | `set_thread_name("KittyWriteStdin");` … `log_error("Failed to write all data to STDIN of child process with error: %s", strerror(errno));` |
 | Resume the loop | `kitty/child-monitor.c` · `wakeup_io_loop` | `:225`, `:442` | `if (pd.write_space_created) wakeup_io_loop(self, false);` |
 | Graphics per-image cap | `kitty/graphics.c` · `#define MAX_DATA_SZ` | `:521` | `#define MAX_DATA_SZ (4u * 100000000u)` |
 | Graphics overflow → error | `kitty/graphics.c` · `load_image_data` / `initialize_load_data` | `:533`, `:638` | `ABRT("EFBIG", "Too much data")` · `ABRT("EINVAL", "PNG data size too large")` |
-| Graphics response builder | `kitty/graphics.c` · `set_command_failed_response` / `finish_command_response` | `:305`, `:759` | `snprintf(command_response, sz, "%s:", code)` · `print(";%s", command_response)` |
+| Graphics response builder | `kitty/graphics.c` · `set_command_failed_response` / `finish_command_response` | `:309`, `:777` | `snprintf(command_response, sz, "%s:", code)` · `print(";%s", command_response)` |
 | Write-back wiring | `kitty/screen.c` · `write_to_child` / `write_escape_code_to_child` | `:947`, `:979`, `:1050` | `write_escape_code_to_child(self, ESC_APC, response)` |
 | APC prefix | `kitty/screen.c` · `get_prefix_and_suffix_for_escape_code` | `:970-971` | `case ESC_APC:` → `*prefix = "\033_";` |
 | Test hooks (used above) | `kitty/screen.c` | `:4755`, `:4762`, `:4772` | `test_create_write_buffer` · `test_commit_write_buffer` · `test_parse_written_data` |
@@ -482,17 +499,36 @@ through built-in observability flags.
    > **Observed output** — test-runner markers
    > ```text
    > $ python3 ./test.py --module parser --verbosity 2
-   > ...
+   > Running under CI: False
+   > test_base64 (kitty_tests.parser.TestParser.test_base64) ... ok
+   > test_charsets (kitty_tests.parser.TestParser.test_charsets) ... ok
+   > test_csi_code_rep (kitty_tests.parser.TestParser.test_csi_code_rep) ... ok
+   > test_csi_codes (kitty_tests.parser.TestParser.test_csi_codes) ... ok
+   > test_dcs_codes (kitty_tests.parser.TestParser.test_dcs_codes) ... ok
+   > test_deccara (kitty_tests.parser.TestParser.test_deccara) ... ok
+   > test_desktop_notify (kitty_tests.parser.TestParser.test_desktop_notify) ... ok
+   > test_esc_codes (kitty_tests.parser.TestParser.test_esc_codes) ... ok
+   > test_find_either_of_two_bytes (kitty_tests.parser.TestParser.test_find_either_of_two_bytes) ... ok
+   > test_graphics_command (kitty_tests.parser.TestParser.test_graphics_command) ... ok
+   > test_osc_codes (kitty_tests.parser.TestParser.test_osc_codes) ... ok
+   > test_oth_codes (kitty_tests.parser.TestParser.test_oth_codes) ... ok
+   > test_parser_threading (kitty_tests.parser.TestParser.test_parser_threading) ... ok
+   > test_simple_parsing (kitty_tests.parser.TestParser.test_simple_parsing) ... ok
+   > test_utf8_parsing (kitty_tests.parser.TestParser.test_utf8_parsing) ... ok
    > test_utf8_simd_decode (kitty_tests.parser.TestParser.test_utf8_simd_decode) ... ok
+   >
    > ----------------------------------------------------------------------
-   > Ran 16 tests in 0.051s
+   > Ran 16 tests in 0.053s
+   >
    > OK
    > ```
    > ```text
    > $ python3 ./test.py --module graphics --verbosity 1
+   > Running under CI: False
    > ...................
    > ----------------------------------------------------------------------
-   > Ran 19 tests in 0.201s
+   > Ran 19 tests in 0.204s
+   >
    > OK
    > ```
 
@@ -577,8 +613,8 @@ refused, so kitty logs it and/or replies with a specific error code.
       (`kitty/screen.c:1050`). Write-back bytes captured verbatim; per-image `MAX_DATA_SZ` ~400 MB
       (`kitty/graphics.c:521`) with captured `EFBIG`/`EINVAL` replies.
 - [x] **R4 — Code locations.** Enumerated with exact `file:line` in the R4 table
-      (`vt-parser.c`, `child-monitor.c`, `graphics.c`, `screen.c`, `options/definition.py`,
-      `options/types.py`, `cli.py`).
+      (`kitty/vt-parser.c`, `kitty/child-monitor.c`, `kitty/graphics.c`, `kitty/screen.c`,
+      `kitty/options/definition.py`, `kitty/options/types.py`, `kitty/cli.py`).
 - [x] **R5 — Runtime manifestation.** Captured: 1 MiB buffer-full state, write-back/error bytes, and
       passing parser (16) + graphics (19) test suites; observability flags cited from `kitty/cli.py`
       and `make debug-event-loop` from `Makefile:25-26`.
@@ -590,7 +626,7 @@ refused, so kitty logs it and/or replies with a specific error code.
 ## Notes on what could not be verified by running (stated plainly)
 
 1. **`input_delay` sub-millisecond batching latency** was not measured, because the `Screen` test
-   harness's `test_parse_written_data` forces `flush = true` (`kitty/screen.c:4772`), bypassing the
+   harness's `test_parse_written_data` forces `flush = true` via the calls at `kitty/screen.c:4775-4776`, bypassing the
    time-based branch of the gate at `kitty/vt-parser.c:1425`. The ground truth used here is the gate's
    literals plus the observed option default `input_delay = 3`.
 2. **The 100 MiB write-buffer overflow log** (`kitty/child-monitor.c:342`) was not force-triggered,
