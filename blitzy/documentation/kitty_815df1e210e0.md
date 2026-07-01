@@ -25,6 +25,8 @@ All build and test runs were executed **inside** the pinned Docker image
 is mandatory: the host Python is 3.13, which cannot load the image's CPython‑3.12 `.so`
 extensions. The repository source tree was bind‑mounted into the container at `/app`.
 
+> **Build-state note (a mounted repo starts *unbuilt*).** The image's *internal* `/app` is pre-built, but a host repository bind-mounted over `/app` exposes an **unbuilt** tree: the four `.so` files and the two launchers are gitignored and untracked (`git ls-files` lists none of them), so a fresh checkout — or a `git clean -dfX` — contains **no** build artifacts. I verified this directly: `ls` of the six artifact paths in a tracked-only export (`git archive HEAD`) returns `No such file or directory` for all six, and only after the Step-2 build do they exist. This is exactly the Regime A -> build -> Regime B sequence in the table below: `python3 test.py` on the unbuilt mount aborts (Regime A), `python3 setup.py --ignore-compiler-warnings` then produces the artifacts, and only then does `./kitty/launcher/kitty +launch test.py` run the full suite (Regime B).
+
 Toolchain, captured verbatim (`gcc --version`, `go version`, `pkg-config --version`,
 `python3 --version`):
 
@@ -61,15 +63,14 @@ public build documentation (<https://sw.kovidgoyal.net/kitty/build/>).
 |---|---|---|---|---|
 | 1 | `python3 test.py` | **unbuilt** | `1` | Regime A cascade — `ModuleNotFoundError: No module named 'kitty.fast_data_types'`, **0 tests run** |
 | 2 | `python3 setup.py --ignore-compiler-warnings` | unbuilt → **builds** | `0` | Build succeeds; produces 4 `.so` + 2 launchers. The flag is the AAP‑mandated build accommodation (drops `-pedantic-errors -Werror` at `setup.py:491`) |
-| 3 | `CI=true … ./kitty/launcher/kitty +launch test.py` ᵃ | **built** | `1` | Regime B — `Ran 145 tests in 7.570s`, `FAILED (failures=3, skipped=6)`, `All Go tests succeeded, ran in 7.6 seconds`, ending in `Error: Some tests failed!` |
+| 3a | `CI=true ./kitty/launcher/kitty +launch test.py` (bare, **no env controls**) | **built** | `1` | `Ran 145 tests in 38.784s`, `FAILED (failures=1, errors=2, skipped=4)` — the 2 `zsh` cases *error* (`zsh` present + POSIX locale), the transfer tests *pass* (non-setgid `/tmp`), and Go `TestCreateAnonymousTempfile` *fails* (no atomic `O_TMPFILE`); see Q1(a) |
+| 3b | reference invocation — self-contained (setgid **tmpfs** `TMPDIR`, `GOCACHE`, `zsh` hidden, UTF-8 locale); **full concrete command in Q1(b)** | **built** | `1` | Regime B — `Ran 145 tests in 7.883s`, `FAILED (failures=3, skipped=6)`, `All Go tests succeeded, ran in 32.0 seconds`, ending in `Error: Some tests failed!` |
 | 4 | `env PYTHONPATH="$PWD" python3 /tmp/observe_loaded.py` | built | `0` | Extension probe — `collected test cases: 145`; only `fast_data_types.so` + `rsync.so` in `sys.modules` |
 | 5 | `CI=true ./kitty/launcher/kitty +launch test.py` (`rsync.so` removed) | built‑minus‑rsync | `1` | Regime A variant — eager‑import abort at `kitty_tests/main.py:64` |
 
-> ᵃ Row 3 full command (reference‑environment conditions recreated in the container, detailed
-> in Q1/Q8): `CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=<setgid dir on an O_TMPFILE‑capable
-> filesystem> ./kitty/launcher/kitty +launch test.py`, with `zsh` and `fish` absent and the
-> *Source Code Pro* font not installed. These conditions reproduce the canonical CI result
-> set (**3 failures / 6 skips**, Go success) verbatim.
+> The bare-vs-reference distinction — and the exact self-contained reference command, with each
+> environment control mapped to its effect — is detailed in Q1(a)/Q1(b) and Q8. Rows 3a/3b
+> are the same built tree; only the environment differs, and the invariant is `Ran 145 tests`.
 
 The bootstrap entry point is a two‑line shim: `test.py` imports and calls
 `kitty_tests.main.main` [`test.py:8`, `test.py:9`, `test.py:13`], and its shebang
@@ -92,7 +93,7 @@ C extensions are present:
 - **Regime B — built tree.** The suite runs **fully** — **145 tests** collected and
   executed — and individual tests then fail or skip **in isolation**. Observed:
   `FAILED (failures=3, skipped=6)` on the Python side, while `All Go tests succeeded, ran in
-  7.6 seconds`; the overall run ends in `Error: Some tests failed!`. **None** of the three
+  32.0 seconds`; the overall run ends in `Error: Some tests failed!`. **None** of the three
   failures is an extension‑loading defect; each is traceable to a setgid‑temp‑directory
   mode mismatch (the two `file_transmission` transfer tests) or a missing font (the
   `fonts.Selection` test) — detailed in Q8.
@@ -100,6 +101,8 @@ C extensions are present:
 The invariant that survives every environment difference is the number **145**: 145 tests
 are collected and run whenever `kitty/fast_data_types.so` is present, and **0** when it is
 absent. That single fact is the spine of the dependency story told below.
+
+> **Count note (observed is authoritative).** Prior technical text (Technical Specification §6.6) referenced *approximately* **~144** tests; the **live observed value is `145`** in every built-tree run captured here (`Ran 145 tests`), and per the ground-truth-precedence rule **`145` is authoritative** for this report. The ~1-test difference is immaterial to the dependency story — the invariant is simply that *all* collected tests run iff `kitty/fast_data_types.so` is present, and **0** run when it is absent.
 
 ---
 
@@ -159,15 +162,88 @@ compiles the C extensions and the Go `kitten` binary. First lines of the build l
 > measured `15945988` here vs. a previously documented `15757572`; the difference is the
 > `go1.23.4` vs `go1.22.2` compiler (see §0.1). Observed value is authoritative.
 
-**Run.** The canonical, built‑tree invocation mirrors what `python setup.py test` performs —
-`os.execl(texe, texe, '+launch', 'test.py')` with `texe = <launcher_dir>/kitty`
-[`setup.py:2101-2103`]. I ran it with the reference‑environment conditions in place (a setgid
-`TMPDIR` on an `O_TMPFILE`‑capable filesystem, a UTF‑8 locale, and neither `zsh` nor `fish`
-installed — each condition is tied to a specific failure/skip in Q8):
+**Run.** The canonical, built-tree invocation mirrors what `python setup.py test` performs
+— `os.execl(texe, texe, '+launch', 'test.py')` with `texe = <launcher_dir>/kitty`
+[`setup.py:2101-2103`]. **Two invocations are documented separately below, because in this
+image they produce different failure distributions** and reporting only one would mislead a
+reproducer. The invariant across both is `Ran 145 tests`; what moves is only the
+failures/errors/skips split, and every difference is an *environment* effect traced to its
+cause.
+
+**(a) Bare invocation — exactly the final-gate command, no environment controls.** Run
+verbatim as a first-time reproducer would (repo bind-mounted at `/app`, image defaults
+otherwise):
 
 ```
-CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=<setgid dir> ./kitty/launcher/kitty +launch test.py
+CI=true ./kitty/launcher/kitty +launch test.py
 ```
+
+**Observed outcome: exit `1`**, `Ran 145 tests in 38.784s`, and — importantly — **not**
+`failures=3, skipped=6`:
+
+```
+FAILED (failures=1, errors=2, skipped=4)
+```
+
+Each deviation from the canonical set is an environment effect, not a defect and not a
+test-count drift:
+
+**`errors=2`** — both `test_zsh_integration` cases *run and error* rather than skip, because
+`zsh` **is installed** in this image (`/usr/bin/zsh`), so the guard
+`@unittest.skipUnless(shutil.which('zsh'), 'zsh not installed')`
+[`kitty_tests/shell_integration.py:107`] does not skip them; under the image's default
+**POSIX** locale the cat-emoji command path is mangled and the case times out. Verbatim tail
+of both tracebacks:
+
+```
+TimeoutError: Timed out: pty.callbacks.last_cmd_cmdline='cd /tmp/tmpf6pgnfa0/testing-cwd-notification-????' != 'cd /tmp/tmpf6pgnfa0/testing-cwd-notification-🐱'.
+```
+
+**`failures=1`** — only `test_font_selection` fails (Source Code Pro absent). The two
+`file_transmission` transfer tests **pass** here, because the default `/tmp` is **not**
+setgid (mode `1777`), so the `0o42755` setgid-inheritance mismatch of Q8 never arises.
+**`skipped=4`** — the two `zsh` skips are missing (they errored instead); the remaining four
+are CA-certs + macOS-Last-Resort + `fish`×2. Finally, the **Go phase prints its full stdout**
+instead of the success line, because `TestCreateAnonymousTempfile` **fails**:
+
+```
+tpmfile_test.go:23: Anonymous tempfile was not created atomically
+--- FAIL: TestCreateAnonymousTempfile (0.00s)
+FAIL	kitty/tools/utils	0.044s
+```
+
+The cause is `CreateAnonymousTemp("")`, which opens `os.TempDir()` with `unix.O_TMPFILE`
+[`tools/utils/tmpfile_linux.go:16-20`]; the image's default temp filesystem does not support
+*atomic* `O_TMPFILE`, so the function falls back to a named temp file and the atomicity
+assertion at `tools/utils/tpmfile_test.go:23` fires.
+
+**(b) Reference invocation — self-contained; reproduces the canonical CI result set
+verbatim.** The four conditions the canonical `3 failures / 6 skips` + Go-success result
+requires are recreated **inside the ephemeral `--rm` container** (which never touches the
+read-only, bind-mounted repo, preserving the read-only-source rule). The command is fully
+concrete — no ellipsis, no `<placeholder>`:
+
+```
+docker run --rm -v "$PWD":/app -w /app \
+  --tmpfs /testtmp:exec \
+  -e CI=true -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
+  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0 -lc '
+    mv /usr/bin/zsh /usr/bin/zsh.disabled            # hide zsh  -> its 2 tests SKIP
+    chmod 2755 /testtmp && export TMPDIR=/testtmp     # setgid tmpfs -> transfer FAILs + O_TMPFILE works
+    mkdir -p /gocache && export GOCACHE=/gocache      # writable, executable Go build/test cache
+    ./kitty/launcher/kitty +launch test.py
+  '
+```
+
+Each control maps to exactly one part of the canonical result (verified by toggling it, and
+by the bare run above where none are applied):
+
+| Control | Mechanism (source anchor) | Effect on the observed tally |
+|---|---|---|
+| hide `zsh` — `mv /usr/bin/zsh /usr/bin/zsh.disabled` | `shutil.which('zsh')` must find the binary on `PATH` [`kitty_tests/shell_integration.py:107`] | the 2 zsh cases return to **skip** (`'zsh not installed'`): `skipped` `4 -> 6` |
+| setgid **tmpfs** `TMPDIR` — `--tmpfs /testtmp:exec` + `chmod 2755 /testtmp` | new subdirs inherit the setgid bit (`0o42755`); **tmpfs** supports atomic `O_TMPFILE` (overlayfs does **not**) | the 2 transfer tests **fail** (`0o42755`≠`0o40755`): `failures` `1 -> 3`; **and** `TestCreateAnonymousTempfile` now passes |
+| `GOCACHE=/gocache` — writable, executable fs | Go needs a build/test cache on an executable filesystem | Go links and runs cleanly, enabling the success line |
+| `LANG=C.UTF-8 LC_ALL=C.UTF-8` | a UTF-8 locale (defensive; with `zsh` hidden the emoji path is never exercised) | keeps any UTF-8-sensitive output well-defined |
 
 **Observed outcome: exit `1`.** Header lines, verbatim:
 
@@ -182,18 +258,29 @@ Go executable: /usr/local/go/bin/go
 Summary markers, verbatim:
 
 ```
-Ran 145 tests in 7.570s
+Ran 145 tests in 7.883s
 
 FAILED (failures=3, skipped=6)
-All Go tests succeeded, ran in 7.6 seconds
+All Go tests succeeded, ran in 32.0 seconds
 ```
 
 with the overall run ending in `Error: Some tests failed!` (`\x1b[31mError\x1b[39m: Some
 tests failed!` printed at `kitty_tests/main.py:242`). The full breakdown of those three
-failures and six skips (and why none is an extension defect) is given in Q8. **`CI=true`
-matters**: `is_ci = os.environ.get('CI') == 'true'` [`kitty_tests/__init__.py:212`] gates
-several test behaviors (e.g. the font check and the GLFW‑backend list), so the run was made
-under CI to keep those conditions well‑defined.
+failures and six skips (and why none is an extension defect) is given in Q8.
+
+> **Timing note — cold vs. warm Go cache (this reconciles the run-specific seconds).** The
+> `32.0 seconds` Go time above is a **cold** `GOCACHE` — the first run compiles all 26 Go
+> packages. Re-running the identical command against the now-warm cache gives, verbatim,
+> `Ran 145 tests in 7.367s` and `All Go tests succeeded, ran in 7.4 seconds`. Only the
+> seconds move; `Ran 145 tests`, `FAILED (failures=3, skipped=6)`, `All Go tests succeeded`
+> and `Error: Some tests failed!` are invariant. This is precisely why a first-time
+> reproducer (and the prior QA pass) observed a ~`32`-second Go phase while earlier
+> documentation recorded ~`7.6` seconds — the same command, cold vs. warm cache — and per
+> the ground-truth-precedence rule the observed values are reported here.
+
+**`CI=true` matters**: `is_ci = os.environ.get('CI') == 'true'` [`kitty_tests/__init__.py:212`] gates
+several test behaviors (e.g. the font check and the GLFW-backend list), so the run was made
+under CI to keep those conditions well-defined.
 
 **Rationale.** `setup.py` is the documented build path (`python3 setup.py build` is a listed
 subcommand, and the official docs state the minimal requirement as a C compiler + the Go
@@ -523,10 +610,10 @@ while the Go phase passes.
 the Go line at `kitty_tests/main.py:216`; the `Error` line at `kitty_tests/main.py:242`):
 
 ```
-Ran 145 tests in 7.570s
+Ran 145 tests in 7.883s
 
 FAILED (failures=3, skipped=6)
-All Go tests succeeded, ran in 7.6 seconds
+All Go tests succeeded, ran in 32.0 seconds
 Error: Some tests failed!
 ```
 
@@ -640,7 +727,7 @@ shell‑integration cases skip. The remaining two are a frozen‑build gate and 
 prints *after* the Python `FAILED` line. Observed, verbatim:
 
 ```
-All Go tests succeeded, ran in 7.6 seconds
+All Go tests succeeded, ran in 32.0 seconds
 ```
 
 `go_proc.returncode == 0`, so `kitty_tests/main.py:216` prints the success line; the overall
@@ -648,7 +735,7 @@ process still exits non‑zero because the Python side failed, so `kitty_tests/m
 prints `Error: Some tests failed!` and `:243` raises `SystemExit(exit_code)`.
 
 **The coherent picture.** `fast_data_types.so` (present) is why all **145** tests could be
-collected and run at all; `rsync.so` (present, imported at `file_transmission.py:13`) is why
+collected and run at all; `rsync.so` (present, imported at `kitty_tests/file_transmission.py:13`) is why
 the transfer/`check_build` tests ran; the GLFW `.so` are present as executables and were
 file‑checked (x11 under CI). Against that fully‑functional extension layer, the only
 non‑passing results were **two setgid‑temp‑directory mode mismatches and one missing font**,
@@ -693,13 +780,13 @@ ground‑truth‑precedence rule my **observed** value is reported for those:
 | Python summary | `FAILED (failures=3, skipped=6)` | **`FAILED (failures=3, skipped=6)`** | ✅ exact match |
 | 3 failures | `test_transfer_receive`, `test_transfer_send` (`0o42755`≠`0o40755`), `test_font_selection` (Source Code Pro) | **same three** | ✅ exact match |
 | 6 skips | CA certs; macOS Last Resort; fish×2; zsh×2 | **same six** | ✅ exact match |
-| Go phase | `All Go tests succeeded` | **`All Go tests succeeded, ran in 7.6 seconds`** | ✅ exact match |
+| Go phase | `All Go tests succeeded` | **`All Go tests succeeded, ran in 32.0 seconds`** | ✅ exact match |
 | Overall marker | `Error: Some tests failed!` | **same** | ✅ exact match |
 | Go compiler | `go1.22.2` | **`go1.23.4`** | ⚠ installed compiler differs; `go.mod` directive is still `go 1.22` [`go.mod:3`] |
 | Go executable path | `/usr/bin/go` | **`/usr/local/go/bin/go`** | ⚠ install location differs (cosmetic) |
 | `kitten` binary size | `15757572` B | **`15945988`** B | ⚠ `go1.23.4` vs `go1.22.2` |
 | `.so` sizes | `1213072` / `442784` / `357592` / `55056` | **same four** | ✅ exact match |
-| Wall‑clock time | ~8–14 s | **7.570 s** (Python) / **7.6 s** (Go) | ⚠ timing is inherently run‑specific |
+| Wall‑clock time | ~8–14 s | **7.883 s** (Python, ~stable) / **32.0 s** cold Go cache, **7.4 s** warm | ⚠ timing is inherently run‑specific |
 | Fonts present in image | `{dejavu sans mono, …}` | **`{dejavu sans mono, symbols nerd font mono}`** | ⚠ installed‑font set differs; Source Code Pro absent in both, so the failure is identical |
 
 The takeaway is that **every requested value reproduces exactly**; the handful of ⚠ rows are
@@ -712,8 +799,8 @@ observed value is reported as authoritative.
 
 - **Q1 — Build and run.** ✅ `python3 setup.py --ignore-compiler-warnings` → exit 0 (§Q1,
   artifacts table; flag = AAP‑mandated accommodation, `setup.py:491`); the reference run
-  `CI=true … ./kitty/launcher/kitty +launch test.py` → exit 1, `Ran 145 tests in 7.570s`,
-  `FAILED (failures=3, skipped=6)`, `All Go tests succeeded, ran in 7.6 seconds`,
+  `CI=true … ./kitty/launcher/kitty +launch test.py` → exit 1, `Ran 145 tests in 7.883s`,
+  `FAILED (failures=3, skipped=6)`, `All Go tests succeeded, ran in 32.0 seconds`,
   `Error: Some tests failed!`. Bootstrap anchors `test.py:1/8/9/13`; test invocation mirrors
   `setup.py:2101-2103`.
 - **Q2 — Which extensions load.** ✅ Only `kitty.fast_data_types` → `fast_data_types.so` and
@@ -722,7 +809,7 @@ observed value is reported as authoritative.
 - **Q3 — Failure cascade.** ✅ Both variants captured verbatim: missing `fast_data_types`
   aborts at package‑import time (`kitty/conf/utils.py:27`, 0 tests); missing `rsync` aborts
   inside the eager loop (`kitty_tests/main.py:64`, no `try/except`), with the honest note that
-  the raw error — not the `main.py:52-53` guard — fired. Plus the run‑method nuance
+  the raw error — not the `kitty_tests/main.py:52-53` guard — fired. Plus the run‑method nuance
   (`AttributeError` at `kitty/constants.py:67`).
 - **Q4 — Dependency structure.** ✅ Hard, layered, non‑optional dependency; the whole suite is
   gated by one C extension reached transitively via `kitty/config.py:10` →
@@ -739,7 +826,7 @@ observed value is reported as authoritative.
   `FAILED (failures=3, skipped=6)` result: three failures (`test_transfer_receive` +
   `test_transfer_send` setgid `0o42755`≠`0o40755`; `test_font_selection` Source Code Pro) and
   six skips (CA certs, macOS Last Resort, fish×2, zsh×2), with `All Go tests succeeded, ran in
-  7.6 seconds` — each non‑pass shown to be environment‑specific, none an extension defect.
+  32.0 seconds` — each non‑pass shown to be environment‑specific, none an extension defect.
 
 **Read‑only outcome.** The only persistent change to the repository is this document,
 `blitzy/documentation/kitty_815df1e210e0.md`. All build artifacts (`*.so`, launchers) remain
