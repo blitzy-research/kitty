@@ -189,7 +189,7 @@ remote interpreter, then per-connection values are substituted into it by replac
 only identifiers and *requests* the payload at runtime.
 
 **1. Template selection.** The interpreter determines `cd.script_type`: in `get_remote_command`
-(`kittens/ssh/main.go:511-529`), `cd.script_type = "sh"` (`kittens/ssh/main.go:515`) unless the
+(`kittens/ssh/main.go:511-525`), `cd.script_type = "sh"` (`kittens/ssh/main.go:515`) unless the
 interpreter's basename contains "python", in which case `cd.script_type = "py"`
 (`kittens/ssh/main.go:517`). The template body is then loaded from the embedded
 shell-integration data:
@@ -276,7 +276,7 @@ input-queue limit — a load-bearing measured number.
 `read_base64_from_tty | base64_decode | command tar "xpzf" "-" "-C" "$tdir"`
 (`shell-integration/ssh/bootstrap.sh:113`). It then sources `bootstrap-utils.sh` and `data.sh`
 and calls `compile_terminfo` and `mv_files_and_dirs`
-(`shell-integration/ssh/bootstrap.sh:132-133`). The Python equivalent is `get_data`
+(`shell-integration/ssh/bootstrap.sh:130-132`). The Python equivalent is `get_data`
 (`shell-integration/ssh/bootstrap.py:203-226`), which opens the archive with `tarfile.open`
 inside a `temporary_directory(dir=HOME, prefix='.kitty-ssh-kitten-untar-')`
 (`shell-integration/ssh/bootstrap.py:213`). Terminfo is compiled by `compile_terminfo`
