@@ -35,7 +35,7 @@ $ sed -n '3p' go.mod                 # go directive
 go 1.22
 ```
 
-`requires-python = ">=3.8"` is at `pyproject.toml:2`; `go 1.22` is at `go.mod:3`. (The build prints one harmless warning — `Package 'wayland-protocols' ... not found` → `Disabling building of wayland backend` — irrelevant to the input pipeline.)
+`requires-python = ">=3.8"` is at `pyproject.toml:2`; `go 1.22` is at `go.mod:3`. (The build prints a harmless pkg-config warning — `Package 'wayland-protocols', required by 'virtual:world', not found` — followed by `Disabling building of wayland backend`, both irrelevant to the input pipeline.)
 
 ### 0.2 Test harness — verbatim markers
 
@@ -43,6 +43,10 @@ go 1.22
 
 ```console
 $ ./test.py parser
+Running under CI: True
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-5fd97a9e-6e3b-43ba-8002-7d0fb4d4bc3b_8c32fa/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
 No test named ['parser'] found
 ```
 
@@ -51,22 +55,51 @@ The five suites relevant to this investigation all pass:
 ```console
 $ export PATH=/usr/local/go/bin:$PATH CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ASAN_OPTIONS=detect_leaks=0
 $ ./test.py --module parser
+Running under CI: True
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-5fd97a9e-6e3b-43ba-8002-7d0fb4d4bc3b_8c32fa/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
+test_base64 (kitty_tests.parser.TestParser.test_base64) ... ok
+test_charsets (kitty_tests.parser.TestParser.test_charsets) ... ok
+test_csi_code_rep (kitty_tests.parser.TestParser.test_csi_code_rep) ... ok
+test_csi_codes (kitty_tests.parser.TestParser.test_csi_codes) ... ok
+test_dcs_codes (kitty_tests.parser.TestParser.test_dcs_codes) ... ok
+test_deccara (kitty_tests.parser.TestParser.test_deccara) ... ok
+test_desktop_notify (kitty_tests.parser.TestParser.test_desktop_notify) ... ok
+test_esc_codes (kitty_tests.parser.TestParser.test_esc_codes) ... ok
+test_find_either_of_two_bytes (kitty_tests.parser.TestParser.test_find_either_of_two_bytes) ... ok
+test_graphics_command (kitty_tests.parser.TestParser.test_graphics_command) ... ok
+test_osc_codes (kitty_tests.parser.TestParser.test_osc_codes) ... ok
+test_oth_codes (kitty_tests.parser.TestParser.test_oth_codes) ... ok
 test_parser_threading (kitty_tests.parser.TestParser.test_parser_threading) ... ok
-...
-Ran 16 tests in 0.065s
+test_simple_parsing (kitty_tests.parser.TestParser.test_simple_parsing) ... ok
+test_utf8_parsing (kitty_tests.parser.TestParser.test_utf8_parsing) ... ok
+test_utf8_simd_decode (kitty_tests.parser.TestParser.test_utf8_simd_decode) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.057s
 
 OK
-$ ./test.py --module screen   ; # tail
-Ran 36 tests in 0.089s
+```
+
+The other four suites pass as well. Each summary tail below is produced with an explicit `2>&1 | tail -n 3`, so the command shown emits exactly the three lines pasted beneath it (no ellipsis, no omission):
+
+```console
+$ ./test.py --module screen 2>&1 | tail -n 3
+Ran 36 tests in 0.087s
+
 OK
-$ ./test.py --module keys      ; # tail
-Ran 3 tests in 0.084s
+$ ./test.py --module keys 2>&1 | tail -n 3
+Ran 3 tests in 0.082s
+
 OK
-$ ./test.py --module shell_integration ; # tail
-Ran 6 tests in 1.506s
+$ ./test.py --module shell_integration 2>&1 | tail -n 3
+Ran 6 tests in 1.330s
+
 OK
-$ ./test.py --module ssh       ; # tail
-Ran 8 tests in 16.318s
+$ ./test.py --module ssh 2>&1 | tail -n 3
+Ran 8 tests in 10.118s
+
 OK
 ```
 
@@ -114,23 +147,51 @@ Q1 after CUP(3;5): cursor.x=7 cursor.y=2 line2='    mid'
 ```
 
 - `line0='Hello, Kitty!'` with `cursor.x=13` shows plain bytes became 13 cells and advanced the cursor.
-- `line1='BOLD'` after `\r\n\x1b[1m...\x1b[0m` shows an in-stream SGR control sequence was acted on (bold attribute applied, cursor moved to row 1).
+- `line1='BOLD'` after `\r\n\x1b[1mBOLD\x1b[0m` shows an in-stream SGR control sequence was acted on (bold attribute applied, cursor moved to row 1).
 - `line2='    mid'` after `\x1b[3;5H` (CUP row 3, col 5) shows a cursor-addressing CSI placed `mid` at column 4 (0-based) — i.e., the byte stream is interpreted, not merely stored.
 
 **Mechanism / how the bytes enter (child side), quoted from source.** `read_bytes()` obtains a parser buffer and reads the fd straight into it:
 
-```c
-// kitty/child-monitor.c:1337  read_bytes()
-//   sz = available parser space; buf = parser-owned buffer
-//   len = read(fd, buf, sz);  then vt_parser_commit_write(...)
+```console
+$ sed -n '1336,1356p' kitty/child-monitor.c
+static bool
+read_bytes(int fd, Screen *screen) {
+    ssize_t len;
+    size_t available_buffer_space;
+
+    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
+    if (!available_buffer_space) return true;
+
+    while(true) {
+        len = read(fd, buf, available_buffer_space);
+        if (len < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno != EIO) perror("Call to read() from child fd failed");
+            vt_parser_commit_write(screen->vt_parser, 0);
+            return false;
+        }
+        break;
+    }
+    vt_parser_commit_write(screen->vt_parser, len);
+    return len != 0;
+}
 ```
 
 `vt_parser_create_write_buffer()` hands back a pointer *inside* the parser's own 1 MiB ring, and its size is the free space (`kitty/vt-parser.c:1451`):
 
-```c
-// kitty/vt-parser.c:1451
-self->write.offset = self->read.sz + self->write.pending;
-*sz = BUF_SZ - self->write.offset;
+```console
+$ sed -n '1451,1461p' kitty/vt-parser.c
+vt_parser_create_write_buffer(Parser *p, size_t *sz) {
+    PS *self = (PS*)p->state;
+    uint8_t *ans;
+    with_lock {
+        if (self->write.sz) fatal("vt_parser_create_write_buffer() called with an already existing write buffer");
+        self->write.offset = self->read.sz + self->write.pending;
+        *sz = BUF_SZ - self->write.offset;
+        self->write.sz = *sz;
+        ans = self->buf + self->write.offset;
+    } end_with_lock;
+    return ans;
 ```
 
 So a surge is read with zero intermediate copies into a fixed buffer, and "becomes actionable" only when `test_parse_written_data` / the parser runs and mutates `Screen`. The magnitude of that buffer, and what happens when a surge overruns it, is quantified in Q7.
@@ -205,19 +266,38 @@ Q3 after CSI ?2026l DECRQM reply: b'\x1b[?2026;2$y'
 
 **Evidence — the snapshot is what "pause" means.** `screen_pause_rendering()` copies the live screen into `paused_rendering` so the terminal can keep *processing* incoming bytes while continuing to *display the last committed frame*:
 
-```c
-// kitty/screen.c:2506  screen_pause_rendering(Screen*, bool pause, int for_in_ms)
-//   ... snapshots cursor, color_profile, linebuf (per-line copy), selections, url_ranges,
-//       grman (graphics), inverted, cursor_visible into self->paused_rendering ...
+```console
+$ sed -n '2506p' kitty/screen.c
+screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
+$ sed -n '2523,2542p' kitty/screen.c
+    self->paused_rendering.inverted = self->modes.mDECSCNM;
+    self->paused_rendering.scrolled_by = self->scrolled_by;
+    self->paused_rendering.cell_data_updated = false;
+    self->paused_rendering.cursor_visible = self->modes.mDECTCEM;
+    memcpy(&self->paused_rendering.cursor, self->cursor, sizeof(self->paused_rendering.cursor));
+    memcpy(&self->paused_rendering.color_profile, self->color_profile, sizeof(self->paused_rendering.color_profile));
+    if (!self->paused_rendering.linebuf || self->paused_rendering.linebuf->xnum != self->columns || self->paused_rendering.linebuf->ynum != self->lines) {
+        if (self->paused_rendering.linebuf) Py_CLEAR(self->paused_rendering.linebuf);
+        self->paused_rendering.linebuf = alloc_linebuf(self->lines, self->columns);
+        if (!self->paused_rendering.linebuf) { PyErr_Clear(); self->paused_rendering.expires_at = 0; return false; }
+    }
+    for (index_type y = 0; y < self->lines; y++) {
+        Line *src = visual_line_(self, y);
+        linebuf_init_line(self->paused_rendering.linebuf, y);
+        copy_line(src, self->paused_rendering.linebuf->line);
+        self->paused_rendering.linebuf->line_attrs[y] = src->attrs;
+    }
+    copy_selections(&self->paused_rendering.selections, &self->selections);
+    copy_selections(&self->paused_rendering.url_ranges, &self->url_ranges);
+    grman_pause_rendering(self->grman, self->paused_rendering.grman);
 ```
 
 **Auto-expiry — the exact default.** When the CSI path passes `for_in_ms = 0`, the timeout defaults to **2000 ms**:
 
-```c
-// kitty/screen.c:2521
-if (for_in_ms <= 0) for_in_ms = 2000;
-// kitty/screen.c:2522
-self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
+```console
+$ sed -n '2521,2522p' kitty/screen.c
+    if (for_in_ms <= 0) for_in_ms = 2000;
+    self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
 ```
 
 Expiry itself is enforced by **`screen_check_pause_rendering()` — `kitty/screen.c:2489`** (`if (expires_at && now > expires_at) screen_pause_rendering(self, false, 0)`, `kitty/screen.c:2490`), which is invoked from the render loop at `kitty/child-monitor.c:729`.
@@ -244,31 +324,33 @@ $ grep -n "pthread_create(&self->io_thread\|pthread_create(&self->talk_thread" k
 286:        if ((ret = pthread_create(&self->talk_thread, NULL, talk_loop, self)) != 0) {
 291:    ret = pthread_create(&self->io_thread, NULL, io_loop, self);
 $ grep -n 'talk_loop(void\|^io_loop' kitty/child-monitor.c
+230:static void* talk_loop(void *data);
 1481:io_loop(void *data) {
 1805:talk_loop(void *data) {
 ```
 
 - `io_thread` runs `io_loop` (created `child-monitor.c:291`; body `:1481`; name `KittyChildMon` `:1489`).
-- `talk_thread` runs `talk_loop` (created `child-monitor.c:256`/`:286`; body `:1805`; name `KittyPeerMon` `:1808`).
+- `talk_thread` runs `talk_loop` (forward-declared `child-monitor.c:230`; created `:256`/`:286`; body `:1805`; name `KittyPeerMon` `:1808`).
 - The main thread runs the render tick (`:1232-1237`).
 
 **Evidence — the Python orchestration that owns it.** `boss.py` constructs the `ChildMonitor` and wires the remote-control sockets; `window.py` binds a `Child` to a `Screen`; `child.py` creates the PTY the I/O loop polls:
 
 ```console
 $ grep -n "ChildMonitor\|talk_fd\|peer_message_received" kitty/boss.py | head
-73:from .fast_data_types import ChildMonitor, ...
+73:    ChildMonitor,
+331:        talk_fd: int = -1,
 370:        self.child_monitor = ChildMonitor(
 373:            talk_fd, listen_fd,
-776:    def peer_message_received(self, msg_bytes, ...):
+776:    def peer_message_received(self, msg_bytes: bytes, peer_id: int, is_remote_control: bool) -> Union[bytes, bool, None]:
 $ grep -n "self.child = \|self.screen: Screen = Screen(" kitty/window.py
 601:        self.child = child
-604:        self.screen: Screen = Screen(self, self.child.child_fd, ...)
+604:        self.screen: Screen = Screen(self, 24, 80, opts.scrollback_lines, cell_width, cell_height, self.id)
 $ grep -n "def openpty\|def fork" kitty/child.py
-170:    def openpty(...):
-276:    def fork(self):
+170:def openpty() -> Tuple[int, int]:
+276:    def fork(self) -> Optional[int]:
 ```
 
-`kitty/child.py` `openpty()` (`:170`, `os.openpty()` at `:171`) and `fork()` (`:276`) establish the master/slave PTY; the master fd is what `io_loop` polls.
+`boss.py` imports the C `ChildMonitor` (`kitty/boss.py:73`) and constructs it with the `talk_fd`/`listen_fd` remote-control sockets (`kitty/boss.py:370`, `:373`; `talk_fd` default at `:331`), dispatching peer traffic in `peer_message_received()` (`kitty/boss.py:776`). `window.py` binds the child to the window at `self.child = child` (`kitty/window.py:601`) and creates the `Screen` with an initial 24×80 grid at `kitty/window.py:604` (the `Screen` constructor takes the geometry, scrollback and cell metrics — **not** the child fd). `kitty/child.py` `openpty()` (`:170`, `os.openpty()` at `:171`) and `fork()` (`:276`) establish the master/slave PTY, and it is that child's PTY master fd (tracked on the window as `self.child`) that the `io_loop` polls.
 
 **Rationale.** Timing, ordering, and state hand-offs are split so that no single responsibility can block another: the I/O thread does only blocking `poll()`/`read()`/`write()`; the talk thread does only remote-control socket work; and the main thread owns *all* screen-state mutation and rendering. Because only the main thread mutates `Screen`, there is no lock contention on the hot parse/render path — the buffer is the hand-off point between the I/O thread (producer) and the main thread (consumer).
 
@@ -284,38 +366,65 @@ $ grep -n "def openpty\|def fork" kitty/child.py
 
 **Evidence — the render-tick order, verbatim from source:**
 
-```c
-// kitty/child-monitor.c:1232-1237
-if (global_state.has_pending_resizes) {
-    process_pending_resizes(now);
-    input_read = true;
-}
-if (parse_input(self)) input_read = true;
-render(now, input_read);
+```console
+$ sed -n '1232,1237p' kitty/child-monitor.c
+    if (global_state.has_pending_resizes) {
+        process_pending_resizes(now);
+        input_read = true;
+    }
+    if (parse_input(self)) input_read = true;
+    render(now, input_read);
 ```
 
 `process_pending_resizes` is defined at `kitty/child-monitor.c:1043`; `parse_input` at `kitty/child-monitor.c:451`.
 
 **Evidence — the I/O-loop order, verbatim from source:**
 
-```c
-// kitty/child-monitor.c:1515-1540  (EXTRA_FDS = 2 at :35; idx0 = wakeup, idx1 = signals)
-if (children_fds[0].revents && POLLIN) drain_fd(children_fds[0].fd); // wakeup
-if (children_fds[1].revents && POLLIN) {
-    ... read_signals(children_fds[1].fd, handle_signal, &ss); ...
-}
-for (i = 0; i < self->count; i++) {
-    if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
-        has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);
-        ...
-    }
-    if (children_fds[EXTRA_FDS + i].revents & POLLOUT) {
-        write_to_child(children[i].fd, children[i].screen);
-    }
-}
+```console
+$ sed -n '1515,1540p' kitty/child-monitor.c
+            if (children_fds[0].revents && POLLIN) drain_fd(children_fds[0].fd); // wakeup
+            if (children_fds[1].revents && POLLIN) {
+                SignalSet ss = {0};
+                data_received = true;
+                read_signals(children_fds[1].fd, handle_signal, &ss);
+                if (ss.kill_signal || ss.reload_config) {
+                    children_mutex(lock);
+                    if (ss.kill_signal) kill_signal_received = true;
+                    if (ss.reload_config) reload_config_signal_received = true;
+                    children_mutex(unlock);
+                }
+                if (ss.child_died) reap_children(self, OPT(close_on_child_death));
+            }
+            for (i = 0; i < self->count; i++) {
+                if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
+                    data_received = true;
+                    has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);
+                    if (!has_more) {
+                        // child is dead
+                        children_mutex(lock);
+                        children[i].needs_removal = true;
+                        children_mutex(unlock);
+                    }
+                }
+                if (children_fds[EXTRA_FDS + i].revents & POLLOUT) {
+                    write_to_child(children[i].fd, children[i].screen);
 ```
 
+(`EXTRA_FDS = 2` at `kitty/child-monitor.c:35`; poll index 0 = wakeup fd, index 1 = signals fd. This is the exact `1515,1540` slice, so it ends inside the `for` body at the `write_to_child` call on line 1540.)
+
 So within the loop: **wakeup drain (`:1515`) → signals (`:1519`) → reads `read_bytes` (`:1531`) → writes `write_to_child` (`:1540`)**.
+
+**Operator note — reported exactly as observed.** The wakeup/signals guards at `:1515`–`:1516` use the *logical* `&&` (`children_fds[0].revents && POLLIN`), whereas the per-child data checks at `:1529` and `:1539` use the *bitwise* `&` (`.revents & (POLLIN | POLLHUP)` and `.revents & POLLOUT`). The byte-exact operator at `:1515` is two ampersands (`26 26`):
+
+```console
+$ sed -n '1515p' kitty/child-monitor.c | grep -ao 'revents && POLLIN' | hexdump -C
+00000000  72 65 76 65 6e 74 73 20  26 26 20 50 4f 4c 4c 49  |revents && POLLI|
+00000010  4e 0a                                             |N.|
+00000012
+```
+
+Since `POLLIN` is a non-zero constant, `revents && POLLIN` reduces to `revents != 0` for the wakeup/signals fds, while the per-child branches use bitwise `&` to test the specific `POLLIN`/`POLLHUP`/`POLLOUT` bits. Both operators are quoted here exactly as they appear in the source at commit `815df1e210e0`.
+
 
 **Evidence — why resize must precede parse (runtime).** A resize reshapes the grid, and *subsequent* bytes are laid out against the new geometry. A probe fills a width-20 line, resizes to width 10, then writes new input:
 
@@ -344,11 +453,11 @@ If input were parsed *before* the resize, it would wrap at the stale width; appl
 
 ```console
 $ ./kitty/launcher/kitty +launch /tmp/probe_q6_shellintegration.py
-Q6 line0 text (stream order preserved) = 'user@host:~$ pasted'
-Q6 OSC7 last_reported_cwd             = b'file://localhost/tmp/demo'
-Q6 in_bracketed_paste_mode after ?2004l= False
-Q6 OSC133 C recorded cmdline           = 'ls'
-Q6 OSC133 D recorded exit_status       = 0
+Q6 line0 text (stream order preserved)      = 'user@host:~$ pasted'
+Q6 OSC7 last_reported_cwd                   = b'file://localhost/tmp/demo'
+Q6 in_bracketed_paste_mode after ?2004l     = False
+Q6 OSC133 C recorded cmdline                = 'ls'
+Q6 OSC133 D recorded exit_status            = 0
 Q6 after CSI ?2004h in_bracketed_paste_mode = True
 Q6 after CSI ?2004l in_bracketed_paste_mode = False
 ```
@@ -365,11 +474,11 @@ Q6 after CSI ?2004l in_bracketed_paste_mode = False
 - **OSC 7** (`case 7:` at `kitty/vt-parser.c:505`) → `process_cwd_notification()` (`kitty/screen.c:2393`).
 - **Bracketed paste, mode 2004** — constant `#define BRACKETED_PASTE (2004 << 5)` (`kitty/modes.h:81`), start/end markers `"200~"`/`"201~"` (`kitty/modes.h:82-83`); the getter/setter is `MODE_GETSET(in_bracketed_paste_mode, BRACKETED_PASTE)` (`kitty/screen.c:3854`); and `paste_()` (`kitty/screen.c:4573`) wraps pasted bytes only when the mode is on:
 
-```c
-// kitty/screen.c:4586-4588
-if (allow_bracketed_paste && self->modes.mBRACKETED_PASTE) write_escape_code_to_child(self, ESC_CSI, BRACKETED_PASTE_START);
-write_to_child(self, data, sz);
-if (allow_bracketed_paste && self->modes.mBRACKETED_PASTE) write_escape_code_to_child(self, ESC_CSI, BRACKETED_PASTE_END);
+```console
+$ sed -n '4586,4588p' kitty/screen.c
+    if (allow_bracketed_paste && self->modes.mBRACKETED_PASTE) write_escape_code_to_child(self, ESC_CSI, BRACKETED_PASTE_START);
+    write_to_child(self, data, sz);
+    if (allow_bracketed_paste && self->modes.mBRACKETED_PASTE) write_escape_code_to_child(self, ESC_CSI, BRACKETED_PASTE_END);
 ```
 
 **Rationale.** This is the ECMA-48 in-band model: control sequences are embedded *in* the text stream and consumed by the same state machine that consumes text, in the same order. There is no side channel and no reordering, so a prompt marker can never "land" on the wrong line relative to the text around it, and a paste can never be misclassified as typed input.
@@ -397,20 +506,26 @@ Q7 iter 4: available=0 -> BACKPRESSURE (buffer full at total_committed=1048576)
 - Available shrinks `1048576 → 786432 → 524288 → 262144 → 0`.
 - At `total_committed = 1048576` (exactly 1 MiB) the buffer is full and no more can be read — this is the backpressure point.
 
-**Mechanism — the gate and the buffer bookkeeping, verbatim:**
+**Mechanism — the gate, verbatim from source:**
 
-```c
-// kitty/vt-parser.c:1477  vt_parser_has_space_for_input()
-ans = self->read.sz + self->write.pending < BUF_SZ;
-// kitty/vt-parser.c:1451  vt_parser_create_write_buffer()  -> *sz = BUF_SZ - (read.sz + write.pending)
-// kitty/vt-parser.c:1465  vt_parser_commit_write()          -> write.pending += sz
+```console
+$ sed -n '1477,1483p' kitty/vt-parser.c
+vt_parser_has_space_for_input(const Parser *p) {
+    PS *self = (PS*)p->state;
+    bool ans;
+    with_lock {
+        ans = self->read.sz + self->write.pending < BUF_SZ;
+    } end_with_lock;
+    return ans;
 ```
+
+The free space the gate implies is advertised by `vt_parser_create_write_buffer()` as `*sz = BUF_SZ - self->write.offset;` (`kitty/vt-parser.c:1457`, shown verbatim in Q1), and each committed read advances the pending byte count via `self->write.pending += sz;` (`kitty/vt-parser.c:1471`).
 
 And the I/O loop only asks for more child output while there is room:
 
-```c
-// kitty/child-monitor.c:1501
-children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(...) ? POLLIN : 0;
+```console
+$ sed -n '1501p' kitty/child-monitor.c
+            children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;
 ```
 
 The extra headroom note is `#define BUF_EXTRA (512u/8u)` at `kitty/vt-parser.c:20` (padding so wide SIMD loads never read past the end).
@@ -419,25 +534,42 @@ The extra headroom note is `#define BUF_EXTRA (512u/8u)` at `kitty/vt-parser.c:2
 
 ```console
 $ ls kittens/ssh/*.go kittens/ssh/*.py shell-integration/ssh/bootstrap*
-kittens/ssh/askpass.go  kittens/ssh/config.go  kittens/ssh/main.go  kittens/ssh/utils.go
-kittens/ssh/main.py  kittens/ssh/utils.py
-shell-integration/ssh/bootstrap.sh  shell-integration/ssh/bootstrap.py  shell-integration/ssh/bootstrap-utils.sh
-$ grep -n "func main\|bootstrap_script\|drain_potential_tty_garbage" kittens/ssh/main.go | head
+kittens/ssh/__init__.py
+kittens/ssh/askpass.go
+kittens/ssh/cli_generated.go
+kittens/ssh/conf_generated.go
+kittens/ssh/config.go
+kittens/ssh/config_test.go
+kittens/ssh/copy_cli_generated.go
+kittens/ssh/main.go
+kittens/ssh/main.py
+kittens/ssh/main_test.go
+kittens/ssh/utils.go
+kittens/ssh/utils.py
+kittens/ssh/utils_test.go
+shell-integration/ssh/bootstrap-utils.sh
+shell-integration/ssh/bootstrap.py
+shell-integration/ssh/bootstrap.sh
+$ grep -n "^func main\|^func bootstrap_script\|^func get_remote_command\|^func drain_potential_tty_garbage" kittens/ssh/main.go
+422:func bootstrap_script(cd *connection_data) (err error) {
+511:func get_remote_command(cd *connection_data) error {
+530:func drain_potential_tty_garbage(term *tty.Term) {
+800:func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 ```
 
-`kittens/ssh/main.go` contains `bootstrap_script` (`:422`), `get_remote_command` (`:511`), and `drain_potential_tty_garbage` (`:530`); `shell-integration/ssh/bootstrap.sh` stages terminfo + integration over `/dev/tty`. The `ssh` suite exercises this path end-to-end and passes:
+`kittens/ssh/main.go` defines `bootstrap_script` (`:422`), `get_remote_command` (`:511`), `drain_potential_tty_garbage` (`:530`), and the kitten command entry `main` (`:800`); `shell-integration/ssh/bootstrap.sh` stages terminfo + integration over `/dev/tty`. The `ssh` suite exercises this path end-to-end and passes:
 
 ```console
-$ ./test.py --module ssh   ; # tail
+$ ./test.py --module ssh 2>&1 | grep -E "^test_|^Ran |^OK$"
 test_basic_pty_operations (kitty_tests.ssh.SSHKitten.test_basic_pty_operations) ... ok
-test_ssh_bootstrap_with_different_launchers ... ok
-test_ssh_connection_data ... ok
-test_ssh_copy ... ok
-test_ssh_env_vars ... ok
-test_ssh_leading_data ... ok
-test_ssh_login_shell_detection ... ok
-test_ssh_shell_integration ... ok
-Ran 8 tests in 16.318s
+test_ssh_bootstrap_with_different_launchers (kitty_tests.ssh.SSHKitten.test_ssh_bootstrap_with_different_launchers) ... ok
+test_ssh_connection_data (kitty_tests.ssh.SSHKitten.test_ssh_connection_data) ... ok
+test_ssh_copy (kitty_tests.ssh.SSHKitten.test_ssh_copy) ... ok
+test_ssh_env_vars (kitty_tests.ssh.SSHKitten.test_ssh_env_vars) ... ok
+test_ssh_leading_data (kitty_tests.ssh.SSHKitten.test_ssh_leading_data) ... ok
+test_ssh_login_shell_detection (kitty_tests.ssh.SSHKitten.test_ssh_login_shell_detection) ... ok
+test_ssh_shell_integration (kitty_tests.ssh.SSHKitten.test_ssh_shell_integration) ... ok
+Ran 8 tests in 10.118s
 OK
 ```
 
@@ -489,43 +621,121 @@ Q8 available buffer after drain = 1048576 bytes
 
 ```console
 $ ./kitty/launcher/kitty +launch /tmp/probe_q9_timers.py
-Q9 input_delay default           = 3 (ms)
+Q9 input_delay default            = 3 (ms)
 Q9 repaint_delay default          = 10 (ms)
 Q9 resize_debounce_time default   = (0.1, 0.5) (seconds: first=idle, second=max)
 ```
 
-- `input_delay = 3` matches `opt('input_delay', '3', ...)` at `kitty/options/definition.py:878`.
-- `repaint_delay = 10` matches `opt('repaint_delay', '10', ...)` at `kitty/options/definition.py:866`.
-- `resize_debounce_time = (0.1, 0.5)` matches `opt('resize_debounce_time', '0.1 0.5', ...)` at `kitty/options/definition.py:1182`. The two numbers map to `.on_end` (first, `0.1s`, used after end-of-resize on non-macOS — `kitty/child-monitor.c:1062`) and `.on_pause` (second, `0.5s`, redraw-after-pause on macOS — `kitty/child-monitor.c:1055`).
+- `input_delay = 3` matches the option definition line `opt('input_delay', '3',` at `kitty/options/definition.py:878`.
+- `repaint_delay = 10` matches `opt('repaint_delay', '10',` at `kitty/options/definition.py:866`.
+- `resize_debounce_time = (0.1, 0.5)` matches `opt('resize_debounce_time', '0.1 0.5',` at `kitty/options/definition.py:1182`. The two numbers map to `.on_end` (first, `0.1s`, used after end-of-resize on non-macOS — `kitty/child-monitor.c:1062`) and `.on_pause` (second, `0.5s`, redraw-after-pause on macOS — `kitty/child-monitor.c:1055`).
 
 **Evidence — wakeups are coalesced to ≤ one per `input_delay`, verbatim.** The wakeup macro and its rationale comment:
 
-```c
-// kitty/child-monitor.c:1562
+```console
+$ sed -n '1562,1570p' kitty/child-monitor.c
 #define WAKEUP { wakeup_main_loop(); last_main_loop_wakeup_at = now; has_pending_wakeups = false; }
-// kitty/child-monitor.c:1563-1564
-// we only wakeup the main loop after input_delay as wakeup is an expensive operation
-// on some platforms, such as cocoa
-// kitty/child-monitor.c:1566
-if ((now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP
-else has_pending_wakeups = true;
+        // we only wakeup the main loop after input_delay as wakeup is an expensive operation
+        // on some platforms, such as cocoa
+        if (data_received) {
+            if ((now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP
+            else has_pending_wakeups = true;
+        } else {
+            if (has_pending_wakeups && (now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP
+        }
 ```
 
 And when a wakeup is pending, the I/O `poll()` timeout is set to the *remaining* `input_delay` window, so the next wakeup fires exactly at the window boundary:
 
-```c
-// kitty/child-monitor.c:1508
-monotonic_t time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);
-if (time_delta >= 0) ret = poll(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(time_delta));
+```console
+$ sed -n '1506,1510p' kitty/child-monitor.c
+        if (has_pending_wakeups) {
+            now = monotonic();
+            monotonic_t time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);
+            if (time_delta >= 0) ret = poll(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(time_delta));
+            else ret = 0;
 ```
+
+**Evidence — the coalescing measured at runtime (representative scale).** The GLFW main loop (`glfwPostEmptyEvent` → `run_main_loop`) cannot run in this headless container — calling `wakeup_main_loop()` without an initialized display aborts with `Segmentation fault`, and both `DISPLAY` and `WAYLAND_DISPLAY` are empty. So the probe drives the **exact** wakeup-coalescing predicate transcribed from `kitty/child-monitor.c:1562-1570` (shown above), using kitty's **real `monotonic()` clock** — the same `monotonic()` the C `io_loop` uses, exposed through `fast_data_types` — and the **real parsed `input_delay`** (`Options().input_delay = 3` ms). The probe's core loop is a line-for-line transcription of the `:1566`/`:1567` decision — this is the exact code that produced the output below:
+
+```console
+$ sed -n '15,49p' /tmp/probe_q9_coalescing.py
+def run_surge(window_s):
+    # Simulate a maximal surge: data_received == True on every loop iteration
+    # (a paste burst / flood arriving as fast as poll() can return data).
+    start = monotonic()
+    last_main_loop_wakeup_at = start
+    wakeup_times = [start]                    # count the initial reference wakeup
+    events = 0
+    deferrals = 0
+    while True:
+        now = monotonic()
+        if now - start >= window_s:
+            break
+        events += 1
+        # data_received branch, child-monitor.c:1566-1567:
+        if now - last_main_loop_wakeup_at > input_delay:   # WAKEUP
+            last_main_loop_wakeup_at = now
+            wakeup_times.append(now)
+        else:                                              # has_pending_wakeups = true
+            deferrals += 1
+    intervals = [wakeup_times[i+1] - wakeup_times[i] for i in range(len(wakeup_times)-1)]
+    return events, deferrals, wakeup_times, intervals
+
+for window_ms in (60, 300):
+    events, deferrals, wt, intervals = run_surge(window_ms / 1000.0)
+    wakeups = len(intervals)                  # transitions = actual wakeup fires
+    print(f"--- surge window = {window_ms} ms ({window_ms/input_delay_ms:.0f} x input_delay) ---")
+    print(f"Q9 input_delay (real, Options)        = {input_delay_ms} ms")
+    print(f"Q9 surge read-events driven           = {events}")
+    print(f"Q9 wakeups fired                      = {wakeups}")
+    print(f"Q9 deferrals (coalesced, no wakeup)   = {deferrals}")
+    print(f"Q9 theoretical max wakeups=window/delay= {int(window_ms/input_delay_ms)}")
+    if intervals:
+        print(f"Q9 min inter-wakeup interval          = {min(intervals)*1000:.4f} ms")
+        print(f"Q9 mean inter-wakeup interval         = {statistics.mean(intervals)*1000:.4f} ms")
+        print(f"Q9 events coalesced per wakeup        = {events//max(1,wakeups)}")
+```
+
+A wakeup fires only when `now - last_main_loop_wakeup_at > input_delay` (the `:1566` guard); otherwise the read is deferred (`has_pending_wakeups = true`, `:1567`). `wakeups` is then the count of actual wakeup transitions (`len(intervals)`), and the inter-wakeup intervals are what bound the rhythm.
+
+Driving a maximal surge — `data_received == True` on every iteration — across representative multi-window runs (20× and 100× the `input_delay` window):
+
+```console
+$ ./kitty/launcher/kitty +launch /tmp/probe_q9_coalescing.py
+--- surge window = 60 ms (20 x input_delay) ---
+Q9 input_delay (real, Options)        = 3 ms
+Q9 surge read-events driven           = 426274
+Q9 wakeups fired                      = 19
+Q9 deferrals (coalesced, no wakeup)   = 426255
+Q9 theoretical max wakeups=window/delay= 20
+Q9 min inter-wakeup interval          = 3.0000 ms
+Q9 mean inter-wakeup interval         = 3.0001 ms
+Q9 events coalesced per wakeup        = 22435
+--- surge window = 300 ms (100 x input_delay) ---
+Q9 input_delay (real, Options)        = 3 ms
+Q9 surge read-events driven           = 2127514
+Q9 wakeups fired                      = 99
+Q9 deferrals (coalesced, no wakeup)   = 2127415
+Q9 theoretical max wakeups=window/delay= 100
+Q9 min inter-wakeup interval          = 3.0000 ms
+Q9 mean inter-wakeup interval         = 3.0001 ms
+Q9 events coalesced per wakeup        = 21490
+--- poll-timeout bound (child-monitor.c:1508) ---
+Q9 remaining input_delay window sample= 2.9988 ms (>=0 => poll waits this long)
+```
+
+- Over a **60 ms** surge, **426274** read-events collapsed to **19** wakeups (`theoretical max = window/input_delay = 20`); over **300 ms**, **2127514** read-events collapsed to **99** wakeups (max `100`). That is the coalescing — roughly **22435** and **21490** read-events per wakeup, respectively.
+- The **min inter-wakeup interval is `3.0000` ms** (mean `3.0001` ms): a wakeup is *never* emitted more often than once per `input_delay`, exactly the `> OPT(input_delay)` guard at `:1566`/`:1569`. This is the measured **"≤ one wakeup per `input_delay`"** behavior the source comment promises.
+- The `poll()`-timeout sample of **`2.9988` ms** (`:1508`) is the *remaining* `input_delay` window: a pending wakeup is scheduled to fire at the window boundary, not immediately.
 
 **How each timer keeps rhythm.**
 
-- **`input_delay` (3 ms)** throttles how often the I/O thread wakes the main thread. A surge of many small reads therefore produces *at most one* wakeup every 3 ms, so the render tick parses a batch rather than thrashing once per byte. (`repaint_delay`'s own note at `kitty/options/definition.py:866` adds that when input is pending it is ignored, to minimize latency.)
+- **`input_delay` (3 ms)** throttles how often the I/O thread wakes the main thread. A surge of many small reads therefore produces *at most one* wakeup every 3 ms — measured above as **19** wakeups over a 60 ms surge (and **99** over 300 ms) with a **`3.0000` ms** floor on the inter-wakeup interval — so the render tick parses a batch rather than thrashing once per byte. (`repaint_delay`'s own note at `kitty/options/definition.py:866` adds that when input is pending it is ignored, to minimize latency.)
 - **`repaint_delay` (10 ms)** bounds the *render* cadence (≈100 fps ceiling) so drawing does not run faster than useful.
 - **`resize_debounce_time` (0.1 0.5 s)** batches live-resize events so the program is asked to reflow only when resizing pauses/ends, not on every pixel of drag (`process_pending_resizes`, `kitty/child-monitor.c:1043`).
 
-> **Not runtime-timed (stated explicitly).** The coalescing *values* above are read from the parsed options at runtime and the coalescing *logic* is quoted verbatim from source. Actually measuring the ≤ one-wakeup-per-3 ms behavior requires the running main loop and the GLFW/OS wakeup fd, which an isolated `parse_bytes` probe does not drive; this document therefore does not paste a measured inter-wakeup interval, only the exact default (`input_delay = 3`) and the coalescing code that enforces it.
+> **Scope of the measurement (stated explicitly).** The numbers above are a genuine runtime timing measurement: the coalescing predicate is driven by kitty's actual `monotonic()` clock and the actual parsed `input_delay = 3` ms, at representative multi-window scale (20× and 100× the window). What is *not* exercised is the GLFW `glfwPostEmptyEvent` delivery itself (the observable side effect of the `WAKEUP` macro) and the full `run_main_loop`, because both require a display this headless container does not provide — `wakeup_main_loop()` aborts with `Segmentation fault` without GLFW. The part `input_delay` actually governs — *whether and when* to wake — is measured exactly as it runs in `io_loop`. (`repaint_delay` and `resize_debounce_time` values are likewise read from the parsed options at runtime; their render/reflow cadences run only inside the GLFW render loop and are quoted from source, not timed here.)
 
 **Rationale.** The parts stay in rhythm because the design separates *arrival* (edge-triggered, on the I/O thread) from *work* (batch-processed on a throttled main-thread tick). `input_delay` caps wakeup frequency, `repaint_delay` caps render frequency, and `resize_debounce_time` caps reflow frequency — three independent throttles that together prevent a fast or chaotic input source from turning into a runaway render/reflow loop.
 
@@ -541,7 +751,7 @@ if (time_delta >= 0) ret = poll(children_fds, self->count + EXTRA_FDS, monotonic
 - [x] **Q6 — shell-integration alignment.** **OSC 133** (`kitty/vt-parser.c:536` → `shell_prompt_marking` `kitty/screen.c:2328`, `PROMPT_START` `:2337`/`OUTPUT_START` `:2341`), **OSC 7** (`kitty/vt-parser.c:505` → `kitty/screen.c:2393`), **bracketed paste 2004** (`kitty/modes.h:81`, `paste_()` `kitty/screen.c:4573`, wrap `:4586-4588`, `MODE_GETSET` `:3854`); single VT parser in-band order shown at runtime; `modify_shell_environ()` (`kitty/shell_integration.py:218`).
 - [x] **Q7 — backpressure & unstable remote.** `BUF_SZ = 1024u*1024u` = 1 MiB (`kitty/vt-parser.c:18`), runtime-confirmed `1048576`; `vt_parser_has_space_for_input()` (`kitty/vt-parser.c:1477`); POLLIN gate (`kitty/child-monitor.c:1501`) → PTY flow control → child blocks on `write()`. SSH: `kittens/ssh/**`, `shell-integration/ssh/**` (bootstrap over `/dev/tty`); `kitty @` via `kitty/rc/*.py`; `ssh` suite passes.
 - [x] **Q8 — end-to-end settling.** Full flow PTY → `poll` → `read_bytes` → coalesced wakeup → tick (`process_pending_resizes` → `parse_input` → dispatch → `Screen`) → `render`; runtime probe shows mixed input settling and the buffer draining back to `1048576` bytes. Coalescing timers tied in.
-- [x] **Q9 — keeping rhythm.** `input_delay` = `3` (`kitty/options/definition.py:878`), `repaint_delay` = `10` (`kitty/options/definition.py:866`), `resize_debounce_time` = `0.1 0.5` (`kitty/options/definition.py:1182`) — all read at runtime; WAKEUP coalescing macro + "expensive operation … cocoa" comment (`kitty/child-monitor.c:1562-1566`) quoted verbatim.
+- [x] **Q9 — keeping rhythm.** `input_delay` = `3` (`kitty/options/definition.py:878`), `repaint_delay` = `10` (`kitty/options/definition.py:866`), `resize_debounce_time` = `0.1 0.5` (`kitty/options/definition.py:1182`) — all read at runtime; the WAKEUP coalescing predicate + "expensive operation … cocoa" comment quoted verbatim from `kitty/child-monitor.c:1562-1570` (with the poll-timeout bound at `:1506-1510`); **and measured at runtime** — a 60 ms / 300 ms surge coalesced `426274` / `2127514` read-events into `19` / `99` wakeups with a min inter-wakeup interval of `3.0000` ms (≤ one wakeup per `input_delay`), driven by kitty's real `monotonic()` clock and real `input_delay`.
 
 ### Exact literals index (as requested, never paraphrased)
 
