@@ -74,15 +74,24 @@ BUILD_EXIT=0
 **gitignored** (`.gitignore` contains `*.so` and `/kitty/launcher/kitt*`), so they do
 not alter the tracked tree: `kitty/launcher/kitty` (the native launcher),
 `kitty/launcher/kitten` (the Go CLI), and `kitty/fast_data_types.so` (the C
-extension). The build log's only notable line is a benign capability notice:
+extension). The build log's only notable output is a benign Wayland-detection notice
+(the container has no `wayland-protocols` dev package). The first six lines of the real
+`CI=true python3 setup.py` log, captured verbatim, are:
 
 ```
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
 Package 'wayland-protocols', required by 'virtual:world', not found
-... Disabling building of wayland backend
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
 ```
 
-This is expected — the container targets X11/Xvfb, not Wayland — and does not affect
-the X11 headless run used throughout this document.
+These lines are emitted by `setup.py:940` → `print(err, file=sys.stderr)` (the
+`pkg-config` failure) followed by `setup.py:941` →
+`print(error('Disabling building of wayland backend'), file=sys.stderr)`. This is
+expected — the container targets X11/Xvfb, not Wayland — and does not affect the X11
+headless run used throughout this document.
 
 Dependency floors, for context (from `docs/build.rst`, `pyproject.toml`, `go.mod`):
 
@@ -97,11 +106,21 @@ Dependency floors, for context (from `docs/build.rst`, `pyproject.toml`, `go.mod
 ### 4.3 Headless harness (verified pattern)
 
 Kitty's renderer is **entirely GPU/OpenGL-based** — there is no CPU text-drawing
-fallback. On a machine with no GPU and no physical display, the standard approach is
-a virtual X11 display (`Xvfb`) paired with Mesa's software OpenGL (llvmpipe), which
-supplies an OpenGL core profile well above Kitty's minimum. The `xvfb-run` wrapper
-starts Xvfb, runs the program against it, and tears Xvfb down afterward. The verified
-smoke run:
+fallback. This is grounded in the project's own design description,
+`docs/overview.rst:16` → `using only OpenGL for rendering everything.`, and is why the
+headless launch must supply a real OpenGL context and fails without a `DISPLAY`. On a
+machine with no GPU and no physical display, the standard approach is a virtual X11
+display (`Xvfb`) paired with Mesa's software OpenGL (llvmpipe), which supplies an
+OpenGL core profile well above Kitty's minimum. That minimum is defined at
+`kitty/data-types.h:20` → `#define OPENGL_REQUIRED_VERSION_MAJOR 3` and (on Linux, the
+`#else` branch) `kitty/data-types.h:24` → `#define OPENGL_REQUIRED_VERSION_MINOR 1`
+(macOS uses minor `3` at `kitty/data-types.h:22`) — i.e. **GL 3.1** on Linux. It is
+enforced at `kitty/gl.c:73` → the version comparison and `kitty/gl.c:74` →
+`fatal("OpenGL version is %d.%d, version >= %d.%d required for kitty", ...)`, which
+aborts startup if the detected context is below the floor (there is no CPU fallback to
+degrade to). The observed `4.5 (Core Profile)` context (captured in §5) clears the
+`3.1` floor comfortably. The `xvfb-run` wrapper starts Xvfb, runs the program against it, and
+tears Xvfb down afterward. The verified smoke run:
 
 ```
 $ xvfb-run -a --server-args="-screen 0 1024x768x24" \
@@ -197,32 +216,58 @@ location; stages that print during boot are tied to the verbatim line above.
    `kitty/main.py:202` → `def _run_app(opts: Options, args: CLIOptions, ...)` and
    `kitty/main.py:239` → `class AppRunner:`. This parses CLI, sets up env/locale/signals,
    and drives the rest. *(Silent.)*
-6. **GLFW windowing + OpenGL context** — `kitty/main.py:514` →
-   `init_glfw(opts, cli_opts.debug_keyboard, cli_opts.debug_rendering)`. The OpenGL
-   version is detected and printed at `kitty/gl.c:72` →
+6. **GLFW library init + OpenGL context/version detection** — `kitty/main.py:514` →
+   `init_glfw(opts, cli_opts.debug_keyboard, cli_opts.debug_rendering)` initializes the
+   GLFW library. The OpenGL context itself is created together with the OS window
+   (step 8); as GLAD loads against that context the version is detected and printed at
+   `kitty/gl.c:72` →
    `if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", ...)`,
    with the string built by `kitty/gl.c:42` → `gl_version_string(void) {` and
    `kitty/gl.c:47` → `snprintf(buf, sizeof(buf), "'%s' Detected version: %d.%d", ...)`.
    **Observed (stdout):** `[0.127] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5`
-   — this is the concrete proof the software-GL context came online.
-7. **Font initialization** — the resolved-font block is emitted by
-   `kitty/fonts/render.py:163` → `log_error('Text fonts:')` (covered in detail in §8;
-   it prints only under `--debug-font-fallback`).
-8. **Boss controller** — `kitty/boss.py:323` → `class Boss:`; it registers itself as the
-   singleton at `kitty/boss.py:375` → `set_boss(self)`, and brings up sessions/windows at
-   `kitty/boss.py:1181` → `def start(self, first_os_window_id: int, startup_sessions: Iterable[Session]) -> None:`.
-   *(Silent by default; its effect is the OS window + child appearing next.)*
-9. **Child-monitor threads** — the C core runs a three-thread engine declared at
-   `kitty/child-monitor.c:229` → `static void* io_loop(void *data);` and
-   `kitty/child-monitor.c:230` → `static void* talk_loop(void *data);` (plus the main
-   thread). The IO thread pumps PTY bytes (see §7). *(Silent.)*
-10. **OS window created** — `kitty/glfw.c:1321` → `debug("OS Window created\n");`.
-    **Observed (stderr):** `[0.150] OS Window created` — proof the GLFW/X11 window exists.
-11. **Child + PTY spawn** — the shell is forked onto a PTY (see §7 for `kitty/child.py`),
-    and a marker is printed by `kitty/window.py:871` →
+   — this is the concrete proof the software-GL context came online. Its `0.127`
+   timestamp precedes the `0.150 OS Window created` line (step 8) because the version is
+   printed early in window/context creation, while the "created" log fires at the end.
+7. **Font initialization** — the font faces are loaded by `kitty/main.py:251` →
+   `set_font_family(opts)`, which runs in the `run_app` wrapper **before** `_run_app`
+   (`kitty/main.py:252`) and therefore **before** the OS window is created. The
+   resolved-font block is only *logged* later, by `kitty/main.py:229` →
+   `dump_font_debug()` (which emits `kitty/fonts/render.py:163` → `log_error('Text fonts:')`),
+   and only under `--debug-font-fallback` (covered in detail in §8). *(Silent unless
+   `--debug-font-fallback`.)*
+8. **OS window created** — inside `_run_app` the window is created **first**, at
+   `kitty/main.py:221` → `window_id = create_os_window(`; this brings up the GLFW/X11
+   window and its OpenGL context (the GL-version line of step 6 is emitted from within
+   this call) and logs `kitty/glfw.c:1321` → `debug("OS Window created\n");`.
+   **Observed (stderr):** `[0.150] OS Window created` — proof the GLFW/X11 window exists.
+9. **Boss controller** — **only after** the OS window exists is the central controller
+   constructed, at `kitty/main.py:226` →
+   `boss = Boss(opts, args, cached_values, global_shortcuts, talk_fd)` (`kitty/boss.py:323`
+   → `class Boss:`), which registers itself as the singleton at `kitty/boss.py:375` →
+   `set_boss(self)`. It is then started at `kitty/main.py:227` →
+   `boss.start(window_id, startup_sessions)` (`kitty/boss.py:1181` →
+   `def start(self, first_os_window_id: int, startup_sessions: Iterable[Session]) -> None:`).
+   *(Silent by default.)*
+10. **Child-monitor threads** — `boss.start` brings up the C event engine at
+    `kitty/boss.py:1183` → `self.child_monitor.start()`. The **main thread** and the
+    **I/O thread** (`kitty/child-monitor.c:229` → `static void* io_loop(void *data);`) come
+    up on every launch — the I/O thread is created unconditionally at
+    `kitty/child-monitor.c:291` → `ret = pthread_create(&self->io_thread, NULL, io_loop, self);`.
+    The **talk thread** (`kitty/child-monitor.c:230` → `static void* talk_loop(void *data);`)
+    is started **only** when a talk/listen socket is configured:
+    `kitty/child-monitor.c:285` → `if (self->talk_fd > -1 || self->listen_fd > -1) {` guards
+    `kitty/child-monitor.c:286` →
+    `if ((ret = pthread_create(&self->talk_thread, NULL, talk_loop, self)) != 0) {`. So this
+    default `--debug-rendering` launch (no `--listen-on`) runs just the **main thread + I/O
+    thread**; the talk thread belongs to the same ChildMonitor subsystem but only comes up
+    for remote-control/listen scenarios such as the Q3 probe (§7, which uses `--listen-on`).
+    The I/O thread pumps PTY bytes (see §7). *(Silent.)*
+11. **Child + PTY spawn** — `boss.start` then spawns the shell onto a PTY (see §7 for
+    `kitty/child.py`), and a marker is printed by `kitty/window.py:871` →
     `print(f'[{now:.3f}] Child launched', file=sys.stderr)` (gated on
     `boss.args.debug_rendering`). **Observed (stderr):** `[0.162] Child launched` — proof
-    the child process was launched onto its pseudo-terminal.
+    the child process was launched onto its pseudo-terminal, **after** the OS window
+    (`0.150`) already existed.
 
 ### 5.2 What you actually see (log evidence, summarized)
 
@@ -296,9 +341,13 @@ appears:
 
 Per-item parsing is generated in `kitty/options/parse.py` (1482 lines), and the resolved
 options are pushed to the C core via `kitty/options/to-c-generated.h` (1346 lines). A
-human-readable dump of the live configuration is available at
-`kitty/debug_config.py:231` → `def debug_config(opts: KittyOpts) -> str:` (bound to the
-`kitty_mod+f6` action inside a running terminal).
+human-readable dump of the live configuration is produced by the function
+`kitty/debug_config.py:231` → `def debug_config(opts: KittyOpts) -> str:`. That function
+is *bound* to a key elsewhere, not in `debug_config.py`: the default binding is declared
+at `kitty/options/definition.py:4256` → `'debug_config kitty_mod+f6 debug_config',` and
+generated into `kitty/options/types.py:914` →
+`KeyDefinition(trigger=SingleKey(mods=256, key=57369), definition='debug_config')`, so
+pressing `kitty_mod+f6` inside a running terminal invokes it.
 
 ### 6.2 Real-launch output proving the defaults are in force
 
@@ -406,9 +455,14 @@ are wired to the slave. Kitty sets this up as follows:
    `kitty/shell_integration.py:223` → `env['KITTY_SHELL_INTEGRATION'] = ksi`. Support is
    decided by `kitty/shell_integration.py:186` → `def get_supported_shell_name(path: str) -> Optional[str]:`,
    which returns a name only for shells in `ENV_MODIFIERS` (bash/zsh/fish) and `None`
-   otherwise. The shell-side scripts that consume this — `shell-integration/bash/kitty.bash`
-   (391 lines) and `shell-integration/zsh/kitty.zsh` (21 lines) — emit **OSC 133** prompt
-   marks, **OSC 7** cwd reporting, and **DECSCUSR** cursor-shape sequences back to Kitty.
+   otherwise. The shell-side scripts that consume this differ by shell:
+   `shell-integration/bash/kitty.bash` (391 lines) contains the bash integration directly,
+   whereas `shell-integration/zsh/kitty.zsh` (21 lines) does **not** emit sequences itself —
+   it is only a wrapper that autoloads and invokes `shell-integration/zsh/kitty-integration`
+   (the 21-line file even notes that "users are discouraged from sourcing kitty.zsh in
+   favor of invoking kitty-integration directly"). It is `kitty-integration` that emits the
+   zsh **OSC 133** prompt marks, **OSC 7** cwd reporting, and **DECSCUSR** cursor-shape
+   sequences back to Kitty.
 4. **Byte pump + VT parser.** The child-monitor IO thread (`kitty/child-monitor.c:229`
    `io_loop`) reads bytes off the PTY master and feeds them to the VT state machine, which
    classifies every byte: `kitty/vt-parser.c:230` → `consume_normal(PS *self) {` (printable
@@ -424,14 +478,18 @@ are wired to the slave. Kitty sets this up as follows:
 
 Because the earlier boot run launched `sh -c ...`, and `sh` (dash) is **not** a supported
 shell, `KITTY_SHELL_INTEGRATION` was correctly **absent**. Re-running with **bash** (a
-supported shell) and reading two variables back off the rendered screen confirms both the
-integration-env injection and the terminal-type wiring. Real captured output:
+supported shell) **under the same Xvfb harness (§4.3)** and reading two variables back off
+the rendered screen confirms both the integration-env injection and the terminal-type
+wiring. The background Kitty is launched under `xvfb-run` (it needs a display); the
+`kitty @` client then connects over the UNIX control socket and needs no display of its
+own. Real captured output:
 
 ```
-$ ./kitty/launcher/kitty --config NONE -o allow_remote_control=yes \
+$ xvfb-run -a --server-args="-screen 0 1024x768x24" \
+    ./kitty/launcher/kitty --config NONE -o allow_remote_control=yes \
     --listen-on unix:/tmp/kitty_test_tmp/ksi.sock \
     bash --norc --noprofile -c 'printf "KSI=[%s]\n" "$KITTY_SHELL_INTEGRATION"; printf "TERM=[%s]\n" "$TERM"; sleep 8' &
-# then, against the same socket:
+# then, against the same socket (no display needed by the client):
 $ ./kitty/launcher/kitty @ --to unix:/tmp/kitty_test_tmp/ksi.sock get-text
 KSI=[enabled]
 TERM=[xterm-kitty]
@@ -450,15 +508,18 @@ host terminal." Instead, Kitty's remote control reads the **rendered grid** back
 string the shell printed can be recovered from the screen model, then those child bytes
 were received, classified by the VT parser, and drawn into the grid.
 
-A temporary probe (created under `/tmp`, deleted afterward) launched Kitty with remote
-control enabled, had the shell print a unique marker `READY_MARKER_42`, then read the
-screen back with `get-text` and the geometry with `ls`. Real captured output:
+A temporary probe (created under `/tmp`, deleted afterward) launched Kitty **under the
+Xvfb harness (§4.3)** with remote control enabled, had the shell print a unique marker
+`READY_MARKER_42`, then read the screen back with `get-text` and the geometry with `ls`.
+As above, only the background Kitty needs the display; the `kitty @` client connects over
+the UNIX socket. Real captured output:
 
 ```
-$ ./kitty/launcher/kitty --config NONE -o allow_remote_control=yes \
+$ xvfb-run -a --server-args="-screen 0 1024x768x24" \
+    ./kitty/launcher/kitty --config NONE -o allow_remote_control=yes \
     --listen-on unix:/tmp/kitty_test_tmp/krc.sock \
     sh -c "printf '%s\n' 'READY_MARKER_42'; sleep 8" &
-# read the rendered screen text back:
+# read the rendered screen text back (client connects to the socket, no display needed):
 $ ./kitty/launcher/kitty @ --to unix:/tmp/kitty_test_tmp/krc.sock get-text
 READY_MARKER_42
 ```
@@ -550,12 +611,18 @@ atlas managed by `kitty/glyph-cache.c` (91 lines).
 terminal. Real captured failure:
 
 ```
-$ xvfb-run -a --server-args="-screen 0 1024x768x24" ./kitty/launcher/kitty +list-fonts
-Error: open /dev/tty: no such device or address        # exit status 1
+$ xvfb-run -a --server-args="-screen 0 1024x768x24" \
+    ./kitty/launcher/kitty +list-fonts 2> /tmp/lf.err; echo "LIST_EXIT=$?"
+LIST_EXIT=1
+$ cat /tmp/lf.err
+Error: open /dev/tty: no such device or address
 ```
 
-`+list-fonts` needs `/dev/tty`, which does not exist headless, so it exits `1`. Font
-evidence is therefore taken from `--debug-font-fallback` (above), **not** `+list-fonts`.
+The exit code and the stderr are captured separately above: the process exits `1`
+(`LIST_EXIT=1`) and its sole stderr line is `Error: open /dev/tty: no such device or
+address` (verbatim, with no trailing annotation). `+list-fonts` needs `/dev/tty`, which
+does not exist headless, so it fails this way. Font evidence is therefore taken from
+`--debug-font-fallback` (above), **not** `+list-fonts`.
 
 ### 8.2 Layout (the computed grid: columns × lines)
 
@@ -627,8 +694,8 @@ Normal/Bold/Italic/Bold-Italic (`render.py:163`), rasterized by FreeType (`freet
 cached in the GPU atlas (`glyph-cache.c`). *Layout* — a computed `71 × 22` grid
 (`kitten @ ls`) derived from font metrics and the 640-px window. *Scrolling* — 2000 lines
 of scrollback (`history.c:287` + `definition.py:372`). *Screen updates* — the GLSL cell
-program (`shaders.c:217`) drawing frames that are presented by
-`swap_window_buffers`/`glfwSwapBuffers` in **`kitty/glfw.c:1802/:1221`** (corrected anchor),
+program (`shaders.c:217`) drawing frames that are presented by `swap_window_buffers`
+(`kitty/glfw.c:1802`) and `glfwSwapBuffers` (`kitty/glfw.c:1221`) (corrected anchors),
 paced by `repaint_delay = 10`. The `GL version string`, `OS Window created`, and
 `Text fonts:` log lines are the console evidence the display system is live.
 
@@ -639,12 +706,17 @@ paced by `repaint_delay = 10`. The `GL version string`, `OS Window created`, and
 
 Re-reading each question and confirming every sub-part is addressed by content above:
 
-- [x] **Q1a — Systems that start up enumerated.** §5.1 lists the full chain: native
-  launcher (`main.c:439`) → single-instance dispatch (`main.c:436`) → CPython bootstrap
-  (`main.c:211/216`) → entry dispatch (`entry_points.py:151`) → GUI `main()`
-  (`main.py:524`) → GLFW/OpenGL (`main.py:514`, `gl.c:72`) → fonts (`render.py:163`) →
-  Boss (`boss.py:323/375/1181`) → child-monitor threads (`child-monitor.c:229/230`) → OS
-  window (`glfw.c:1321`) → child/PTY (`child.py`, `window.py:871`).
+- [x] **Q1a — Systems that start up enumerated (in source order).** §5.1 lists the full
+  chain: native launcher (`main.c:439`) → single-instance dispatch (`main.c:436`) →
+  CPython bootstrap (`main.c:211/216`) → entry dispatch (`entry_points.py:151`) → GUI
+  `main()` (`main.py:524`) → GLFW library init + GL context/version (`main.py:514`,
+  `gl.c:72`) → fonts (`set_font_family` `main.py:251`; dump at `render.py:163`) → **OS
+  window created** (`create_os_window` `main.py:221` → `glfw.c:1321`) → **Boss** (`main.py:226`;
+  `boss.py:323/375`) → `boss.start` (`main.py:227`; `boss.py:1181/1183`) → **child-monitor**
+  (I/O thread `child-monitor.c:229/291` always; talk thread `child-monitor.c:230/286`
+  only when `talk_fd`/`listen_fd` set, `child-monitor.c:285`) → child/PTY (`child.py`,
+  `window.py:871`). The OS window is created **before** Boss, matching `kitty/main.py:221-227`
+  and the observed log order (`[0.150] OS Window created` precedes `[0.162] Child launched`).
 - [x] **Q1b — On-screen/log evidence quoted verbatim.** §5 quotes `GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5`,
   `OS Window created`, `Child launched`; §4.4 explains the `[%.3f]` elapsed-seconds format
   (`logging.c:56`); §5.3 labels the systemd line (`systemd.c:87`) benign.
@@ -670,7 +742,8 @@ Re-reading each question and confirming every sub-part is addressed by content a
 - [x] **Q4c — Scrolling evidence.** §8.3: scrollback `historybuf_add_line`
   (`history.c:287`) with `scrollback_lines = 2000` (`definition.py:372`).
 - [x] **Q4d — Screen-update evidence.** §8.4: GLSL cell program (`shaders.c:217`) + buffer
-  swap in **`kitty/glfw.c:1802/:1221`** (citation correction noted and verified).
+  swap via `swap_window_buffers` (`kitty/glfw.c:1802`) and `glfwSwapBuffers`
+  (`kitty/glfw.c:1221`) (citation correction noted and verified).
 - [x] **Build/run preamble present with real exit codes.** §4.2 `BUILD_EXIT=0`; §4.3
   `RUN_EXIT=0`; §5 `RUN_EXIT=0`.
 - [x] **Read-only + cleanup.** All observation scripts/logs were created only under `/tmp`
