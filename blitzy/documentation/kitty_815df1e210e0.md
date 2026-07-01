@@ -150,7 +150,7 @@ read_bytes(int fd, Screen *screen) {
 
 **Rationale:** with the PTY undrained, the kernel's PTY buffer fills and the child's next `write()` **blocks** (or returns `EAGAIN` if the child made its end non-blocking). Backpressure is thus propagated to the producer by the operating system, with no application-level protocol — the elegant reason kitty needs no "stop" message.
 
-**Observed (Approach B):** the real `io_loop` poll trace (debug build with `DEBUG_POLL_EVENTS`) shows the child fd (`EXTRA_FDS = 2`, so index `i:2` is the first child) being polled for `POLLIN` only while the parser has space. Command: real headless `kitty` on `Xvfb :99` with a child emitting queries, stdout captured to `/tmp/kitty_io.out`:
+**Observed (Approach B) — normal poll scheduling.** The real `io_loop` poll trace (debug build with `DEBUG_POLL_EVENTS`) shows the child fd (`EXTRA_FDS = 2`, so index `i:2` is the first child) being scheduled for `POLLIN`/`POLLOUT` under ordinary query load. Command: real headless `kitty` on `Xvfb :99` with a child emitting queries, stdout captured to `/tmp/kitty_io.out`:
 
 ```text
 i:0 POLLIN
@@ -166,7 +166,28 @@ i:2 POLLHUP
 i:0 POLLIN
 ```
 
-`i:2 POLLIN` appears while the buffer has room; `i:2 POLLOUT` appears interleaved when there are bytes to write back (see Q2). When the buffer would be full, the corresponding `events` is `0` and no `i:2 POLLIN` is issued — the pause.
+`i:2 POLLIN` and `i:2 POLLOUT` appear interleaved — reads and write-backs scheduled per cycle (`POLLOUT` is covered in Q2). Under this interactive query load the 1 MiB buffer never fills, so **this trace does not by itself contain an `events = 0` pause line**; capturing that live would require scripting a sustained multi-MiB flood that outruns the parser inside the GUI, which was not isolated here (an explicit limitation). Instead, the pause *condition* is evidenced directly and deterministically below by driving the parser buffer to `BUF_SZ` in-process and then measuring the producer's `write()`.
+
+**Observed (Approach A) — the pause condition itself (buffer full → no `POLLIN`).** Filling the VT-parser buffer *without parsing* drives it to exactly `BUF_SZ`; the next `test_create_write_buffer()` then reports **0 bytes of available space**. That available size is exactly `BUF_SZ - (self->read.sz + self->write.pending)` (`vt-parser.c:1457`), so a size of `0` is precisely `read.sz + write.pending == BUF_SZ` — i.e. `vt_parser_has_space_for_input() == False` (`vt-parser.c:1481`), the exact value the pause gate at `child-monitor.c:1501` uses to set the child fd's `events` to `0`. Command: `./kitty/launcher/kitty +launch /tmp/obs_pause.py`:
+
+```text
+PART1_create_write_buffer_available_sizes = [1048576, 0]
+PART1_commit_sizes = [1048576, 0]
+PART1_total_committed_without_parsing = 1048576 (BUF_SZ = 1048576 )
+PART1_available_space_when_full = 0
+PART1_vt_parser_has_space_for_input_equals_False (available==0 and used==BUF_SZ) -> True
+```
+
+The available space collapses to `0` the moment `1048576` bytes (`= BUF_SZ`) are buffered, and the harness confirms `vt_parser_has_space_for_input()` is `False`. Per `child-monitor.c:1501` that makes `events = 0` and **no `POLLIN` is requested for the child** — reads pause; `read_bytes` reinforces this by returning immediately when there is no space (`child-monitor.c:1342`).
+
+**Observed (Approach B, OS primitive — same `openpty()` technique as Q2(a) below) — the pause propagates to the producer as OS backpressure.** With kitty no longer draining the PTY master, a process writing into the PTY blocks. Measured with kitty's own `openpty()` (the writer's end made non-blocking so the block surfaces as `EAGAIN` instead of hanging the observation), the `write()` stops after `12288` bytes:
+
+```text
+PART2_child_write_to_pty_blocked_after_bytes = 12288
+PART2_errno = 11 (EAGAIN = 11 , EWOULDBLOCK = 11 )
+```
+
+Once the kernel PTY buffer is full (here after `12288` bytes) the producer's `write()` returns `EAGAIN` (errno `11`) — precisely the "child feels a full pipe" backpressure that the `POLLIN` pause creates, with no application-level stop message. Together the two observations demonstrate the full chain the code implements: **buffer full (`vt_parser_has_space_for_input() == False`) → `events = 0` / no `POLLIN` (`child-monitor.c:1501`) → PTY undrained → the producer's `write()` blocks / `EAGAIN`.**
 
 ### (c) THROTTLE / COALESCE — defer parsing to batch bursty input
 
@@ -187,6 +208,8 @@ The `16 * 1024` term is the force-flush guard: once `read.sz` is within 16 KiB o
 // kitty/child-monitor.c:1509
             if (time_delta >= 0) ret = poll(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(time_delta));
 ```
+
+The `io_loop` reaches the parser through **`do_parse`** (`child-monitor.c:438`): it calls `self->parse_func` (which runs the `run_worker` coalescing gate above) and then, at `child-monitor.c:441`–`446`, schedules the next wake — `set_maximum_wait(OPT(input_delay) - pd.time_since_new_input)` while input remains to be coalesced (both when input was read and when `pd.has_pending_input`), and it calls `wakeup_io_loop(self, false)` when parsing freed write-buffer space (`pd.write_space_created`), which is how a *paused* child (Q1b) is promptly re-armed for `POLLIN` once room reopens. `do_parse` is thus the loop-side half of the `input_delay` throttle — the counterpart to `run_worker`'s parser-side gate.
 
 The timing defaults come from the options definition:
 
@@ -276,7 +299,7 @@ Wrote: 13 bytes: \x1b[?62;c\x1b[1;1R
 Wrote: 12 bytes: \x1b_Gi=31;OK\x1b\\
 ```
 
-The first line is kitty answering the child's Primary Device Attributes (`ESC[c`) and Cursor Position Report (`ESC[6n`) queries; the second is the graphics-query response `Gi=31;OK` wrapped as an APC — routed through the `screen.c` bridge (below). Under a sustained flood the trace becomes a steady stream of `Wrote: 2048 bytes: AAAA...` lines, one per `POLLOUT` cycle — the write buffer draining incrementally.
+The first line is kitty answering the child's Primary Device Attributes (`ESC[c`) and Cursor Position Report (`ESC[6n`) queries; the second is the graphics-query response `Gi=31;OK` wrapped as an APC — routed through the `screen.c` bridge (below). These are two **separate** writable cycles — each queued response drained on its own `POLLOUT`, which is the deferred, incremental flush the design intends: after each `write()` the routine advances by the bytes actually taken, `memmove`s any remainder to the front of `write_buf`, and keeps `POLLOUT` armed only while `write_buf_used > 0` (`child-monitor.c:1472`–`1474`, re-arm at `:1503`). The genuine partial-write slice is quantified in Q2(a) above — a single `write()` took `11776` of `65536` bytes before `EAGAIN`, leaving the remainder for the next cycle. *(A longer sustained-flood trace with larger per-cycle chunks was not isolated in this environment, so no specific per-`POLLOUT` byte count beyond these observed values is claimed.)*
 
 ### (c) Unrecoverable write error → discard with a diagnostic
 
@@ -351,6 +374,7 @@ Every row was re-verified in the container with `sed -n 'Np' <file>` at HEAD `81
 | Coalescing poll timeout | `kitty/child-monitor.c:1508` / `:1509` | `io_loop` | `monotonic_t time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);` |
 | Blocking poll when no pending wakeups | `kitty/child-monitor.c:1512` | `io_loop` | `ret = poll(children_fds, self->count + EXTRA_FDS, -1);` |
 | Read into parser buffer (early-return when full) | `kitty/child-monitor.c:1337` / `:1342` | `read_bytes` | `if (!available_buffer_space) return true;` |
+| **Parse step + `input_delay` wakeup / coalescing** | `kitty/child-monitor.c:438` / `:441`–`:446` | `do_parse` | `if (pd.write_space_created) wakeup_io_loop(self, false); … } else set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);` |
 | POLLIN read dispatch | `kitty/child-monitor.c:1531` | `io_loop` | `has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);` |
 | Write to child | `kitty/child-monitor.c:1443` | `write_to_child` | `write_to_child(int fd, Screen *screen) {` |
 | **EAGAIN/EWOULDBLOCK defer** | `kitty/child-monitor.c:1463` | `write_to_child` | `if (errno == EWOULDBLOCK \|\| errno == EAGAIN) break;` |
@@ -368,10 +392,12 @@ Every row was re-verified in the container with `sed -n 'Np' <file>` at HEAD `81
 | 400 MB per-transmission limit | `kitty/graphics.c:521` | `#define MAX_DATA_SZ` | `#define MAX_DATA_SZ (4u * 100000000u)` |
 | **EFBIG abort** (size clause OR non-PNG) | `kitty/graphics.c:533` | (load) | `if (load_data->buf_used + g->payload_sz > MAX_DATA_SZ \|\| data_fmt != PNG) ABRT("EFBIG", "Too much data");` |
 | ENODATA (used for quiet demo) | `kitty/graphics.c:609` | (load) | `ABRT("ENODATA", "Insufficient image data: %zu < %zu", …)` |
-| **ENOSPC abort** (disk cache) | `kitty/graphics.c:746` | (load) | `ABRT("ENOSPC", "Failed to store image data in disk cache");` |
-| ENOSPC (frame variant) | `kitty/graphics.c:1858` | (frame) | `set_command_failed_response("ENOSPC", "Failed to store image data in disk cache");` |
+| **ENOSPC abort — 5× animation-frame quota (the demonstrated Q4-ii path)** | `kitty/graphics.c:1573` | (frame) | `ABRT("ENOSPC", "Cache size exceeded cannot add new frames");` |
+| ENOSPC — add-to-cache failure (frame) | `kitty/graphics.c:1627` / `:1661` | (frame) | `ABRT("ENOSPC", "Failed to cache data for image frame");` |
+| ENOSPC — root-image disk-cache store (*not* the Q4-ii path) | `kitty/graphics.c:746` | (load) | `ABRT("ENOSPC", "Failed to store image data in disk cache");` |
+| ENOSPC — frame-composition store (*not* the Q4-ii path) | `kitty/graphics.c:1858` | (frame) | `set_command_failed_response("ENOSPC", "Failed to store image data in disk cache");` |
 | Build final response / quiet gate | `kitty/graphics.c:759`–`763` | `finish_command_response` | `if (g->quiet) { if (is_ok_response \|\| g->quiet > 1) return NULL;` |
-| 5× animation disk-cache quota | `kitty/graphics.c:1570` | (frame) | `if (is_new_frame && cache_size(self) + load_data->data_sz > self->storage_limit * 5) {` |
+| 5× animation-frame quota (condition; abort at `:1573`) | `kitty/graphics.c:1570` | (frame) | `if (is_new_frame && cache_size(self) + load_data->data_sz > self->storage_limit * 5) {` |
 | `input_delay` default (3 ms) | `kitty/options/definition.py:878` | `opt('input_delay', …)` | `opt('input_delay', '3',` |
 | `repaint_delay` default (10 ms) | `kitty/options/definition.py:866` | `opt('repaint_delay', …)` | `opt('repaint_delay', '10',` |
 
@@ -394,17 +420,19 @@ The response body is `Gi=1;EFBIG:Too much data`, wrapped as `\x1b_G…\x1b\\` (a
 
 ### (ii) `ENOSPC` + LRU eviction — storage stays bounded, older images evicted
 
-Using a deliberately small `g.storage_limit = 72` for determinism (the **real** default is `DEFAULT_STORAGE_LIMIT = 320u * (1024u * 1024u)`; see (iii)), transmitting three 36-byte images shows the image count **capped at 2** — the oldest is evicted — and total storage pinned to the limit; then eight animation frames succeed and the **ninth returns `ENOSPC`**. Command: `./kitty/launcher/kitty +launch /tmp/obs_a.py`:
+Using a deliberately small `g.storage_limit = 72` for determinism (the **real** default is `DEFAULT_STORAGE_LIMIT = 320u * (1024u * 1024u)`; see (iii)), transmitting three 36-byte images shows the image count **capped at 2** — the oldest is evicted — and total storage pinned to the limit; then eight animation frames succeed and the **ninth returns `ENOSPC`**. This reproduces `kitty_tests/graphics.py:1189`–`1205` (`test_graphics_quota_enforcement`); the observation additionally prints the raw APC response bytes and the parsed message for the 9th frame. Command: `./kitty/launcher/kitty +launch /tmp/obs_enospc.py`:
 
 ```text
 transmit i=1 -> OK | image_count = 1 | disk_cache.total_size = 36
 transmit i=2 -> OK | image_count = 2 | disk_cache.total_size = 72
 transmit i=3 -> OK | image_count = 2 | disk_cache.total_size = 72
 8 frames added to i=2 -> ['OK', 'OK', 'OK', 'OK', 'OK', 'OK', 'OK', 'OK']
-9th frame add to i=2 -> ENOSPC
+9th frame add to i=2 -> code = ENOSPC
+9th frame raw wtcbuf = b'\x1b_Gi=2,r=10;ENOSPC:Cache size exceeded cannot add new frames\x1b\\'
+9th frame parsed msg = 'Cache size exceeded cannot add new frames'
 ```
 
-`image_count` holds at `2` from `i=2` onward while `disk_cache.total_size` stays at the `72`-byte limit — LRU eviction (`apply_storage_quota`, `graphics.c:290`) removes the oldest image to make room. The 9th frame cannot fit and yields `ENOSPC` (`graphics.c:746` / frame variant `graphics.c:1858`).
+`image_count` holds at `2` from `i=2` onward while `disk_cache.total_size` stays at the `72`-byte limit — LRU eviction (`apply_storage_quota`, `graphics.c:290`) removes the oldest simple image to make room. The **9th *animation frame*** is then refused because the per-image frame cache would exceed the **5× animation quota** (`self->storage_limit * 5` = `360` bytes here). The observed response above is exactly `ENOSPC:Cache size exceeded cannot add new frames`, emitted by `ABRT("ENOSPC", "Cache size exceeded cannot add new frames")` at **`kitty/graphics.c:1573`**, inside the `if (is_new_frame && cache_size(self) + load_data->data_sz > self->storage_limit * 5)` gate at `graphics.c:1570`–`1573` (a `remove_images()` trim pass runs first, and the abort fires only if the frame still will not fit). Note the response also carries `r=10` — the frame number. *(The similarly-worded `ENOSPC:Failed to store image data in disk cache` message is a **different** path: `graphics.c:746` for a root image's disk-cache store and `graphics.c:1858` for frame composition; neither is the path this 9th-frame animation-quota scenario exercises. The remaining ENOSPC variant, `Failed to cache data for image frame` at `graphics.c:1627`/`:1661`, fires only when the underlying `add_to_cache()` itself fails.)*
 
 ### (iii) The **real 320 MiB** storage quota — crossing the genuine threshold
 
@@ -427,6 +455,8 @@ images_offered=45, images_retained=19, images_evicted=26
 
 Storage grows linearly to **288 MiB at image 24**, then when cumulative offered data crosses the **320 MiB** quota (`img 27: offered_cum = 324.00MiB`) the quota enforcement aggressively evicts, dropping `image_count` to `1`. Across the whole run the **peak** stored size is **312 MiB ≤ 320 MiB** — storage never exceeds the `335544320`-byte bound — and of 45 images offered, **26 were evicted** and 19 retained. This is the real-magnitude confirmation that the 320 MiB quota (`graphics.c:25`) with LRU eviction (`graphics.c:290`) keeps memory bounded under a flood.
 
+> **Note on the `literal 320u*(1024u*1024u) = 335544320` line above:** that string is the *observation script's own computed-equivalent label* (its f-string elided the spaces around the operators); it is a script label, **not** a verbatim quote of the source token. The exact source literal — re-verified with `sed -n '25p' kitty/graphics.c` — is `#define DEFAULT_STORAGE_LIMIT 320u * (1024u * 1024u)` (with spaces) at **`kitty/graphics.c:25`**; it evaluates to the same `335544320` bytes = 320 MiB reported by the run.
+
 ### (iv) The **100 MB** per-child write cap under a non-draining child
 
 Already shown in Q2(d): with a non-reading child, sending ~150 MB produced the exact write-cap log line, repeated as the buffer stayed pinned at the cap:
@@ -438,7 +468,7 @@ count = 22037
 
 ### (v) Deferred processing / incremental draining (timings)
 
-The `io_loop` poll trace interleaves `POLLIN` and `POLLOUT` on the child fd (`i:2`), and under a sustained flood the write buffer drains a fixed slice per writable cycle (`Wrote: 2048 bytes: …` per `POLLOUT`) — both shown verbatim in Q1(b) and Q2(b). Coalescing operates on the **3 ms** `input_delay` window (`options/definition.py:878`) via the poll timeout at `child-monitor.c:1508`.
+The `io_loop` poll trace interleaves `POLLIN` and `POLLOUT` on the child fd (`i:2`), and each queued response drains on its own writable cycle — shown verbatim by the two separate `Wrote: 13 bytes` / `Wrote: 12 bytes` writes in Q2(b) and the `11776`-of-`65536`-byte partial write (remainder deferred to the next cycle) in Q2(a). Coalescing operates on the **3 ms** `input_delay` window (`options/definition.py:878`) via the poll timeout at `child-monitor.c:1508`.
 
 ### (vi) Limitation — the 400 MB `MAX_DATA_SZ` size clause (reported honestly)
 
@@ -473,7 +503,7 @@ None of these emit any indicator: from the child's perspective, nothing has "shi
 
 ### Visible signs — protocol error responses and stderr log messages
 
-- **Graphics APC error responses** are the primary visible sign: `EFBIG:Too much data` (Q4-i), `ENOSPC:Failed to store image data in disk cache` (Q4-ii), each returned as `\x1b_Gi=<id>;<CODE>:<msg>\x1b\\`.
+- **Graphics APC error responses** are the primary visible sign: `EFBIG:Too much data` (Q4-i) and `ENOSPC:Cache size exceeded cannot add new frames` (Q4-ii — the 5× animation-frame quota abort at `graphics.c:1573`), each returned as `\x1b_Gi=<id>;<CODE>:<msg>\x1b\\` (the exact observed 9th-frame response was `\x1b_Gi=2,r=10;ENOSPC:Cache size exceeded cannot add new frames\x1b\\`).
 - **Stderr log messages**: the 100 MB write-cap line `Too much data being sent to child with id: 1, ignoring it` (Q2-d/Q4-iv), and the `perror` diagnostics (`child-monitor.c:1464`) on unrecoverable `write()`/`read()` errors.
 
 ### The `quiet` flag governs graphics-response visibility
@@ -532,12 +562,12 @@ A final check that every named item is addressed explicitly and by name.
 - 100 MB write cap drop — Q2(d)/Q4(iv), `child-monitor.c:341`–`342`. ✔
 - 320 MB storage quota + LRU eviction — Q4(ii)/(iii), `graphics.c:25`, `apply_storage_quota` `:290`. ✔
 - 400 MB per-transmission limit — Q4(vi), `MAX_DATA_SZ` `graphics.c:521` (size-clause crossing = documented limitation; EFBIG shown via the non-PNG clause of the same L533 condition). ✔
-- 5× animation disk-cache quota — Q5 corroboration, `graphics.c:1570`. ✔
+- 5× animation-frame quota → `ENOSPC:Cache size exceeded cannot add new frames` — Q4-ii (demonstrated) & Q5 corroboration, condition `graphics.c:1570`, abort `graphics.c:1573`. ✔
 - `quiet` flag suppression — Q5, `graphics.c:762`–`763`. ✔
 
 **Functions**
 
-`vt_parser_has_space_for_input` (Q1a, vt-parser.c:1477) • `run_worker` (Q1c, vt-parser.c:1417) • `read_bytes` (Q1b, child-monitor.c:1337) • `io_loop` (Q1, child-monitor.c:1481) • `write_to_child` (Q2a, child-monitor.c:1443) • `schedule_write_to_child` (Q2d/e, child-monitor.c:372) • `write_escape_code_to_child` (Q2e, screen.c:979) • `screen_handle_graphics_command` (Q2e, screen.c:1047) • `apply_storage_quota` (Q4ii, graphics.c:290) • `set_command_failed_response` (Q4i, graphics.c:305) • `finish_command_response` (Q4i/Q5, graphics.c:759). All ✔
+`vt_parser_has_space_for_input` (Q1a, vt-parser.c:1477) • `run_worker` (Q1c, vt-parser.c:1417) • `read_bytes` (Q1b, child-monitor.c:1337) • `io_loop` (Q1, child-monitor.c:1481) • `do_parse` (Q1c, child-monitor.c:438, wakeup/coalescing `:441`–`:446`) • `write_to_child` (Q2a, child-monitor.c:1443) • `schedule_write_to_child` (Q2d/e, child-monitor.c:372) • `write_escape_code_to_child` (Q2e, screen.c:979) • `screen_handle_graphics_command` (Q2e, screen.c:1047) • `apply_storage_quota` (Q4ii, graphics.c:290) • `set_command_failed_response` (Q4i, graphics.c:305) • `finish_command_response` (Q4i/Q5, graphics.c:759). All ✔
 
 **Conditions / literals**
 
