@@ -312,6 +312,10 @@ are three concrete, code-level mechanisms:
 2. **Output parsing is deliberately throttled by `OPT(input_delay)` (and frames by `OPT(repaint_delay)`).**
    The monitor caps how long it waits before processing newly arrived input with
    `set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);` [kitty/child-monitor.c:L445-L446].
+   Frame rendering is throttled separately by `OPT(repaint_delay)`: when no new input was read the
+   renderer defers the next frame with `set_maximum_wait(OPT(repaint_delay) - time_since_last_render);`
+   [kitty/child-monitor.c:L874-L876] (the visual-bell path arms the same delay with
+   `set_maximum_wait(OPT(repaint_delay));` [kitty/child-monitor.c:L804]).
    This is an explicit trade of output freshness for lower input latency / CPU — a prioritization
    knob, not an accident.
 3. **A scroll pauses rendering so the view coalesces cleanly.** As shown in §4.4, `dirty_scroll`
@@ -731,8 +735,9 @@ Confirming every question and every named sub-part is answered:
   - independent of history size → **flat across a 150× depth range** (§4.2).
   - under concurrent output → **sub-µs median (273.0 ns)**, p99 ≈ 678.1 ns (§4.3).
   - "signs of prioritizing one operation over another" → **three mechanisms**: `io_thread`
-    [child-monitor.c:L291], `input_delay`/`repaint_delay` [child-monitor.c:L445-L446],
-    `dirty_scroll`→`screen_pause_rendering` [screen.c:L1908-L1911] (§4.5).
+    [kitty/child-monitor.c:L291], `input_delay` [kitty/child-monitor.c:L445-L446] / `repaint_delay`
+    [kitty/child-monitor.c:L874-L876], `dirty_scroll`→`screen_pause_rendering`
+    [kitty/screen.c:L1908-L1911] (§4.5).
 - **Q3 — Buffer boundaries / allocation:**
   - at what point behavior changes → **every 2048-line segment boundary** (§5.1, §5.2).
   - "when does allocation of new storage occur" (the explicit e.g.) → **on demand at each boundary**
@@ -741,7 +746,7 @@ Confirming every question and every named sub-part is answered:
     2049/4097/6145/8193/10241 (§5.2).
   - tie to docs → **"Memory is allocated on demand."** [kitty/options/definition.py:L375-L376] (§5.4).
 - **Caveats:** default-scrollback wrap (`ynum=2000 < 2048`), negative → `2 ** 32 - 1`, pager-history
-  is a distinct ring, real-app wiring at `window.py:L604` (§6).
+  is a distinct ring, real-app wiring at `kitty/window.py:L604` (§6).
 
 Every behavioral statement above is traceable to either a quoted observed output line (with the
 command that produced it) or an exact `file:line` citation.
