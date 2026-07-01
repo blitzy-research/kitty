@@ -458,7 +458,7 @@ number of signature blocks           : 135
 signature size (sent receiver->sender): 2712 bytes
 ```
 
-The spec (`docs/file-transfer-protocol.rst`) defines the signature as a **12-byte header** (`uint16 version + uint16 checksum_type + uint16 strong_hash_type + uint16 weak_hash_type + uint32 block_size`, L417-L424) followed by per-block records of **20 bytes** each (`uint64 index + uint32 weak_hash + uint64 strong_hash`, L447-L451). The arithmetic checks out exactly:
+The spec (`docs/file-transfer-protocol.rst`) defines the signature as a **12-byte header** (`uint16 version + uint16 checksum_type + uint16 strong_hash_type + uint16 weak_hash_type + uint32 block_size`, L417-L425) followed by per-block records of **20 bytes** each (`uint64 index + uint32 weak_hash + uint64 strong_hash`, L447-L451). The arithmetic checks out exactly:
 ```
 12  (header)  +  135 blocks × 20 bytes/block  =  12 + 2700  =  2712 bytes  ✓
 ```
@@ -672,7 +672,7 @@ delta produced by sender: 233 bytes
 
 `src_file opened = True` is the observable proof that `open(self.path, 'rb')` at L430 ran against the pre-existing `file.bin`, and the 2712-byte signature (12 + 135×20; see O5) is computed from that file's *current* contents.
 
-**Rationale.** Because the signature is derived from whatever is already on disk, resuming an interrupted transfer is not a special case: the receiver simply re-signs the partial file and the sender computes a fresh delta against it. Whatever bytes already arrived are represented as *copy* operations and are never re-sent. The transfer kitten's own `--transmit-deltas` help text calls this out verbatim — `kittens/transfer/main.py:L117` describes using the rsync algorithm to update an existing file, *"automatically resuming partial transfers"*.
+**Rationale.** Because the signature is derived from whatever is already on disk, resuming an interrupted transfer is not a special case: the receiver simply re-signs the partial file and the sender computes a fresh delta against it. Whatever bytes already arrived are represented as *copy* operations and are never re-sent. The transfer kitten's own `--transmit-deltas` help text calls this out verbatim — `kittens/transfer/main.py:L115-L120` describes using the rsync algorithm to update an existing file, *"automatically resuming partial transfers"* (the quoted phrase is on `L119`).
 
 ---
 
@@ -817,7 +817,7 @@ Every objective was answered with **(a)** a real command — or, where full GUI/
 | O5 | Signature/difference data structures | signature = 2712 = 12+135×20; block size 134 | `tools/rsync/algorithm.go:L177-L183,L261,L362-L366`, `tools/rsync/api.go:L31-L43,L47-L61,L270`, `kittens/transfer/rsync.pyi:L24,L38,L45` |
 | O6 | Chunk encoding | `o6_encoding.py`: captured `ac=data … d=<base64>` and a real `zip=zlib` frame (round-trips); `d=QUJD`→`ABC` | `kitty/file_transmission.py:L254-L268,L22`, `kittens/transfer/send.go:L64,L131`, `kittens/transfer/utils.py:L41,L50`, `docs/file-transfer-protocol.rst:L497,L503` |
 | O7 | Receiver reassembly & discrimination | VT-parser `case FILE_TRANSFER_CODE`; deserialize + `parse_ftc`; 6/6 tests OK | `kitty/vt-parser.c:L547-L549`, `kitty/file_transmission.py:L377,L441` |
-| O8 | Resumption behavior | signature computed over existing file (`src_file opened=True`, 2712 B) | `kitty/file_transmission.py:L426-L439,L450,L469-L470`, `kittens/transfer/main.py:L117` |
+| O8 | Resumption behavior | signature computed over existing file (`src_file opened=True`, 2712 B) | `kitty/file_transmission.py:L426-L439,L450,L469-L470`, `kittens/transfer/main.py:L115-L120` |
 | O9 | Resumption metadata location | temp file (`tmp3k26qnmb` in the quoted run; suffix random per run) during patch → atomic replace → only `file.bin`; no sidecar | `kitty/file_transmission.py:L392,L405`, `kittens/transfer/receive.go:L91` |
 | O10 | Delta-efficiency evidence | **18000 → 233 bytes = 98.7% fewer** (delta payload; direct-`rsync.so` fallback for full GUI/SSH capture); reconstruction True; Block-vs-Data | `tools/rsync/algorithm.go:L261,L362-L366`, `kittens/transfer/main.py:L115`, `docs/kittens/transfer.rst:L80`, `docs/file-transfer-protocol.rst:L338` |
 
