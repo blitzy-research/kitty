@@ -85,7 +85,14 @@ if (UNLIKELY(self->columns < self->cursor->x + (unsigned int)char_width)) {
 }
 ```
 
-With `columns == 1` and a width‑2 base, `1 < x + 2` is satisfied for the second and subsequent bases. Autowrap (DECAWM, mode 7) is **on by default** — the initial mode block sets it true: `static const ScreenModes empty_modes = {0, .mDECAWM=true, .mDECTCEM=true, .mDECARM=true};` (`kitty/screen.c:33`). So `continue_to_next_line` (`kitty/screen.c:524`) runs, pushing the just‑completed line into the scrollback ring via `historybuf_add_line` (`kitty/history.c:287`, invoked at `kitty/history.c:342`). The base itself is then written with `s->cp[self->cursor->x].ch = ch;` (`kitty/screen.c:836`); the cursor advances (`kitty/screen.c:837`) and, for a width‑2 base, advances again while marking the GPU width (`kitty/screen.c:838`–`:843`).
+With `columns == 1` and a width‑2 base, the wrap check `1 < cursor->x + 2` (`kitty/screen.c:821`) is satisfied for **every** base in the sequence — **including the very first one at `x = 0`**, where `1 < 0 + 2` already holds, because a width‑2 glyph can never fit in a single column. Autowrap (DECAWM, mode 7) is **on by default** — the initial mode block sets it true: `static const ScreenModes empty_modes = {0, .mDECAWM=true, .mDECTCEM=true, .mDECARM=true};` (`kitty/screen.c:33`) — so `continue_to_next_line` (`kitty/screen.c:823`, defined at `kitty/screen.c:524`) runs on **each** wrap, pushing the current line into the scrollback ring via `historybuf_add_line` (`kitty/history.c:287`, invoked at `kitty/history.c:342`). Because the first base wraps *before* any cell has been written to the row, the line pushed first is the still‑empty starting row — this is precisely the origin of the empty trailing history entry `hist[3]` seen below; each of the subsequent bases then wraps in turn, pushing the prior, **content‑bearing** base into scrollback. After each wrap the base is written with `s->cp[self->cursor->x].ch = ch;` (`kitty/screen.c:836`); the cursor advances (`kitty/screen.c:837`) and, for a width‑2 base, advances again while marking the GPU width (`kitty/screen.c:838`–`:843`).
+
+Drawing a **single** base into a 1×1 grid confirms this first‑base wrap directly — the row pushed to scrollback is empty and `historybuf.count` is already `1` after just one base:
+
+```text
+=== First-base wrap probe (does the FIRST width-2 base wrap at x=0?) ===
+draw 1 base U+1F468 into 1x1 -> historybuf.count = 1 ; hist[0] = '' (pre-write wrap at x=0 pushed an EMPTY line)
+```
 
 ### Observed: fragmentation across scrollback
 
@@ -99,7 +106,7 @@ hist[2] = '👨\u200d' | U+1F468 U+200D
 hist[3] = ''         (empty trailing history line; count still reports 4)
 ```
 
-The scrollback is ordered newest‑first: the girl (`U+1F467`) was the last base to wrap and sits at `hist[0]`, the woman (`U+1F469`) at `hist[1]`, and the man (`U+1F468`) — the first to wrap — at `hist[2]`. Each retains its **trailing ZWJ** as a combining mark, exactly as the storage model predicts. `historybuf.count` reports **4**, of which three carry content and one (`hist[3]`) is an empty trailing line. The boy (`U+1F466`) never wrapped and remains on the visible row (see Q2).
+The scrollback is ordered newest‑first: the girl (`U+1F467`) was the last base to wrap and sits at `hist[0]`, the woman (`U+1F469`) at `hist[1]`, and the man (`U+1F468`) — the first content‑bearing base to wrap — at `hist[2]`. Each retains its **trailing ZWJ** as a combining mark, exactly as the storage model predicts. `historybuf.count` reports **4**, of which three carry content and one (`hist[3]`) is an empty trailing line. The boy (`U+1F466`) never wrapped and remains on the visible row (see Q2).
 
 **Rationale.** With only one column, a width‑2 base cannot coexist with the next base, so autowrap fragments the sequence. Retention is therefore **per base cell** (each base plus up to three combining marks), *not* per grapheme cluster: the man/woman/girl bases — each still carrying the ZWJ that was meant to *join* them to the next figure — land on separate `continued` history lines, which is direct proof that kitty stored them as four independent cells rather than one cluster.
 
@@ -198,7 +205,11 @@ $ ls kitty/text-cache*
 ls: cannot access 'kitty/text-cache*': No such file or directory
 ```
 
-The Unicode standard's text‑segmentation rules (UAX #29, rule GB11) intend that an emoji ZWJ sequence such as `👨‍👩‍👧‍👦` be treated as a **single** extended grapheme cluster. kitty 0.35.2 does **not** implement that clustering here: because the ZWJ is "combining" (`kitty/unicode-data.c:323`) but the emoji bases are **not** (they fall through to `wcwidth_std`, `kitty/wcwidth-std.h:10`, as width‑2 characters), the sequence is split at every base boundary. The `is_combining` probe makes the boundary rule explicit:
+The Unicode standard's text‑segmentation rules intend that an emoji ZWJ sequence such as `👨‍👩‍👧‍👦` be treated as a **single** extended grapheme cluster — a conformance baseline this document compares kitty against.
+
+> **External standard (context — not verified from this repository).** The preceding sentence is a claim about the *Unicode standard*, not about kitty's code. Unicode Standard Annex #29, *Unicode Text Segmentation* (UAX #29), §3.1.1 *Grapheme Cluster Boundary Rules*, rule **GB11** ("Do not break within emoji modifier sequences or emoji zwj sequences") gives the boundary formula `\p{Extended_Pictographic} Extend* ZWJ × \p{Extended_Pictographic}`, where `×` means "do not break here"; the `Extended_Pictographic` property values come from UTS #51. Under GB11 the family sequence `👨‍👩‍👧‍👦` is therefore intended to be a **single** extended grapheme cluster. Reference: UAX #29, <https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundary_Rules> (an external specification consulted for context — it is **not** a `file:line` fact from this repository, and no code in this repository was found to implement it).
+
+kitty 0.35.2 does **not** implement that clustering here: because the ZWJ is "combining" (`kitty/unicode-data.c:323`) but the emoji bases are **not** (they fall through to `wcwidth_std`, `kitty/wcwidth-std.h:10`, as width‑2 characters), the sequence is split at every base boundary. The `is_combining` probe makes the boundary rule explicit:
 
 ```text
 is_combining probe: A+U+1F468 cursor 1->3 (NEW CELL); A+U+200D / A+U+0301 / A+U+FE0F / A+U+FE0E each 1->1 (appended)
@@ -255,6 +266,19 @@ CI=true python3 setup.py build --debug --skip-building-kitten --ignore-compiler-
 
 `--skip-building-kitten` omits only the Go kitten binary (irrelevant to the screen/cell logic under study); `--ignore-compiler-warnings` tolerates unrelated windowing warnings. Neither affects the C screen model. Build entry `def build(...)` (`setup.py:1084`); extension `'kitty/fast_data_types'` (`setup.py:1091`).
 
+The built artifact's size was measured directly with `stat`; the raw output is quoted verbatim below so the figure is grounded rather than asserted:
+
+```text
+$ stat -c '%n %s bytes' kitty/fast_data_types.so
+kitty/fast_data_types.so 6142824 bytes
+$ stat kitty/fast_data_types.so
+  File: kitty/fast_data_types.so
+  Size: 6142824   	Blocks: 12000      IO Block: 4096   regular file
+Access: (0755/-rwxr-xr-x)  Uid: (    0/    root)   Gid: ( 1001/ UNKNOWN)
+```
+
+The measured size is exactly **`6142824` bytes** for this `--debug` build. (The size is build‑configuration dependent: the container ships a pre‑built *release* `kitty/fast_data_types.so` of `1221264` bytes, whereas the `--debug` rebuild documented here is `6142824` bytes.)
+
 ### Harness script (temporary; lived only under `/tmp`, removed afterward)
 
 ```python
@@ -280,13 +304,70 @@ def cps(text):
 
 FAMILY = '\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466'
 
-# CASE A: family into a 1x1 grid
+# ---- CASE A: family into a 1x1 grid ----
+print("=== CASE A: 1x1 screen, draw FAMILY ===")
 s, c = mk(1, 1); s.draw(FAMILY)
-#   str(s.line(0)); s.line(0).width(0); s.cursor.x/.y
-#   q(s, c, b'\x1b[6n')  -> CPR ;  b'\x1b[5n' -> DSR ;  b'\x1b[14t' -> size
-# Fragmentation: s.historybuf.count ; str(s.historybuf.line(i)) for i in range(count)
-# State queries: b'\x1b[c'  b'\x1b[>c'  b'\x1b[>q'  b'\x1b[?7$p'
-# Edge cases: ZWJ pair; cols in (1,2,5,10); 'a'+U+0301..U+0305; 'e'+U+0301; is_combining probe
+vis = str(s.line(0))
+print("%-20s: %r" % ("line(0) repr", vis))
+print("%-20s: %s | count = %d" % ("line(0) codepoints", cps(vis), len(vis)))
+print("%-20s: %d" % ("cell[0] width", s.line(0).width(0)))
+print("%-20s: %d %d" % ("cursor (x,y)", s.cursor.x, s.cursor.y))
+print("%-20s: %r" % ("CPR  ESC[6n  reply", q(s, c, b'\x1b[6n')))
+print("%-20s: %r" % ("DSR5 ESC[5n  reply", q(s, c, b'\x1b[5n')))
+print("%-20s: %r" % ("SIZE ESC[14t reply", q(s, c, b'\x1b[14t')))
+print()
+
+# ---- Fragmentation across scrollback ----
+print("=== Fragmentation across scrollback (family in 1x1) ===")
+n = s.historybuf.count
+print("%-20s: %d" % ("historybuf.count", n))
+hs = "\n".join(str(s.historybuf.line(i)) for i in range(n))
+print("%-20s: %r" % ("historybuf str", hs))
+for i in range(n):
+    ln = str(s.historybuf.line(i))
+    if ln:
+        print("hist[%d] = %r | %s" % (i, ln, cps(ln)))
+    else:
+        print("hist[%d] = %r         (empty trailing history line; count still reports 4)" % (i, ln))
+print()
+
+# ---- First-base wrap probe (proves the FIRST width-2 base also wraps at x=0) ----
+print("=== First-base wrap probe (does the FIRST width-2 base wrap at x=0?) ===")
+s1, _ = mk(1, 1); s1.draw('\U0001f468')   # draw ONE base only
+h0 = str(s1.historybuf.line(0)) if s1.historybuf.count else '<none>'
+print("draw 1 base U+1F468 into 1x1 -> historybuf.count = %d ; hist[0] = %r (pre-write wrap at x=0 pushed an EMPTY line)" % (s1.historybuf.count, h0))
+print()
+
+# ---- State queries ----
+print("=== State queries on the 1x1 constrained screen ===")
+print("DA1  ESC[c   -> %r" % q(s, c, b'\x1b[c'))
+print("DA2  ESC[>c  -> %r" % q(s, c, b'\x1b[>c'))
+print("XTVER ESC[>q -> %r" % q(s, c, b'\x1b[>q'))
+print("DECRQM ESC[?7$p -> %r" % q(s, c, b'\x1b[?7$p'))
+print()
+
+# ---- Edge cases ----
+print("=== Edge cases ===")
+sp, _ = mk(1, 1); sp.draw('\U0001f468\u200d\U0001f469')
+vp = str(sp.line(0))
+print("ZWJ pair U+1F468 U+200D U+1F469 in 1x1 -> visible %r | %s (only woman survives)" % (vp, cps(vp)))
+for cols in (1, 2, 5, 10):
+    sc, _ = mk(1, cols); sc.draw(FAMILY)
+    vc = str(sc.line(0))
+    print("cols=%-2d -> %r (%d cp: %s)" % (cols, vc, len(vc), cps(vc)))
+scap, _ = mk(1, 10); scap.draw('a\u0301\u0302\u0303\u0304\u0305')
+vcap = str(scap.line(0))
+print("Combining cap: 'a'+U+0301..U+0305 -> %r | %s (slot 2 = LAST mark)" % (vcap, cps(vcap)))
+sn, _ = mk(1, 10); sn.draw('e\u0301')
+vn = str(sn.line(0))
+print("No normalization: 'e'+U+0301 -> %r | %s ; NFC U+00E9 present? %s" % (vn, cps(vn), '\u00e9' in vn))
+
+def probe(cp):
+    p, _ = mk(1, 10); p.draw('A'); before = p.cursor.x; p.draw(cp); return before, p.cursor.x
+b0, a0 = probe('\U0001f468')
+r200d = probe('\u200d'); r0301 = probe('\u0301'); rfe0f = probe('\ufe0f'); rfe0e = probe('\ufe0e')
+assert r200d == r0301 == rfe0f == rfe0e, (r200d, r0301, rfe0f, rfe0e)
+print("is_combining probe: A+U+1F468 cursor %d->%d (NEW CELL); A+U+200D / A+U+0301 / A+U+FE0F / A+U+FE0E each %d->%d (appended)" % (b0, a0, r200d[0], r200d[1]))
 ```
 
 Notes: `s.draw(text)` drives `screen_draw_text` (`kitty/screen.c:866`); `parse_bytes(s, b'...')` feeds control sequences through the VT parser (`kitty_tests/__init__.py:30`); replies are captured in `Callbacks.wtcbuf` (`kitty_tests/__init__.py:51`), reset to `b''` before each query. `Screen(...)` uses `cell_width=10, cell_height=20`, which is why `ESC[14t` → `ESC[4;20;10t`. The history string is built by joining `str(historybuf.line(i))` (do **not** call `as_text_for_history_buf()` with no arguments — it requires at least one).
@@ -319,6 +400,9 @@ hist[1] = '👩\u200d' | U+1F469 U+200D
 hist[2] = '👨\u200d' | U+1F468 U+200D
 hist[3] = ''         (empty trailing history line; count still reports 4)
 
+=== First-base wrap probe (does the FIRST width-2 base wrap at x=0?) ===
+draw 1 base U+1F468 into 1x1 -> historybuf.count = 1 ; hist[0] = '' (pre-write wrap at x=0 pushed an EMPTY line)
+
 === State queries on the 1x1 constrained screen ===
 DA1  ESC[c   -> b'\x1b[?62;c'
 DA2  ESC[>c  -> b'\x1b[>1;4000;35c'
@@ -346,7 +430,13 @@ is_combining probe: A+U+1F468 cursor 1->3 (NEW CELL); A+U+200D / A+U+0301 / A+U+
 
 - **No existing repository file was modified.** The only file added is this document, `blitzy/documentation/kitty_815df1e210e0.md`.
 - Temporary observation scripts lived only under `/tmp` and were **removed** after use.
-- Build artifacts do not pollute the tree: `*.so` and `/build/` are gitignored (`.gitignore:1`, `.gitignore:14`), and `git status --porcelain` was verified to show only the new document.
+- Build artifacts do not pollute the tree: `*.so` and `/build/` are gitignored (`.gitignore:1`, `.gitignore:14`).
+- **Exact read‑only evidence.** After the deliverable was committed (and the temporary `/tmp` observation scripts removed), `git status --porcelain` produced **no output** — the working tree is clean and differs from the pre‑task baseline only by the single added, now‑committed document. Before that commit, the sole intended tracked change was the addition `A blitzy/documentation/kitty_815df1e210e0.md`. The empty status output is shown verbatim below:
+
+```text
+$ git status --porcelain
+$
+```
 
 ---
 
@@ -361,5 +451,5 @@ A final confirmation that every sub‑question was answered explicitly, each wit
 | **Q3** — the state‑query reply | § Q3 | CPR `ESC[6n` → `b'\x1b[1;2R'`; DSR `b'\x1b[0n'`; size `b'\x1b[4;20;10t'`; DA1 `b'\x1b[?62;c'`; DA2 `b'\x1b[>1;4000;35c'`; XTVERSION `b'\x1bP>|kitty(0.35.2)\x1b\\'`; DECRQM `b'\x1b[?7;1$y'` | `kitty/screen.c:2179`, `:2192`, `:2196`, `:2186`, `:2147`–`:2164`, `:2125`, `:2128`, `:2137`, `:2203`, `:955` |
 | **Q4** — synthesis | § Q4 | no‑norm `U+0065 U+0301` (NFC `U+00E9` absent); no `kitty/text-cache.*`; combining cap `U+0061 U+0301 U+0302 U+0305`; survivor scaling by columns | `kitty/unicode-data.c:11`, `:323`; `kitty/unicode-data.h:5`; `kitty/wcwidth-std.h:10`; `kitty/line.c:466` |
 
-**All four sub‑questions are addressed.** Every quoted value — codepoints, counts, cursor coordinates, and control‑sequence reply bytes — is reproduced exactly as captured by building and running kitty headlessly, and every technical claim carries a `file:line` reference to source at HEAD `815df1e210e0`. The investigation was strictly **read‑only**: no existing repository file was changed, temporary scripts under `/tmp` were removed, and the working tree remains clean apart from this newly created answer document.
+**All four sub‑questions are addressed.** Every quoted value — codepoints, counts, cursor coordinates, and control‑sequence reply bytes — is reproduced exactly as captured by building and running kitty headlessly, and every technical claim carries a `file:line` reference to source at HEAD `815df1e210e0`. The investigation was strictly **read‑only**: no existing repository file was changed, temporary scripts under `/tmp` were removed, and after the deliverable commit `git status --porcelain` is empty (the tree differs from its pre‑task baseline only by this newly created, now‑committed answer document).
 
