@@ -222,7 +222,7 @@ VT_PARSER_MAX_ESCAPE_CODE_SIZE = 262144
 On the Python side, the reassembled clipboard bytes are accumulated in a `Tempfile` that starts in RAM and **spills to disk** once it crosses a size threshold:
 
 ```
-$ sed -n '26,39p' kitty/clipboard.py
+$ sed -n '26,40p' kitty/clipboard.py
 class Tempfile:
 
     def __init__(self, max_size: int) -> None:
@@ -340,7 +340,7 @@ $ sed -n '1431,1433p' kitty/vt-parser.c
 `` `kitty/vt-parser.c:1431-1433` `` shows the lock is dropped (`end_with_lock`) for the duration of `consume_input` and re-taken (`with_lock`) afterward. Ingestion is bounded by back-pressure — new input is only accepted while there is room in the 1 MiB buffer:
 
 ```
-$ sed -n '1477,1483p' kitty/vt-parser.c
+$ sed -n '1477,1482p' kitty/vt-parser.c
 vt_parser_has_space_for_input(const Parser *p) {
     PS *self = (PS*)p->state;
     bool ans;
@@ -510,11 +510,12 @@ The pager-history ringbuffer is separately capped rather than unbounded — its 
 
 kitty avoids holding very large payloads wholly in RAM in two concrete ways:
 
-1. **Clipboard disk rollover.** As observed in §1.4, a clipboard `Tempfile` swaps from `io.BytesIO` to an on-disk `TemporaryFile()` once it exceeds `max_size` (default 16 MiB) — `` `kitty/clipboard.py:32-35` ``. Re-quoting the observed transition:
+1. **Clipboard disk rollover.** As observed in §1.4, a clipboard `Tempfile` swaps from `io.BytesIO` to an on-disk `TemporaryFile()` once it exceeds `max_size` (default 16 MiB) — `` `kitty/clipboard.py:32-35` ``. Re-quoting the observed transition verbatim from §1.4 (produced by `$ python3 /tmp/obs/exp3_rollover.py`):
 
    ```
-   after 1 MiB   type(tf2.file) = BytesIO       (<= 16 MiB: stays in RAM)
-   after +16 MiB type(tf2.file) = BufferedRandom (> 16 MiB: spilled to disk), fileno = 4
+   after 1 MiB   type(tf2.file) = BytesIO | tell = 1048576 (<= 16 MiB: stays in RAM)
+   after +16 MiB type(tf2.file) = BufferedRandom | tell = 17825792 (> 16 MiB: spilled to disk)
+   rolled-over file has real OS fd?  True fileno = 4
    ```
 
    So a *very large* clipboard payload is bounded in RAM to ~16 MiB; the remainder lives on disk.
