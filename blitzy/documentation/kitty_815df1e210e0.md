@@ -4,7 +4,7 @@ This document answers, with **actually-observed runtime output**, how the [kitty
 
 **One-paragraph summary of the flow.** A program emits `ESC ] 133 ; <letter> [ ; params ] ST`. kitty's VT parser dispatches `OSC 133` at `kitty/vt-parser.c:536` and hands the payload (the text after `133;`) to `shell_prompt_marking(...)` at `kitty/screen.c:2328` (call site `kitty/vt-parser.c:544`). That C handler only sets a *line attribute* (`prompt_kind`) on the cursor's line and fires the `cmd_output_marking` Python callback — it never stores the control bytes in screen cell text. On the Python side (`kitty/window.py`), the `C` marker records the command line and the `D` marker's exit-status **string** flows into `handle_cmd_end(...)` (`kitty/window.py:1408`), where `int(exit_status)` (`kitty/window.py:1413`) converts it to an `int` (defaulting to `0` on any parse error via the surrounding `try/except`). Separately, the command *output* is captured on demand by `cmd_output(...)` (`kitty/screen.c:3606`), which returns the plain text of the output region and, in ANSI mode, a **re-synthesized** `ESC ] 133 ; C ST` boundary rather than the original bytes.
 
-Every measured value below was produced by **building kitty and running the relevant code paths** through two throwaway probe scripts, then quoting the observed output verbatim. Nothing in the repository was modified; the probes lived outside the repository and were deleted afterward.
+Every measured value below was produced by **building kitty and running the relevant code paths** through three throwaway probe scripts, then quoting the observed output verbatim. Nothing in the repository was modified; the probes lived outside the repository and were deleted afterward.
 
 ---
 
@@ -17,7 +17,7 @@ All measurements were taken against a freshly built kitty at the repository HEAD
 - **Revision:** HEAD = `815df1e21` ("Wire up applying of font config"); working branch derived from source branch `kitty_815df1e210e0`. `git status --porcelain` was **empty before and after** all experiments — the tracked tree is unchanged (the build emits only git-ignored artifacts such as `*.so` and `/build/`).
 - **Build dependencies:** the authoritative apt list is `.github/workflows/ci.py:84-88` (supplemented by `libssl-dev` / `zlib1g-dev` for a fresh build), driven by `setup.py`.
 - **`sys.maxsize` on this 64-bit build:** `9223372036854775807` (= 2**63 − 1). This value is used as a *sentinel* by the test harness (see §7) and is **not** a real exit code.
-- **Ephemeral probes (deleted after use, never in the repository):** `/tmp/osc133_probe.py` (test-harness driver) and `/tmp/osc133_prod.py` (production-method driver).
+- **Ephemeral probes (deleted after use, never in the repository):** `/tmp/osc133_probe.py` (test-harness driver), `/tmp/osc133_prod.py` (production-method driver), and `/tmp/osc133_wrapper_probe.py` (wrapper-vs-lower-level capture driver).
 
 > **Note on environment portability.** The byte-geometry, capture strings, recorded exit statuses, and the sentinel value below are determined by the byte stream and the C/Python code logic, not by the Python patch version; they reproduce identically regardless of whether the interpreter is 3.12.x or 3.13.x. Only the interpreter's own version banner (`PYTHON 3.13.7`) reflects this specific environment.
 
@@ -79,7 +79,7 @@ The dispatch payload handed to `shell_prompt_marking` is the text **after** `133
 
 ## 4. Verbatim Observed Output
 
-Two ephemeral probes produced every measured value in this document. They are quoted **verbatim** (unaltered) below. The only environment-specific line is the interpreter banner `PYTHON 3.13.7`; every other value (byte counts, offsets, capture strings, recorded statuses, sentinel) is code-determined and reproduces identically on any supported Python.
+Three ephemeral probes produced every measured value in this document. They are quoted **verbatim** (unaltered) below. The only environment-specific line is the interpreter banner `PYTHON 3.13.7`; every other value (byte counts, offsets, capture strings, recorded statuses, sentinel) is code-determined and reproduces identically on any supported Python.
 
 ### 4.1 Test-harness driver — `/tmp/osc133_probe.py`
 
@@ -173,6 +173,29 @@ stray D with no preceding C -> last_cmd_exit_status=9223372036854775807 (unchang
 
 The stray-`D` line proves the early-return guard `if self.last_cmd_output_start_time == 0.: return` (`kitty/window.py:1409-1410`): a `D` with no preceding `C` records nothing (sentinel unchanged, zero watcher events).
 
+### 4.3 Wrapper-vs-lower-level capture driver — `/tmp/osc133_wrapper_probe.py`
+
+**Method.** Drives the same user stream (`A + B + C;cmdline=ls -la + "some text" + D;42`) through a real built `Screen`, then captures the *last-run* command output three ways to separate the C engine from its Python wrapper: **(1)** the lower-level `Screen.cmd_output(0, chunks.append, True)` — printing each **raw callback chunk** with `%r`, then their manual join; **(2)** the module wrapper `kitty.window.cmd_output(screen, CommandOutput.last_run, True)` (`kitty/window.py:457`); and **(3)** the bound method `Window.cmd_output(shim, CommandOutput.last_run, True)` (`kitty/window.py:1583`) via a minimal shim exposing only `.screen`. Both wrappers are also read in plain mode. Run with `python3 -B`. **Command:**
+
+```
+PATH=$PATH:/usr/local/go/bin CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 python3 -B /tmp/osc133_wrapper_probe.py
+```
+
+**Observed output (verbatim):**
+
+```
+PYTHON 3.13.7
+Screen.cmd_output chunk[0] = '\x1b[m'
+Screen.cmd_output chunk[1] = '\x1b]133;C\x1b\\some text'
+Screen.cmd_output joined = '\x1b[m\x1b]133;C\x1b\\some text'
+kitty.window.cmd_output as_ansi=True = '\x1b[msome text'
+kitty.window.cmd_output as_ansi=False = 'some text'
+Window.cmd_output as_ansi=True = '\x1b[msome text'
+Window.cmd_output as_ansi=False = 'some text'
+```
+
+This isolates the distinction used in Q1b: the lower-level `Screen.cmd_output` callback delivers the ANSI capture as **two separate chunks** — `'\x1b[m'` then `'\x1b]133;C\x1b\\some text'` — whose manual join is the re-synthesized `'\x1b[m\x1b]133;C\x1b\\some text'`; the Python wrapper then **strips** the `\x1b]133;C` chunk (`kitty/window.py:464-467`) and returns `'\x1b[msome text'`.
+
 ---
 
 ## 5. Per-Question Answers
@@ -191,18 +214,33 @@ The stray-`D` line proves the early-return guard `if self.last_cmd_output_start_
 
 ### Q1b — Are the OSC 133 sequences still present in the capture?
 
-**Answer:** **No.** A plain capture contains none of them (it is just `'some text'`). In **ANSI-preserving** mode the capture is a **re-synthesized** command-output boundary, not the original bytes: observed **`'\x1b[m\x1b]133;C\x1b\\some text'`** for every variation. Only a synthesized `\x1b]133;C\x1b\\` prefix appears — the `;cmdline=ls -la` payload and the `A` / `B` / `D` markers do **not** reappear.
+**Answer:** **No — none of the sequences survive as sent.** A **plain** capture contains none of them: it is exactly `'some text'` from *both* the lower-level engine and the Python wrapper. In **ANSI-preserving** mode the result depends on *which* API you call, and neither reproduces the original bytes:
 
-**Evidence.** Every block in §4.1 shows both modes:
+- The lower-level **`Screen.cmd_output(..., callback, as_ansi=True)`** delivers the capture as **two separate callback chunks** — `'\x1b[m'` and `'\x1b]133;C\x1b\\some text'` — whose manual **join** is a **re-synthesized** command-output boundary **`'\x1b[m\x1b]133;C\x1b\\some text'`** (observed for every variation in §4.1; chunks shown in §4.3).
+- The Python wrapper **`kitty.window.cmd_output(...)`** / **`Window.cmd_output(..., as_ansi=True)`** then **strips** that synthesized `\x1b]133;C` chunk and returns **`'\x1b[msome text'`** (observed in §4.3).
+
+In **both** forms the `;cmdline=ls -la` payload and the `A` / `B` / `D` markers do **not** reappear. At most a *synthesized* `\x1b]133;C\x1b\\` boundary is present in the lower-level chunks, and even that is removed by the production wrapper.
+
+**Evidence.** Every block in §4.1 shows the **lower-level engine** in both modes:
 
 ```
   capture as_ansi=False -> 'some text'
   capture as_ansi=True  -> '\x1b[m\x1b]133;C\x1b\\some text'
 ```
 
+and §4.3 shows the lower-level callback **chunks** side-by-side with the **Python wrapper** return value:
+
+```
+Screen.cmd_output chunk[0] = '\x1b[m'
+Screen.cmd_output chunk[1] = '\x1b]133;C\x1b\\some text'
+Screen.cmd_output joined = '\x1b[m\x1b]133;C\x1b\\some text'
+kitty.window.cmd_output as_ansi=True = '\x1b[msome text'
+Window.cmd_output as_ansi=True = '\x1b[msome text'
+```
+
 **Citations / rationale.**
 - The ANSI form matches the canonical shape asserted by the existing test at `kitty_tests/screen.py:1124`: `'\x1b[m\x1b]133;C\x1b\\abcd\n\x1b[m12'`. Crucially, that test *feeds* its markers with the **`BEL`** terminator (`\007`, e.g. `b'\033]133;C\007'` at `kitty_tests/screen.py:1063`) yet the capture regenerates `\x1b\\` (`ESC \`). Producing a terminator that was never fed proves the boundary is **re-synthesized**, not byte-preserved.
-- The wrapper's leading-`\x1b]133;C` strip at `kitty/window.py:464-467` (`if x.startswith('\x1b]133;C'): lines[i] = x.partition('\\')[-1]`) does **not** trigger here, because the real captured string begins with the SGR reset `\x1b[m` *before* `\x1b]133;C` — the strip only fires when a line literally `.startswith('\x1b]133;C')`, and `'\x1b[m\x1b]133;C...'` does not. This is why the synthesized `\x1b]133;C\x1b\\` prefix survives into the returned ANSI string.
+- **The wrapper's `\x1b]133;C` strip at `kitty/window.py:464-467` *does* fire — the synthesized boundary survives only in the raw lower-level chunks, not in the wrapper's return value.** The key is that `screen.cmd_output(which, lines.append, ...)` (`kitty/window.py:459`) invokes the callback with **separate chunks**, not a single joined string: here chunk `0` is `'\x1b[m'` and chunk `1` is `'\x1b]133;C\x1b\\some text'` (see §4.3). The wrapper then loops over the **first three chunks** — `for i in range(min(len(lines), 3))` (`:464`) — testing each with `if x.startswith('\x1b]133;C')` (`:466`). Chunk `1` **does** start with `\x1b]133;C`, so the strip fires: `lines[i] = x.partition('\\')[-1]` (`:467`) splits `'\x1b]133;C\x1b\\some text'` on the first backslash (the second byte of the `ESC \` terminator) and keeps the remainder `'some text'`. The final `return ''.join(lines)` (`:468`) is therefore `'\x1b[m' + 'some text'` = **`'\x1b[msome text'`** (observed in §4.3). The synthesized `\x1b]133;C\x1b\\` boundary is present **only** if you manually join the raw lower-level chunks yourself (as §4.1 does with `list.append`); the production `kitty.window.cmd_output` / `Window.cmd_output` wrapper removes it.
 
 ### Q1c — Are the raw OSC 133 control bytes stored in the screen's cell text?
 
@@ -349,7 +387,7 @@ All references confirmed against the source at HEAD `815df1e21`.
 
 **Python layer (`kitty/window.py`)**
 - `:225` — `decode_cmdline` (`ctype, sep, val = x.partition('=')` `:226`; `if ctype == 'cmdline': return next(shlex_split(val, True))` `:227-228`) → `cmdline=ls -la` → `'ls'`.
-- `:457` — module `cmd_output(screen, which=CommandOutput.last_run, as_ansi=False, add_wrap_markers=False)`; `:459` calls the C `screen.cmd_output(...)`; `:464-467` strips a leading bare `\x1b]133;C` prefix (does **not** trigger on SGR-prefixed real output).
+- `:457` — module `cmd_output(screen, which=CommandOutput.last_run, as_ansi=False, add_wrap_markers=False)`; `:459` calls the C `screen.cmd_output(...)` with `lines.append` (the callback receives **separate chunks**); `:464` loops the first three chunks (`for i in range(min(len(lines), 3))`); `:466-467` strips any chunk starting with `\x1b]133;C` (`x.partition('\\')[-1]`). For the user stream this **does** fire on chunk 1 (`'\x1b]133;C\x1b\\some text'`), so the ANSI wrapper returns `'\x1b[msome text'`; the synthesized boundary survives only in a manual join of the raw lower-level chunks (`'\x1b[m\x1b]133;C\x1b\\some text'`).
 - `:275-276` — `class CommandOutput(IntEnum)` with `last_run = 0` (this enum lives in Python, not in `fast_data_types`; the C `cmd_output` takes an integer `which`).
 - `:244` — annotation `last_cmd_exit_status: int`; `:572` — init `self.last_cmd_exit_status = 0`; `:704` and `:729` — `as_dict` serializes `'last_cmd_exit_status'`.
 - `:1408` — `handle_cmd_end`; `:1409-1410` — early-return guard `if self.last_cmd_output_start_time == 0.: return`; `:1412` `try:`, `:1413` `self.last_cmd_exit_status = int(exit_status)`, `:1414` `except Exception:`, `:1415` `= 0`; `:1419-1420` — `on_cmd_startstop` watcher payload (`'exit_status': self.last_cmd_exit_status`). (The AAP loosely cited the `int()` call as `L1412`; it is precisely on `:1413`, within the `:1412-1415` `try/except` block.)
@@ -377,7 +415,7 @@ This corroborates — it does **not** replace — the code findings above. The O
 Every distinct sub-question is answered explicitly above:
 
 - [x] **Q1a — Captured content:** plain-mode capture is exactly `'some text'` (§5 Q1a; evidence §4.1).
-- [x] **Q1b — Marker presence:** no in plain mode; ANSI mode returns a *re-synthesized* `'\x1b[m\x1b]133;C\x1b\\some text'` (no `A`/`B`/`D`, no `;cmdline`) (§5 Q1b).
+- [x] **Q1b — Marker presence:** no in plain mode (`'some text'`). In ANSI mode the lower-level `Screen.cmd_output` callback chunks **joined** give a *re-synthesized* `'\x1b[m\x1b]133;C\x1b\\some text'`, while the Python wrapper `kitty.window.cmd_output` / `Window.cmd_output` **strips** that boundary and returns `'\x1b[msome text'`; neither reproduces `A`/`B`/`D` or `;cmdline` (§5 Q1b; evidence §4.1 + §4.3).
 - [x] **Q1c — Cell-text preservation:** no — cell text is `'some text'`, contains no `ESC` and no `"133"`; bytes only set line attributes + fire a callback (§5 Q1c).
 - [x] **Q1d — Byte offset of the `D` marker:** total 63 bytes for the `D;42` example; the `D` marker begins at offset **51**, `D;42` at **57**, digits at **59**; the marker/digit offsets do **not** shift with the code (§5 Q1d/Q2b).
 - [x] **Q2a — Byte lengths per exit code:** `0`→62, `1`→62, `42`→63, `99`→63, `127`→64 (plus `not_a_number`→73, empty→61, bare `D`→60); marker offset 51, digit offset 59 throughout (§5 Q2a table).
@@ -393,4 +431,4 @@ Every distinct sub-question is answered explicitly above:
 
 ## 10. Repository Left Read-Only
 
-This investigation was strictly read-only. This markdown file — `blitzy/documentation/kitty_815df1e210e0.md` — is the **only** file created; no existing repository file was modified or deleted. The build produced only git-ignored artifacts (`*.so`, `/build/`), so `git status --porcelain` was empty before and after the experiments. The two ephemeral probe scripts lived **outside** the repository at `/tmp/osc133_probe.py` and `/tmp/osc133_prod.py` and were **deleted** after the investigation concluded.
+This investigation was strictly read-only. This markdown file — `blitzy/documentation/kitty_815df1e210e0.md` — is the **only** file created; no existing repository file was modified or deleted. The build produced only git-ignored artifacts (`*.so`, `/build/`), so `git status --porcelain` was empty before and after the experiments. The three ephemeral probe scripts lived **outside** the repository at `/tmp/osc133_probe.py`, `/tmp/osc133_prod.py`, and `/tmp/osc133_wrapper_probe.py` and were **deleted** after the investigation concluded.
