@@ -186,7 +186,7 @@ $ xvfb-run -a --server-args="-screen 0 1024x768x24" \
 $ echo "RUN_EXIT=$?"
 RUN_EXIT=0
 
-$ cat /tmp/kitty_boot.out          # stdout (printf, gl.c:72)
+$ cat /tmp/kitty_boot.out          # stdout (printf, kitty/gl.c:72)
 [0.127] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
 
 $ cat /tmp/kitty_boot.err          # stderr (log_error / debug() / print(...,file=sys.stderr))
@@ -329,21 +329,21 @@ The authoritative default values live in `kitty/options/definition.py` (4327 lin
 `opt(...)` declarations. The specific defaults relevant to what you see when the window
 appears:
 
-| `definition.py` line | Declaration (verbatim head) | Effect on the visible window |
+| `kitty/options/definition.py` line | Declaration (verbatim head) | Effect on the visible window |
 |---|---|---|
-| `:59` | `opt('font_size', '11.0',` | Text scale (points) for the grid |
-| `:320` | `opt('cursor_shape', 'block',` | Cursor drawn as a solid block |
-| `:372` | `opt('scrollback_lines', '2000',` | How many lines of history are kept |
-| `:866` | `opt('repaint_delay', '10',` | Frame cadence — ms between repaints |
-| `:878` | `opt('input_delay', '3',` | ms to wait before processing input |
-| `:994` | `opt('initial_window_width', '640',` | Window width (px) when it first appears |
-| `:2896` | `opt('shell', '.',` | `'.'` means "use the user's login shell" |
+| `kitty/options/definition.py:59` | `opt('font_size', '11.0',` | Text scale (points) for the grid |
+| `kitty/options/definition.py:320` | `opt('cursor_shape', 'block',` | Cursor drawn as a solid block |
+| `kitty/options/definition.py:372` | `opt('scrollback_lines', '2000',` | How many lines of history are kept |
+| `kitty/options/definition.py:866` | `opt('repaint_delay', '10',` | Frame cadence — ms between repaints |
+| `kitty/options/definition.py:878` | `opt('input_delay', '3',` | ms to wait before processing input |
+| `kitty/options/definition.py:994` | `opt('initial_window_width', '640',` | Window width (px) when it first appears |
+| `kitty/options/definition.py:2896` | `opt('shell', '.',` | `'.'` means "use the user's login shell" |
 
 Per-item parsing is generated in `kitty/options/parse.py` (1482 lines), and the resolved
 options are pushed to the C core via `kitty/options/to-c-generated.h` (1346 lines). A
 human-readable dump of the live configuration is produced by the function
 `kitty/debug_config.py:231` → `def debug_config(opts: KittyOpts) -> str:`. That function
-is *bound* to a key elsewhere, not in `debug_config.py`: the default binding is declared
+is *bound* to a key elsewhere, not in `kitty/debug_config.py`: the default binding is declared
 at `kitty/options/definition.py:4256` → `'debug_config kitty_mod+f6 debug_config',` and
 generated into `kitty/options/types.py:914` →
 `KeyDefinition(trigger=SingleKey(mods=256, key=57369), definition='debug_config')`, so
@@ -372,10 +372,10 @@ initial_window_width= (640, 'px')
 shell= '.'
 ```
 
-Each printed value matches its `definition.py` literal exactly:
+Each printed value matches its `kitty/options/definition.py` literal exactly:
 
-- **`font_size = 11.0`** ← `definition.py:59` `'11.0'`. Governs text scale in the window.
-- **`cursor_shape = 1`** ← `definition.py:320` `'block'`. The `'block'` string is parsed
+- **`font_size = 11.0`** ← `kitty/options/definition.py:59` `'11.0'`. Governs text scale in the window.
+- **`cursor_shape = 1`** ← `kitty/options/definition.py:320` `'block'`. The `'block'` string is parsed
   into an integer enum; the enum mapping was confirmed live:
 
   ```
@@ -385,12 +385,12 @@ Each printed value matches its `definition.py` literal exactly:
   ```
 
   So `cursor_shape = 1` **is** `CURSOR_BLOCK` — the cursor is drawn as a solid block.
-- **`scrollback_lines = 2000`** ← `definition.py:372` `'2000'`. 2000 lines of history.
-- **`repaint_delay = 10`** ← `definition.py:866` `'10'`. ~10 ms between repaints.
-- **`input_delay = 3`** ← `definition.py:878` `'3'`. 3 ms input coalescing.
-- **`initial_window_width = (640, 'px')`** ← `definition.py:994` `'640'`. The window is
+- **`scrollback_lines = 2000`** ← `kitty/options/definition.py:372` `'2000'`. 2000 lines of history.
+- **`repaint_delay = 10`** ← `kitty/options/definition.py:866` `'10'`. ~10 ms between repaints.
+- **`input_delay = 3`** ← `kitty/options/definition.py:878` `'3'`. 3 ms input coalescing.
+- **`initial_window_width = (640, 'px')`** ← `kitty/options/definition.py:994` `'640'`. The window is
   640 px wide when it appears; the `'px'` unit is carried alongside the number.
-- **`shell = '.'`** ← `definition.py:2896` `'.'`. The sentinel `'.'` tells Kitty to run
+- **`shell = '.'`** ← `kitty/options/definition.py:2896` `'.'`. The sentinel `'.'` tells Kitty to run
   the user's login shell rather than a hard-coded program.
 
 ### 6.3 Proving an override is merged on top
@@ -410,7 +410,7 @@ default font_size= 11.0
 default cursor_shape= 1
 ```
 
-With no override, `load_config()` yields `font_size = 11.0` (the `definition.py:59`
+With no override, `load_config()` yields `font_size = 11.0` (the `kitty/options/definition.py:59`
 default); with `overrides=["font_size 12"]`, the same pipeline yields
 `font_size = 12.0`. This is the same mechanism exercised by the smoke run's
 `-o font_size=12` in §4.3. The override layer is therefore proven to merge on top of the
@@ -419,8 +419,8 @@ built-in defaults, exactly as the `load_config(..., overrides=...)` signature at
 
 **Summary for Q2.** (1) *Sources:* built-in defaults in `kitty/options/definition.py`
 (used wholesale under `--config NONE`), optionally a user `kitty.conf`, and `-o`
-runtime overrides — all merged by `load_config` (`config.py:163`) into an `Options`
-object (`types.py:471`). (2) *Effect on the window:* the defaults set the font scale
+runtime overrides — all merged by `load_config` (`kitty/config.py:163`) into an `Options`
+object (`kitty/options/types.py:471`). (2) *Effect on the window:* the defaults set the font scale
 (`font_size = 11.0`), the block cursor (`cursor_shape = 1`), the initial window width
 (`initial_window_width = (640, 'px')`), the history depth (`scrollback_lines = 2000`),
 and the login-shell choice (`shell = '.'`). (3) *Proof applied:* the `+runpy` readback
@@ -496,7 +496,7 @@ TERM=[xterm-kitty]
 ```
 
 - `KSI=[enabled]` proves `modify_shell_environ` set `KITTY_SHELL_INTEGRATION=enabled`
-  (`shell_integration.py:223`) for the bash child.
+  (`kitty/shell_integration.py:223`) for the bash child.
 - `TERM=[xterm-kitty]` proves Kitty advertised its own terminfo-backed terminal type to
   the child, so the shell knows which capabilities it may use.
 
@@ -526,8 +526,8 @@ READY_MARKER_42
 
 The marker printed by the shell — `READY_MARKER_42` — was read back **verbatim** from the
 rendered screen. That round trip is the concrete behavior proving the data was understood
-correctly: the child's bytes traversed `io_loop` → `consume_normal` (`vt-parser.c:230`) →
-`screen_draw_text`/`draw_codepoint` (`screen.c:866`/`:872`) and landed in the grid as the
+correctly: the child's bytes traversed `io_loop` → `consume_normal` (`kitty/vt-parser.c:230`) →
+`screen_draw_text`/`draw_codepoint` (`kitty/screen.c:866`/`kitty/screen.c:872`) and landed in the grid as the
 exact characters the shell emitted.
 
 The companion `ls` call reports the window/grid structure (its `env` block is **omitted**
@@ -554,11 +554,11 @@ The reported `cmdline` matches exactly what the shell was told to run, and
 `last_cmd_exit_status: 0` confirms clean execution. The grid geometry (`columns: 71`,
 `lines: 22`) is analyzed further under Q4 (§8).
 
-**Summary for Q3.** (1) *Readiness path:* allocate a PTY (`child.py:170`), fork/exec the
-child onto it (`child.py:276`, `:281`), prepare its environment including
-`KITTY_SHELL_INTEGRATION` (`shell_integration.py:218`, `:223`) and `TERM=xterm-kitty`,
-then pump PTY bytes through the VT parser (`vt-parser.c:230/261/457`) into the screen model
-(`screen.c:866/872`). (2) *First-output proof:* the shell's `READY_MARKER_42` round-tripped
+**Summary for Q3.** (1) *Readiness path:* allocate a PTY (`kitty/child.py:170`), fork/exec the
+child onto it (`kitty/child.py:276`, `kitty/child.py:281`), prepare its environment including
+`KITTY_SHELL_INTEGRATION` (`kitty/shell_integration.py:218`, `kitty/shell_integration.py:223`) and `TERM=xterm-kitty`,
+then pump PTY bytes through the VT parser (`kitty/vt-parser.c:230/261/457`) into the screen model
+(`kitty/screen.c:866/872`). (2) *First-output proof:* the shell's `READY_MARKER_42` round-tripped
 verbatim through `kitten @ get-text`, and `KSI=[enabled]` / `TERM=[xterm-kitty]` confirm the
 integration/terminal wiring — the data was received, parsed, and drawn exactly.
 
@@ -644,7 +644,7 @@ from real font metrics — a prerequisite for placing any glyph.
 Lines that scroll off the top are retained in the scrollback buffer by
 `kitty/history.c:287` → `historybuf_add_line(HistoryBuf *self, const Line *line, ANSIBuf *as_ansi_buf) {`.
 The depth of that buffer is governed by the `scrollback_lines = 2000` default proven in
-§6.2 (`definition.py:372`). Together these show the display system preserves 2000 lines of
+§6.2 (`kitty/options/definition.py:372`). Together these show the display system preserves 2000 lines of
 history as new output pushes old lines upward. The cursor position within the grid is
 tracked by the model in `kitty/cursor.c` (338 lines).
 
@@ -674,7 +674,7 @@ a frame is drawn, the back buffer is presented to the (virtual) display.
 > and `kitty/glfw.c:1221` → `if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);`
 > (called from `kitty/glfw.c:283`). `kitty/shaders.c` (1285 lines) contains neither symbol.
 
-The frame cadence is paced by the `repaint_delay = 10` default (§6.2, `definition.py:866`)
+The frame cadence is paced by the `repaint_delay = 10` default (§6.2, `kitty/options/definition.py:866`)
 — roughly one repaint every 10 ms when there is something to draw.
 
 ### 8.5 The log/console messages that confirm the display system is active
@@ -690,11 +690,11 @@ Pulling the confirming messages together (all captured verbatim above):
 - **Grid sized:** `columns: 71`, `lines: 22` from `kitten @ ls` (§8.2).
 
 **Summary for Q4.** *Fonts* — the `Text fonts:` block resolves DejaVu Sans Mono across
-Normal/Bold/Italic/Bold-Italic (`render.py:163`), rasterized by FreeType (`freetype.c`) and
-cached in the GPU atlas (`glyph-cache.c`). *Layout* — a computed `71 × 22` grid
+Normal/Bold/Italic/Bold-Italic (`kitty/fonts/render.py:163`), rasterized by FreeType (`kitty/freetype.c`) and
+cached in the GPU atlas (`kitty/glyph-cache.c`). *Layout* — a computed `71 × 22` grid
 (`kitten @ ls`) derived from font metrics and the 640-px window. *Scrolling* — 2000 lines
-of scrollback (`history.c:287` + `definition.py:372`). *Screen updates* — the GLSL cell
-program (`shaders.c:217`) drawing frames that are presented by `swap_window_buffers`
+of scrollback (`kitty/history.c:287` + `kitty/options/definition.py:372`). *Screen updates* — the GLSL cell
+program (`kitty/shaders.c:217`) drawing frames that are presented by `swap_window_buffers`
 (`kitty/glfw.c:1802`) and `glfwSwapBuffers` (`kitty/glfw.c:1221`) (corrected anchors),
 paced by `repaint_delay = 10`. The `GL version string`, `OS Window created`, and
 `Text fonts:` log lines are the console evidence the display system is live.
@@ -707,41 +707,41 @@ paced by `repaint_delay = 10`. The `GL version string`, `OS Window created`, and
 Re-reading each question and confirming every sub-part is addressed by content above:
 
 - [x] **Q1a — Systems that start up enumerated (in source order).** §5.1 lists the full
-  chain: native launcher (`main.c:439`) → single-instance dispatch (`main.c:436`) →
-  CPython bootstrap (`main.c:211/216`) → entry dispatch (`entry_points.py:151`) → GUI
-  `main()` (`main.py:524`) → GLFW library init + GL context/version (`main.py:514`,
-  `gl.c:72`) → fonts (`set_font_family` `main.py:251`; dump at `render.py:163`) → **OS
-  window created** (`create_os_window` `main.py:221` → `glfw.c:1321`) → **Boss** (`main.py:226`;
-  `boss.py:323/375`) → `boss.start` (`main.py:227`; `boss.py:1181/1183`) → **child-monitor**
-  (I/O thread `child-monitor.c:229/291` always; talk thread `child-monitor.c:230/286`
-  only when `talk_fd`/`listen_fd` set, `child-monitor.c:285`) → child/PTY (`child.py`,
-  `window.py:871`). The OS window is created **before** Boss, matching `kitty/main.py:221-227`
+  chain: native launcher (`kitty/launcher/main.c:439`) → single-instance dispatch (`kitty/launcher/main.c:436`) →
+  CPython bootstrap (`kitty/launcher/main.c:211/216`) → entry dispatch (`kitty/entry_points.py:151`) → GUI
+  `main()` (`kitty/main.py:524`) → GLFW library init + GL context/version (`kitty/main.py:514`,
+  `kitty/gl.c:72`) → fonts (`set_font_family` `kitty/main.py:251`; dump at `kitty/fonts/render.py:163`) → **OS
+  window created** (`create_os_window` `kitty/main.py:221` → `kitty/glfw.c:1321`) → **Boss** (`kitty/main.py:226`;
+  `kitty/boss.py:323/375`) → `boss.start` (`kitty/main.py:227`; `kitty/boss.py:1181/1183`) → **child-monitor**
+  (I/O thread `kitty/child-monitor.c:229/291` always; talk thread `kitty/child-monitor.c:230/286`
+  only when `talk_fd`/`listen_fd` set, `kitty/child-monitor.c:285`) → child/PTY (`kitty/child.py`,
+  `kitty/window.py:871`). The OS window is created **before** Boss, matching `kitty/main.py:221-227`
   and the observed log order (`[0.150] OS Window created` precedes `[0.162] Child launched`).
 - [x] **Q1b — On-screen/log evidence quoted verbatim.** §5 quotes `GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5`,
   `OS Window created`, `Child launched`; §4.4 explains the `[%.3f]` elapsed-seconds format
-  (`logging.c:56`); §5.3 labels the systemd line (`systemd.c:87`) benign.
+  (`kitty/logging.c:56`); §5.3 labels the systemd line (`kitty/systemd.c:87`) benign.
 - [x] **Q2a — Configuration sources identified.** §6.1: built-in defaults
-  (`definition.py`, used wholesale under `--config NONE`), optional user `kitty.conf`, and
-  `-o` overrides, merged by `load_config` (`config.py:163`) into `Options` (`types.py:471`).
+  (`kitty/options/definition.py`, used wholesale under `--config NONE`), optional user `kitty.conf`, and
+  `-o` overrides, merged by `load_config` (`kitty/config.py:163`) into `Options` (`kitty/options/types.py:471`).
 - [x] **Q2b — Default literals cited + on-screen effects.** §6.1/§6.2: `font_size = 11.0`
-  (`:59`), `cursor_shape = block`→enum `1` (`:320`), `scrollback_lines = 2000` (`:372`),
-  `repaint_delay = 10` (`:866`), `input_delay = 3` (`:878`),
-  `initial_window_width = (640, 'px')` (`:994`), `shell = '.'` (`:2896`).
+  (`kitty/options/definition.py:59`), `cursor_shape = block`→enum `1` (`kitty/options/definition.py:320`), `scrollback_lines = 2000` (`kitty/options/definition.py:372`),
+  `repaint_delay = 10` (`kitty/options/definition.py:866`), `input_delay = 3` (`kitty/options/definition.py:878`),
+  `initial_window_width = (640, 'px')` (`kitty/options/definition.py:994`), `shell = '.'` (`kitty/options/definition.py:2896`).
 - [x] **Q2c — Real-launch output proving settings applied.** §6.2 `+runpy` readback prints
   each default; §6.3 shows `-o` override `font_size` `11.0 → 12.0`; cursor enum confirmed
   `CURSOR_BLOCK= 1`.
-- [x] **Q3a — Terminal-readiness path documented.** §7.1: PTY alloc (`child.py:170`),
-  fork/exec (`child.py:276/281`), env + shell integration (`shell_integration.py:218/223`),
-  VT parser (`vt-parser.c:230/261/457`), screen model (`screen.c:866/872`).
+- [x] **Q3a — Terminal-readiness path documented.** §7.1: PTY alloc (`kitty/child.py:170`),
+  fork/exec (`kitty/child.py:276/281`), env + shell integration (`kitty/shell_integration.py:218/223`),
+  VT parser (`kitty/vt-parser.c:230/261/457`), screen model (`kitty/screen.c:866/872`).
 - [x] **Q3b — First-output proof shown.** §7.3: shell marker `READY_MARKER_42`
   round-tripped verbatim via `kitten @ get-text`; §7.2: `KSI=[enabled]`,
   `TERM=[xterm-kitty]`; geometry via `ls`.
 - [x] **Q4a — Fonts evidence.** §8.1: the `Text fonts:` block resolves **DejaVu Sans Mono**
-  (Normal/Bold/Italic/Bold-Italic), `render.py:163`; `+list-fonts` headless failure quoted.
+  (Normal/Bold/Italic/Bold-Italic), `kitty/fonts/render.py:163`; `+list-fonts` headless failure quoted.
 - [x] **Q4b — Layout evidence.** §8.2: grid `columns: 71`, `lines: 22` from `kitten @ ls`.
 - [x] **Q4c — Scrolling evidence.** §8.3: scrollback `historybuf_add_line`
-  (`history.c:287`) with `scrollback_lines = 2000` (`definition.py:372`).
-- [x] **Q4d — Screen-update evidence.** §8.4: GLSL cell program (`shaders.c:217`) + buffer
+  (`kitty/history.c:287`) with `scrollback_lines = 2000` (`kitty/options/definition.py:372`).
+- [x] **Q4d — Screen-update evidence.** §8.4: GLSL cell program (`kitty/shaders.c:217`) + buffer
   swap via `swap_window_buffers` (`kitty/glfw.c:1802`) and `glfwSwapBuffers`
   (`kitty/glfw.c:1221`) (citation correction noted and verified).
 - [x] **Build/run preamble present with real exit codes.** §4.2 `BUILD_EXIT=0`; §4.3
@@ -763,5 +763,5 @@ Re-reading each question and confirming every sub-part is addressed by content a
 - **Honest limits:** `+list-fonts` genuinely cannot run headless (`open /dev/tty` error,
   §8.1); font evidence was taken from `--debug-font-fallback` instead. The
   `Failed to open systemd user bus … Connection refused` line is an expected
-  no-systemd-user-bus artifact (`systemd.c:87`), not a defect.
+  no-systemd-user-bus artifact (`kitty/systemd.c:87`), not a defect.
 
