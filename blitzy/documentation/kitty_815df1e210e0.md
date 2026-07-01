@@ -142,22 +142,22 @@ The control channel was confirmed live at idle before any stress was applied (`k
 
 ## R1 — Driving kitty under sustained rendering pressure, and what it actually does
 
-**The exact stress driver.** A temporary script (`/tmp/stress_inner.sh`) generated the first burst — colored ANSI-SGR output plus scrollback churn — and printed its own measured line-counts and wall-clock timings. It was launched *into a real kitty window* over remote control so the bytes actually flowed through the terminal engine (not a detached pipe):
+**The exact stress driver.** A temporary script (`/tmp/stress_inner.sh`) generated the first burst — colored ANSI-SGR output plus scrollback churn — writing the **bulk output to stdout (fd 1)** while emitting its own measured line-counts and wall-clock timings to **stderr (fd 2)**. It was launched *into a real kitty window* over remote control so the bulk bytes on fd 1 actually flowed through the terminal engine (not a detached pipe), while the launch command's `2>/tmp/stress_inner_measure.txt` captured only the fd-2 marker lines (the `700000` bulk lines went to the window's pty, not the file):
 
 ```
 $ cat /tmp/stress_inner.sh
 #!/bin/bash
-python3 -c 'import time;print("stress_start=%.9f"%time.time())'
+python3 -c 'import sys,time;print("stress_start=%.9f"%time.time(),file=sys.stderr)'
 t0=$(python3 -c 'import time;print(time.time())')
 for i in $(seq 1 200000); do printf "\033[38;5;%dmL%05d colored render pressure\033[0m\n" $((i%256)) $i; done
 t1=$(python3 -c 'import time;print(time.time())')
-python3 -c "print('colored_output_lines=200000 seconds=%f'%($t1-$t0))"
+python3 -c "import sys;print('colored_output_lines=200000 seconds=%f'%($t1-$t0),file=sys.stderr)"
 t2=$(python3 -c 'import time;print(time.time())')
 seq 1 500000
 t3=$(python3 -c 'import time;print(time.time())')
-python3 -c "print('seq_churn_lines=500000 seconds=%f'%($t3-$t2))"
-python3 -c 'import time;print("stress_end=%.9f"%time.time())'
-echo "total_lines_rendered=700000"; echo "STRESS_INNER_DONE=1"
+python3 -c "import sys;print('seq_churn_lines=500000 seconds=%f'%($t3-$t2),file=sys.stderr)"
+python3 -c 'import sys,time;print("stress_end=%.9f"%time.time(),file=sys.stderr)'
+echo "total_lines_rendered=700000" >&2; echo "STRESS_INNER_DONE=1" >&2
 
 $ ./kitty/launcher/kitty @ --to unix:/tmp/ktest launch --type=tab --title work \
     bash -c 'bash /tmp/stress_inner.sh 2>/tmp/stress_inner_measure.txt'
@@ -172,7 +172,7 @@ STRESS_INNER_DONE=1
 
 So the first burst pushed **`700000`** lines (`200000` colored SGR + `500000` `seq`) through a live window; the writer's own perceived time was `0.646237`s + `0.328642`s (`stress_end - stress_start = 0.978014`s wall).
 
-**A second, sustained burst** (`/tmp/stress_sustained.sh`) repeated a 50 000-line block and measured throughput while the renderer was in the loop — here the writer is deliberately **render-throttled** (its `write()`s block on kitty draining/rendering the pty), which is why far fewer lines/second are achieved than a detached pipe:
+**A second, sustained burst** (`/tmp/stress_sustained.sh`) repeated a 50 000-line block and measured throughput while the renderer was in the loop — again emitting the bulk lines to stdout (fd 1, the pty) and only its summary markers to stderr (fd 2), so `2>/tmp/sustained_measure.txt` captures exactly those markers. Here the writer is deliberately **render-throttled** (its `write()`s block on kitty draining/rendering the pty), which is why far fewer lines/second are achieved than a detached pipe:
 
 ```
 $ cat /tmp/stress_sustained.sh
@@ -184,8 +184,8 @@ while [ "$(python3 -c 'import time;print(int(time.time()<'"$end"'))')" = 1 ]; do
   reps=$((reps+1)); lines=$((lines+50000))
 done
 t1=$(python3 -c 'import time;print(time.time())')
-python3 -c "print('sustained_reps=$reps lines_emitted=$lines seconds=%.4f'%($t1-$t0))"
-echo SUSTAINED_DONE=1
+python3 -c "import sys;print('sustained_reps=$reps lines_emitted=$lines seconds=%.4f'%($t1-$t0),file=sys.stderr)"
+echo SUSTAINED_DONE=1 >&2
 
 $ ./kitty/launcher/kitty @ --to unix:/tmp/ktest launch --type=tab --title sustained \
     bash -c 'bash /tmp/stress_sustained.sh 2>/tmp/sustained_measure.txt'
