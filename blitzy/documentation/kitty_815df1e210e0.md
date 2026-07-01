@@ -48,7 +48,7 @@ $ find /tmp/kitty_clean -name '*.so' | wc -l
 
 ## Q1 — It's marketed as "GPU based," but which language does the heavy lifting?
 
-**Answer:** The heavy lifting is native. The performance‑critical subsystems — VT parsing, the screen/line model, rendering, fonts, graphics, key encoding, SIMD string scanning, and the non‑blocking PTY I/O thread — are compiled **C** (with **Objective‑C** for macOS integration), exposed to Python as the single extension module **`kitty.fast_data_types`**, and the pixels are produced on the **GPU** by GLSL shaders. Python is the orchestration/configuration/extensibility layer; **Go** builds the standalone `kitten` binary and `tools/`. Python "wins" on file count, but that is breadth of orchestration, not runtime cost.
+**Answer:** The heavy lifting is native. The performance‑critical subsystems — VT parsing, the screen/line model, rendering, fonts, graphics, key encoding, SIMD string scanning, and the non‑blocking PTY I/O thread — are compiled **C** (with **Objective‑C** for macOS integration), exposed to Python as the single extension module **`kitty.fast_data_types`**, and the pixels are produced on the **GPU** by GLSL shaders. Python is the orchestration/configuration/extensibility layer; **Go** builds the standalone `kitten` binary and `tools/`. Python "wins" on line count (63,042 lines, the most of any single language), but that is breadth of orchestration, not runtime cost.
 
 ### 1.1 The premise: kitty's own identity string
 
@@ -65,7 +65,7 @@ README.asciidoc:1
 
 ### 1.2 Quantifying the multi‑language surface (lines of code)
 
-**Claim.** Measured across the committed source tree (excluding `.git` and the vendored `3rdparty/`), the native body (C + headers + Objective‑C) totals ≈ 100,000 lines, while **Python leads in single‑language file count** and Go contributes a large CLI‑tooling body.
+**Claim.** Measured across the committed source tree (excluding `.git` and the vendored `3rdparty/`), the native body (C + headers + Objective‑C) totals ≈ 100,000 lines, while **Python leads in single‑language line count** and Go contributes a large CLI‑tooling body.
 
 **Evidence.** The repository ships a canonical counter, `./count-lines-of-code`, which runs `git ls-files`, drops `linguist-generated`/`linguist-vendored` paths per `.gitattributes`, then runs `cloc`. `cloc` is **not installed** in this image — shown directly:
 
@@ -108,7 +108,7 @@ Presented as a table:
 
 **Reasoning & honest caveats.**
 - **Native ≈ 100k lines carry the performance‑critical work:** C + headers + Obj‑C = 57,292 + 34,890 + 8,006 = **100,188** lines.
-- **Python leads single‑language file count (213 files):** this is the breadth of orchestration/config/extensibility, not runtime hot‑path cost.
+- **Python leads single‑language line count (63,042 lines):** this is the breadth of orchestration/config/extensibility, not runtime hot‑path cost. (By *file* count Go actually leads at 258 `.go` files vs Python's 213 `.py`; Python's 213 `.py` files still far exceed the 83 `.c` files, so Python remains the broad orchestration layer.)
 - **Go ≈ 56k lines** builds the standalone CLI (`kitten`) and `tools/`.
 - **Measure the committed tree, not the built tree.** Running the same loop at the *built* repo root inflates the counts, because kitty's build **generates source files** (extra Go under `tools/`/`kittens/`, plus generated headers). Shown directly for the two affected extensions:
 
@@ -491,7 +491,7 @@ A deliberate re‑read of each question, confirming every named item is addresse
 - [x] "GPU based" identity — `README.asciidoc:1` (§1.1)
 - [x] Per‑language LOC with observed command + verbatim output, as a table (§1.2)
 - [x] Native C + `.h` + Obj‑C ≈ 100,188 (~100k) lines (§1.2)
-- [x] Python leads single‑language file count (213 files) (§1.2)
+- [x] Python leads single‑language line count (63,042 lines); Go leads file count (258) (§1.2)
 - [x] Go ≈ 56k builds CLI tooling (§1.2)
 - [x] `fast_data_types` seam — `kitty/data-types.c:467/469/525` (§1.3)
 - [x] Named C/Obj‑C subsystems: `vt-parser.c`, `screen.c`, `line.c`, `line-buf.c`, `gl.c`, `shaders.c`, `freetype.c`, `graphics.c`, `keys.c`, `simd-string-128.c`, `simd-string-256.c`, `state.c`, `child-monitor.c`, `*.m` (`core_text.m`, `cocoa_window.m`), `glfw/`, `tools/` (§1.3)
