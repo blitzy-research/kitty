@@ -46,7 +46,7 @@ at runtime.
 | # | Question | Answer (grounded) |
 |---|----------|-------------------|
 | **Q1** | What does kitty do with the sequence, and what is captured? | Each `133;*` payload is dispatched to `shell_prompt_marking` (`kitty/screen.c:L2328`). `A` marks the line `PROMPT_START` and fires `cmd_output_marking(False)`; `C` marks it `OUTPUT_START`, captures the cmdline, and fires `cmd_output_marking(True, 'mycmd')`; `D` fires `cmd_output_marking(None, '42')`. `B` is dispatched but hits **no case** — no state change, no callback. Observed: `last_cmd_cmdline = 'mycmd'`, `last_cmd_exit_status = 42`. |
-| **Q2** | Are the OSC sequences stripped or retained? | Depends on the surface. **`cmd_output`/`as_text` text serialization:** `line.c` re-emits only `A`, `A;k=s`, `C` (`kitty/line.c:L353-L360`) — **never `D`**; `cmd_output` additionally strips the leading `\x1b]133;C` (`kitty/window.py:L466-L467`). **Diagnostic dump trace:** the raw `D;42` payload appears. Net: **`133;D` appears only in the dump trace, never in `cmd_output`/`as_text`.** |
+| **Q2** | Are the OSC sequences stripped or retained? | Depends on the surface. For a full command cycle the text capture is `cmd_output(as_ansi=False) = 'some text\n'` and `cmd_output(as_ansi=True) = '\x1b[msome text\n'`, and `as_text(as_ansi=True)` re-emits **both `133;A` and `133;C`** but **never `133;D`**. Mechanism — **`cmd_output`/`as_text` serialization:** `line.c` re-emits only `A`, `A;k=s`, `C` (`kitty/line.c:L353-L360`) — **never `D`**; `cmd_output` additionally strips the leading `\x1b]133;C` (`kitty/window.py:L466-L467`). **Diagnostic dump trace:** the raw `D;42` payload appears. Net: **`133;D` appears only in the dump trace, never in `cmd_output`/`as_text`.** |
 | **Q3** | Total byte length and offset of `D;42`? | Total length = **62** bytes; the `\x1b]133;D` marker begins at byte offset **50** (for `cmdline=mycmd` + body `some text`). |
 | **Q4** | How does this change for exit codes 0, 1, 127? | The `\x1b]133;D` marker **start offset is constant (50)** across all codes; only the total length grows: `0`→**61**, `1`→**61**, `42`→**62**, `99`→**62**, `127`→**63**. Invariant: `total_len == 60 + num_digits` — **+1 byte per additional exit-code digit**. |
 | **Q5** | For exit code 99, what runtime evidence proves it was processed end-to-end? | Both recording paths record `99`: test harness `callback last_cmd_exit_status = 99`; production `Window.handle_cmd_end('99')` → `production last_cmd_exit_status = 99`. |
@@ -233,30 +233,43 @@ here — as already shown in Q1’s dump trace.
 **Conclusion.** `D;42` appears **only** in the dump trace, **never** in `cmd_output`/`as_text`.
 The `C` marker survives in `as_text(as_ansi=True)` but is stripped from `cmd_output`.
 
-**Evidence** — same `/tmp/osc133_obs/q1_q2.py`:
+To answer the capture question exactly, the text surfaces are observed from a **full command
+cycle as a real shell emits it** — the prompt line marked by `A`, the typed command, a newline,
+then the output line marked by `C`, the output text, a newline, then `D`. (The bash/fish
+emitters in §1 send exactly this arrangement — `A` on the prompt line, `C` before the output,
+`D` after, with the shell's own newlines separating them.) The screen is wide enough
+(`cols=20`) that `some text` does not wrap.
+
+**Evidence (required capture-surface values)** — script
+`/tmp/osc133_obs/q2_capture_surfaces.py`, run with `python3 /tmp/osc133_obs/q2_capture_surfaces.py`:
 
 ```
-===== Q2: capture surfaces =====
-cmd_output(as_ansi=False) = 'some text'
-cmd_output(as_ansi=True)  = '\x1b[msome text'
-as_text(as_ansi=False)    = 'some text\n\n\n\n'
-as_text(as_ansi=True)     = '\x1b[m\x1b]133;C\x1b\\some text\n\n\n\n'
-  '133;D' in cmd_output(ansi=False)? -> False | '133;C'? -> False
-  '133;D' in cmd_output(ansi=True)?  -> False | '133;C'? -> False
-  '133;D' in as_text(ansi=True)?     -> False | '133;C'? -> True
+===== Q2 (REQUIRED capture-surface evidence): full command cycle =====
+STREAM repr = b'\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\mycmd\r\n\x1b]133;C;cmdline=mycmd\x1b\\some text\r\n\x1b]133;D;42\x1b\\'
+cmd_output(as_ansi=False) = 'some text\n'
+cmd_output(as_ansi=True)  = '\x1b[msome text\n'
+as_text(as_ansi=False)    = '$ mycmd\nsome text\n\n\n'
+as_text(as_ansi=True)     = '\x1b[m\x1b]133;A\x1b\\$ mycmd\n\x1b[m\x1b]133;C\x1b\\some text\n\n\n'
+  '133;A' in as_text(ansi=True)? -> True | '133;C'? -> True | '133;D'? -> False
+  '133;D' in cmd_output(ansi=True)? -> False | '133;C'? -> False
 ```
 
 One claim at a time:
 
-- **`133;D` is never present in any text surface.** `'133;D' in cmd_output(ansi=False)? -> False`,
-  `'133;D' in cmd_output(ansi=True)? -> False`, `'133;D' in as_text(ansi=True)? -> False`
-  (no `WRITE_MARK("D")`, `kitty/line.c:L353-L360`).
-- **`133;C` survives in `as_text(as_ansi=True)`.** `'133;C' in as_text(ansi=True)? -> True`
-  (`WRITE_MARK("C")` at `kitty/line.c:L360`).
+- **`cmd_output(as_ansi=False) = 'some text\n'`** — the command output captured between the `C`
+  and `D` markers, carrying its trailing newline, with every OSC marker stripped (`as_ansi=False`).
+- **`cmd_output(as_ansi=True) = '\x1b[msome text\n'`** — the same output with only the leading
+  SGR reset; the leading `\x1b]133;C` has been stripped (`kitty/window.py:L466-L467`, shown
+  below) and **no `D` marker appears**.
+- **`as_text(as_ansi=True)` re-emits BOTH `133;A` and `133;C`, but never `133;D`.**
+  `'133;A' in as_text(ansi=True)? -> True`, `'133;C'? -> True`, `'133;D'? -> False`. The
+  `A`-marked prompt line and the `C`-marked output line are each re-emitted
+  (`WRITE_MARK("A")` at `kitty/line.c:L354`, `WRITE_MARK("C")` at `kitty/line.c:L360`); there is
+  **no `WRITE_MARK("D")`** (`kitty/line.c:L353-L360`), so `D` can never appear.
 - **`133;C` is stripped from `cmd_output`.** `'133;C' in cmd_output(ansi=True)? -> False`
   (the leading-`\x1b]133;C` strip at `kitty/window.py:L466-L467`).
-- **With `as_ansi=False`, all OSC are stripped.** `cmd_output(as_ansi=False) = 'some text'`
-  and `as_text(as_ansi=False) = 'some text\n\n\n\n'` contain no OSC bytes.
+- **With `as_ansi=False`, all OSC are stripped.** `cmd_output(as_ansi=False) = 'some text\n'`
+  and `as_text(as_ansi=False) = '$ mycmd\nsome text\n\n\n'` contain no OSC bytes.
 
 The two-step handling of `C` (re-emitted by `line.c`, then stripped by `window.py`) is shown
 directly by `/tmp/osc133_obs/q2_verify.py`, which captures the raw lines produced by the
@@ -266,12 +279,14 @@ C-level `screen.cmd_output(...)` **before** the Python post-processing runs:
 RAW lines from screen.cmd_output(as_ansi=True), BEFORE window.py:L466 strip:
   raw[0] = '\x1b[m'
   raw[1] = '\x1b]133;C\x1b\\some text'
+  raw[2] = '\n'
+  raw[3] = ''
 AFTER window.py cmd_output() post-processing:
-   '\x1b[msome text'
+   '\x1b[msome text\n'
 ```
 
 - **`line.c` re-emits `C`:** `raw[1] = '\x1b]133;C\x1b\\some text'` (`kitty/line.c:L360`).
-- **`window.py` then strips it:** the final `cmd_output` result is `'\x1b[msome text'`
+- **`window.py` then strips it:** the final `cmd_output` result is `'\x1b[msome text\n'`
   (`kitty/window.py:L466-L467`).
 
 **Corroboration from an existing test.** `kitty_tests/screen.py:L1124` asserts
@@ -280,16 +295,38 @@ contains `133;C` and **never** `133;D`, independently confirming the same surfac
 Additionally, kitty’s scrollback boundary search keys on the **`C`** marker, not `D`:
 `reverse_find(buf, sz, (const uint8_t*)"\x1b]133;C\x1b\\")` (`kitty/history.c:L475`).
 
-> **Observed nuance (reported exactly as seen).** For the user’s *literal* stream (which draws
-> no prompt text and no newline between `A` and `C`), `C`’s `OUTPUT_START` overwrites `A`’s
-> `PROMPT_START` on the same line 0. Consequently `as_text(as_ansi=True)` shows the `C` marker
-> but **not** a separate `A`-marked prompt line: `'\x1b[m\x1b]133;C\x1b\\some text\n\n\n\n'`.
-> This is consistent with the Q1 finding that “`A` and `C` both act on line 0.” In a normal
-> shell session the prompt is drawn and a newline separates the prompt line from the output
-> line, so both an `A`-marked line and a `C`-marked line would appear (as in the
-> `screen.py:L1124` assertion above). The invariant that matters for this question is
-> unchanged in either arrangement: **`C` can appear in `as_text(as_ansi=True)`, `D` never can,
-> and `cmd_output` strips the leading `C`.**
+### Secondary nuance — the user’s *literal* single-line example (reported exactly as seen)
+
+The user’s example writes the markers **back-to-back** — no prompt text drawn and no newline
+between them (`…A…B…C;cmdline=mycmd…some text…D;42…`). Running that exact literal stream (same
+`/tmp/osc133_obs/q2_capture_surfaces.py`) yields slightly different *text* strings:
+
+```
+===== Q2 (secondary nuance): user's LITERAL example (no newlines) =====
+STREAM repr = b'\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C;cmdline=mycmd\x1b\\some text\x1b]133;D;42\x1b\\'
+cmd_output(as_ansi=False) = 'some text'
+cmd_output(as_ansi=True)  = '\x1b[msome text'
+as_text(as_ansi=False)    = 'some text\n\n\n\n'
+as_text(as_ansi=True)     = '\x1b[m\x1b]133;C\x1b\\some text\n\n\n\n'
+  '133;A' in as_text(ansi=True)? -> False | '133;C'? -> True | '133;D'? -> False
+```
+
+This differs from the required capture-surface values in exactly **two** ways, and **both come
+from the stream construction, not from any different kitty behavior**:
+
+- **No trailing newline in `cmd_output`** (`'some text'` vs the required `'some text\n'`): the
+  literal stream places `D` immediately after `some text` with no line advance, so there is no
+  newline to capture. The full cycle ends the output line with a newline, yielding `'some text\n'`.
+- **Only `133;C` appears in `as_text(as_ansi=True)`** (`'133;A' … -> False` vs the required
+  `True`): with no newline between `A` and `C`, both act on **line 0**, so `C`’s `OUTPUT_START`
+  overwrites `A`’s `PROMPT_START` (the same “`A` and `C` both act on line 0” finding from Q1).
+  The full cycle separates them onto two lines, so both `133;A` and `133;C` are re-emitted.
+
+**Both arrangements give the same answer to Q2:** `D` is **never** re-emitted into any text
+surface (it appears only in the diagnostic dump trace); `C` **can** appear in
+`as_text(as_ansi=True)` but is **stripped** from `cmd_output`; and with `as_ansi=False` all OSC
+markers are stripped. The existing test assertion `kitty_tests/screen.py:L1124` (which draws a
+prompt and thus separates the prompt and output lines) matches the required full-cycle behavior.
 
 ---
 
@@ -515,14 +552,16 @@ strategies (`suppress` + `sys.maxsize` init versus `try/except → 0`).
 - **Reproducibility of measured numbers.** The byte counts (`62`, offset `50`, and `61/61/62/62/63`),
   the exit-99 values, the `sys.maxsize` value `9223372036854775807`, the production `0`, and the
   `3`-vs-`4` callback counts reproduce exactly.
-- **One observed nuance, reported exactly.** The Q1/Q2 *text-serialization* strings reflect the
-  user’s **literal** stream, in which `A` and `C` target the same line 0 (no prompt text drawn,
-  no newline inserted), so `C`’s `OUTPUT_START` overwrites `A`’s `PROMPT_START`. This is why
-  `as_text(as_ansi=True)` shows only the `C` marker rather than a separate `A`-marked prompt line.
-  It is consistent with the Q1 finding and with the existing test assertion at
-  `kitty_tests/screen.py:L1124` (which draws a prompt and thus shows both). It does not change the
-  answer to Q2 (‘`C` can appear in `as_text(as_ansi=True)`; `D` never can; `cmd_output` strips the
-  leading `C`’).
+- **Two stream constructions, one answer (reported exactly).** Q2’s **required** text-capture
+  values come from a **full command cycle** (prompt drawn, newline, output, newline), so both the
+  `A`-marked and `C`-marked lines appear in `as_text(as_ansi=True)` and `cmd_output` carries the
+  output’s trailing newline (`'some text\n'`) — matching a real shell session and the existing
+  test assertion at `kitty_tests/screen.py:L1124`. The user’s **literal** single-line example
+  (used for the Q1 dispatch trace and the Q3/Q4 byte measurements) draws no prompt text and no
+  newline, so `A` and `C` collapse onto line 0 (`C`’s `OUTPUT_START` overwrites `A`’s
+  `PROMPT_START`) and `cmd_output` lacks the trailing newline; this is reported as a **secondary
+  nuance** in Q2. Both arrangements give the same Q2 answer: `C` can appear in
+  `as_text(as_ansi=True)`, `D` never can, and `cmd_output` strips the leading `C`.
 - **Nothing was left unverifiable.** Every value the questions ask for was obtained by reading or
   running the code.
 
