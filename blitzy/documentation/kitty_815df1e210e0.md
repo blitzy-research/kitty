@@ -31,18 +31,18 @@ This was confirmed at runtime: after exercising the Enter path, `kitty.conf` con
 flowchart TD
     A["kitten choose-fonts"] --> B["tools/cmd/tool/main.go:L82<br/>KittyToolEntryPoints registers choose_fonts.EntryPoint"]
     B --> C["kittens/choose_fonts/main.go:L74-L85<br/>AddSubCommand Name=choose-fonts"]
-    C --> D["main.go:L86-L95<br/>parse --reload-in (default parent)"]
-    D --> E["main.go:L35<br/>handler{lp, opts}; run TUI loop"]
+    C --> D["kittens/choose_fonts/main.go:L86-L95<br/>parse --reload-in (default parent)"]
+    D --> E["kittens/choose_fonts/main.go:L35<br/>handler{lp, opts}; run TUI loop"]
     E --> F["family list pane (list.go / family_list.go)"]
     F --> G["faces preview pane (faces.go)"]
-    G --> H["final_pane.on_enter (faces.go:L120)"]
-    H --> I["final.go:L33-L45<br/>final screen: Enter / Esc / s / Ctrl+c"]
-    I -->|Enter| J["final.go:L78-L97<br/>Patcher.Patch(kitty.conf, KITTY_FONTS, serialized())"]
-    J --> K["api.go:L343-L347<br/>write kitty.conf.bak + AtomicUpdateFile"]
-    K --> L["api.go:L352-L371<br/>ReloadConfigInKitty -> SIGUSR1"]
+    G --> H["final_pane.on_enter (kittens/choose_fonts/faces.go:L120)"]
+    H --> I["kittens/choose_fonts/final.go:L33-L45<br/>final screen: Enter / Esc / s / Ctrl+c"]
+    I -->|Enter| J["kittens/choose_fonts/final.go:L78-L97<br/>Patcher.Patch(kitty.conf, KITTY_FONTS, serialized())"]
+    J --> K["tools/config/api.go:L343-L347<br/>write kitty.conf.bak + AtomicUpdateFile"]
+    K --> L["tools/config/api.go:L352-L371<br/>ReloadConfigInKitty -> SIGUSR1"]
     L --> M["lp.Quit(0) -> PERSISTED"]
-    I -->|s| N["final.go:L101-L111<br/>output_on_exit = serialized()"]
-    N --> O["main.go:L64-L65<br/>write to STDOUT -> SESSION/THROWAWAY"]
+    I -->|s| N["kittens/choose_fonts/final.go:L101-L111<br/>output_on_exit = serialized()"]
+    N --> O["kittens/choose_fonts/main.go:L64-L65<br/>write to STDOUT -> SESSION/THROWAWAY"]
     I -->|Esc| G
 ```
 
@@ -56,7 +56,7 @@ flowchart TD
 
 **Interactive-TUI handling.** `choose-fonts` is a `loop.New`-based full-screen TUI (`kittens/choose_fonts/main.go:L30`). Two complementary techniques were used:
 1. A **PTY driver** launched the real `kitten choose-fonts` and captured its live UI (used for the family-selection screen and to confirm the entry path).
-2. A **source-faithful Go harness** exercised the exact persistence code path (`config.Patcher.Patch`) that the Enter branch invokes (`final.go:L80-L82`). This is the more reliable, reproducible way to capture the `kitty.conf` before/after, the `# BEGIN_KITTY_FONTS` block, and the `.bak` backup — and is explicitly an acceptable method for the persistence proof. The faces→final GUI transition is not reachable in a bare PTY (face previews use kitty's graphics protocol, which needs a real kitty terminal), so the final-screen *text* is shown by reproducing its deterministic `fmt.Sprintf` literals (`final.go:L33-L45`); this limitation is stated where relevant.
+2. A **source-faithful Go harness** exercised the exact persistence code path (`config.Patcher.Patch`) that the Enter branch invokes (`kittens/choose_fonts/final.go:L80-L82`). This is the more reliable, reproducible way to capture the `kitty.conf` before/after, the `# BEGIN_KITTY_FONTS` block, and the `.bak` backup — and is explicitly an acceptable method for the persistence proof. The faces→final GUI transition is not reachable in a bare PTY (face previews use kitty's graphics protocol, which needs a real kitty terminal), so the final-screen *text* is shown by reproducing its deterministic `fmt.Sprintf` literals (`kittens/choose_fonts/final.go:L33-L45`); this limitation is stated where relevant.
 
 **Non-destructive verification.** All configuration writes were redirected to a throwaway directory via `KITTY_CONFIG_DIRECTORY`, which `ConfigDirForName` honors **first** (`tools/utils/paths.go:L88-L90`), so the real `~/.config/kitty/kitty.conf` was **never** modified. This was re-verified after every step (the real config directory stayed empty). All temporary scripts, harnesses, logs, and the throwaway config directory were deleted afterward, leaving the repository unchanged except for this one document.
 
@@ -126,6 +126,23 @@ kitty/launcher/kitty --config NONE
 
 `--config NONE` forces kitty to ignore any user configuration, so the instance starts from built-in defaults and nothing from a pre-existing `kitty.conf` interferes.
 
+**Runtime evidence — launch attempt (headless container).** This container is headless — both `DISPLAY` and `WAYLAND_DISPLAY` are empty — so kitty's GPU/GUI layer cannot open a real OS window. The launch was nonetheless attempted. The launcher runs and parses its options, then proceeds to GLFW/windowing initialization, which is the step that fails on the missing display. The exact commands and their verbatim output:
+
+```
+$ echo "DISPLAY=[$DISPLAY] WAYLAND_DISPLAY=[$WAYLAND_DISPLAY]"
+DISPLAY=[] WAYLAND_DISPLAY=[]
+
+$ kitty/launcher/kitty --version
+kitty 0.35.2 created by Kovid Goyal
+
+$ timeout 15 kitty/launcher/kitty --config NONE ; echo exit=$?
+[0.078] [glfw error 65544]: X11: The DISPLAY environment variable is missing
+GLFW initialization failed
+exit=1
+```
+
+The `--version` success proves the launcher binary is intact; the `--config NONE` run reaches GLFW initialization and fails only at the final windowing step (`glfw error 65544`, exit `1`) because there is no display. On a machine with a display this same command opens one default-configured kitty window. Note that kitty has **no** `--debug-config` command-line flag at this commit — `debug_config` is only an in-GUI key action (`kitty/options/definition.py:L4256`, `'debug_config kitty_mod+f6 debug_config'`) — so it cannot serve as a headless substitute: `kitty/launcher/kitty --config NONE --debug-config` returns `Unknown option: --debug-config`. The `choose-fonts` runtime evidence in this document is therefore captured through the non-GUI paths (a sized PTY for the family list in Requirement 2, kitty's own config loader for the restart proof in Requirement 4, and a source-faithful Go harness for the finalization write), all of which are reachable headlessly.
+
 **Rationale.** The build is required because the investigate-by-running rule mandates exercising the real code paths; the bare sandbox lacks the Go/pkg-config toolchain, hence the provided Docker image. `--config NONE` guarantees a clean baseline so that any observed configuration change is attributable to the kitten, not to a leftover config.
 
 ---
@@ -167,7 +184,7 @@ The `>` marker (`>Fira Code`) is the currently highlighted family. It is pre-sel
 
 Pressing Enter with a family highlighted advances to the faces preview pane: `if family := self.family_list.CurrentFamily(); family != "" { return self.handler.faces.on_enter(family) }` — `kittens/choose_fonts/list.go:L247-L251`.
 
-> **Headless limitation, stated explicitly.** In a bare PTY (no real kitty terminal), the loop's first screen-size computation divides pixel width by cell count. With an unsized PTY that count is zero, so the kitten aborts with `runtime error: integer divide by zero` at `tools/tui/loop/run.go:L80` (`s.CellWidth = s.WidthPx / s.WidthCells`). Its stack trace usefully confirms the entry path: `kittens/choose_fonts.EntryPoint.func1` (`main.go:L83`) → `kittens/choose_fonts.main` (`main.go:L54`, `lp.Run()`) → the loop. Supplying the PTY with a proper window size (including pixel dimensions) fixes it, which is how the family list above was captured. The subsequent faces→final transition renders font-face **previews** via kitty's graphics protocol and therefore requires a real kitty GUI terminal; it is not reachable headlessly. The final-screen *text* is shown in Requirement 3d by reproducing its deterministic format strings.
+> **Headless limitation, stated explicitly.** In a bare PTY (no real kitty terminal), the loop's first screen-size computation divides pixel width by cell count. With an unsized PTY that count is zero, so the kitten aborts with `runtime error: integer divide by zero` at `tools/tui/loop/run.go:L80` (`s.CellWidth = s.WidthPx / s.WidthCells`). Its stack trace usefully confirms the entry path: `kittens/choose_fonts.EntryPoint.func1` (`kittens/choose_fonts/main.go:L83`) → `kittens/choose_fonts.main` (`kittens/choose_fonts/main.go:L54`, `lp.Run()`) → the loop. Supplying the PTY with a proper window size (including pixel dimensions) fixes it, which is how the family list above was captured. The subsequent faces→final transition renders font-face **previews** via kitty's graphics protocol and therefore requires a real kitty GUI terminal; it is not reachable headlessly. The final-screen *text* is shown in Requirement 3d by reproducing its deterministic format strings.
 
 **Rationale.** This is exactly the flow a user walks through to reach the finalization step that the persistence question is about: pick a family → tune faces → confirm.
 
@@ -260,10 +277,10 @@ The pane progression that carries the user (and the options with them) is:
 
 - `handler.initialize` sets `h.panes = []pane{&h.listing, &h.faces, &h.face_pane, &h.final_pane}` — `kittens/choose_fonts/ui.go:L81`.
 - `current_pane` starts at `&h.listing` — `kittens/choose_fonts/ui.go:L172-L173`.
-- Key and text events dispatch to the current pane — `kittens/choose_fonts/ui.go:L195-L201` (keys) and `L206-L210` (text). `Ctrl+c` is intercepted at the handler level and cancels — `ui.go:L196-L199`.
+- Key and text events dispatch to the current pane — `kittens/choose_fonts/ui.go:L195-L201` (keys) and `L206-L210` (text). `Ctrl+c` is intercepted at the handler level and cancels — `kittens/choose_fonts/ui.go:L196-L199`.
 - In the faces pane, Enter transitions to the final pane: `return self.handler.final_pane.on_enter(self.family, self.settings)` — `kittens/choose_fonts/faces.go:L118-L120`.
 
-**Runtime evidence.** The PTY stack trace in Requirement 2 confirms the top of this chain at runtime: `EntryPoint.func1` (`main.go:L83`) invokes `main` (`main.go:L54`), which builds the `handler` (`main.go:L35`) and runs the loop. The `--reload-in` value validated in 3b is the value that arrives at `final.go:L87`.
+**Runtime evidence.** The PTY stack trace in Requirement 2 confirms the top of this chain at runtime: `EntryPoint.func1` (`kittens/choose_fonts/main.go:L83`) invokes `main` (`kittens/choose_fonts/main.go:L54`), which builds the `handler` (`kittens/choose_fonts/main.go:L35`) and runs the loop. The `--reload-in` value validated in 3b is the value that arrives at `kittens/choose_fonts/final.go:L87`.
 
 **Rationale.** This demonstrates that the value the user supplies on the command line survives, unchanged, all the way to the finalization branch where it decides the reload behavior.
 
@@ -271,14 +288,14 @@ The pane progression that carries the user (and the options with them) is:
 
 The final confirmation screen is drawn by `final_pane.draw_screen` — `kittens/choose_fonts/final.go:L29-L47`. The text lines (with their exact format strings) are:
 
-- `"You have chosen the %s family"` — `final.go:L34`
-- `"What would you like to do?"` — `final.go:L36`
-- `"%s to modify %s and use the new fonts"` (second `%s` is the italicized literal `kitty.conf`) — `final.go:L38`
-- `"%s to abort and return to font selection"` — `final.go:L40`
-- `"%s to write the new font settings to %s"` (second `%s` is the italicized literal `STDOUT`) — `final.go:L42`
-- `"%s to quit"` (for `Ctrl+c`) — `final.go:L44`
+- `"You have chosen the %s family"` — `kittens/choose_fonts/final.go:L34`
+- `"What would you like to do?"` — `kittens/choose_fonts/final.go:L36`
+- `"%s to modify %s and use the new fonts"` (second `%s` is the italicized literal `kitty.conf`) — `kittens/choose_fonts/final.go:L38`
+- `"%s to abort and return to font selection"` — `kittens/choose_fonts/final.go:L40`
+- `"%s to write the new font settings to %s"` (second `%s` is the italicized literal `STDOUT`) — `kittens/choose_fonts/final.go:L42`
+- `"%s to quit"` (for `Ctrl+c`) — `kittens/choose_fonts/final.go:L44`
 
-**Runtime evidence.** Reproducing those `fmt.Sprintf` calls verbatim (with `family = "Fira Code"` and the styling wrappers replaced by the raw `Enter`/`Esc`/`s`/`Ctrl+c` key labels) yields the exact user-visible text of the final screen:
+**Source-derived expected text (final-screen runtime capture not obtainable headlessly).** The final confirmation screen is painted through kitty's TUI/graphics layer and, like the faces-preview pane, requires a real kitty GUI terminal; it is therefore **not reachable in this headless container** (see the GLFW/`DISPLAY` launch limitation in Requirement 1 and the PTY note in Requirement 2), so its live rendering could not be captured here. The text it displays is nonetheless fully determined by the format strings cited above — substituting `family = "Fira Code"` and replacing the styling wrappers with the raw `Enter`/`Esc`/`s`/`Ctrl+c` key labels yields the exact user-visible text. The block below is thus **expected text derived from source** (`kittens/choose_fonts/final.go:L33-L45`), not a screen capture:
 
 ```
 You have chosen the Fira Code family
@@ -296,11 +313,11 @@ Ctrl+c to quit
 
 The three finalization branches are dispatched from two handlers:
 
-- **`on_key_event`** — `final.go:L72-L99`:
-  - `Esc` → return to the faces pane, no write — `final.go:L73-L76`.
-  - `Enter` → persist to `kitty.conf` — `final.go:L78-L97` (detailed in Requirement 4).
-- **`on_text`** — `final.go:L101-L111`:
-  - `s` / `S` → write settings to STDOUT and quit — `final.go:L104-L106` (session-only; detailed in Requirement 4).
+- **`on_key_event`** — `kittens/choose_fonts/final.go:L72-L99`:
+  - `Esc` → return to the faces pane, no write — `kittens/choose_fonts/final.go:L73-L76`.
+  - `Enter` → persist to `kitty.conf` — `kittens/choose_fonts/final.go:L78-L97` (detailed in Requirement 4).
+- **`on_text`** — `kittens/choose_fonts/final.go:L101-L111`:
+  - `s` / `S` → write settings to STDOUT and quit — `kittens/choose_fonts/final.go:L104-L106` (session-only; detailed in Requirement 4).
 
 **Rationale.** The final screen is the fork in the road: `Enter` makes the choice **persistent**, `s`/`S` makes it **session-only**, and `Esc` discards it and returns to selection.
 
@@ -318,27 +335,27 @@ The three finalization branches are dispatched from two handlers:
 The Enter handler in the final pane (`kittens/choose_fonts/final.go:L78-L97`) does the following:
 
 ```go
-patcher := config.Patcher{Write_backup: true}                                   // final.go:L80
-path := filepath.Join(utils.ConfigDir(), "kitty.conf")                          // final.go:L81
-updated, err := patcher.Patch(path, "KITTY_FONTS", self.settings.serialized(),  // final.go:L82
+patcher := config.Patcher{Write_backup: true}                                   // kittens/choose_fonts/final.go:L80
+path := filepath.Join(utils.ConfigDir(), "kitty.conf")                          // kittens/choose_fonts/final.go:L81
+updated, err := patcher.Patch(path, "KITTY_FONTS", self.settings.serialized(),  // kittens/choose_fonts/final.go:L82
     "font_family", "bold_font", "italic_font", "bold_italic_font")
 ...
 if updated {
-    switch self.handler.opts.Reload_in {                                        // final.go:L87
+    switch self.handler.opts.Reload_in {                                        // kittens/choose_fonts/final.go:L87
     case "parent":
-        config.ReloadConfigInKitty(true)                                        // final.go:L88-L89
+        config.ReloadConfigInKitty(true)                                        // kittens/choose_fonts/final.go:L88-L89
     case "all":
-        config.ReloadConfigInKitty(false)                                       // final.go:L90-L91
+        config.ReloadConfigInKitty(false)                                       // kittens/choose_fonts/final.go:L90-L91
     }
 }
-self.lp.Quit(0)                                                                 // final.go:L94
+self.lp.Quit(0)                                                                 // kittens/choose_fonts/final.go:L94
 ```
 
 Key facts, each cited:
 
-- The **target file is hardcoded to `kitty.conf`** in the resolved config directory — `final.go:L81`. There is no option to change the file name at this commit (see the Version-divergence note).
-- The **sentinel** passed to `Patch` is the literal `"KITTY_FONTS"`, and the four setting keys to reconcile are `"font_family"`, `"bold_font"`, `"italic_font"`, `"bold_italic_font"` — `final.go:L82`.
-- After a successful write (`updated == true`), the reload signal depends on the `--reload-in` value: `parent` → `ReloadConfigInKitty(true)`, `all` → `ReloadConfigInKitty(false)`, `none` → no signal — `final.go:L86-L93`. Then the loop quits with code `0` — `final.go:L94`.
+- The **target file is hardcoded to `kitty.conf`** in the resolved config directory — `kittens/choose_fonts/final.go:L81`. There is no option to change the file name at this commit (see the Version-divergence note).
+- The **sentinel** passed to `Patch` is the literal `"KITTY_FONTS"`, and the four setting keys to reconcile are `"font_family"`, `"bold_font"`, `"italic_font"`, `"bold_italic_font"` — `kittens/choose_fonts/final.go:L82`.
+- After a successful write (`updated == true`), the reload signal depends on the `--reload-in` value: `parent` → `ReloadConfigInKitty(true)`, `all` → `ReloadConfigInKitty(false)`, `none` → no signal — `kittens/choose_fonts/final.go:L86-L93`. Then the loop quits with code `0` — `kittens/choose_fonts/final.go:L94`.
 
 **What gets written — `serialized()`** (`kittens/choose_fonts/final.go:L63-L70`) joins exactly four lines with `"\n"`, each key left-padded so the value column starts at column 18:
 
@@ -353,20 +370,90 @@ The backing struct is `type faces_settings struct { font_family, bold_font, ital
 
 **How the file is patched — `Patcher.Patch`** (`tools/config/api.go:L310-L350`):
 
-- The `Patcher` struct is `type Patcher struct { Write_backup bool; Mode fs.FileMode }` — `api.go:L305-L308`.
-- Prior matching settings are commented out via regex replacement with `# $1` — `api.go:L325-L326`.
-- The new content is wrapped in a `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block; the template is `"# BEGIN_%s\n%s\n# END_%s"` (`api.go:L330`), inserted if absent or replacing an existing block if present — `api.go:L328-L340`.
-- A `<path>.bak` backup is written **only when** the original file is non-empty **and** `Write_backup` is set: `os.WriteFile(backup_path+".bak", raw, self.Mode)` — `api.go:L343-L345`.
-- The file is written **atomically** via `utils.AtomicUpdateFile(path, nraw, self.Mode)` — `api.go:L347`; that helper is `func AtomicUpdateFile(path string, data []byte, perms ...fs.FileMode) (err error)` — `tools/utils/atomic-write.go:L79` (a write-to-temp-then-rename).
-- If the resulting content is byte-identical to the original, `Patch` returns `updated=false` and performs no write and no backup — `api.go:L349`.
+- The `Patcher` struct is `type Patcher struct { Write_backup bool; Mode fs.FileMode }` — `tools/config/api.go:L305-L308`.
+- Prior matching settings are commented out via regex replacement with `# $1` — `tools/config/api.go:L325-L326`.
+- The new content is wrapped in a `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block; the template is `"# BEGIN_%s\n%s\n# END_%s"` (`tools/config/api.go:L330`), inserted if absent or replacing an existing block if present — `tools/config/api.go:L328-L340`.
+- A `<path>.bak` backup is written **only when** the original file is non-empty **and** `Write_backup` is set: `os.WriteFile(backup_path+".bak", raw, self.Mode)` — `tools/config/api.go:L343-L345`.
+- The file is written **atomically** via `utils.AtomicUpdateFile(path, nraw, self.Mode)` — `tools/config/api.go:L347`; that helper is `func AtomicUpdateFile(path string, data []byte, perms ...fs.FileMode) (err error)` — `tools/utils/atomic-write.go:L79` (a write-to-temp-then-rename).
+- If the resulting content is byte-identical to the original, `Patch` returns `updated=false` and performs no write and no backup — `tools/config/api.go:L349`.
 
-**Live reload — `ReloadConfigInKitty`** (`tools/config/api.go:L352-L371`): the `parent` branch reads `KITTY_PID` and sends `unix.SIGUSR1` to that process — `api.go:L353-L357`; the all-instances branch sends `SIGUSR1` to every kitty GUI process — `api.go:L363-L369`. Both are guarded by `is_kitty_gui_cmdline`, which requires `filepath.Base(cmd[0]) == "kitty"` — `tools/config/api.go:L282-L303`. On the receiving side, kitty's C child-monitor lists `SIGUSR1` among `KITTY_HANDLED_SIGNALS` (`kitty/child-monitor.c:L121`) and handles it with `case SIGUSR1: ss->reload_config = true;` — `kitty/child-monitor.c:L1373-L1374` — which is what makes a running instance re-read `kitty.conf`.
+**Live reload — `ReloadConfigInKitty`** (`tools/config/api.go:L352-L371`): the `parent` branch reads `KITTY_PID` and sends `unix.SIGUSR1` to that process — `tools/config/api.go:L353-L357`; the all-instances branch sends `SIGUSR1` to every kitty GUI process — `tools/config/api.go:L363-L369`. Both are guarded by `is_kitty_gui_cmdline`, which requires `filepath.Base(cmd[0]) == "kitty"` — `tools/config/api.go:L282-L303`. On the receiving side, kitty's C child-monitor lists `SIGUSR1` among `KITTY_HANDLED_SIGNALS` (`kitty/child-monitor.c:L121`) and handles it with `case SIGUSR1: ss->reload_config = true;` — `kitty/child-monitor.c:L1373-L1374` — which is what makes a running instance re-read `kitty.conf`.
 
-**Config-directory resolution (what makes non-destructive testing possible).** `ConfigDir()` is `ConfigDirForName("kitty.conf")` — `tools/utils/paths.go:L132-L133`. `ConfigDirForName` honors **`KITTY_CONFIG_DIRECTORY` first**, returning `Abspath(Expanduser(kcd))` directly (so `kitty.conf` lives directly in that directory) — `tools/utils/paths.go:L88-L90`; otherwise it uses `XDG_CONFIG_HOME` / `XDG_CONFIG_DIRS` — `paths.go:L101-L108` — else `~/.config/kitty` — `paths.go:L109`.
+**Config-directory resolution (what makes non-destructive testing possible).** `ConfigDir()` is `ConfigDirForName("kitty.conf")` — `tools/utils/paths.go:L132-L133`. `ConfigDirForName` honors **`KITTY_CONFIG_DIRECTORY` first**, returning `Abspath(Expanduser(kcd))` directly (so `kitty.conf` lives directly in that directory) — `tools/utils/paths.go:L88-L90`; otherwise it uses `XDG_CONFIG_HOME` / `XDG_CONFIG_DIRS` — `tools/utils/paths.go:L101-L108` — else `~/.config/kitty` — `tools/utils/paths.go:L109`.
 
 ### The worked runtime example (verbatim)
 
-All of the following was run with `KITTY_CONFIG_DIRECTORY` pointed at a throwaway directory, so the real user config was never touched. The Enter branch was exercised with a source-faithful Go harness that reproduces `final.go:L80-L82` exactly (constructing `config.Patcher{Write_backup: true}` and calling `patcher.Patch(ConfigDir()+"/kitty.conf", "KITTY_FONTS", serialized, "font_family", "bold_font", "italic_font", "bold_italic_font")`). This exercises the identical persistence machinery the interactive Enter key invokes.
+All of the following was run with `KITTY_CONFIG_DIRECTORY` pointed at a throwaway directory (`/tmp/blitzy_kitty_cfg`), so the real user config was never touched. The Enter and `s`/`S` branches were exercised with a small, **source-faithful Go harness** that reproduces the two finalization writes verbatim. Because `choose-fonts` is a `loop.New` GUI/PTY TUI whose faces→final panes need a real kitty terminal (unreachable headlessly, per Requirements 1–2), the harness calls the exact same library functions the interactive keys call — `config.Patcher.Patch` for Enter (`kittens/choose_fonts/final.go:L80-L82`) and `serialized() → STDOUT` for `s`/`S` (`kittens/choose_fonts/final.go:L104-L106` + `kittens/choose_fonts/main.go:L64-L65`) — so it drives the identical persistence machinery.
+
+**The harness (source).** Saved as a temporary file inside the module at `blitzy_adhoc_test_choose_fonts_harness/main.go` and **deleted after evidence capture** (never committed):
+
+```go
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"kitty/tools/config"
+	"kitty/tools/utils"
+)
+
+// faces_settings mirrors kittens/choose_fonts/faces.go:L14-L16 and the
+// serialized() method copied verbatim from kittens/choose_fonts/final.go:L63-L70.
+type faces_settings struct {
+	font_family, bold_font, italic_font, bold_italic_font string
+}
+
+func (self faces_settings) serialized() string {
+	return strings.Join([]string{
+		"font_family      " + self.font_family,
+		"bold_font        " + self.bold_font,
+		"italic_font      " + self.italic_font,
+		"bold_italic_font " + self.bold_italic_font,
+	}, "\n")
+}
+
+func main() {
+	mode := flag.String("mode", "patch", "patch (Enter branch) | stdout (s/S branch)")
+	flag.Parse()
+
+	// Chosen family => font_family set to family="<family>"; the other three faces
+	// default to the literal "auto" (kittens/choose_fonts/faces.go:L152-L155).
+	settings := faces_settings{
+		font_family:      `family="Fira Code"`,
+		bold_font:        "auto",
+		italic_font:      "auto",
+		bold_italic_font: "auto",
+	}
+
+	switch *mode {
+	case "patch":
+		// Verbatim reproduction of kittens/choose_fonts/final.go:L80-L82.
+		patcher := config.Patcher{Write_backup: true}
+		path := filepath.Join(utils.ConfigDir(), "kitty.conf")
+		updated, err := patcher.Patch(path, "KITTY_FONTS", settings.serialized(), "font_family", "bold_font", "italic_font", "bold_italic_font")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Patch returned updated=%v\n", updated)
+		fmt.Printf("target path=%s\n", path)
+	case "stdout":
+		// Verbatim reproduction of kittens/choose_fonts/final.go:L104-L106 followed by
+		// kittens/choose_fonts/main.go:L64-L65 (write output_on_exit to STDOUT; no Patch call).
+		output_on_exit := settings.serialized() + "\n"
+		os.Stdout.WriteString(output_on_exit)
+	default:
+		fmt.Fprintln(os.Stderr, "unknown mode:", *mode)
+		os.Exit(2)
+	}
+}
+```
+
+It is invoked as `KITTY_CONFIG_DIRECTORY=/tmp/blitzy_kitty_cfg go run ./blitzy_adhoc_test_choose_fonts_harness -mode=patch` for the Enter branch and `… -mode=stdout` for the `s`/`S` branch; `go run` compiles it offline against the module's populated build cache. Every command and its verbatim output follow.
 
 **Step 1 — isolate config writes and confirm a clean baseline.**
 
@@ -376,9 +463,10 @@ $ cat "$KITTY_CONFIG_DIRECTORY/kitty.conf"
 cat: /tmp/blitzy_kitty_cfg/kitty.conf: No such file or directory (os error 2)
 ```
 
-**Step 2 — press Enter (run the faithful Patch harness).** The harness prints the `Patch` return value and the target path:
+**Step 2 — press Enter (run the faithful Patch harness).** The `-mode=patch` run reproduces `kittens/choose_fonts/final.go:L80-L82` and prints the `Patch` return value and the target path:
 
 ```
+$ KITTY_CONFIG_DIRECTORY=/tmp/blitzy_kitty_cfg go run ./blitzy_adhoc_test_choose_fonts_harness -mode=patch
 Patch returned updated=true
 target path=/tmp/blitzy_kitty_cfg/kitty.conf
 ```
@@ -395,7 +483,7 @@ bold_italic_font auto$
 # END_KITTY_FONTS
 ```
 
-Because the original file did not exist (empty), **no `.bak` was written** — matching the `len(raw) > 0 && self.Write_backup` guard at `api.go:L343`:
+Because the original file did not exist (empty), **no `.bak` was written** — matching the `len(raw) > 0 && self.Write_backup` guard at `tools/config/api.go:L343`:
 
 ```
 $ ls -l "$KITTY_CONFIG_DIRECTORY/kitty.conf.bak"
@@ -408,9 +496,13 @@ ls: cannot access '/tmp/blitzy_kitty_cfg/kitty.conf.bak': No such file or direct
 $ printf '%s\n' 'font_family      Cascadia Code' 'font_size 12.0' > "$KITTY_CONFIG_DIRECTORY/kitty.conf"
 $ sha256sum "$KITTY_CONFIG_DIRECTORY/kitty.conf"
 1e47e41283b79556ffa783e0fa58a6ef2b5c365312845d192b5000cc6ee16310  /tmp/blitzy_kitty_cfg/kitty.conf
+
+$ KITTY_CONFIG_DIRECTORY=/tmp/blitzy_kitty_cfg go run ./blitzy_adhoc_test_choose_fonts_harness -mode=patch
+Patch returned updated=true
+target path=/tmp/blitzy_kitty_cfg/kitty.conf
 ```
 
-After running the harness (`Patch returned updated=true`), `kitty.conf` shows the prior `font_family` **commented out**, the unrelated `font_size` **preserved**, and the new block appended:
+After this run, `kitty.conf` shows the prior `font_family` **commented out**, the unrelated `font_size` **preserved**, and the new block appended:
 
 ```
 $ cat "$KITTY_CONFIG_DIRECTORY/kitty.conf"
@@ -430,7 +522,7 @@ bold_italic_font auto
 
 ```
 $ ls -l "$KITTY_CONFIG_DIRECTORY/kitty.conf.bak"
--rw-r--r-- 1 root root 46 Jul  1 04:18 /tmp/blitzy_kitty_cfg/kitty.conf.bak
+-rw-r--r-- 1 root root 46 Jul  1 05:02 /tmp/blitzy_kitty_cfg/kitty.conf.bak
 $ cat "$KITTY_CONFIG_DIRECTORY/kitty.conf.bak"
 font_family      Cascadia Code
 font_size 12.0
@@ -438,10 +530,10 @@ $ sha256sum "$KITTY_CONFIG_DIRECTORY/kitty.conf.bak"
 1e47e41283b79556ffa783e0fa58a6ef2b5c365312845d192b5000cc6ee16310  /tmp/blitzy_kitty_cfg/kitty.conf.bak
 ```
 
-Running the same patch a **third** time is idempotent — `Patch` returns `updated=false` (per `api.go:L349`), and there remains exactly **one** `# BEGIN_KITTY_FONTS` marker (the block is *replaced*, not duplicated):
+Running the same patch a **third** time is idempotent — `Patch` returns `updated=false` (per `tools/config/api.go:L349`), and there remains exactly **one** `# BEGIN_KITTY_FONTS` marker (the block is *replaced*, not duplicated):
 
 ```
-$ # (re-run the harness)
+$ KITTY_CONFIG_DIRECTORY=/tmp/blitzy_kitty_cfg go run ./blitzy_adhoc_test_choose_fonts_harness -mode=patch
 Patch returned updated=false
 target path=/tmp/blitzy_kitty_cfg/kitty.conf
 $ grep -c '# BEGIN_KITTY_FONTS' "$KITTY_CONFIG_DIRECTORY/kitty.conf"
@@ -473,13 +565,13 @@ font_size       = 12.0
 
 The new process reads `font_family = family="Fira Code"` (the value written by the Enter branch), plus `bold_font`/`italic_font`/`bold_italic_font = auto`, and it also correctly parses the preserved `font_size = 12.0`. **This is the literal proof that the choice survives a restart — i.e. it is persistent, not session-only.**
 
-**Step 6 — the session-only contrast (`s`/`S`).** The `s`/`S` handler sets `output_on_exit = self.settings.serialized() + "\n"` and quits — `kittens/choose_fonts/final.go:L104-L106` (the cases are `case "s", "S":` at `L104`). `main` then writes that string to STDOUT: `os.Stdout.WriteString(output_on_exit)` — `kittens/choose_fonts/main.go:L64-L65` (with `var output_on_exit string` declared at `main.go:L14`). Reproducing that branch faithfully (serialize → STDOUT, **no** `Patch` call) prints the four lines and leaves `kitty.conf` byte-for-byte unchanged:
+**Step 6 — the session-only contrast (`s`/`S`).** The `s`/`S` handler sets `output_on_exit = self.settings.serialized() + "\n"` and quits — `kittens/choose_fonts/final.go:L104-L106` (the cases are `case "s", "S":` at `L104`). `main` then writes that string to STDOUT: `os.Stdout.WriteString(output_on_exit)` — `kittens/choose_fonts/main.go:L64-L65` (with `var output_on_exit string` declared at `kittens/choose_fonts/main.go:L14`). Reproducing that branch faithfully (serialize → STDOUT, **no** `Patch` call) prints the four lines and leaves `kitty.conf` byte-for-byte unchanged:
 
 ```
 $ sha256sum "$KITTY_CONFIG_DIRECTORY/kitty.conf"
 df24a663064dd7fec104a57b0614bed3be3e549f51b1d02a9b238b3516132832  /tmp/blitzy_kitty_cfg/kitty.conf
 
-$ # (run the 's'/'S'-branch harness: serialized() -> STDOUT)
+$ KITTY_CONFIG_DIRECTORY=/tmp/blitzy_kitty_cfg go run ./blitzy_adhoc_test_choose_fonts_harness -mode=stdout
 font_family      family="Fira Code"
 bold_font        auto
 italic_font      auto
@@ -491,14 +583,14 @@ df24a663064dd7fec104a57b0614bed3be3e549f51b1d02a9b238b3516132832  /tmp/blitzy_ki
 
 The sha256 is identical before and after — the `s`/`S` path **never touches `kitty.conf`**. This is the session-only / throwaway path (it merely emits the settings so a user can copy them elsewhere).
 
-**SIGUSR1 delivery (concrete).** A full live reload of a running kitty GUI could not be exercised headlessly (no display is available in the container, so a kitty **GUI** window cannot start). The mechanism is nonetheless verified end-to-end in code (sender `api.go:L357`, receiver `kitty/child-monitor.c:L1373-L1374`), and the signal itself was delivered concretely to confirm its identity:
+**SIGUSR1 delivery (concrete).** A full live reload of a running kitty GUI could not be exercised headlessly (no display is available in the container, so a kitty **GUI** window cannot start). The mechanism is nonetheless verified end-to-end in code (sender `tools/config/api.go:L357`, receiver `kitty/child-monitor.c:L1373-L1374`), and the signal itself was delivered concretely to confirm its identity:
 
 ```
 $ python3 - <<'PY'
 import os, signal, time
 got = {}
 signal.signal(signal.SIGUSR1, lambda s, f: got.__setitem__('sig', signal.Signals(s).name))
-os.kill(os.getpid(), signal.SIGUSR1)   # mirrors p.SendSignal(unix.SIGUSR1) at api.go:L357
+os.kill(os.getpid(), signal.SIGUSR1)   # mirrors p.SendSignal(unix.SIGUSR1) at tools/config/api.go:L357
 time.sleep(0.05)
 print("delivered signal =", got.get('sig'), "(number", int(signal.SIGUSR1), ")")
 PY
@@ -550,11 +642,11 @@ Consequently, **this document is the first in-repo write-up of the `choose-fonts
 
 The official kitty documentation independently corroborates the code-derived behavior traced above. It is cited here only as secondary confirmation; wherever docs and code could diverge, **the code at `815df1e2` and its observed behavior are authoritative**.
 
-- The docs describe `choose-fonts` as, in their words, <cite index="8-2">"a convenient UI for choosing fonts, in the form of the choose-fonts kitten."</cite> This matches the family-selection → face-preview → final-confirmation TUI traced in Requirements 2 and 3.
-- The docs enumerate the same four font-face keys the kitten writes: <cite index="8-22">there are four font face selection keys: font_family, bold_font, italic_font and bold_italic_font.</cite> These are exactly the keys emitted by `serialized()` (`kittens/choose_fonts/final.go:L63-L70`) and passed to `Patch` (`final.go:L82`).
-- The docs confirm the reload signal used by the persist branch: configuration can be reloaded by <cite index="1-2">sending kitty the SIGUSR1 signal with kill -SIGUSR1 $KITTY_PID.</cite> This matches `ReloadConfigInKitty` (`tools/config/api.go:L352-L371`), which sends `unix.SIGUSR1` to `KITTY_PID` (`api.go:L357`).
-- The docs also document the config-directory override used for non-destructive verification: kitty honors the <cite index="1-24">KITTY_CONFIG_DIRECTORY environment variable</cite> when locating the config file — the same variable resolved first by `ConfigDirForName` (`tools/utils/paths.go:L88-L90`).
-- On the interactive flow, the docs state that <cite index="8-5">once you select a family by pressing the Enter key, you are shown previews of what the regular, bold and italic faces look like for that family,</cite> matching the `listing → faces` pane transition (`kittens/choose_fonts/list.go:L247-L251`) and the subsequent `faces → final_pane` transition on Enter (`kittens/choose_fonts/faces.go:L120`).
+- The [official choose-fonts documentation](https://sw.kovidgoyal.net/kitty/kittens/choose-fonts/) describes it as "a convenient UI for choosing fonts, in the form of the choose-fonts kitten." This matches the family-selection → face-preview → final-confirmation TUI traced in Requirements 2 and 3.
+- The [kitty.conf font documentation](https://sw.kovidgoyal.net/kitty/conf/#fonts) enumerates the same four font-face keys the kitten writes — `font_family`, `bold_font`, `italic_font`, `bold_italic_font`. These are exactly the keys emitted by `serialized()` (`kittens/choose_fonts/final.go:L63-L70`) and passed to `Patch` (`kittens/choose_fonts/final.go:L82`).
+- The [kitty.conf documentation](https://sw.kovidgoyal.net/kitty/conf/) confirms the reload signal the persist branch relies on: the config can be reloaded by "sending kitty the SIGUSR1 signal with kill -SIGUSR1 $KITTY_PID". This matches `ReloadConfigInKitty` (`tools/config/api.go:L352-L371`), which sends `unix.SIGUSR1` to `KITTY_PID` (`tools/config/api.go:L357`).
+- The [kitty command-line documentation](https://sw.kovidgoyal.net/kitty/invocation/) documents the config-directory override used for non-destructive verification: when the `KITTY_CONFIG_DIRECTORY` environment variable is set, kitty always uses that directory for `kitty.conf`. This is the same variable resolved first by `ConfigDirForName` (`tools/utils/paths.go:L88-L90`).
+- On the interactive flow, the [choose-fonts documentation](https://sw.kovidgoyal.net/kitty/kittens/choose-fonts/) states that after selecting a family with Enter "you are shown previews of what the regular, bold and italic faces look like", matching the `listing → faces` pane transition (`kittens/choose_fonts/list.go:L247-L251`) and the subsequent `faces → final_pane` transition on Enter (`kittens/choose_fonts/faces.go:L120`).
 
 One divergence is worth restating in doc terms: current upstream also documents a `--config-file-name` option for the kitten, which — as shown above — **does not exist at this commit**.
 
@@ -566,14 +658,14 @@ Every distinct sub-part of the question is addressed above. This checklist confi
 
 | Requirement | Addressed? | Where / primary evidence |
 |-------------|:---------:|--------------------------|
-| **R1 — Build & launch a single default instance** | ✅ | `./dev.sh build` (`dev.sh:L9`, `docs/build.rst:L19`) → binary `kitty/launcher/kitty` (`docs/build.rst:L22`); captured build tail (`Build successful. Run kitty as: kitty/launcher/kitty`), `ls -l` of the binary, `kitty/launcher/kitty --version` → `kitty 0.35.2 created by Kovid Goyal`; launch with `--config NONE`. |
+| **R1 — Build & launch a single default instance** | ✅ | `./dev.sh build` (`dev.sh:L9`, `docs/build.rst:L19`) → binary `kitty/launcher/kitty` (`docs/build.rst:L22`); captured build tail (`Build successful. Run kitty as: kitty/launcher/kitty`), `ls -l` of the binary, `kitty/launcher/kitty --version` → `kitty 0.35.2 created by Kovid Goyal`; launch **attempted** with `--config NONE` — reaches GLFW init then fails on the missing display (headless container; verbatim output + limitation under R1). |
 | **R2 — Invoke the kitten** | ✅ | `kitten choose-fonts` / `kitty +kitten choose-fonts`; captured `--help` usage and the live family-selection list (with `>Fira Code` preselected). |
-| **R3a — Subcommand registration** | ✅ | `tools/cmd/tool/main.go:L9` (import), `:L82` (`choose_fonts.EntryPoint(root)`); `kittens/choose_fonts/main.go:L74-L85` (`AddSubCommand`, `Name: "choose-fonts"`, `ShortDescription: "Choose the fonts used in kitty"`); visible alias `choose_fonts` at `main.go:L96-L98`. |
+| **R3a — Subcommand registration** | ✅ | `tools/cmd/tool/main.go:L9` (import), `:L82` (`choose_fonts.EntryPoint(root)`); `kittens/choose_fonts/main.go:L74-L85` (`AddSubCommand`, `Name: "choose-fonts"`, `ShortDescription: "Choose the fonts used in kitty"`); visible alias `choose_fonts` at `kittens/choose_fonts/main.go:L96-L98`. |
 | **R3b — Option parsing** | ✅ | The sole option `--reload-in` (`Dest: "Reload_in"`, `Type: "choices"`, `Choices: "parent, all, none"`, `Default: "parent"`) at `kittens/choose_fonts/main.go:L86-L95`; `Options` struct at `:L70-L72`; runtime invalid-choice rejection. |
-| **R3c — Value flow (CLI → program → final screen)** | ✅ | `cmd.GetOptionValues(&opts)` (`main.go:L79-L80`) → `main(&opts)` (`:L83`) → `handler{opts}` (`:L35`, field at `ui.go:L43`) → final pane reads `self.handler.opts.Reload_in` (`final.go:L87`); pane progression `ui.go:L81`, `faces.go:L120`. |
-| **R3d — Finalization (final screen + branches)** | ✅ | Final-screen text literals at `final.go:L34-L44` (Enter/Esc/`s`/Ctrl+c); `on_key_event` (`:L72-L99`), `on_text` (`:L101-L111`); both branches demonstrated under R4. |
-| **R4 — The KEY persistence question** | ✅ | **Enter PERSISTS**: `Patcher{Write_backup:true}` (`final.go:L80`), `Patch(kitty.conf, "KITTY_FONTS", serialized(), font_family, bold_font, italic_font, bold_italic_font)` (`:L81-L82`); wrote `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block + `.bak` (byte-identical sha256) + atomic write (`api.go:L328-L347`); `SIGUSR1` reload (`api.go:L352-L371`); **restart proof** loads `font_family="Fira Code"`. **`s`/`S` is session-only**: STDOUT only, `kitty.conf` sha256 unchanged (`final.go:L104-L106`, `main.go:L64-L65`). **Esc** aborts to faces pane (`final.go:L73-L76`). |
-| **Version divergence** | ✅ | `--config-file-name` absent (only `--reload-in`); target file hardcoded to `kitty.conf` (`final.go:L81`); `docs/kittens/choose-fonts.rst` absent at this commit. |
+| **R3c — Value flow (CLI → program → final screen)** | ✅ | `cmd.GetOptionValues(&opts)` (`kittens/choose_fonts/main.go:L79-L80`) → `main(&opts)` (`:L83`) → `handler{opts}` (`:L35`, field at `kittens/choose_fonts/ui.go:L43`) → final pane reads `self.handler.opts.Reload_in` (`kittens/choose_fonts/final.go:L87`); pane progression `kittens/choose_fonts/ui.go:L81`, `kittens/choose_fonts/faces.go:L120`. |
+| **R3d — Finalization (final screen + branches)** | ✅ | Final-screen text literals at `kittens/choose_fonts/final.go:L34-L44` (Enter/Esc/`s`/Ctrl+c); `on_key_event` (`:L72-L99`), `on_text` (`:L101-L111`); both branches demonstrated under R4. |
+| **R4 — The KEY persistence question** | ✅ | **Enter PERSISTS**: `Patcher{Write_backup:true}` (`kittens/choose_fonts/final.go:L80`), `Patch(kitty.conf, "KITTY_FONTS", serialized(), font_family, bold_font, italic_font, bold_italic_font)` (`:L81-L82`); wrote `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block + `.bak` (byte-identical sha256) + atomic write (`tools/config/api.go:L328-L347`); `SIGUSR1` reload (`tools/config/api.go:L352-L371`); **restart proof** loads `font_family="Fira Code"`. **`s`/`S` is session-only**: STDOUT only, `kitty.conf` sha256 unchanged (`kittens/choose_fonts/final.go:L104-L106`, `kittens/choose_fonts/main.go:L64-L65`). **Esc** aborts to faces pane (`kittens/choose_fonts/final.go:L73-L76`). |
+| **Version divergence** | ✅ | `--config-file-name` absent (only `--reload-in`); target file hardcoded to `kitty.conf` (`kittens/choose_fonts/final.go:L81`); `docs/kittens/choose-fonts.rst` absent at this commit. |
 
 **Definitive answer to the KEY question:** pressing **Enter** at the final screen **persists** the font choice — it writes a `# BEGIN_KITTY_FONTS` block into `kitty.conf`, creates a `kitty.conf.bak` backup (when a non-empty original exists), writes the file atomically, and signals a live reload via `SIGUSR1`; the choice therefore **survives a restart**. The **`s`/`S`** key is the **session-only / throwaway** alternative — it prints the four `font_*` lines to STDOUT and never touches `kitty.conf`. **Esc** aborts back to the face-preview pane without writing anything.
 
