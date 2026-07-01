@@ -33,18 +33,20 @@ kitty 0.35.2 created by Kovid Goyal
 
 ```
 $ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 ./kitty/launcher/kitty \
-      --listen-on unix:/tmp/kitty.sock -o allow_remote_control=yes
+      --listen-on unix:/tmp/kitty.sock -o allow_remote_control=yes 2> kitty.log
 ```
 
 Software rendering was confirmed with:
 
 ```
+$ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 glxinfo | grep 'OpenGL renderer'
 OpenGL renderer string: llvmpipe (LLVM 20.1.2, 256 bits)
 ```
 
 kitty started successfully; the only startup log line was a harmless bus warning:
 
 ```
+$ grep 'systemd user bus' kitty.log   # kitty's own startup stderr from the launch above (log_error, kitty/systemd.c:87)
 [0.246] Failed to open systemd user bus with error: Connection refused
 ```
 
@@ -112,6 +114,7 @@ With `strace` attached to kitty, `echo test123` was typed into the running termi
 **(a) System call(s) used:** `poll()` (to wait until the PTY master is readable) followed by `read()`. A resolved poll returning `revents=POLLIN` on fd 10, immediately followed by the `read()`, looks like this:
 
 ```
+$ strace -f -e trace=read,poll -yy -ttt -p 36659 -o echo.strace   # POLLIN wakeup, then the read
 36729 1782937399.460351 poll([{fd=7<anon_inode:[eventfd]>, events=POLLIN}, {fd=8<signalfd:[HUP INT USR1 USR2 TERM CHLD]>, events=POLLIN}, {fd=10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, events=POLLIN}], 3, 1) = 1 ([{fd=10, revents=POLLIN}])
 36729 1782937399.460494 read(10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, "\1\33]133;k;start_kitty\7\2...\1\33]133;k;end_suffix_kitty\7\2test123\r\n", 1048506) = 114
 ```
@@ -119,18 +122,21 @@ With `strace` attached to kitty, `echo test123` was typed into the running termi
 Once the shell's output is fully drained, the next `poll()` **times out** (`= 0`) and the I/O thread goes idle (it then blocks in `poll(..., -1)` [kitty/child-monitor.c:1512] until more data arrives):
 
 ```
+$ strace -f -e trace=read,poll -yy -ttt -p 36659 -o echo.strace   # the next poll drains -> = 0 (Timeout)
 36729 1782937399.461032 poll([...{fd=10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, events=POLLIN}], 3, 1) = 0 (Timeout)
 ```
 
 **(b) Buffer size used:** the first `read()` requests **`1048576` bytes = 1 MiB**, which is exactly kitty's parser buffer `BUF_SZ`:
 
 ```
+$ strace -f -e trace=read,poll -yy -ttt -p 36659 -o echo.strace   # first read requests the full BUF_SZ
 36729 1782937399.459006 read(10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, "echo test123\r\n\33[?2004l\r", 1048576) = 23
 ```
 
 **(c) Bytes returned:** the shell's output for this one line arrived as **four reads returning `23`, `47`, `114`, and `169` bytes** (total `353`):
 
 ```
+$ strace -f -e trace=read,poll -yy -ttt -p 36659 -o echo.strace   # the four reads for this one line
 36729 ... read(10<...>, "echo test123\r\n\33[?2004l\r", 1048576) = 23
 36729 ... read(10<...>, "\33]2;echo test123\7\33]133;C;cmdline=echo\\ test123\7", 1048553) = 47
 36729 ... read(10<...>, "\1\33]133;k;start_kitty\7\2...\1\33]133;k;end_suffix_kitty\7\2test123\r\n", 1048506) = 114
@@ -141,7 +147,7 @@ The literal command output `test123\r\n` is the last 9 bytes of the **114-byte**
 
 *Rationale (grounding in source):*
 - The reader is `read_bytes()`, which asks the parser for a write buffer and then does `len = read(fd, buf, available_buffer_space)` [kitty/child-monitor.c:1345].
-- `available_buffer_space` is computed by `vt_parser_create_write_buffer()` as `*sz = BUF_SZ - self->write.offset` [kitty/vt-parser.c:1457], where `#define BUF_SZ (1024u*1024u)` = `1048576` [kitty/vt-parser.c:18]. On the first read the buffer is empty (`write.offset == 0`), so the request is the full `1048576`.
+- `available_buffer_space` is computed by `vt_parser_create_write_buffer()` as `*sz = BUF_SZ - self->write.offset` [kitty/vt-parser.c:1457], where `#define BUF_SZ (1024u*1024u)` (i.e. 1024 × 1024) = `1048576` [kitty/vt-parser.c:18]. On the first read the buffer is empty (`write.offset == 0`), so the request is the full `1048576`.
 - The subsequent request sizes decrease exactly by what was already buffered: `1048553 = 1048576 - 23`, `1048506 = 1048576 - (23+47)`, `1048392 = 1048576 - (23+47+114)`. This is `write.offset = read.sz + write.pending` [kitty/vt-parser.c:1456] in action.
 - The returned byte count is simply whatever the kernel had available on the PTY at that instant; for this tiny input the reads are small and one-shot.
 
@@ -154,6 +160,7 @@ The literal command output `test123\r\n` is the last 9 bytes of the **114-byte**
 **(a) How the reading behavior changes.** For the tiny `echo` (Q3), the I/O thread did four reads and then its next `poll()` **timed out** (`= 0 (Timeout)`) and it went idle. Under `yes hello` the thread instead spins in a **tight, continuous `read -> poll -> read` loop** in which every `poll()` returns immediately with `revents=POLLIN` (data is always available — it never times out):
 
 ```
+$ strace -f -e trace=read,poll -yy -ttt -p 36659 -o yes.strace   # tight read/poll loop under yes hello
 36729 1782937584.361158 read(10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 986694) = 1827
 36729 1782937584.361227 poll([...{fd=10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, events=POLLIN}], 3, 2) = 1 ([{fd=10, revents=POLLIN}])
 ```
@@ -163,6 +170,7 @@ The literal command output `test123\r\n` is the last 9 bytes of the **114-byte**
 A second visible change: the **request size now shrinks below 1 MiB** as unparsed data accumulates between the main thread's parse cycles. Three consecutive reads request `1044303`, then `1043314`, then `1042175` bytes — and each decrease equals the previous read's return (`1044303 - 989 = 1043314`; `1043314 - 1139 = 1042175`):
 
 ```
+$ strace -f -e trace=read,poll -yy -ttt -p 36659 -o yes.strace   # request size shrinks by write.offset
 36729 1782937584.338839 read(10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1044303) = 989
 36729 1782937584.338946 read(10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, "hello\r\nhello\r\nhello\r\nhello\r\nhell"..., 1043314) = 1139
 36729 1782937584.339046 read(10</dev/pts/ptmx<char 5:2 @/dev/pts/0>>, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhe"..., 1042175) = 1101
@@ -175,6 +183,7 @@ Reads are **gated by backpressure**: the I/O thread only asks for `POLLIN` on a 
 **(b) Frequency of reads.** During the streaming window kitty issued **`31,180` reads on fd 10 over a `4.034 s` span -> ~ `7,729` reads/second (~ `129.4 us` between reads)** — *as measured under strace*:
 
 ```
+$ python3 -c "ts=[float(l.split()[1]) for l in open('yes.strace') if len(l.split())>2 and l.split()[2].startswith('read(10<')]; s=ts[-1]-ts[0]; print(f'fd10 reads counted: {len(ts)}'); print(f'first ts: {ts[0]:.6f}  last ts: {ts[-1]:.6f}'); print(f'streaming span: {s:.3f} s'); print(f'read frequency: {len(ts)/s:,.0f} reads/sec  (under strace; strace adds overhead)'); print(f'avg interval  : {s/len(ts)*1e6:.1f} microseconds between reads')"
 fd10 reads counted: 31180
 first ts: 1782937584.336019  last ts: 1782937588.370408
 streaming span: 4.034 s
@@ -185,6 +194,7 @@ avg interval  : 129.4 microseconds between reads
 Because strace slows the read loop, an independent un-traced PTY probe (a small helper that mimics kitty's path: `openpty()`, fork/exec `yes hello`, then `read(master, 1 MiB)`) reads **far more often** — about **`98,560` reads/second**:
 
 ```
+$ python3 pty_probe.py   # openpty(); fork/exec 'yes hello'; loop read(master, 1<<20)
 no-strace PTY probe (buffer request size = 1048576 = BUF_SZ):
   duration ~2.0s, reads=197119, total_bytes=22915695
   read freq   = 98,560 reads/sec
@@ -193,6 +203,7 @@ no-strace PTY probe (buffer request size = 1048576 = BUF_SZ):
 **(c) Typical byte count per read.** Under strace the reads are ~1 KB each — **median `1059` bytes, mean `1217` bytes** (min `2`, max `20827`; `0` reads reached even 64 KiB):
 
 ```
+$ python3 -c "import statistics; b=[int(l.split()[-1]) for l in open('yes.strace') if len(l.split())>2 and l.split()[2].startswith('read(10<') and l.split()[-1].isdigit()]; print(f'num reads on fd10: {len(b)}'); print(f'total bytes read : {sum(b)}'); print(f'min / median / mean / max: {min(b)} {statistics.median(b):.1f} {statistics.mean(b):.1f} {max(b)}'); print(f'reads >= 65536 : {sum(1 for x in b if x>=65536)}')"
 num reads on fd10: 29504
 total bytes read : 35908408
 min / median / mean / max: 2 1059.0 1217.1 20827
@@ -202,6 +213,7 @@ reads >= 65536 : 0
 Un-traced (probe), where the reader keeps up, the reads are much smaller — **median `84` bytes, mean `116` bytes** — and every common size is a whole multiple of 7 (because `hello\r\n` is 7 bytes on the wire after the PTY's `\n`->`\r\n` translation):
 
 ```
+$ python3 pty_probe.py   # per-read byte sizes (every common size is a multiple of 7 = the on-wire bytes of one 'hello' line)
 min/median/mean/max bytes = 2/84/116.3/19754
 top read sizes (bytes:count): [(42, 5964), (35, 5890), (49, 5797), (63, 5684), (70, 5064), (56, 5057)]
 ```
@@ -286,14 +298,14 @@ The screen owns the parser instance the reader fills and this function drains: `
 | Q2 | exact command line | `/bin/bash --posix` (`/proc/36730/cmdline` = `/bin/bash^@--posix^@`) |
 | Q2 | PTY device path | `/dev/pts/0` (slave, from `/proc/36730/fd/{0,1,2}`) |
 | Q3 | system call(s) | `poll()` for `POLLIN`, then `read()` |
-| Q3 | buffer size | `1048576` bytes = 1 MiB = `BUF_SZ` [vt-parser.c:18] |
+| Q3 | buffer size | `1048576` bytes = 1 MiB = `BUF_SZ` [kitty/vt-parser.c:18] |
 | Q3 | bytes returned | `23`, `47`, `114`, `169` (total `353`); `test123\r\n` inside the 114-byte read |
 | Q4 | behavior change | blocking single reads → continuous `poll/read` loop; request size shrinks by `write.offset`; `POLLIN` gate stayed open (buffer never full) |
 | Q4 | frequency | ≈ `7,729` reads/s under strace (129 µs apart); ≈ `98,560` reads/s un-traced |
 | Q4 | typical bytes/read | median `1059` B / mean `1217` B under strace; median `84` B un-traced; always ≪ 1 MiB request |
 | Q5 | master fd number | **`10`** (`/proc/36659/fd/10 -> /dev/pts/ptmx`) |
-| Q6 | reading function | `read_bytes()` [child-monitor.c:1337] → `read()` [:1345] on `io_loop()` |
-| Q6 | parsing function | `consume_input()` [vt-parser.c:1367]; text via `consume_normal()`/`screen_draw_text` [:230,:236]; escapes via `VTEState` machine [:160] |
+| Q6 | reading function | `read_bytes()` [kitty/child-monitor.c:1337] → `read()` [kitty/child-monitor.c:1345] on `io_loop()` |
+| Q6 | parsing function | `consume_input()` [kitty/vt-parser.c:1367]; text via `consume_normal()`/`screen_draw_text` [kitty/vt-parser.c:230, kitty/vt-parser.c:236]; escapes via `VTEState` machine [kitty/vt-parser.c:160] |
 
 ## Notes on fidelity
 
