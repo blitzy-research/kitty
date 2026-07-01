@@ -82,12 +82,30 @@ That is, `./dev.sh build` runs `go run bypy/devenv.go build` (`dev.sh:L9`), whic
 
 ### Runtime evidence
 
-The commit under investigation, verified:
+**Provenance — the source commit under investigation vs. the current `HEAD`.** Every code path, literal, and `file:line` citation in this document is grounded in the **source commit under investigation**, `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. That object is immutable and present in the repository:
 
 ```
-$ git rev-parse HEAD
+$ git rev-parse 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 ```
+
+This answer document is the investigation's single deliverable, and committing it necessarily creates a commit **on top of** the source commit. Consequently `git rev-parse HEAD` resolves to the **documentation commit** — a descendant of `815df1e2`, *not* `815df1e2` itself (and, by construction, it cannot be: adding a file changes the tree, and therefore the commit hash). The exact `HEAD` hash advances with each deliverable-only commit, so the reproducible, stale-proof invariant is the *relationship* between `HEAD` and the source commit, not a pinned `HEAD` value. Two checks establish it.
+
+First, `815df1e2` is an ancestor of `HEAD` — their merge base is exactly `815df1e2`:
+
+```
+$ git merge-base HEAD 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+```
+
+Second, the *only* path that differs between the source commit and `HEAD` is this deliverable — every cited source file is byte-for-byte identical to its `815df1e2` state:
+
+```
+$ git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD --name-status
+A	blitzy/documentation/kitty_815df1e210e0.md
+```
+
+So the `file:line` references throughout this document resolve against the exact `815df1e2` sources, even though `HEAD` points at the documentation commit that carries this file. (A checkpoint that expects `git rev-parse HEAD` to *equal* `815df1e2` can only hold *before* the deliverable is committed; once it is committed, the merge-base and `--name-status` checks above are the correct, reproducible substitute.)
 
 Running the build (the launcher binaries were already present from the environment setup, so this is an **incremental** rebuild — it recompiles the Go `kitten` binary and reports success):
 
@@ -149,17 +167,40 @@ The `--version` success proves the launcher binary is intact; the `--config NONE
 
 ## Requirement 2 — Invoke the kitten
 
-From inside a running kitty instance, invoke the kitten with either form:
+From inside a running kitty instance, the invocation that works at commit `815df1e2` is the standalone `kitten` binary:
 
 ```
 kitten choose-fonts
 ```
 
-or the fully-qualified form
+This is runtime-verified — the Go kitten's own CLI answers, printing its usage and its single option (full verbatim capture; see also Requirement 3b):
 
 ```
-kitty +kitten choose-fonts
+$ kitty/launcher/kitten choose-fonts --help
+Usage: kitten choose-fonts 
+
+Choose the fonts used in kitty
+
+Options:
+  --reload-in [=parent]
+    By default, this kitten will signal only the parent kitty instance it is
+    running in to reload its config, after making changes. Use this option to
+    instead either not reload the config at all or in all running kitty
+    instances.
+    Choices: parent, all, none
 ```
+
+**The `kitty +kitten choose-fonts` form does *not* invoke this kitten at this commit — it silently no-ops.** Verified at runtime, the command exits `0` while writing **zero bytes** to both stdout and stderr:
+
+```
+$ kitty/launcher/kitty +kitten choose-fonts --help ; echo "exit=$?"
+exit=0
+$ kitty/launcher/kitty +kitten choose-fonts --help 2>/tmp/e >/tmp/o ; wc -c </tmp/o ; wc -c </tmp/e
+0
+0
+```
+
+The reason is in the launcher's delegation logic. `kitty +kitten <name>` is handed off to the Go `kitten` binary **only** when `<name>` is a *wrapped* kitten — `delegate_to_kitten_if_possible` guards the `+kitten` branch with `is_wrapped_kitten(argv[2])` (`kitty/launcher/main.c:L354-L357`), and `is_wrapped_kitten` tests membership in the compile-time string `WRAPPED_KITTENS` (`kitty/launcher/main.c:L333-L336`). That set is generated from `shell-integration/ssh/kitty:L27`, whose value — `clipboard icat hyperlinked_grep ask hints unicode_input ssh themes diff show_key transfer query_terminal` — does **not** include `choose_fonts`. So `+kitten choose-fonts` is never delegated to the Go binary; it falls through to the Python kitten runner (`kittens/runner.py:L110`, which does `runpy.run_module('kittens.choose_fonts.main')` at `kittens/runner.py:L116`). But `kittens/choose_fonts/main.py` is an **empty file (0 bytes)** at this commit, so running it does nothing — precisely the observed no-op. (`choose-fonts` is a *Go* kitten; its real entry point is `kittens/choose_fonts/main.go`, reached only through the standalone `kitten` binary — see Requirement 3a.)
 
 ### Runtime evidence — the live UI
 
@@ -608,7 +649,7 @@ The restart proof in Step 5 already establishes persistence independently of liv
 
 The code at commit `815df1e2` diverges from the **current** upstream `kitten choose-fonts` documentation/man-pages in three concrete, verifiable ways. Per the governing rule, the answers above are grounded in the code **as it exists at this commit**; the divergences are called out here explicitly.
 
-**1. Only `--reload-in` exists at this commit; `--config-file-name` does not.** Current upstream man pages for `kitten choose-fonts` document two options — `--reload-in [=parent]` **and** `--config-file-name [=kitty.conf]`. At `815df1e2`, the `OptionSpec` string passed to `AddSubCommand` declares **exactly one** option, `--reload-in` (`kittens/choose_fonts/main.go:L86-L95`), and the `Options` struct has a **single** field, `Reload_in` (`kittens/choose_fonts/main.go:L70-L72`). There is no `Config_file_name` field and no second `OptionSpec` stanza. This was confirmed at runtime — the parser rejects the upstream-documented option:
+**1. Only `--reload-in` exists at this commit; `--config-file-name` does not.** Later upstream source adds a second option, `--config-file-name [=kitty.conf]`, alongside `--reload-in [=parent]`; because a kitten's option help is generated from its source `OptionSpec`, the exact option set shown by any given version's generated docs/man pages varies by version (some pages surface `--config-file-name`, others do not). At `815df1e2`, the `OptionSpec` string passed to `AddSubCommand` declares **exactly one** option, `--reload-in` (`kittens/choose_fonts/main.go:L86-L95`), and the `Options` struct has a **single** field, `Reload_in` (`kittens/choose_fonts/main.go:L70-L72`). There is no `Config_file_name` field and no second `OptionSpec` stanza. This was confirmed at runtime — the parser rejects the option that later upstream adds:
 
 ```
 $ kitty/launcher/kitten choose-fonts --config-file-name=kitty.conf
@@ -648,7 +689,7 @@ The official kitty documentation independently corroborates the code-derived beh
 - The [kitty command-line documentation](https://sw.kovidgoyal.net/kitty/invocation/) documents the config-directory override used for non-destructive verification: when the `KITTY_CONFIG_DIRECTORY` environment variable is set, kitty always uses that directory for `kitty.conf`. This is the same variable resolved first by `ConfigDirForName` (`tools/utils/paths.go:L88-L90`).
 - On the interactive flow, the [choose-fonts documentation](https://sw.kovidgoyal.net/kitty/kittens/choose-fonts/) states that after selecting a family with Enter "you are shown previews of what the regular, bold and italic faces look like", matching the `listing → faces` pane transition (`kittens/choose_fonts/list.go:L247-L251`) and the subsequent `faces → final_pane` transition on Enter (`kittens/choose_fonts/faces.go:L120`).
 
-One divergence is worth restating in doc terms: current upstream also documents a `--config-file-name` option for the kitten, which — as shown above — **does not exist at this commit**.
+One divergence is worth restating in doc terms: later upstream source adds a `--config-file-name` option for the kitten (and some generated docs/man pages surface it), which — as shown above — **does not exist at this commit**.
 
 ---
 
@@ -659,12 +700,12 @@ Every distinct sub-part of the question is addressed above. This checklist confi
 | Requirement | Addressed? | Where / primary evidence |
 |-------------|:---------:|--------------------------|
 | **R1 — Build & launch a single default instance** | ✅ | `./dev.sh build` (`dev.sh:L9`, `docs/build.rst:L19`) → binary `kitty/launcher/kitty` (`docs/build.rst:L22`); captured build tail (`Build successful. Run kitty as: kitty/launcher/kitty`), `ls -l` of the binary, `kitty/launcher/kitty --version` → `kitty 0.35.2 created by Kovid Goyal`; launch **attempted** with `--config NONE` — reaches GLFW init then fails on the missing display (headless container; verbatim output + limitation under R1). |
-| **R2 — Invoke the kitten** | ✅ | `kitten choose-fonts` / `kitty +kitten choose-fonts`; captured `--help` usage and the live family-selection list (with `>Fira Code` preselected). |
-| **R3a — Subcommand registration** | ✅ | `tools/cmd/tool/main.go:L9` (import), `:L82` (`choose_fonts.EntryPoint(root)`); `kittens/choose_fonts/main.go:L74-L85` (`AddSubCommand`, `Name: "choose-fonts"`, `ShortDescription: "Choose the fonts used in kitty"`); visible alias `choose_fonts` at `kittens/choose_fonts/main.go:L96-L98`. |
-| **R3b — Option parsing** | ✅ | The sole option `--reload-in` (`Dest: "Reload_in"`, `Type: "choices"`, `Choices: "parent, all, none"`, `Default: "parent"`) at `kittens/choose_fonts/main.go:L86-L95`; `Options` struct at `:L70-L72`; runtime invalid-choice rejection. |
-| **R3c — Value flow (CLI → program → final screen)** | ✅ | `cmd.GetOptionValues(&opts)` (`kittens/choose_fonts/main.go:L79-L80`) → `main(&opts)` (`:L83`) → `handler{opts}` (`:L35`, field at `kittens/choose_fonts/ui.go:L43`) → final pane reads `self.handler.opts.Reload_in` (`kittens/choose_fonts/final.go:L87`); pane progression `kittens/choose_fonts/ui.go:L81`, `kittens/choose_fonts/faces.go:L120`. |
-| **R3d — Finalization (final screen + branches)** | ✅ | Final-screen text literals at `kittens/choose_fonts/final.go:L34-L44` (Enter/Esc/`s`/Ctrl+c); `on_key_event` (`:L72-L99`), `on_text` (`:L101-L111`); both branches demonstrated under R4. |
-| **R4 — The KEY persistence question** | ✅ | **Enter PERSISTS**: `Patcher{Write_backup:true}` (`kittens/choose_fonts/final.go:L80`), `Patch(kitty.conf, "KITTY_FONTS", serialized(), font_family, bold_font, italic_font, bold_italic_font)` (`:L81-L82`); wrote `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block + `.bak` (byte-identical sha256) + atomic write (`tools/config/api.go:L328-L347`); `SIGUSR1` reload (`tools/config/api.go:L352-L371`); **restart proof** loads `font_family="Fira Code"`. **`s`/`S` is session-only**: STDOUT only, `kitty.conf` sha256 unchanged (`kittens/choose_fonts/final.go:L104-L106`, `kittens/choose_fonts/main.go:L64-L65`). **Esc** aborts to faces pane (`kittens/choose_fonts/final.go:L73-L76`). |
+| **R2 — Invoke the kitten** | ✅ | `kitten choose-fonts` is the working form at this commit; `kitty +kitten choose-fonts` **silently no-ops** here (`choose_fonts` is absent from `WRAPPED_KITTENS` at `shell-integration/ssh/kitty:L27`, so the launcher does not delegate it — `kitty/launcher/main.c:L354-L357` — and the Python fallback runs the empty `kittens/choose_fonts/main.py`). Captured `kitten choose-fonts --help` usage, the `+kitten` zero-output evidence, and the live family-selection list (with `>Fira Code` preselected). |
+| **R3a — Subcommand registration** | ✅ | `tools/cmd/tool/main.go:L9` (import), `tools/cmd/tool/main.go:L82` (`choose_fonts.EntryPoint(root)`); `kittens/choose_fonts/main.go:L74-L85` (`AddSubCommand`, `Name: "choose-fonts"`, `ShortDescription: "Choose the fonts used in kitty"`); visible alias `choose_fonts` at `kittens/choose_fonts/main.go:L96-L98`. |
+| **R3b — Option parsing** | ✅ | The sole option `--reload-in` (`Dest: "Reload_in"`, `Type: "choices"`, `Choices: "parent, all, none"`, `Default: "parent"`) at `kittens/choose_fonts/main.go:L86-L95`; `Options` struct at `kittens/choose_fonts/main.go:L70-L72`; runtime invalid-choice rejection. |
+| **R3c — Value flow (CLI → program → final screen)** | ✅ | `cmd.GetOptionValues(&opts)` (`kittens/choose_fonts/main.go:L79-L80`) → `main(&opts)` (`kittens/choose_fonts/main.go:L83`) → `handler{opts}` (`kittens/choose_fonts/main.go:L35`, field at `kittens/choose_fonts/ui.go:L43`) → final pane reads `self.handler.opts.Reload_in` (`kittens/choose_fonts/final.go:L87`); pane progression `kittens/choose_fonts/ui.go:L81`, `kittens/choose_fonts/faces.go:L120`. |
+| **R3d — Finalization (final screen + branches)** | ✅ | Final-screen text literals at `kittens/choose_fonts/final.go:L34-L44` (Enter/Esc/`s`/Ctrl+c); `on_key_event` (`kittens/choose_fonts/final.go:L72-L99`), `on_text` (`kittens/choose_fonts/final.go:L101-L111`); both branches demonstrated under R4. |
+| **R4 — The KEY persistence question** | ✅ | **Enter PERSISTS**: `Patcher{Write_backup:true}` (`kittens/choose_fonts/final.go:L80`), `Patch(kitty.conf, "KITTY_FONTS", serialized(), font_family, bold_font, italic_font, bold_italic_font)` (`kittens/choose_fonts/final.go:L81-L82`); wrote `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` block + `.bak` (byte-identical sha256) + atomic write (`tools/config/api.go:L328-L347`); `SIGUSR1` reload (`tools/config/api.go:L352-L371`); **restart proof** loads `font_family="Fira Code"`. **`s`/`S` is session-only**: STDOUT only, `kitty.conf` sha256 unchanged (`kittens/choose_fonts/final.go:L104-L106`, `kittens/choose_fonts/main.go:L64-L65`). **Esc** aborts to faces pane (`kittens/choose_fonts/final.go:L73-L76`). |
 | **Version divergence** | ✅ | `--config-file-name` absent (only `--reload-in`); target file hardcoded to `kitty.conf` (`kittens/choose_fonts/final.go:L81`); `docs/kittens/choose-fonts.rst` absent at this commit. |
 
 **Definitive answer to the KEY question:** pressing **Enter** at the final screen **persists** the font choice — it writes a `# BEGIN_KITTY_FONTS` block into `kitty.conf`, creates a `kitty.conf.bak` backup (when a non-empty original exists), writes the file atomically, and signals a live reload via `SIGUSR1`; the choice therefore **survives a restart**. The **`s`/`S`** key is the **session-only / throwaway** alternative — it prints the four `font_*` lines to STDOUT and never touches `kitty.conf`. **Esc** aborts back to the face-preview pane without writing anything.
