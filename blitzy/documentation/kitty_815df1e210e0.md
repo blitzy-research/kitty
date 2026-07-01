@@ -182,6 +182,18 @@ answer to "what happens when graphics arrive too fast" is: **kitty buffers up to
 stops reading** — it neither grows the buffer without bound nor drops inbound bytes; it lets
 backpressure propagate to the writer.
 
+**Note — reproducing the exact after-parse figure.** Every figure above is payload-independent *except
+the last*: `1048576`, the per-chunk `349532`, the offered/committed/leftover values, and the
+buffer-full `len = 0` follow only from the fixed 1 MiB buffer and the `349532`-byte chunk size. The
+after-parse free-space figure `1047818` equals the 1 MiB buffer minus the **retained trailing
+incomplete `_G` frame** that the 1 MiB boundary cut mid-transmission (`1048576 − 1047818 = 758` bytes
+retained), so its exact value depends on the per-frame payload byte length — the declared
+`s=10,v=10,f=24` control keys are image metadata and do not bound the attached base64 payload. This
+capture attached a **764-byte** base64 payload per frame (full frame = **792 bytes**), which reproduces
+`1047818` (retained `758`) bit-for-bit; a 300-byte (10×10 RGB) payload instead yields `1048174`
+(retained `402`). Across payload sizes the value stays just below `1048576` — an observed range of
+`1047026`–`1048576` when sweeping per-frame payloads from 150 to 1200 bytes.
+
 ---
 
 ## R2 — How kitty decides between buffering, pausing, and throttling
@@ -413,7 +425,9 @@ The `ABRT` macro (`kitty/graphics.c:519`) calls `set_command_failed_response` (`
 which formats the reply as `"CODE:message"` (`snprintf(command_response, sz, "%s:", code)` at `:309`
 followed by the message at `:310`). `finish_command_response` (`kitty/graphics.c:759`) then emits the
 image id via `print("i=%u", g->id)` (`:773`) and appends `;%s` with the code:message (`:777`) — but
-only if the command carried an `i=`/`I=` key (`:766`) and was not silenced by `q`.
+only if the command carried an `i=`/`I=` key (`:765`, the `if (g->id || g->image_number)` guard) and
+was not silenced by `q` (the nested `:766` `if (is_ok_response)` only controls whether the literal `OK`
+string is written on success).
 
 **Observed output (driving the graphics caps).** The same script sends an oversized **direct RGB**
 transmission (payload far larger than the tiny declared 1×1 image, so `data_fmt != PNG` fires the
