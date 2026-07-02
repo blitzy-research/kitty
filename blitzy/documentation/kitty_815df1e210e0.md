@@ -26,7 +26,7 @@ python3 setup.py build --verbose
 The package libcrypto was not found on your system
 ```
 
-This is because `setup.py` probes `libcrypto` through `pkg-config` (`setup.py:L253 def libcrypto_flags()` → `setup.py:L275 ldflags = pkg_config('libcrypto', '--libs', ...)`, consumed by the build at `setup.py:L616-L617`). Installing `libssl-dev` (which provides `libcrypto.pc`) resolved it, after which the build completed (`BUILD_DONE rc=0`). **This `libcrypto`/`libssl-dev` prerequisite is required in addition to the apt install command at `.github/workflows/ci.py:L85-L88`** — the CI base image already ships it, so it is not repeated in that list.
+This is because `setup.py` probes `libcrypto` through `pkg-config` (`setup.py:L253 def libcrypto_flags()` → `setup.py:L275 ldflags = pkg_config('libcrypto', '--libs', ...)`); the returned flags are consumed by the build at `setup.py:L616-L617` (the `libcrypto_flags()` call and `cflags.extend(libcrypto_cflags)`) and, for the link step, at `setup.py:L642` (`ans.ldpaths += ... + libcrypto_ldflags`). Installing `libssl-dev` (which provides `libcrypto.pc`) resolved it, after which the build completed (`BUILD_DONE rc=0`). **This `libcrypto`/`libssl-dev` prerequisite is required in addition to the apt install command at `.github/workflows/ci.py:L85-L88`** — the CI base image already ships it, so it is not repeated in that list.
 
 **2. Native dependencies installed.** The authoritative apt command is at `.github/workflows/ci.py:L85-L88` (four implicitly-concatenated string literals that form one `apt-get install` invocation). Quoted **exactly** as implemented, in full:
 
@@ -67,9 +67,9 @@ OpenGL version string: 4.5 (Compatibility Profile) Mesa 25.2.8-0ubuntu0.24.04.2
 
 ---
 
-## ⚠ Two accuracy corrections (report reality)
+## ⚠ Report-reality corrections
 
-Two statements in the governing plan do not hold for this exact commit on the Linux/Xvfb target. Both are reported here with their evidence, because the investigation is grounded in *observed* reality rather than an idealized description.
+This investigation surfaced **four** report-reality corrections in total. **Two** of them correct statements in the governing plan that do not hold for this exact commit on the Linux/Xvfb target and are detailed in this section — Correction #1 (the Linux OpenGL minimum) and Correction #2 (`--debug-config` is not a CLI flag). The other **two** are reported inline where they arise: the `libcrypto`/`libssl-dev` build prerequisite (the failed first build documented above) and the non-fatal systemd user-bus line in Question 1 (the `[0.213] Failed to open systemd user bus with error: Connection refused` entry). All four are reported with their evidence, because the investigation is grounded in *observed* reality rather than an idealized description.
 
 ### Correction #1 — the Linux OpenGL minimum is **3.1**, not 3.3
 
@@ -260,7 +260,7 @@ Because this run used an **empty** `KITTY_CONFIG_DIRECTORY` with **no** `kitty.c
 **Role:** Every option's default value is declared in `kitty/options/definition.py`. Rather than read them, the exact defaults were captured from the built binary by materializing the generated `defaults` object (this uses `+runpy`, so it needs no GL and runs headlessly). Command:
 
 ```
-./kitty/launcher/kitty +runpy 'from kitty.options.types import defaults as d; print("term=",repr(d.term)); print("font_size=",d.font_size); print("scrollback_lines=",d.scrollback_lines); print("repaint_delay=",d.repaint_delay); print("input_delay=",d.input_delay); print("sync_to_monitor=",d.sync_to_monitor)'
+./kitty/launcher/kitty +runpy 'from kitty.options.types import defaults as d; print("term=",repr(d.term)); print("font_family=", d.font_family); print("font_size=",d.font_size); print("scrollback_lines=",d.scrollback_lines); print("repaint_delay=",d.repaint_delay); print("input_delay=",d.input_delay); print("sync_to_monitor=",d.sync_to_monitor)'
 ```
 
 Captured verbatim:
@@ -389,7 +389,7 @@ Each displayed variable is grounded in the exact assignment that produced it:
 - `KITTY_INSTALLATION_DIR` ← `kitty/child.py:L261` (`env['KITTY_INSTALLATION_DIR'] = kitty_base_dir`).
 - `KITTY_WINDOW_ID` ← `kitty/tabs.py:L491` (`fenv['KITTY_WINDOW_ID'] = str(next_window_id())`); this one is assigned by the tab when the window is created, not in `child.py`.
 
-The `TERM` value `xterm-kitty` is defined by `terminfo/kitty.terminfo`, whose first line is `xterm-kitty|KovIdTTY,` — this is the terminfo entry exported to the child so that `tput`/`ncurses` programs know Kitty's capabilities. Shell integration is layered on top by `kitty/shell_integration.py` (`def modify_shell_environ` at `kitty/shell_integration.py:L218`), which sources the per-shell scripts under `shell-integration/` (directories `bash`, `fish`, `ssh`, and `zsh`).
+The `TERM` value `xterm-kitty` is defined by `terminfo/kitty.terminfo`, whose first line is `xterm-kitty|KovIdTTY,` (`terminfo/kitty.terminfo:L1`) — this is the terminfo entry exported to the child so that `tput`/`ncurses` programs know Kitty's capabilities. Shell integration is layered on top by `kitty/shell_integration.py` (`def modify_shell_environ` at `kitty/shell_integration.py:L218`), which sources the per-shell scripts under `shell-integration/` (directories `bash`, `fish`, `ssh`, and `zsh`).
 
 ### 3. Terminal-ready handshake + correctness-critical ordering
 
