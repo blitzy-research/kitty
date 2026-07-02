@@ -437,7 +437,7 @@ Write at 0x00c00029c480 by goroutine 13:
       /tmp/racetest/cache.go:34 +0x89
 ```
 
-The same run terminated with Go's runtime fatal error (observed **4×** in the output):
+The same run terminated with Go's runtime fatal error shown below. Go prints this abort line once for each goroutine it catches writing the map concurrently, so its **repeat count is non-deterministic across runs** — re-running the test 14 times produced between **1 and 6** occurrences (observed counts included 4, 1, 6, 3, and 2). What *is* invariant on every run is that the test exits non-zero (`RACE_EXIT=1`), prints exactly one `WARNING: DATA RACE` at `cache.go:34`, and aborts with at least one occurrence of:
 
 ```
 fatal error: concurrent map writes
