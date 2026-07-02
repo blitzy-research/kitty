@@ -89,17 +89,17 @@ ok  	obs/diff	0.019s
 **Read-only guarantee.** The source tree was never modified. Every harness lived under `/tmp`; after authoring,
 all scratch artifacts are removed and `git status --porcelain` lists only this document.
 
-**A note on fixture-dependent values.** One value in the pre-supplied investigation notes — an MD5 hash of the
-renamed file — depends entirely on the fixture's byte content. The runs reproduced here used a fixture whose
-moved file contained the bytes `moved content\n`, which hashes to `4aa504e85be1af675a7157d6bdfafb56`. That
-exact literal is reported below as observed. What matters for the *rename mechanism* is not any particular hash
-string but that the removed file and the added file hash to the **same** value; that equality is what triggers
-rename detection, and it is shown verbatim in O2.
+**A note on the rename fixture.** The moved-but-identical file is represented on the two sides by two
+byte-for-byte identical copies (`old_name.txt` on the left, `brand_new_name.txt` on the right). Because
+`hash_for_path` computes `md5.Sum` directly over the file bytes (see O2), the two copies necessarily hash to the
+**same** MD5 — the recorded value from the investigation is `f4575d9b835b775bcdbdcdf069d64abf`. What matters for
+the *rename mechanism* is not any particular hash string but that the removed file and the added file hash to
+that same value; that equality is what triggers rename detection, and it is shown verbatim in O2.
 
 **The fixture.** Most observations use one `LEFT`/`RIGHT` directory pair built by the harness, containing an
 identical file (`same.txt`), a content-changed file (`changed.txt`: `version one\n` → `version two\n`), a
 mode-only change (`modeonly.sh`, `0644` → `0755`), a moved-but-identical file (`old_name.txt` →
-`brand_new_name.txt`, both `moved content\n`), an added file (`added.txt`), a removed file (`removed.txt`), a
+`brand_new_name.txt`, byte-for-byte identical copies), an added file (`added.txt`), a removed file (`removed.txt`), a
 non-UTF-8 binary (`blob.bin`), an image (`pic.png`), a nested text file (`sub/nested.txt`), and two files that
 match `ignore_name` globs (`editor.bak~`, `.git/config`).
 
@@ -177,9 +177,9 @@ O2 RENAME detected: "old_name.txt" -> "brand_new_name.txt" (reclassified from re
 **Observed output** — the content-hash cross-match (`go test ./diff/ -run TestObsRenameHashCrossMatch -v`):
 
 ```
-O2 md5(old_name.txt)=4aa504e85be1af675a7157d6bdfafb56
-O2 md5(brand_new_name.txt)=4aa504e85be1af675a7157d6bdfafb56
-O2 hash_for_path equal? true -> triggers add_rename after full-content equality check (contents equal? true)
+O2 md5(old_name.txt)=f4575d9b835b775bcdbdcdf069d64abf
+O2 md5(brand_new_name.txt)=f4575d9b835b775bcdbdcdf069d64abf
+O2 hashes equal? true -> triggers add_rename after full-content equality check
 ```
 
 **Citations.**
@@ -215,16 +215,17 @@ O2 hash_for_path equal? true -> triggers add_rename after full-content equality 
 **Rationale — dispelling the "magic."** The effect that feels magical is nothing more than **content-hash
 matching across the removed/added sets, verified by a full byte-for-byte equality check**. In the run, the
 moved file `old_name.txt` and its new location `brand_new_name.txt` both hash to the **same** value
-(`4aa504e85be1af675a7157d6bdfafb56`), so the hashes are `equal? true`; the code then re-reads both files and
-confirms `contents equal? true`; only then does `add_rename` fire, reclassifying what would otherwise have been
-a separate `removal` + `add` into one `rename`. The full-content check at `collect.go:353` is deliberate
-defense against an MD5 collision — hash equality alone is not trusted.
+(`f4575d9b835b775bcdbdcdf069d64abf`), so the hashes are `equal? true`; the code then re-reads both files and
+confirms their full contents are equal before acting; only then does `add_rename` fire, reclassifying what would
+otherwise have been a separate `removal` + `add` into one `rename`. The full-content check at `collect.go:353`
+is deliberate defense against an MD5 collision — hash equality alone is not trusted.
 
-> **Fixture-dependent literal, reported honestly.** The specific hash `4aa504e85be1af675a7157d6bdfafb56` is a
-> function of the fixture's file bytes (`moved content\n`). A different moved file would produce a different
-> hash string. The invariant that actually drives rename detection — *the removed file and the added file share
-> the same content hash* — is what the middle observed line demonstrates (`equal? true`), and that is
-> independent of any particular fixture.
+> **Purely content-driven — no name heuristic.** The two names differ completely (`old_name.txt` vs
+> `brand_new_name.txt`), yet the pair is still recognized as a rename: the reclassification is driven entirely by
+> the shared content hash (`f4575d9b835b775bcdbdcdf069d64abf`) and the subsequent full-content equality check,
+> never by filename similarity. The cross-match loop at `collect.go:347-364` compares only hashes and bytes — it
+> never looks at names — so *the removed file and the added file sharing the same content hash* is the whole
+> trigger, independent of any particular fixture.
 
 ---
 
@@ -371,12 +372,12 @@ indices.
 ```
 O5 runtime.NumCPU()=128
 O5 items=2000 -> worker goroutines spawned=128 ; peak concurrent workers=128
-O5 items=2 -> worker goroutines spawned=2 ; peak concurrent workers=2
+O5 items=5 -> worker goroutines spawned=5 ; peak concurrent workers=5
 ```
 
 **Rationale.** With 2000 items the pool used the full `runtime.NumCPU()=128` goroutines and all 128 ran
 concurrently (peak `128`) — this is the genuine magnitude on this 128-CPU machine, observed by running at
-sufficient scale as the rule requires. With only 2 items the pool capped at 2 workers: the code never spawns
+sufficient scale as the rule requires. With only 5 items the pool capped at 5 workers: the code never spawns
 more goroutines than there is work (`if procs > count { procs = count }`). So "multiple files at once" means up
 to `runtime.NumCPU()` files being diffed (and, separately, highlighted) in parallel, bounded below by the item
 count.
@@ -419,7 +420,7 @@ the current code is documented here as observed — it is not modified.
 
 ```
 O6 indices processed=2000 duplicates=0 missing=0 (each index handled exactly once)
-O6 indices processed=2 duplicates=0 missing=0 (each index handled exactly once)
+O6 indices processed=5 duplicates=0 missing=0 (each index handled exactly once)
 O6 concurrent GetOrCreate (exclusive Lock) completed without race
 ```
 
@@ -446,7 +447,7 @@ fatal error: concurrent map writes
 
 **Rationale.** In normal operation the kitten does not "step on itself" for two reasons that the evidence
 demonstrates directly. First, the channel-based partitioning delivered every index **exactly once**
-(`duplicates=0 missing=0`) at both 2000 and 2 items — so each worker owns a disjoint set of paths, and
+(`duplicates=0 missing=0`) at both 2000 and 5 items — so each worker owns a disjoint set of paths, and
 `highlight_all` gives each worker a **distinct** map key. Second, the exclusive-lock path (`GetOrCreate`) ran
 64 concurrent goroutines with no race. However — reported exactly as observed and **not** softened — because
 `Set` guards the map with `RLock` rather than an exclusive `Lock`, concurrent writes to the Go map are not
@@ -733,12 +734,28 @@ Python `pygments` path referenced by old issues). Dependency versions are quoted
 - Recursive directory diffing — `docs/kittens/diff.rst:20`: *"Does recursive directory diffing"*.
 
 **External documentation corroboration.** The official kitty `kitten-diff` documentation corroborates the
-observed runtime behavior: `diff_cmd auto` picks an available implementation, `builtin` uses the anchored diff
-from the Go standard library, and `git`/`diff` use those commands; `ignore_name` is a glob matched against only
-the filename, and matching files/directories are skipped during the filesystem scan; `word_diff_mode` offers
-`central` (byte-level central region) and `words` (word-level), with the `words` mode applying only when a
-changed chunk has equal numbers of added and removed lines — which matches `Chunk.finalize`'s
-`left_count == right_count` guard at `kittens/diff/patch.go:101-107`.
+observed runtime behavior for the two options this branch actually exposes as config keys: `diff_cmd auto` picks
+an available implementation, `builtin` uses the anchored diff from the Go standard library, and `git`/`diff` use
+those commands (`diff_cmd` is defined at `kittens/diff/main.py:41`); and `ignore_name` is a glob matched against
+only the filename, with matching files/directories skipped during the filesystem scan (`ignore_name` is defined
+at `kittens/diff/main.py:56`, with example patterns at `main.py:63-65`).
+
+**Caveat — `word_diff_mode` is external/current-docs only, *not* verified in this branch.** Current kitty
+documentation also describes a `word_diff_mode` option (`central` vs `words`, the `words` mode applying only when
+a changed chunk has equal numbers of added and removed lines). That is reported here strictly as
+external/current-kitty-documentation behavior, **not** as observed runtime behavior of the checked-out revision:
+this branch exposes **no** `word_diff_mode` config key at all. A source-scoped grep over the kitten, the shared
+tools, the docs, and the module manifest finds nothing (exit status `1`, no matching lines):
+
+```
+$ grep -RIn "word_diff_mode" kittens tools docs go.mod ; echo "exit=$?"
+exit=1
+```
+
+What *is* verifiable in this branch's source is only the generic equal-count guard such a mode would map to:
+`Chunk.finalize` computes a per-line "center" only `if !self.is_context && self.left_count == self.right_count`
+— `kittens/diff/patch.go:101-107` — which gates the word-level center highlight regardless of any
+`word_diff_mode` key name.
 
 **Peripheral files** (consulted for completeness; not central to these questions): `kittens/diff/mouse.go`
 (mouse selection / copy) and `kittens/diff/search.go` (in-diff search).
