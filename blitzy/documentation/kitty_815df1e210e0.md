@@ -583,7 +583,7 @@ resident.
 every screen/scrollback scan runs with the GIL held. `obs6_scan.py` times the canonical
 text extraction over 1,000,000 history lines
 (`kitty.window.as_text(screen, add_history=True)`, which calls
-`screen.as_text_non_visual` at `kitty/screen.c:3491` and
+`screen.as_text_non_visual` at `kitty/screen.c:3490` and
 `screen.as_text_for_history_buf` at `kitty/screen.c:3495`):
 
 ```console
