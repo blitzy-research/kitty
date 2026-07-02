@@ -90,16 +90,17 @@ ok  	obs/diff	0.019s
 all scratch artifacts are removed and `git status --porcelain` lists only this document.
 
 **A note on the rename fixture.** The moved-but-identical file is represented on the two sides by two
-byte-for-byte identical copies (`old_name.txt` on the left, `brand_new_name.txt` on the right). Because
-`hash_for_path` computes `md5.Sum` directly over the file bytes (see O2), the two copies necessarily hash to the
-**same** MD5 — the recorded value from the investigation is `f4575d9b835b775bcdbdcdf069d64abf`. What matters for
+byte-for-byte identical copies (`old_name.txt` on the left, `brand_new_name.txt` on the right), each containing
+exactly the bytes `moved content\n`. Because `hash_for_path` computes `md5.Sum` directly over the file bytes
+(see O2), the two copies necessarily hash to the **same** MD5 — the recorded value from the investigation is
+`4aa504e85be1af675a7157d6bdfafb56` (the MD5 of the fixture bytes `moved content\n`). What matters for
 the *rename mechanism* is not any particular hash string but that the removed file and the added file hash to
 that same value; that equality is what triggers rename detection, and it is shown verbatim in O2.
 
 **The fixture.** Most observations use one `LEFT`/`RIGHT` directory pair built by the harness, containing an
 identical file (`same.txt`), a content-changed file (`changed.txt`: `version one\n` → `version two\n`), a
 mode-only change (`modeonly.sh`, `0644` → `0755`), a moved-but-identical file (`old_name.txt` →
-`brand_new_name.txt`, byte-for-byte identical copies), an added file (`added.txt`), a removed file (`removed.txt`), a
+`brand_new_name.txt`, byte-for-byte identical copies each containing `moved content\n`), an added file (`added.txt`), a removed file (`removed.txt`), a
 non-UTF-8 binary (`blob.bin`), an image (`pic.png`), a nested text file (`sub/nested.txt`), and two files that
 match `ignore_name` globs (`editor.bak~`, `.git/config`).
 
@@ -177,8 +178,8 @@ O2 RENAME detected: "old_name.txt" -> "brand_new_name.txt" (reclassified from re
 **Observed output** — the content-hash cross-match (`go test ./diff/ -run TestObsRenameHashCrossMatch -v`):
 
 ```
-O2 md5(old_name.txt)=f4575d9b835b775bcdbdcdf069d64abf
-O2 md5(brand_new_name.txt)=f4575d9b835b775bcdbdcdf069d64abf
+O2 md5(old_name.txt)=4aa504e85be1af675a7157d6bdfafb56
+O2 md5(brand_new_name.txt)=4aa504e85be1af675a7157d6bdfafb56
 O2 hashes equal? true -> triggers add_rename after full-content equality check
 ```
 
@@ -215,14 +216,14 @@ O2 hashes equal? true -> triggers add_rename after full-content equality check
 **Rationale — dispelling the "magic."** The effect that feels magical is nothing more than **content-hash
 matching across the removed/added sets, verified by a full byte-for-byte equality check**. In the run, the
 moved file `old_name.txt` and its new location `brand_new_name.txt` both hash to the **same** value
-(`f4575d9b835b775bcdbdcdf069d64abf`), so the hashes are `equal? true`; the code then re-reads both files and
+(`4aa504e85be1af675a7157d6bdfafb56`), so the hashes are `equal? true`; the code then re-reads both files and
 confirms their full contents are equal before acting; only then does `add_rename` fire, reclassifying what would
 otherwise have been a separate `removal` + `add` into one `rename`. The full-content check at `collect.go:353`
 is deliberate defense against an MD5 collision — hash equality alone is not trusted.
 
 > **Purely content-driven — no name heuristic.** The two names differ completely (`old_name.txt` vs
 > `brand_new_name.txt`), yet the pair is still recognized as a rename: the reclassification is driven entirely by
-> the shared content hash (`f4575d9b835b775bcdbdcdf069d64abf`) and the subsequent full-content equality check,
+> the shared content hash (`4aa504e85be1af675a7157d6bdfafb56`) and the subsequent full-content equality check,
 > never by filename similarity. The cross-match loop at `collect.go:347-364` compares only hashes and bytes — it
 > never looks at names — so *the removed file and the added file sharing the same content hash* is the whole
 > trigger, independent of any particular fixture.
@@ -798,6 +799,9 @@ go test ./diff/ -run TestDiffCollectWalk -v
 go test ./diff/ -run TestObsWalkPairing -v
 
 # O2 rename detection (classification + MD5 cross-match):
+#   rename fixture: LEFT/old_name.txt and RIGHT/brand_new_name.txt each contain exactly the
+#   bytes "moved content\n" (14 bytes), so hash_for_path -> md5.Sum yields, hex-encoded,
+#   4aa504e85be1af675a7157d6bdfafb56 for both (equivalently: printf 'moved content\n' | md5sum).
 go test ./diff/ -run 'TestObsCreateCollectionClassify|TestObsRenameHashCrossMatch' -v
 
 # O3 seven caches (per-type population):
