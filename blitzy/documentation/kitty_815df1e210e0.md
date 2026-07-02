@@ -108,7 +108,7 @@ exit=1
 
 The build exits `1`. The first line is the missing generated `kitty` constants package (imported at `[kittens/ssh/main.go:15]`); the second is the missing `//go:embed data_generated.bin` (`[tools/tui/shell_integration/data.go:19]`). Both are created by `python setup.py build`.
 
-**Contrast — this is specifically a *bare-checkout* result, not the warmed tree.** In the built/warmed tree used for EV1–EV9 (where `setup.py build` has already generated `constants_generated.go` and `data_generated.bin`), the identical command **succeeds**:
+**Contrast — this is specifically a *bare-checkout* result, not the warmed tree.** In the built/warmed tree used for EV1–EV8 (where `setup.py build` has already generated `constants_generated.go` and `data_generated.bin`), the identical command **succeeds**:
 
 ```bash
 go build ./kittens/ssh/ ; echo "exit=$?"
@@ -740,14 +740,14 @@ Every concrete item named by the question, mapped to its code location and the e
 | **fish** (`exec_fish_with_integration`, `XDG_DATA_DIRS`, `KITTY_FISH_XDG_DATA_DIR`, `exec … -l`) | `[bootstrap-utils.sh:118-125]` | EV7 (`fish/kitty-shell-integration.fish`) |
 | **Python path** (`eval(compile(base64…))`) | `[kittens/ssh/main.go:498-499]` | EV5 (unwrap string + base64) |
 | dispatch `exec_with_shell_integration` (cases **only** zsh/fish/bash) | `[bootstrap-utils.sh:138-151]` | code trace Q6 |
-| bootstrap-script size cap `9000` | `[kittens/ssh/main_test.go:76-77]` | EV9 (observed 5282 < 9000) |
+| bootstrap-script size cap `9000` | `[kittens/ssh/main_test.go:76-77]` | EV1 (`TestSSHBootstrapScriptLimit` PASS), EV4 (observed 5282 < 9000) |
 | `kittens/ssh/main.py` is option/config-only (`main()` raises) | `[kittens/ssh/main.py:224-225]` | Critical-context (`sed` of `main()`) |
 | `kittens/ssh/utils.py` = terminal-side SSH runtime (`get_ssh_data`, Python `read_data_from_shared_memory`, `create_shared_memory`) | `[kittens/ssh/utils.py:87,100,115]` | Critical-context (`grep` of defs); Q1/Q8/Q9 |
 | terminal DCS dispatch `handle_remote_ssh` → `get_ssh_data` | `[kitty/window.py:1289-1291]` | Critical-context; Q9 |
 | `ssh\|` DCS registered (C VT parser) | `[kitty/vt-parser.c:608]` | Critical-context; Q9 |
 | Python terminal-side `read_data_from_shared_memory` (unlink + owner/mode + pw/id validation) | `[kittens/ssh/utils.py:100-112,129-133]` | Q1/Q8 |
 
-**Magnitudes (EV9), by name.** bootstrap `rcmd` (sh) total = **5282 bytes** (EV4), well under the **9000**-byte cap at `[kittens/ssh/main_test.go:76]`; shm JSON payload = **31575 bytes** (EV6); gzip tarball = **23599 bytes** (EV7).
+**Magnitudes, by name.** bootstrap `rcmd` (sh) total = **5282 bytes** (EV4), well under the **9000**-byte cap at `[kittens/ssh/main_test.go:76]` (enforced by `TestSSHBootstrapScriptLimit`, EV1); shm JSON payload = **31575 bytes** (EV6); gzip tarball = **23599 bytes** (EV7).
 
 ---
 
