@@ -488,7 +488,7 @@ Because kitty cannot even start without a working OpenGL context, a live GL cont
   $ grep -c -i "input_read\|check_for_active_animated" /tmp/kitty_captures/kitty_stdout.log
   0
   ```
-  The reason is grounded in source: `render()`'s debug call uses the `EVDBG(...)` macro (`EVDBG("input_read: %d, …")` at **[kitty/child-monitor.c:872]**), and `EVDBG` is **compiled out** unless `DEBUG_EVENT_LOOP` is defined — verbatim at **[kitty/child-monitor.c:28‑32]**:
+  The reason is grounded in source: `render()`'s debug call uses the `EVDBG(...)` macro (`EVDBG("input_read: %d, …")` at **[kitty/child-monitor.c:872]**), and `EVDBG` is **compiled out** unless `DEBUG_EVENT_LOOP` is defined — verbatim at **[kitty/child-monitor.c:29‑33]**:
   ```c
   #ifdef DEBUG_EVENT_LOOP
   #define EVDBG(...) timed_debug_print(__VA_ARGS__)
@@ -574,7 +574,7 @@ Because kitty cannot even start without a working OpenGL context, a live GL cont
 
 - **RECEIVE:** a real key press is first translated by the Linux **XKB** layer in `glfw/xkb_glfw.c` `(observed` — the `Press xkb_keycode` line, section b.1`)`, delivered by GLFW's `key_callback` [kitty/glfw.c:430] `(source‑derived` — guarded call [kitty/glfw.c:439]`)` to kitty's `on_key_input` [kitty/keys.c:166], whose `--debug-keyboard` line (gated at [kitty/keys.c:172]) is the definitive receive signal `(observed` — the `on_key_input: … action: PRESS` line, section b.3`)`.
 - **INTERMEDIATE:** the key is encoded — text → literal bytes `(observed` — the `sent key as text to child` fragment, c.1`)`; special → escape byte, Enter → `0xd` `(observed` — the `sent encoded key to child: 0xd` fragment, c.1`)` — via `encode_glfw_key_event` [kitty/key_encoding.c:414], written to the child PTY through `write_to_child` [kitty/window.py:955]; the child's reply is read+parsed on the io thread (`io_loop`/`do_parse` [kitty/child-monitor.c:1481,438]) `(source‑derived` — thread split, c.4`)` by the VT parser (`consume_normal` [kitty/vt-parser.c:230]) into the screen model (`screen_draw_text` [kitty/screen.c:866]) `(observed` — the `draw als` trace line, c.5`)`. The default `bash` ran in **legacy** keyboard mode, so key **releases** were ignored `(observed` — the `ignoring as keyboard mode does not support encoding this event` line, c.2`)`.
-- **DISPLAY:** the dirtied screen triggers `render()` [kitty/child-monitor.c:871] → `request_frame_render()` [kitty/child-monitor.c:814], which composites the frame with the OpenGL shader stages `kitty/*.glsl` via `kitty/gl.c` `(source‑derived`, section d`)`. The live **OpenGL 4.5** context proves the GPU pipeline initialized `(observed` — the `GL version string` line, section d`)`; a per‑frame render log line is compiled out (`EVDBG`, [kitty/child-monitor.c:28‑32]) and so is honestly reported as not observed.
+- **DISPLAY:** the dirtied screen triggers `render()` [kitty/child-monitor.c:871] → `request_frame_render()` [kitty/child-monitor.c:814], which composites the frame with the OpenGL shader stages `kitty/*.glsl` via `kitty/gl.c` `(source‑derived`, section d`)`. The live **OpenGL 4.5** context proves the GPU pipeline initialized `(observed` — the `GL version string` line, section d`)`; a per‑frame render log line is compiled out (`EVDBG`, [kitty/child-monitor.c:29‑33]) and so is honestly reported as not observed.
 
 *All runtime output above was captured from a live `kitty 0.35.2` process; every temporary capture file and the virtual display were removed after the investigation, leaving the repository byte‑for‑byte unchanged except for this document.*
 
