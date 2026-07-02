@@ -48,7 +48,7 @@ $ find /tmp/kitty_clean -name '*.so' | wc -l
 
 ## Q1 — It's marketed as "GPU based," but which language does the heavy lifting?
 
-**Answer:** The heavy lifting is native. The performance‑critical subsystems — VT parsing, the screen/line model, rendering, fonts, graphics, key encoding, SIMD string scanning, and the non‑blocking PTY I/O thread — are compiled **C** (with **Objective‑C** for macOS integration), exposed to Python as the single extension module **`kitty.fast_data_types`**, and the pixels are produced on the **GPU** by GLSL shaders. Python is the orchestration/configuration/extensibility layer; **Go** builds the standalone `kitten` binary and `tools/`. Python "wins" on line count (63,042 lines, the most of any single language), but that is breadth of orchestration, not runtime cost.
+**Answer:** The heavy lifting is native. The performance‑critical subsystems — VT parsing, the screen/line model, rendering, fonts, graphics, key encoding, SIMD string scanning, and the non‑blocking PTY I/O thread — are compiled **C** (with **Objective‑C** for macOS integration), exposed to Python as the single extension module **`kitty.fast_data_types`**, and the pixels are produced on the **GPU** by GLSL shaders. Python is the orchestration/configuration/extensibility layer; **Go** builds the standalone `kitten` binary and `tools/`. Python "wins" on line count (62,829 lines, the most of any single language), but that is breadth of orchestration, not runtime cost.
 
 ### 1.1 The premise: kitty's own identity string
 
@@ -82,33 +82,33 @@ rm -rf /tmp/kitty_clean && mkdir -p /tmp/kitty_clean && git archive HEAD | tar -
 cd /tmp/kitty_clean
 for ext in c h m py go glsl; do
   files=$(find . -path ./.git -prune -o -path ./3rdparty -prune -o -type f -name "*.$ext" -print | wc -l)
-  lines=$(find . -path ./.git -prune -o -path ./3rdparty -prune -o -type f -name "*.$ext" -print -exec cat {} + | wc -l)
+  lines=$(find . -path ./.git -prune -o -path ./3rdparty -prune -o -type f -name "*.$ext" -exec cat {} + | wc -l)
   printf "%-6s files=%-6s lines=%s\n" ".$ext" "$files" "$lines"
 done
 ```
 ```text
-.c     files=83     lines=57292
-.h     files=75     lines=34890
-.m     files=7      lines=8006
-.py    files=213    lines=63042
-.go    files=258    lines=56329
-.glsl  files=13     lines=709
+.c     files=83     lines=57209
+.h     files=75     lines=34815
+.m     files=7      lines=7999
+.py    files=213    lines=62829
+.go    files=258    lines=56071
+.glsl  files=13     lines=696
 ```
 
 Presented as a table:
 
 | Language          | Extension | Files | Lines  |
 |-------------------|-----------|------:|-------:|
-| C                 | `.c`      |    83 | 57,292 |
-| C headers         | `.h`      |    75 | 34,890 |
-| Objective‑C       | `.m`      |     7 |  8,006 |
-| Python            | `.py`     |   213 | 63,042 |
-| Go                | `.go`     |   258 | 56,329 |
-| GLSL              | `.glsl`   |    13 |    709 |
+| C                 | `.c`      |    83 | 57,209 |
+| C headers         | `.h`      |    75 | 34,815 |
+| Objective‑C       | `.m`      |     7 |  7,999 |
+| Python            | `.py`     |   213 | 62,829 |
+| Go                | `.go`     |   258 | 56,071 |
+| GLSL              | `.glsl`   |    13 |    696 |
 
 **Reasoning & honest caveats.**
-- **Native ≈ 100k lines carry the performance‑critical work:** C + headers + Obj‑C = 57,292 + 34,890 + 8,006 = **100,188** lines.
-- **Python leads single‑language line count (63,042 lines):** this is the breadth of orchestration/config/extensibility, not runtime hot‑path cost. (By *file* count Go actually leads at 258 `.go` files vs Python's 213 `.py`; Python's 213 `.py` files still far exceed the 83 `.c` files, so Python remains the broad orchestration layer.)
+- **Native ≈ 100k lines carry the performance‑critical work:** C + headers + Obj‑C = 57,209 + 34,815 + 7,999 = **100,023** lines.
+- **Python leads single‑language line count (62,829 lines):** this is the breadth of orchestration/config/extensibility, not runtime hot‑path cost. (By *file* count Go actually leads at 258 `.go` files vs Python's 213 `.py`; Python's 213 `.py` files still far exceed the 83 `.c` files, so Python remains the broad orchestration layer.)
 - **Go ≈ 56k lines** builds the standalone CLI (`kitten`) and `tools/`.
 - **Measure the committed tree, not the built tree.** Running the same loop at the *built* repo root inflates the counts, because kitty's build **generates source files** (extra Go under `tools/`/`kittens/`, plus generated headers). Shown directly for the two affected extensions:
 
@@ -116,16 +116,16 @@ Presented as a table:
   # same loop at the BUILT repo root (not the clean tree)
   for ext in h go; do
     files=$(find . -path ./.git -prune -o -path ./3rdparty -prune -o -type f -name "*.$ext" -print | wc -l)
-    lines=$(find . -path ./.git -prune -o -path ./3rdparty -prune -o -type f -name "*.$ext" -print -exec cat {} + | wc -l)
+    lines=$(find . -path ./.git -prune -o -path ./3rdparty -prune -o -type f -name "*.$ext" -exec cat {} + | wc -l)
     printf "%-6s files=%-6s lines=%s\n" ".$ext" "$files" "$lines"
   done
   ```
   ```text
-  .h     files=77     lines=35385
-  .go    files=338    lines=69489
+  .h     files=77     lines=35308
+  .go    files=338    lines=69151
   ```
   That inflation (`.h` 75→77, `.go` 258→338) is itself evidence of the build‑time code generation discussed in Q2; I therefore report the clean‑tree numbers as the true footprint.
-- The clean‑tree line counts differ from a `cloc` run by roughly one line per file (a trailing‑newline / `wc -l` counting nuance); the file counts are exact. I show what the command produced rather than silently reconciling the two.
+- **Why `-print` appears only in the `files=` counter, not the `lines=` counter.** The `lines=` sub‑command is `find … -exec cat {} + | wc -l` (no `-print`), so it counts pure file **contents**. Adding `-print` — which the `files=` counter does deliberately, since its whole job is to count filenames — makes `find` emit each matched *filename* as an extra line ahead of that file's contents, and `wc -l` then counts those filename lines too, inflating every language by **exactly its file count** (`.c` +83, `.h` +75, `.m` +7, `.py` +213, `.go` +258, `.glsl` +13). That is a one‑line‑**per‑file** artifact of `-print`, not a trailing‑newline nuance (a missing trailing newline would push a count the other way). These are raw physical line counts (`wc -l`); the file counts are exact. I show exactly what the commands produced.
 
 ### 1.3 Where the heavy lifting actually lives: the `fast_data_types` seam
 
@@ -504,8 +504,8 @@ A deliberate re‑read of each question, confirming every named item is addresse
 **Q1 — heavy lifting**
 - [x] "GPU based" identity — `README.asciidoc:1` (§1.1)
 - [x] Per‑language LOC with observed command + verbatim output, as a table (§1.2)
-- [x] Native C + `.h` + Obj‑C ≈ 100,188 (~100k) lines (§1.2)
-- [x] Python leads single‑language line count (63,042 lines); Go leads file count (258) (§1.2)
+- [x] Native C + `.h` + Obj‑C ≈ 100,023 (~100k) lines (§1.2)
+- [x] Python leads single‑language line count (62,829 lines); Go leads file count (258) (§1.2)
 - [x] Go ≈ 56k builds CLI tooling (§1.2)
 - [x] `fast_data_types` seam — `kitty/data-types.c:467/469/525` (§1.3)
 - [x] Named C/Obj‑C subsystems: `vt-parser.c`, `screen.c`, `line.c`, `line-buf.c`, `gl.c`, `shaders.c`, `freetype.c`, `graphics.c`, `keys.c`, `simd-string-128.c`, `simd-string-256.c`, `state.c`, `child-monitor.c`, `*.m` (`core_text.m`, `cocoa_window.m`), `glfw/`, `tools/` (§1.3)
