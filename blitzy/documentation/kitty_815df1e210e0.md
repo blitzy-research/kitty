@@ -2,7 +2,7 @@
 
 > **The question answered here:** *"Start kitty with whatever debugging/tracing options are available, press a few simple keys inside the default shell, and explain how kitty handles keyboard input during normal use: which parts **RECEIVE** the input first, which parts handle **INTERMEDIATE** processing, and how the **UPDATED DISPLAY** is ultimately produced."*
 
-This document is an **evidence‑first** answer. Every behavioural claim below is placed directly next to the **verbatim runtime output** that demonstrates it, together with the exact command that produced that output, and is grounded with a `file:line` reference into the (read‑only) kitty source. The investigation followed a strict **build → run → observe → document** order: kitty was built/available as native artifacts, launched under a virtual display with its tracing flags, driven with a few real key presses in the default shell, and only then written up from the captured logs.
+This document is an **evidence‑first** answer. Every **runtime-observable** behavioural claim below is placed directly next to the **verbatim runtime output** that demonstrates it, together with the exact command that produced that output; claims about **implementation details that runtime tracing cannot directly prove** (for example internal threading order, or code paths that emit no debug line in this build) are instead placed next to **source evidence** and are explicitly labelled as source-derived. Every such claim is additionally grounded with a `file:line` reference into the (read‑only) kitty source. The investigation followed a strict **build → run → observe → document** order: kitty was built/available as native artifacts, launched under a virtual display with its tracing flags, driven with a few real key presses in the default shell, and only then written up from the captured logs.
 
 - **kitty version observed:** `kitty 0.35.2 created by Kovid Goyal` (from `./kitty/launcher/kitty --version`).
 - **Keys pressed in the default shell (`bash`):** `a`, `l`, `s`, then `Return` (delivered as *real* key events via `xdotool`), followed by a remote‑control `send-text 'echo hi\n'` and `send-text 'exit\n'`.
@@ -86,6 +86,16 @@ default=normal
 choices=normal,fullscreen,maximized,minimized
 Control how the initial kitty window is created.
 ```
+
+The exact headless example named by kitty's own invocation docs and by this task's AAP — `--start-as=hidden` — was therefore **tested directly**. It is **rejected at CLI‑parse time** (before any window or OpenGL context is created), which is precisely why it cannot be used to run kitty headless in this repository:
+
+```console
+$ ./kitty/launcher/kitty --config NONE -o confirm_os_window_close=0 --start-as=hidden true; echo "exit=$?"
+hidden is not a valid value for the --start-as option. Valid values are: maximized, normal, fullscreen, minimized
+exit=1
+```
+
+The four listed values are exactly the `choices` at **[kitty/cli.py:961]**; their **print order varies run‑to‑run** because they are enumerated from an unordered set (re‑running the same command produced, e.g., `fullscreen, maximized, normal, minimized` and `normal, fullscreen, minimized, maximized`), but the `hidden is not a valid value` rejection and the `exit=1` status are invariant. So the literal invocation `kitty --start-as=hidden` is **not valid in this repository/version (kitty 0.35.2)**, and the virtual‑display fallback below is what actually provided the headless OpenGL context for this investigation.
 
 Because no built-in "hidden window" mode exists and an OpenGL context is still required on Linux regardless, a virtual X display with software GL was used for the entire investigation:
 
@@ -507,7 +517,7 @@ Because kitty cannot even start without a working OpenGL context, a live GL cont
 | `--dump-bytes` | [kitty/cli.py:985] | Used; wrote the 1818‑byte raw child‑byte file (`wc -c` in c.4). |
 | `--dump-commands` | [kitty/cli.py:972] | Used; produced the parsed `draw`/`screen_*` trace on stdout. |
 | `--replay-commands` | [kitty/cli.py:977] | Referenced (replays a prior `--dump-commands` dump); not exercised — **unverified at runtime**. |
-| `--start-as` | [kitty/cli.py:958] | Its `choices` at [kitty/cli.py:961] are `normal,fullscreen,maximized,minimized` — **there is no `hidden` value**. No built-in hidden-window mode exists; a virtual display + software GL was used instead because a GL context is required on Linux. |
+| `--start-as` (incl. the AAP example `--start-as=hidden`) | [kitty/cli.py:958] | Its `choices` at [kitty/cli.py:961] are `normal,fullscreen,maximized,minimized` — **there is no `hidden` value**. The exact invocation `--start-as=hidden` was tested and is **rejected at CLI‑parse time** (`hidden is not a valid value for the --start-as option.`, `exit=1`) — see the display‑context evidence block in §(a). No built-in hidden-window mode exists; a virtual display + software GL was used instead because a GL context is required on Linux. |
 
 ### Functions / symbols
 
