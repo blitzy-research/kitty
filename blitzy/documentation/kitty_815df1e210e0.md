@@ -133,7 +133,7 @@ These hooks call straight into `vt_parser_create_write_buffer` / `vt_parser_comm
 
 **Direct answer.** Two independent streams feed the terminal. Bytes coming *from the child program* first enter at `read_bytes()` — `kitty/child-monitor.c:1337` — which asks the VT parser for a buffer, `read(2)`s the PTY **directly into that parser-owned buffer**, and commits it. Bytes coming *from the user* (keystrokes, mouse) enter separately on the main thread (Q2). A "surge" is therefore ingested as raw bytes into a 1 MiB parser buffer and only *becomes actionable* when the parser turns those bytes into screen-state mutations. The three named surge items are each handled by a distinct mechanism:
 
-- **keystrokes** → user-input path `on_key_input()` → `encode_key_for_tty` → `schedule_write_to_child` (Q2),
+- **keystrokes** → user-input path `on_key_input()` → `encode_glfw_key_event` → `schedule_write_to_child` (Q2),
 - **paste bursts** → bracketed paste `paste_()` `kitty/screen.c:4573` and the 1 MiB buffer (Q6/Q7),
 - **resize signals** → `process_pending_resizes()` `kitty/child-monitor.c:1043` (Q5).
 
@@ -205,7 +205,7 @@ So a surge is read with zero intermediate copies into a fixed buffer, and "becom
 **Direct answer.** There are **two distinct ingress points on two different threads**:
 
 1. **Child output** enters on the dedicated I/O thread. `io_loop()` — `kitty/child-monitor.c:1481` — `poll()`s the PTY file descriptors on a thread named **`KittyChildMon`** (`set_thread_name("KittyChildMon")` at `kitty/child-monitor.c:1489`) and reads them via `read_bytes()` (`kitty/child-monitor.c:1337`).
-2. **User keyboard / mouse** enters on the main (UI) thread. GLFW delivers a key event to **`on_key_input(GLFWkeyevent *ev)` — `kitty/keys.c:166`**, which encodes it (`kitty/key_encoding.c`, via `encode_key_for_tty`) and hands the bytes to **`schedule_write_to_child`** (`kitty/keys.c:259`).
+2. **User keyboard / mouse** enters on the main (UI) thread. GLFW delivers a key event to **`on_key_input(GLFWkeyevent *ev)` — `kitty/keys.c:166`**, which encodes it via **`encode_glfw_key_event`** (defined at `kitty/key_encoding.c:414`, called at `kitty/keys.c:251`) and hands the bytes to **`schedule_write_to_child`** (`kitty/keys.c:259`). (The Q2 probe below drives the `encode_key_for_tty` Python binding — C function `pyencode_key_for_tty`, `kitty/keys.c:311`, registered `kitty/keys.c:334` — which wraps this same `encode_glfw_key_event`; it is *not* a separate function in `kitty/key_encoding.c`.)
 
 **Evidence — the I/O thread name is real (compiled into the extension).** The thread name literal is present in the built `fast_data_types.so`:
 
@@ -219,7 +219,7 @@ $ grep -n 'set_thread_name("Kitty' kitty/child-monitor.c
 1808:    set_thread_name("KittyPeerMon");
 ```
 
-**Evidence — a user keystroke becomes the exact bytes that go to the child.** A probe runs the *same* encoder `on_key_input` uses (`encode_key_for_tty`) and shows the encoded output that `schedule_write_to_child` (`keys.c:259`) would transmit:
+**Evidence — a user keystroke becomes the exact bytes that go to the child.** A probe drives the `encode_key_for_tty` Python binding (`kitty/keys.c:311`), which wraps the *same* `encode_glfw_key_event` (`kitty/key_encoding.c:414`) that `on_key_input` calls, and shows the encoded output that `schedule_write_to_child` (`keys.c:259`) would transmit:
 
 ```console
 $ ./kitty/launcher/kitty +launch /tmp/probe_q2_keyinput.py
@@ -237,7 +237,7 @@ Q2 key 'a' + Alt          -> '\x1ba'
 - `UP` → `'\x1b[A'`: an arrow key becomes a CSI sequence.
 - `Alt+'a'` → `'\x1ba'`: Alt prefixes an ESC.
 
-These are exactly the bytes `on_key_input` produces via `encode_key_for_tty` before calling `schedule_write_to_child(w->id, 1, encoded_key, size)` at `kitty/keys.c:259`.
+These are exactly the bytes `on_key_input` produces via `encode_glfw_key_event` before calling `schedule_write_to_child(w->id, 1, encoded_key, size)` at `kitty/keys.c:259` (reproduced above through the `encode_key_for_tty` binding, which wraps the same encoder).
 
 **Evidence — child bytes enter via the buffer path.** The child-side entry is the write-buffer path already shown in Q1 (and quantified in Q7): the first buffer handed out is the full ring (`len == 1048576`), confirming `read_bytes` targets the 1 MiB parser buffer.
 
@@ -471,7 +471,7 @@ Q6 after CSI ?2004l in_bracketed_paste_mode = False
 **Named markers, by name, with anchors.**
 
 - **OSC 133** (`case 133:` at `kitty/vt-parser.c:536`) → `shell_prompt_marking()` (`kitty/screen.c:2328`), which sets the line attribute `prompt_kind`: `PROMPT_START` for `A` (`kitty/screen.c:2337`) and `OUTPUT_START` for `C` (`kitty/screen.c:2341`).
-- **OSC 7** (`case 7:` at `kitty/vt-parser.c:505`) → `process_cwd_notification()` (`kitty/screen.c:2393`).
+- **OSC 7** (`case 7:` at `kitty/vt-parser.c:499`; handler call `process_cwd_notification(self->screen, …)` at `kitty/vt-parser.c:505`) → `process_cwd_notification()` (`kitty/screen.c:2393`).
 - **Bracketed paste, mode 2004** — constant `#define BRACKETED_PASTE (2004 << 5)` (`kitty/modes.h:81`), start/end markers `"200~"`/`"201~"` (`kitty/modes.h:82-83`); the getter/setter is `MODE_GETSET(in_bracketed_paste_mode, BRACKETED_PASTE)` (`kitty/screen.c:3854`); and `paste_()` (`kitty/screen.c:4573`) wraps pasted bytes only when the mode is on:
 
 ```console
@@ -744,11 +744,11 @@ Q9 remaining input_delay window sample= 2.9988 ms (>=0 => poll waits this long)
 ## Coverage pass — every sub-question and every named item
 
 - [x] **Q1 — surge ingestion.** Child bytes enter at `read_bytes()` (`kitty/child-monitor.c:1337`) into the parser buffer; runtime probe shows bytes → cells/cursor. Named items covered: **keystrokes** (→ Q2 `on_key_input`/`schedule_write_to_child`), **paste bursts** (→ `paste_()` `kitty/screen.c:4573` + 1 MiB buffer, Q6/Q7), **resize signals** (→ `process_pending_resizes` `kitty/child-monitor.c:1043`, Q5).
-- [x] **Q2 — entry point (both, by name).** Child output: `io_loop()` (`kitty/child-monitor.c:1481`) on thread **`KittyChildMon`** (`:1489`) via `read_bytes()` (`:1337`). User keys/mouse: `on_key_input()` (`kitty/keys.c:166`) → `encode_key_for_tty` (`kitty/key_encoding.c`) → `schedule_write_to_child` (`kitty/keys.c:259`); encoded bytes shown at runtime.
+- [x] **Q2 — entry point (both, by name).** Child output: `io_loop()` (`kitty/child-monitor.c:1481`) on thread **`KittyChildMon`** (`:1489`) via `read_bytes()` (`:1337`). User keys/mouse: `on_key_input()` (`kitty/keys.c:166`) → `encode_glfw_key_event` (`kitty/key_encoding.c:414`) → `schedule_write_to_child` (`kitty/keys.c:259`); the Q2 probe drives the `encode_key_for_tty` binding (`kitty/keys.c:311`) that wraps the same encoder; encoded bytes shown at runtime.
 - [x] **Q3 — pause/resume.** Mode **2026**: `CSI ?2026h`/`?2026l` observed toggling via DECRQM (`?2026;1$y`/`?2026;2$y`); `screen_pause_rendering` (`kitty/screen.c:2506`), `screen_check_pause_rendering` (`kitty/screen.c:2489`), `PENDING_UPDATE (2026 << 5)` (`kitty/modes.h:86`), **2000 ms** auto-expiry (`kitty/screen.c:2521`, cited-not-timed).
 - [x] **Q4 — the conductor (three threads).** Main/render tick (`kitty/child-monitor.c:1232-1237`); `io_loop` (`:1481`, `KittyChildMon`); talk loop (`talk_loop` `:1805`, `KittyPeerMon`). Python: `boss.py` (`ChildMonitor` `:370`), `window.py` (`Child`↔`Screen` `:601`/`:604`), `child.py` (`openpty` `:170`, `fork` `:276`).
 - [x] **Q5 — ordering & priority.** Render tick `process_pending_resizes` (`kitty/child-monitor.c:1043`, called `:1233`) → `parse_input` (`:451`, called `:1236`) → `render` (`:1237`); I/O loop wakeup drain (`:1515`) → signals (`:1519`) → POLLIN reads (`:1531`) → POLLOUT writes (`:1540`); runtime resize-before-parse demonstrated.
-- [x] **Q6 — shell-integration alignment.** **OSC 133** (`kitty/vt-parser.c:536` → `shell_prompt_marking` `kitty/screen.c:2328`, `PROMPT_START` `:2337`/`OUTPUT_START` `:2341`), **OSC 7** (`kitty/vt-parser.c:505` → `kitty/screen.c:2393`), **bracketed paste 2004** (`kitty/modes.h:81`, `paste_()` `kitty/screen.c:4573`, wrap `:4586-4588`, `MODE_GETSET` `:3854`); single VT parser in-band order shown at runtime; `modify_shell_environ()` (`kitty/shell_integration.py:218`).
+- [x] **Q6 — shell-integration alignment.** **OSC 133** (`kitty/vt-parser.c:536` → `shell_prompt_marking` `kitty/screen.c:2328`, `PROMPT_START` `:2337`/`OUTPUT_START` `:2341`), **OSC 7** (`case 7:` `kitty/vt-parser.c:499` → `kitty/screen.c:2393`), **bracketed paste 2004** (`kitty/modes.h:81`, `paste_()` `kitty/screen.c:4573`, wrap `:4586-4588`, `MODE_GETSET` `:3854`); single VT parser in-band order shown at runtime; `modify_shell_environ()` (`kitty/shell_integration.py:218`).
 - [x] **Q7 — backpressure & unstable remote.** `BUF_SZ = 1024u*1024u` = 1 MiB (`kitty/vt-parser.c:18`), runtime-confirmed `1048576`; `vt_parser_has_space_for_input()` (`kitty/vt-parser.c:1477`); POLLIN gate (`kitty/child-monitor.c:1501`) → PTY flow control → child blocks on `write()`. SSH: `kittens/ssh/**`, `shell-integration/ssh/**` (bootstrap over `/dev/tty`); `kitty @` via `kitty/rc/*.py`; `ssh` suite passes.
 - [x] **Q8 — end-to-end settling.** Full flow PTY → `poll` → `read_bytes` → coalesced wakeup → tick (`process_pending_resizes` → `parse_input` → dispatch → `Screen`) → `render`; runtime probe shows mixed input settling and the buffer draining back to `1048576` bytes. Coalescing timers tied in.
 - [x] **Q9 — keeping rhythm.** `input_delay` = `3` (`kitty/options/definition.py:878`), `repaint_delay` = `10` (`kitty/options/definition.py:866`), `resize_debounce_time` = `0.1 0.5` (`kitty/options/definition.py:1182`) — all read at runtime; the WAKEUP coalescing predicate + "expensive operation … cocoa" comment quoted verbatim from `kitty/child-monitor.c:1562-1570` (with the poll-timeout bound at `:1506-1510`); **and measured at runtime** — a 60 ms / 300 ms surge coalesced `426274` / `2127514` read-events into `19` / `99` wakeups with a min inter-wakeup interval of `3.0000` ms (≤ one wakeup per `input_delay`), driven by kitty's real `monotonic()` clock and real `input_delay`.
