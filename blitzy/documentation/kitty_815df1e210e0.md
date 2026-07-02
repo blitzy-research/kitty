@@ -46,10 +46,10 @@ kitty 0.35.2 created by Kovid Goyal
 
 Produced artifacts: `kitty/fast_data_types.so` (1,213,072 bytes), `kitty/launcher/kitten` (Go, 15,945,988 bytes), `kitty/launcher/kitty` (36,224 bytes).
 
-Two observation vehicles were used:
+Two observation vehicles were used, both runnable inside the designated container:
 
-- **Approach A — in-process harness** (`./kitty/launcher/kitty +launch <script>` / `+runpy "<code>"`), patterned on `kitty_tests/graphics.py`. Deterministic; best for the graphics *visible signs* (Q4/Q5) and the bounded parser buffer (Q1).
-- **Approach B — real `kitty` GUI process** on a headless X server (`Xvfb :99` + Mesa `llvmpipe` software GL), rebuilt with the compile-time debug macros `KITTY_PRINT_BYTES_SENT_TO_CHILD` and `DEBUG_POLL_EVENTS` (enabled via `CFLAGS`, no source edit). Best for the I/O engine — `io_loop` poll scheduling (Q1 pause/throttle) and write backpressure (Q2).
+- **Approach A — deterministic in-process harness** (`./kitty/launcher/kitty +launch <script>` / `+runpy "<code>"`), patterned on `kitty_tests/graphics.py`. Deterministic and stable; used for the graphics *visible signs* (Q4/Q5), the bounded parser buffer and the pause *condition* (Q1), and the write-side partial-write/`EAGAIN` measured directly against kitty's own `openpty()` OS primitive (Q2).
+- **Approach B — in-process `ChildMonitor` I/O-loop harness**, rebuilt with the compile-time debug macros `KITTY_PRINT_BYTES_SENT_TO_CHILD` and `DEBUG_POLL_EVENTS` (enabled via `CFLAGS`, no source edit). This drives the *real* `io_loop` (`child-monitor.c:1481`) head-less in-process: it constructs a `ChildMonitor`, adds a child backed by a real PTY master fd, calls `start()` (which runs the io thread that drains the add-queue and polls the child fd), and queues responses via `needs_write()`; the debug macros then surface the engine's `Wrote:` writes (stderr) and poll events (stdout). **Environment limitation (verified):** the designated image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` ships **no `Xvfb`, `xvfb-run`, or `X`** (`command -v Xvfb` → `not found`), and `DISPLAY` is empty, so a *real windowed* `kitty` GUI process cannot be launched here — the io engine is exercised in-process instead. This minimal harness is **unstable: it segfaults shortly after emitting its first debug lines** (observed exit code `139`), so only short traces are captured before the crash. Where a longer sustained-load trace would be needed, that is reported as an explicit limitation rather than asserted.
 
 ---
 
@@ -119,14 +119,14 @@ BUF_SZ_literal = 1024*1024 = 1048576
 
 The first `commit` accepts `1048576` bytes (`= BUF_SZ`); the second accepts `0` — the buffer is full and refuses more. `remaining_unaccepted = 3145728` (the other 3 MiB) stays unread until the buffer drains. This is the bounded-buffer behavior, observed at the real 1 MiB threshold.
 
-A corollary bound applies to a **single graphics APC escape code**: it too is capped just under `BUF_SZ`. Feeding one 12 MiB graphics APC produced (verbatim, repeatedly):
+A corollary bound applies to a **single graphics APC escape code**: it too is capped just under `BUF_SZ`. Command (Approach A): `./kitty/launcher/kitty +launch /tmp/obs_parse_err.py`, where the script feeds one ~12 MiB single graphics APC — `ESC _ G a=T,f=24,s=1,v=1; <12 MiB of 'Z'> ESC \` — through `parse_bytes` and lets stderr through. The verbatim stderr:
 
 ```text
-[PARSE ERROR] VTE_APC escape code too long (1048574 bytes), ignoring it
-[PARSE ERROR] Unknown char after ESC: 0x5c
+[0.039] [PARSE ERROR] VTE_APC escape code too long (1048574 bytes), ignoring it
+[0.095] [PARSE ERROR] Unknown char after ESC: 0x5c
 ```
 
-`1048574 = BUF_SZ - 2`; an oversized single escape code is discarded. (This is why large images must be sent chunked, or via file/shared-memory transmission, rather than as one giant APC.)
+The bracketed `[0.039]`/`[0.095]` prefixes are `log_error`'s monotonic-clock timestamps — emitted by `fprintf(stderr, "[%.3f] ", …)` at `kitty/logging.c:56` — and therefore **vary run-to-run** (an earlier run showed `[0.056]`/`[0.115]`); only the message bodies are stable. `1048574 = BUF_SZ - 2`; an oversized single escape code is discarded. (This is why large images must be sent chunked, or via file/shared-memory transmission, rather than as one giant APC.)
 
 ### (b) PAUSE — stop reading from the child (OS-level backpressure, no app "stop" signal)
 
@@ -150,23 +150,14 @@ read_bytes(int fd, Screen *screen) {
 
 **Rationale:** with the PTY undrained, the kernel's PTY buffer fills and the child's next `write()` **blocks** (or returns `EAGAIN` if the child made its end non-blocking). Backpressure is thus propagated to the producer by the operating system, with no application-level protocol — the elegant reason kitty needs no "stop" message.
 
-**Observed (Approach B) — normal poll scheduling.** The real `io_loop` poll trace (debug build with `DEBUG_POLL_EVENTS`) shows the child fd (`EXTRA_FDS = 2`, so index `i:2` is the first child) being scheduled for `POLLIN`/`POLLOUT` under ordinary query load. Command: real headless `kitty` on `Xvfb :99` with a child emitting queries, stdout captured to `/tmp/kitty_io.out`:
+**Observed (Approach B) — poll scheduling of the child fd.** Driving the real `io_loop` head-less in-process (debug build with `DEBUG_POLL_EVENTS`) shows the child fd (`EXTRA_FDS = 2`, so index `i:2` is the first child) being scheduled for `POLLIN`. `DEBUG_POLL_EVENTS` emits `printf("i:%lu %s\n", …)` on **stdout** (`child-monitor.c:1550`–`1553`). Command: `stdbuf -o0 ./kitty/launcher/kitty +launch /tmp/obs_poll.py` — the script builds a `ChildMonitor`, `add_child(1, …, master, screen)`, `start()`, then `os.write(slave, b"query-from-child")` to make the child fd readable — stdout captured verbatim:
 
 ```text
 i:0 POLLIN
 i:2 POLLIN
-i:0 POLLIN
-i:2 POLLOUT
-i:2 POLLIN
-i:0 POLLIN
-i:2 POLLOUT
-i:2 POLLIN
-i:1 POLLIN
-i:2 POLLHUP
-i:0 POLLIN
 ```
 
-`i:2 POLLIN` and `i:2 POLLOUT` appear interleaved — reads and write-backs scheduled per cycle (`POLLOUT` is covered in Q2). Under this interactive query load the 1 MiB buffer never fills, so **this trace does not by itself contain an `events = 0` pause line**; capturing that live would require scripting a sustained multi-MiB flood that outruns the parser inside the GUI, which was not isolated here (an explicit limitation). Instead, the pause *condition* is evidenced directly and deterministically below by driving the parser buffer to `BUF_SZ` in-process and then measuring the producer's `write()`.
+`i:0` is the loop's internal wake-up fd; `i:2` is the child fd being scheduled readable — exactly the read scheduling that the pause gate at `child-monitor.c:1501` modulates (it sets that child's `events` to `POLLIN` only while the parser has space, else `0`). **Limitations (this environment):** (1) the designated image has **no `Xvfb`** (verified above), so there is no real windowed GUI — the io engine is driven in-process; (2) this minimal harness **segfaults immediately after these two lines** (exit `139`), so the longer interleaved `POLLIN`/`POLLOUT` sequence, a `POLLHUP` on child exit, and a live `events = 0` pause line over a sustained multi-MiB flood are **not reproducible here** and are not claimed. The `POLLOUT` write-scheduling side is evidenced separately (source-cited) in Q2(b); the pause *condition* itself is evidenced directly and deterministically just below, by driving the parser buffer to `BUF_SZ` in-process and then measuring the producer's `write()`.
 
 **Observed (Approach A) — the pause condition itself (buffer full → no `POLLIN`).** Filling the VT-parser buffer *without parsing* drives it to exactly `BUF_SZ`; the next `test_create_write_buffer()` then reports **0 bytes of available space**. That available size is exactly `BUF_SZ - (self->read.sz + self->write.pending)` (`vt-parser.c:1457`), so a size of `0` is precisely `read.sz + write.pending == BUF_SZ` — i.e. `vt_parser_has_space_for_input() == False` (`vt-parser.c:1481`), the exact value the pause gate at `child-monitor.c:1501` uses to set the child fd's `events` to `0`. Command: `./kitty/launcher/kitty +launch /tmp/obs_pause.py`:
 
@@ -180,14 +171,14 @@ PART1_vt_parser_has_space_for_input_equals_False (available==0 and used==BUF_SZ)
 
 The available space collapses to `0` the moment `1048576` bytes (`= BUF_SZ`) are buffered, and the harness confirms `vt_parser_has_space_for_input()` is `False`. Per `child-monitor.c:1501` that makes `events = 0` and **no `POLLIN` is requested for the child** — reads pause; `read_bytes` reinforces this by returning immediately when there is no space (`child-monitor.c:1342`).
 
-**Observed (Approach B, OS primitive — same `openpty()` technique as Q2(a) below) — the pause propagates to the producer as OS backpressure.** With kitty no longer draining the PTY master, a process writing into the PTY blocks. Measured with kitty's own `openpty()` (the writer's end made non-blocking so the block surfaces as `EAGAIN` instead of hanging the observation), the `write()` stops after `12288` bytes:
+**Observed (Approach A, OS primitive — same deterministic `openpty()` technique and same 64 KiB write chunk as Q2(a) below) — the pause propagates to the producer as OS backpressure.** With kitty no longer draining the PTY master, a process writing into the PTY blocks. Measured with kitty's own `openpty()` (the writer's end made non-blocking so the block surfaces as `EAGAIN` instead of hanging the observation), writing 64 KiB chunks, the `write()` stops after `11776` bytes — the *identical* PTY capacity Q2(a) reports for its first partial write, since both observations measure the same kernel PTY buffer limit (this total is deterministic for a given write granularity: `11776` for chunks ≥ 4 KiB; smaller chunks pack the buffer differently). Command: `./kitty/launcher/kitty +launch /tmp/obs_pause.py` (PART2):
 
 ```text
-PART2_child_write_to_pty_blocked_after_bytes = 12288
+PART2_child_write_to_pty_blocked_after_bytes = 11776
 PART2_errno = 11 (EAGAIN = 11 , EWOULDBLOCK = 11 )
 ```
 
-Once the kernel PTY buffer is full (here after `12288` bytes) the producer's `write()` returns `EAGAIN` (errno `11`) — precisely the "child feels a full pipe" backpressure that the `POLLIN` pause creates, with no application-level stop message. Together the two observations demonstrate the full chain the code implements: **buffer full (`vt_parser_has_space_for_input() == False`) → `events = 0` / no `POLLIN` (`child-monitor.c:1501`) → PTY undrained → the producer's `write()` blocks / `EAGAIN`.**
+Once the kernel PTY buffer is full (here after `11776` bytes) the producer's `write()` returns `EAGAIN` (errno `11`) — precisely the "child feels a full pipe" backpressure that the `POLLIN` pause creates, with no application-level stop message. Together the two observations demonstrate the full chain the code implements: **buffer full (`vt_parser_has_space_for_input() == False`) → `events = 0` / no `POLLIN` (`child-monitor.c:1501`) → PTY undrained → the producer's `write()` blocks / `EAGAIN`.**
 
 ### (c) THROTTLE / COALESCE — defer parsing to batch bursty input
 
@@ -265,7 +256,7 @@ After a partial write, the routine `memmove`s the remainder to the front of the 
 
 **Rationale:** the child fd is non-blocking (kitty must never block its single I/O thread on one slow child). A full kernel PTY buffer therefore surfaces as `EAGAIN`/`EWOULDBLOCK`; treating that as "try again later" (rather than an error) is precisely the write-side backpressure.
 
-**Observed (Approach B, OS primitive):** using kitty's own `kitty.child.openpty()` with the master fd set non-blocking (exactly as `io_loop` runs it), the first `write()` of a 64 KiB chunk **partially succeeds (11,776 bytes) and the next raises `EAGAIN` (errno 11)**. Command: `./kitty/launcher/kitty +launch /tmp/obs_pty.py`:
+**Observed (Approach A, OS primitive — deterministic):** using kitty's own `kitty.child.openpty()` with the master fd set non-blocking (exactly as `io_loop` runs it), the first `write()` of a 64 KiB chunk **partially succeeds (11,776 bytes) and the next raises `EAGAIN` (errno 11)**. Command: `./kitty/launcher/kitty +launch /tmp/obs_pty.py`:
 
 ```text
 write() raised BlockingIOError errno=11 (EAGAIN) after 11776 bytes
@@ -292,23 +283,38 @@ The dispatch side calls `write_to_child` whenever the fd reports writable:
                 if (children_fds[EXTRA_FDS + i].revents & POLLOUT) {
 ```
 
-**Observed (Approach B):** the same poll trace from Q1 shows `i:2 POLLOUT` interleaved with `i:2 POLLIN` — `POLLOUT` is armed only when `write_buf_used > 0`. And with the `KITTY_PRINT_BYTES_SENT_TO_CHILD` debug build, kitty's actual writes back to the child are visible (stderr, `/tmp/kitty_io.err`):
+The `POLLOUT` arming (`child-monitor.c:1503`) and its dispatch (`:1539`) are the source-cited mechanism; the in-process poll trace in Q1 captured the child fd scheduled `POLLIN` but the harness segfaulted before a `POLLOUT` cycle, so the `POLLOUT` *scheduling* itself is asserted from source, not a live capture (stated as a limitation there).
+
+**Observed (Approach B — in-process debug io_loop harness):** with the `KITTY_PRINT_BYTES_SENT_TO_CHILD` debug build, the io engine's actual writes back to the child are printed on stderr as `Wrote: %zd bytes: <text>` (`write_to_child`, `child-monitor.c:1450`). Queuing each exact response byte-string through `ChildMonitor.needs_write()` and letting the io thread write it reproduces:
 
 ```text
 Wrote: 13 bytes: \x1b[?62;c\x1b[1;1R
+```
+Command: `./kitty/launcher/kitty +launch /tmp/obs_wrote.py` (queues `b"\x1b[?62;c\x1b[1;1R"`). And, in a second run (`/tmp/obs_wrote12.py`, queuing `b"\x1b_Gi=31;OK\x1b\\"` with a slave-reader draining the PTY):
+```text
 Wrote: 12 bytes: \x1b_Gi=31;OK\x1b\\
 ```
 
-The first line is kitty answering the child's Primary Device Attributes (`ESC[c`) and Cursor Position Report (`ESC[6n`) queries; the second is the graphics-query response `Gi=31;OK` wrapped as an APC — routed through the `screen.c` bridge (below). These are two **separate** writable cycles — each queued response drained on its own `POLLOUT`, which is the deferred, incremental flush the design intends: after each `write()` the routine advances by the bytes actually taken, `memmove`s any remainder to the front of `write_buf`, and keeps `POLLOUT` armed only while `write_buf_used > 0` (`child-monitor.c:1472`–`1474`, re-arm at `:1503`). The genuine partial-write slice is quantified in Q2(a) above — a single `write()` took `11776` of `65536` bytes before `EAGAIN`, leaving the remainder for the next cycle. *(A longer sustained-flood trace with larger per-cycle chunks was not isolated in this environment, so no specific per-`POLLOUT` byte count beyond these observed values is claimed.)*
+The first is the shape of kitty answering a child's Primary Device Attributes (`ESC[c`) + Cursor Position Report; the second is a graphics-query `Gi=31;OK` wrapped as an APC — routed through the `screen.c` bridge (below). `print_text` (`child-monitor.c`) renders printable bytes as-is and others as `\xNN`, hence the exact strings above. **Evidence qualification / limitation:** these are **direct in-process io_loop-harness** captures, *not* a real GUI trace (the designated image has no `Xvfb`), and the minimal harness is **unstable — it segfaults (exit `139`) immediately after emitting each line**, so the two `Wrote:` lines were captured in **separate** short runs rather than one continuous interleaved trace. The design intent they illustrate — each queued response drained on its own `POLLOUT`, the routine advancing by the bytes actually taken, `memmove`-ing any remainder to the front of `write_buf`, and keeping `POLLOUT` armed only while `write_buf_used > 0` (`child-monitor.c:1472`–`1474`, re-arm at `:1503`) — is source-cited. The genuine, **deterministic** partial-write slice is quantified in Q2(a) above: a single `write()` took `11776` of `65536` bytes before `EAGAIN`, leaving the remainder for the next cycle. *(A longer sustained-flood trace with larger per-cycle chunks was not isolated in this environment, so no specific per-`POLLOUT` byte count beyond these observed values is claimed.)*
 
 ### (c) Unrecoverable write error → discard with a diagnostic
 
-If `write()` fails for a non-retryable reason, the data is discarded and a diagnostic printed:
+If `write()` fails for a reason that is **not** retryable — i.e. errno is neither `EINTR` nor `EAGAIN`/`EWOULDBLOCK` — the routine discards the pending data (`written = screen->write_buf_used`) and prints a diagnostic via `perror`:
 
 ```c
 // kitty/child-monitor.c:1464
             perror("Call to write() to child fd failed, discarding data.");
 ```
+
+**Limitation — this branch is reported from source, not reproduced at runtime (stated explicitly per the evidence rules).** It is a defensive last resort that fires only on a genuinely unrecoverable `write()` error (e.g. `EIO`), which could **not** be provoked in the designated container. The usual technique — `os.openpty()`, close the slave, then write to the master — does **not** error here; writes keep succeeding. Command: `./kitty/launcher/kitty +launch /tmp/obs_perror.py` (opens a pty, `os.close(slave)`, then writes to `master`), observed verbatim:
+
+```text
+write#1 succeeded, n = 5
+write#2 succeeded, n = 4096
+write#3 succeeded, n = 4096
+```
+
+Because the master `write()` returns success rather than a fatal errno, the `perror` path at `child-monitor.c:1464` is never entered in this environment; it is therefore documented from the source above (the exact literal string and its `EINTR`/`EAGAIN`-exclusion condition) rather than with a captured `perror` line. The related retryable branch (`EAGAIN`/`EWOULDBLOCK` → defer) one line above **is** demonstrated at runtime in Q2(a).
 
 ### (d) 100 MB hard cap on the growable per-child write buffer → drop
 
@@ -323,20 +329,13 @@ The write buffer can grow, but a hard cap protects against unbounded growth when
 
 The scheduling entry points are the `schedule_write_to_child_generic` macro (`child-monitor.c:323`) and `schedule_write_to_child` (`child-monitor.c:372`).
 
-**Observed (Approach B):** launching real `kitty` with a non-reading child (`stty -echo -icanon; sleep 300`) and sending ~150 MB via remote control triggered the cap. Command:
-`head -c 150000000 /dev/zero | tr '\0' 'B' | ./kitty/launcher/kitty @ --to unix:/tmp/kitty_rc send-text --stdin`, then grepping the kitty stderr:
+**Observed (Approach B — in-process direct-API harness, stable):** the cap is driven directly through the same code path a real child would use — `ChildMonitor.needs_write()` → `schedule_write_to_child` → the `schedule_write_to_child_generic` macro that holds the cap check at `child-monitor.c:341`. A single `needs_write` of `150,000,000` bytes (> `100 * 1024 * 1024` = `104,857,600`) to a child whose PTY is not being drained trips the cap on the first call. Command: `./kitty/launcher/kitty +launch /tmp/obs_100mb_stable.py` (builds a `ChildMonitor`, `add_child(1, …, master, screen)`, `start()`, then `needs_write(1, b"B" * 150000000)`), verbatim stderr:
 
 ```text
-[10.219] Too much data being sent to child with id: 1, ignoring it
+[0.510] Too much data being sent to child with id: 1, ignoring it
 ```
 
-It fired repeatedly once `write_buf_used` approached `100 * 1024 * 1024`:
-
-```text
-count = 22037
-```
-
-(The *first* attempt with echo **on** did *not* trip the cap, because terminal echo drained the child's input; only after disabling echo/canonical mode so the child truly never reads did the write buffer grow to the 100 MB cap. Reported here as observed.)
+This reproduction is **stable and deterministic** (exit `0`, same line across repeated runs; the `[0.510]` prefix is the `log_error` monotonic timestamp and varies run-to-run — e.g. `[0.506]`, `[0.507]`). **Limitation:** the *exact GUI artifact* the earlier draft quoted — timestamp `[10.219]` and a repeated `count = 22037` — came from a full remote-control GUI flood (`kitty @ send-text` into a non-reading child), which is **not reproducible in the designated image**: it ships no `Xvfb` so no windowed `kitty` runs, and the many-small-chunk direct harness that would grow `write_buf_used` toward the cap and log repeatedly **segfaults** (exit `139`) before a stable high count can be recorded. The cap is therefore evidenced by (a) the stable single-call log line above and (b) the source literal `if (screen->write_buf_used + sz > 100 * 1024 * 1024)` at `child-monitor.c:341`; the specific `[10.219]`/`22037` values are **not** claimed as reproduced here.
 
 ### (e) Where responses originate — the bridge
 
@@ -459,33 +458,36 @@ Storage grows linearly to **288 MiB at image 24**, then when cumulative offered 
 
 ### (iv) The **100 MB** per-child write cap under a non-draining child
 
-Already shown in Q2(d): with a non-reading child, sending ~150 MB produced the exact write-cap log line, repeated as the buffer stayed pinned at the cap:
+Already shown in Q2(d): a single `needs_write` of `150,000,000` bytes to a non-draining child trips the cap on the first call, producing the stable, reproducible write-cap log line. Command: `./kitty/launcher/kitty +launch /tmp/obs_100mb_stable.py`:
 
 ```text
-[10.219] Too much data being sent to child with id: 1, ignoring it
-count = 22037
+[0.510] Too much data being sent to child with id: 1, ignoring it
 ```
+
+As detailed in Q2(d), the *repeated high count* from a full GUI remote-control flood (the earlier draft's `[10.219]` / `count = 22037` artifact) is **not reproducible in the designated image** (no `Xvfb`; the many-chunk direct harness segfaults), and is reported there as a limitation rather than a reproduced value. The `[0.510]` prefix is a monotonic-relative `log_error` timestamp and varies run-to-run.
 
 ### (v) Deferred processing / incremental draining (timings)
 
-The `io_loop` poll trace interleaves `POLLIN` and `POLLOUT` on the child fd (`i:2`), and each queued response drains on its own writable cycle — shown verbatim by the two separate `Wrote: 13 bytes` / `Wrote: 12 bytes` writes in Q2(b) and the `11776`-of-`65536`-byte partial write (remainder deferred to the next cycle) in Q2(a). Coalescing operates on the **3 ms** `input_delay` window (`options/definition.py:878`) via the poll timeout at `child-monitor.c:1508`.
+Each queued response drains on its own writable cycle — shown by the two separate `Wrote: 13 bytes` / `Wrote: 12 bytes` writes captured (in separate short runs) in Q2(b) and the deterministic `11776`-of-`65536`-byte partial write (remainder deferred to the next cycle) in Q2(a). The in-process poll trace (Q1) captured the child fd scheduled readable (`i:2 POLLIN`); a full interleaved `POLLIN`/`POLLOUT` sequence over sustained load was **not** reproducible here (harness segfault, no `Xvfb`), so it is stated as a limitation and the `POLLOUT` scheduling is source-cited (`child-monitor.c:1503` arm, `:1539` dispatch). Coalescing operates on the **3 ms** `input_delay` window (`options/definition.py:878`) via the poll timeout at `child-monitor.c:1508`.
 
 ### (vi) Limitation — the 400 MB `MAX_DATA_SZ` size clause (reported honestly)
 
-The per-transmission limit is `#define MAX_DATA_SZ (4u * 100000000u)` — **400,000,000 bytes** (`graphics.c:521`). An attempt to cross it via chunked-PNG accumulation (so the *size* clause of `graphics.c:533`, `load_data->buf_used + g->payload_sz > MAX_DATA_SZ`, would fire) **could not be cleanly captured**: the process core-dumped during the ~400 MB repeated buffer reallocation. Command: `timeout 300 ./kitty/launcher/kitty +launch /tmp/obs_maxdata.py`:
+The per-transmission limit is `#define MAX_DATA_SZ (4u * 100000000u)` — **400,000,000 bytes** (`graphics.c:521`). Crossing it requires accumulating a single PNG transmission across many **sub-1 MiB** APC chunks (a 400 MB payload cannot arrive as one APC — a single escape code is capped at `BUF_SZ`, per Q1). The harness sends a PNG transmission (`f=100,t=d`) as ~600 KB raw chunks (base64 ≈ 800 KB, under the 1 MiB APC limit) with `m=1`, so the load buffer grows toward the 400 MB size clause of `graphics.c:533` (`load_data->buf_used + g->payload_sz > MAX_DATA_SZ`). Command: `timeout 240 ./kitty/launcher/kitty +launch /tmp/obs_maxdata.py`. The run **does not return an EFBIG response** — instead it **aborts with a core dump** during the repeated `realloc` of the load buffer as it approaches 400 MB; the exact verbatim stderr tail:
 
 ```text
+corrupted size vs. prev_size
 timeout: the monitored command dumped core
 ```
 
-The container had ample memory and no cgroup cap, so this is not an OOM-kill:
+The process exits with status **`134` = `128 + 6` (SIGABRT)** — a glibc heap-integrity abort (`corrupted size vs. prev_size`) raised inside `abort()`, reproduced deterministically (exit `134` on repeated runs). This is **not** an OOM-kill: the container has ample memory and no cgroup memory cap. Command: `free && cat /sys/fs/cgroup/memory.max`:
 
 ```text
-Mem:         3935090       67936     3424230         430      462828     3867153
+               total        used        free      shared  buff/cache   available
+Mem:      4029532184    66198688  3494580228      376412   489073268  3963333496
 memory.max: max
 ```
 
-Therefore, **the EFBIG-via-size-clause path at full 400 MB is not demonstrated here**; it is reported as a limitation. The **same** `graphics.c:533` abort — identical `ABRT("EFBIG", "Too much data")`, identical response `Gi=<id>;EFBIG:Too much data` — **is** demonstrated via the `data_fmt != PNG` clause of the very same condition, in (i) above. The real literal `MAX_DATA_SZ = 4u * 100000000u` is cited from source.
+Therefore, **the EFBIG-via-size-clause path at full 400 MB is not demonstrated as a clean protocol response here** — the accumulation aborts (SIGABRT, `corrupted size vs. prev_size`) before an EFBIG APC is emitted, and this is reported honestly as observed. The **same** `graphics.c:533` abort that the size clause would trigger — identical `ABRT("EFBIG", "Too much data")`, identical response `Gi=<id>;EFBIG:Too much data` — **is** demonstrated cleanly via the `data_fmt != PNG` clause of the very same condition, in (i) above. The real literal `MAX_DATA_SZ = 4u * 100000000u` is cited from source (`graphics.c:521`).
 
 ---
 
@@ -504,7 +506,7 @@ None of these emit any indicator: from the child's perspective, nothing has "shi
 ### Visible signs — protocol error responses and stderr log messages
 
 - **Graphics APC error responses** are the primary visible sign: `EFBIG:Too much data` (Q4-i) and `ENOSPC:Cache size exceeded cannot add new frames` (Q4-ii — the 5× animation-frame quota abort at `graphics.c:1573`), each returned as `\x1b_Gi=<id>;<CODE>:<msg>\x1b\\` (the exact observed 9th-frame response was `\x1b_Gi=2,r=10;ENOSPC:Cache size exceeded cannot add new frames\x1b\\`).
-- **Stderr log messages**: the 100 MB write-cap line `Too much data being sent to child with id: 1, ignoring it` (Q2-d/Q4-iv), and the `perror` diagnostics (`child-monitor.c:1464`) on unrecoverable `write()`/`read()` errors.
+- **Stderr log messages**: the 100 MB write-cap line `Too much data being sent to child with id: 1, ignoring it` (Q2-d/Q4-iv) is an **observed, reproduced** visible sign. A second, source-cited diagnostic is the `perror("Call to write() to child fd failed, discarding data.")` at `child-monitor.c:1464`, which fires only on a genuinely unrecoverable `write()` error (errno neither `EINTR` nor `EAGAIN`/`EWOULDBLOCK`); as noted in Q2(c), that fatal branch **could not be provoked in the designated container** (PTY-master writes kept succeeding), so it is documented from source rather than as a captured runtime line.
 
 ### The `quiet` flag governs graphics-response visibility
 
@@ -520,7 +522,7 @@ The `quiet` flag (`q=` in a graphics command) decides whether responses are emit
 - `q=1` → suppress **only success** (`OK`) responses; **errors still returned**.
 - `q=2` → suppress **all** responses, including errors.
 
-**Observed (Approach A):** a failing transmission (declare 10×10 = 400 bytes, send only 4) at each quiet level, plus a valid transmission at `q=1`. Command: `./kitty/launcher/kitty +launch /tmp/obs_a.py`:
+**Observed (Approach A):** a failing transmission declared with **`f=32`** (RGBA = **4 bytes per pixel**), so a 10×10 image expects `10 × 10 × 4 = 400` bytes — with only 4 bytes sent — evaluated at each quiet level, plus a valid transmission at `q=1`. The `f=32`/4-bpp is what makes the expected size exactly `400` (with `f=24`/RGB = 3 bpp it would instead be `4 < 300`). Command: `./kitty/launcher/kitty +launch /tmp/obs_quiet.py`, where the failing rows are `send_command(s, "a=T,f=32,s=10,v=10,i=1[,q=1|,q=2]", b"ABCD")` and the valid rows are `send_command(s, "a=T,f=32,s=2,v=2,i=1[,q=1]", b"A"*16)`:
 
 ```text
 q absent -> wtcbuf = b'\x1b_Gi=1;ENODATA:Insufficient image data: 4 < 400\x1b\\'
