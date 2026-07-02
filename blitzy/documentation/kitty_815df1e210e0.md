@@ -470,24 +470,43 @@ As detailed in Q2(d), the *repeated high count* from a full GUI remote-control f
 
 Each queued response drains on its own writable cycle — shown by the two separate `Wrote: 13 bytes` / `Wrote: 12 bytes` writes captured (in separate short runs) in Q2(b) and the deterministic `11776`-of-`65536`-byte partial write (remainder deferred to the next cycle) in Q2(a). The in-process poll trace (Q1) captured the child fd scheduled readable (`i:2 POLLIN`); a full interleaved `POLLIN`/`POLLOUT` sequence over sustained load was **not** reproducible here (harness segfault, no `Xvfb`), so it is stated as a limitation and the `POLLOUT` scheduling is source-cited (`child-monitor.c:1503` arm, `:1539` dispatch). Coalescing operates on the **3 ms** `input_delay` window (`options/definition.py:878`) via the poll timeout at `child-monitor.c:1508`.
 
-### (vi) Limitation — the 400 MB `MAX_DATA_SZ` size clause (reported honestly)
+### (vi) The **400 MB** `MAX_DATA_SZ` size clause — a clean `EFBIG` at exactly 400 MB (with a harness caveat)
 
-The per-transmission limit is `#define MAX_DATA_SZ (4u * 100000000u)` — **400,000,000 bytes** (`graphics.c:521`). Crossing it requires accumulating a single PNG transmission across many **sub-1 MiB** APC chunks (a 400 MB payload cannot arrive as one APC — a single escape code is capped at `BUF_SZ`, per Q1). The harness sends a PNG transmission (`f=100,t=d`) as ~600 KB raw chunks (base64 ≈ 800 KB, under the 1 MiB APC limit) with `m=1`, so the load buffer grows toward the 400 MB size clause of `graphics.c:533` (`load_data->buf_used + g->payload_sz > MAX_DATA_SZ`). Command: `timeout 240 ./kitty/launcher/kitty +launch /tmp/obs_maxdata.py`. The run **does not return an EFBIG response** — instead it **aborts with a core dump** during the repeated `realloc` of the load buffer as it approaches 400 MB; the exact verbatim stderr tail:
+The per-transmission limit is `#define MAX_DATA_SZ (4u * 100000000u)` — **400,000,000 bytes** (`graphics.c:521`). It is the first half of the `EFBIG` abort at `graphics.c:533`: `if (load_data->buf_used + g->payload_sz > MAX_DATA_SZ || data_fmt != PNG) ABRT("EFBIG", "Too much data");`. Crossing the *size* clause requires accumulating a single **PNG** direct transmission (`f=100,t=d`) across many sub-1 MiB APC chunks with `m=1` (a 400 MB payload cannot arrive as one APC — a single escape code is capped at `BUF_SZ`, per Q1); it must be PNG because the *non*-PNG branch of the very same condition aborts immediately, as shown in (i).
+
+**Why chunk size matters here.** The direct-load buffer starts small: for PNG, `data_sz` defaults to `1024 * 100` = **102400** bytes when no `S=` is given (`graphics.c:641`), and the initial buffer is `data_sz + 10` ≈ **100 KiB** (`graphics.c:656`). When a chunk does not fit, the buffer grows by **a single doubling** — `load_data->buf_capacity = MIN(2 * load_data->buf_capacity, MAX_DATA_SZ)` (`graphics.c:534`), with **no loop** to keep doubling until the chunk fits — and then `memcpy(load_data->buf + load_data->buf_used, payload, g->payload_sz)` copies the whole chunk (`graphics.c:541`). Because `buf_capacity`/`buf_used` are `size_t` (`graphics.h:111`), a chunk larger than one doubling can hold overruns the buffer. So the transmission must be fed in chunks no larger than one doubling (≤ 2× the current capacity) to grow cleanly toward the size clause.
+
+**The clean `EFBIG` at exactly 400 MB (safe chunks).** Feeding the PNG transmission as **200,000-byte** chunks (each ≤ 2× the ~100 KiB base, so every `memcpy` fits) lets `buf_used` climb linearly to `MAX_DATA_SZ`; the chunk that would push it past 400,000,000 is rejected with a clean `EFBIG` APC response and **no crash**. Command: `./kitty/launcher/kitty +launch /tmp/obs_maxdata_clean.py` (first chunk `a=T,f=100,t=d,i=1,m=1`, then bare `m=1` continuations of 200,000 bytes each until a response appears):
 
 ```text
-corrupted size vs. prev_size
-timeout: the monitored command dumped core
+chunks_sent=2001
+accepted_into_buffer_bytes=400000000
+rejected_chunk_bytes=200000
+total_offered_bytes=400200000 (400.20 MB)
+buf_used_at_reject=400000000 (400.00 MB) vs MAX_DATA_SZ=400000000
+EFBIG_response_repr=b'\x1b_Gi=1;EFBIG:Too much data\x1b\\'
+elapsed_s=0.3
 ```
 
-The process exits with status **`134` = `128 + 6` (SIGABRT)** — a glibc heap-integrity abort (`corrupted size vs. prev_size`) raised inside `abort()`, reproduced deterministically (exit `134` on repeated runs). This is **not** an OOM-kill: the container has ample memory and no cgroup memory cap. Command: `free && cat /sys/fs/cgroup/memory.max`:
+Exactly **400,000,000 bytes = 400.00 MB = `MAX_DATA_SZ`** were accepted across the first **2000** chunks; the **2001st** chunk tripped `buf_used + payload_sz > MAX_DATA_SZ` and the client received the verbatim response `\x1b_Gi=1;EFBIG:Too much data\x1b\\` — **byte-for-byte identical** to the non-PNG `EFBIG` in (i), now driven by the **size clause at the real 400 MB threshold**, and the process exits cleanly (`EXIT=0`). This is the definitive runtime confirmation of the size-clause path.
+
+**Caveat — a naive oversized-chunk harness crashes early, nowhere near 400 MB.** If the same transmission is instead fed as **~600 KiB** chunks — larger than one doubling of the ~100 KiB base buffer — the single-doubling `realloc` (`graphics.c:534`) cannot make room and the `memcpy` (`graphics.c:541`) overruns the buffer, corrupting the heap on the **very first chunk**. Command: `./kitty/launcher/kitty +launch /tmp/obs_maxdata_faithful.py` (first chunk `a=T,f=100,t=d,i=1,m=1`, then `m=1` continuations of 600 KiB); per-chunk logging shows it aborts while still *sending chunk 1* (only ~600 KiB accumulated), 3/3 runs:
+
+```text
+EXIT=134
+corrupted size vs. prev_size while consolidating
+```
+
+The crash therefore occurs at **~600 KiB, not "as it approaches 400 MB"** — the accumulation never gets close (the earlier draft's "approaches 400 MB" framing was wrong). The exact signal is a heap-overrun artifact that depends on the allocator/environment and **should not be quoted as a stable value**: in this container, 3/3 runs of every oversized-chunk variant tried (with `i=`, without `i=`, and re-declaring `a=T` on every chunk) deterministically give `SIGABRT` (exit `134`) with glibc's `corrupted size vs. prev_size while consolidating`; a prior cross-model run of a similar harness instead observed `SIGSEGV` (exit `139`) with no glibc message, which could **not** be reproduced here. What is stable and load-bearing is the **cause** — an oversized chunk versus the single-doubling `realloc` (`graphics.c:534`/`:541`/`:641`/`:656`) — and that the crash is an early heap corruption, not the 400 MB limit and not an OOM-kill. Command: `free && cat /sys/fs/cgroup/memory.max`:
 
 ```text
                total        used        free      shared  buff/cache   available
-Mem:      4029532184    66198688  3494580228      376412   489073268  3963333496
-memory.max: max
+Mem:      4029532184    58182364  3525643540      430880   466077180  3971349820
+Swap:              0           0           0
+max
 ```
 
-Therefore, **the EFBIG-via-size-clause path at full 400 MB is not demonstrated as a clean protocol response here** — the accumulation aborts (SIGABRT, `corrupted size vs. prev_size`) before an EFBIG APC is emitted, and this is reported honestly as observed. The **same** `graphics.c:533` abort that the size clause would trigger — identical `ABRT("EFBIG", "Too much data")`, identical response `Gi=<id>;EFBIG:Too much data` — **is** demonstrated cleanly via the `data_fmt != PNG` clause of the very same condition, in (i) above. The real literal `MAX_DATA_SZ = 4u * 100000000u` is cited from source (`graphics.c:521`).
+Total memory is ~**4.03 GB** (`4029532184`) and `memory.max` is `max` (no cgroup limit), so the abort is a heap-integrity failure, not an out-of-memory kill; the `used`/`free`/`available` columns are live values that vary run-to-run. The real literal `MAX_DATA_SZ = 4u * 100000000u` is cited from source (`graphics.c:521`), and the clean size-clause `EFBIG` above is its demonstrated protocol response at the true 400 MB threshold.
 
 ---
 
@@ -563,7 +582,7 @@ A final check that every named item is addressed explicitly and by name.
 - POLLOUT re-registration — Q2(b), `child-monitor.c:1503`, dispatch `:1539`. ✔
 - 100 MB write cap drop — Q2(d)/Q4(iv), `child-monitor.c:341`–`342`. ✔
 - 320 MB storage quota + LRU eviction — Q4(ii)/(iii), `graphics.c:25`, `apply_storage_quota` `:290`. ✔
-- 400 MB per-transmission limit — Q4(vi), `MAX_DATA_SZ` `graphics.c:521` (size-clause crossing = documented limitation; EFBIG shown via the non-PNG clause of the same L533 condition). ✔
+- 400 MB per-transmission limit — Q4(vi), `MAX_DATA_SZ` `graphics.c:521` (size-clause crossing **demonstrated**: safe 200,000-byte chunks fill the load buffer to exactly `400000000` bytes and the next chunk yields a clean `EFBIG` APC; the same abort is also shown via the non-PNG clause of the `graphics.c:533` condition in Q4(i)). ✔
 - 5× animation-frame quota → `ENOSPC:Cache size exceeded cannot add new frames` — Q4-ii (demonstrated) & Q5 corroboration, condition `graphics.c:1570`, abort `graphics.c:1573`. ✔
 - `quiet` flag suppression — Q5, `graphics.c:762`–`763`. ✔
 
