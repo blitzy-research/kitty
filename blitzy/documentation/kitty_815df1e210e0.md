@@ -106,7 +106,7 @@ vt_parser_has_space_for_input(const Parser *p) {
 
 **Rationale:** the buffer is *bounded* — accumulation cannot grow without limit; once `read.sz + write.pending` reaches `BUF_SZ` the parser reports "no space" and reading stops. This is the "buffer" reaction, but with a hard ceiling.
 
-**Observed (Approach A):** feeding **4 MiB** into the parser's write buffer *without draining it* accepts **exactly `BUF_SZ` = 1,048,576 bytes** and then reports zero further space. Command: `./kitty/launcher/kitty +launch /tmp/obs_a.py` (repeatedly calling `screen.test_create_write_buffer()` / `test_commit_write_buffer()`, the same primitives `parse_bytes` uses):
+**Observed (Approach A):** feeding **4 MiB** into the parser's write buffer *without draining it* accepts **exactly `BUF_SZ` = 1,048,576 bytes** and then reports zero further space. Command: `./kitty/launcher/kitty +launch /tmp/obs_buf.py` (repeatedly calling `screen.test_create_write_buffer()` / `test_commit_write_buffer()`, the same primitives `parse_bytes` uses):
 
 ```text
 offered_bytes = 4194304
@@ -488,7 +488,7 @@ EFBIG_response_repr=b'\x1b_Gi=1;EFBIG:Too much data\x1b\\'
 elapsed_s=0.3
 ```
 
-Exactly **400,000,000 bytes = 400.00 MB = `MAX_DATA_SZ`** were accepted across the first **2000** chunks; the **2001st** chunk tripped `buf_used + payload_sz > MAX_DATA_SZ` and the client received the verbatim response `\x1b_Gi=1;EFBIG:Too much data\x1b\\` — **byte-for-byte identical** to the non-PNG `EFBIG` in (i), now driven by the **size clause at the real 400 MB threshold**, and the process exits cleanly (`EXIT=0`). This is the definitive runtime confirmation of the size-clause path.
+Exactly **400,000,000 bytes = 400.00 MB = `MAX_DATA_SZ`** were accepted across the first **2000** chunks; the **2001st** chunk tripped `buf_used + payload_sz > MAX_DATA_SZ` and the client received the verbatim response `\x1b_Gi=1;EFBIG:Too much data\x1b\\` — **byte-for-byte identical** to the non-PNG `EFBIG` in (i), now driven by the **size clause at the real 400 MB threshold**, and the process exits cleanly (`EXIT=0`). This is the definitive runtime confirmation of the size-clause path. (The `elapsed_s=0.3` line is wall-clock time to accumulate the 400 MB and — like the `log_error` timestamps elsewhere — **varies run-to-run**: a later run measured `elapsed_s=0.7`. It is not a threshold and no claim depends on it; the load-bearing values `chunks_sent=2001`, `accepted_into_buffer_bytes=400000000`, and the `EFBIG` response are stable and reproduce exactly.)
 
 **Caveat — a naive oversized-chunk harness crashes early, nowhere near 400 MB.** If the same transmission is instead fed as **~600 KiB** chunks — larger than one doubling of the ~100 KiB base buffer — the single-doubling `realloc` (`graphics.c:534`) cannot make room and the `memcpy` (`graphics.c:541`) overruns the buffer, corrupting the heap on the **very first chunk**. Command: `./kitty/launcher/kitty +launch /tmp/obs_maxdata_faithful.py` (first chunk `a=T,f=100,t=d,i=1,m=1`, then `m=1` continuations of 600 KiB); per-chunk logging shows it aborts while still *sending chunk 1* (only ~600 KiB accumulated), 3/3 runs:
 
