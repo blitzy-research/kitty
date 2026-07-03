@@ -81,8 +81,9 @@ measured in **Q3**.
   where mentioned and never substituted for a production observation.
 
 A single temporary probe script lived **outside** the repository at `/tmp/osc133_probe.py`,
-was run **3 times** with byte-for-byte identical output, and was deleted afterward (see the
-**Read-only integrity** appendix). The reference test vector (BEL terminator) is:
+was run **3 times** with byte-for-byte identical output (the `diff -u` / `wc -c -l` /
+`sha256sum` verification proving this is pasted verbatim in the **Read-only integrity**
+appendix), and was deleted afterward. The reference test vector (BEL terminator) is:
 
 ```python
 b'\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;cmdline=ls -la\x07hello output\n\x1b]133;D;42\x07'
@@ -211,9 +212,11 @@ decode_cmdline('cmdline=ls -la') = 'ls'
 ### Q2(a) — What is actually captured
 What you get depends on **which surface** you read; there are three, and they differ:
 
-1. **Raw child stream** (what a PTY exposes as `received_bytes`,
-   `kitty_tests/__init__.py:404`-adjacent) — the literal bytes fed in, **including** the OSC
-   sequences. This is the input vector itself.
+1. **Raw child stream** (what a PTY exposes as `received_bytes`, initialised at
+   [`kitty_tests/__init__.py:320`] and accumulated at [`kitty_tests/__init__.py:365-366`],
+   where each child read is appended to `received_bytes` and then handed to the same
+   `parse_bytes`) — the literal bytes fed in, **including** the OSC sequences. This is the
+   input vector itself.
 2. **Parsed screen text** (`PTY.screen_contents()`, `kitty_tests/__init__.py:404-410`) — only
    the visible cell contents; the parser has **consumed** every control sequence. For this
    vector the only visible text is `hello output`:
@@ -370,8 +373,11 @@ handle_cmd_end('') -> last_cmd_exit_status = 0    watcher exit_status = 0
 - The **`on_cmd_startstop` watcher payload** kitty broadcasts to registered watchers
   [`kitty/window.py:1419-1420`] carried the **parsed integer `99`** (the `watcher exit_status
   = 99` above). In the **default** configuration this watcher payload is the primary Q4
-  evidence, because `notify_on_cmd_finish` defaults to `when='never'`
-  [`kitty/options/utils.py`] so **no notification fires**:
+  evidence, because `notify_on_cmd_finish` defaults to `when='never'` — its default value is
+  declared at [`kitty/options/types.py:560`] as
+  `NotifyOnCmdFinish(when='never', duration=5.0, action='notify', cmdline=())`, and the
+  config-option default is set at [`kitty/options/definition.py:3190`] — so **no notification
+  fires**:
   ```
   default notify_on_cmd_finish = NotifyOnCmdFinish(when='never', duration=5.0, action='notify', cmdline=())
   ```
@@ -480,18 +486,62 @@ reason, each backed by a pasted evidence line:
 
 - **Terminator:** `BEL` (`\x07`, 1 byte) for the primary vector; the `ESC \` variant is
   measured and labeled in Q3.
-- **Stability:** the temporary probe `/tmp/osc133_probe.py` (outside the repository) was run
-  **3 times**; the output was **byte-for-byte identical** (`diff` reported no differences;
-  `2744` bytes / `49` lines each run).
+- **Stability (reproduced in this environment, 3 runs):** the temporary probe
+  `/tmp/osc133_probe.py` (outside the repository) was run **3 times**; the output was
+  **byte-for-byte identical** — `diff -u` reported no differences and all three runs share a
+  single SHA-256 — at **`2744` bytes / `49` lines** each run. Exact commands and their real,
+  verbatim output:
+  ```
+  $ export PYTHONPATH="$(pwd)"   # repo root, so kitty.fast_data_types is importable
+  $ for i in 1 2 3; do python3 /tmp/osc133_probe.py > /tmp/osc133_run$i.txt; done
+  $ wc -c -l /tmp/osc133_run1.txt /tmp/osc133_run2.txt /tmp/osc133_run3.txt
+    49 2744 /tmp/osc133_run1.txt
+    49 2744 /tmp/osc133_run2.txt
+    49 2744 /tmp/osc133_run3.txt
+   147 8232 total
+  $ diff -u /tmp/osc133_run1.txt /tmp/osc133_run2.txt && echo "IDENTICAL: run1 == run2"
+  IDENTICAL: run1 == run2
+  $ diff -u /tmp/osc133_run2.txt /tmp/osc133_run3.txt && echo "IDENTICAL: run2 == run3"
+  IDENTICAL: run2 == run3
+  $ sha256sum /tmp/osc133_run1.txt /tmp/osc133_run2.txt /tmp/osc133_run3.txt
+  424c8bbec05fff36739b1d249a9a45ee762185748eb70867f7f81751b101afcd  /tmp/osc133_run1.txt
+  424c8bbec05fff36739b1d249a9a45ee762185748eb70867f7f81751b101afcd  /tmp/osc133_run2.txt
+  424c8bbec05fff36739b1d249a9a45ee762185748eb70867f7f81751b101afcd  /tmp/osc133_run3.txt
+  ```
 - **Canonical build command:** `python3 setup.py build --ignore-compiler-warnings` (exit `0`),
   default configuration (no custom `kitty.conf`).
-- **Read-only:** no existing repository file was modified, added, or deleted. Build artifacts
-  (`kitty/fast_data_types.so`, `build/`, `kitty/*_generated.h`, `__pycache__/`) are
-  `.gitignore`d, and the temporary probe was removed afterward. After cleanup, the only
-  tracked change is this document:
+- **Read-only & cleanup:** no existing repository file was modified, added, or deleted. Every
+  build artifact produced while observing was **physically removed** from the working tree
+  afterward — **not merely `.gitignore`d** — namely `kitty/fast_data_types.so` (and the other
+  `*.so`: `kitty/glfw-wayland.so`, `kitty/glfw-x11.so`, `kittens/transfer/rsync.so`), `build/`,
+  the generated headers `kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h`, all
+  30 source-tree `__pycache__/` directories, `constants_generated.go`, the `kitty/launcher/`
+  binaries (`kitty`, `kitten`), the `glfw/wayland-*-protocol.[ch]` files, and every
+  `*_generated.{go,s,bin}` — as were the temporary probe (`/tmp/osc133_probe.py`) and its run
+  captures. Only the `.venv/` environment directory (a Python virtualenv, not a kitty build
+  artifact) is intentionally retained. Shell-only cleanup verification (no Python, so no
+  `__pycache__/` is regenerated):
+  ```
+  $ find . -name "fast_data_types*.so" -not -path "./.venv/*"
+  (no output — none remain)
+  $ test -d build && echo present || echo absent
+  absent
+  $ find kitty -maxdepth 1 -name "*_generated.h"
+  (no output — none remain)
+  $ find . -type d -name __pycache__ -not -path "./.venv/*"
+  (no output — none remain)
+  $ find . \( -name "*_generated.go" -o -name "*_generated.s" -o -name "*_generated.bin" \) -not -path "./.venv/*" | wc -l
+  0
+  $ find . -name "*.so" -not -path "./.venv/*" | wc -l
+  0
+  ```
+- **Integrity (final delivered state):** this document is committed, so the working tree is
+  clean (empty `git status --porcelain`) and the only baseline→HEAD change is this single added
+  file:
   ```
   $ git status --porcelain
-  ?? blitzy/documentation/kitty_815df1e210e0.md
+  $ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
+  A	blitzy/documentation/kitty_815df1e210e0.md
   ```
 
 ### Reproduction — the probe's canonical entry points
@@ -529,9 +579,13 @@ w.handle_cmd_end('99')   # -> w.last_cmd_exit_status == 99, watcher payload exit
 - `kitty/window.py:1408-1429` — `handle_cmd_end`: early-return `1409`; `int(exit_status)`
   `1413`; `= 0` fallback `1415`; watcher payload `1419-1420`; notification body (raw) `1429`.
 - `kitty/window.py:1453` — `cmd_output_marking` routing.
+- `kitty/options/types.py:560` — default `notify_on_cmd_finish = NotifyOnCmdFinish(when='never',
+  duration=5.0, action='notify', cmdline=())`; `kitty/options/definition.py:3190` — the
+  `notify_on_cmd_finish` config-option default (`'never'`).
 - `kitty/history.c:475` — scrollback search for literal `"\x1b]133;C\x1b\\"`.
 - `kitty_tests/__init__.py:30` — `parse_bytes`; `:71-79` — `Callbacks` double (sentinel
-  `sys.maxsize`); `:404-414` — `screen_contents` / `last_cmd_output`.
+  `sys.maxsize`); `:320` — `received_bytes` init, `:365-366` — raw-byte accumulation +
+  `parse_bytes` dispatch; `:404-414` — `screen_contents` / `last_cmd_output`.
 - `kitty_tests/screen.py:1059-1063`, `:1124` — classic prompt/output scenario & assertion.
 - `shell-integration/**` — BEL-terminated OSC 133 emitters (fish `:83`; zsh `B` commented
   out `:222-226`; bash `:127`,`:208`).
