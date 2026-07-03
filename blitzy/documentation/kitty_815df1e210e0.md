@@ -99,15 +99,17 @@ DISPLAY=:99 XDG_RUNTIME_DIR=/tmp/xdg-0 \
     > /tmp/kitty_stdout_run1.log  2> /tmp/kitty_stderr_run1.log
 ```
 
-- `--config NONE` forces kitty's **default configuration** (the `--config`/`-c` option is
-  `kitty/cli.py:870`; it accepts `NONE`), so no user `kitty.conf` is applied.
+- `--config NONE` forces kitty's **default configuration** (the `--config`/`-c` option is defined at
+  `kitty/cli.py:870`, and its completion metadata lists `NONE` — `kwds:none,NONE` — at
+  `kitty/cli.py:872`), so no user `kitty.conf` is applied.
 - `bash` is the default shell child; launching it provisions the **PTY** (see Section 3).
 - **Stream routing (verified by reading the emitters and confirmed by capture):**
-  `--debug-keyboard` output goes to **STDERR** — its macro chain ends in `timed_debug_print`, which is
-  `fprintf(stderr, …)`/`vfprintf(stderr, …)` (`kitty/monotonic.h:99`). `--dump-commands` output goes
-  to **STDOUT** via `safe_print` → `print(...)` (`kitty/utils.py:125`). The `--debug-rendering`
-  "GL version string" line goes to **STDOUT** via a direct `printf` (`kitty/gl.c:72`). Both streams
-  were captured separately.
+  `--debug-keyboard` output goes to **STDERR** — its macro chain ends in `timed_debug_print` (defined
+  at `kitty/monotonic.h:99`), which writes to stderr via `fprintf(stderr, …)` (`kitty/monotonic.h:102`)
+  and `vfprintf(stderr, …)` (`kitty/monotonic.h:105`). `--dump-commands` output goes
+  to **STDOUT** via `safe_print` (defined at `kitty/utils.py:125`) → `print(...)` (`kitty/utils.py:127`).
+  The `--debug-rendering` "GL version string" line goes to **STDOUT** via a direct `printf`
+  (`kitty/gl.c:72`). Both streams were captured separately.
 
 After the window appeared, the keys `a`, `Space`, `Return`, and `b` were typed through the real
 OS key-event path. Each key thus reached the genuine per-key C callback `on_key_input(GLFWkeyevent *ev)`
@@ -182,8 +184,10 @@ confirming this is the real received `a`.
 > **Observed detail (reported as-is):** the receipt text and the dispatch text (`sent key as
 > text to child: a`, Section 3) appear **on one physical line**. This is expected: the receipt
 > format (`kitty/keys.c:176`) ends with a space and **no** newline, and `timed_debug_print` only
-> emits the leading `[seconds]` timestamp immediately after a newline (`kitty/monotonic.h:101,106`).
-> So the next `debug(...)` continues the same line until a `\n` is printed.
+> emits the leading `[seconds]` timestamp when its `starting_print` flag is set — the timestamp write
+> is `if (starting_print) fprintf(stderr, "[%.3f] ", …)` (`kitty/monotonic.h:102`), and `starting_print`
+> is reset to true only after a newline, `starting_print = fmt && strchr(fmt, '\n') != NULL;`
+> (`kitty/monotonic.h:107`). So the next `debug(...)` continues the same line until a `\n` is printed.
 
 - **IME sibling variant (inferred):** when a key produces IME text with no key code, the same guard
   block instead prints `on_IME_input: text: %s` (`kitty/keys.c:174`). This branch was not triggered
@@ -290,8 +294,8 @@ The Python sink is `class DumpCommands` (`kitty/boss.py:232`), whose `__call__` 
 buffers consecutive draws and flushes them with `safe_print('draw', ''.join(self.draw_dump_buf))`
 (`kitty/boss.py:249`), and prints other commands with `safe_print(what, *a)` (`kitty/boss.py:252`).
 It is constructed at `kitty/boss.py:372`
-(`DumpCommands(args) if args.dump_commands or args.dump_bytes else None`). `safe_print` is
-`print(...)` (`kitty/utils.py:125`) → **STDOUT**.
+(`DumpCommands(args) if args.dump_commands or args.dump_bytes else None`). `safe_print` (defined at
+`kitty/utils.py:125`) calls `print(...)` (`kitty/utils.py:127`) → **STDOUT**.
 
 Captured `--dump-commands` STDOUT for the echoed keystrokes (identical in both runs):
 
@@ -302,7 +306,7 @@ screen_linefeed
 ```
 
 - `draw a ` — the echoed printable characters (`a` and the following Space) drawn — **producing
-  anchors:** `kitty/vt-parser.c:92,105` → `kitty/boss.py:239,249` → `kitty/utils.py:125`.
+  anchors:** `kitty/vt-parser.c:92,105` → `kitty/boss.py:239,249` → `kitty/utils.py:125,127`.
 - `screen_carriage_return` — the CR from Return — **producing anchor:** `kitty/vt-parser.c:102`.
 - `screen_linefeed` — the LF the shell emitted alongside CR — **producing anchor:**
   `kitty/vt-parser.c:101`.
@@ -388,10 +392,12 @@ printed as a per-call log line.
 
 The OpenGL layer is wrapped by `kitty/gl.c`. Under `--debug-rendering`/`--debug-gl`, GL calls are
 checked for errors instead of ignored: the error checker is
-`check_for_gl_error(...)` (`kitty/gl.c:16`); it is installed via `gladSetGLPostCallback(check_for_gl_error);`
-(`kitty/gl.c:62`) guarded by `if (!global_state.debug_rendering) { … }` (`kitty/gl.c:59`), and the GL
-version is printed at `kitty/gl.c:72`
-(`if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", …)`). The corresponding
+`check_for_gl_error(...)` (`kitty/gl.c:16`). When `debug_rendering` is **false**, the guard
+`if (!global_state.debug_rendering) {` (`kitty/gl.c:59`) calls `gladUninstallGLDebug();`
+(`kitty/gl.c:60`), removing the GLAD debug layer; the post-callback error checker is then installed
+**unconditionally** (outside that guard) via `gladSetGLPostCallback(check_for_gl_error);`
+(`kitty/gl.c:62`). The GL version is printed only when `debug_rendering` is **true**, guarded by
+`if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", …)` (`kitty/gl.c:72`). The corresponding
 macro is `debug_rendering(...)` (`kitty/state.h:14`). This is the **observed** display evidence — the
 GL context was created and driven for our window:
 
@@ -429,7 +435,7 @@ flag in that block relevant to tracing the pipeline, plus the removed-flag note.
 | `--replay-commands` | Replays a prior `--dump-commands` dump (e.g. `kitty sh -c "kitty --replay-commands /path/to/dump; read"`). | `kitty/cli.py:977` | Not needed for live typing (documented for completeness) |
 | `--debug-config` | **Removed** — **not present** in `kitty/cli.py` at this commit. | (absent) | Deliberately **not used**; a `grep` for it returns nothing (compatibility constraint). |
 
-Supporting flag-plumbing citations: `--config`/`-c` (`kitty/cli.py:870`) accepts `NONE`;
+Supporting flag-plumbing citations: `--config`/`-c` (`kitty/cli.py:870`, with `NONE` in its completion metadata at `kitty/cli.py:872`);
 `kitty/main.py:514` forwards the debug flags into `init_glfw`; `kitty/glfw.c:1444-1446` sets the GLFW
 init hints and stores `OPT(debug_keyboard)`; `kitty/boss.py:1580` (`if self.args.debug_keyboard:`) is
 the Boss-level branch.
@@ -450,13 +456,13 @@ the Boss-level branch.
   PTY via `kitty/child.py:170,171,276`.
 - [x] **(b) Child echo + parse** — `--dump-commands` STDOUT `draw a`, `screen_carriage_return`,
   `screen_linefeed` → `kitty/child-monitor.c:178-181,439`; `kitty/vt-parser.c:92,101,102,105`;
-  `kitty/boss.py:232,239,249,252,372`; `kitty/utils.py:125`. Raw bytes via `--dump-bytes` (741 B).
+  `kitty/boss.py:232,239,249,252,372`; `kitty/utils.py:125,127`. Raw bytes via `--dump-bytes` (741 B).
 - [x] **(b) Screen model** — runtime update `screen_draw_text` (`kitty/screen.c:866,867,868`) driven
   by `kitty/vt-parser.c:226,236`; `kitty/screen.c:4772` noted as **test-only**. Model-mutation linkage
   labeled **(inferred)**.
 - [x] **(c) Display produced** — observed `GL version string: '4.5 (Core Profile) Mesa …'` →
   `kitty/gl.c:72` (with `--debug-rendering`); render scheduling `kitty/child-monitor.c:705,714`;
-  cell upload `kitty/shaders.c:970`; GL error hook `kitty/gl.c:16,59,62`; frame swap
+  cell upload `kitty/shaders.c:970`; GL error hook `kitty/gl.c:16,59,60,62`; frame swap
   `kitty/glfw.c:1802,1803` **(inferred)**.
 - [x] **Every debug/tracing flag enumerated** (Section 5): `--debug-input`/`--debug-keyboard`,
   `--dump-commands`, `--dump-bytes`, `--debug-rendering`/`--debug-gl`, `--replay-commands`, plus the
