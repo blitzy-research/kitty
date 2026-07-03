@@ -307,10 +307,13 @@ argv[0]='-V'
 === ssh invocation (argc=20) ===
 ```
 
-The third invocation's complete `argv` — all 20 elements, verbatim from the shim log. `argv[18]` (the
-`tr` unwrap) and `argv[19]` (the entire encoded bootstrap script, several kilobytes) are the subject
-of Q7 and are reproduced there byte-for-byte; they are cross-referenced rather than repeated here (no
-content is elided from this document):
+The third invocation had `argc=20` (per the `=== ssh invocation (argc=20) ===` header above). Its
+`argv[18]` (the `tr` unwrap) and `argv[19]` (the entire encoded bootstrap script — a several-kilobyte,
+per-run machine-generated blob) belong to Q7 and are covered there rather than repeated here: in Q7,
+`argv[18]` is reproduced **byte-for-byte**, whereas `argv[19]` is **summarized, not pasted in full**
+(Q7 evidences it with complete, un-truncated per-substitution fragments in `sh` mode and a complete
+base64 round-trip on a boundary-aligned prefix plus its measured length in `py` mode). The other
+eighteen elements, `argv[0..17]`, are listed verbatim from the shim log below with nothing elided:
 
 ```text
 argv[0]='-t'
