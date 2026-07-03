@@ -283,7 +283,7 @@ So the `VSUSP` control character (default Ctrl‑Z) is delivered to the child as
 
 ---
 
-## 3. Q2 — The "unseen conductor": timing, ordering, hand‑offs
+## 3. Q2 — The "unseen conductor": timing, ordering, hand-offs
 
 **The question.** *How are the responsibilities of timing, ordering, and state hand‑offs split among the moving parts — and critically, what decides which event gets handled first?*
 
@@ -564,7 +564,7 @@ The SSH kitten *driver* is functional (`+kitten ssh --help` exits `0`), but ther
 
 ---
 
-## 5. Q4 — End‑to‑end rhythm: from arrival to "settling again"
+## 5. Q4 — End-to-end rhythm: from arrival to "settling again"
 
 **The question.** *Narrate the full journey from the moment mixed input arrives to the moment the interface "settles again," and how the moving parts keep their rhythm.*
 
