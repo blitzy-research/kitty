@@ -14,7 +14,7 @@ Every behavioral claim below is paired with the exact command that produced it a
 
 **Environment.** All build and runtime observation was performed inside the user‑provided container toolchain (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`, image `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`), on branch `blitzy-5900e980-186b-42ac-b10f-47549fbb3c92`.
 
-**Build/investigation revision (the identity behind every observation below).** The working tree was at commit `e3ae9a081` — full `e3ae9a081ed071a46d494bfe60ae264ce4477337`. This is the value `git rev-parse HEAD` returns and the exact value the canonical build stamps into the binary as `kitty.VCSRevision` (shown verbatim in the build section below). Note the deliberate distinction from the deliverable's *filename*: the filename derives from the **source branch** `kitty_815df1e210e0`, whose base commit is `815df1e21` (the commit immediately before this Q&A was added). The documentation commits that carry this file sit on top of that base, so the actual revision that built the binary and produced every observation here is `e3ae9a081`, **not** the source‑branch base `815df1e21`.
+**Build/observation revision (the identity behind every observation below).** The working tree was at commit `ddf3d7e9c` — full `ddf3d7e9ce06529b2a971e7d698a741107094568`. This is the value `git rev-parse HEAD` returned **at observation time** and the exact value the canonical build stamps into the binary as `kitty.VCSRevision` (read back verbatim from the on-disk binary in the build section below). Because this document is itself a tracked file, one caveat applies: the commit that finalizes and adds this Q&A necessarily advances `HEAD` one commit further, so on the *delivered* tree `git rev-parse HEAD` returns a **later** hash than `ddf3d7e9c`. In other words, `ddf3d7e9c` is the revision at which the binary was built and every observation captured, **not** the delivered `HEAD`. Note the deliberate distinction from the deliverable's *filename*: the filename derives from the **source branch** `kitty_815df1e210e0`, whose base commit is `815df1e21` (the commit immediately before this Q&A was added). The documentation commits that carry this file sit on top of that base, so the observation-time revision that built the binary and produced every observation here is `ddf3d7e9c`, **not** the source‑branch base `815df1e21`.
 
 **Canonical build.** The kitten was built exactly as a normal user would, with the two‑stage canonical build:
 
@@ -56,10 +56,10 @@ kitten 0.35.2 created by Kovid Goyal
 ```text
 $ CI=true GOTOOLCHAIN=local ASAN_OPTIONS=detect_leaks=0 python3 setup.py build --verbose
 # … C build, then "Updating Go generated files…", then:
-/usr/local/bin/go build -v -ldflags '-X kitty.VCSRevision=e3ae9a081ed071a46d494bfe60ae264ce4477337 -s -w' -o kitty/launcher/kitten <repo>/tools/cmd
+/usr/local/bin/go build -v -ldflags '-X kitty.VCSRevision=ddf3d7e9ce06529b2a971e7d698a741107094568 -s -w' -o kitty/launcher/kitten <repo>/tools/cmd
 ```
 
-The stamped value `e3ae9a081ed071a46d494bfe60ae264ce4477337` is exactly the `git rev-parse HEAD` output (short `e3ae9a081`). The `-X kitty.VCSRevision=…` flag is assembled at [setup.py:1151] from `get_vcs_rev()` [setup.py:674], which runs `git rev-parse HEAD`. Confirmed by reading it back out of the binary: `strings kitty/launcher/kitten | grep VCSRevision` → `kitty.VCSRevision=e3ae9a081ed071a46d494bfe60ae264ce4477337`. Every observation in this document was produced by this exact build at revision `e3ae9a081`.
+The stamped value `ddf3d7e9ce06529b2a971e7d698a741107094568` is exactly the `git rev-parse HEAD` output **at observation time** (short `ddf3d7e9c`). The `-X kitty.VCSRevision=…` flag is assembled at [setup.py:1151] from `get_vcs_rev()` [setup.py:674], which runs `git rev-parse HEAD`. Confirmed by reading it back out of the on-disk binary: `strings kitty/launcher/kitten | grep VCSRevision` → `kitty.VCSRevision=ddf3d7e9ce06529b2a971e7d698a741107094568`. Every observation in this document was produced by this exact build at the observation-time revision `ddf3d7e9c`; because `get_vcs_rev()` evaluates `git rev-parse HEAD` at **build** time, the on-disk binary carries `ddf3d7e9c`, while a fresh rebuild on the delivered tree — whose `HEAD` is the later commit that adds this document — would instead stamp that later hash.
 
 **Real entry point.** Every behavioral observation uses the real entry point `kitten diff <left> <right>` (equivalently `kitty +kitten diff <left> <right>`). Because the kitten is a full‑screen TUI that requires a real PTY with a **non‑zero** window size (otherwise it panics with a divide‑by‑zero at loop start), interactive captures were driven through a Python `pty.fork()` harness that sets `TIOCSWINSZ` to a non‑zero size (e.g. 50×200), reads the rendered output, then sends `q` to quit. Terminal escape sequences were stripped for readability; the raw bytes were retained. Error‑path claims (wrong argument count, directory‑vs‑file) print to stderr **before** the TUI loop starts and were captured directly. Two observations that cannot be produced through the TUI — `runtime.NumCPU()` and a Go **race‑detector** confirmation — were obtained from scratch programs and are **explicitly labeled** where they appear.
 
@@ -586,17 +586,17 @@ $ ./kitty/launcher/kitten --version
 kitten 0.35.2 created by Kovid Goyal
 ```
 
-**Repository baseline — before investigation:**
+**Repository baseline — at observation time (before investigation):**
 
 ```text
 $ git rev-parse --abbrev-ref HEAD; git rev-parse --short HEAD; git rev-parse HEAD
 blitzy-5900e980-186b-42ac-b10f-47549fbb3c92
-e3ae9a081
-e3ae9a081ed071a46d494bfe60ae264ce4477337
+ddf3d7e9c
+ddf3d7e9ce06529b2a971e7d698a741107094568
 $ git status --porcelain
 ```
 
-(The `git status --porcelain` output above is empty — a clean tree. The working tree is at commit `e3ae9a081`, full `e3ae9a081ed071a46d494bfe60ae264ce4477337` — the same revision the canonical build stamps as `kitty.VCSRevision` (see the build section), and therefore the build/investigation revision for every observation in this document. That revision sits two documentation commits above `815df1e21`, which is the **base commit of the source branch** `kitty_815df1e210e0` after which this file is named. In other words, `815df1e21` is the source‑branch base the filename encodes, **not** the revision that produced these observations; the revision that did is `e3ae9a081`.)
+(The `git status --porcelain` output above is empty — a clean tree. At observation time the working tree was at commit `ddf3d7e9c`, full `ddf3d7e9ce06529b2a971e7d698a741107094568` — the same revision the canonical build stamps as `kitty.VCSRevision` (see the build section), and therefore the build/observation revision for every observation in this document. Because this document is itself tracked, the commit that adds it advances `HEAD` one further, so the *delivered* tree's `git rev-parse HEAD` is a **later** commit than `ddf3d7e9c`; `ddf3d7e9c` is the observation-time revision, not the delivered `HEAD`. That observation-time revision sits three documentation commits above `815df1e21`, which is the **base commit of the source branch** `kitty_815df1e210e0` after which this file is named. In other words, `815df1e21` is the source‑branch base the filename encodes, **not** the revision that produced these observations; the revision that did is `ddf3d7e9c`.)
 
 **Repository integrity — after investigation:**
 
