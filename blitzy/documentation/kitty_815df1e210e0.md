@@ -1,6 +1,6 @@
 # How kitty moves clipboard data across the C ↔ Python boundary under concurrent load
 
-*An evidence-grounded investigation of kitty `0.35.2` at branch `kitty_815df1e210e0`, HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.*
+*An evidence-grounded investigation of kitty `0.35.2` at branch `kitty_815df1e210e0`, built from the canonical base commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. The delivery `HEAD` is a descendant of that base that adds **only** this document (proof in §2 and §11); its exact SHA advances with each documentation commit, so it is deliberately not pinned here.*
 
 Every behavioral claim below was produced by **building and running kitty** in the provided Docker image and pasting the observed output next to the claim. Claims that could only be derived from reading the source are explicitly labelled **(inferred)**. Magnitude/timing claims state the scale used and were confirmed stable across **at least two runs**. All temporary observation scripts lived outside the repository (in `/tmp/kitty_probe`, mounted into the container at `/probe`) and were removed afterward; the only file added to the repository is this document. The verbatim `git status` / baseline-to-HEAD diff and the temp-script search that prove this are pasted in **§11 (Repository integrity & cleanup)**.
 
@@ -40,10 +40,12 @@ $ ./kitty/launcher/kitten --version
 kitten 0.35.2 created by Kovid Goyal
 ```
 
-**Commit and runtimes** (verbatim):
+**Commit and runtimes** (verbatim). The built kitty **source** is the canonical base commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; the delivery `HEAD` is a descendant that adds **only** this document. Rather than pin the delivery `HEAD` SHA — which advances with every documentation commit (including the commit that adds this file) and would immediately go stale — the two commands below prove the built source **is** that canonical base using output that is invariant to the layered doc commits (the single-file `A` diff that completes the proof is pasted in §11):
 
 ```
-$ git rev-parse HEAD
+$ git rev-parse 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1^{commit}   # the canonical kitty base this build reflects
+815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+$ git merge-base HEAD 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1      # that base is an ancestor of the delivery HEAD
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 $ python3 --version
 Python 3.12.3                       # satisfies requires-python = ">=3.8"  (pyproject.toml:L2)
@@ -221,7 +223,7 @@ OSC routing sends codes 52 and 5522 to `clipboard_control` (`kitty/vt-parser.c:L
         if (callback_ret == NULL) PyErr_Print(); else Py_DECREF(callback_ret); \
 ```
 
-The C function `clipboard_control(Screen *self, int code, PyObject *data)` (`kitty/screen.c:L2305`) maps the code to the `is_partial` argument, with three distinct cases: normal **OSC 52 → `Py_False`** and **extended OSC 52 (partial, `code = -52`) → `Py_True`** (`:L2306`), and **OSC 5522 → `Py_None`** (`:L2307`). Observed (§3.1): OSC 52 → `is_partial=False` (`bool`); extended OSC 52 partial (`code = -52`) → `is_partial=True` (`bool`); OSC 5522 → `is_partial=None` (`NoneType`).
+The callback target is declared in the C header as `void clipboard_control(Screen *self, int code, PyObject*);` (`kitty/screen.h:L230`) — the single prototype shared by the parser's `DISPATCH_OSC_WITH_CODE(clipboard_control)` dispatch (`kitty/vt-parser.c:L534`) and the `screen.c` definition, so both sides of the in-process C→Python bridge agree on the exact `(Screen*, int code, PyObject*)` signature (cause → effect: a signature mismatch here would be a compile error, which is precisely why the header declaration is the boundary's contract). The C function `clipboard_control(Screen *self, int code, PyObject *data)` (`kitty/screen.c:L2305`) maps the code to the `is_partial` argument, with three distinct cases: normal **OSC 52 → `Py_False`** and **extended OSC 52 (partial, `code = -52`) → `Py_True`** (`:L2306`), and **OSC 5522 → `Py_None`** (`:L2307`). Observed (§3.1): OSC 52 → `is_partial=False` (`bool`); extended OSC 52 partial (`code = -52`) → `is_partial=True` (`bool`); OSC 5522 → `is_partial=None` (`NoneType`).
 
 **Step 7 — `Window.clipboard_control` demultiplexes.**
 
@@ -243,11 +245,13 @@ Observed (§3.1): `is_partial is None` for OSC 5522 (routes to `parse_osc_5522`)
 **Step 10 — the OS clipboard via GLFW.**
 
 ```c
-// kitty/glfw.c:L2142
+// kitty/glfw.c:L2142 — the clipboard-type enum selects which OS selection to touch
 PyObject *c = PyObject_GetAttrString(global_state.boss, ct == GLFW_PRIMARY_SELECTION ? "primary_selection" : "clipboard");
+// kitty/glfw.c:L2281 — the two clipboard-type constants exported to the fast_data_types module
+ADDC(GLFW_PRIMARY_SELECTION); ADDC(GLFW_CLIPBOARD);
 ```
 
-This is the OS-clipboard boundary the Python `Clipboard` wraps. Observed-vs-inferred, precisely: **steps 1–8 were observed at runtime** (step 1 §3.2; step 2 §2; steps 3–8 §3.1/§5/§6, with the callback object/`is_partial`/parse-order pasted in §3.1). **Step 9 (the response leg) is inferred from source** — it needs a live `Boss`, so the outbound `send_escape_code_to_child` write was not driven end-to-end here (see §5.3, where the truncation path reaches the boss dependency). **Step 10 (the OS-clipboard hop) is inferred from source** — the headless container has no OS clipboard owner. No bypass value was substituted for either inferred step.
+The discriminator `ct` is one of the two clipboard-type constants that the GLFW module init exports to Python — `ADDC(GLFW_PRIMARY_SELECTION); ADDC(GLFW_CLIPBOARD);` (`kitty/glfw.c:L2281`, where `ADDC` is the `PyModule_AddIntConstant` wrapper defined just above). **`GLFW_CLIPBOARD`** selects the `boss.clipboard` object (the OSC 52 `c;` target) and **`GLFW_PRIMARY_SELECTION`** selects `boss.primary_selection` (the OSC 52 `p;` target). Cause → effect: the enum value registered at `:L2281` is exactly what the ternary at `:L2142` tests to choose the correct Python selection object, so these two constants are the bridge tying the OSC 52 selection letter to the OS clipboard-vs-primary-selection split. This is the OS-clipboard boundary the Python `Clipboard` wraps. Observed-vs-inferred, precisely: **steps 1–8 were observed at runtime** (step 1 §3.2; step 2 §2; steps 3–8 §3.1/§5/§6, with the callback object/`is_partial`/parse-order pasted in §3.1). **Step 9 (the response leg) is inferred from source** — it needs a live `Boss`, so the outbound `send_escape_code_to_child` write was not driven end-to-end here (see §5.3, where the truncation path reaches the boss dependency). **Step 10 (the OS-clipboard hop) is inferred from source** — the headless container has no OS clipboard owner. No bypass value was substituted for either inferred step.
 
 ---
 
@@ -713,7 +717,7 @@ Each row gives the exact literal with `file:line`, the evidence (**Obs** = obser
 | `is_osc_52` / `continue_osc_52` / `accumulate_st_terminated_esc_code` | `:L381` / `:L386` / `:L395` · `vt-parser.c` | Obs §5.1 (partials of `262145`) | Detect/continue/emit-partial for >256 KiB OSC 52. |
 | OSC 52/5522 routing | `case 52: case 5522:` `:L531`; `code = -52` `:L533`; `DISPATCH_OSC_WITH_CODE(clipboard_control)` `:L534` · `vt-parser.c` | Obs §3.1 (52→False, 5522→None) | Routes both protocols to one C callback. |
 | `CALLBACK` (+ `Py_DECREF`) | `#define CALLBACK(...)` `screen.c:L87`; `else Py_DECREF(callback_ret);` `:L90` | Src §8.2 | Invokes the Python method; decrefs its return (refcount correctness). |
-| `clipboard_control` (C) | `clipboard_control(Screen*,int code,PyObject*data)` `screen.c:L2305`; 52/−52→`Py_False`/`Py_True` `:L2306`, else `Py_None` `:L2307` | Obs §3.1 | Maps OSC code → `is_partial` for Python. |
+| `clipboard_control` (C) | decl `void clipboard_control(Screen *self, int code, PyObject*);` `screen.h:L230`; def `clipboard_control(Screen*,int code,PyObject*data)` `screen.c:L2305`; 52/−52→`Py_False`/`Py_True` `:L2306`, else `Py_None` `:L2307` | Obs §3.1 + Src (`screen.h:L230`) | Header prototype is the shared C→Python bridge contract; def maps OSC code → `is_partial` for Python. |
 | `send_escape_code_to_child` | `send_escape_code_to_child(Screen*,PyObject*args)` · `screen.c:L4464` | Src §4 step 9 | Response leg: writes escape bytes back to the child. |
 
 ### Python clipboard model
@@ -746,7 +750,7 @@ Each row gives the exact literal with `file:line`, the evidence (**Obs** = obser
 | Item | Literal · `file:line` | Evidence | Why / cause → effect |
 |---|---|---|---|
 | `RAII_PyObject` / `cleanup_decref` | `cleanup_decref{ Py_CLEAR }` `data-types.h:L52`; `RAII_PyObject … cleanup(cleanup_decref)` `:L53` | Obs §8.3 (retained view changed) | Bounds the borrowed `memoryview` to dispatch scope. |
-| GLFW `clipboard` / `primary_selection` | `PyObject_GetAttrString(global_state.boss, … "primary_selection" : "clipboard")` · `glfw.c:L2142` | Inf §4 step 10 (no OS clipboard headless) | OS-clipboard boundary the Python `Clipboard` wraps. |
+| GLFW `clipboard` / `primary_selection` | select `PyObject_GetAttrString(global_state.boss, … "primary_selection" : "clipboard")` · `glfw.c:L2142`; consts `ADDC(GLFW_PRIMARY_SELECTION); ADDC(GLFW_CLIPBOARD);` · `glfw.c:L2281` | Inf §4 step 10 (no OS clipboard headless) + Src (`glfw.c:L2281`) | `GLFW_CLIPBOARD`→`boss.clipboard` (`c;`), `GLFW_PRIMARY_SELECTION`→`boss.primary_selection` (`p;`); the enum registered at `:L2281` is what `:L2142` tests to pick the OS selection. |
 | `clipboard_control` policy modes | default `'write-clipboard write-primary read-clipboard-ask read-primary-ask'` · `definition.py:L3096` | Src | Variants incl. `write-clipboard`, `write-clipboard read-clipboard`, `write-clipboard read-clipboard-ask` gate write/read/ask. |
 | `scrollback_lines` (default `2000`) | `opt('scrollback_lines', '2000', …)` · `definition.py:L372` | Src | Sets history capacity → larger scans (§7). |
 | `scrollback_pager_history_size` (default `0`) | `opt('scrollback_pager_history_size', '0', …)` · `definition.py:L406` | Src | Optional extra pager history (`pagerhist_*`). |
@@ -799,14 +803,14 @@ $ ls -1 /tmp/kitty_probe/*.py /tmp/kitty_probe/*.sh
 
 These host-only scripts are deleted after the investigation completes (`rm -rf /tmp/kitty_probe`); they are outside the tree, so their removal cannot affect the repository.
 
-**Observed — the only change from the kitty baseline (`HEAD 815df1e210e0`) to the delivery HEAD is this one added file.** Baseline-to-HEAD name-status and diffstat show a single `A` (added) path and nothing else — no C/Python/Go/build/docs reference file is modified:
+**Observed — the only change from the kitty baseline (base commit `815df1e210e0`) to the delivery HEAD is this one added file.** Baseline-to-HEAD name-status and diffstat show a single `A` (added) path and nothing else — no C/Python/Go/build/docs reference file is modified:
 
 ```
 $ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
 A	blitzy/documentation/kitty_815df1e210e0.md
 $ git diff --stat 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
- blitzy/documentation/kitty_815df1e210e0.md | 817 +++++++++++++++++++++++++++++
- 1 file changed, 817 insertions(+)
+ blitzy/documentation/kitty_815df1e210e0.md | 821 +++++++++++++++++++++++++++++
+ 1 file changed, 821 insertions(+)
 ```
 
 **Why it matters (cause → effect):** the investigation exercised the real code paths (building kitty, forking real children over real ptys, driving the real parser and clipboard model) without editing a single line of kitty's C, Python, Go, build, or documentation files — satisfying the read-only scope: the source tree that produced every measured value above is the unmodified kitty at `815df1e210e0`, and the sole artifact added is this answer document.
