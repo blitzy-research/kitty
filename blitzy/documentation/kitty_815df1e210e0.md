@@ -4,8 +4,8 @@ This document traces, **end-to-end and from directly observed runtime behavior**
 terminal emulator's **SSH kitten** (`kitten ssh`) establishes a secure remote session and shares
 SSH connections. It answers eight questions (Q1–Q8). Every behavioral claim is paired with the
 exact command/code that produced it, an adjacent **verbatim** evidence block, and a `file:line`
-citation into the source at the canonical source commit `815df1e21` (see §0.1 for how this commit
-relates to the current `HEAD`).
+citation into the source at the canonical source commit `815df1e21` (see §0.1 for how this canonical
+source base relates to the branch `HEAD` and the working tree).
 
 ---
 
@@ -76,30 +76,38 @@ kitten 0.35.2 created by Kovid Goyal
 > appends `CFLAGS` **after** it, so only that library-drift warning is de-promoted. All genuine
 > warnings still error, no source is modified, and the C VT parser and the Go kitten are unaffected.
 
-The build/HEAD anchor for the "default, canonical configuration" claim (verbatim):
+The VCS anchor for the "default, canonical configuration" claim is the **canonical source base
+commit**, which is immutable and therefore reproduces verbatim regardless of how many
+documentation-only commits are later layered onto the branch (verbatim):
 
 ```text
 $ git rev-parse --abbrev-ref HEAD
 blitzy-7d489156-59de-439e-9b2f-075b4512d760
-$ git rev-parse --short HEAD
-13ba38b3a
-$ git log --oneline -3
-13ba38b3a docs: add SSH-kitten secure-session & connection-sharing answer (kitty_815df1e210e0)
-815df1e21 Wire up applying of font config
-f15eebec0 Refactor config patching code to make it re-useable
-$ git rev-parse --short HEAD~1
-815df1e21
-$ git rev-parse HEAD~1
+$ git rev-parse 815df1e21
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+$ git log --oneline -1 815df1e21
+815df1e21 Wire up applying of font config
+$ git diff --name-status 815df1e21..HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
-The current `HEAD` (`13ba38b3a`) is the single commit that **adds this answer document**; its parent
-`HEAD~1` (`815df1e21`, full `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`) is the **canonical source
-commit** the build reflects, and it equals the container image tag
-`…kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Because this commit adds only the document and
-touches no source file, every `file:line` citation in this document resolves identically at
+The **canonical source commit** the build reflects is `815df1e21` (full
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`), and it equals the container image tag
+`…kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. This answer document is added on top of that base
+by **documentation-only commit(s)** on branch `blitzy-7d489156-59de-439e-9b2f-075b4512d760`; those
+commits touch **only this file** and no source file. The invariant proof is
+`git diff --name-status 815df1e21..HEAD`, which reports exactly one changed path —
+`A blitzy/documentation/kitty_815df1e210e0.md` — no matter how many documentation-only commits are
+layered on top (the diff compares the two endpoints, so its output does not drift as later review-fix
+commits are added). Consequently every `file:line` citation in this document resolves identically at
 `815df1e21` and at the working tree. The deliverable filename is fixed as `<source_branch_name>.md` =
 `kitty_815df1e210e0.md`, matching the full source commit `815df1e210e0…`.
+
+> **Why the anchor is `815df1e21` and not a `HEAD` short-hash:** a `HEAD` value is not a stable,
+> reproducible anchor — every subsequent commit (including a review-fix commit to this very document)
+> changes it, so a quoted `git rev-parse --short HEAD` would cease to reproduce. The anchor above is
+> pinned to the immutable canonical base commit and to the endpoint diff, both of which reproduce
+> verbatim at any later `HEAD`.
 
 ### 0.2 The SSH target and how the real path was driven
 
@@ -1605,7 +1613,7 @@ inferred from reading.
 - [x] `yield b'KITTY_DATA_END\n'` — `utils.py:148` — (obs, trailing bytes).
 
 ### Q5 — connection_data (all 16 fields)
-- [x] All 16 fields — `main.go:171-189` — enumerated in the Q5 table with per-field population site and evidence label; 11 (observed), 5 (inferred). Observed values from the sh1 run: `request_id=87498-1` `main.go:424`, `shm_name=kssh-87499-DIUQ3H4FV3L5I` `main.go:458`, `script_type` sh+py `:515/:517`, `request_data` `="0"`(push)+`="1"`(pull) `:724`, `echo_on=1` `:722`, `rcmd` `:508`, `listen_on` `:716`; inferred (source-only): `host_opts` defaults, `literal_env` `:723`, `test_script`, `dont_create_shm`, `replacements` `:514`.
+- [x] All 16 fields — `main.go:171-189` — enumerated in the Q5 table with per-field population site and evidence label; 11 (observed), 5 (inferred). Observed values from the sh1 run: `request_id=87498-1` `main.go:424`, `shm_name=kssh-87499-DIUQ3H4FV3L5I` `main.go:458`, `script_type` sh+py `:515/:517`, `request_data` `="0"`(push)+`="1"`(pull) `:724`, `echo_on=1` `:722`, `rcmd` `:508`, `listen_on` `:716`; inferred (source-only): `host_opts` defaults, `literal_env` `:723`, `test_script`, `dont_create_shm`, `replacements` `:480`.
 
 ### Q6 — connection reuse (all six -o options + decision)
 - [x] `ControlMaster=auto` — `main.go:138` — (obs).
