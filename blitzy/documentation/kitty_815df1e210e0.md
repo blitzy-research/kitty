@@ -621,7 +621,7 @@ There are **two independent locks** in play — conflating them is a mistake:
 
 - **I/O thread → no GIL.** `io_loop`/`read_bytes` do `read()`/`poll()` and `vt_parser_commit_write` of raw bytes; they touch no Python objects, so they never acquire the GIL. Observed indirectly: the scans/callbacks all run on the *main* thread (§7), and the I/O thread only ever moves bytes.
 - **Main thread → holds the GIL for all dispatch.** `consume_input` → `dispatch_osc` → `PyMemoryView_FromMemory` → `CALLBACK` → `clipboard.py`, and the `history.c` scans, all execute on the main thread under the GIL (observed in §3.1 and §7).
-- **The parser lock is released around dispatch.** `run_worker` (`kitty/vt-parser.c:L1416`) does `end_with_lock; { consume_input(...); } with_lock;` (`:L1431-1433`) — the heavy parse + Python-callback work (which builds the `memoryview`) runs with the **parser mutex released**, so the I/O thread can keep filling the disjoint write region concurrently. The GIL and the parser mutex are thus decoupled: the I/O thread needs neither, the main thread holds the GIL but drops the parser mutex during dispatch.
+- **The parser lock is released around dispatch.** `run_worker` (`kitty/vt-parser.c:L1417`) does `end_with_lock; { consume_input(...); } with_lock;` (`:L1431-1433`) — the heavy parse + Python-callback work (which builds the `memoryview`) runs with the **parser mutex released**, so the I/O thread can keep filling the disjoint write region concurrently. The GIL and the parser mutex are thus decoupled: the I/O thread needs neither, the main thread holds the GIL but drops the parser mutex during dispatch.
 
 ### 8.2 Reference-count correctness
 
@@ -805,8 +805,8 @@ These host-only scripts are deleted after the investigation completes (`rm -rf /
 $ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
 A	blitzy/documentation/kitty_815df1e210e0.md
 $ git diff --stat 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
- blitzy/documentation/kitty_815df1e210e0.md | 596 +++++++++++++++++++++++++++++
- 1 file changed, 596 insertions(+)
+ blitzy/documentation/kitty_815df1e210e0.md | 817 +++++++++++++++++++++++++++++
+ 1 file changed, 817 insertions(+)
 ```
 
 **Why it matters (cause → effect):** the investigation exercised the real code paths (building kitty, forking real children over real ptys, driving the real parser and clipboard model) without editing a single line of kitty's C, Python, Go, build, or documentation files — satisfying the read-only scope: the source tree that produced every measured value above is the unmodified kitty at `815df1e210e0`, and the sole artifact added is this answer document.
