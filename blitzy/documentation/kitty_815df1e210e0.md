@@ -502,7 +502,7 @@ checking `/dev/shm` immediately after the single read — the real push leaves t
 after read, /dev/shm/kssh-61471-C3POQXME36BHK exists? False  -> unlink CONFIRMED (gone)
 ```
 
-**Defense 2 — owner UID/GID check.** 
+**Defense 2 — owner UID/GID check.**
 
 ```python
 # kittens/ssh/utils.py:107-108
