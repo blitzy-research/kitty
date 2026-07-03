@@ -587,7 +587,7 @@ run2: as_ansi(200k) scan=225.3ms -> spinner got 48.0% of idle CPU (per-line Pyth
 
 This is the part of the user's memory question that the earlier draft got **wrong**: it claimed "the scan is near-O(1)". That is true only for the C routine's *own* scratch, **not** for the canonical path a user actually triggers. Two different things must be separated.
 
-**(1) The C scan's own scratch is near-O(1) — but only because it releases each line.** `as_ansi` reuses **one** `ANSIBuf output` (grown via `realloc`, `kitty/history.c:L20`; `ensure_space_for`), and after handing each per-line string to the callback it immediately `Py_CLEAR(ans)`s it (`:L363`). So *if the callback discards the line*, the C routine's extra memory is flat regardless of scrollback size. Measured with a discarding callback — the **non-canonical** measurement that produced the earlier O(1) claim:
+**(1) The C scan's own scratch is near-O(1) — but only because it releases each line.** `as_ansi` reuses **one** `ANSIBuf output` (grown via `ensure_space_for` `kitty/history.c:L357`, a macro that `realloc`s at `data-types.h:L355`; not the history-ring `self->segments` `realloc` at `kitty/history.c:L20`), and after handing each per-line string to the callback it immediately `Py_CLEAR(ans)`s it (`:L363`). So *if the callback discards the line*, the C routine's extra memory is flat regardless of scrollback size. Measured with a discarding callback — the **non-canonical** measurement that produced the earlier O(1) claim:
 
 ```
 $ docker run --rm --entrypoint bash -e CI=true -e LC_ALL=C.UTF-8 -e LANG=C.UTF-8 --tmpfs /tmp:exec \
@@ -742,7 +742,7 @@ Each row gives the exact literal with `file:line`, the evidence (**Obs** = obser
 | `as_text_history_buf` | `as_text_history_buf` · `history.c:L509` (via `Screen.as_text_for_history_buf` `screen.c:L3495`) | Obs §7.3 (~66 ms, hist.count=99977) | The exact function `show_scrollback` uses. |
 | `rewrap` | `rewrap` · `history.c:L617` | Obs §7.3-7.4 (~150–240 ms run alone; monolithic GIL hold, spinner ~1.6%) | No callback → holds the GIL solid for the whole scan. |
 | no GIL-release in `history.c` | (grep → rc=1) vs `Py_BEGIN_ALLOW_THREADS` `utmp.c:L17` | Obs §7.1 | Scans run under the GIL on the calling (main) thread. |
-| memory ops | `realloc` `history.c:L20`; `Py_CLEAR(ans)` `:L363`; `PyMem_Free` `:L442` | Obs §7.5 (discarding-cb C scratch flat `0.00 MiB`; canonical `Window.as_text` peak `12.9/25.9/52.0 MiB` ∝ `out_len`) | C scan scratch is O(1) via `Py_CLEAR` per line; canonical pager `as_text` retains per-line `str`s + `''.join`s → memory ∝ output size (**not** O(1)). |
+| memory ops | `ANSIBuf` scratch `realloc` via `ensure_space_for` `history.c:L357` (macro `data-types.h:L355`); `Py_CLEAR(ans)` `:L363`; `PyMem_Free` `:L442` | Obs §7.5 (discarding-cb C scratch flat `0.00 MiB`; canonical `Window.as_text` peak `12.9/25.9/52.0 MiB` ∝ `out_len`) | C scan scratch is O(1) via `Py_CLEAR` per line; canonical pager `as_text` retains per-line `str`s + `''.join`s → memory ∝ output size (**not** O(1)). |
 | `show_scrollback` (trigger) | `text = self.as_text(as_ansi=True, add_history=True, …)` · `window.py:L1736` | Src §7.2 | Pager scan runs synchronously on the main thread. |
 
 ### Ownership / options / build flags
