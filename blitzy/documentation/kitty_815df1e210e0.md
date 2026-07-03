@@ -14,6 +14,7 @@
 4. [Q3 — Staying in sync: OSC 133, backpressure, unstable remote](#4-q3--staying-in-sync-osc-133-backpressure-unstable-remote)
 5. [Q4 — End‑to‑end rhythm: from arrival to "settling again"](#5-q4--end-to-end-rhythm-from-arrival-to-settling-again)
 6. [Evidence & coverage appendix](#6-evidence--coverage-appendix)
+7. [Appendix A — Full observation scripts & build log](#7-appendix-a--full-observation-scripts--build-log)
 
 ---
 
@@ -23,20 +24,31 @@ Kitty is a three‑language monorepo: a C core (compiled into the `fast_data_typ
 
 ### 1.1 Build (default, canonical configuration)
 
-The canonical build action is `build` (this is `setup.py`'s default `action`). It was run as a normal user with no flag overrides:
+The canonical build action is `build` (this is `setup.py`'s default `action`). It was run as a normal user with **no flag overrides**. To capture the full compiler output verbatim (rather than an incremental no‑op), this run was performed after removing the *git‑ignored* build artifacts (`build/` and `kitty/fast_data_types.so`) to force a from‑scratch C recompile. The block below shows the **verbatim head** (backend selection) and **verbatim tail** (last compile step + the four link steps + exit status); the per‑file `[N/85] Compiling …` progress lines in between are elided as explicitly marked, and the **complete 98‑line log is reproduced in Appendix A.1**:
 
 ```console
 $ cd /tmp/blitzy/kitty/blitzy-cd587963-f961-4938-8656-dd2a48df9768_65ebf2
 $ python3 setup.py build ; echo "BUILD EXIT=$?"
-...
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
 Package 'wayland-protocols', required by 'virtual:world', not found
 wayland-protocols >= 1.17 is required, found version: not found
 Disabling building of wayland backend
-kitty/tools/cmd
+[1/85] Compiling kitty/screen.c ...
+[6/85] Compiling kitty/child-monitor.c ...
+[excerpt] per-file lines [2/85] through [84/85] omitted here; the complete 98-line build log is in Appendix A.1
+[85/85] Compiling kitty/gl-wrapper.c ...
+ done
+[1/4] Linking kitty/fast_data_types ...
+[2/4] Linking [x11] kitty/glfw-x11 ...
+[3/4] Linking kittens/transfer/rsync ...
+[4/4] Linking launcher ...
+ done
 BUILD EXIT=0
 ```
 
-`BUILD EXIT=0` confirms a clean build. The `Disabling building of wayland backend` line is the canonical behavior in this environment: `wayland-protocols` is absent, so `setup.py` auto‑selects the X11 backend. This is **not** an accommodation and needs **no** `--ignore-compiler-warnings` flag — the strict default flags (`-pedantic-errors -Werror -Wall -Wextra`) compiled cleanly. The Wayland/X11 windowing backend is orthogonal to the VT‑parser / screen / keys code documented here, so all evidence remains canonical.
+`BUILD EXIT=0` confirms a clean build: all **85** C translation units compiled and the four link steps (`fast_data_types`, the X11 GLFW backend, the `rsync` transfer helper, and the `launcher`) succeeded. The two documented core files are visible in the log — `[1/85] Compiling kitty/screen.c` and `[6/85] Compiling kitty/child-monitor.c`. The `Disabling building of wayland backend` line is the canonical behavior in this environment: `wayland-protocols` is absent, so `setup.py` auto‑selects the X11 backend. This is **not** an accommodation and needs **no** `--ignore-compiler-warnings` flag — the strict default flags (`-pedantic-errors -Werror -Wall -Wextra`) compiled cleanly (no compiler diagnostic appears anywhere in the 98‑line log; only the `[N/85] Compiling …` progress and the link steps). The Wayland/X11 windowing backend is orthogonal to the VT‑parser / screen / keys code documented here, so all evidence remains canonical.
 
 ### 1.2 Version banner (authoritative, run twice)
 
@@ -234,7 +246,7 @@ pty_resize(int fd, struct winsize *dim) {
 Rapid resizes are **debounced** by `process_pending_resizes(monotonic_t now)` at `kitty/child-monitor.c:1043`, so a drag‑resize does not flood the child with `SIGWINCH`. The genuine `ioctl(TIOCSWINSZ)` path was exercised via the test PTY's `set_window_size`, which issues the real `fcntl.ioctl(master_fd, TIOCSWINSZ, …)` — mirroring `pty_resize`:
 
 ```python
-# /tmp/kobs_resize.py  (abridged)
+# /tmp/kobs_resize.py  (excerpt — full script in Appendix A.2)
 pty = t.create_pty(['cat'], cols=80, lines=25)
 print("initial: screen.lines =", pty.screen.lines, "screen.columns =", pty.screen.columns)
 pty.set_window_size(rows=20, columns=40)      # -> screen.resize + real ioctl(TIOCSWINSZ)
@@ -275,7 +287,7 @@ So the `VSUSP` control character (default Ctrl‑Z) is delivered to the child as
 
 **The question.** *How are the responsibilities of timing, ordering, and state hand‑offs split among the moving parts — and critically, what decides which event gets handled first?*
 
-**The short answer.** The "unseen conductor" is the **Child Monitor** in `kitty/child-monitor.c`, a **three‑thread** engine. "What gets handled first" is **not** a priority queue; it is a **fixed `if`‑branch order** executed after `poll()` returns in the I/O thread. Timing/cadence is governed by two knobs, `input_delay` (input batching) and `repaint_delay` (render batching); state hand‑offs cross threads through a mutex‑guarded parser buffer (§4) and lightweight `eventfd`/`signalfd` wakeups.
+**The short answer.** The "unseen conductor" is the **Child Monitor** in `kitty/child-monitor.c`, a **three‑thread** engine. "What gets handled first" is **not** a priority queue; it is a **fixed `if`‑branch order** executed after `poll()` returns in the I/O thread. Timing/cadence is governed by two knobs, `input_delay` (input batching) and `repaint_delay` (render batching); state hand‑offs cross threads through a mutex‑guarded parser buffer (§4) and lightweight cross‑thread wakeups — an `eventfd`/`signalfd` waking the `poll()`‑based I/O and talk loops, and `glfwPostEmptyEvent()` waking the GUI loop (the two are distinct mechanisms; see §3.3).
 
 ### 3.1 The three threads
 
@@ -299,7 +311,7 @@ $ grep -n "pthread_create\|pthread_join" kitty/child-monitor.c
 - **Main / GUI thread** — `main_loop(ChildMonitor *self, …)` at `kitty/child-monitor.c:1259`. Consumes the parser buffer, updates screen state, schedules GPU repaints.
 - **Talk thread** — `talk_loop`, created at `:256`/`:286`. Serves peer sockets for remote control; its `poll()` handlers are the analogues `read_from_peer`/`write_to_peer`/`POLLNVAL`. (The `pthread_create` at `:1002` is a helper `thread_write`, not one of the three long‑lived loops.)
 
-This three‑thread split *is* the "split of responsibilities": the I/O thread owns fd multiplexing and timing of wakeups; the main thread owns parsing/screen/render; the talk thread owns the remote‑control side channel. Because they are separate threads, a slow render cannot stall reads, and a busy child cannot stall the GUI — the hand‑off between them is the parser buffer.
+This three‑thread split *is* the "split of responsibilities": the I/O thread owns fd multiplexing and timing of wakeups; the main thread owns parsing/screen/render; the talk thread owns the remote‑control side channel. Because they are separate threads, *normal* I/O is decoupled from parsing and rendering: a momentarily slow frame does not block the I/O thread's reads, and routine child output does not block the GUI. This decoupling is **bounded by flow control**, however — it is deliberately *not* unlimited isolation. If the main thread stalls long enough that the mutex‑guarded parser buffer reaches its 1 MiB cap, the I/O thread **intentionally stops reading that child**: it stops requesting `POLLIN` for the child fd (`kitty/child-monitor.c:1501`, gated on `vt_parser_has_space_for_input`, `kitty/vt-parser.c:1481`), which lets the kernel PTY buffer fill and throttles the child's own `write()` rather than dropping or reordering bytes (detailed in §4.4). The hand‑off between the threads is that parser buffer, and the buffer's fullness is exactly what applies the brakes — so under sustained backpressure a stalled consumer *does* propagate back to the reader, by design.
 
 ### 3.2 What decides which event is handled first: the deterministic `poll()` branch order
 
@@ -338,9 +350,11 @@ The priority is therefore, in order:
 
 There is no runtime scheduler weighing events; the *code layout* is the schedule. This is why the behavior is deterministic and easy to reason about: for any `poll()` wakeup, wakeup‑drain precedes signals, signals precede reads, reads precede writes, writes precede cleanup.
 
-### 3.3 Cross‑thread wakeups: `eventfd` and `signalfd` (with self‑pipe fallback)
+### 3.3 Cross‑thread wakeups: two *distinct* mechanisms (`eventfd`/`signalfd` for the poll loops, `glfwPostEmptyEvent()` for the GUI)
 
-The wakeup and signal fds serviced above are set up in `kitty/loop-utils.c`. Wakeups use an `eventfd`; OS signals are funnelled through a `signalfd`; each has a portable self‑pipe fallback:
+There are **two** different wakeup mechanisms and it is important not to conflate them: one wakes the `poll()`‑based loops (the I/O and talk threads), the other wakes the GUI / main thread.
+
+**(a) The poll‑based loops (I/O and talk) are woken by an `eventfd`; OS signals arrive via a `signalfd`.** These fds are set up in `kitty/loop-utils.c` (each with a portable self‑pipe fallback) and are exactly the fds serviced by branches (1) and (2) of §3.2:
 
 ```console
 $ grep -n "eventfd\|signalfd\|self_pipe" kitty/loop-utils.c
@@ -350,12 +364,25 @@ $ grep -n "eventfd\|signalfd\|self_pipe" kitty/loop-utils.c
 73:    if (!self_pipe(ld->wakeup_fds, true)) return false;
 ```
 
-- `signalfd(...)` at `kitty/loop-utils.c:42` turns asynchronous OS signals into a pollable fd (fallback self‑pipe at `:48`) — this is what feeds branch (2) above.
-- `eventfd(...)` at `kitty/loop-utils.c:70` is the cheap cross‑thread doorbell the main thread rings to wake the I/O thread, and vice‑versa (fallback self‑pipe at `:73`) — this feeds branch (1).
+- `signalfd(...)` at `kitty/loop-utils.c:42` turns asynchronous OS signals into a pollable fd (fallback self‑pipe at `:48`) — this feeds branch (2) above.
+- `eventfd(...)` at `kitty/loop-utils.c:70` (fallback self‑pipe at `:73`) is the I/O thread's `LoopData.wakeup_read_fd`. It is wired into the poll set as `children_fds[0]` (`kitty/child-monitor.c:183`) and drained by branch (1). Other threads ring this doorbell to wake the **I/O** thread by calling `wakeup_io_loop()` → `wakeup_loop(&self->io_loop_data, …)` (`kitty/child-monitor.c:225-226`); the **talk** thread's loop is woken the same way through its own `LoopData` (`kitty/child-monitor.c:1755`). This `eventfd` therefore wakes **only the poll‑based loops — never the GUI thread.**
+
+**(b) The GUI / main thread is woken by `glfwPostEmptyEvent()`, not by the `eventfd`.** The main thread does not `poll()` on the `eventfd`; it runs a GLFW event loop (`main_loop` → `run_main_loop`, `kitty/child-monitor.c:1259`/`:1262`). When the I/O thread has batched input ready to hand over, its `WAKEUP` macro (`kitty/child-monitor.c:1562`, see §3.4) calls `wakeup_main_loop()`, which is defined as a single `glfwPostEmptyEvent()`:
+
+```console
+$ grep -n "define WAKEUP" kitty/child-monitor.c
+1562:#define WAKEUP { wakeup_main_loop(); last_main_loop_wakeup_at = now; has_pending_wakeups = false; }
+$ grep -n -A2 "^wakeup_main_loop" kitty/glfw.c
+1807:wakeup_main_loop(void) {
+1808-    glfwPostEmptyEvent();
+1809-}
+```
+
+So the direction matters: the **main → I/O** nudge is the `eventfd` (`kitty/loop-utils.c:70`); the **I/O → GUI** nudge is `glfwPostEmptyEvent()` (`kitty/glfw.c:1807-1808`). The GUI is never woken by the `eventfd` — an important correction to the intuition that a single doorbell serves both directions.
 
 ### 3.4 The cadence: batched wakeups every `input_delay`
 
-The I/O thread deliberately does **not** wake the main thread on every byte. It coalesces input and only rings the doorbell once per `input_delay` window:
+The I/O thread deliberately does **not** wake the GUI thread on every byte. It coalesces input and only fires its `WAKEUP` — i.e. the `glfwPostEmptyEvent()` GUI nudge of §3.3(b), **not** the `eventfd` — once per `input_delay` window:
 
 ```c
 // kitty/child-monitor.c:1562-1566
@@ -427,7 +454,7 @@ Orchestration that turns these on lives in `kitty/shell_integration.py:218` `def
 **(a) Synthetic mixed stream through the real parser.** Feeding a stream that interleaves OSC 133 markers with ordinary text (via `parse_bytes`, which is exactly the `read_bytes` → `test_create_write_buffer` → `test_commit_write_buffer` → `test_parse_written_data` sequence) shows the markers vanish from the screen while text order is preserved and the exit status is captured:
 
 ```python
-# /tmp/kobs_osc133.py  (abridged)
+# /tmp/kobs_osc133.py  (excerpt — full script in Appendix A.3)
 run('\x1b]133;A\x07host$ \x1b]133;C;cmdline=ls -la /etc\x07out1  out2\r\n\x1b]133;D;0\x07', "exit 0")
 run('\x1b]133;A\x07host$ \x1b]133;C;cmdline=false\x07out1  out2\r\n\x1b]133;D;1\x07', "exit 1")
 ```
@@ -451,7 +478,7 @@ The rendered row is `screen.line0 = 'host$ out1  out2'` — **all** three OSC 13
 **(b) Real bash over a genuine PTY.** Forking real `bash` with shell integration enabled and reading its output through the genuine `os.read(master_fd)` → parser path confirms the same alignment end‑to‑end with real OSC 133 emission:
 
 ```python
-# /tmp/kobs_realbash.py  (abridged)
+# /tmp/kobs_realbash.py  (excerpt — full script in Appendix A.4)
 env = safe_env_for_running_shell(['bash'], home_dir, rc='PS1="PROMPT> "', shell='bash', with_kitten=False)
 pty = t.create_pty(['bash'], cwd=home_dir, env=env)     # forks real bash
 ... pump until 'PROMPT> ' ...
@@ -484,7 +511,7 @@ The parser buffer is a producer/consumer region guarded by a mutex (`pthread_mut
 `vt_parser_has_space_for_input` returns `read.sz + write.pending < BUF_SZ` (`kitty/vt-parser.c:1481`). When the buffer is full there is no space → no `POLLIN` requested → the kernel PTY buffer fills → the child's own `write()` blocks. That is classic flow control: kitty throttles the child rather than dropping or reordering bytes, so alignment cannot break. Measured at scale by committing a **4 MiB** surge into the write buffer *without parsing* (simulating a stalled main thread):
 
 ```python
-# /tmp/kobs_backpressure.py  (abridged)
+# /tmp/kobs_backpressure.py  (excerpt — full script in Appendix A.5)
 chunk = b'x' * (64*1024); attempted = 4*1024*1024   # 4 MiB
 while sent < attempted:
     dest = s.test_create_write_buffer()
@@ -504,21 +531,32 @@ Against a 4 MiB attempted surge, exactly **`1048576`** bytes (1 MiB, = `BUF_SZ`)
 
 ### 4.5 Under an unstable remote connection — the SSH kitten (path unavailability stated)
 
-For remote sessions the SSH kitten deploys terminfo and the shell‑integration scripts to the remote host over the controlling TTY, then a bootstrap script stages them. The bootstrap is guarded so a partial/interrupted deployment cleans up after itself:
+For remote sessions the SSH kitten deploys terminfo and the shell‑integration scripts to the remote host over the controlling TTY, then a bootstrap script stages them. The bootstrap is guarded so a partial/interrupted deployment cleans up its *temporary* extraction directory (and restores the TTY) after itself — see the exact, limited scope below:
 
 - `cleanup_on_bootstrap_exit()` trap definition — `shell-integration/ssh/bootstrap.sh:10`, invoked at `:156`.
 - `request_data="REQUEST_DATA"` placeholder, substituted by the kitten at transmit time — `shell-integration/ssh/bootstrap.sh:90`.
-- `data_dir` resolved from `$KITTY_SSH_KITTEN_DATA_DIR` (absolute `/*` vs `$HOME/`‑relative) — `shell-integration/ssh/bootstrap.sh:119-121`; staging dir `shell_integration_dir="$data_dir/shell-integration"` — `:122`.
+- `data_dir` resolved from `$KITTY_SSH_KITTEN_DATA_DIR` (absolute `/*` vs `$HOME/`‑relative) — `shell-integration/ssh/bootstrap.sh:119-120` (`case` block `:118-121`); staging dir `shell_integration_dir="$data_dir/shell-integration"` — `:122`.
 - Driver: `kittens/ssh/main.go` (and `kittens/ssh/main.py`), which transmit terminfo + integration over the TTY.
 
-The cleanup traps are what make this robust on an **unstable** link: if the connection drops mid‑bootstrap, the trap removes partial staging so a reconnect starts clean. **The live end‑to‑end remote path was NOT exercised, and this is stated explicitly rather than synthesized:**
+The cleanup trap narrows the blast radius of an *interrupted* bootstrap, but its scope is **limited** — and because there is no `sshd` in this container the following is **[inferred]** from source, not observed on a live link. `cleanup_on_bootstrap_exit()` (`shell-integration/ssh/bootstrap.sh:10-15`) does exactly two things: it restores terminal echo (`command stty echo`, gated on `$echo_on`, `:11`) and removes the **temporary extraction directory** `$tdir` (`command rm -rf "$tdir"`, `:13`; then `tdir=""`, `:14`). It does **not** roll back the *final* staged files: once `untar_and_read_env` has run `mv_files_and_dirs "$tdir/home" "$HOME"` (`:131`; plus the root tree at `:132`) — helper defined at `shell-integration/ssh/bootstrap-utils.sh:9-15` — the terminfo and integration files already live under `$HOME` (in `data_dir`/`shell_integration_dir`, resolved at `:119-120`/`:122`) and **persist**. So the trap keeps a *dropped mid‑transfer* attempt from leaving a stray temp dir or an echo‑off TTY; it does **not** erase already‑staged data, so it would be inaccurate to claim a reconnect necessarily "starts clean." **The live end‑to‑end remote path was NOT exercised, and this is stated explicitly rather than synthesized:**
 
 ```console
 $ command -v ssh        ->  /usr/bin/ssh          # client present
 $ command -v sshd       ->  (not found)           # server ABSENT: /usr/sbin/sshd missing
 $ ./kitty/launcher/kitty +kitten ssh --help ; echo EXIT=$?
 Usage: kitten ssh arguments for the ssh command
-...
+
+The ssh kitten is a thin wrapper around the ssh command. It automatically
+enables shell integration on the remote host, re-uses existing connections to
+reduce latency, makes the kitty terminfo database available, etc. Its invocation
+is identical to the ssh command. For details on its usage, see Truly convenient
+SSH.
+
+Options:
+  --help, -h
+    Show help for this command
+
+kitten ssh 0.35.2 created by Kovid Goyal
 EXIT=0                                              # the kitten DRIVER works
 ```
 
@@ -536,7 +574,7 @@ Combining §2–§4, the journey of a surge of mixed input is:
 
 1. **Arrival (I/O thread).** The child's bytes become readable; `poll()` returns and — per the fixed branch order (§3.2) — the wakeup fd is drained (`:1515`), signals handled (`:1516`), then `read_bytes(...)` (`kitty/child-monitor.c:1529`→`:1337`) copies bytes into the parser's write buffer under the mutex (`kitty/vt-parser.c:206`). Queued user input is flushed out on `POLLOUT` (`:1539`).
 2. **Batch (I/O thread).** Rather than waking the GUI per byte, the I/O thread coalesces and rings the doorbell only once per `input_delay` (observed `3` ms): `if ((now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP` at `kitty/child-monitor.c:1566`, with the rationale comment at `:1563`. This is the first half of the "rhythm."
-3. **Hand‑off + parse (main thread).** The `eventfd` wakeup (`kitty/loop-utils.c:70`) wakes `main_loop` (`kitty/child-monitor.c:1259`), which parses the buffered bytes under the same mutex via `parse_input`/`do_parse` (`:451`/`:438`). The single parser demultiplexes text, control codes, and OSC 133 markers (§4.1) into screen state — prompt/command/output boundaries included.
+3. **Hand‑off + parse (main thread).** That `WAKEUP` (step 2) calls `wakeup_main_loop()` → `glfwPostEmptyEvent()` (`kitty/glfw.c:1807-1808`), waking the GUI `main_loop` (`kitty/child-monitor.c:1259`) — the GUI is nudged through GLFW, **not** the `eventfd` (§3.3(b)). `main_loop` then parses the buffered bytes under the same mutex via `parse_input`/`do_parse` (`:451`/`:438`). The single parser demultiplexes text, control codes, and OSC 133 markers (§4.1) into screen state — prompt/command/output boundaries included.
 4. **Render (main thread).** The GPU repaint is scheduled subject to `repaint_delay` (observed `10` ms, ~100 FPS). Per its own docs, `repaint_delay` *"is ignored"* while input is pending (§1.3), so a burst is drained quickly; once input stops, the repaint cadence takes over. This is the second half of the "rhythm."
 5. **Settle.** When the surge ends, no more wakeups fire, the buffer drains below the flush threshold, and the display reaches a steady frame — the interface has "settled."
 
@@ -561,7 +599,7 @@ An application that redraws a whole frame can ask the terminal to **hold the cur
 The terminal reports mode 2026's state on a DECRQM query (`CSI ? 2026 $ p`), replying `?2026;1$y` when *set/paused* and `?2026;2$y` when *reset/live*. Driving the real parser and capturing the bytes written back to the child (`Callbacks.wtcbuf`):
 
 ```python
-# /tmp/kobs_mode2026.py  (abridged)
+# /tmp/kobs_mode2026.py  (excerpt — full script in Appendix A.6)
 decrqm("initial")
 parse_bytes(s, b'\x1b[?2026h')              # enable  -> pause
 decrqm("after CSI ?2026h (enable/pause)")
@@ -631,14 +669,14 @@ Every named item from the four questions — each mechanism, function, condition
 
 | # | Named item (from the questions) | Answered in | Verified `file:line` | Observed evidence line |
 |---|--------------------------------|-------------|----------------------|------------------------|
-| **Baseline** |
+| **Baseline** |  |  |  |  |
 | B1 | Build (default canonical) | §1.1 | `setup.py` default `action='build'` | `BUILD EXIT=0`; `Disabling building of wayland backend` |
 | B2 | Version banner (VCS‑stamped) | §1.2 | `kitty/constants.py:25` | `kitty 0.35.2 created by Kovid Goyal` (×2) |
 | B3 | `VT_PARSER_BUFFER_SIZE` | §1.3 | `kitty/vt-parser.c:18`, `:1589` | `VT_PARSER_BUFFER_SIZE = 1048576` |
 | B4 | `input_delay` | §1.3,§3.4 | `kitty/options/types.py:536`; `definition.py:878` | `input_delay = 3` |
 | B5 | `repaint_delay` | §1.3,§5.1 | `kitty/options/types.py:567`; `definition.py:866` | `repaint_delay = 10` |
 | B6 | Harness markers | §1.4 | `kitty_tests/` | `Ran 16 tests`/`OK`; `Ran 36 tests`/`OK`; `Ran 3 tests`/`OK` |
-| **Q1 — input entry** |
+| **Q1 — input entry** |  |  |  |  |
 | 1a | Child output first enters | §2.1 | `kitty/child-monitor.c:1337` `read_bytes` | (path feeds §4.3 parse evidence) |
 | 1b | User input queue → flush | §2.2 | `kitty/child-monitor.c:372` `schedule_write_to_child`, `:1443` `write_to_child` | (poll `POLLOUT` branch, §3.2) |
 | 1c | **Keystrokes** entry | §2.2 | `kitty/keys.c:166` `on_key_input` → `:251` encode → `:259`/`:202` `schedule_write_to_child` | `'a'`→`'a'`; `Ctrl+a`→`'\x01'`; flags=0b1111→`'\x1b[97;5u'`; `F1`→`'\x1bOP'` |
@@ -649,14 +687,15 @@ Every named item from the four questions — each mechanism, function, condition
 | 1h | boss.py wiring | §2.2,§3.1 | `kitty/boss.py:370` `ChildMonitor(`, `:587` `add_child` | (named) |
 | 1i | **Paused/resumed (a)** child suspend | §2.5 | `kitty/child.py:492-493` `VSUSP`→`SIGTSTP`; `:174` `set_iutf8_fd` | **[inferred]** (line‑discipline, not parser path) |
 | 1j | **Paused/resumed (b)** render suspend | §2.5,§5 | `kitty/screen.c:2506` (see Q4) | DECRQM `;1`/`;2` toggle (§5.3) |
-| **Q2 — the conductor** |
+| **Q2 — the conductor** |  |  |  |  |
 | 2a | Three threads | §3.1 | `child-monitor.c:55`, `:1481` `io_loop`, `:1259` `main_loop`, `talk_loop` | `grep pthread_create` → `:256/:286/:291`; join `:427` |
 | 2b | **What gets handled first** (poll order) | §3.2 | `child-monitor.c:1515`→`:1516`→`:1529`→`:1539`→`:1542` | verbatim branch block (wakeup→signal→read→write→NVAL) |
 | 2c | Not a priority queue | §3.2 | (fixed `if`‑branch order) | (explicit statement) |
-| 2d | `eventfd`/`signalfd` + self‑pipe | §3.3 | `kitty/loop-utils.c:42`,`:48`,`:70`,`:73` | `grep` → `signalfd`(:42)/`eventfd`(:70) lines |
-| 2e | Batched wakeup / `input_delay` | §3.4 | `child-monitor.c:1562` `WAKEUP`, `:1563` comment, `:1566` condition | verbatim macro+comment+condition |
-| 2f | Parse dispatch | §3.4,§5.1 | `child-monitor.c:451` `parse_input`, `:438` `do_parse` | (named) |
-| **Q3 — staying in sync** |
+| 2d | `eventfd`/`signalfd` + self‑pipe (**poll‑based I/O & talk loops only**) | §3.3(a) | `kitty/loop-utils.c:42`,`:48`,`:70`,`:73`; wired `child-monitor.c:183`, rung `wakeup_io_loop` `:225-226`, talk `:1755` | `grep` → `signalfd`(:42)/`eventfd`(:70) lines |
+| 2e | GUI‑loop wakeup (`glfwPostEmptyEvent`, **not** the `eventfd`) | §3.3(b),§3.4 | `child-monitor.c:1562` `WAKEUP`→`wakeup_main_loop()`; `kitty/glfw.c:1807-1808` `glfwPostEmptyEvent()`; loop `:1259`/`:1262` | `grep` → `1808-    glfwPostEmptyEvent();` |
+| 2f | Batched wakeup / `input_delay` | §3.4 | `child-monitor.c:1562` `WAKEUP`, `:1563` comment, `:1566` condition | verbatim macro+comment+condition |
+| 2g | Parse dispatch | §3.4,§5.1 | `child-monitor.c:451` `parse_input`, `:438` `do_parse` | (named) |
+| **Q3 — staying in sync** |  |  |  |  |
 | 3a | Single demux point | §4.1 | `vt-parser.c:457` `dispatch_osc`, `:536` `case 133:`, `:544` | verbatim lines |
 | 3b | Handler A/C/D | §4.1 | `screen.c:2328` `shell_prompt_marking`; A `:2333`, `k=s`→SECONDARY `:2321`, C `:2341`/`:2344`, D `:2351` | verbatim handler |
 | 3c | OSC 133 **A** (plain / `k=s` / `special_key=1`) | §4.2 | zsh `:153`; bash `:137`/`:240`, zsh `:163`; fish `:85` | marker table |
@@ -671,10 +710,10 @@ Every named item from the four questions — each mechanism, function, condition
 | 3l | **Heavy backpressure**: `BUF_SZ` 1 MiB | §4.4 | `vt-parser.c:18` | `total committed before FULL = 1048576` |
 | 3m | POLLIN gate (`has_space`) | §4.4 | `child-monitor.c:1501` (POLLOUT `:1503`); `vt-parser.c:1481` | `available space now = 0` |
 | 3n | Mutex / flush gate / max esc len | §4.4 | `vt-parser.c:206`, `:1425`, `:21` | 4 MiB surge, stable ×2 |
-| 3o | **Unstable remote**: bootstrap | §4.5 | `bootstrap.sh:10`,`:90`,`:119-121`,`:122`,`:156`; `kittens/ssh/main.go` | **[inferred]**; unavailability stated |
+| 3o | **Unstable remote**: bootstrap (trap scope **limited** — echo + temp `$tdir` only, no final‑file rollback) | §4.5 | `bootstrap.sh:10-15` (echo `:11`, `$tdir` `:13`), `:90`, `:119-120`, `:122`, `:131-133`, `:156`; `bootstrap-utils.sh:9-15`; `kittens/ssh/main.go` | **[inferred]**; unavailability stated |
 | 3p | Remote path unavailability | §4.5 | (no `sshd`) | `command -v sshd` → not found; `+kitten ssh --help` `EXIT=0` |
-| **Q4 — settling** |
-| 4a | Arrival→batch→wake→parse→render→settle | §5.1 | `child-monitor.c:1566`,`:1259`; `loop-utils.c:70` | (narrative built from observed §2–§4) |
+| **Q4 — settling** |  |  |  |  |
+| 4a | Arrival→batch→wake→parse→render→settle | §5.1 | `child-monitor.c:1566` (input_delay), `:1562` `WAKEUP`→`wakeup_main_loop()`, `:1259` `main_loop`; `glfw.c:1807-1808` `glfwPostEmptyEvent()` | (narrative built from observed §2–§4) |
 | 4b | Mode 2026 enable/disable | §5.2 | `control-codes.h:235`; `screen.c:1174-1175` | verbatim handler |
 | 4c | DECRQM `;2`→`;1`→`;2` | §5.3 | `screen.c:2238` (`case PENDING_UPDATE:` `:2237`, snprintf `:2240`) | `;2$y`→`;1$y`→`;2$y`; pause_rendering(100)→`;1$y` |
 | 4d | Parsing continues while paused | §5.3 | (mode 2026 semantics) | `screen.line(0) while paused = 'while-paused-text'` |
@@ -700,3 +739,334 @@ Every named item from the four questions — each mechanism, function, condition
 - **No non‑canonical values.** Every runtime value was taken from the genuine PTY/parser/screen path (the same code `read_bytes` feeds), the default canonical build, or the compiled extension's exported constants — none from a remote‑control socket, debug hook, fallback, or synthetic stand‑in.
 - **Environment deviations reported honestly.** `fish` and `zsh` are installed here (their plain integration tests pass rather than skip); the `ssh` module reported `errors=57`. These are reported as observed, independent of any prior expectation.
 
+
+---
+
+## 7. Appendix A — Full observation scripts & build log
+
+> This appendix reproduces, **verbatim and in full**, the observation artifacts that §1–§5 quote as excerpts, so every quoted line is fully reproducible. Each script is exactly the file that was run via `./kitty/launcher/kitty +launch <path>`. (The key‑encoding, paste‑sanitize and runtime‑constants scripts are already shown in full inline at §2.2, §2.3 and §1.3 and are not repeated here.) All temporary scripts lived under `/tmp` — outside the repository tree — and were removed after the investigation, leaving the repo unchanged.
+
+### A.1 — Build log (full)
+
+The complete verbatim output of the default build, run after removing the git‑ignored `build/` and `kitty/fast_data_types.so` to force a from‑scratch C recompile (§1.1 shows the head+tail excerpt of this exact log):
+
+```console
+$ python3 setup.py build ; echo "BUILD EXIT=$?"
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+[1/85] Compiling kitty/screen.c ...
+[2/85] Compiling kitty/unicode-data.c ...
+[3/85] Compiling [x11] glfw/x11_window.c ...
+[4/85] Compiling kitty/glfw.c ...
+[5/85] Compiling kitty/graphics.c ...
+[6/85] Compiling kitty/child-monitor.c ...
+[7/85] Compiling kitty/fonts.c ...
+[8/85] Compiling kitty/shaders.c ...
+[9/85] Compiling kitty/vt-parser.c ...
+[10/85] Compiling kitty/vt-parser.c ...
+[11/85] Compiling kitty/state.c ...
+[12/85] Compiling [x11] glfw/input.c ...
+[13/85] Compiling kitty/mouse.c ...
+[14/85] Compiling [x11] glfw/xkb_glfw.c ...
+[15/85] Compiling kitty/freetype.c ...
+[16/85] Compiling [x11] glfw/window.c ...
+[17/85] Compiling kitty/line.c ...
+[18/85] Compiling kitty/glfw-wrapper.c ...
+[19/85] Compiling kittens/transfer/algorithm.c ...
+[20/85] Compiling [x11] glfw/x11_init.c ...
+[21/85] Compiling kitty/freetype_render_ui_text.c ...
+[22/85] Compiling [x11] glfw/egl_context.c ...
+[23/85] Compiling kitty/disk-cache.c ...
+[24/85] Compiling [x11] glfw/glx_context.c ...
+[25/85] Compiling kitty/line-buf.c ...
+[26/85] Compiling kitty/data-types.c ...
+[27/85] Compiling kitty/colors.c ...
+[28/85] Compiling kitty/history.c ...
+[29/85] Compiling kitty/keys.c ...
+[30/85] Compiling [x11] glfw/x11_monitor.c ...
+[31/85] Compiling kitty/fontconfig.c ...
+[32/85] Compiling [x11] glfw/context.c ...
+[33/85] Compiling kitty/crypto.c ...
+[34/85] Compiling [x11] glfw/ibus_glfw.c ...
+[35/85] Compiling kitty/key_encoding.c ...
+[36/85] Compiling kitty/launcher/main.c ...
+[37/85] Compiling [x11] glfw/monitor.c ...
+[38/85] Compiling kitty/font-names.c ...
+[39/85] Compiling [x11] glfw/backend_utils.c ...
+[40/85] Compiling kitty/charsets.c ...
+[41/85] Compiling [x11] glfw/linux_joystick.c ...
+[42/85] Compiling [x11] glfw/init.c ...
+[43/85] Compiling [x11] glfw/dbus_glfw.c ...
+[44/85] Compiling kitty/gl.c ...
+[45/85] Compiling [x11] glfw/vulkan.c ...
+[46/85] Compiling [x11] glfw/osmesa_context.c ...
+[47/85] Compiling kitty/cursor.c ...
+[48/85] Compiling kitty/launcher/single-instance.c ...
+[49/85] Compiling kitty/desktop.c ...
+[50/85] Compiling kitty/loop-utils.c ...
+[51/85] Compiling 3rdparty/ringbuf/ringbuf.c ...
+[52/85] Compiling kitty/simd-string.c ...
+[53/85] Compiling kitty/systemd.c ...
+[54/85] Compiling kitty/shlex.c ...
+[55/85] Compiling kitty/child.c ...
+[56/85] Compiling kitty/kittens.c ...
+[57/85] Compiling 3rdparty/base64/lib/codec_choose.c ...
+[58/85] Compiling kitty/png-reader.c ...
+[59/85] Compiling [x11] glfw/linux_notify.c ...
+[60/85] Compiling kitty/rowcolumn-diacritics.c ...
+[61/85] Compiling kitty/hyperlink.c ...
+[62/85] Compiling kitty/wcswidth.c ...
+[63/85] Compiling kitty/fast-file-copy.c ...
+[64/85] Compiling 3rdparty/base64/lib/lib.c ...
+[65/85] Compiling [x11] glfw/posix_thread.c ...
+[66/85] Compiling kitty/window_logo.c ...
+[67/85] Compiling kitty/glyph-cache.c ...
+[68/85] Compiling kitty/logging.c ...
+[69/85] Compiling 3rdparty/base64/lib/arch/neon64/codec.c ...
+[70/85] Compiling 3rdparty/base64/lib/tables/tables.c ...
+[71/85] Compiling 3rdparty/base64/lib/arch/neon32/codec.c ...
+[72/85] Compiling 3rdparty/base64/lib/arch/avx/codec.c ...
+[73/85] Compiling 3rdparty/base64/lib/arch/ssse3/codec.c ...
+[74/85] Compiling 3rdparty/base64/lib/arch/sse42/codec.c ...
+[75/85] Compiling 3rdparty/base64/lib/arch/sse41/codec.c ...
+[76/85] Compiling 3rdparty/base64/lib/arch/avx2/codec.c ...
+[77/85] Compiling kitty/utmp.c ...
+[78/85] Compiling 3rdparty/base64/lib/arch/avx512/codec.c ...
+[79/85] Compiling 3rdparty/base64/lib/arch/generic/codec.c ...
+[80/85] Compiling kitty/cleanup.c ...
+[81/85] Compiling [x11] glfw/monotonic.c ...
+[82/85] Compiling kitty/monotonic.c ...
+[83/85] Compiling kitty/simd-string-128.c ...
+[84/85] Compiling kitty/simd-string-256.c ...
+[85/85] Compiling kitty/gl-wrapper.c ...
+ done
+[1/4] Linking kitty/fast_data_types ...
+[2/4] Linking [x11] kitty/glfw-x11 ...
+[3/4] Linking kittens/transfer/rsync ...
+[4/4] Linking launcher ...
+ done
+BUILD EXIT=0
+```
+
+### A.2 — `/tmp/kobs_resize.py` (full)
+
+Exercises the genuine `ioctl(TIOCSWINSZ)` resize path via the test PTY (mirrors `pty_resize()` → `ioctl(fd, TIOCSWINSZ, dim)` at `kitty/child-monitor.c:577-579`). §2.4 shows the excerpt.
+
+```python
+# /tmp/kobs_resize.py
+# Exercises the genuine ioctl(TIOCSWINSZ) path via the test PTY's
+# set_window_size(), which issues the real fcntl.ioctl(master_fd, TIOCSWINSZ, ...)
+# mirroring pty_resize() -> ioctl(fd, TIOCSWINSZ, dim) at kitty/child-monitor.c:577-579.
+import fcntl, termios, struct
+from kitty_tests import BaseTest
+
+class T(BaseTest):
+    def runTest(self):
+        pass
+
+t = T()
+pty = t.create_pty(['cat'], cols=80, lines=25)
+print("initial: screen.lines =", pty.screen.lines, "screen.columns =", pty.screen.columns)
+pty.set_window_size(rows=20, columns=40)      # -> screen.resize + real ioctl(TIOCSWINSZ)
+print("after set_window_size(rows=20, columns=40): screen.lines =", pty.screen.lines, "screen.columns =", pty.screen.columns)
+r = fcntl.ioctl(pty.master_fd, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
+rows, cols, xpix, ypix = struct.unpack('HHHH', r)
+print("kernel TIOCGWINSZ readback: rows =", rows, "cols =", cols, "xpix =", xpix, "ypix =", ypix)
+```
+
+Observed output (identical across two runs):
+
+```console
+$ ./kitty/launcher/kitty +launch /tmp/kobs_resize.py
+initial: screen.lines = 25 screen.columns = 80
+after set_window_size(rows=20, columns=40): screen.lines = 20 screen.columns = 40
+kernel TIOCGWINSZ readback: rows = 20 cols = 40 xpix = 400 ypix = 400
+```
+
+### A.3 — `/tmp/kobs_osc133.py` (full)
+
+Feeds a stream interleaving OSC 133 shell‑integration markers with ordinary text through the **real** parser (`parse_bytes` = `test_create_write_buffer` → `test_commit_write_buffer` → `test_parse_written_data`, exactly what `read_bytes` feeds). §4.2 shows the excerpt.
+
+```python
+# /tmp/kobs_osc133.py
+# Feeds a stream interleaving OSC 133 markers with ordinary text through the
+# REAL parser (parse_bytes = test_create_write_buffer -> test_commit_write_buffer
+# -> test_parse_written_data, exactly what read_bytes feeds).
+from kitty.options.types import defaults
+from kitty.fast_data_types import set_options, Screen
+from kitty_tests import Callbacks, parse_bytes
+set_options(defaults)
+
+def run(stream, label):
+    c = Callbacks()
+    s = Screen(c, 25, 80, 100, 10, 20, 0, c)
+    parse_bytes(s, stream.encode('utf-8'))
+    print("[%s]" % label)
+    print("  input        =", repr(stream))
+    print("  screen.line0 =", repr(str(s.line(0))))
+    print("  last_cmdline =", repr(c.last_cmd_cmdline))
+    print("  exit_status  =", c.last_cmd_exit_status)
+
+run('\x1b]133;A\x07host$ \x1b]133;C;cmdline=ls -la /etc\x07out1  out2\r\n\x1b]133;D;0\x07', "exit 0")
+run('\x1b]133;A\x07host$ \x1b]133;C;cmdline=false\x07out1  out2\r\n\x1b]133;D;1\x07', "exit 1")
+```
+
+Observed output (identical across two runs):
+
+```console
+$ ./kitty/launcher/kitty +launch /tmp/kobs_osc133.py
+[exit 0]
+  input        = '\x1b]133;A\x07host$ \x1b]133;C;cmdline=ls -la /etc\x07out1  out2\r\n\x1b]133;D;0\x07'
+  screen.line0 = 'host$ out1  out2'
+  last_cmdline = 'ls'
+  exit_status  = 0
+[exit 1]
+  input        = '\x1b]133;A\x07host$ \x1b]133;C;cmdline=false\x07out1  out2\r\n\x1b]133;D;1\x07'
+  screen.line0 = 'host$ out1  out2'
+  last_cmdline = 'false'
+  exit_status  = 1
+```
+
+### A.4 — `/tmp/kobs_realbash.py` (full)
+
+Forks **real** bash with shell integration enabled and reads its output through the genuine `os.read(master_fd)` → `parse_bytes` path (`process_input_from_child()`), mirroring `kitty_tests/shell_integration.py:test_bash_integration`. §4.3 shows the excerpt. Note the in‑place `argv` mutation documented in the script header. §4.3 also documents the initial failure this script header guards against.
+
+```python
+# /tmp/kobs_realbash.py
+# Forks REAL bash with shell integration enabled and reads its output through the
+# genuine os.read(master_fd) -> parse_bytes path (process_input_from_child()).
+# Mirrors kitty_tests/shell_integration.py:test_bash_integration. NOTE:
+# safe_env_for_running_shell() MUTATES the argv list in place (it appends
+# "--posix" so bash sources $ENV=kitty.bash); the SAME argv object must then be
+# handed to create_pty(). We wait for integration to finish loading (cursor
+# becomes CURSOR_BEAM) before sending commands so the command-start (OSC 133 C)
+# DEBUG-trap hook is installed and the command-end (OSC 133 D;$?) status is captured.
+import os, sys, tempfile
+from kitty_tests import BaseTest
+from kitty_tests.shell_integration import safe_env_for_running_shell
+from kitty.fast_data_types import CURSOR_BEAM
+
+class T(BaseTest):
+    def runTest(self):
+        pass
+
+t = T()
+ps1 = 'PROMPT> '
+home_dir = os.path.realpath(tempfile.mkdtemp())
+argv = ['bash']                                                # ONE list, mutated below
+env = safe_env_for_running_shell(argv, home_dir, rc='PS1="%s"' % ps1, shell='bash', with_kitten=False)
+env['KITTY_RUNNING_SHELL_INTEGRATION_TEST'] = '1'
+pty = t.create_pty(argv, cwd=home_dir, env=env)                # forks real bash (argv now ['bash','--posix'])
+# Wait until shell integration has fully loaded (it switches the cursor to a beam).
+pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM)
+pty.wait_till(lambda: pty.screen_contents().count(ps1) == 1)
+print("startup screen.line(0)          =", repr(str(pty.screen.line(0))))
+
+for cmd in ('echo hello-kitty', 'false'):
+    pty.callbacks.clear()
+    pty.send_cmd_to_child(cmd)
+    pty.wait_till(lambda: pty.callbacks.last_cmd_exit_status != sys.maxsize)
+    print("after %-19s cmdline = %s exit_status = %s" % (
+        repr(cmd) + ':', repr(pty.callbacks.last_cmd_cmdline), pty.callbacks.last_cmd_exit_status))
+```
+
+Observed output (identical across two runs):
+
+```console
+$ ./kitty/launcher/kitty +launch /tmp/kobs_realbash.py
+startup screen.line(0)          = 'PROMPT> '
+after 'echo hello-kitty': cmdline = 'echo hello-kitty' exit_status = 0
+after 'false':            cmdline = 'false' exit_status = 1
+```
+
+### A.5 — `/tmp/kobs_backpressure.py` (full)
+
+Commits a 4 MiB surge into the parser write buffer **without parsing** (simulating a stalled main thread) to force the 1 MiB `BUF_SZ` cap and observe backpressure. §4.4 shows the excerpt.
+
+```python
+# /tmp/kobs_backpressure.py
+# Commits a 4 MiB surge into the parser write buffer WITHOUT parsing (simulating a
+# stalled main thread) to force the 1 MiB BUF_SZ cap and observe backpressure.
+from kitty.options.types import defaults
+from kitty.fast_data_types import set_options, Screen, VT_PARSER_BUFFER_SIZE
+from kitty_tests import Callbacks
+set_options(defaults)
+
+c = Callbacks()
+s = Screen(c, 25, 80, 100, 10, 20, 0, c)
+chunk = b'x' * (64 * 1024)
+attempted = 4 * 1024 * 1024                       # 4 MiB
+sent = 0
+total_committed = 0
+while sent < attempted:
+    dest = s.test_create_write_buffer()
+    if len(dest) == 0:                            # no space -> backpressure
+        break
+    n = s.test_commit_write_buffer(chunk, dest)   # DO NOT parse
+    total_committed += n
+    sent += len(chunk)
+
+print("VT_PARSER_BUFFER_SIZE           =", VT_PARSER_BUFFER_SIZE)
+print("attempted surge                 =", attempted, "bytes (4 MiB)")
+print("total committed before FULL     =", total_committed, "bytes")
+print("available space now (len buf)   =", len(s.test_create_write_buffer()))
+```
+
+Observed output (identical across two runs):
+
+```console
+$ ./kitty/launcher/kitty +launch /tmp/kobs_backpressure.py
+VT_PARSER_BUFFER_SIZE           = 1048576
+attempted surge                 = 4194304 bytes (4 MiB)
+total committed before FULL     = 1048576 bytes
+available space now (len buf)   = 0
+```
+
+### A.6 — `/tmp/kobs_mode2026.py` (full)
+
+Drives the real parser and captures the bytes written back to the child (`Callbacks.wtcbuf`) in reply to a DECRQM query (`CSI ? 2026 $ p`) around enabling/disabling synchronized output (DEC private mode 2026). §5.2 shows the excerpt.
+
+```python
+# /tmp/kobs_mode2026.py
+# Drives the real parser and captures the bytes written back to the child
+# (Callbacks.wtcbuf) in reply to a DECRQM query (CSI ? 2026 $ p) around
+# enabling/disabling synchronized output (DEC private mode 2026).
+from kitty.options.types import defaults
+from kitty.fast_data_types import set_options, Screen
+from kitty_tests import Callbacks, parse_bytes
+set_options(defaults)
+
+c = Callbacks()
+s = Screen(c, 25, 80, 100, 10, 20, 0, c)
+
+def decrqm(label):
+    c.wtcbuf = b''
+    parse_bytes(s, b'\x1b[?2026$p')
+    print("  %-38s DECRQM reply = %r" % (label, c.wtcbuf))
+
+decrqm("initial")
+parse_bytes(s, b'\x1b[?2026h')              # enable  -> pause
+decrqm("after CSI ?2026h (enable/pause)")
+parse_bytes(s, b'while-paused-text')        # text arrives WHILE paused
+print("  screen.line(0) while paused          =", repr(str(s.line(0))))
+parse_bytes(s, b'\x1b[?2026l')              # disable -> resume
+decrqm("after CSI ?2026l (disable/resume)")
+print("  screen.pause_rendering(100)          =", s.pause_rendering(100))
+decrqm("after pause_rendering(100)")
+```
+
+Observed output (identical across two runs):
+
+```console
+$ ./kitty/launcher/kitty +launch /tmp/kobs_mode2026.py
+  initial                                DECRQM reply = b'\x1b[?2026;2$y'
+  after CSI ?2026h (enable/pause)        DECRQM reply = b'\x1b[?2026;1$y'
+  screen.line(0) while paused          = 'while-paused-text'
+  after CSI ?2026l (disable/resume)      DECRQM reply = b'\x1b[?2026;2$y'
+  screen.pause_rendering(100)          = True
+  after pause_rendering(100)             DECRQM reply = b'\x1b[?2026;1$y'
+```
