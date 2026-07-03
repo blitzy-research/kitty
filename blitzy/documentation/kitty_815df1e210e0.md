@@ -515,7 +515,7 @@ kitty does **both**: most flow control is silent, but a few conditions produce v
 
 kitty's “pending mode” is the industry **Synchronized Output** feature (DEC private mode **2026**: `CSI ? 2026 h` to begin, `CSI ? 2026 l` to end; also BSU/ESU) for atomic, tearing‑free updates; kitty additionally accepts the older iTerm2‑style DCS form `ESC P = 1 s` / `ESC P = 2 s` (`vt-parser.c:L638-648`). *(Terminology cross‑referenced externally; the codebase and observed output remain authoritative.)*
 
-kitty's own documentation frames this feature under the same "Synchronized update" name: `docs/performance.rst:L109-L110` — "konsole, gnome-terminal and xterm do not support the `Synchronized update … escape code used to suppress rendering`" — confirming that pending mode is the *rendering‑suppression* mechanism whose implementation lives in `screen.c` (`screen_pause_rendering()`, `PENDING_MODE`) and `vt-parser.c` (the DCS toggle at `L638-648`). The `docs/performance.rst` note (**INFERRED / SOURCE‑CONFIRMED**: read from the shipped docs, not a runtime capture) is the repository's synchronized‑update framing referenced by the AAP.
+kitty's own documentation frames this feature under the same "Synchronized update" name: `docs/performance.rst:L109-L111` — "konsole, gnome-terminal and xterm do not support the `Synchronized update … escape code used to suppress rendering`" — confirming that pending mode is the *rendering‑suppression* mechanism whose implementation lives in `screen.c` (`screen_pause_rendering()`, `PENDING_MODE`) and `vt-parser.c` (the DCS toggle at `L638-648`). The `docs/performance.rst` note (**INFERRED / SOURCE‑CONFIRMED**: read from the shipped docs, not a runtime capture) is the repository's synchronized‑update framing referenced by the AAP.
 
 **Status query and toggles** (OBSERVED, native + Docker, 2 runs). The status reply bit is driven by `screen.c:L2238` (`ans = self->paused_rendering.expires_at ? 1 : 2;`):
 
@@ -615,7 +615,7 @@ QUIET q=2 bad-data (expect None) -> None
 | Quiet level `q=0` (all — default / omitted `q`) | `graphics.c:L762` (`if (g->quiet)` false) | §6.4 |
 | Quiet level `q=1` (suppress OK) | `graphics.c:L762` | §6.4 |
 | Quiet level `q=2` (suppress failures) | `graphics.c:L762` | §6.4 |
-| Synchronized‑update framing (repo docs) | `docs/performance.rst:L109-L110` | §6.3 |
+| Synchronized‑update framing (repo docs) | `docs/performance.rst:L109-L111` | §6.3 |
 | Pending termination — explicit stop | `vt-parser.c:L644-645` | §6.3 |
 | Pending termination — timeout 2000 ms | `screen.c:L2521,L2489-2490` | §6.3 |
 | Pending termination — disruptive ops | `screen.c:L163/347/1910/4155` | §6.3 |
