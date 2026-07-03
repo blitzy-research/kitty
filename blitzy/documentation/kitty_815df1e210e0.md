@@ -2,7 +2,7 @@
 
 > **Scope note.** This document answers four questions about how the [Kitty](https://github.com/kovidgoyal/kitty) terminal emulator moves input through its pipeline. Every behavioral claim below was produced by **building and running** Kitty at branch `kitty_815df1e210e0` / HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, then driving the *genuine* PTY / VT‑parser / screen code paths in‑process and pasting the verbatim output next to the claim. This was a strictly **read‑only** investigation: no repository source file was modified; the only artifact added is this document. Temporary observation scripts lived under `/tmp` (outside the repository tree) and were removed afterward.
 >
-> **How to read the evidence.** Each behavioral statement carries one adjacent fenced code block showing the command/script and its observed output, plus the exact `file:line` literal that implements it. Values that could only be *read from source* (not exercised at runtime) are labeled **[inferred]**. Any measurement taken through a bypassing interface would be labeled **[non‑canonical]** — none were needed. Where a `file:line` in the planning notes had drifted by a few lines from the real source, the **verified** line is cited and the drift is called out.
+> **How to read the evidence.** Each behavioral statement carries one adjacent fenced code block showing the command/script and its observed output, plus the exact `file:line` literal that implements it. Values that could only be *read from source* (not exercised at runtime) are labeled **[inferred]**. Any value taken through a bypassing interface, a fallback, or a synthetic stand‑in is labeled **[non‑canonical]**; the *only* such value in this document is the **supplemental** synthetic OSC 133 stream in §4.3(a) (hand‑crafted *input* fed through the real parser), and the very same alignment claim is proven **canonically** by the real‑`bash` PTY run in §4.3(b). Every other runtime value is canonical. Where a `file:line` in the planning notes had drifted by a few lines from the real source, the **verified** line is cited and the drift is called out.
 
 ---
 
@@ -401,7 +401,7 @@ The comment at `kitty/child-monitor.c:1563` states the rationale verbatim — *"
 
 **The question.** *When shell‑integration hints arrive mixed in with ordinary text, how does the system keep screen state, command context, and input meaning aligned without drifting out of sync — and does that differ under heavy backpressure or an unstable remote connection?*
 
-**The short answer.** Alignment is guaranteed by **construction**: the hints (OSC 133 sequences) and the ordinary text ride the **same byte stream** and are demultiplexed by the **single VT parser**. Because there is exactly one ordered consumer of that stream, marker order and text order cannot diverge. Under heavy backpressure the alignment is *preserved* (the parser stops reading rather than dropping/reordering bytes). The unstable‑remote case is handled by the SSH kitten deploying integration over the controlling TTY — documented from source because a live server is unavailable here (stated explicitly in §4.4).
+**The short answer.** Alignment is guaranteed by **construction**: the hints (OSC 133 sequences) and the ordinary text ride the **same byte stream** and are demultiplexed by the **single VT parser**. Because there is exactly one ordered consumer of that stream, marker order and text order cannot diverge. Under heavy backpressure the alignment is *preserved* (the parser stops reading rather than dropping/reordering bytes). The unstable‑remote case is handled by the SSH kitten deploying integration over the controlling TTY — documented from source because a live server is unavailable here (stated explicitly in §4.5).
 
 ### 4.1 One stream, one demux point
 
@@ -435,23 +435,23 @@ The four marker letters (`A`, `B`, `C`, `D`) plus the kitty‑internal `k` regio
 
 | Marker | Meaning | Variant (verbatim literal) | Shell — `file:line` | Why it exists (cause → effect) |
 |--------|---------|----------------------------|---------------------|-------------------------------|
-| **A** | Prompt start | `\e]133;A` | zsh `kitty-integration:153`; (bash emits `…D;$?…A` combined, see below) | Marks the row where a fresh prompt begins, so jump‑to‑prompt / prompt reflow know the boundary |
-| **A** | Secondary‑prompt start | `\e]133;A;k=s` | bash `kitty.bash:137` & `:240`; zsh `kitty-integration:163` | `k=s` tells kitty this is a continuation (PS2) prompt → parsed to `SECONDARY_PROMPT` at `screen.c:2321` |
-| **A** | Prompt start, special keys | `\e]133;A;special_key=1` | fish `…kitty-shell-integration.fish:85` | `special_key=1` sets `uses_special_keys_for_cursor_movement` so cursor‑key edits are handled correctly |
-| **B** | Prompt end / command typed | `\e]133;B` | zsh `kitty-integration:226` (commented‑out) | The prompt‑end marker is optional; zsh ships it disabled, so it is mostly implicit — reported as present‑but‑commented |
-| **C** | Command start (pre‑exec) + cmdline | `\e]133;C;cmdline=%q` | bash `kitty.bash:208`; zsh `kitty-integration:218` | `%q`‑quoted command line captured at pre‑exec → populates command context (`cmdline = buf+2`, `screen.c:2344`) |
-| **C** | Command start, URL‑escaped cmdline | `\e]133;C;cmdline_url=%s` | fish `…kitty-shell-integration.fish:91` | fish URL‑escapes the command line instead of shell‑quoting → same effect, different encoding |
-| **D** | Command end (no status) | `\e]133;D` | zsh `kitty-integration:149`; fish `…fish:83` | Marks output end when the exit status is not (yet) known |
-| **D** | Command end + status | `\e]133;D;<status>` | zsh `kitty-integration:145` | Records the process exit status for the just‑finished command |
-| **D** | Command end + `$?`, then next A | `\e]133;D;$?` `\e]133;A` | bash `kitty.bash:239` | bash appends the exit code `$?` and immediately starts the next prompt in one PS1 fragment |
-| **D** | Command end + `$status` | `\e]133;D;$status` | fish `…kitty-shell-integration.fish:96` | fish's equivalent of `$?` |
-| **k** | kitty‑internal region marker | `\e]133;k;<name>_kitty` | bash `kitty.bash:127` | Delimits kitty‑inserted regions so they can be stripped from `PS0`/`PS1`/`PS2` and not double‑counted |
+| **A** | Prompt start | `\e]133;A` | zsh `shell-integration/zsh/kitty-integration:153`; (bash emits `…D;$?…A` combined, see below) | Marks the row where a fresh prompt begins, so jump‑to‑prompt / prompt reflow know the boundary |
+| **A** | Secondary‑prompt start | `\e]133;A;k=s` | bash `shell-integration/bash/kitty.bash:137` & `:240`; zsh `shell-integration/zsh/kitty-integration:163` | `k=s` tells kitty this is a continuation (PS2) prompt → parsed to `SECONDARY_PROMPT` at `kitty/screen.c:2321` |
+| **A** | Prompt start, special keys | `\e]133;A;special_key=1` | fish `shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:85` | `special_key=1` sets `uses_special_keys_for_cursor_movement` so cursor‑key edits are handled correctly |
+| **B** | Prompt end / command typed | `\e]133;B` | zsh `shell-integration/zsh/kitty-integration:226` (commented‑out) | The prompt‑end marker is optional; zsh ships it disabled, so it is mostly implicit — reported as present‑but‑commented |
+| **C** | Command start (pre‑exec) + cmdline | `\e]133;C;cmdline=%q` | bash `shell-integration/bash/kitty.bash:208`; zsh `shell-integration/zsh/kitty-integration:218` | `%q`‑quoted command line captured at pre‑exec → populates command context (`cmdline = buf+2`, `kitty/screen.c:2344`) |
+| **C** | Command start, URL‑escaped cmdline | `\e]133;C;cmdline_url=%s` | fish `shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:91` | fish URL‑escapes the command line instead of shell‑quoting → same effect, different encoding |
+| **D** | Command end (no status) | `\e]133;D` | zsh `shell-integration/zsh/kitty-integration:149`; fish `shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:83` | Marks output end when the exit status is not (yet) known |
+| **D** | Command end + status | `\e]133;D;<status>` | zsh `shell-integration/zsh/kitty-integration:145` | Records the process exit status for the just‑finished command |
+| **D** | Command end + `$?`, then next A | `\e]133;D;$?` `\e]133;A` | bash `shell-integration/bash/kitty.bash:239` | bash appends the exit code `$?` and immediately starts the next prompt in one PS1 fragment |
+| **D** | Command end + `$status` | `\e]133;D;$status` | fish `shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:96` | fish's equivalent of `$?` |
+| **k** | kitty‑internal region marker | `\e]133;k;<name>_kitty` | bash `shell-integration/bash/kitty.bash:127` | Delimits kitty‑inserted regions so they can be stripped from `PS0`/`PS1`/`PS2` and not double‑counted |
 
 Orchestration that turns these on lives in `kitty/shell_integration.py:218` `def modify_shell_environ(opts, env, argv)`, which sets `KITTY_SHELL_INTEGRATION` and wires the per‑shell rc files.
 
 ### 4.3 Proof of alignment: markers are split out of the visible text
 
-**(a) Synthetic mixed stream through the real parser.** Feeding a stream that interleaves OSC 133 markers with ordinary text (via `parse_bytes`, which is exactly the `read_bytes` → `test_create_write_buffer` → `test_commit_write_buffer` → `test_parse_written_data` sequence) shows the markers vanish from the screen while text order is preserved and the exit status is captured:
+**(a) Synthetic mixed stream through the real parser [non‑canonical, supplemental].** The *input* here is a hand‑crafted byte stream — a synthetic stand‑in for what a shell actually emits — so this illustration is labeled **[non‑canonical]** and is **supplemental** to the canonical real‑`bash` proof in (b). It is still instructive because those bytes pass through the *genuine* parser (via `parse_bytes`, which is exactly the `read_bytes` → `test_create_write_buffer` → `test_commit_write_buffer` → `test_parse_written_data` sequence). The run shows the markers vanish from the screen while text order is preserved and the exit status is captured:
 
 ```python
 # /tmp/kobs_osc133.py  (excerpt — full script in Appendix A.3)
@@ -541,8 +541,10 @@ For remote sessions the SSH kitten deploys terminfo and the shell‑integration 
 The cleanup trap narrows the blast radius of an *interrupted* bootstrap, but its scope is **limited** — and because there is no `sshd` in this container the following is **[inferred]** from source, not observed on a live link. `cleanup_on_bootstrap_exit()` (`shell-integration/ssh/bootstrap.sh:10-15`) does exactly two things: it restores terminal echo (`command stty echo`, gated on `$echo_on`, `:11`) and removes the **temporary extraction directory** `$tdir` (`command rm -rf "$tdir"`, `:13`; then `tdir=""`, `:14`). It does **not** roll back the *final* staged files: once `untar_and_read_env` has run `mv_files_and_dirs "$tdir/home" "$HOME"` (`:131`; plus the root tree at `:132`) — helper defined at `shell-integration/ssh/bootstrap-utils.sh:9-15` — the terminfo and integration files already live under `$HOME` (in `data_dir`/`shell_integration_dir`, resolved at `:119-120`/`:122`) and **persist**. So the trap keeps a *dropped mid‑transfer* attempt from leaving a stray temp dir or an echo‑off TTY; it does **not** erase already‑staged data, so it would be inaccurate to claim a reconnect necessarily "starts clean." **The live end‑to‑end remote path was NOT exercised, and this is stated explicitly rather than synthesized:**
 
 ```console
-$ command -v ssh        ->  /usr/bin/ssh          # client present
-$ command -v sshd       ->  (not found)           # server ABSENT: /usr/sbin/sshd missing
+$ command -v ssh || echo '(not found)'
+/usr/bin/ssh
+$ command -v sshd || echo '(not found)'
+(not found)
 $ ./kitty/launcher/kitty +kitten ssh --help ; echo EXIT=$?
 Usage: kitten ssh arguments for the ssh command
 
@@ -557,10 +559,10 @@ Options:
     Show help for this command
 
 kitten ssh 0.35.2 created by Kovid Goyal
-EXIT=0                                              # the kitten DRIVER works
+EXIT=0
 ```
 
-The SSH kitten *driver* is functional (`+kitten ssh --help` exits `0`), but there is **no `sshd` server** in this container, so a genuine remote bootstrap over a live connection cannot be performed here. Per the real‑entry‑point rule this is reported as **unavailable**; the bootstrap mechanism above is therefore documented **[inferred]** from source, not from a live run. (The in‑process `ssh` test module likewise cannot run its launcher‑dependent cases — it errors on `AttributeError: module 'sys' has no attribute 'kitty_run_data'`, §1.4.)
+The `ssh` **client** is present — `command -v ssh` prints `/usr/bin/ssh` — but the `sshd` **server** is absent: `command -v sshd` finds nothing, so its `|| echo '(not found)'` fallback prints `(not found)`. The SSH kitten *driver* is itself functional (`+kitten ssh --help` exits `EXIT=0`), yet with **no `sshd` server** in this container a genuine remote bootstrap over a live connection cannot be performed here. Per the real‑entry‑point rule this is reported as **unavailable**; the bootstrap mechanism above is therefore documented **[inferred]** from source, not from a live run. (The in‑process `ssh` test module likewise cannot run its launcher‑dependent cases — it errors on `AttributeError: module 'sys' has no attribute 'kitty_run_data'`, §1.4.)
 
 ---
 
@@ -673,14 +675,14 @@ Every named item from the four questions — each mechanism, function, condition
 | B1 | Build (default canonical) | §1.1 | `setup.py` default `action='build'` | `BUILD EXIT=0`; `Disabling building of wayland backend` |
 | B2 | Version banner (VCS‑stamped) | §1.2 | `kitty/constants.py:25` | `kitty 0.35.2 created by Kovid Goyal` (×2) |
 | B3 | `VT_PARSER_BUFFER_SIZE` | §1.3 | `kitty/vt-parser.c:18`, `:1589` | `VT_PARSER_BUFFER_SIZE = 1048576` |
-| B4 | `input_delay` | §1.3,§3.4 | `kitty/options/types.py:536`; `definition.py:878` | `input_delay = 3` |
-| B5 | `repaint_delay` | §1.3,§5.1 | `kitty/options/types.py:567`; `definition.py:866` | `repaint_delay = 10` |
+| B4 | `input_delay` | §1.3,§3.4 | `kitty/options/types.py:536`; `kitty/options/definition.py:878` | `input_delay = 3` |
+| B5 | `repaint_delay` | §1.3,§5.1 | `kitty/options/types.py:567`; `kitty/options/definition.py:866` | `repaint_delay = 10` |
 | B6 | Harness markers | §1.4 | `kitty_tests/` | `Ran 16 tests`/`OK`; `Ran 36 tests`/`OK`; `Ran 3 tests`/`OK` |
 | **Q1 — input entry** |  |  |  |  |
 | 1a | Child output first enters | §2.1 | `kitty/child-monitor.c:1337` `read_bytes` | (path feeds §4.3 parse evidence) |
 | 1b | User input queue → flush | §2.2 | `kitty/child-monitor.c:372` `schedule_write_to_child`, `:1443` `write_to_child` | (poll `POLLOUT` branch, §3.2) |
 | 1c | **Keystrokes** entry | §2.2 | `kitty/keys.c:166` `on_key_input` → `:251` encode → `:259`/`:202` `schedule_write_to_child` | `'a'`→`'a'`; `Ctrl+a`→`'\x01'`; flags=0b1111→`'\x1b[97;5u'`; `F1`→`'\x1bOP'` |
-| 1d | Kitty keyboard protocol CSI‑u | §2.2 | `kitty/key_encoding.c` (via `keys.c:319`) | `Ctrl+a` flags=0b1111 → `'\x1b[97;5u'` |
+| 1d | Kitty keyboard protocol CSI‑u | §2.2 | `kitty/key_encoding.c` (via `kitty/keys.c:319`) | `Ctrl+a` flags=0b1111 → `'\x1b[97;5u'` |
 | 1e | Key mapping / mouse sibling | §2.2 | `kitty/keys.py`, `kitty/mouse.c`, `kitty/boss.py:1408` | (named; `dispatch_possible_special_key`) |
 | 1f | **Paste bursts** entry + sanitize | §2.3 | `kitty/window.py:1643` `paste_with_actions`, `:117`/`:1718`, `kitty/utils.py:1139`; `:423` filter | `b'…\x1b[201~ echo…'` → `b'…  echo…'` |
 | 1g | **Resize signals** → `ioctl(TIOCSWINSZ)` | §2.4 | `kitty/child-monitor.c:577-579` `pty_resize`; debounce `:1043` | screen `25×80`→`20×40`; kernel `TIOCGWINSZ rows=20 cols=40` |
@@ -688,37 +690,37 @@ Every named item from the four questions — each mechanism, function, condition
 | 1i | **Paused/resumed (a)** child suspend | §2.5 | `kitty/child.py:492-493` `VSUSP`→`SIGTSTP`; `:174` `set_iutf8_fd` | **[inferred]** (line‑discipline, not parser path) |
 | 1j | **Paused/resumed (b)** render suspend | §2.5,§5 | `kitty/screen.c:2506` (see Q4) | DECRQM `;1`/`;2` toggle (§5.3) |
 | **Q2 — the conductor** |  |  |  |  |
-| 2a | Three threads | §3.1 | `child-monitor.c:55`, `:1481` `io_loop`, `:1259` `main_loop`, `talk_loop` | `grep pthread_create` → `:256/:286/:291`; join `:427` |
-| 2b | **What gets handled first** (poll order) | §3.2 | `child-monitor.c:1515`→`:1516`→`:1529`→`:1539`→`:1542` | verbatim branch block (wakeup→signal→read→write→NVAL) |
+| 2a | Three threads | §3.1 | `kitty/child-monitor.c:55`, `:1481` `io_loop`, `:1259` `main_loop`, `talk_loop` | `grep pthread_create` → `:256/:286/:291`; join `:427` |
+| 2b | **What gets handled first** (poll order) | §3.2 | `kitty/child-monitor.c:1515`→`:1516`→`:1529`→`:1539`→`:1542` | verbatim branch block (wakeup→signal→read→write→NVAL) |
 | 2c | Not a priority queue | §3.2 | (fixed `if`‑branch order) | (explicit statement) |
-| 2d | `eventfd`/`signalfd` + self‑pipe (**poll‑based I/O & talk loops only**) | §3.3(a) | `kitty/loop-utils.c:42`,`:48`,`:70`,`:73`; wired `child-monitor.c:183`, rung `wakeup_io_loop` `:225-226`, talk `:1755` | `grep` → `signalfd`(:42)/`eventfd`(:70) lines |
-| 2e | GUI‑loop wakeup (`glfwPostEmptyEvent`, **not** the `eventfd`) | §3.3(b),§3.4 | `child-monitor.c:1562` `WAKEUP`→`wakeup_main_loop()`; `kitty/glfw.c:1807-1808` `glfwPostEmptyEvent()`; loop `:1259`/`:1262` | `grep` → `1808-    glfwPostEmptyEvent();` |
-| 2f | Batched wakeup / `input_delay` | §3.4 | `child-monitor.c:1562` `WAKEUP`, `:1563` comment, `:1566` condition | verbatim macro+comment+condition |
-| 2g | Parse dispatch | §3.4,§5.1 | `child-monitor.c:451` `parse_input`, `:438` `do_parse` | (named) |
+| 2d | `eventfd`/`signalfd` + self‑pipe (**poll‑based I/O & talk loops only**) | §3.3(a) | `kitty/loop-utils.c:42`,`:48`,`:70`,`:73`; wired `kitty/child-monitor.c:183`, rung `wakeup_io_loop` `:225-226`, talk `:1755` | `grep` → `signalfd`(:42)/`eventfd`(:70) lines |
+| 2e | GUI‑loop wakeup (`glfwPostEmptyEvent`, **not** the `eventfd`) | §3.3(b),§3.4 | `kitty/child-monitor.c:1562` `WAKEUP`→`wakeup_main_loop()`; `kitty/glfw.c:1807-1808` `glfwPostEmptyEvent()`; loop `:1259`/`:1262` | `grep` → `1808-    glfwPostEmptyEvent();` |
+| 2f | Batched wakeup / `input_delay` | §3.4 | `kitty/child-monitor.c:1562` `WAKEUP`, `:1563` comment, `:1566` condition | verbatim macro+comment+condition |
+| 2g | Parse dispatch | §3.4,§5.1 | `kitty/child-monitor.c:451` `parse_input`, `:438` `do_parse` | (named) |
 | **Q3 — staying in sync** |  |  |  |  |
-| 3a | Single demux point | §4.1 | `vt-parser.c:457` `dispatch_osc`, `:536` `case 133:`, `:544` | verbatim lines |
-| 3b | Handler A/C/D | §4.1 | `screen.c:2328` `shell_prompt_marking`; A `:2333`, `k=s`→SECONDARY `:2321`, C `:2341`/`:2344`, D `:2351` | verbatim handler |
+| 3a | Single demux point | §4.1 | `kitty/vt-parser.c:457` `dispatch_osc`, `:536` `case 133:`, `:544` | verbatim lines |
+| 3b | Handler A/C/D | §4.1 | `kitty/screen.c:2328` `shell_prompt_marking`; A `:2333`, `k=s`→SECONDARY `:2321`, C `:2341`/`:2344`, D `:2351` | verbatim handler |
 | 3c | OSC 133 **A** (plain / `k=s` / `special_key=1`) | §4.2 | zsh `:153`; bash `:137`/`:240`, zsh `:163`; fish `:85` | marker table |
-| 3d | OSC 133 **B** (commented) | §4.2 | zsh `kitty-integration:226` | marker table |
+| 3d | OSC 133 **B** (commented) | §4.2 | zsh `shell-integration/zsh/kitty-integration:226` | marker table |
 | 3e | OSC 133 **C** (`cmdline=%q` / `cmdline_url=%s`) | §4.2 | bash `:208`, zsh `:218`; fish `:91` | marker table |
 | 3f | OSC 133 **D** (`D` / `D;<status>` / `D;$?` / `D;$status`) | §4.2 | zsh `:149`/`:145`, bash `:239`, fish `:83`/`:96` | marker table |
-| 3g | OSC 133 **k** (internal region) | §4.2 | bash `kitty.bash:127` | marker table |
+| 3g | OSC 133 **k** (internal region) | §4.2 | bash `shell-integration/bash/kitty.bash:127` | marker table |
 | 3h | Integration orchestration | §4.2 | `kitty/shell_integration.py:218` `modify_shell_environ` | (named) |
-| 3i | Alignment proof (synthetic) | §4.3 | via `parse_bytes` | `screen.line0 = 'host$ out1  out2'`; `exit_status 0`/`1` |
-| 3j | Alignment proof (real bash) | §4.3 | `kitty_tests/shell_integration.py` real PTY | `'PROMPT> '`; `echo hello-kitty`→`0`; `false`→`1` |
+| 3i | Alignment proof — synthetic *input*, real parser **[non‑canonical, supplemental]** | §4.3(a) | via `parse_bytes` | `screen.line0 = 'host$ out1  out2'`; `exit_status 0`/`1` |
+| 3j | Alignment proof — real `bash` over a genuine PTY **[canonical]** | §4.3(b) | `kitty_tests/shell_integration.py` real PTY | `'PROMPT> '`; `echo hello-kitty`→`0`; `false`→`1` |
 | 3k | Scrollback cmd‑output find | §4.3 | `kitty/history.c:475` `reverse_find "…133;C…"` | (named) |
-| 3l | **Heavy backpressure**: `BUF_SZ` 1 MiB | §4.4 | `vt-parser.c:18` | `total committed before FULL = 1048576` |
-| 3m | POLLIN gate (`has_space`) | §4.4 | `child-monitor.c:1501` (POLLOUT `:1503`); `vt-parser.c:1481` | `available space now = 0` |
-| 3n | Mutex / flush gate / max esc len | §4.4 | `vt-parser.c:206`, `:1425`, `:21` | 4 MiB surge, stable ×2 |
-| 3o | **Unstable remote**: bootstrap (trap scope **limited** — echo + temp `$tdir` only, no final‑file rollback) | §4.5 | `bootstrap.sh:10-15` (echo `:11`, `$tdir` `:13`), `:90`, `:119-120`, `:122`, `:131-133`, `:156`; `bootstrap-utils.sh:9-15`; `kittens/ssh/main.go` | **[inferred]**; unavailability stated |
+| 3l | **Heavy backpressure**: `BUF_SZ` 1 MiB | §4.4 | `kitty/vt-parser.c:18` | `total committed before FULL = 1048576` |
+| 3m | POLLIN gate (`has_space`) | §4.4 | `kitty/child-monitor.c:1501` (POLLOUT `:1503`); `kitty/vt-parser.c:1481` | `available space now = 0` |
+| 3n | Mutex / flush gate / max esc len | §4.4 | `kitty/vt-parser.c:206`, `:1425`, `:21` | 4 MiB surge, stable ×2 |
+| 3o | **Unstable remote**: bootstrap (trap scope **limited** — echo + temp `$tdir` only, no final‑file rollback) | §4.5 | `shell-integration/ssh/bootstrap.sh:10-15` (echo `:11`, `$tdir` `:13`), `:90`, `:119-120`, `:122`, `:131-133`, `:156`; `shell-integration/ssh/bootstrap-utils.sh:9-15`; `kittens/ssh/main.go` | **[inferred]**; unavailability stated |
 | 3p | Remote path unavailability | §4.5 | (no `sshd`) | `command -v sshd` → not found; `+kitten ssh --help` `EXIT=0` |
 | **Q4 — settling** |  |  |  |  |
-| 4a | Arrival→batch→wake→parse→render→settle | §5.1 | `child-monitor.c:1566` (input_delay), `:1562` `WAKEUP`→`wakeup_main_loop()`, `:1259` `main_loop`; `glfw.c:1807-1808` `glfwPostEmptyEvent()` | (narrative built from observed §2–§4) |
-| 4b | Mode 2026 enable/disable | §5.2 | `control-codes.h:235`; `screen.c:1174-1175` | verbatim handler |
-| 4c | DECRQM `;2`→`;1`→`;2` | §5.3 | `screen.c:2238` (`case PENDING_UPDATE:` `:2237`, snprintf `:2240`) | `;2$y`→`;1$y`→`;2$y`; pause_rendering(100)→`;1$y` |
+| 4a | Arrival→batch→wake→parse→render→settle | §5.1 | `kitty/child-monitor.c:1566` (input_delay), `:1562` `WAKEUP`→`wakeup_main_loop()`, `:1259` `main_loop`; `kitty/glfw.c:1807-1808` `glfwPostEmptyEvent()` | (narrative built from observed §2–§4) |
+| 4b | Mode 2026 enable/disable | §5.2 | `kitty/control-codes.h:235`; `kitty/screen.c:1174-1175` | verbatim handler |
+| 4c | DECRQM `;2`→`;1`→`;2` | §5.3 | `kitty/screen.c:2238` (`case PENDING_UPDATE:` `:2237`, snprintf `:2240`) | `;2$y`→`;1$y`→`;2$y`; pause_rendering(100)→`;1$y` |
 | 4d | Parsing continues while paused | §5.3 | (mode 2026 semantics) | `screen.line(0) while paused = 'while-paused-text'` |
-| 4e | Safety timeout 2000 ms | §5.4 | `screen.c:2521`,`:2522`; field `screen.h:160` | **[inferred]** (read from source) |
-| 4f | Auto‑resume | §5.4 | `screen.c:2489-2490` `screen_check_pause_rendering` | **[inferred]** |
+| 4e | Safety timeout 2000 ms | §5.4 | `kitty/screen.c:2521`,`:2522`; field `kitty/screen.h:160` | **[inferred]** (read from source) |
+| 4f | Auto‑resume | §5.4 | `kitty/screen.c:2489-2490` `screen_check_pause_rendering` | **[inferred]** |
 | 4g | Screen model files | §5.4 | `line.c`,`line-buf.c`,`cursor.c`,`charsets.c`,`history.c`,`modes.h` | (named) |
 
 ### 6.2 Anchor drifts encountered (verified line cited throughout)
@@ -736,7 +738,7 @@ Every named item from the four questions — each mechanism, function, condition
 - **Stability.** Every measured magnitude was identical across two runs: version banner; the three runtime constants; keystroke encodings; paste sanitize; resize dims + kernel readback; OSC 133 demux; real‑bash cmdline/exit status; the 4 MiB backpressure measurement (`1048576` cap, `0` free); and the DECRQM `;2`/`;1`/`;2` cycle.
 - **Scale.** Backpressure was driven at **4 MiB** (4× the 1 MiB cap) to force the buffer full and observe the `0`‑free / no‑`POLLIN` state.
 - **[inferred] labels.** Read‑from‑source, not runtime‑exercised: the `VSUSP`→`SIGTSTP` mapping (§2.5a); the SSH bootstrap mechanism and the whole live remote path (§4.5, unavailable — no `sshd`); the 2000 ms safety‑timeout default and its render‑loop auto‑resume (§5.4). The mode‑2026 pause/resume *toggle* itself is observed (§5.3).
-- **No non‑canonical values.** Every runtime value was taken from the genuine PTY/parser/screen path (the same code `read_bytes` feeds), the default canonical build, or the compiled extension's exported constants — none from a remote‑control socket, debug hook, fallback, or synthetic stand‑in.
+- **Canonicality of evidence.** Every runtime value in this document is canonical — taken from the genuine PTY/parser/screen path (the same code `read_bytes` feeds), the default canonical build, or the compiled extension's exported constants — **with one explicitly labeled exception**: the **supplemental** synthetic OSC 133 stream in §4.3(a), whose *input* is a hand‑crafted stand‑in and is therefore labeled **[non‑canonical]**. That single illustration is not load‑bearing — the same alignment claim is proven canonically by the real‑`bash` PTY run in §4.3(b). No value comes from a remote‑control socket or debug hook.
 - **Environment deviations reported honestly.** `fish` and `zsh` are installed here (their plain integration tests pass rather than skip); the `ssh` module reported `errors=57`. These are reported as observed, independent of any prior expectation.
 
 
@@ -851,6 +853,8 @@ Disabling building of wayland backend
  done
 BUILD EXIT=0
 ```
+
+> **Note — from‑scratch capture vs. incremental re‑verification.** The 98‑line log above is the **from‑scratch** capture: it was produced after removing the git‑ignored `build/` directory and `kitty/fast_data_types.so`, which forces `setup.py` to compile all **85** C translation units. A *subsequent* `python3 setup.py build` run **without** first removing those artifacts is **incremental** and will not reproduce the full `[N/85] Compiling …` sequence — with the artifacts already present it recompiles **0** of the 85 units and still exits `0`. This was verified directly: the incremental re‑run emitted only the `Disabling building of wayland backend` notice and the `kitty/tools/cmd` Go‑tools step, then `BUILD EXIT=0`, with **zero** `[N/85] Compiling …` lines. This is expected build‑system behavior, not a discrepancy; independently regenerating the from‑scratch log requires deleting the git‑ignored `build/` and `kitty/fast_data_types.so` again first. Either way the build exits `0` and yields the same `./kitty/launcher/kitty` and `kitty/fast_data_types.so` artifacts. (Only git‑ignored artifacts are affected by a rebuild — no tracked source file changes.)
 
 ### A.2 — `/tmp/kobs_resize.py` (full)
 
