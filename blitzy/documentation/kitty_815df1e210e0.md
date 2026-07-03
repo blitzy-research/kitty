@@ -2,7 +2,7 @@
 
 **Buffering, pausing, throttling, backpressure, storage‑quota eviction, protocol errors, and silent‑vs‑visible adaptation — answered from observed runtime evidence at HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (kitty v0.35.2).**
 
-This document answers, from directly observed runtime behavior, how the kitty terminal emulator controls the inbound and outbound flow of graphics‑protocol (`APC _G`) data when it arrives faster than the terminal can comfortably process and respond to it. Every behavioral claim is paired with the exact command that produced it and the verbatim captured output. Values that could only be established by reading the source (because they require a live GPU render loop or the I/O thread that is not present in a headless harness) are explicitly labeled **SOURCE‑CONFIRMED**; everything else is **OBSERVED**. Exact literals are cited with `file:line`.
+This document answers, from directly observed runtime behavior, how the kitty terminal emulator controls the inbound and outbound flow of graphics‑protocol (`APC _G`) data when it arrives faster than the terminal can comfortably process and respond to it. Every behavioral claim is paired with the exact command that produced it and the verbatim captured output. Values that could only be established by reading the source (because they require a live GPU render loop or the I/O thread that is not present in a headless harness) are explicitly labeled **INFERRED / SOURCE‑CONFIRMED** — i.e. *inferred* from reading the source rather than captured at runtime (still grounded in, and confirmed against, the exact code literals); everything else is **OBSERVED**. Exact literals are cited with `file:line`.
 
 ---
 
@@ -33,6 +33,7 @@ all:
 ```
 
 - **Optional tracing builds** (not required for the observations below; available per `Makefile`): `make debug` → `python3 setup.py build $(VVAL) --debug`; `make debug-event-loop` → `python3 setup.py build $(VVAL) --debug --extra-logging=event-loop`.
+- **INSTRUMENTATION: none.** None of the reported values depend on an instrumentation‑only build. The optional tracing builds above (`make debug`, `make debug-event-loop`) and the compile‑time `KITTY_PRINT_BYTES_SENT_TO_CHILD` hook were **not** used as the source of any figure in this document; every measured value comes from the default, canonical build. Any value that had required such **instrumentation** would be labeled **INSTRUMENTATION** at the point of use.
 
 ### 1.2 Version banner (verbatim)
 
@@ -156,7 +157,7 @@ When the buffer is full the event mask becomes `0` — kitty stops asking the OS
 
 - **No read when full:** `kitty/child-monitor.c:L1341`–`L1342` — `uint8_t *buf = vt_parser_create_write_buffer(...); if (!available_buffer_space) return true;`.
 
-Because the space predicate becomes false exactly when the buffer is full (which §2.1 observed happens at 1 048 576 B), `POLLIN` is withheld and the PTY is no longer drained. **SOURCE‑CONFIRMED:** the `POLLIN`‑gating line runs on kitty's dedicated I/O thread's `poll()` loop, which is not instantiated in a headless harness.
+Because the space predicate becomes false exactly when the buffer is full (which §2.1 observed happens at 1 048 576 B), `POLLIN` is withheld and the PTY is no longer drained. **INFERRED / SOURCE‑CONFIRMED:** the `POLLIN`‑gating line runs on kitty's dedicated I/O thread's `poll()` loop, which is not instantiated in a headless harness.
 
 The *consequence* of an undrained PTY is a standard POSIX guarantee, which was demonstrated directly with a real `openpty()`/`fork()` (OBSERVED, stable across 2 runs): with the master end deliberately left undrained (modeling kitty withholding `POLLIN`), the child's `write()` blocks after the kernel PTY buffer fills:
 
@@ -207,7 +208,7 @@ children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT  : 0);
 if (errno == EWOULDBLOCK || errno == EAGAIN) break;
 ```
 
-- **Resume when space frees up:** once the write buffer drains, `kitty/child-monitor.c:L442` — `if (pd.write_space_created) wakeup_io_loop(self, false);` — nudges the loop to resume reading. **SOURCE‑CONFIRMED** (I/O‑thread `poll()` loop).
+- **Resume when space frees up:** once the write buffer drains, `kitty/child-monitor.c:L442` — `if (pd.write_space_created) wakeup_io_loop(self, false);` — nudges the loop to resume reading. **INFERRED / SOURCE‑CONFIRMED** (I/O‑thread `poll()` loop).
 
 ### 3.3 The 100 MB output cap — the only place kitty drops data it is sending to the child
 
@@ -341,7 +342,7 @@ This section drives each code path **past** its limit and quotes the resulting p
 
 ### 5.1 PTY backpressure blocking the child
 
-Covered in §2.3. When the 1 MiB parse buffer saturates, `POLLIN` is withheld (`child-monitor.c:L1501`, **SOURCE‑CONFIRMED**) and the PTY stops draining; the standard POSIX consequence — the child's `write()` blocking — was demonstrated directly (OBSERVED, 2 runs): `child bytes written before its write() BLOCKED = 12288`.
+Covered in §2.3. When the 1 MiB parse buffer saturates, `POLLIN` is withheld (`child-monitor.c:L1501`, **INFERRED / SOURCE‑CONFIRMED**) and the PTY stops draining; the standard POSIX consequence — the child's `write()` blocking — was demonstrated directly (OBSERVED, 2 runs): `child bytes written before its write() BLOCKED = 12288`.
 
 ### 5.2 Coalesced input processing near `input_delay`
 
@@ -384,6 +385,19 @@ IMAGE_DIM s=10000 at-limit -> 'ENODATA:Insufficient image data: 1 < 40000'
 ```
 
 **Root cause (traced in source, reported exactly as observed):** the dimension `ABRT` at `graphics.c:L695` fires *before* the command's image id is recorded into `currently_loading.start_command` (assigned later at `graphics.c:L717`). The `ABRT` macro calls `free_load_data`, and `finish_command_response()` then finds no id/image‑number and returns `NULL` — so no response is written. By contrast, the PNG‑size `EINVAL` at `graphics.c:L638` runs *inside* `initialize_load_data()` **after** `start_command = *g` (`graphics.c:L634`), so it *does* emit a response (§5.3). The dimension limit is still enforced (the oversize image is rejected — `s=10000` at‑limit shows the request proceeding to the data‑length check `ENODATA:Insufficient image data: 1 < 40000`); only the *visible reply* differs. This is reported as observed rather than adjusted toward the expected `EINVAL:Image too large`.
+
+**State-dependent sibling variant — the same over‑dimension condition *does* emit `EINVAL:Image too large` after a prior graphics command** (enumerated for exhaustiveness; **OBSERVED**, native run 1 == run 2 == Docker, driven over the genuine `APC _G` path). Whether the visible reply appears depends on the `GraphicsManager` state at the moment of the abort:
+
+```console
+$ kitty +launch dimension_state.py
+fresh s=10001 -> None
+fresh v=10001 -> None
+pre OK -> 'OK'
+after_success s=10001 -> 'EINVAL:Image too large'
+after_success v=10001 -> 'EINVAL:Image too large'
+```
+
+**Cause → effect (traced in source, confirmed by the run above):** the response emitter `finish_command_response()` is handed `lg = &self->currently_loading.start_command` (`graphics.c:L2177,L2180`) and only writes a reply when `lg->id || lg->image_number` is non‑zero (`graphics.c:L765`). On a **fresh** screen `start_command` is all‑zero, so after the `L695` abort `lg->id == 0` and no reply is emitted (the fresh‑add case above). After a **prior successful** command, `start_command.id` was populated (`graphics.c:L717`) and — crucially — `free_load_data()` (`graphics.c:L103`) clears `buf`/`mapped_file`/`loading_for` but **not** `start_command`; so the retained non‑zero `lg->id` makes `finish_command_response()` emit the `EINVAL:Image too large` string that the `L695` abort placed into `command_response`. Net: the dimension limit is always enforced (the oversize image is always rejected); only *whether the client sees a wire reply* is state-dependent — no response on a fresh add, `EINVAL:Image too large` once any earlier graphics command has run. Reported exactly as observed.
 
 ### 5.5 Graphics storage quota — 320 MiB → silent LRU eviction
 
@@ -463,8 +477,10 @@ Two observations reported exactly as seen: (1) `icat` sends `q=2` (quiet — sup
 | --- | --- | --- |
 | PNG payload `S=400000001` | `EINVAL:PNG data size too large` | `graphics.c:L638` |
 | RGBA transfer overflow | `EFBIG:Too much data` | `graphics.c:L533` |
-| Dimension `s=10001`/`v=10001` | *(no wire response — see §5.4 root cause)* | `graphics.c:L695` |
-| Successful load, no quiet | `OK` | `graphics.c:L759-777` |
+| Dimension `s=10001`/`v=10001` — **fresh add** | *(no wire response — see §5.4 root cause)* | `graphics.c:L695` |
+| Dimension `s=10001`/`v=10001` — **after a prior graphics command** | `EINVAL:Image too large` (state-dependent sibling — see §5.4) | `graphics.c:L695,L765,L2177` |
+| Successful load, `q=0` (or omitted `q`) | `OK` | `graphics.c:L759-777` |
+| Bad data, `q=0` (or omitted `q`) | `ENODATA:Insufficient image data: 4 < 400` (failure shown) | `graphics.c:L762` |
 | Successful load, `q=1` | *(suppressed → None)* | `graphics.c:L762` |
 | Bad data, `q=1` | `ENODATA:Insufficient image data: 4 < 400` (failure still shown) | `graphics.c:L762` |
 | Bad data, `q=2` | *(suppressed → None)* | `graphics.c:L762` |
@@ -480,7 +496,7 @@ kitty does **both**: most flow control is silent, but a few conditions produce v
 | Silent mechanism | What happens | Evidence / source |
 | --- | --- | --- |
 | **Input coalescing** | Bytes are batched for up to `input_delay` (3 ms) instead of parsed per‑read | `vt-parser.c:L1425`; buffer‑fill OBSERVED §2.1 |
-| **`POLLIN` de‑registration** | When the 1 MiB buffer is full, kitty stops asking to read; no error, no drop | `child-monitor.c:L1501`, `vt-parser.c:L1477-1481` (SOURCE‑CONFIRMED) |
+| **`POLLIN` de‑registration** | When the 1 MiB buffer is full, kitty stops asking to read; no error, no drop | `child-monitor.c:L1501`, `vt-parser.c:L1477-1481` (INFERRED / SOURCE‑CONFIRMED) |
 | **Kernel PTY backpressure** | Undrained PTY → the child's `write()` blocks | OBSERVED §2.3 (`... BLOCKED = 12288`) |
 | **Disk‑cache offload** | Image bytes silently moved off‑RAM to disk | OBSERVED §5.6 (`size_on_disk ... 4194304`) |
 | **Storage‑quota LRU eviction** | Over 320 MiB, oldest images silently evicted; new image still accepted | OBSERVED §5.5 (`non-OK responses during load: 0`) |
@@ -492,12 +508,14 @@ kitty does **both**: most flow control is silent, but a few conditions produce v
 | **Output 100 MB cap** | `log_error` to stderr, data dropped | OBSERVED §3.3 — `[0.479] Too much data being sent to child with id: 1, ignoring it` (`child-monitor.c:L341-343`) |
 | **Graphics `EFBIG`** | `APC _G` reply `EFBIG:Too much data` | OBSERVED §5.3 (`graphics.c:L533`) |
 | **Graphics `EINVAL` (PNG size)** | `APC _G` reply `EINVAL:PNG data size too large` | OBSERVED §5.3 (`graphics.c:L638`) |
-| **Graphics `EINVAL` (dimension)** | `APC _G` reply `EINVAL:Image too large` **in code**; §5.4 shows the fresh‑add path emits *no* reply due to abort ordering | SOURCE `graphics.c:L695,L1553`; OBSERVED discrepancy §5.4 |
+| **Graphics `EINVAL` (dimension)** | `APC _G` reply `EINVAL:Image too large`; **state-dependent** (§5.4): fresh‑add emits *no* reply due to abort ordering, but after a prior graphics command the same condition **does** emit `EINVAL:Image too large` | OBSERVED §5.4 (`graphics.c:L695,L765,L1553`) |
 | **Pending/synchronized mode termination** | `screen_stop_pending_mode` + a `REPORT_ERROR` naming the cause | OBSERVED §6.3 |
 
 ### 6.3 Pending / synchronized output mode (DEC private mode 2026) — visible termination signals
 
 kitty's “pending mode” is the industry **Synchronized Output** feature (DEC private mode **2026**: `CSI ? 2026 h` to begin, `CSI ? 2026 l` to end; also BSU/ESU) for atomic, tearing‑free updates; kitty additionally accepts the older iTerm2‑style DCS form `ESC P = 1 s` / `ESC P = 2 s` (`vt-parser.c:L638-648`). *(Terminology cross‑referenced externally; the codebase and observed output remain authoritative.)*
+
+kitty's own documentation frames this feature under the same "Synchronized update" name: `docs/performance.rst:L109-L110` — "konsole, gnome-terminal and xterm do not support the `Synchronized update … escape code used to suppress rendering`" — confirming that pending mode is the *rendering‑suppression* mechanism whose implementation lives in `screen.c` (`screen_pause_rendering()`, `PENDING_MODE`) and `vt-parser.c` (the DCS toggle at `L638-648`). The `docs/performance.rst` note (**INFERRED / SOURCE‑CONFIRMED**: read from the shipped docs, not a runtime capture) is the repository's synchronized‑update framing referenced by the AAP.
 
 **Status query and toggles** (OBSERVED, native + Docker, 2 runs). The status reply bit is driven by `screen.c:L2238` (`ans = self->paused_rendering.expires_at ? 1 : 2;`):
 
@@ -513,7 +531,7 @@ DCS =2s cmd dump   -> [('screen_stop_pending_mode',)]
 **All pending‑mode termination causes, enumerated exhaustively:**
 
 1. **Explicit stop** — `CSI ?2026l` or DCS `=2s`. **OBSERVED** → state returns to `;2$y` (above).
-2. **Timeout (default 2000 ms)** — **SOURCE‑CONFIRMED.** `screen.c:L2521` — `if (for_in_ms <= 0) for_in_ms = 2000;` sets `expires_at` (`L2522`); `screen_check_pause_rendering()` (`L2489-2490`) ends pending mode once `now > expires_at`. This check is invoked **only** from the GPU render path `prepare_to_render_os_window()` (`child-monitor.c:L729`), which requires a live display; it is therefore not exercisable in a headless harness and is labeled SOURCE‑CONFIRMED rather than OBSERVED.
+2. **Timeout (default 2000 ms)** — **INFERRED / SOURCE‑CONFIRMED.** `screen.c:L2521` — `if (for_in_ms <= 0) for_in_ms = 2000;` sets `expires_at` (`L2522`); `screen_check_pause_rendering()` (`L2489-2490`) ends pending mode once `now > expires_at`. This check is invoked **only** from the GPU render path `prepare_to_render_os_window()` (`child-monitor.c:L729`), which requires a live display; it is therefore not exercisable in a headless harness and is labeled INFERRED / SOURCE‑CONFIRMED rather than OBSERVED.
 3. **Disruptive screen operations** — each calls `screen_pause_rendering(self, false, 0)`: `screen_reset` (`screen.c:L163`), `screen_resize` (`L347`), `dirty_scroll` (`L1910`), `screen_start_selection` (`L4155`). **OBSERVED** that a full RIS reset (`ESC c`) and a resize terminate pending mode; reported faithfully, a plain line‑feed scroll and an `ED (CSI 2J)` did **not** (they do not reach `dirty_scroll`):
 
 ```console
@@ -534,21 +552,30 @@ STOP-when-not-pending dump -> [('screen_stop_pending_mode',), ('Pending mode sto
 double-START dump  -> [('screen_start_pending_mode',), ('Pending mode start requested while already in pending mode. This is most likely an application error.',)]
 ```
 
-On the phrase “**too much data in pending mode**”: a repository‑wide search found **no** separate pending‑mode byte counter — the only bounds on data accumulated while rendering is paused are the 2000 ms timeout (cause 2) and the global 1 MiB `BUF_SZ` parse ceiling (§2.1). The wording describes the *purpose* of the timeout‑bounded protection, not an additional independent limit. (SOURCE‑CONFIRMED via exhaustive grep of `paused_rendering` in `screen.c`.)
+On the phrase “**too much data in pending mode**”: a repository‑wide search found **no** separate pending‑mode byte counter — the only bounds on data accumulated while rendering is paused are the 2000 ms timeout (cause 2) and the global 1 MiB `BUF_SZ` parse ceiling (§2.1). The wording describes the *purpose* of the timeout‑bounded protection, not an additional independent limit. (INFERRED / SOURCE‑CONFIRMED via exhaustive grep of `paused_rendering` in `screen.c`.)
 
 ### 6.4 Quiet levels modulate visibility — a visible sign can be intentionally silenced
 
 Whether a graphics “visible sign” is actually emitted depends on the command's quiet level `q`:
 
 - **Literal:** `graphics.c:L762` (within `finish_command_response`, `L759-777`) — `if (g->quiet) { if (is_ok_response || g->quiet > 1) return NULL; }`.
-  - `q=1` suppresses **OK** responses (success goes silent; failures still reported).
-  - `q=2` additionally suppresses **failure** responses (even errors go silent).
-- Docs corroborate: `docs/graphics-protocol.rst:L767-768` — “Set it to ``1`` to suppress ``OK`` responses and to ``2`` to suppress failure responses.”
 
-**OBSERVED** (native + Docker, 2 runs):
+All three quiet levels, enumerated exhaustively with the causal reason for each:
+
+| `q` value | Effect | Why (cause → effect) |
+| --- | --- | --- |
+| `q=0` (**all**) — the default, also selected by **omitting** the `q` key | **Every** response is emitted — both `OK` successes and every failure/error | `q=0` (or an absent `q`) leaves `g->quiet == 0`, so the `if (g->quiet)` guard at `graphics.c:L762` is **false** and the suppression branch never runs; nothing is silenced |
+| `q=1` | Suppresses **OK** responses (success goes silent; failures still reported) | `g->quiet == 1` is truthy, so `if (is_ok_response …) return NULL` silences the OK case; the `g->quiet > 1` sub‑condition is false, so failures are still emitted |
+| `q=2` | **Additionally** suppresses **failure** responses (even errors go silent) | `g->quiet == 2`, so `g->quiet > 1` is true and `return NULL` fires for *any* response — OK **and** failure |
+
+- Docs corroborate: `docs/graphics-protocol.rst:L767-768` — “Set it to ``1`` to suppress ``OK`` responses and to ``2`` to suppress failure responses.” (The unset/`0` value — all responses — is the documented default when the `q` key is omitted.)
+
+**OBSERVED** (native run 1 == run 2 == Docker) — driven over the genuine `APC _G` path. The explicit `q=0` (and the equivalent omitted‑`q`) case emits both the success `OK` **and** the failure, i.e. nothing is suppressed; `q=1`/`q=2` then progressively silence:
 
 ```console
 $ kitty +launch graphics_limits.py
+QUIET success q=0 (expect OK) -> 'OK'
+QUIET q=0 bad-data (expect failure) -> 'ENODATA:Insufficient image data: 4 < 400'
 QUIET success no-q (expect OK) -> 'OK'
 QUIET success q=1 (expect None) -> None
 QUIET q=1 bad-data (expect failure) -> 'ENODATA:Insufficient image data: 4 < 400'
@@ -583,9 +610,12 @@ QUIET q=2 bad-data (expect None) -> None
 | **400 000 000‑byte `MAX_DATA_SZ` → `EFBIG`** | `graphics.c:L521,L533` | §5.3 |
 | PNG‑size sibling → `EINVAL` | `graphics.c:L638` | §5.3 |
 | **10 000‑px `MAX_IMAGE_DIMENSION` → `EINVAL`** (both checks) | `graphics.c:L674,L695,L1553` | §5.4 |
+| Dimension response — state-dependent sibling | fresh add → no reply; after prior cmd → `EINVAL:Image too large` (`graphics.c:L695,L765,L2177`) | §5.4, §5.8 |
 | Disk‑cache add / read / remove / defrag | `disk-cache.c:L488/591/517/232` | §5.6 |
+| Quiet level `q=0` (all — default / omitted `q`) | `graphics.c:L762` (`if (g->quiet)` false) | §6.4 |
 | Quiet level `q=1` (suppress OK) | `graphics.c:L762` | §6.4 |
 | Quiet level `q=2` (suppress failures) | `graphics.c:L762` | §6.4 |
+| Synchronized‑update framing (repo docs) | `docs/performance.rst:L109-L110` | §6.3 |
 | Pending termination — explicit stop | `vt-parser.c:L644-645` | §6.3 |
 | Pending termination — timeout 2000 ms | `screen.c:L2521,L2489-2490` | §6.3 |
 | Pending termination — disruptive ops | `screen.c:L163/347/1910/4155` | §6.3 |
@@ -604,9 +634,9 @@ QUIET q=2 bad-data (expect None) -> None
 ### 7.3 Evidence discipline & labels used
 
 - **OBSERVED:** runtime‑captured, stable across ≥2 runs, cross‑checked in the canonical Docker image where applicable — includes: `BUF_SZ` ceiling, buffer‑fill sequence, the **100 MB cap log line**, `EFBIG`, PNG `EINVAL`, dimension no‑response discrepancy, 320 MiB storage LRU eviction, disk‑cache offload, real `icat` chunk framing, quiet levels, pending‑mode toggles/status/errors, RIS/resize termination, PTY backpressure substrate.
-- **SOURCE‑CONFIRMED (not headlessly observable):** `POLLIN`/`POLLOUT`/`EAGAIN`/wakeup gating (kitty's I/O‑thread `poll()` loop) and the pending‑mode **2000 ms timeout expiry** (only reached from the GPU render path `child-monitor.c:L729`). These are grounded in exact source literals.
-- **Discrepancies reported exactly as observed (not adjusted):** (a) over‑dimension image aborts emit **no** wire response on the fresh‑add path (§5.4, abort‑ordering root cause); (b) real `icat` uses **131 072‑byte** base64 chunks, larger than the docs' conservative ≤4096‑byte figure (§5.7).
-- No value here was produced by a bypassing remote‑control interface; all graphics observations used the genuine `APC _G` path (real `icat` and/or raw `_G` into the real `Screen`/`vt_parser`).
+- **INFERRED / SOURCE‑CONFIRMED** (**inferred** from reading the source — not headlessly observable, but grounded in exact code literals): `POLLIN`/`POLLOUT`/`EAGAIN`/wakeup gating (kitty's I/O‑thread `poll()` loop) and the pending‑mode **2000 ms timeout expiry** (only reached from the GPU render path `child-monitor.c:L729`). These are grounded in exact source literals.
+- **Discrepancies reported exactly as observed (not adjusted):** (a) over‑dimension image aborts emit **no** wire response on the fresh‑add path, but the *same* over‑dimension condition emits `EINVAL:Image too large` **after a prior graphics command** — a state-dependent sibling driven by whether `start_command.id` is populated when the abort runs (§5.4, abort‑ordering root cause); (b) real `icat` uses **131 072‑byte** base64 chunks, larger than the docs' conservative ≤4096‑byte figure (§5.7).
+- **NON-CANONICAL: none.** No value in this document comes from a bypassing remote‑control interface or debug hook; all graphics observations used the genuine `APC _G` path (real `icat` and/or raw `_G` into the real `Screen`/`vt_parser`). Had any **non-canonical** value been used, it would be labeled **NON-CANONICAL** at the point of use.
 
 ### 7.4 Cleanup / read‑only scope
 
