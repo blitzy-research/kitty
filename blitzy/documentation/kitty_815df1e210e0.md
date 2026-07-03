@@ -63,15 +63,23 @@ kitty is a GPU-based terminal and `choose-fonts` is an interactive TUI. This con
 - The **full kitty GUI** (needed only for Q1's "single default instance" in §3.3 and for the live-reload demonstration in §10.1) was run headless under `xvfb-run` with software OpenGL (`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`).
 - The **`choose-fonts` kitten** (a terminal program, not a GPU app) was driven through a small PTY harness (`/tmp/blitzy_harness/cf_pty.py`, a temporary observation script, since removed) that `exec`s the real `kitty/launcher/kitten choose-fonts` and emulates a real terminal so the genuine code path runs end-to-end. The exact invocation form was `python3 cf_pty.py --cfgdir DIR --filter "Fira Code" --final enter|s [--reload-in parent|all|none] --kitty <abs path to kitty>`.
 
-Two real-terminal behaviors had to be emulated, **each verified by observation**:
+First, the PTY had to be given a **non-zero window size**. kitty derives its cell metrics by dividing the terminal's pixel size by its row/column count — `s.CellWidth = s.WidthPx / s.WidthCells` and `s.CellHeight = s.HeightPx / s.HeightCells` (`tools/tui/loop/run.go:L80-L81`), reached from the family-listing pane's `lp.ScreenSize()` call (`kittens/choose_fonts/list.go:L176`). Under a **zero-size** PTY the row/column count is `0`, so *this build* aborts with an integer division by zero — observed verbatim when the harness left the PTY at winsize `0×0`:
 
-1. **The kitten queries the terminal** for color/DPI via kitty's DCS `+q` protocol — driven from `ui.go:L80`, `lp.QueryTerminal("font_size", "dpi_x", "dpi_y", "foreground", "background")`. A bare PTY that never answers those queries makes *this build* abort — observed verbatim:
+```text
+Panicked with error: runtime error: integer divide by zero
+```
+
+A controlled two-scenario run isolates the cause — winsize `0×0` (queries left unanswered) → the panic above, and the family list is never reached; winsize `40×120` (queries **still** unanswered) → **no** divide-by-zero, and the family-listing pane renders normally. The panic is therefore caused by the **window size**, not by the font/DPI queries described below; the harness sizes the PTY (e.g. `40×120`) to avoid it.
+
+Two real-terminal behaviors then had to be emulated, **each verified by observation**:
+
+1. **The kitten queries the terminal** for color/DPI via kitty's DCS `+q` protocol — driven from `ui.go:L80`, `lp.QueryTerminal("font_size", "dpi_x", "dpi_y", "foreground", "background")`. The responses populate `text_style` (`ui.go:L114`, `on_query_response`), which the **faces** stage then sends to the Python backend to render the previews (`faces.go:L60`). If those queries go unanswered, `foreground`/`background` stay empty and the backend aborts *at the faces stage* with a color-parse error — observed verbatim (PTY sized at `40×120`, queries left unanswered, after advancing past the family list):
 
    ```text
-   Panicked with error: runtime error: integer divide by zero
+   ValueError: Invalid color name:
    ```
 
-   (font size / DPI come back as `0`, so a later cell-metric division is by zero). Note this is the **actual** observed failure at this commit — not a color-parse error. The harness answers the real `kitty-query-*` DCS requests (`font_size=11.0`, `dpi_x=96.0`, `dpi_y=96.0`, `foreground=#ffffff`, `background=#000000`), after which the **real kitten** runs with no error.
+   raised at `kitty/rgb.py:L73` (`raise ValueError(f'Invalid color name: {raw}')`), reached via `kitty/conf/utils.py:L60` `to_color`. This failure is **distinct** from the window-size divide-by-zero above: with the PTY sized but the queries unanswered there is *no* divide-by-zero — only this color error, and only once the faces stage is reached. The harness therefore answers the real `kitty-query-*` DCS requests (`font_size=11.0`, `dpi_x=96.0`, `dpi_y=96.0`, `foreground=#ffffff`, `background=#000000`), after which the **real kitten** runs with no error.
 
 2. **The kitten enables the kitty keyboard protocol** (`CSI > <flags> u`, `tools/tui/loop/terminal-state.go:L140`), under which `Enter` arrives as `CSI 13 u` (CSI number `13` → functional `ENTER`, `tools/tui/loop/key-encoding.go:L17,L187-L189`). A bare carriage return is therefore *not* seen as Enter — observed at the family-listing pane after typing a filter:
 
@@ -82,7 +90,7 @@ Two real-terminal behaviors had to be emulated, **each verified by observation**
 
    The harness therefore delivers `Enter` as `\x1b[13u` (and `s` at the final pane as `\x1b[115;1;115u`, per §8.1).
 
-With those two details handled, the **entire** `choose-fonts` flow — scanning → family listing → faces → final confirmation → **Enter** patching `kitty.conf`, the **`s`** contrast (§9.4), and the **`--reload-in`** live-reload (§10.1) — was exercised through the genuine kitten via its real entry point (`kitten choose-fonts`). **Nothing was replaced by a synthetic stand-in**: even the post-write `SIGUSR1` reload was triggered by the real kitten's own `--reload-in` finalization against a live kitty GUI (§10.1). The only difference from a normal user's machine is that the GUI ran headless under Xvfb with software GL.
+With the PTY sized and those two behaviors handled, the **entire** `choose-fonts` flow — scanning → family listing → faces → final confirmation → **Enter** patching `kitty.conf`, the **`s`** contrast (§9.4), and the **`--reload-in`** live-reload (§10.1) — was exercised through the genuine kitten via its real entry point (`kitten choose-fonts`). **Nothing was replaced by a synthetic stand-in**: even the post-write `SIGUSR1` reload was triggered by the real kitten's own `--reload-in` finalization against a live kitty GUI (§10.1). The only difference from a normal user's machine is that the GUI ran headless under Xvfb with software GL.
 
 ---
 
@@ -188,9 +196,24 @@ From inside a running kitty instance, the kitten is invoked as:
 
 ```bash
 kitten choose-fonts
-# equivalently:
-kitty +kitten choose-fonts
 ```
+
+This is the direct Go command registered in the kitten tool tree (`tools/cmd/tool/main.go:L82`, `choose_fonts.EntryPoint(root)`), and it is the form exercised for every runtime observation in this document.
+
+**Observed caveat — at this pinned commit `kitty +kitten choose-fonts` is a silent no-op, so it is _not_ an equivalent invocation.** The `+kitten` form dispatches through the Python runner: `kitty/entry_points.py:L192` (`main`) → `:L146` (`namespaced`) → `run_kitten` (`entry_points.py:L118`) → `kittens/runner.py:L110` (`run_kitten`). There `resolved_kitten` (`runner.py:L23-L26`) maps `choose-fonts` → `choose_fonts`, and because `choose_fonts ∈ all_kitten_names()` (`runner.py:L115`) it runs `runpy.run_module('kittens.choose_fonts.main')` (`runner.py:L116`). But `kittens/choose_fonts/main.py` is **0 bytes** at this commit, so nothing runs — observed verbatim:
+
+```console
+$ kitty/launcher/kitty +kitten choose-fonts --help
+# → exit 0; 0 bytes on stdout, 0 bytes on stderr (silent no-op)
+$ kitty/launcher/kitten choose-fonts --help
+Usage: kitten choose-fonts …
+# → exit 0; 463 bytes of real help (works)
+$ kitty/launcher/kitty +kitten themes --help
+Usage: kitten themes [options] …
+# → exit 0; 1383 bytes (a *wrapped* kitten works via +kitten)
+```
+
+The contrast with `themes` shows the mechanism: `themes` is a *wrapped* kitten whose `main.py` bridges to the Go tool, so `kitty +kitten themes` works; `choose_fonts` is **not** wrapped and its `main.py` is empty, so `kitty +kitten choose-fonts` does nothing. The working invocation at this commit is therefore the direct Go command **`kitten choose-fonts`** (equivalently spelled `kitten choose_fonts`, the visible clone of §5).
 
 The official docs recommend exactly this — running the `kitten choose-fonts` command to select fonts through its UI.
 
@@ -525,7 +548,7 @@ The final pane draws four action lines (`kittens/choose_fonts/final.go:L33-L45`)
 
 ### 8.2 `serialized()` — the exact four keys and spacing
 
-The settings are serialized to exactly four lines, each key padded so the values align to column 17 — `kittens/choose_fonts/final.go:L63-L70`:
+The settings are serialized to exactly four lines, each key right-padded with trailing spaces to a fixed field width of 17 characters, so every value begins at column 18 (1-indexed) — `kittens/choose_fonts/final.go:L63-L70`:
 
 ```go
 func (self faces_settings) serialized() string {
@@ -610,7 +633,7 @@ bold_italic_font auto$
 # END_KITTY_FONTS
 ```
 
-The `cat -A` output (with `$` marking line ends) confirms the exact column-17 alignment from `serialized()` (§8.2). The mode `0644` matches the `Patcher` default (see §9.3, `tools/config/api.go:L311-L313`).
+The `cat -A` output (with `$` marking line ends) confirms the exact 17-character key field width from `serialized()` (§8.2) — every value begins at column 18 (1-indexed). The mode `0644` matches the `Patcher` default (see §9.3, `tools/config/api.go:L311-L313`).
 
 > _Why `font_family` is `family="Fira Code"` while the others are `auto`:_ when a family is selected fresh, `font_family` is written as a `family=` spec and the bold/italic/bold-italic variants are left as `auto`, which (per the official docs) means kitty auto-derives those variants from the chosen family. The `serialized()` function emits whatever `faces_settings` currently holds; §9.4 shows a different, resolved-face example produced by the `s` key.
 
@@ -909,7 +932,7 @@ The observed behavior was cross-checked against the official kitty documentation
 Every named item from the question is addressed and cross-referenced below. Items proven by observed runtime output are marked **[observed]**; items established purely from source reading are marked **[inferred]**.
 
 - **[x] Q1 — Build from source & run a default instance** — §3. `./dev.sh build` → `Build successful.` **[observed]**; binaries at `kitty/launcher/{kitty,kitten}` v0.35.2 **[observed]**; `docs/build.rst:L14-L22` + caveat `L35-L37`; `dev.sh:L9`; `go.mod:L3`; `pyproject.toml:L2`; launch under ephemeral `KITTY_CONFIG_DIRECTORY` **[observed]**.
-- **[x] Q2 — Invoking `choose-fonts`** — §4. `kitten choose-fonts` / `kitty +kitten choose-fonts`; captured scanning/listing/faces/final screens **[observed]**; Go-frontend + Python-backend split (`backend.go:L41` `+runpy`; `backend.py:L150-L168`; `kitty/fonts/list.py`).
+- **[x] Q2 — Invoking `choose-fonts`** — §4. The working invocation is `kitten choose-fonts` (the direct Go command); captured scanning/listing/faces/final screens **[observed]**. At this pinned commit `kitty +kitten choose-fonts` is a silent no-op — empty `kittens/choose_fonts/main.py` and `choose_fonts ∉ wrapped_kitten_names()` — **[observed]**, so it is not an equivalent form. Go-frontend + Python-backend split (`backend.go:L41` `+runpy`; `backend.py:L150-L168`; `kitty/fonts/list.py`).
 - **[x] Q3a — Subcommand registration** — §5. `tools/cmd/tool/main.go:L82`; `EntryPoint`/`AddSubCommand` (`main.go:L74-L85`); `Run` closure → `GetOptionValues` → `main(&opts)`.
 - **[x] Q3b — Option parsing** — §6. Single `--reload-in` (`main.go:L86-L95`); one-field `Options` (`main.go:L70-L72`); confirmed via `--help` **[observed]**.
 - **[x] Q3c — Option-value flow** — §7. `opts` → `main` (`main.go:L16`) → `handler{opts}` (`main.go:L35`, `ui.go:L42-L62`) → panes (`ui.go:L81`) → consumed only at `final.go:L87`; preselect `list.go:L170` **[observed]**; transitions `list.go:L250`, `faces.go:L120`.
