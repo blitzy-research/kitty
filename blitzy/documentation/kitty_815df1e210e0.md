@@ -22,22 +22,33 @@ configuration are labeled **(non-canonical)**.
 ### The exact investigation environment
 
 - **Repository under investigation (read-only):** the working tree at
-  `/tmp/blitzy/kitty/blitzy-9c2d02b8-f915-4bb9-9b5a-f4f809a35c60_df1353`, at HEAD
-  `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (commit *"Wire up applying of font config"*). The tree
-  was **byte-for-byte unchanged** throughout the investigation (`git status --porcelain` empty).
+  `/tmp/blitzy/kitty/blitzy-9c2d02b8-f915-4bb9-9b5a-f4f809a35c60_df1353`. The **source baseline under
+  investigation** — the kitty checkout whose behavior these answers describe — is commit
+  `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (*"Wire up applying of font config"*). That baseline is
+  **distinct from the current destination-branch `HEAD`**: the destination branch carries one
+  additional commit that adds *this* answer document under `blitzy/documentation/` (and its `HEAD`
+  hash changes again each time the document is re-committed), so `git rev-parse HEAD` here is **not**
+  the baseline hash. What stays invariant is that the **source tree is byte-for-byte unchanged**
+  versus the baseline — the *only* path ever added under the repo is `blitzy/documentation/`, verified
+  below with `git diff --name-status` against the fixed baseline commit.
 - **Canonical interpreter used for all runtime probes:** **Python 3.12.3**, from the prepared build
   venv `/opt/kitty-venv`. This matches the version kitty is canonically built/run with.
 - **Observed environment deviations (reported honestly, per "observe, don't assume"):**
   - The default `python3` on this shell is **Python 3.13.7**, *not* 3.12.3 — so all probes were run
     with the 3.12.3 venv explicitly to stay canonical.
-  - `go` **is present** here (`go version go1.24.4 linux/amd64`), contrary to a prior note that it
-    was absent. Building is nonetheless **out of scope**: the whole point of Q3/Q4 is to observe the
-    *uncompiled* failure state, and building would erase it.
-- **Canonical build / version banner:** the compiled `kitty` launcher + `fast_data_types` extension
-  are produced by the user-provided Docker image
+  - `go` **is present** here (`go version go1.24.4 linux/amd64`), and so are `cc`/`gcc` 15.2.0 — this
+    shell *is* the user-provided canonical build/run environment. The Q1–Q4 *failure* observations are
+    nevertheless captured against the **uncompiled** checkout (with `kitty/fast_data_types*.so`
+    absent), because that missing-extension state is the exact condition the questions ask about.
+- **Canonical build / version banner:** the compiled startup banner is a genuinely **observed** value,
+  not an attributed one. A default, canonical build was performed **in this environment** — which is
+  the user-provided Docker build/run image
   `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
-  (from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`). No build was performed in
-  this shell; the running startup banner is **attributed to that Docker environment**.
+  (from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`) — to produce the launcher +
+  `fast_data_types` extension and read the banner verbatim (see the *Version & default configuration*
+  section). The transient build artifacts were then removed (`git clean -dfx -e blitzy`) to restore
+  the uncompiled state, so the source tree stays byte-for-byte unchanged and the Q3/Q4 failures below
+  reproduce exactly.
 
 The environment facts, captured verbatim:
 
@@ -52,10 +63,11 @@ $ cc --version | head -1
 cc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
 $ gcc --version | head -1
 gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
-$ git rev-parse HEAD
-815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
-$ git status --porcelain | wc -l  (0 = clean)
-0
+$ git log --oneline -1 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   (source baseline under investigation)
+815df1e21 Wire up applying of font config
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 -- . ':(exclude)blitzy'   (source tree vs baseline; empty ⇒ unchanged)
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   (full diff vs baseline; only the deliverable)
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 A single unifying thread runs through all four answers: **one missing compiled artifact,
@@ -198,10 +210,13 @@ GPU shaders draw, and Python wires it all together.
 terminal is not something I expected, so what role do those files play and how central are they to
 the system?"*
 
-**Answer (up front):** the `.glsl` files are the **entire rendering path**. kitty draws its grid of
-cells, its images, its window borders, and its background image **on the GPU**, and these shaders
-are the programs the GPU runs. There is **no CPU text-drawing fallback**, so they are not an
-optional extra — they are *the* way pixels reach the screen.
+**Answer (up front):** the `.glsl` files are kitty's **rendering path**. kitty draws its grid of
+cells, its images, its window borders, and its background image **on the GPU**, and these shaders are
+the programs the GPU runs. **(inferred, from reading `kitty/shaders.py` + the render code)** they are
+in fact the **entire** rendering path — there is **no CPU text-drawing fallback** — so they are not
+an optional extra but *the* way pixels reach the screen. (This "sole path / no fallback" claim is
+labeled inferred because it derives from reading the render code, not from exercising the GL
+pipeline; the supporting basis is in §2.5–§2.6.)
 
 ### 2.1 Full inventory — all 13 `kitty/*.glsl` files
 
@@ -360,12 +375,12 @@ with different `#define`s drawn from `cell_defines.glsl`.
 
 ### 2.6 Centrality
 
-**How central are the shaders?** Totally central: they are the **sole rendering path**. Glyphs,
-images, borders, and the background all reach the screen only through these GL programs; there is
-**no CPU text-drawing fallback** in the render path. **(inferred, from reading)** the drawing code
-routes exclusively through the compiled GL programs listed above — there is no alternative "draw
-text with the CPU" branch — so if the shaders (or the C extension that compiles them) are
-unavailable, nothing is drawn at all.
+**How central are the shaders?** Totally central. **(inferred, from reading `kitty/shaders.py` and
+the render code)** they are the **sole rendering path**: glyphs, images, borders, and the background
+all reach the screen only through these GL programs, and there is **no CPU text-drawing fallback** —
+the drawing code routes exclusively through the compiled GL programs listed above, with no
+alternative "draw text with the CPU" branch. So if the shaders (or the C extension that compiles
+them) are unavailable, nothing is drawn at all.
 
 
 ---
@@ -384,7 +399,7 @@ the type stub `kitty/fast_data_types.pyi` — the compiled `*.so` has not been b
 ### 3.1 The verbatim failure (real entry point, bare interpreter)
 
 ```text
-$ PYTHONDONTWRITEBYTECODE=1 python3 -B __main__.py
+$ PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B __main__.py
 Traceback (most recent call last):
   File "/tmp/blitzy/kitty/blitzy-9c2d02b8-f915-4bb9-9b5a-f4f809a35c60_df1353/__main__.py", line 7, in <module>
     main()
@@ -437,13 +452,13 @@ install this is guaranteed because the native launcher embeds CPython [kitty/lau
 the build always assembles the extension [setup.py:1091]; a bare `python3 __main__.py` skips the
 launcher and the build, so the wiring has nothing to connect to.
 
-### 3.4 A distinct, non-canonical contrast: `python3 -m kitty`
+### 3.4 A distinct, non-canonical contrast: `/opt/kitty-venv/bin/python3 -m kitty`
 
 **(non-canonical)** Invoking the *package* with `-m` is **not** the real entry point and fails
 *differently* — before it can even reach the native import:
 
 ```text
-$ python3 -B -m kitty
+$ /opt/kitty-venv/bin/python3 -B -m kitty
 /opt/kitty-venv/bin/python3: No module named kitty.__main__; 'kitty' is a package and cannot be directly executed
 ```
 
@@ -489,16 +504,17 @@ actually happens, and what does that reveal about how modular the system really 
 **Answer (up front):** the Python kittens are **not** independent. Whether launched as a bare
 script, through the real `+kitten` dispatcher, or imported transitively, they end up depending on
 the `kitty` package and — directly or via the shared `kittens/tui/*` framework — on the **same
-native `fast_data_types` bridge** that breaks Q3. Modularity is real at the *source-organization*
-level, but *runtime* standalone execution belongs to the compiled **Go `kitten` binary**, not the
-Python kittens.
+native `fast_data_types` bridge** that breaks Q3 (all three modes are run and captured below).
+Modularity is real at the *source-organization* level, but **(inferred, from reading — the Go
+`kitten` binary was not built or run standalone in the failure probes)** *runtime* standalone
+execution belongs to the compiled **Go `kitten` binary**, not the Python kittens.
 
 Exercised three distinct ways, a kitten fails three distinct ways:
 
 ### 4.1 Mode A — bare script (`kittens/hints/main.py`)
 
 ```text
-$ PYTHONDONTWRITEBYTECODE=1 python3 -B kittens/hints/main.py
+$ PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B kittens/hints/main.py
 Traceback (most recent call last):
   File "/tmp/blitzy/kitty/blitzy-9c2d02b8-f915-4bb9-9b5a-f4f809a35c60_df1353/kittens/hints/main.py", line 8, in <module>
     from kitty.cli_stub import HintsCLIOptions
@@ -514,7 +530,7 @@ is importable.
 ### 4.2 Mode B — the real `+kitten` entry (canonical dispatcher)
 
 ```text
-$ PYTHONDONTWRITEBYTECODE=1 python3 -B __main__.py +kitten hints
+$ PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B __main__.py +kitten hints
 Traceback (most recent call last):
   File "/tmp/blitzy/kitty/blitzy-9c2d02b8-f915-4bb9-9b5a-f4f809a35c60_df1353/__main__.py", line 7, in <module>
     main()
@@ -542,7 +558,7 @@ runs further: `main()` → `namespaced(...)` [kitty/entry_points.py:192] →
 ### 4.3 Mode C — transitive import (`kittens.unicode_input.main`)
 
 ```text
-$ PYTHONDONTWRITEBYTECODE=1 python3 -B -c "import kittens.unicode_input.main"
+$ PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B -c "import kittens.unicode_input.main"
 Traceback (most recent call last):
   File "<string>", line 1, in <module>
   File "/tmp/blitzy/kitty/blitzy-9c2d02b8-f915-4bb9-9b5a-f4f809a35c60_df1353/kittens/unicode_input/main.py", line 8, in <module>
@@ -608,10 +624,14 @@ remote_file
 resize_window
 ```
 
-**(inferred, from source — the Go binary was not built here)** The compiled Go `kitten` binary does
-*not* import `kitty.fast_data_types`; it is a self-contained native executable and is the genuinely
-standalone artifact. A real build of it would be performed in the canonical Docker image (Go is
-present in this shell, but building remains out of scope for this read-only investigation).
+**(inferred, from reading the Go sources — the compiled `kitten` was produced by the canonical build
+above, but was not *exercised standalone* in these probes)** The Go `kitten` binary does *not* import
+`kitty.fast_data_types` — it is Go, not Python, and links none of the CPython extension — so it is a
+self-contained native executable and the genuinely standalone artifact. Concretely, it was built as
+`kitty/launcher/kitten` (a ~16 MB native binary) during the canonical build in the *Version* section,
+then removed with the other transient artifacts via `git clean -dfx -e blitzy`; running it in
+isolation was outside this read-only failure investigation, so the "standalone" claim is labeled
+inferred rather than observed.
 
 **Q4 conclusion:** the Python kittens are modular in *layout* but not *runtime-independent* — all
 three invocation modes converge on the `kitty` package and its native `fast_data_types` bridge.
@@ -638,20 +658,49 @@ That value is `appname='kitty'` [kitty/constants.py:23] and `version=Version(0, 
 the bare interpreter:
 
 ```text
-$ PYTHONDONTWRITEBYTECODE=1 python3 -B -c "from kitty.constants import appname, str_version; print(appname, str_version)"
+$ PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B -c "from kitty.constants import appname, str_version; print(appname, str_version)"
 kitty 0.35.2
 ```
 
 This is a genuine runtime observation of the version string (exit code `0`), confirming the pure-
 Python configuration layer is intact even while `fast_data_types` is missing.
 
-The full **compiled startup banner** (what `kitty --version` prints from the native launcher) is
-**attributed to the canonical Docker build** — image
-`andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` — since
-it requires the launcher + extension, and no build was performed in this read-only shell. The
-build/run commands there are the project's standard
-`python setup.py build` followed by launching the produced `kitty` binary; the banner it prints
-corresponds to the same `0.35.2` constant above.
+The full **compiled startup banner** — what `kitty --version` prints from the native launcher — was
+**observed directly** by performing the project's **default, canonical build** in this environment
+(which *is* the user-provided Docker build/run image
+`andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, from
+`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`) and then running the produced
+launcher binary. The **exact build command**, the **exact invocation**, and the **verbatim** banner:
+
+```text
+$ source /opt/kitty-venv/bin/activate
+$ python setup.py build --verbose --ignore-compiler-warnings
+[... compiler output elided; builds the kitty/fast_data_types.so C extension, the bundled glfw,
+     the native launcher kitty/launcher/kitty, and the Go kitten binary kitty/launcher/kitten ...]
+$ ./kitty/launcher/kitty --version
+kitty 0.35.2 created by Kovid Goyal
+```
+
+This is a **genuine runtime observation** of the compiled banner — exit code `0`, **stable across two
+consecutive runs**, and `./kitty/launcher/kitty -v` prints the identical line. The running banner's
+`0.35.2` matches the pure-Python `str_version` constant above, so the compiled launcher and the
+source constant agree. (As a corroborating aside, once the extension is built,
+`/opt/kitty-venv/bin/python3 -c "import kitty.fast_data_types"` succeeds — importing from the
+freshly produced `kitty/fast_data_types.so` — which is the exact piece whose absence causes the Q3/Q4
+failures below.)
+
+> **Why `--ignore-compiler-warnings`?** It is required for a clean default build in *this* toolchain
+> because the installed `wayland-protocols` (1.45) adds `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values
+> that kitty 0.35.2's `switch` in `glfw/wl_window.c` predates, tripping the default `-Werror=switch`.
+> This is a toolchain/library-version mismatch, **not** a kitty source defect, and **no source file
+> was edited** to accommodate it.
+
+> **Read-only discipline for this build.** The build writes only Git-ignored artifacts (e.g.
+> `kitty/fast_data_types.so`, `kitty/launcher/kitty`, `kitty/launcher/kitten`, `build/`) and modifies
+> **no tracked source file**. After capturing the banner, every artifact was removed with
+> `git clean -dfx -e blitzy` (154 ignored entries), restoring the uncompiled state — which is why the
+> `fast_data_types`-missing failures in Q3/Q4 reproduce exactly as shown and the source tree is left
+> byte-for-byte unchanged.
 
 Runtime manifests that pin the toolchains:
 
@@ -697,7 +746,7 @@ checked off against observed evidence:
 - [x] Full import chain: `__main__.py:7` → `entry_points.py:194` → `main.py:11` → `borders.py:7` → `fast_data_types`.
 - [x] Mermaid diagram of the chain included.
 - [x] Root cause: `.so` absent, only `kitty/fast_data_types.pyi` present.
-- [x] Non-canonical `python3 -m kitty` contrast, labeled **(non-canonical)**.
+- [x] Non-canonical `/opt/kitty-venv/bin/python3 -m kitty` contrast, labeled **(non-canonical)**.
 - [x] Dispatch literals: L183, L188, L191, L192, L194 (plus L138/L146/L118/L126).
 
 **Q4 — kitten modularity**
@@ -710,7 +759,7 @@ checked off against observed evidence:
 - [x] Conclusion: not runtime-independent; Go binary is the standalone path **(inferred)**.
 
 **Cross-cutting**
-- [x] Version **`0.35.2`** reported [kitty/constants.py:25], observed at runtime, full banner attributed to Docker.
+- [x] Version **`0.35.2`** reported [kitty/constants.py:25], observed at runtime; full compiled banner `kitty 0.35.2 created by Kovid Goyal` **observed verbatim** from a default build (`./kitty/launcher/kitty --version`).
 - [x] Manifests: `requires-python = ">=3.8"` [pyproject.toml:2], `go 1.22` [go.mod:3].
 - [x] Unifying thread: the single missing `kitty/fast_data_types*.so` drives Q3, Q4 (Modes B & C), and gates Q2's shader compilation.
 
@@ -731,12 +780,15 @@ $ cc --version | head -1
 cc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
 $ gcc --version | head -1
 gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
-$ git rev-parse HEAD
-815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+$ git log --oneline -1 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # source baseline under investigation (NOT the current HEAD)
+815df1e21 Wire up applying of font config
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # only the deliverable differs from baseline
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 **Complete list of commands run for this investigation** (all Python probes used
-`PYTHONDONTWRITEBYTECODE=1` / `python3 -B` to avoid writing bytecode, keeping the tree clean):
+`PYTHONDONTWRITEBYTECODE=1` with the canonical `/opt/kitty-venv/bin/python3 -B` interpreter to avoid
+writing bytecode, keeping the tree clean):
 
 - Footprint counts (Q1): `ls kitty/*.c | wc -l`; `find kitty -name '*.c' | wc -l`;
   `find kitty/launcher -name '*.c' | wc -l`; `find . -path ./.git -prune -o -name '*.py' -print | wc -l`;
@@ -747,25 +799,37 @@ $ git rev-parse HEAD
 - Shaders (Q2): `for f in kitty/*.glsl; do echo "$(grep -c 'void main' "$f") $(basename "$f")"; done`;
   `grep -rn kitty_include_shader kitty/*.glsl`; `sed -n '1040,1046p' setup.py`;
   `sed -n '61,68p' kitty/shaders.py`; `sed -n '10,32p' kitty/shaders.py`.
-- Entry-point failure (Q3): `PYTHONDONTWRITEBYTECODE=1 python3 -B __main__.py` (×2);
-  `ls kitty/fast_data_types*`; `find kitty -name '*.so'`; `python3 -B -m kitty` **(non-canonical)**;
+- Entry-point failure (Q3): `PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B __main__.py` (×2);
+  `ls kitty/fast_data_types*`; `find kitty -name '*.so'`;
+  `/opt/kitty-venv/bin/python3 -B -m kitty` **(non-canonical)**;
   `sed -n '188,195p' kitty/entry_points.py`.
-- Kittens (Q4): `PYTHONDONTWRITEBYTECODE=1 python3 -B kittens/hints/main.py`;
-  `PYTHONDONTWRITEBYTECODE=1 python3 -B __main__.py +kitten hints`;
-  `PYTHONDONTWRITEBYTECODE=1 python3 -B -c "import kittens.unicode_input.main"`;
+- Kittens (Q4): `PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B kittens/hints/main.py`;
+  `PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B __main__.py +kitten hints`;
+  `PYTHONDONTWRITEBYTECODE=1 /opt/kitty-venv/bin/python3 -B -c "import kittens.unicode_input.main"`;
   `grep -rl fast_data_types kittens/tui/*.py`; `ls kittens/*/main.py | wc -l`;
   `ls kittens/*/main.go | wc -l`; `comm -23 <(...) <(...)`.
 - Version (Q3.5): `sed -n '23p;25p;26p' kitty/constants.py`;
-  `python3 -B -c "from kitty.constants import appname, str_version; print(appname, str_version)"`;
+  `/opt/kitty-venv/bin/python3 -B -c "from kitty.constants import appname, str_version; print(appname, str_version)"`;
   `sed -n '2p' pyproject.toml`; `sed -n '3p' go.mod`.
+- Canonical compiled banner (default build in the Docker build/run environment):
+  `source /opt/kitty-venv/bin/activate && python setup.py build --verbose --ignore-compiler-warnings`;
+  `./kitty/launcher/kitty --version` (×2); `./kitty/launcher/kitty -v`; then
+  `git clean -dfx -e blitzy` to remove the transient build artifacts.
 
-**Canonical build/run environment (for the compiled banner):** Docker image
-`andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
-(from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`). The `kitty 0.35.2` startup
-banner is attributed to a default build there; no build was performed in this read-only shell.
+**Canonical build/run environment (for the compiled banner):** the user-provided Docker build/run
+image `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
+(from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`) — the environment this
+investigation ran in. The `kitty 0.35.2 created by Kovid Goyal` startup banner was **observed
+verbatim** from a default build there. Build: `source /opt/kitty-venv/bin/activate && python setup.py
+build --verbose --ignore-compiler-warnings`. Invocation: `./kitty/launcher/kitty --version`
+(exit `0`, identical across two runs; `-v` prints the same line). Artifacts were then removed with
+`git clean -dfx -e blitzy`.
 
-**Read-only discipline:** the source tree was never modified. Every probe wrote no bytecode
-(`find . -name __pycache__ -not -path './.git/*'` and `find . -name '*.pyc' -not -path './.git/*'`
-both returned nothing), all temporary observation scripts lived outside the repository, and
-`git status --porcelain` remained empty except for this document.
+**Read-only discipline:** no tracked source file was ever modified. Every Python probe wrote no
+bytecode (`find . -name __pycache__ -not -path './.git/*'` and `find . -name '*.pyc' -not -path
+'./.git/*'` both returned nothing), all temporary observation scripts lived outside the repository,
+and the one transient canonical build (used solely to read the compiled banner) produced only
+Git-ignored artifacts that were removed with `git clean -dfx -e blitzy` — leaving the source tree
+byte-for-byte unchanged versus the baseline commit. `git status --porcelain` is empty except for this
+document.
 
