@@ -142,6 +142,7 @@ Focus is delivered to the window (a precondition for it to receive key events):
 ```
 [0.211] \x1b[35mon_focus_change\x1b[m: window id: 0x1 focused: 1
 ```
+— **producing anchor:** `kitty/glfw.c:517` (`window_focus_callback` emits `debug_input("\x1b[35mon_focus_change\x1b[m: window id: 0x%llu focused: %d\n", …)`; the format reproduced identically across both runs).
 
 ### 2.2 The GLFW/XKB backend receives the raw OS key first
 
@@ -248,7 +249,7 @@ child: ` (`kitty/keys.c:261`). Each byte is rendered: ESC as `^[ ` (`kitty/keys.
 `0x%x ` (`kitty/keys.c:266`). Pressing **Return** produced:
 
 ```
-[4.217] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
+[4.217] \x1b[33mon_key_input\x1b[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
 ```
 (run2: `[4.223] … sent encoded key to child: 0xd` — identical) — **producing anchors:**
 `kitty/keys.c:259,260,261,266`.
@@ -307,10 +308,37 @@ screen_linefeed
   `kitty/vt-parser.c:101`.
 
 **Raw-bytes cross-check (`--dump-bytes`):** the raw pre-parse bytes received from the child were
-written to `/tmp/kitty_dump_bytes_run{1,2}.bin` (**741 bytes** in both runs). An `od -c` view shows
-the raw PTY stream (shell-integration OSC sequences plus the prompt text
-`root@4d14d0b4de52:/app#`) before the VT parser classifies it — confirming the parser's input is the
-child's echoed output.
+written to `/tmp/kitty_dump_bytes_run{1,2}.bin`. Both dumps measure **741 bytes**, stable across
+the two runs, as measured with `wc -c`:
+
+```
+$ wc -c /tmp/kitty_dump_bytes_run1.bin /tmp/kitty_dump_bytes_run2.bin
+ 741 /tmp/kitty_dump_bytes_run1.bin
+ 741 /tmp/kitty_dump_bytes_run2.bin
+1482 total
+```
+
+An `od -c` view of that same dump shows the raw PTY stream — the shell-integration OSC sequences
+(the `\x1b]7;kitty-shell-cwd://4d14d0b4de52/app` cwd report and the `\x1b]133;…` prompt markers)
+and the prompt text `root@4d14d0b4de52:/app#` — as received *before* the VT parser classifies it,
+confirming the parser's input is the child's echoed output:
+
+```
+$ od -c /tmp/kitty_dump_bytes_run1.bin | sed -n '11,23p'
+0000240 033   \ 033   ]   7   ;   k   i   t   t   y   -   s   h   e   l
+0000260   l   -   c   w   d   :   /   /   4   d   1   4   d   0   b   4
+0000300   d   e   5   2   /   a   p   p  \a 033   [   ?   2   0   0   4
+0000320   h 033   ]   1   3   3   ;   k   ;   s   t   a   r   t   _   k
+0000340   i   t   t   y  \a 033   ]   1   3   3   ;   D   ;   0  \a 033
+0000360   ]   1   3   3   ;   A  \a 033   ]   1   3   3   ;   k   ;   e
+0000400   n   d   _   k   i   t   t   y  \a 033   ]   0   ;   r   o   o
+0000420   t   @   4   d   1   4   d   0   b   4   d   e   5   2   :    
+0000440   /   a   p   p  \a   r   o   o   t   @   4   d   1   4   d   0
+0000460   b   4   d   e   5   2   :   /   a   p   p   #     033   ]   1
+0000500   3   3   ;   k   ;   s   t   a   r   t   _   s   u   f   f   i
+0000520   x   _   k   i   t   t   y  \a 033   [   5       q 033   ]   2
+0000540   ;   /   a   p   p  \a 033   ]   1   3   3   ;   k   ;   e   n
+```
 
 ### 3.4 (iv) Screen-model update
 
