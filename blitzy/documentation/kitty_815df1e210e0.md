@@ -438,7 +438,9 @@ ans.Add(cli.OptionSpec{
 	Type:    "choices",
 	Choices: "parent, all, none",
 	Default: "parent",
-	Help:    "By default, this kitten will signal only the parent kitty instance it is running in to reload its config, after making changes. Use this option to instead either not reload the config at all or in all running kitty instances.",
+	Help: `By default, this kitten will signal only the parent kitty instance it is
+running in to reload its config, after making changes. Use this option to
+instead either not reload the config at all or in all running kitty instances.`,
 })
 ```
 
@@ -635,7 +637,7 @@ bold_italic_font auto$
 
 The `cat -A` output (with `$` marking line ends) confirms the exact 17-character key field width from `serialized()` (§8.2) — every value begins at column 18 (1-indexed). The mode `0644` matches the `Patcher` default (see §9.3, `tools/config/api.go:L311-L313`).
 
-> _Why `font_family` is `family="Fira Code"` while the others are `auto`:_ when a family is selected fresh, `font_family` is written as a `family=` spec and the bold/italic/bold-italic variants are left as `auto`, which (per the official docs) means kitty auto-derives those variants from the chosen family. The `serialized()` function emits whatever `faces_settings` currently holds; §9.4 shows a different, resolved-face example produced by the `s` key.
+> _Why `font_family` is `family="Fira Code"` while the others are `auto`:_ when a family is selected fresh, `font_family` is written as a `family=` spec and the bold/italic/bold-italic variants are left as `auto`, which (per the official docs) means kitty auto-derives those variants from the chosen family. The `serialized()` function emits whatever `faces_settings` currently holds; §9.4 shows the `s` key producing this same `family=`/`auto` form for a different chosen family (`JetBrains Mono`). Resolved face names (e.g., `FiraCodeRoman-Regular`) — visible in the faces-pane *preview* (§4.2) — would be serialized only if a face were fine-tuned before finalizing.
 
 
 ---
