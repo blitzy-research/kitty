@@ -303,8 +303,9 @@ $ grep -n "pthread_create\|pthread_join" kitty/child-monitor.c
 256:        if ((ret = pthread_create(&self->talk_thread, NULL, talk_loop, self)) != 0) {
 286:        if ((ret = pthread_create(&self->talk_thread, NULL, talk_loop, self)) != 0) {
 291:    ret = pthread_create(&self->io_thread, NULL, io_loop, self);
-1002:    int ret = pthread_create(&thread, NULL, thread_write, data);
 427:    int ret = pthread_join(self->io_thread, NULL);
+430:        ret = pthread_join(self->talk_thread, NULL);
+1002:    int ret = pthread_create(&thread, NULL, thread_write, data);
 ```
 
 - **I/O thread** — `io_loop(void *data)` at `kitty/child-monitor.c:1481`, created at `:291`. Polls child PTY fds, reads/writes, reaps dead children.
@@ -362,7 +363,13 @@ $ grep -n "eventfd\|signalfd\|self_pipe" kitty/loop-utils.c
 48:        if (!self_pipe(ld->signal_fds, true)) return false;
 70:    ld->wakeup_read_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 73:    if (!self_pipe(ld->wakeup_fds, true)) return false;
+133:    static struct signalfd_siginfo fdsi[32];
+144:        size_t num_signals = s / sizeof(struct signalfd_siginfo);
+145:        if (num_signals == 0 || num_signals * sizeof(struct signalfd_siginfo) != (size_t)s) {
+146:            log_error("Incomplete signal read from signalfd");
 ```
+
+The fd‑setup matches are the first four lines — `:42`/`:48`/`:70`/`:73`; the trailing four (`:133`/`:144`/`:145`/`:146`) are incidental substring matches of the `signalfd_siginfo` struct type and a log string in the signal‑*reading* code (`read_signals`), not fd creation.
 
 - `signalfd(...)` at `kitty/loop-utils.c:42` turns asynchronous OS signals into a pollable fd (fallback self‑pipe at `:48`) — this feeds branch (2) above.
 - `eventfd(...)` at `kitty/loop-utils.c:70` (fallback self‑pipe at `:73`) is the I/O thread's `LoopData.wakeup_read_fd`. It is wired into the poll set as `children_fds[0]` (`kitty/child-monitor.c:183`) and drained by branch (1). Other threads ring this doorbell to wake the **I/O** thread by calling `wakeup_io_loop()` → `wakeup_loop(&self->io_loop_data, …)` (`kitty/child-monitor.c:225-226`); the **talk** thread's loop is woken the same way through its own `LoopData` (`kitty/child-monitor.c:1755`). This `eventfd` therefore wakes **only the poll‑based loops — never the GUI thread.**
@@ -690,7 +697,7 @@ Every named item from the four questions — each mechanism, function, condition
 | 1i | **Paused/resumed (a)** child suspend | §2.5 | `kitty/child.py:492-493` `VSUSP`→`SIGTSTP`; `:174` `set_iutf8_fd` | **[inferred]** (line‑discipline, not parser path) |
 | 1j | **Paused/resumed (b)** render suspend | §2.5,§5 | `kitty/screen.c:2506` (see Q4) | DECRQM `;1`/`;2` toggle (§5.3) |
 | **Q2 — the conductor** |  |  |  |  |
-| 2a | Three threads | §3.1 | `kitty/child-monitor.c:55`, `:1481` `io_loop`, `:1259` `main_loop`, `talk_loop` | `grep pthread_create` → `:256/:286/:291`; join `:427` |
+| 2a | Three threads | §3.1 | `kitty/child-monitor.c:55`, `:1481` `io_loop`, `:1259` `main_loop`, `talk_loop` | `grep pthread_create` → `:256/:286/:291`; joins `:427` (io_thread)/`:430` (talk_thread) |
 | 2b | **What gets handled first** (poll order) | §3.2 | `kitty/child-monitor.c:1515`→`:1516`→`:1529`→`:1539`→`:1542` | verbatim branch block (wakeup→signal→read→write→NVAL) |
 | 2c | Not a priority queue | §3.2 | (fixed `if`‑branch order) | (explicit statement) |
 | 2d | `eventfd`/`signalfd` + self‑pipe (**poll‑based I/O & talk loops only**) | §3.3(a) | `kitty/loop-utils.c:42`,`:48`,`:70`,`:73`; wired `kitty/child-monitor.c:183`, rung `wakeup_io_loop` `:225-226`, talk `:1755` | `grep` → `signalfd`(:42)/`eventfd`(:70) lines |
@@ -854,7 +861,7 @@ Disabling building of wayland backend
 BUILD EXIT=0
 ```
 
-> **Note — from‑scratch capture vs. incremental re‑verification.** The 98‑line log above is the **from‑scratch** capture: it was produced after removing the git‑ignored `build/` directory and `kitty/fast_data_types.so`, which forces `setup.py` to compile all **85** C translation units. A *subsequent* `python3 setup.py build` run **without** first removing those artifacts is **incremental** and will not reproduce the full `[N/85] Compiling …` sequence — with the artifacts already present it recompiles **0** of the 85 units and still exits `0`. This was verified directly: the incremental re‑run emitted only the `Disabling building of wayland backend` notice and the `kitty/tools/cmd` Go‑tools step, then `BUILD EXIT=0`, with **zero** `[N/85] Compiling …` lines. This is expected build‑system behavior, not a discrepancy; independently regenerating the from‑scratch log requires deleting the git‑ignored `build/` and `kitty/fast_data_types.so` again first. Either way the build exits `0` and yields the same `./kitty/launcher/kitty` and `kitty/fast_data_types.so` artifacts. (Only git‑ignored artifacts are affected by a rebuild — no tracked source file changes.)
+> **Note — from‑scratch capture vs. incremental re‑verification.** The 98‑line log above is the **from‑scratch** capture: it was produced after removing the git‑ignored `build/` directory and `kitty/fast_data_types.so`, which forces `setup.py` to compile all **85** C translation units. A *subsequent* `python3 setup.py build` run **without** first removing those artifacts is **incremental** and will not reproduce the full `[N/85] Compiling …` sequence — with the artifacts already present it recompiles **0** of the 85 units and still exits `0`. This was verified directly by observation. Once the Go build cache and the `kitty/launcher/kitten` binary are fully settled, the incremental re‑run emits **only** the `Disabling building of wayland backend` notice, then `BUILD EXIT=0`, with **zero** `[N/85] Compiling …` lines — a 6‑line log that was stable across four consecutive runs. Two secondary states also occur, and neither is a discrepancy: (i) the *first* incremental run taken after the `kitten` binary needs relinking additionally prints a single `kitty/tools/cmd` line — the Go **main‑package** relink emitted by `go build -v` — after which it settles back to the notice‑only 6‑line output; and (ii) a fully **cold** Go build cache makes `go build -v` print its entire transitive dependency set (287 import paths in one observed run, of which exactly one ends in `kitty/tools/cmd`, the main package). In every warm‑cache case **0** of the 85 C translation units recompile; the full `[N/85] Compiling …` C sequence appears only on a genuine from‑scratch build (after removing `build/` and `kitty/fast_data_types.so`). This is expected build‑system behavior, not a discrepancy; independently regenerating the from‑scratch log requires deleting the git‑ignored `build/` and `kitty/fast_data_types.so` again first. Either way the build exits `0` and yields the same `./kitty/launcher/kitty` and `kitty/fast_data_types.so` artifacts. (Only git‑ignored artifacts are affected by a rebuild — no tracked source file changes.)
 
 ### A.2 — `/tmp/kobs_resize.py` (full)
 
