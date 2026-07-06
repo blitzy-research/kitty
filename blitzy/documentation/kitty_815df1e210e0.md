@@ -21,6 +21,7 @@ $ pkg-config --version
 - **Python floor:** `pyproject.toml:2` declares `requires-python = ">=3.8"`, so the observed Python 3.13.7 satisfies the project requirement. *(The instructions referenced 3.12.3 from an earlier scope-discovery shell; the value reported here is the one actually observed on this host.)*
 - **Go toolchain:** `go.mod:3` pins `go 1.22`; the host provides go1.22.12 (put it on `PATH` with `export PATH=$PATH:/usr/local/go/bin`).
 - **Exact build command used:** `python3 setup.py --ignore-compiler-warnings`. This is the default build target (`setup.py:1084` `def build(...)`). The `--ignore-compiler-warnings` flag is the project's own option and is required *on this host* only because the bundled `glfw/wl_window.c` trips `-Werror` against the host's newer `wayland-protocols`; it changes no source. No product source file is edited by the build.
+- **Toolchain / library install commands:** *none were run while authoring this document.* The provided setup environment already had every build prerequisite installed and configured, so this investigation ran **no** `pip install`, `apt-get install`, or `go get`/module-download step. Per the setup inventory, the environment preinstalled: Python 3.13.7 (system interpreter with dev headers; kitty's core has zero PyPI dependencies, so no venv/`pip install` is needed), Go 1.22.12 (at `/usr/local/go`, with modules pre-downloaded and `go mod verify` reporting all verified), gcc 15.2.0, GNU Make 4.4.1, `pkg-config` 1.8.1, and the C system libraries kitty links against — `harfbuzz`, `zlib`, `libpng`, `lcms2`, `xxhash`, `openssl`/`libcrypto`, `freetype`, `fontconfig`, `libgl`/mesa, `libxkbcommon`, and the X11/Wayland dev packages — all resolvable via `pkg-config`. The only environment step this investigation performed before building was putting Go on `PATH` (`export PATH=$PATH:/usr/local/go/bin`); the exact build invocation is the `python3 setup.py --ignore-compiler-warnings` command stated above.
 
 **Read-only / before→after methodology (important, and done transparently):**
 
@@ -51,6 +52,11 @@ $ find kitty -name '*.c' | wc -l
 $ find kitty -name '*.c' -exec cat {} + | wc -l
 35917
 
+$ git ls-files 'kitty/*.h' | awk -F/ 'NF==2' | wc -l
+45
+$ git ls-files 'kitty/*.h' | awk -F/ 'NF==2' | xargs wc -l | tail -1
+  22587 total
+
 $ ls kitty/*.py | wc -l
 44
 $ cat kitty/*.py | wc -l
@@ -70,6 +76,7 @@ $ find tools -name '*.go' -exec cat {} + | wc -l
 |---|---|---|---|---|
 | C (`.c`) | top-level `kitty/*.c` | `ls kitty/*.c \| wc -l` / `cat kitty/*.c \| wc -l` | 49 | 35,155 |
 | C (`.c`) | recursive `kitty/**` | `find kitty -name '*.c' …` | 51 | 35,917 |
+| C (`.h`) | top-level `kitty/*.h`, git-tracked | `git ls-files 'kitty/*.h' \| awk -F/ 'NF==2' \| xargs wc -l` | 45 | 22,587 |
 | C (`.h`) | recursive, git-tracked | `git ls-files 'kitty/*.h' \| xargs cat` | 48 | 24,314 |
 | Python | top-level `kitty/*.py` | `cat kitty/*.py \| wc -l` | 44 | 20,647 |
 | Python | recursive `kitty/**` | `find kitty -name '*.py' …` | 109 | 39,355 |
@@ -79,17 +86,25 @@ $ find tools -name '*.go' -exec cat {} + | wc -l
 **Scope note / built-tree reconciliation (measured, not assumed).** Because this checkout is *built*, the raw `find` counts for `.h` and `.go` are inflated by build-generated files, so they are larger than a fresh clone:
 
 ```text
-$ find kitty -name '*.h' | wc -l          # disk (built tree)
+$ ls kitty/*.h | wc -l                    # top-level, disk (built tree)
+47
+$ git ls-files 'kitty/*.h' | awk -F/ 'NF==2' | wc -l   # top-level, pristine source
+45
+$ find kitty -name '*.h' | wc -l          # recursive, disk (built tree)
 50
 $ find kitty -name '*.h' -exec cat {} + | wc -l
 24807
-$ git ls-files 'kitty/*.h' | wc -l        # pristine source (fresh clone)
+$ git ls-files 'kitty/*.h' | wc -l        # recursive, pristine source (fresh clone)
 48
 $ git ls-files 'kitty/*.h' | xargs cat | wc -l
 24314
-$ find kitty -name '*_generated.h'
+$ find kitty -name '*_generated.h'        # the 2 generated top-level headers
 kitty/uniforms_generated.h
 kitty/docs_ref_map_generated.h
+$ git ls-files 'kitty/*.h' | awk -F/ 'NF>2'   # the 3 tracked headers below top level
+kitty/launcher/launcher.h
+kitty/options/to-c-generated.h
+kitty/options/to-c.h
 
 $ find tools -name '*.go' | wc -l          # disk (built tree)
 255
@@ -99,7 +114,7 @@ $ find tools -name '*_generated*.go' | wc -l          # the difference
 62
 ```
 
-So the pristine `.h` footprint is **48 files / 24,314 lines** (built-tree disk shows 50 / 24,807 because of the **2** generated headers `kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h`), and the pristine Go footprint is **193 files / 38,155 lines** (built-tree disk shows 255 / 49,254 because of **62** `*_generated.go` files). The `.c` and `.py` counts are **not** inflated: `find kitty -name '*.c'` = 51 both on disk and git-tracked, and `find kitty -name '*.py'` = 109 both ways.
+So the pristine `.h` footprint is **45 files / 22,587 lines at top level** (`kitty/*.h`) and **48 files / 24,314 lines recursively**; the 3 extra recursive headers are tracked files that live below top level (`kitty/launcher/launcher.h`, `kitty/options/to-c.h`, `kitty/options/to-c-generated.h`). Built-tree disk inflates these to **47 / 23,080** (top level) and **50 / 24,807** (recursive) because of the **2** generated top-level headers `kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h`. The pristine Go footprint is **193 files / 38,155 lines** (built-tree disk shows 255 / 49,254 because of **62** `*_generated.go` files). The `.c` and `.py` counts are **not** inflated: `find kitty -name '*.c'` = 51 both on disk and git-tracked, and `find kitty -name '*.py'` = 109 both ways.
 
 **What the numbers say.** Inside the terminal package `kitty/`, native C is the largest hand-written body (≈ 35.9k lines of `.c` + 24.3k lines of `.h`), roughly on par with Python (≈ 39.4k lines recursive). GLSL is small in line count (696) but, as Section 2 shows, disproportionately important — it *is* the rendering. The ≈ 38k lines of Go under `tools/` compile into the separate `kitten` binary rather than the terminal's render loop.
 
@@ -129,7 +144,7 @@ kitty/data-types.c
 
 There are **49** top-level C translation units (`ls kitty/*.c | wc -l` → 49) — e.g. `screen.c`, `graphics.c`, `shaders.c`, `fonts.c`, `child-monitor.c`, `vt-parser.c`, `simd-string-128.c`, `simd-string-256.c` — and they all register their functions and constants into that **single** `fast_data_types` module. That is why Sections 3 and 4 both collapse onto the same missing `.so`: it is the one native object the whole Python layer (and the kittens) import from.
 
-**Observed corroboration.** Once built, the module loads from the compiled object and even exposes the build-stamped VCS revision:
+**Observed corroboration (and how the VCS stamp is produced).** Once built, the module loads from the compiled object and exposes a build-stamped VCS revision. The extension used for the OBJ-3/OBJ-4 runtime observations was built **at the source commit under investigation** — i.e. with the working tree checked out at `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, before this documentation file had been committed to the branch — and its stamp captured exactly that commit:
 
 ```text
 $ python3 -c "import kitty.fast_data_types as f; print('file:', f.__file__); print('KITTY_VCS_REV:', repr(getattr(f,'KITTY_VCS_REV','<absent>')))"
@@ -137,11 +152,34 @@ file: /tmp/blitzy/kitty/blitzy-7fdf484a-739d-4a2f-adae-79a05f070ff9_919275/kitty
 KITTY_VCS_REV: '815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1'
 ```
 
-The `KITTY_VCS_REV` value equals this checkout's HEAD commit — direct evidence that the running native core is the compiled artifact of this exact source.
+That `815df1e2…` value is **not** read from the source at import time — it is **stamped into the binary at build time from `git rev-parse HEAD`**. `setup.py`'s `get_vcs_rev()` shells out to `git rev-parse HEAD`, and when `kitty/data-types.c` is compiled that value is injected as the `KITTY_VCS_REV="…"` preprocessor define (shown as two exact, non-elided excerpts):
+
+```text
+$ sed -n '674,679p' setup.py
+def get_vcs_rev() -> str:
+    ans = ''
+    if os.path.exists('.git'):
+        try:
+            rev = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8')
+        except FileNotFoundError:
+$ sed -n '724,726p' setup.py
+        if not env.vcs_rev:
+            env.vcs_rev = get_vcs_rev()
+        return src, [], [f'KITTY_VCS_REV="{env.vcs_rev}"', f'WRAPPED_KITTENS="{wrapped_kittens()}"']
+```
+
+So the stamp records **whatever `HEAD` is at the moment the `.so` is compiled**, not "the commit under study" as an invariant. The `815df1e2…` capture above is therefore direct evidence that the native core exercised for Sections 3–4 was the compiled artifact of *this exact source commit* — because the extension was built while `HEAD` pointed there. It is **not** a frozen property of the checkout: rebuilding the extension *after* this documentation file is committed re-stamps it to the then-current `HEAD`. Observed on this host — the extension currently on disk was rebuilt after the documentation commit and now reports that later commit instead of `815df1e2…`:
+
+```text
+$ python3 -c "import kitty.fast_data_types as f; print('KITTY_VCS_REV:', getattr(f,'KITTY_VCS_REV','<absent>'))"
+KITTY_VCS_REV: 3673b7967767b5222674f680c545b815a0c80363
+```
+
+The later value `3673b7967767b5222674f680c545b815a0c80363` is the documentation commit that first added this file — confirming the stamp tracks build-time `HEAD` exactly as `setup.py:725-726` prescribe. (Reproduction note: anyone re-running the command will see whatever commit was `HEAD` when *their* extension was built — this source commit only if it was built before the documentation commit existed.)
 
 ### 1.3 Reasoning and honest labeling
 
-- **Directly observed:** the source line/file counts above; the single `PyModuleDef` named `fast_data_types` at `kitty/data-types.c:469`; the native launcher embedding CPython at `kitty/launcher/main.c:147-161`; that the whole Python layer imports from `kitty.fast_data_types` (Sections 3–4); and that `KITTY_VCS_REV` in the loaded `.so` matches HEAD.
+- **Directly observed:** the source line/file counts above; the single `PyModuleDef` named `fast_data_types` at `kitty/data-types.c:469`; the native launcher embedding CPython at `kitty/launcher/main.c:147-161`; that the whole Python layer imports from `kitty.fast_data_types` (Sections 3–4); and that `KITTY_VCS_REV` in the loaded `.so` is build-stamped from `git rev-parse HEAD` at compile time (§1.2) — capturing the source commit `815df1e2…` when built at that commit.
 - **(Inferred)** that VT parsing, the screen model, GPU draw submission, font rasterization, and the PTY I/O thread are the *hottest* runtime paths specifically. This is consistent with the C file names (`vt-parser.c`, `screen.c`, `shaders.c`, `graphics.c`, `fonts.c`, `freetype.c`, `child-monitor.c`, the `simd-string-*.c` SIMD helpers) and with kitty being a "GPU based terminal emulator," but this document does not include a per-subsystem CPU profile, so the *ranking* of hotness is labeled Inferred. The *observed* facts are the footprint, the module definition, the launcher boot, and the import wiring.
 
 ---
@@ -205,40 +243,117 @@ The `continue` at `setup.py:1043-1044` skips any file whose name has no `_vertex
 The Python shader layer imports the program-id constants and the native `compile_program` entry point from the C core, prepends the GLSL version, and resolves `#include`s:
 
 ```text
-kitty/shaders.py
-10: from .fast_data_types import (
-11:     BGIMAGE_PROGRAM,
-...
-19:     GLSL_VERSION,
-...
-30:     compile_program,
-...
-61:     def _load_sources(self, name: str, seen: Set[str], level: int = 0) -> Iterator[str]:
-62:         if level == 0:
-63:             yield f'#version {GLSL_VERSION}\n'
-...
-72:             yield from self._load_sources(iname, seen, level+1)
-...
-87:     def compile(self, program_id: int, allow_recompile: bool = False) -> None:
-...
-90:             compile_program(program_id, self.vertex_sources, self.fragment_sources, allow_recompile)
-...
-107: @lru_cache(maxsize=64)
-108: def program_for(name: str) -> Program:
-109:     return Program(name)
+$ sed -n '10,32p' kitty/shaders.py
+from .fast_data_types import (
+    BGIMAGE_PROGRAM,
+    CELL_BG_PROGRAM,
+    CELL_FG_PROGRAM,
+    CELL_PROGRAM,
+    CELL_SPECIAL_PROGRAM,
+    DECORATION,
+    DECORATION_MASK,
+    DIM,
+    GLSL_VERSION,
+    GRAPHICS_ALPHA_MASK_PROGRAM,
+    GRAPHICS_PREMULT_PROGRAM,
+    GRAPHICS_PROGRAM,
+    MARK,
+    MARK_MASK,
+    NUM_UNDERLINE_STYLES,
+    REVERSE,
+    STRIKETHROUGH,
+    TINT_PROGRAM,
+    compile_program,
+    get_options,
+    init_cell_program,
+)
+$ sed -n '61,81p' kitty/shaders.py
+    def _load_sources(self, name: str, seen: Set[str], level: int = 0) -> Iterator[str]:
+        if level == 0:
+            yield f'#version {GLSL_VERSION}\n'
+        if name in seen:
+            return
+        seen.add(name)
+        self.filename_map[name] = fnum = next(self.filename_number_counter)
+        src = read_kitty_resource(name).decode('utf-8')
+        pos = 0
+        lnum = 0
+        assert Program.include_pat is not None
+        for m in Program.include_pat.finditer(src):
+            prefix = src[pos:m.start()]
+            if prefix:
+                yield f'\n#line {lnum} {fnum}\n{prefix}'
+                lnum += prefix.count('\n')
+            iname = m.group(1)
+            yield from self._load_sources(iname, seen, level+1)
+            pos = m.end()
+        if pos < len(src):
+            yield f'\n#line {lnum} {fnum}\n{src[pos:]}'
+$ sed -n '87,90p' kitty/shaders.py
+    def compile(self, program_id: int, allow_recompile: bool = False) -> None:
+        cerr: CompileError = CompileError()
+        try:
+            compile_program(program_id, self.vertex_sources, self.fragment_sources, allow_recompile)
+$ sed -n '107,109p' kitty/shaders.py
+@lru_cache(maxsize=64)
+def program_for(name: str) -> Program:
+    return Program(name)
 ```
 
-`shaders.py:63` prepends `#version {GLSL_VERSION}` and `shaders.py:72` recursively resolves `#include` directives (this is the mechanism by which the three helper files are pulled into the cell/border/graphics/etc. shaders). `shaders.py:90` then calls the native `compile_program`. On the C side, that native function compiles each stage and links the GPU program:
+`shaders.py:63` prepends `#version {GLSL_VERSION}`; the `#include` directives are found by `Program.include_pat.finditer` at `shaders.py:72` and pulled in recursively at `shaders.py:78` (`yield from self._load_sources(iname, seen, level+1)`) — this is the mechanism by which the three helper files are pulled into the cell/border/graphics/etc. shaders. `shaders.py:90` then calls the native `compile_program`. On the C side, that native function compiles each stage and links the GPU program:
 
 ```text
-kitty/shaders.c
-1153: attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
-1160:     GLuint shader_id = compile_shaders(shader_type, PyTuple_GET_SIZE(sources), c_sources);
-1168: compile_program(PyObject UNUSED *self, PyObject *args) {
-1182:     glLinkProgram(program->id);
-1189:         PyErr_Format(PyExc_ValueError, "Failed to link GLSL shaders:\n%s", glbuf);
-...
-1254:     C(GLSL_VERSION);
+$ sed -n '1152,1195p' kitty/shaders.c
+static bool
+attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
+    RAII_ALLOC(const GLchar*, c_sources, calloc(PyTuple_GET_SIZE(sources), sizeof(GLchar*)));
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(sources); i++) {
+        PyObject *temp = PyTuple_GET_ITEM(sources, i);
+        if (!PyUnicode_Check(temp)) { PyErr_SetString(PyExc_TypeError, "shaders must be strings"); return false; }
+        c_sources[i] = PyUnicode_AsUTF8(temp);
+    }
+    GLuint shader_id = compile_shaders(shader_type, PyTuple_GET_SIZE(sources), c_sources);
+    if (shader_id == 0) return false;
+    glAttachShader(program_id, shader_id);
+    glDeleteShader(shader_id);
+    return true;
+}
+
+static PyObject*
+compile_program(PyObject UNUSED *self, PyObject *args) {
+    PyObject *vertex_shaders, *fragment_shaders;
+    int which, allow_recompile = 0;
+    if (!PyArg_ParseTuple(args, "iO!O!|p", &which, &PyTuple_Type, &vertex_shaders, &PyTuple_Type, &fragment_shaders, &allow_recompile)) return NULL;
+    if (which < 0 || which >= NUM_PROGRAMS) { PyErr_Format(PyExc_ValueError, "Unknown program: %d", which); return NULL; }
+    Program *program = program_ptr(which);
+    if (program->id != 0) {
+        if (allow_recompile) { glDeleteProgram(program->id); program->id = 0; }
+        else { PyErr_SetString(PyExc_ValueError, "program already compiled"); return NULL; }
+    }
+#define fail_compile() { glDeleteProgram(program->id); return NULL; }
+    program->id = glCreateProgram();
+    if (!attach_shaders(vertex_shaders, program->id, GL_VERTEX_SHADER)) fail_compile();
+    if (!attach_shaders(fragment_shaders, program->id, GL_FRAGMENT_SHADER)) fail_compile();
+    glLinkProgram(program->id);
+    GLint ret = GL_FALSE;
+    glGetProgramiv(program->id, GL_LINK_STATUS, &ret);
+    if (ret != GL_TRUE) {
+        GLsizei len;
+        static char glbuf[4096];
+        glGetProgramInfoLog(program->id, sizeof(glbuf), &len, glbuf);
+        PyErr_Format(PyExc_ValueError, "Failed to link GLSL shaders:\n%s", glbuf);
+        fail_compile();
+    }
+#undef fail_compile
+    init_uniforms(which);
+    return Py_BuildValue("I", program->id);
+}
+$ sed -n '1250,1254p' kitty/shaders.c
+bool
+init_shaders(PyObject *module) {
+#define C(x) if (PyModule_AddIntConstant(module, #x, x) != 0) { PyErr_NoMemory(); return false; }
+    C(CELL_PROGRAM); C(CELL_BG_PROGRAM); C(CELL_SPECIAL_PROGRAM); C(CELL_FG_PROGRAM); C(BORDERS_PROGRAM); C(GRAPHICS_PROGRAM); C(GRAPHICS_PREMULT_PROGRAM); C(GRAPHICS_ALPHA_MASK_PROGRAM); C(BGIMAGE_PROGRAM); C(TINT_PROGRAM);
+    C(GLSL_VERSION);
 ```
 
 So the full pipeline is: **`Program.compile` (`shaders.py:90`) → native `compile_program` (`shaders.c:1168`) → `attach_shaders` (`shaders.c:1153`) → `compile_shaders` (`shaders.c:1160`, per stage) → `glLinkProgram` (`shaders.c:1182`)**, i.e. GLSL source is turned into linked OpenGL GPU programs at runtime. A link failure surfaces as `Failed to link GLSL shaders` at `shaders.c:1189`. `shaders.c:1254` registers `GLSL_VERSION` (alongside the program-id constants `CELL_PROGRAM`, `BORDERS_PROGRAM`, `GRAPHICS_PROGRAM`, `BGIMAGE_PROGRAM`, `TINT_PROGRAM`, …) into the same `fast_data_types` module.
@@ -380,7 +495,7 @@ kitty 0.35.2 created by Kovid Goyal
 EXIT=0
 ```
 
-The `0.35.2` is `str_version` built from `kitty/constants.py:25` (`version: Version = Version(0, 35, 2)`), formatted by `kitty/cli.py:492`. The banner does **not** append a VCS-rev suffix because `version()` defaults to `add_rev=False` (`cli.py:486`); the revision is nonetheless build-stamped into the native module and matches this HEAD commit (shown in Section 1.2: `KITTY_VCS_REV == '815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1'`).
+The `0.35.2` is `str_version` built from `kitty/constants.py:25` (`version: Version = Version(0, 35, 2)`), formatted by `kitty/cli.py:492`. The banner does **not** append a VCS-rev suffix because `version()` defaults to `add_rev=False` (`cli.py:486`); the revision is nonetheless build-stamped into the native module from build-time `git rev-parse HEAD` (see §1.2 — it captured the source commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` when the extension was built at that commit, and re-stamps to the then-current `HEAD` on any later rebuild).
 
 Running the bare entry point after the build shows the import barrier is **gone** — execution now reaches real startup code:
 
@@ -517,7 +632,7 @@ That is the before→after transition for the kittens: `import kittens.unicode_i
 
 Every named item from the four questions, with where its evidence lives in this document:
 
-- [x] **OBJ-1 — language doing the heavy lifting / where performance comes from.** Answer: Python orchestrates; native C (`kitty.fast_data_types`) + GPU (GLSL) do the hot work. Evidence: measured footprint with **top-level / recursive / git-tracked** scope labels (§1.1); single `PyModuleDef` at `kitty/data-types.c:469` with 49 top-level `.c` files (§1.2); native launcher embedding CPython `kitty/launcher/main.c:147-161` (§1.2); `KITTY_VCS_REV` == HEAD (§1.2). Hotness *ranking* labeled **(Inferred)** (§1.3).
+- [x] **OBJ-1 — language doing the heavy lifting / where performance comes from.** Answer: Python orchestrates; native C (`kitty.fast_data_types`) + GPU (GLSL) do the hot work. Evidence: measured footprint with **top-level / recursive / git-tracked** scope labels (§1.1); single `PyModuleDef` at `kitty/data-types.c:469` with 49 top-level `.c` files (§1.2); native launcher embedding CPython `kitty/launcher/main.c:147-161` (§1.2); `KITTY_VCS_REV` build-stamped from build-time `git rev-parse HEAD`, capturing the source commit when built at it (§1.2). Hotness *ranking* labeled **(Inferred)** (§1.3).
 - [x] **OBJ-2 — role and centrality of the GLSL files; all 13 named.** Answer: they *are* the GPU rendering pipeline. Evidence: full `wc -l kitty/*.glsl` listing all 13 (§2.1); shader-to-role table naming every file (§2.2); build bundling `setup.py:1040-1044` (§2.3); runtime compile/link `shaders.py:63,72,90,108` + `shaders.c:1160,1182,1189,1254` (§2.4). The 13 files: `alpha_blend.glsl`, `bgimage_fragment.glsl`, `bgimage_vertex.glsl`, `border_fragment.glsl`, `border_vertex.glsl`, `cell_defines.glsl`, `cell_fragment.glsl`, `cell_vertex.glsl`, `graphics_fragment.glsl`, `graphics_vertex.glsl`, `linear2srgb.glsl`, `tint_fragment.glsl`, `tint_vertex.glsl`.
 - [x] **OBJ-3 — what is missing when the entry point is run directly.** Answer: the compiled extension `kitty.fast_data_types`. Evidence: verbatim `python3 __main__.py` traceback ending in `ModuleNotFoundError: No module named 'kitty.fast_data_types'` (§3.1); wiring chain `__main__.py:7 → entry_points.py:194 → main.py:11 → borders.py:7`, with the `main.py:11`-before-`main.py:32` nuance (§3.2); bridge definition `kitty/data-types.c:469`; `--version` also fails at `borders.py:7` (§3.3).
 - [x] **OBJ-4 — are the kittens independent (two distinct entry points).** Answer: no. Evidence: path (a) `+kitten unicode_input` via `entry_points.py:126 → kittens/runner.py:14 → kitty/utils.py:45` (§4.1); path (b) `import kittens.unicode_input.main` via `kittens/unicode_input/main.py:8 → kittens/tui/handler.py:10` (§4.2); shared-TUI explanation (§4.3). "Every TUI kitten" labeled **(Inferred)** (§4.5).
@@ -529,9 +644,25 @@ Every named item from the four questions, with where its evidence lives in this 
 
 ### Read-only verification
 
+The read-only guarantee is that **no tracked file in the kitty source tree was modified**. Scoping `git status` to the whole repository *except* the `blitzy/` deliverable directory therefore prints nothing; the trailing sentinel makes the empty result unambiguous:
+
 ```text
-$ git status --porcelain        # inside the kitty checkout, after all builds/runs
+$ git status --porcelain -- . ':(exclude)blitzy' ; echo "EXIT=$?"
+EXIT=0
 ```
 
-The command returned **no output for any tracked source file**; the only new path is this document under `blitzy/documentation/`, which lives outside the kitty source tree. The regenerated `kitty/fast_data_types.so`, the launcher binaries, and `build/` are all git-ignored and remain uncommitted, so the tracked kitty source is unchanged.
+The command produced **no `git status` lines at all** — the very next line printed is the sentinel `EXIT=0` — i.e. every tracked file under `kitty/`, `kittens/`, `tools/`, `glfw/`, `glad/`, `docs/`, and the manifests is unmodified. The only new tracked path anywhere in the repository is this document itself, `blitzy/documentation/kitty_815df1e210e0.md`, which lives **outside** the kitty source tree.
+
+The build artifacts created while observing the "after" state — `kitty/fast_data_types.so`, the launcher binaries `kitty/launcher/kitty` and `kitty/launcher/kitten`, and `build/` — are git-ignored, so they never appear in `git status` and remain uncommitted. `git check-ignore` confirms each is matched by an ignore rule (it echoes every ignored path and exits `0`):
+
+```text
+$ git check-ignore kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten build ; echo "EXIT=$?"
+kitty/fast_data_types.so
+kitty/launcher/kitty
+kitty/launcher/kitten
+build
+EXIT=0
+```
+
+So the tracked kitty source is byte-for-byte unchanged, the observation-only build artifacts stay untracked, and the sole committed change of this project is the documentation file.
 
