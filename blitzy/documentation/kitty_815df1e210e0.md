@@ -4,7 +4,7 @@
 
 When a kitty window is resized, the resize orchestrator `screen_resize` [kitty/screen.c:346-463] reflows buffered cell content to the new column count by driving a single, macro‑parameterized reflow engine, `rewrap_inner` [kitty/rewrap.h:56-96], over two buffers: the visible‑screen `LineBuf` and the scrollback `HistoryBuf`. Narrowing spills overflow rows from the screen into history; widening (with `scrollback_fill_enlarged_window`) pulls rows back. The authoritative record of "this row continues onto the next" is a **per‑cell** flag, `CellAttrs.next_char_was_wrapped` [kitty/data-types.h:206], while a **per‑line** flag, `LineAttrs.is_continued` [kitty/data-types.h:233], is *derived on read* and is structurally `false` for the top row of each buffer.
 
-This investigation was performed by **building the `fast_data_types` C extension and running the real rewrap path first**, then writing the answer from the captured output. It **reproduces the reported symptom** ("the reflow doesn't seem to preserve logical line boundaries correctly") deterministically: a single 18‑character logical line, once it straddles the history/screen boundary, is **split into two logical lines** when the window is subsequently enlarged. The root cause is that history is rewrapped **first and in isolation** [kitty/screen.c:375]; the engine clears the source row's per‑cell continuation bit when a row is continued [kitty/rewrap.h:72], and the trailing re‑assertion `next_dest_line(false)` runs only when `src_y < src_limit` [kitty/rewrap.h:93] — so the **newest** history row is never told that it still continues into the screen's top row. Because neither buffer's per‑line `is_continued` can express cross‑buffer continuation (it is `false` for the newest history row [kitty/history.c:170] and for the screen's top row [kitty/line-buf.c:145]), the boundary continuation is lost. Per the task's rules, these issues are **identified and explained only — not fixed.**
+This investigation was performed by **building the `fast_data_types` C extension and running the real rewrap path first**, then writing the answer from the captured output. It **reproduces the reported symptom** ("the reflow doesn't seem to preserve logical line boundaries correctly") deterministically: a single 18‑character logical line, once it straddles the history/screen boundary, is **split into two logical lines** when the window is subsequently enlarged. The root cause is that history is rewrapped **first and in isolation** [kitty/screen.c:375]; the engine clears the source row's per‑cell continuation bit when a row is continued [kitty/rewrap.h:72], and the trailing re‑assertion `next_dest_line(false)` runs only when `src_y < src_limit` [kitty/rewrap.h:93] — so the **newest** history row is never told that it still continues into the screen's top row. Because neither buffer's per‑line `is_continued` is designed to express *cross‑buffer* continuation — the screen's top row derives it as structurally `false` [kitty/line-buf.c:145], while on the history side it is derived from *within‑history* adjacency via the physical ring index [kitty/history.c:162-170], not from any relation to the screen — the only field that could carry the boundary continuation is the **per‑cell** `next_char_was_wrapped` on the newest history row's last cell, which is exactly the bit the isolated history rewrap drops. Per the task's rules, these issues are **identified and explained only — not fixed.**
 
 ---
 
@@ -31,7 +31,7 @@ The reflow logic is pure C, compiled into the `kitty.fast_data_types` extension;
 python setup.py build --verbose
 ```
 
-Built to the C11 standard (`std = '' if is_openbsd else '-std=c11'`, [setup.py:492]). In this Ubuntu 25.10 container the build additionally used `--ignore-compiler-warnings` [setup.py:2003] to bypass an *unrelated* GLFW wayland‑protocols `-Werror` warning in the Wayland backend (`glfw/wl_window.c`); the reflow C sources themselves compile clean. The produced artifact is `kitty/fast_data_types.so` (1,253,792 bytes ≈ 1.2 MB) and is `.gitignore`d (`*.so`), so the source tree stays byte‑for‑byte unchanged.
+Built to the C11 standard (`std = '' if is_openbsd else '-std=c11'`, [setup.py:492]; **source‑verified**). In this Ubuntu 25.10 container the build additionally used `--ignore-compiler-warnings` [setup.py:2003] to bypass an *unrelated* GLFW wayland‑protocols `-Werror` warning in the Wayland backend (`glfw/wl_window.c`); the reflow C sources themselves compile clean. The produced artifact is `kitty/fast_data_types.so` (1,253,792 bytes ≈ 1.2 MB) and is `.gitignore`d (`*.so`), so the source tree stays byte‑for‑byte unchanged.
 
 Import verification (exact command and output):
 
@@ -53,16 +53,18 @@ Observation follows kitty's own headless test harness — `create_lbuf` [kitty_t
 
 ### 1.4 Methodology (binding rules, satisfied)
 
-- **Ran the code first, then wrote.** Every value below was produced by executing the built extension; nothing is asserted from reading alone. Statements that are *not* directly observed at runtime are explicitly labeled **(inferred)**.
+- **Ran the code first, then wrote.** The extension was built and the real rewrap path executed *before* any prose was written, and every fenced runtime block below is verbatim captured output. To keep the evidence honest, claims are drawn from three explicitly distinguished classes: **runtime‑observed** — backed by the captured output shown adjacent to the claim (all buffer states, cursor positions, continuation bits, counts, and the reproduced symptom); **source‑verified** — statements about C control flow, macro parameterization, and function/step sequencing that are fixed at compile time and therefore cannot be emitted as runtime data, confirmed by reading the cited `file:line` at this HEAD and marked **(source‑verified)**; and **inferred** — the few interpretive conclusions beyond both, marked **(inferred)**. Where a behavior is observable it was observed rather than asserted.
 - **Real entry point only.** Resize is driven through `Screen.resize` and the headless `LineBuf.rewrap` / `HistoryBuf.rewrap` entries that the shipped tests use — never the bypassing remote‑control hook `resize_os_window` [kitty/boss.py:1543].
-- **Both directions + edges.** Widening (soft‑wrap splitting) and narrowing (line joining + history spill) are both exercised, along with the line‑0 / last‑line edge branches and the `scrollback_fill_enlarged_window` flag on and off.
+- **Both directions + edges.** Widening (soft‑wrap splitting) and narrowing (line joining + history spill) are both exercised, along with the line‑0 / last‑line edge branches and the `scrollback_fill_enlarged_window` flag on and off, plus the dummy‑char insert/remove and prompt‑preservation copy‑back edge branches (§5.5).
 - **Before / during / after + boundary.** State is captured before, at the intermediate narrow step, and after, and specifically at the screen/history boundary.
-- **Determinism.** The reported symptom was reproduced across repeated runs of the same unchanged input (three internal repeats, plus two full‑script runs that were byte‑for‑byte identical).
+- **Determinism.** The reported symptom was reproduced across repeated runs of the same unchanged input: three internal repeats plus a whole‑script two‑run `md5sum`/`diff` comparison, both shown in §6.3.
 - **Exact run command:**
 
 ```
 cd /tmp && PYTHONPATH=/tmp/blitzy/kitty/blitzy-272eab58-bd8e-4c5f-bc07-aa70eba24877_c54bda python3 /tmp/obs_consolidated.py
 ```
+
+- **Block ↔ command mapping.** Below, **`$R`** denotes that repository root. Every fenced runtime block in Sections 2–6 is a labeled section of the output of this single command (the full harness is reproduced in §8); each such block is preceded by the exact command that produced it, and where a block shows only part of a section it is marked *(excerpt)*.
 
 - **Hygiene.** The only file created is this document. No kitty source file was created, modified, or deleted; the temporary script lives in `/tmp` and is deleted after use; `git status --porcelain` reports the source tree unchanged.
 
@@ -77,11 +79,11 @@ cd /tmp && PYTHONPATH=/tmp/blitzy/kitty/blitzy-272eab58-bd8e-4c5f-bc07-aa70eba24
 - **Screen buffer:** `realloc_lb` [kitty/screen.c:234-242] → `linebuf_rewrap` [kitty/line-buf.c:586-622] → `rewrap_inner` [kitty/line-buf.c:617].
 - **Scrollback buffer:** `realloc_hb` [kitty/screen.c:216-223] → `historybuf_rewrap` [kitty/history.c:595-614] → `rewrap_inner` [kitty/history.c:611].
 
-The engine `rewrap_inner` [kitty/rewrap.h:56-96] lives in a header that is `#include`d **twice** — once inside `kitty/line-buf.c` [kitty/line-buf.c:583] (with `BufType = LineBuf`, the default [kitty/rewrap.h:10-12]) and once inside `kitty/history.c` [kitty/history.c:592] (with `#define BufType HistoryBuf` [kitty/history.c:582]). Each translation unit supplies its own `init_src_line`, `first_dest_line`, and — critically — `next_dest_line` macros before the include, so **one algorithm serves both buffers with buffer‑specific line‑advance behavior** (this is the single most important structural fact of the subsystem). The `LineBuf` `next_dest_line` [kitty/rewrap.h:24-38] can spill into history; the `HistoryBuf` `next_dest_line` [kitty/history.c:588] pushes onto the ring.
+The engine `rewrap_inner` [kitty/rewrap.h:56-96] lives in a header that is `#include`d **twice** — once inside `kitty/line-buf.c` [kitty/line-buf.c:583] (with `BufType = LineBuf`, the default [kitty/rewrap.h:10-12]) and once inside `kitty/history.c` [kitty/history.c:592] (with `#define BufType HistoryBuf` [kitty/history.c:582]). Each translation unit supplies its own `init_src_line`, `first_dest_line`, and — critically — `next_dest_line` macros before the include, so **one algorithm serves both buffers with buffer‑specific line‑advance behavior** (this is the single most important structural fact of the subsystem). The `LineBuf` `next_dest_line` [kitty/rewrap.h:24-38] can spill into history; the `HistoryBuf` `next_dest_line` [kitty/history.c:588] pushes onto the ring. *(This twice‑`#include`d macro structure is **source‑verified** from the cited `rewrap.h`/`line-buf.c`/`history.c` lines; its observable effect on buffer state is shown in §2.3.)*
 
 ### 2.2 The per‑source‑line algorithm
 
-For each source row, `rewrap_inner` [kitty/rewrap.h:56-96]:
+For each source row, `rewrap_inner` [kitty/rewrap.h:56-96] performs the following (the step sequence is **source‑verified** by reading the cited lines; the resulting buffer states are runtime‑observed in §2.3):
 
 1. Reads whether the row is continued via `is_src_line_continued()` [kitty/rewrap.h:41], which returns the last cell's `next_char_was_wrapped` bit.
 2. If **not** continued (a hard line break): trims trailing blank cells so the hard break is preserved [kitty/rewrap.h:70].
@@ -96,6 +98,8 @@ For each source row, `rewrap_inner` [kitty/rewrap.h:56-96]:
 ### 2.3 Observed baseline (matches the shipped tests)
 
 The baseline confirms the harness observes real buffer state and reproduces the shipped assertions `test_rewrap_simple` / `test_rewrap_wider` / `test_rewrap_narrower` [kitty_tests/datatypes.py:337,374,385]. `cont` = per‑line derived `is_continued`; `wrapped` = per‑cell `next_char_was_wrapped`; `cy = (nclb, ncla)`.
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
 
 ```
 ==============================================================================
@@ -124,7 +128,7 @@ Cause → effect:
 
 ### 3.1 Ordering: history first, then the screen (with history passed in)
 
-`screen_resize` reflows the buffers in a fixed order that is central to the boundary behavior:
+`screen_resize` reflows the buffers in a fixed order that is central to the boundary behavior (**source‑verified** from [kitty/screen.c:346-463]; the ordering's observable consequences appear in §3.2–§3.3 and §5.4):
 
 1. **History is rewrapped first**, and independently: `realloc_hb(self->historybuf, self->historybuf->ynum, columns, …)` [kitty/screen.c:375] → `historybuf_rewrap` [kitty/history.c:595-614]. At this point the engine has **no knowledge of the screen** — it sees only the history rows.
 2. Then the live prompt is preserved (see Q4) via `prevent_current_prompt_from_rewrapping` [kitty/screen.c:302-341].
@@ -138,6 +142,8 @@ This "history reflowed in isolation, then more screen rows spilled onto it" orde
 When narrowing pushes more destination rows than the screen can hold, the `LineBuf` variant of `next_dest_line` [kitty/rewrap.h:24-38] indexes the screen up and, if a `historybuf` was supplied, appends the evicted top row to scrollback via `historybuf_add_line(historybuf, dest->line, as_ansi_buf)` [kitty/rewrap.h:32] before clearing the freed row [kitty/rewrap.h:34]. This is the **SPILL**.
 
 Observed: one 18‑character logical line laid out on a 3×6 `LineBuf` is narrowed into a 2×3 destination plus a 2‑row `HistoryBuf`:
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
 
 ```
 ==============================================================================
@@ -162,6 +168,8 @@ Cause → effect:
 On enlargement, if `scrollback_fill_enlarged_window` is set, `screen_resize` pulls rows back from history to fill the new vertical space [kitty/screen.c:428-438]: while there is room, it pops the newest history row with `historybuf_pop_line` [kitty/screen.c:432], scrolls the screen down (`INDEX_DOWN`), copies the popped row to the screen top [kitty/screen.c:434], and advances the cursor. When the option is off, the enlarged space is simply left blank and history is retained.
 
 Both behaviors are observed in the real `Screen` path (full block under Q4). The decisive contrast:
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section (**excerpt** of the Q4 run shown in full at §5.4; AFTER + history rows, fill OFF vs ON):
 
 ```
 --- fill OFF ---
@@ -192,11 +200,13 @@ Cause → effect: with **fill OFF**, history keeps two rows and the screen shows
 
 ### 4.2 The engine copies whole attrs, then re‑asserts continuation separately
 
-`set_dest_line_attrs` [kitty/rewrap.h:18] copies the **entire** `src->line->attrs` onto the destination row (`dest->line_attrs[dest_y] = src->line->attrs; …`), which includes a possibly‑stale `is_continued` bit. Continuation is then re‑asserted separately on the destination's last cell by `next_dest_line` [kitty/rewrap.h:26]. For `LineBuf` the stale copied `is_continued` is harmless because it is overwritten on read [kitty/line-buf.c:145]; the **per‑cell** bit is the one that matters. This split — whole‑attrs copy vs. separate per‑cell re‑assertion — is why the per‑cell bit is the only reliable carrier, and why dropping it (Section 4.4) is silent.
+`set_dest_line_attrs` [kitty/rewrap.h:18] copies the **entire** `src->line->attrs` onto the destination row (`dest->line_attrs[dest_y] = src->line->attrs; …`), which includes a possibly‑stale `is_continued` bit. Continuation is then re‑asserted separately on the destination's last cell by `next_dest_line` [kitty/rewrap.h:26]. For `LineBuf` the stale copied `is_continued` is harmless because it is overwritten on read [kitty/line-buf.c:145]; the **per‑cell** bit is the one that matters. This split — whole‑attrs copy vs. separate per‑cell re‑assertion — is why the per‑cell bit is the only reliable carrier, and why dropping it (Section 4.4) is silent. *(This whole‑attrs‑copy‑then‑re‑assert structure is **source‑verified** from [kitty/rewrap.h:18,26]; its observable consequence — the per‑cell bit being the only reliable carrier — is shown at runtime in §4.3 and §4.6.)*
 
 ### 4.3 The source's continuation bit is mutated (destroyed) during rewrap
 
 Observed directly in the widen baseline (Q1): the source row's per‑cell wrapped bit is cleared by the engine at [kitty/rewrap.h:72]:
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section (**excerpt** of the Q1 baseline shown in full at §2.3; the two `[widen 5->6] src` lines):
 
 ```
 [widen 5->6] src  BEFORE: ['0123 ', '56789'] cont [False, True] wrapped [True, False]
@@ -208,6 +218,8 @@ Cause → effect: when a source row is continued, `rewrap_inner` sets `src->line
 ### 4.4 The last source row's continuation is never re‑managed on the destination
 
 The trailing re‑assertion is guarded: `if (!src_line_is_continued && src_y < src_limit) { … next_dest_line(false); … }` [kitty/rewrap.h:93]. It fires **only when there is a next source row** (`src_y < src_limit`). For the **last** source row there is no next row, so no trailing `next_dest_line` runs, and the final destination row's continuation bit is left at whatever the last `copy_range`/`next_dest_line(true)` produced — it is never explicitly cleared or, crucially, re‑asserted.
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
 
 ```
 ==============================================================================
@@ -221,16 +233,37 @@ For a self‑contained `LineBuf` reflow this is benign (a buffer's last row genu
 
 ### 4.5 The history buffer cannot represent continuation into the screen
 
-For `HistoryBuf` the picture is analogous but the consequence is worse at the boundary:
+For `HistoryBuf` the per‑line story must be stated against the *physical ring buffer*, and once it is, the per‑line flag turns out to be the wrong carrier for the boundary in **either** buffer:
 
-- The `HistoryBuf` `next_dest_line` [kitty/history.c:588] pushes the row and copies `*lap = src->line->attrs` directly into the stored per‑line attrs.
-- On **read**, `HistoryBuf`'s `init_line` [kitty/history.c:161-177] *does* re‑derive `is_continued`: for a non‑newest row it takes the previous history row's last‑cell wrapped bit [kitty/history.c:168], but for the **newest** row (index 0) it forces `is_continued = false` [kitty/history.c:170] (unless the pager‑history ringbuffer indicates otherwise). *(The re‑derivation for non‑newest rows is confirmed by reading [kitty/history.c:161-177]; the decisive newest‑row behavior is confirmed at runtime in Section 4.6.)*
+- The `HistoryBuf` `next_dest_line` [kitty/history.c:588] pushes the row and copies `*lap = src->line->attrs` directly into the stored per‑line attrs (source‑verified).
+- On **read**, `HistoryBuf`'s `init_line` [kitty/history.c:162-177] derives `is_continued` from the **physical ring‑buffer index** `num` it is handed, *not* from the logical line number: for `num > 0` it takes the physically‑previous row's last‑cell wrapped bit [kitty/history.c:168], and only for `num == 0` (the physical bottom slot of the ring) does it force `is_continued = false` [kitty/history.c:170] (unless the pager‑history ringbuffer indicates otherwise). This derivation is **source‑verified**: the Python API exposes no `is_continued` getter on a history `Line` (confirmed at runtime — a `Line` object has no `is_continued` attribute), so it cannot be read back directly.
+- Crucially, `HistoryBuf.line(lnum)` maps the **logical** line number to a physical index through `index_of` [kitty/history.c:153-158], called at [kitty/history.c:315]: the newest logical row (`lnum == 0`) lands at physical `(start_of_data + count - 1) % ynum`, which equals `0` only in particular ring states. So `history.c:170` does **not** structurally force the *logical newest* row's `is_continued` to `false`; it is a **physical‑index‑0** condition. (An earlier draft of this document mis‑cited `history.c:170` as proof that the logical newest row is always `false`; that is corrected here.)
+- More fundamentally, even where it *is* derived, this per‑line flag describes continuation *from the physically‑previous row within history* (`num-1`), never continuation *into the screen*. It is therefore the wrong flag for the history/screen boundary regardless of the ring's physical layout.
 
-Net effect of 4.1–4.5: **neither** buffer's per‑line `is_continued` can carry continuation across the history/screen join — it is structurally `false` for the newest history row [kitty/history.c:170] and for the screen's top row [kitty/line-buf.c:145]. That leaves the **per‑cell** `next_char_was_wrapped` on the newest history row's last cell as the only possible carrier — and that is exactly the bit the engine drops (4.3–4.4) when it rewraps history in isolation.
+The per‑line flag that *is* relevant to the boundary is the **screen's top row** `is_continued`, which is structurally `false` [kitty/line-buf.c:145] (`idx > 0 ? ... : false`). Both the ring's position‑independence and the screen‑side derivation are observable at runtime.
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
+
+```
+==============================================================================
+F1 HISTORY-SIDE: ring physical vs logical index; per-cell carrier durability; is_continued derivation
+==============================================================================
+[ring] pushed 6 rows into HistoryBuf(cap=3); count=3 (oldest evicted)
+[ring] newest-first (text, per-cell wrapped): [('PQR', False), ('MNO', True), ('JKL', True)]
+[ring] newest logical row (line(0)) per-cell wrapped = False (position-independent carrier)
+[derive] LineBuf rows=['AB', 'CD', 'EF'] per-cell wrapped=[True, False, False] -> is_continued(derived)=[False, True, False]
+[derive] is_continued(0)=False (idx>0 ? prev.next_char_was_wrapped : false) -> row 0 ALWAYS False [line-buf.c:145]
+```
+
+Cause → effect: pushing a single 6‑row logical line into a capacity‑3 ring wraps it twice, yet the per‑cell `next_char_was_wrapped` bits survive intact (`MNO`, `JKL` remain `True`) regardless of the physical slot each row now occupies — the per‑cell bit is a **position‑independent** carrier, whereas the derived per‑line flag is recomputed from whatever physical neighbour `init_line` sees. The `[derive]` line shows the screen‑side rule directly: a `LineBuf` whose row 0 ends `wrapped=True` yields `is_continued = [False, True, False]` — row 0 is **always** `False` [kitty/line-buf.c:145] and each later row merely mirrors the previous row's per‑cell bit. Neither per‑line derivation can look across a buffer boundary.
+
+Net effect of 4.1–4.5: **neither** buffer's per‑line `is_continued` can carry continuation across the history/screen join. On the screen side the top row is structurally `false` [kitty/line-buf.c:145]; on the history side the flag is derived from within‑history (physical‑neighbour) adjacency [kitty/history.c:162-170] and never encodes a relationship to the screen. That leaves the **per‑cell** `next_char_was_wrapped` on the newest history row's last cell as the only possible carrier — and that is exactly the bit the engine drops (4.3–4.4) when it rewraps history in isolation.
 
 ### 4.6 Decisive runtime evidence — the boundary continuation is dropped
 
 Seed a history whose **newest** row (`GHI`) ends `wrapped=True` (it continues into the screen's top row), then rewrap the history **alone** to a wider width:
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
 
 ```
 ==============================================================================
@@ -256,17 +289,17 @@ Cause → effect: before rewrap the newest row's last cell is `wrapped=True`. Du
 
 ### 5.2 Inside `screen_resize` [kitty/screen.c:346-463]
 
-In order:
+In order (**source‑verified**: the step sequence is read from [kitty/screen.c:346-463]; the runtime consequences of the dummy‑char and prompt branches are shown in §5.5, and of the overall flow in §5.4):
 
 - Pause rendering and clamp `lines`/`columns` to ≥ 1 [kitty/screen.c:347-348].
-- **Dummy‑char insert:** if the cursor sits at column 0 on a blank `OUTPUT_START` line, insert a `'<'` so the blank output line survives reflow [kitty/screen.c:353-360].
+- **Dummy‑char insert:** if the cursor sits at column 0 on a blank `OUTPUT_START` line, insert a `'<'` so the blank output line survives reflow [kitty/screen.c:353-360] (exercised at runtime in §5.5).
 - **History rewrap FIRST:** `realloc_hb` [kitty/screen.c:375] → `historybuf_rewrap` — history reflowed to the new column count, in isolation.
-- **Prompt preservation:** `prevent_current_prompt_from_rewrapping` [kitty/screen.c:302-341] copies the live prompt lines into a scratch `LineBuf` and blanks them, trusting the shell to redraw (prevents flicker).
+- **Prompt preservation:** `prevent_current_prompt_from_rewrapping` [kitty/screen.c:302-341] copies the live prompt lines into a scratch `LineBuf` and blanks them, trusting the shell to redraw (prevents flicker) (exercised at runtime in §5.5).
 - **Main screen rewrap:** `realloc_lb(main_linebuf, …, self->historybuf, …)` [kitty/screen.c:384] — the already‑rewrapped history is passed in so top‑of‑screen overflow spills onto it.
 - **Alt screen rewrap:** `realloc_lb(alt_linebuf, …, NULL, …)` [kitty/screen.c:394] — no history for the alternate screen.
 - **Cursor reposition:** clamp active + saved cursors to the new bounds via the `S(…)` macro [kitty/screen.c:419-423] and, if the cursor was beyond content, snap it to `num_content_lines` [kitty/screen.c:424-427]. Cursors are tracked through the reflow by `CursorTrack` [kitty/screen.c:226-232] feeding the engine's `TrackCursor` [kitty/rewrap.h:50-53], remapped as cells are copied [kitty/rewrap.h:74-90].
 - **Scrollback fill‑back:** if `scrollback_fill_enlarged_window` is set, pull rows back from history [kitty/screen.c:428-438].
-- **Dummy‑char removal** [kitty/screen.c:439-443] and **non‑reflowed prompt copy‑back** [kitty/screen.c:444-461] (the preserved prompt lines are copied back verbatim, *without* reflow).
+- **Dummy‑char removal** [kitty/screen.c:439-443] and **non‑reflowed prompt copy‑back** [kitty/screen.c:444-461] (the preserved prompt lines are copied back verbatim, *without* reflow) (both exercised at runtime in §5.5).
 
 ### 5.3 Flow diagram
 
@@ -310,6 +343,8 @@ flowchart TD
 
 A single 18‑character logical line is drawn on a 3×6 screen, then narrowed to 3×3, then enlarged to 6×8, with `scrollback_fill_enlarged_window` off and on. `cursor=(x,y)`, `hist.count` = scrollback row count.
 
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
+
 ```
 ==============================================================================
 Q4 + SYMPTOM (REAL Screen path): draw 18-char logical line -> narrow -> enlarge (+fill)
@@ -324,6 +359,7 @@ Q4 + SYMPTOM (REAL Screen path): draw 18-char logical line -> narrow -> enlarge 
 [fill=True] DURING (3x3): screen=['JKL', 'MNO', 'PQR'] wrapped=[True, True, False] cursor=(2,2) hist.count=3
 [fill=True] AFTER  (6x8): screen=['ABCDEFGH', 'I', 'JKLMNOPQ', 'R', '', ''] wrapped=[True, False, True, False, False, False] cursor=(1,3) hist.count=0
 [fill=True] history(newest first)=[]
+[fill=True] screen is_continued(derived)=[False, True, False, True, False, False]  <- boundary split visible as per-line flag
 ```
 
 Cause → effect (data flow made concrete):
@@ -334,6 +370,43 @@ Cause → effect (data flow made concrete):
 - **AFTER (6×8), fill ON:** history is popped back onto the screen, yielding `['ABCDEFGH', 'I', 'JKLMNOPQ', 'R', '', '']` with `wrapped=[True, False, True, False, False, False]`. The `'I'` row is `wrapped=False`, so the screen now represents **two** logical lines (`ABCDEFGHI` and `JKLMNOPQR`) where there was originally **one** (`ABCDEFGHIJKLMNOPQR`). Cursor tracked to `(1,3)`.
 
 The cursor snapshots (`(6,2) → (2,2) → (1,1)`/`(1,3)`) are the observable output of the `CursorTrack`/`TrackCursor` remapping [kitty/screen.c:226-232, kitty/rewrap.h:50-53] plus the post‑reflow clamp/`is_beyond_content` handling [kitty/screen.c:419-427].
+
+### 5.5 Edge branches exercised at runtime: dummy‑char insertion and prompt preservation
+
+Two `screen_resize` edge branches are exercised directly on the real `Screen` path (runtime‑observed, not read from source). Each is shown as a contrast that isolates the branch.
+
+**Dummy‑char insert/remove** [kitty/screen.c:353-360, 439-443]. When the cursor sits at column 0 on a *blank* `OUTPUT_START` line, `screen_resize` inserts a `'<'` [kitty/screen.c:358] so the blank output line counts as content through reflow, then removes it afterwards [kitty/screen.c:439-443]. To isolate the branch the `OUTPUT_START` mark is set with `OSC 133 ; C` only (which does **not** enable prompt redraws), so the prompt‑preservation path is inert.
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
+
+```
+==============================================================================
+F2 DUMMY-CHAR: blank OUTPUT_START line preserved across reflow (screen.c:353-360, 439-443)
+==============================================================================
+[OUTPUT_START=True] BEFORE (6x6) : ['Pabcde', 'fghQ', '', '', '', ''] cursor=(0,4)
+[OUTPUT_START=True] AFTER  (6x10): ['PabcdefghQ', '', '', '', '', ''] cursor=(0,3)
+[OUTPUT_START=False] BEFORE (6x6) : ['Pabcde', 'fghQ', '', '', '', ''] cursor=(0,4)
+[OUTPUT_START=False] AFTER  (6x10): ['PabcdefghQ', '', '', '', '', ''] cursor=(0,1)
+```
+
+Cause → effect: the input is one logical line `PabcdefghQ` wrapped to `['Pabcde', 'fghQ']` at width 6, with the cursor parked on a blank row 4 (`x==0`) that is marked `OUTPUT_START`. On widening to width 10 the content rejoins to a single row `PabcdefghQ`. **With** the mark the dummy‑char branch fires: the blank output line is preserved as content, so the cursor tracks to `(0,3)` (the blank output row, three rows below the reflowed content). **Without** the mark the branch is skipped: the blank line is treated as beyond‑content and the cursor collapses up to the content boundary at `(0,1)`. The observable `(0,3)` vs `(0,1)` difference is the branch's effect.
+
+**Prompt preservation / non‑reflowed copy‑back** [kitty/screen.c:302-341, 444-461]. When the shell has marked a prompt and `redraws_prompts_at_all` is set, `prevent_current_prompt_from_rewrapping` [kitty/screen.c:302-341] copies the live prompt lines into a scratch `LineBuf` and blanks them; after the reflow they are copied back **verbatim, without reflow** [kitty/screen.c:444-461]. The contrast toggles `redraws_prompts_at_all` via `OSC 133 ; A` (present vs absent).
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
+
+```
+==============================================================================
+F2 PROMPT-PRESERVATION: live prompt copied back WITHOUT reflow (screen.c:302-341, 444-461)
+==============================================================================
+[redraws_prompts=True] BEFORE (5x10): ['PROMPT>abc', 'd', '', '', ''] cursor=(1,1)
+[redraws_prompts=True] AFTER  (5x6) : ['PROMPT', 'd', '', '', ''] cursor=(0,1)
+[redraws_prompts=False] BEFORE (5x10): ['PROMPT>abc', 'd', '', '', ''] cursor=(1,1)
+[redraws_prompts=False] AFTER  (5x6) : ['PROMPT', '>abcd', '', '', ''] cursor=(4,1)
+```
+
+Cause → effect: the input is one logical line `PROMPT>abcd` wrapped to `['PROMPT>abc', 'd']` at width 10. On resize to width 6, **with** redraws on the prompt is copied back verbatim — `'PROMPT>abc'` is truncated to `'PROMPT'` and the old second row `'d'` is kept as‑is, giving `['PROMPT', 'd']` (cursor `(0,1)`); the line is **not** re‑wrapped. **Without** redraws the normal engine reflows the 11‑char logical line to width 6, giving `['PROMPT', '>abcd']` (cursor `(4,1)`). The `'d'` vs `'>abcd'` second row is the signature that `prevent_current_prompt_from_rewrapping` fired and the copy‑back skipped reflow.
+
 
 
 ---
@@ -354,10 +427,12 @@ With fill OFF the same dropped bit is visible directly in scrollback: the newest
 1. `screen_resize` rewraps the history **first and in isolation** [kitty/screen.c:375], before the screen and without any reference to the screen's top row.
 2. The newest history row is continued (`wrapped=True`) — it flows into the screen's top row. During the isolated rewrap the engine **clears** that source per‑cell bit [kitty/rewrap.h:72] as it consumes the continued row.
 3. Because the newest history row is the **last** source row of the history rewrap, the trailing continuation re‑assertion `next_dest_line(false)` is skipped (`src_y < src_limit` is false) [kitty/rewrap.h:93]. Nothing re‑asserts the boundary continuation on the rewrapped newest row.
-4. The per‑line `is_continued` cannot compensate: it is forced `false` for the newest history row [kitty/history.c:170] and for the screen's top row [kitty/line-buf.c:145], and the `HistoryBuf` `next_dest_line` [kitty/history.c:588] stores whatever attrs the source had. There is no channel by which the history buffer can record "I continue into the screen."
+4. The per‑line `is_continued` cannot compensate: on the screen side the top row derives it as structurally `false` [kitty/line-buf.c:145], while on the history side `init_line` derives it from within‑history (physical‑neighbour) adjacency via the ring index [kitty/history.c:162-170] and the `HistoryBuf` `next_dest_line` [kitty/history.c:588] merely stores the source attrs — neither ever encodes a relationship to the screen. There is no channel by which the history buffer can record "I continue into the screen."
 5. Result: the boundary continuation bit is dropped; on the next enlargement the join is treated as a hard break, splitting one logical line into two.
 
 ### 6.3 Determinism (same unchanged input, repeated)
+
+*Producing command:* `cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py` — output section:
 
 ```
 ==============================================================================
@@ -368,7 +443,19 @@ DETERMINISM: repeat SYMPTOM 3x with identical unchanged input
 [run 3] mid(after 3x3) hist=[('GHI', True), ('DEF', True), ('ABC', True)] | final screen=['ABCDEFGH', 'I', 'JKLMNOPQ', 'R', '', ''] wrapped=[True, False, True, False, False, False]
 ```
 
-Three runs of the identical unchanged input produced byte‑identical output; additionally, two full‑script runs were byte‑for‑byte identical. The symptom is **stable and deterministic**, not intermittent — it depends only on whether a continued row lands as the newest history row at the moment of an isolated history rewrap.
+The three internal repeats above are byte‑identical. Whole‑script determinism was confirmed by running the entire harness twice and comparing with `md5sum` and `diff`:
+
+```
+$ cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py > run1.txt 2>&1
+$ cd /tmp && PYTHONPATH=$R python3 /tmp/obs_consolidated.py > run2.txt 2>&1
+$ md5sum run1.txt run2.txt
+05ed7dd58d01649099137f8c13884479  run1.txt
+05ed7dd58d01649099137f8c13884479  run2.txt
+$ diff run1.txt run2.txt && echo IDENTICAL
+IDENTICAL
+```
+
+The symptom is **stable and deterministic**, not intermittent — it depends only on whether a continued row lands as the newest history row at the moment of an isolated history rewrap.
 
 ---
 
@@ -388,13 +475,13 @@ Three runs of the identical unchanged input produced byte‑identical output; ad
 | **Q3** `set_dest_line_attrs` copies whole attrs; HistoryBuf direct push | §4.2, §4.5 | [rewrap.h:18], [history.c:588] |
 | **Q3** source mutation of wrapped bit | §4.3, widen BEFORE→AFTER | [rewrap.h:72] |
 | **Q3** last‑row edge: trailing `next_dest_line(false)` only when `src_y<src_limit` | §4.4, Q3 edge | [rewrap.h:93] |
-| **Q3** HistoryBuf re‑derives on read; newest forced false | §4.5 | [history.c:161-177], [history.c:168,170] |
+| **Q3** HistoryBuf `is_continued` derived from PHYSICAL ring index (not logical newest); boundary carrier is per‑cell | §4.5 (F1 history‑side block, runtime) | [history.c:153-158,162-170,315], [line-buf.c:145] |
 | **Q4** entry chain (boss → window → PTY → binding); avoid RC hook | §5.1 | [boss.py:1206], [window.py:854,863], [child-monitor.c:592], [state.c:406], [screen.c:3928-3935], [boss.py:1543] |
 | **Q4** cursor tracking `CursorTrack`/`TrackCursor` | §5.2, §5.4 cursor values | [screen.c:226-232], [rewrap.h:50-53], [screen.c:419-427] |
-| **Q4** prompt preservation + non‑reflowed copy‑back; dummy char | §5.2 | [screen.c:302-341,444-461,353-360,439-443] |
+| **Q4** prompt preservation + non‑reflowed copy‑back; dummy char | §5.2 (step sequence, source‑verified), §5.5 (runtime before/after: dummy‑char + prompt copy‑back) | [screen.c:302-341,444-461,353-360,439-443] |
 | **Q4** mermaid diagram | §5.3 | — |
-| Symptom reproduced + deterministic + isolated mechanism | §6.1, §6.2, §6.3 | [rewrap.h:72,93], [screen.c:375], [history.c:170], [line-buf.c:145] |
-| Every claim: actual output + exact command + `file:line` + cause→effect; inferred labeled | throughout; §1.2, §1.4 | — |
+| Symptom reproduced + deterministic + isolated mechanism | §6.1, §6.2, §6.3 | [rewrap.h:72,93], [screen.c:375], [line-buf.c:145] |
+| Evidence taxonomy applied: runtime‑observed (adjacent output + command), source‑verified (cited `file:line`), inferred; runtime blocks carry cause→effect | throughout; §1.4 taxonomy | — |
 
 ---
 
@@ -416,6 +503,7 @@ from kitty.fast_data_types import LineBuf, HistoryBuf, Screen, Cursor as C, set_
 from kitty.config import finalize_keys, finalize_mouse_mappings
 from kitty.options.parse import merge_result_dicts
 from kitty.options.types import Options, defaults
+from kitty_tests import Callbacks, parse_bytes
 
 
 def create_lbuf(*lines):
@@ -490,6 +578,30 @@ print(f"[spill] reassembled hist(oldest->newest)+dest: {oldest_first + dest_txt}
 print(f"[spill] BOUNDARY: dest.is_continued(0)= {dest.is_continued(0)} | history NEWEST wrapped= {hist.line(0).last_char_has_wrapped_flag()}")
 
 # ---------------------------------------------------------------------------
+# F1 HISTORY-SIDE: physical/logical ring mapping + per-cell durability + LineBuf.is_continued derivation
+# ---------------------------------------------------------------------------
+print()
+print(bar)
+print("F1 HISTORY-SIDE: ring physical vs logical index; per-cell carrier durability; is_continued derivation")
+print(bar)
+# Push one 6-row logical line (each row continues) into a capacity-3 ring so the ring WRAPS.
+src = create_lbuf('ABC', 'DEF', 'GHI', 'JKL', 'MNO', 'PQR')
+for i in range(1, 6):
+    src.set_continued(i, True)          # rows 0..4 each continue into next -> one logical line
+hb = HistoryBuf(3, 3)                    # capacity 3; pushing 6 rows wraps the ring twice
+for i in range(6):
+    hb.push(src.line(i))
+print(f"[ring] pushed 6 rows into HistoryBuf(cap=3); count={hb.count} (oldest evicted)")
+print(f"[ring] newest-first (text, per-cell wrapped): {HB(hb)}")
+print(f"[ring] newest logical row (line(0)) per-cell wrapped = {hb.line(0).last_char_has_wrapped_flag()} (position-independent carrier)")
+# LineBuf.is_continued derivation: row 0 always False; row y == prev row's per-cell wrapped bit [line-buf.c:145]
+d = create_lbuf('AB', 'CD', 'EF')
+d.set_continued(1, True)                 # row0 continues into row1 (per-cell wrapped on row0)
+d.set_continued(2, False)                # row1 does NOT continue into row2
+print(f"[derive] LineBuf rows={L(d)} per-cell wrapped={WR(d)} -> is_continued(derived)={CO(d)}")
+print(f"[derive] is_continued(0)={d.is_continued(0)} (idx>0 ? prev.next_char_was_wrapped : false) -> row 0 ALWAYS False [line-buf.c:145]")
+
+# ---------------------------------------------------------------------------
 # Q3 edge: line-0 always-false derivation; final dest line never re-flagged
 # ---------------------------------------------------------------------------
 print()
@@ -500,13 +612,54 @@ print("[edge] dest.is_continued(0) is ALWAYS False (idx>0 ? prev.next_char_was_w
 print(f"[edge] final dest line wrapped = {dest.line(dest.ynum - 1).last_char_has_wrapped_flag()} (trailing next_dest_line(false) only fires when src_y<src_limit [rewrap.h:93])")
 
 # ---------------------------------------------------------------------------
+# F2 DUMMY-CHAR: isolated (133;C only, no redraws) blank OUTPUT_START line preserved by dummy insert/remove
+# ---------------------------------------------------------------------------
+print()
+print(bar)
+print("F2 DUMMY-CHAR: blank OUTPUT_START line preserved across reflow (screen.c:353-360, 439-443)")
+print(bar)
+def csnap(s):
+    return [str(s.line(i)) for i in range(s.lines)], f"({s.cursor.x},{s.cursor.y})"
+for marked in (True, False):
+    set_options(opts())
+    cb = Callbacks(); s = Screen(cb, 6, 6, 1000, 10, 20, 0, cb)
+    s.draw('PabcdefghQ')                          # 10-char logical line -> wraps 'Pabcde'/'fghQ' at width 6
+    s.carriage_return()
+    for _ in range(3): s.index()                  # cursor -> row4 (blank), x=0
+    if marked:
+        parse_bytes(s, b'\033]133;C\007')          # mark ONLY OUTPUT_START on blank row4 (no redraws_prompts)
+    ls, cur = csnap(s)
+    print(f"[OUTPUT_START={marked}] BEFORE (6x6) : {ls} cursor={cur}")
+    s.resize(6, 10)
+    ls, cur = csnap(s)
+    print(f"[OUTPUT_START={marked}] AFTER  (6x10): {ls} cursor={cur}")
+
+# ---------------------------------------------------------------------------
+# F2 PROMPT-PRESERVATION: prompt copied back WITHOUT reflow (screen.c:302-341, 444-461)
+# ---------------------------------------------------------------------------
+print()
+print(bar)
+print("F2 PROMPT-PRESERVATION: live prompt copied back WITHOUT reflow (screen.c:302-341, 444-461)")
+print(bar)
+for redraw in (True, False):
+    set_options(opts())
+    cb = Callbacks(); s = Screen(cb, 5, 10, 1000, 10, 20, 0, cb)
+    if redraw:
+        parse_bytes(s, b'\033]133;A\007')          # PROMPT_START; sets redraws_prompts_at_all=1
+    s.draw('PROMPT>abcd')                          # 11-char logical line -> wraps 'PROMPT>abc'/'d' at width 10
+    ls, cur = csnap(s)
+    print(f"[redraws_prompts={redraw}] BEFORE (5x10): {ls} cursor={cur}")
+    s.resize(5, 6)
+    ls, cur = csnap(s)
+    print(f"[redraws_prompts={redraw}] AFTER  (5x6) : {ls} cursor={cur}")
+
+# ---------------------------------------------------------------------------
 # Q4 + symptom: real Screen path, draw 18-char line -> resize(3,3) -> resize(6,8) with fill OFF/ON
 # ---------------------------------------------------------------------------
 print()
 print(bar)
 print("Q4 + SYMPTOM (REAL Screen path): draw 18-char logical line -> narrow -> enlarge (+fill)")
 print(bar)
-from kitty_tests import Callbacks
 
 def snap(s):
     return ([str(s.line(i)) for i in range(s.lines)],
@@ -528,6 +681,8 @@ for fill in (False, True):
     ls, wr, cur, hc = snap(s)
     print(f"[fill={fill}] AFTER  (6x8): screen={ls} wrapped={wr} cursor={cur} hist.count={hc}")
     print(f"[fill={fill}] history(newest first)={[(str(s.historybuf.line(i)), s.historybuf.line(i).last_char_has_wrapped_flag()) for i in range(s.historybuf.count)]}")
+    if fill:
+        print(f"[fill={fill}] screen is_continued(derived)={[s.linebuf.is_continued(i) for i in range(s.lines)]}  <- boundary split visible as per-line flag")
 
 # ---------------------------------------------------------------------------
 # Mechanism: isolated history rewrap drops the newest line's 'continues-into-screen' bit
