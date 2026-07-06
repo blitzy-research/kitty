@@ -67,7 +67,7 @@ $ PYTHONPATH=. python3 -c "import kitty.fast_data_types as f; from kitty.constan
 <class 'fast_data_types.Screen'> 0.35.2
 ```
 
-  The version lives in `kitty.constants.str_version` (it is **not** an attribute of `fast_data_types`); `git show -s --format=%ci HEAD` reports the commit date `2024-06-24`.
+  The version lives in `kitty.constants.str_version` (it is **not** an attribute of `fast_data_types`); `git show -s --format=%ci 815df1e2` reports the commit date `2024-06-24` for the investigated base commit (referenced by its hash rather than `HEAD`, so the value reproduces even after this document is committed on top of the base).
 - **Build artifacts are gitignored:** `git check-ignore kitty/fast_data_types.so build` prints both paths, so the build leaves no tracked changes.
 
 ### Observation harness (real entry point — no bypass)
@@ -275,7 +275,7 @@ Interpretation (each with its citation):
 
 This section is **external corroboration** (web search + kitty's own docs/changelog), kept distinct from the observed runtime behavior above. It establishes that the results belong to the **classic per-codepoint model** and must not be read against a newer kitty.
 
-- **This commit is June 2024.** `git show -s --format=%ci HEAD` reports `2024-06-24`; the changelog dates the release at `docs/changelog.rst:59`: `0.35.2 [2024-06-22]`.
+- **This commit is June 2024.** `git show -s --format=%ci 815df1e2` reports `2024-06-24` (the investigated base commit is referenced by its hash rather than `HEAD`, so this reproduces regardless of any commits layered on top); the changelog dates the release at `docs/changelog.rst:59`: `0.35.2 [2024-06-22]`.
 - **It predates kitty's text-sizing / grapheme-segmentation work.**
   - GitHub **#8226** — the text-sizing protocol ("display text in different sizes") — is 2025 work that introduced the ability for clients to declare explicit cell widths.
   - GitHub **#8533** — the RFC "Specifying how terminals process Unicode text" — is dated **April 2025** and follows on from #8226. It specifies full grapheme segmentation based on the Unicode standard's rules and explicitly warns that for ZWJ-based emoji "the width kitty assigns to these has changed" under the new algorithm. kitty's changelog records the behavior change: *"Now kitty does full grapheme segmentation following the Unicode 16 spec when splitting text into cells (#8533)."* (shipped in a later 0.4x release, 2025).
@@ -305,7 +305,7 @@ A final coverage pass over **every named item** this investigation was required 
 | 13 | Regional-indicator flag pair | *Sibling-condition coverage* | `🇮🇳` round-trips; forced 1×1 → `ESC[6n` `b'\x1b[1;2R'` (`is_flag_pair` `kitty/screen.c:633`) | ✅ Covered |
 | 14 | Wide char + backspace | *Sibling-condition coverage* | after emoji `cursor.x=2`; after `BS` `cursor.x=1`, cell unchanged `👨` (cf. `kitty_tests/screen.py:271`) | ✅ Covered |
 | 15 | Version context (predates #8226 / #8533) | *Version context* | 0.35.2 (June 2024); classic per-codepoint model; newer grapheme-segmentation model explicitly excluded | ✅ Covered |
-| 16 | Repository integrity / cleanup | *Repository integrity & cleanup proof* | `git status --porcelain` empty except `blitzy/`; `/tmp` probes removed; build artifacts gitignored | ✅ Covered |
+| 16 | Repository integrity / cleanup | *Repository integrity & cleanup proof* | `git status --porcelain` clean; `git diff 815df1e2..HEAD --name-status` lists only the added answer doc; `/tmp` probes removed; build artifacts gitignored | ✅ Covered |
 | 17 | Canonical build & run baseline | *Canonical build & run baseline* | canonical command + version 0.35.2 + toolchain + `.so` size **6,142,952 bytes**; verification rerun distinguished | ✅ Covered |
 | 18 | Real VT-parser entry path (no bypass) | *How this was investigated / Observation harness* | `parse_bytes` → real `kitty/vt-parser.c`; the `s.draw()` binding is explicitly **not** used for observations | ✅ Covered |
 
@@ -314,7 +314,7 @@ A final coverage pass over **every named item** this investigation was required 
 ## Repository integrity & cleanup proof
 
 - The two temporary probes lived at `/tmp/kitty_probe.py` and `/tmp/kitty_probe2.py` — **outside** the repository — and were removed after use.
-- `git status --porcelain` shows **no modified or deleted tracked files**; the only new path is the `blitzy/` tree containing this document.
+- `git status --porcelain` is **clean** — no modified or deleted tracked source files. Relative to the investigated base commit, `git diff 815df1e2..HEAD --name-status` lists exactly one added entry (status `A`): `blitzy/documentation/kitty_815df1e210e0.md`. This document under the `blitzy/` tree is the sole added path, and referencing the base by hash keeps the check reproducible after the document is committed on top of the base.
 - `git check-ignore kitty/fast_data_types.so build` confirms both build artifacts are **gitignored**, so building the native extension leaves no tracked changes.
 - **This answer document under `blitzy/documentation/` is the only addition.** No existing source file was modified, added to, or deleted — consistent with the read-only mandate.
 
