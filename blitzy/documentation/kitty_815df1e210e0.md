@@ -300,7 +300,7 @@ def program_for(name: str) -> Program:
     return Program(name)
 ```
 
-`shaders.py:63` prepends `#version {GLSL_VERSION}`; the `#include` directives are found by `Program.include_pat.finditer` at `shaders.py:72` and pulled in recursively at `shaders.py:78` (`yield from self._load_sources(iname, seen, level+1)`) — this is the mechanism by which the three helper files are pulled into the cell/border/graphics/etc. shaders. `shaders.py:90` then calls the native `compile_program`. On the C side, that native function compiles each stage and links the GPU program:
+`shaders.py:63` prepends `#version {GLSL_VERSION}`; the `#include` directives are found by `Program.include_pat.finditer` at `shaders.py:72` and pulled in recursively at `shaders.py:78` (`yield from self._load_sources(iname, seen, level+1)`) — this is the mechanism by which the three helper files are pulled into the cell and graphics shaders (`cell_vertex.glsl`, `cell_fragment.glsl`, and `graphics_fragment.glsl`). `shaders.py:90` then calls the native `compile_program`. On the C side, that native function compiles each stage and links the GPU program:
 
 ```text
 $ sed -n '1152,1195p' kitty/shaders.c
