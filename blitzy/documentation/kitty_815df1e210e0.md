@@ -8,8 +8,8 @@
 - **This document leads with directly observed runtime behavior.** Every behavioral claim below is backed by the *actual, captured* output of a running kitty binary and the *exact command* that produced it. Source `file:line` citations and function names are provided so each observation can be traced to the code that emits it, but the evidence — not code reading — is primary.
 - **The exact input path was exercised.** Keystrokes were injected with `xdotool key` (the X11 **XTEST** extension), which delivers events into the *same* GLFW event queue a physical keyboard uses. No value in this document comes from `kitty @` remote control, an internal test hook, or any bypassing interface.
 - **Default, canonical build and configuration.** kitty was built with `python3 setup.py build` and run as a normal user would. The only non‑default elements are *environment* accommodations for a headless container (a virtual X display via **Xvfb** and **Mesa llvmpipe** software OpenGL); these are host accommodations, **not** kitty configuration changes, and are labeled as such wherever they appear.
-- **Repository is treated strictly read‑only.** This Markdown file is the only artifact added to the tree. All observation scripts and logs lived under `/tmp` and were removed afterward; build outputs are git‑ignored. `git status --porcelain` is empty apart from this file.
-- **Presentation of captured output.** kitty colorizes its debug labels with ANSI SGR escape sequences (e.g. `Press` in red, `Release` in green, `on_key_input` in yellow). Those purely cosmetic color codes are stripped in the code blocks below for Markdown readability; **all substantive fields — keycodes, encodings, event names, modifier state — are shown exactly as captured.** The `[seconds]` timestamp prefix (emitted by `timed_debug_print`, `kitty/monotonic.h:99`) is the *only* field that varies from run to run (see the Stability section).
+- **Repository is treated strictly read‑only.** This Markdown file is the only artifact added to the tree. All observation scripts and logs lived under `/tmp` and were removed afterward; build outputs are git‑ignored. To be precise about what "read‑only" means here: after the deliverable is committed, the working tree is clean, so `git status --porcelain` prints nothing; and comparing the branch against the pre‑existing baseline commit with `git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 --name-status` shows exactly one entry — `A	blitzy/documentation/kitty_815df1e210e0.md` — confirming that a single new file was **added** and that no existing file was modified or deleted.
+- **Presentation of captured output.** kitty colorizes its debug labels with ANSI SGR escape sequences, and it emits them **unconditionally** — they are *not* gated on `isatty`, so they are present verbatim in the log even when stderr is redirected to a file. For example `glfw/xkb_glfw.c:875` wraps the label as `\x1b[31mPress\x1b[m` / `\x1b[32mRelease\x1b[m`, `kitty/keys.c` prints `\x1b[33mon_key_input\x1b[m`, and `kitty/screen.c:1244` uses `\x1b[35m…\x1b[39m`. So that the captured bytes are reproduced **faithfully** in this Markdown while remaining printable, every code block below is shown **exactly as `cat -v` renders the raw log file**: the ESC byte (`0x1b`) is displayed in caret notation as `^[`, so a red `Press` label reads `^[[31mPress^[[m` and a yellow `on_key_input` reads `^[[33mon_key_input^[[m`. **Nothing is stripped** — the SGR codes and all substantive fields (keycodes, encodings, event names, modifier state) appear exactly as captured. The **only** field that varies from run to run is the `[seconds]` timestamp prefix (emitted by `timed_debug_print`, `kitty/monotonic.h:99`); it is shown at its real captured value (see the Stability section).
 
 ---
 
@@ -146,20 +146,31 @@ $ wid=$(xdotool search --class kitty | head -1); xdotool windowfocus "$wid"
 $ xdotool key --clearmodifiers a; xdotool key --clearmodifiers b; xdotool key --clearmodifiers Return
 ```
 
-Captured output (ANSI color codes stripped; timestamps are the only volatile field):
+Captured output — the **complete, unedited** log for all three keystrokes (`a`, `b`, `Return`), shown exactly as `cat -v` renders the raw log file (ESC = `^[`; only the `[seconds]` timestamps vary between runs):
 
 ```text
 [0.061] Loading new XKB keymaps
-[0.065] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
-[0.152] Failed to open systemd user bus with error: Connection refused
-[0.156] on_focus_change: window id: 0x1 focused: 1
-[2.193] Loading new XKB keymaps
-[2.198] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
-[2.198] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
-[2.198] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
-[2.199] Release xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
-[2.199] on_key_input: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[0.067] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
+[0.160] Failed to open systemd user bus with error: Connection refused
+[0.164] ^[[35mon_focus_change^[[m: window id: 0x1 focused: 1
+[0.689] Loading new XKB keymaps
+[0.694] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
+[0.694] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.694] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
+[0.697] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.697] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.057] ^[[31mPress^[[m xkb_keycode: 0x38 clean_sym: b composed_sym: b text: b mods: none glfw_key: 98 (b) xkb_key: 98 (b)
+[1.057] ^[[33mon_key_input^[[m: glfw key: 0x62 native_code: 0x62 action: PRESS mods: none text: 'b' state: 0 sent key as text to child: b
+[1.063] ^[[32mRelease^[[m xkb_keycode: 0x38 clean_sym: b mods: none glfw_key: 98 (b) xkb_key: 98 (b)
+[1.063] ^[[33mon_key_input^[[m: glfw key: 0x62 native_code: 0x62 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.424] ^[[31mPress^[[m xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.425] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
+[1.431] ^[[32mRelease^[[m xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.431] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+Got XkbNewKeyboardNotify event with changes: key codes: 1 geometry: 1 device id: 0
 ```
+
+> **On the non‑keyboard lines.** The first four lines and the trailing `Got XkbNewKeyboardNotify …` line are headless‑environment artifacts, not pipeline events, and are retained only so the block is genuinely complete and unedited: `Loading new XKB keymaps` / `Modifier indices …` are XKB keymap initialisation (`glfw/xkb_glfw.c:672` and `:376`), `Failed to open systemd user bus …` reflects the container having no session bus, `^[[35mon_focus_change^[[m` (`kitty/glfw.c`) fires when Xvfb gives the window focus, and `Got XkbNewKeyboardNotify …` is an X‑server notice emitted at teardown. The substantive keyboard events are the `Press` / `Release` / `on_key_input` lines. Note that all three keys produce a `Press … xkb_keycode` line **before** their paired `on_key_input:` line — `a` (`0x26`), `b` (`0x38`), and `Return` (`0x24`) — which is the observable proof that the GLFW/XKB layer receives every event first.
 
 ### Reading the evidence (cause → effect)
 
@@ -204,12 +215,14 @@ Its return value selects one of three observed branches:
 From the Q1 capture above, the three branches are all visible:
 
 - **`a` (unmodified printable) → text.** `on_key_input: … action: PRESS … text: 'a' … sent key as text to child: a`. Because `a` produces text and no encoding is required, `encode_glfw_key_event` returns `SEND_TEXT_TO_CHILD` and the literal byte `a` is queued (`kitty/keys.c:253`).
-- **`Return` (requires encoding) → encoded.** The Q1 capture shows:
+- **`Return` (requires encoding) → encoded.** The `Return` **press and release** from the very same `a b Return` run shown in Q1 (nothing omitted) are:
   ```text
-  [2.929] Press xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
-  [2.929] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd
+  [1.424] ^[[31mPress^[[m xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+  [1.425] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
+  [1.431] ^[[32mRelease^[[m xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+  [1.431] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
   ```
-  (This is the `Return` press from the same `a b Return` run shown in Q1; its release, ignored for encoding, is omitted here for brevity.) Enter carries no printable `text`, so it takes the encoded branch (`kitty/keys.c:259`) and the single byte **`0x0d`** (carriage return) is queued. The per‑byte hex/char formatting after `sent encoded key to child:` is produced by the loop at `kitty/keys.c:261‑268`.
+  Enter carries no printable `text`, so its **press** takes the encoded branch (`kitty/keys.c:259`) and the single byte **`0x0d`** (carriage return) is queued; its **release** takes the ignore branch (`kitty/keys.c:271`), identical to the `a`/`b` releases above, because the default legacy mode does not encode release events. The per‑byte hex/char formatting after `sent encoded key to child:` is produced by the loop at `kitty/keys.c:261‑268` (e.g. non‑printable bytes are rendered as `0x%x`, hence `0xd`).
 - **Release (transitional state) → ignored in the default mode.** Every `RELEASE` line reads `ignoring as keyboard mode does not support encoding this event` (`kitty/keys.c:271`). This is the **default (legacy) keyboard mode**: only presses generate bytes; releases are not encoded. (Section Q2c below demonstrates that enabling the Kitty Keyboard Protocol changes exactly this.)
 
 #### Modifier combinations (secondary conditions)
@@ -220,29 +233,41 @@ Command:
 $ xdotool key --clearmodifiers ctrl+a; xdotool key --clearmodifiers alt+a; xdotool key --clearmodifiers shift+a
 ```
 
-Captured output (ANSI stripped):
+Captured output — **complete and unedited** (`cat -v` form, ESC = `^[`), showing every `Press` **and** `Release` transition for all three combinations:
 
 ```text
-[2.196] Press xkb_keycode: 0x25 clean_sym: Control_L composed_sym: Control_L mods: none glfw_key: 57442 (LEFT_CONTROL) xkb_key: 65507 (Control_L)
-[2.197] on_key_input: glfw key: 0xe062 native_code: 0xffe3 action: PRESS mods: ctrl text: '' state: 0 ignoring as keyboard mode does not support encoding this event
-[2.203] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a mods: ctrl glfw_key: 97 (a) xkb_key: 97 (a)
-[2.203] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: ctrl text: '' state: 0 sent encoded key to child: 0x1 
-[2.578] Press xkb_keycode: 0x40 clean_sym: Alt_L composed_sym: Alt_L mods: none glfw_key: 57443 (LEFT_ALT) xkb_key: 65513 (Alt_L)
-[2.578] on_key_input: glfw key: 0xe063 native_code: 0xffe9 action: PRESS mods: alt text: '' state: 0 ignoring as keyboard mode does not support encoding this event
-[2.584] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a mods: alt glfw_key: 97 (a) xkb_key: 97 (a)
-[2.584] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: alt text: '' state: 0 sent encoded key to child: ^[ a 
-[2.958] Press xkb_keycode: 0x32 clean_sym: Shift_L composed_sym: Shift_L mods: none glfw_key: 57441 (LEFT_SHIFT) xkb_key: 65505 (Shift_L)
-[2.958] on_key_input: glfw key: 0xe061 native_code: 0xffe1 action: PRESS mods: shift text: '' state: 0 ignoring as keyboard mode does not support encoding this event
-[2.965] Press xkb_keycode: 0x26 clean_sym: a composed_sym: A text: A mods: shift glfw_key: 97 (a) xkb_key: 97 (a) shifted_key: 65 (A)
-[2.965] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: shift text: 'A' state: 0 sent key as text to child: A
+[0.681] ^[[31mPress^[[m xkb_keycode: 0x25 clean_sym: Control_L composed_sym: Control_L mods: none glfw_key: 57442 (LEFT_CONTROL) xkb_key: 65507 (Control_L)
+[0.682] ^[[33mon_key_input^[[m: glfw key: 0xe062 native_code: 0xffe3 action: PRESS mods: ctrl text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[0.688] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: a mods: ctrl glfw_key: 97 (a) xkb_key: 97 (a)
+[0.688] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: ctrl text: '' state: 0 sent encoded key to child: 0x1 
+[0.694] ^[[32mRelease^[[m xkb_keycode: 0x25 clean_sym: Control_L mods: ctrl glfw_key: 57442 (LEFT_CONTROL) xkb_key: 65507 (Control_L)
+[0.694] ^[[33mon_key_input^[[m: glfw key: 0xe062 native_code: 0xffe3 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[0.700] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.700] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.061] ^[[31mPress^[[m xkb_keycode: 0x40 clean_sym: Alt_L composed_sym: Alt_L mods: none glfw_key: 57443 (LEFT_ALT) xkb_key: 65513 (Alt_L)
+[1.061] ^[[33mon_key_input^[[m: glfw key: 0xe063 native_code: 0xffe9 action: PRESS mods: alt text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.067] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: a mods: alt glfw_key: 97 (a) xkb_key: 97 (a)
+[1.067] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: alt text: '' state: 0 sent encoded key to child: ^[ a 
+[1.074] ^[[32mRelease^[[m xkb_keycode: 0x40 clean_sym: Alt_L mods: alt glfw_key: 57443 (LEFT_ALT) xkb_key: 65513 (Alt_L)
+[1.074] ^[[33mon_key_input^[[m: glfw key: 0xe063 native_code: 0xffe9 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.080] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[1.080] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.441] ^[[31mPress^[[m xkb_keycode: 0x32 clean_sym: Shift_L composed_sym: Shift_L mods: none glfw_key: 57441 (LEFT_SHIFT) xkb_key: 65505 (Shift_L)
+[1.441] ^[[33mon_key_input^[[m: glfw key: 0xe061 native_code: 0xffe1 action: PRESS mods: shift text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.447] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: A text: A mods: shift glfw_key: 97 (a) xkb_key: 97 (a) shifted_key: 65 (A)
+[1.447] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: shift text: 'A' state: 0 sent key as text to child: A
+[1.454] ^[[32mRelease^[[m xkb_keycode: 0x32 clean_sym: Shift_L mods: shift glfw_key: 57441 (LEFT_SHIFT) xkb_key: 65505 (Shift_L)
+[1.454] ^[[33mon_key_input^[[m: glfw key: 0xe061 native_code: 0xffe1 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.460] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[1.460] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
 ```
 
-The `mods:` field (baseline `mods: none`) now reflects the held modifier, and the encoding differs accordingly:
+Each `xdotool key <mod>+a` produces, in order, the modifier **press**, the `a` **press**, then the two **releases**. The `mods:` field (baseline `mods: none`) reflects the held modifier on the press lines, and the encoding differs accordingly:
 
 - **`Ctrl+A` → encoded control byte `0x1`.** With `mods: ctrl` and no `text`, `encode_glfw_key_event` returns the control code, so `sent encoded key to child: 0x1` (ASCII SOH) — the classic Ctrl+letter → control‑character mapping.
 - **`Alt+A` → encoded `^[ a`.** With `mods: alt`, the encoded bytes are `0x1b` (ESC, printed as `^[` by the debug formatter at `kitty/keys.c:263`) followed by `a`; i.e. the Alt/Meta "ESC‑prefix" convention.
 - **`Shift+A` → text `A`.** Shift changes the *produced text*, not the encoding path: the receive layer reports `composed_sym: A text: A` with `shifted_key: 65 (A)`, and `on_key_input` takes the **text** branch, `sent key as text to child: A`.
-- **The modifier keys themselves are ignored.** Each `Control_L` / `Alt_L` / `Shift_L` press yields `ignoring as keyboard mode does not support encoding this event` — a lone modifier produces no bytes; only the combined `<mod>+a` event does.
+- **The lone modifier keys, and *every* release, are ignored.** Each bare `Control_L` / `Alt_L` / `Shift_L` press yields `ignoring as keyboard mode does not support encoding this event` — a lone modifier produces no bytes. So do **all** `RELEASE` lines: both the modifier release (still carrying `mods: ctrl`/`alt`/`shift`) and the trailing `a` release (which reports `mods: none`, since the modifier has already lifted). Only the combined `<mod>+a` **press** emits bytes, consistent with the default legacy mode's press‑only encoding.
 
 ### 2b. The write crosses to the child on a dedicated I/O thread
 
@@ -302,24 +327,24 @@ $ wid=$(xdotool search --class kitty | head -1); xdotool windowfocus "$wid"
 $ xdotool key --clearmodifiers a; xdotool key --clearmodifiers Return
 ```
 
-Captured output (ANSI stripped). Note the GL‑version line is emitted very early — its timestamp `[0.125]` shows it happened during initialization; it appears last only because kitty's `printf` to *stdout* is block‑buffered and flushes at exit, whereas the timestamped debug lines go to *stderr*:
+Captured output — **complete and unedited** (`cat -v` form, ESC = `^[`). Note the GL‑version line carries the *earliest* timestamp (`[0.124]`, emitted during initialization) yet appears **last**: kitty's `printf` for that line goes to *stdout*, which is block‑buffered and flushes at exit, whereas the timestamped debug lines go to *stderr*. The first two lines plus `Failed to open systemd user bus …` and `^[[35mon_focus_change^[[m` are the same headless‑environment artifacts annotated in Q1:
 
 ```text
-[0.064] Loading new XKB keymaps
-[0.069] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
-[0.151] OS Window created
-[0.160] Failed to open systemd user bus with error: Connection refused
-[0.163] Child launched
-[0.164] on_focus_change: window id: 0x1 focused: 1
-[2.194] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
-[2.198] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
-[2.200] Release xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
-[2.200] on_key_input: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
-[2.562] Press xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
-[2.562] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
-[2.568] Release xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
-[2.568] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
-[0.125] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
+[0.061] Loading new XKB keymaps
+[0.066] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
+[0.150] OS Window created
+[0.159] Failed to open systemd user bus with error: Connection refused
+[0.162] Child launched
+[0.163] ^[[35mon_focus_change^[[m: window id: 0x1 focused: 1
+[0.690] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.690] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
+[0.696] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.696] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.058] ^[[31mPress^[[m xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.058] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
+[1.064] ^[[32mRelease^[[m xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.064] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[0.124] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
 ```
 
 ### Reading the evidence (cause → effect)
@@ -350,7 +375,7 @@ Captured output (ANSI stripped). Note the GL‑version line is emitted very earl
 
 ## 3. Complete condition coverage
 
-Every distinct condition below was driven through the real XTEST path. The unmodified‑key, encoded‑key, and modifier outputs are shown verbatim in Q1/Q2 above; this table consolidates the observed result of each, and the Kitty‑Keyboard‑Protocol contrast follows.
+Every distinct condition below was driven through the real XTEST path, and its **complete, unedited** output — every `Press` **and** `Release` transition — is shown verbatim in Q1/Q2 above: `a` and `b` and `Return` (press+release) in the Q1 block, the `Ctrl+A`/`Alt+A`/`Shift+A` combinations (including lone‑modifier and modified‑key releases) in the Q2 modifier block, and the child→terminal bytes in Q2c. This table consolidates the observed result of each, and the Kitty‑Keyboard‑Protocol contrast follows.
 
 | Condition (injected key) | Command | Observed `mods:` | Path taken | Bytes to child | Debug line (`kitty/keys.c`) |
 |---|---|---|---|---|---|
@@ -376,24 +401,28 @@ $ wid=$(xdotool search --class kitty | head -1); xdotool windowfocus "$wid"
 $ xdotool key --clearmodifiers a; xdotool key --clearmodifiers Return
 ```
 
-Captured output (ANSI stripped):
+Captured output — **complete and unedited** (`cat -v` form, ESC = `^[`). The first four lines are the same headless‑environment artifacts annotated in Q1; the `^[ [ 9 7 u` etc. after `sent encoded key to child:` are the *actual encoded bytes* (the debug loop at `kitty/keys.c:262‑267` prints `^[ ` for the ESC byte `0x1b`, then each following byte):
 
 ```text
-[0.216] Pushed key encoding flags to: 15
-[2.494] Press xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
-[2.494] on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent encoded key to child: ^[ [ 9 7 u 
-[2.500] Release xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
-[2.500] on_key_input: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 sent encoded key to child: ^[ [ 9 7 ; 1 : 3 u 
-[2.862] Press xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
-[2.862] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: ^[ [ 1 3 u 
-[2.869] Release xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
-[2.869] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 sent encoded key to child: ^[ [ 1 3 ; 1 : 3 u 
+[0.060] Loading new XKB keymaps
+[0.065] Modifier indices alt: 0x3 super: 0x6 hyper: 0xffffffff meta: 0xffffffff numlock: 0x4 shift: 0x0 capslock: 0x1
+[0.154] Failed to open systemd user bus with error: Connection refused
+[0.158] ^[[35mon_focus_change^[[m: window id: 0x1 focused: 1
+[0.171] ^[[35mPushed key encoding flags to: 15^[[39m
+[0.692] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.692] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent encoded key to child: ^[ [ 9 7 u 
+[0.698] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[0.698] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 sent encoded key to child: ^[ [ 9 7 ; 1 : 3 u 
+[1.061] ^[[31mPress^[[m xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.061] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: ^[ [ 1 3 u 
+[1.067] ^[[32mRelease^[[m xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.067] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 sent encoded key to child: ^[ [ 1 3 ; 1 : 3 u 
 ```
 
 Reading the evidence (cause → effect):
 
 - **`Pushed key encoding flags to: 15`** (`kitty/screen.c:1244`, in `screen_push_key_encoding_flags()` at `kitty/screen.c:1234`) confirms the mode switch actually took effect at runtime.
-- **`a` press → `^[ [ 9 7 u`** = `CSI 97 u`: in this mode even an unmodified printable key is encoded as a CSI‑u sequence (`97` is the codepoint of `a`), instead of being `sent key as text` as in the default mode. CSI‑u encoding is implemented in `kitty/key_encoding.c` (see `serialize()` with `csi_trailer = 'u'`, `kitty/key_encoding.c:150`).
+- **`a` press → `^[ [ 9 7 u`** = `CSI 97 u`: in this mode even an unmodified printable key is encoded as a CSI‑u sequence (`97` is the codepoint of `a`), instead of being `sent key as text` as in the default mode. CSI‑u encoding is assembled in `kitty/key_encoding.c` by `serialize()` (`kitty/key_encoding.c:65`), which writes the trailing byte — its `csi_trailer` argument — with `output[pos++] = csi_trailer;` at `kitty/key_encoding.c:95`. For an ordinary key that trailer is `'u'`, set as `char csi_trailer = 'u';` (`kitty/key_encoding.c:150`, a local inside `encode_function_key()` which begins at `:148`) and passed to `serialize()` at the call sites `kitty/key_encoding.c:232`, `:376`, and `:396`.
 - **`a` release → `^[ [ 9 7 ; 1 : 3 u`** = `CSI 97 ; 1 : 3 u`: the `:3` is the **release** event type. This is the crux — the release that was *ignored* in default mode is now *encoded*, which is precisely why the legacy default emits `ignoring as keyboard mode does not support encoding this event`.
 - **`Return` press → `^[ [ 1 3 u`** (`CSI 13 u`) and **release → `^[ [ 1 3 ; 1 : 3 u`**: the same press/release distinction for Enter.
 
@@ -441,7 +470,7 @@ Every named mechanism, flag, condition, and file is addressed with its value, `f
 ### 6d. Named files/mechanisms
 
 - Receive: `glfw/xkb_glfw.c` (`:376`, `:672`, `:864`, `:875`) ✅; `glfw/ibus_glfw.c` (IME context) ✅; `kitty/glfw.c` (`:439`, `:517`, `:1321`, `:1802`) ✅.
-- Intermediate: `kitty/keys.c` (`:166`, `:172`, `:176`, `:251`, `:253`, `:254`, `:259`, `:261`, `:271`) ✅; `kitty/keys.py` (`keyboard_mode_name` `:33`, `get_shortcut` `:40`) ✅ (mapping/keyboard‑mode logic consulted by the C layer); `kitty/key_encoding.c` (`serialize`/CSI‑u `:150`) ✅; `kitty/child.py` (`openpty` `:170`, `fork` `:276`) ✅; `kitty/child-monitor.c` (`io_loop` `:229`/`:1481`, `talk_loop` `:230`/`:1805`, `schedule_write_to_child` `:372`, `write_to_child` `:1443`, `render` `:871`, `render_os_window` `:833`, `render_prepared_os_window` `:788`) ✅; `kitty/vt-parser.c` (`:224`, `:230`, `:236`, `:261`) ✅; `kitty/screen.c` / `line.c` / `line-buf.c` (screen grid; `screen_push_key_encoding_flags` `:1234`, debug `:1244`) ✅.
+- Intermediate: `kitty/keys.c` (`:166`, `:172`, `:176`, `:251`, `:253`, `:254`, `:259`, `:261`, `:271`) ✅; `kitty/keys.py` (`keyboard_mode_name` `:33`, `get_shortcut` `:40`) ✅ (mapping/keyboard‑mode logic consulted by the C layer); `kitty/key_encoding.c` (`serialize` `:65` with trailer write `:95`; `encode_function_key` `:148` sets `csi_trailer = 'u'` at `:150`; `serialize(…, 'u')` call sites `:232`/`:376`/`:396`) ✅; `kitty/child.py` (`openpty` `:170`, `fork` `:276`) ✅; `kitty/child-monitor.c` (`io_loop` `:229`/`:1481`, `talk_loop` `:230`/`:1805`, `schedule_write_to_child` `:372`, `write_to_child` `:1443`, `render` `:871`, `render_os_window` `:833`, `render_prepared_os_window` `:788`) ✅; `kitty/vt-parser.c` (`:224`, `:230`, `:236`, `:261`) ✅; `kitty/screen.c` / `line.c` / `line-buf.c` (screen grid; `screen_push_key_encoding_flags` `:1234`, debug `:1244`) ✅.
 - Display: `kitty/shaders.c` (`draw_cells` `:1009`, `draw_cells_simple` `:577`) ✅; `kitty/gl.c` (`:47`, `:72`, `:73`) ✅; `kitty/glyph-cache.c` (GPU atlas) ✅; 13 `kitty/*.glsl` shaders ✅.
 - Orchestration/support: `kitty/boss.py` (`class Boss` `:323`, `dump_bytes` `:236`, `debug_keyboard` `:1580`, `set_options` `:2649`, `DumpCommands` `:239‑252`) ✅; `kitty/window.py` (`class Window` `:523`, `Child launched` `:871`) ✅; `kitty/mouse.c` (parallel mouse route — noted for context only, keyboard is the subject) ✅; `kitty/cli.py` (`:972‑997`) ✅; `kitty/monotonic.h` (`timed_debug_print` `:99`) ✅; `kitty/state.h` (`debug_input` macro `:15`) ✅; `setup.py` (default `build` action `:175`) ✅; `kitty/constants.py` (version `:25`) ✅.
 - Docs (corroboration): `docs/performance.rst` (`:7`, `:8`, `:10`, `:16`, `:48`) ✅; `docs/keyboard-protocol.rst` (`:110`, `:111`, `:113`, `:204`) ✅; `docs/build.rst` (build‑from‑source dependencies) ✅.
@@ -453,10 +482,10 @@ Every named mechanism, flag, condition, and file is addressed with its value, `f
 This investigation is strictly read‑only with respect to the source tree:
 
 - The **only** file added is this document, `blitzy/documentation/kitty_815df1e210e0.md`. No existing file was modified or deleted, and no code, scripts, fixtures, or manifest changes were committed.
-- All observation scripts and logs lived under `/tmp` (e.g. `/tmp/kitty_capture.sh`, `/tmp/cap_*.log`, `/tmp/evidence/`) and were removed after use. kitty was launched from a `/tmp` scratch directory so that any relative output files it created never touched the repository.
+- All observation scripts and logs lived under `/tmp` (e.g. `/tmp/kitty_capture.sh`, `/tmp/cap_*.log`, `/tmp/bytes.raw`) and were removed after use. kitty was launched from a `/tmp` scratch directory so that any relative output files it created never touched the repository.
 - Build outputs (`build/`, `kitty/launcher/kitt*`) are git‑ignored (per `.gitignore`), so building from source leaves the tree clean.
 - The harness was torn down with numeric PID kills derived from the launched process tree (`pgrep -P <pid>`), never broad pattern‑based kills.
-- `git status --porcelain` reports only this new document and nothing else.
+- After the deliverable is committed, the working tree is clean, so `git status --porcelain` prints **nothing**. The fact that exactly one *new* file was added — with no existing file modified or deleted — is shown by diffing against the pre‑existing baseline commit: `git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 --name-status` prints exactly one line, `A	blitzy/documentation/kitty_815df1e210e0.md`.
 
 ### Filename note
 
