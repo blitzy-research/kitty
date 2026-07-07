@@ -750,7 +750,22 @@ cmd (len=5):
 `cmd[4]` is the base64 the remote `python3` decodes in `cmd[3]`
 (`base64.standard_b64decode(sys.argv[-1])`). Decoding it yields the templated `bootstrap.py`
 (**10178 bytes, sha256 `bc9ec47ac4417f1e19e7a7b37ffcccc0664657202a15d6646d2be02603f5095d`**), whose
-substituted lines are exactly those enumerated in the placeholder table above. The `main()` guard
+substituted lines are exactly those enumerated in the placeholder table above.
+
+> **These `py` bytes — and therefore both sha256 values above — are a single captured run, not
+> reproducible.** The `__pytest__` entry sets `request_data: true` (`main.go:862`), so the emitted
+> script embeds *this* run's random one-time `pw` and `shm_name` (note `shm_name =
+> kssh-122511-JM4FEVEV4SKEE` in the block above); the encoded `cmd[4]` and the decoded
+> `bootstrap.py` therefore change every run — two further runs produced encoded/decoded sha256
+> `3d646959…`/`098df4b6…` and `201ec57c…`/`a2ee5b8a…`. Only the **structure and lengths** (encoded
+> `13572`, decoded `10178`) are invariant, which is what the round-trip proof in
+> [Q7](#q7--per-shell-bootstrap-encoding-sh-vs-py) and the length-summary in
+> [Q5](#q5--per-connection-state-tracking) rely on. By contrast the `sh` variant's encoded sha256
+> `e2e55802…` is byte-stable, because its canonical `request_data="0"` leaves the sensitive
+> placeholders literal (the same tarball non-determinism is covered in
+> [Q4](#q4--shell-integration-archive-tarball-build--transmission)).
+
+The `main()` guard
 that actually issues the request is (verbatim from the decoded script):
 
 ```python
@@ -768,7 +783,7 @@ def main():
         cleanup()
 ```
 Because `request_data = int('1')` (L22) is truthy, `send_data_request()` (L80-81) fires, emitting
-the DCS request captured byte-for-byte in [Q10](#q10--terminal-requestresponse-protocol). The `sh`
+the DCS request captured byte-for-byte in [Q10](#q10--terminal-requestresponse-protocol-the-dcs-handshake). The `sh`
 variant is identical in structure but wrapped differently; the exact `unwrap`/`encoded` byte forms
 for both variants are in [Q7](#q7--per-shell-bootstrap-encoding-sh-vs-py).
 
@@ -1168,9 +1183,15 @@ $ python3 -c "import json,base64,hashlib; j=json.load(open('q3_py_remote_cmd.jso
 10178 bc9ec47ac4417f1e19e7a7b37ffcccc0664657202a15d6646d2be02603f5095d   # decoded bootstrap.py
 True                                                                     # re-encode == cmd[4]  BYTE-IDENTICAL
 ```
-`cmd[4]` is 13572 base64 characters; its full identity is the sha256
-`0a7158eae9145c5cfc76d36118592faf9212d97bf8b3be1fa8a983fbef10f262` (shown in the round-trip block
-above) plus the round-trip equality. First 48 chars: `IyEvdXNyL2Jpbi9lbnYgcHl0aG9uCiMgTGljZW5zZTogR1BM` (base64 of
+`cmd[4]` is 13572 base64 characters. For the `py` variant the sha256
+`0a7158eae9145c5cfc76d36118592faf9212d97bf8b3be1fa8a983fbef10f262` shown in the round-trip block
+above is **that run's value only** — because the `__pytest__` path sets `request_data: true`
+(`main.go:862`), the encoded/decoded bytes embed a fresh random `pw`+`shm_name` and change every
+run (two further runs gave encoded sha256 `3d646959…` and `201ec57c…`); the *reproducible* `py`
+invariants are the round-trip equality and the `13572 = 4·⌈10178/3⌉` length relation below. The `sh`
+encoded sha256 `e2e55802…` above, by contrast, **is** byte-stable at the canonical
+`request_data="0"` (see [Q3](#q3--bootstrap-script-generation) /
+[Q5](#q5--per-connection-state-tracking)). First 48 chars: `IyEvdXNyL2Jpbi9lbnYgcHl0aG9uCiMgTGljZW5zZTogR1BM` (base64 of
 `#!/usr/bin/env python\n# License: GPL`); last 24 chars: `c2hlbGwpKQoKCm1haW4oKQo=` (base64 of
 `shell))\n\n\nmain()\n`). The decoded first line is `#!/usr/bin/env python`. `13572 = 4·⌈10178/3⌉`
 exactly — the canonical base64 expansion of a 10178-byte input. **BYTE-IDENTICAL ROUND-TRIP** for
@@ -1611,7 +1632,7 @@ value, so a reviewer can confirm nothing is missing.
 | Q4 | Archive build & transmission | `make_tarfile` main.go:255; `get_ssh_data` utils.py:115 | gzip (1f8b); canonical_sh.tgz 23577 B / canonical_py.tgz 21823 B; modes 0644 (13 files) / 0755 (2 execs), floor via bitwise-OR main.go:269; bootstrap-utils.sh sh-only; ssh/* & zsh/kitty.zsh excluded |
 | Q5 | Per-connection state | `connection_data` main.go:171; `get_connection_data` utils.py:258 → `SSHConnectionData` utils.py:338 | 16 struct fields dumped; `SSHConnectionData(binary,hostname,port,identity_file,extra_args)` for 4 command lines |
 | Q6 | Connection-reuse decision | `Share_connections` branch main.go:637; `master_is_functional` main.go:659; decision main.go:663 | `ssh -O check` → exit 255 (fresh, request_data=1) vs exit 0 (reuse, request_data=0); `run_control_master` = `ssh … -N -f -- host` |
-| Q7 | Per-shell encoding | `wrap_bootstrap_script` main.go:486; `detect_python` bootstrap.sh:30; base64 chain bootstrap.sh:55-73 | py=base64 (encoded sha256 `0a7158eae9145c5cfc76d36118592faf9212d97bf8b3be1fa8a983fbef10f262`); sh=`'`+replacer+`'` (encoded sha256 `e2e55802ca9c7ee1839acaa9dcc6c399b3f2a0d2c135424a05f95c0925d7f59d`); round-trips byte-identical; python2 fallback + 6-branch base64 chain |
+| Q7 | Per-shell encoding | `wrap_bootstrap_script` main.go:486; `detect_python` bootstrap.sh:30; base64 chain bootstrap.sh:55-73 | py=base64 (encoded sha256 `0a7158eae9145c5cfc76d36118592faf9212d97bf8b3be1fa8a983fbef10f262`, run-specific — see Q3/Q7); sh=`'`+replacer+`'` (encoded sha256 `e2e55802ca9c7ee1839acaa9dcc6c399b3f2a0d2c135424a05f95c0925d7f59d`); round-trips byte-identical; python2 fallback + 6-branch base64 chain |
 | Q8 | Full trace | §2 (all of the above) | Whole pipeline; `Ran 8 tests in 5.421s` / `OK` via `kitty +launch test.py --module ssh` |
 | Q9 | Shared-memory security model | `secrets.TokenHex` main.go:431; `0600` shm_fs.go:130; Python `read_data_from_shared_memory` utils.py:100; deferred Close+Unlink main.go:600-605 | 6 distinct pw; 0600 at creation (both regions); Python REJECTS wrong perms 0644 & wrong owner 65534; single-use (2nd read FileNotFoundError); Go owner-check no-op (empirically proved) |
 | Q10 | Terminal request/response (DCS) | `bootstrap.sh:94` / `main.go:761`; `get_ssh_data` utils.py:115; `leading_data` bootstrap.sh:86,147 | DCS `\x1bP@kitty-ssh\|BASE64\x1b\\` → `id=119453-1:pwfile=kssh-119454-6N5PXKN573CHO:pw=78819bdd1c13bfeb26fe5f2278bf892e9cbd8d75a44dda88914cc253a74779af`; START/OK/254-byte lines(124)/END; tarball byte-identical (sha256 `22831d5956f6551711afe6941a82c6830c5e1a166f2705a563dc9bcb467cae34`); leading_data before=empty/after=populated; request_data 0 vs 1 |
