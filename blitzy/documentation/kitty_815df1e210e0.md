@@ -1672,22 +1672,37 @@ $ taskset -c 0 python3 /tmp/tui_capture.py --cols 120 --rows 20 --quit-after 4 -
 ```
 
 **Honest note on pixel transmission (reported exactly as observed).** In this pyte-based PTY harness
-the kitten does **not** transmit any pixels: capturing the raw byte stream (`--raw-out`) and counting
-kitty graphics-protocol APC chunks (`ESC _ G`) yields **0**, stably across every attempt (windows
-0.2 s – 10 s, and even with `TERM=xterm-kitty`):
+the kitten transmits **no image pixels**. The faithful metric is *not* the raw total of kitty
+graphics-protocol APC chunks (`ESC _ G …`): that total is entirely control-plane traffic — capability
+probes and cleanup deletes — whose count depends on the terminal lifecycle and so varies between
+harnesses. The reproducible invariant is the number of **pixel transmit/display** chunks (graphics
+action `a=T`, `a=t`, or the default-`a` transmit, and display `a=p`), which is **0**. Capturing the
+raw byte stream (`--raw-out`) and classifying every `ESC _ G` chunk by its `a=` action confirms this,
+stably across 3 identical runs and across quit-windows of 2 s – 8 s:
 
 ```console
-$ python3 /tmp/tui_capture.py --raw-out --cols 120 --rows 20 --quit-after 6 -- \
-      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q6_img_l /tmp/kdiff/q6_img_r > /tmp/q6c_img_raw.bin
-$ python3 -c "d=open('/tmp/q6c_img_raw.bin','rb').read(); print('ESC_G chunks =', d.count(b'\x1b_G'))"
-ESC_G chunks = 0
+$ taskset -c 0 python3 /tmp/tui_capture.py --raw-out /tmp/q6c_img_raw.bin --cols 120 --rows 20 --quit-after 6 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q6_img_l /tmp/kdiff/q6_img_r > /tmp/q6c_grid.txt
+$ python3 -c "import re,collections; d=open('/tmp/q6c_img_raw.bin','rb').read(); ch=re.findall(rb'\x1b_G([^;\x1b]*)', d); act=lambda c: dict(p.split(b'=',1) for p in c.split(b',') if b'=' in p).get(b'a',b't').decode(); a=[act(c) for c in ch]; C=collections.Counter(a); print('total ESC_G =', len(a), '| by action =', dict(sorted(C.items())), '| pixel transmit/display (a=t/T/p) =', sum(v for k,v in C.items() if k in ('t','T','p')))"
+total ESC_G = 4 | by action = {'d': 2, 'q': 2} | pixel transmit/display (a=t/T/p) = 0
 ```
+
+The four chunks observed here are all control-plane and none carries pixels: two capability
+**queries** (`a=q`) from `ImageCollection.Initialize` — the tempfile probe (`a=q,f=24,t=t,…,i=1`)
+and the shared-memory probe (`a=q,f=24,t=s,…,i=2`) (`tools/tui/graphics/collection.go:183-211`) —
+and two **deletes** (`a=d`), one per allocated image id, from `Finalize`
+(`tools/tui/graphics/collection.go:223`). The *total* is therefore harness-dependent: an independent
+harness that redraws a different number of times observes a different total (e.g. `5 = a=q×2 + a=d×3`),
+because each `draw_screen` redraw can additionally emit a `DeleteAllVisiblePlacements` delete
+(`collection.go:149-151`, `ui.go:345`). What is invariant — and what actually answers the question —
+is that **zero pixel-transmit/display chunks are emitted**.
 
 The cause is visible in `image_lines`: pixels are only reserved when
 `image_collection.GetSizeIfAvailable(path, image_size)` **succeeds** (`render.go:358`); when it
 returns `graphics.ErrNotFound` the branch instead emits `Loading image...` (`render.go:364`). The
-harness is not a graphics-capable terminal, so `GetSizeIfAvailable` never succeeds and the render
-stays on the placeholder — hence 0 transmitted chunks. **The actual on-screen pixel display therefore
+harness is not a graphics-capable terminal — it answers the DA/CPR queries but never the graphics
+`a=q` capability probe — so `GetSizeIfAvailable` never succeeds and the render stays on the
+placeholder, hence **no pixel-transmit chunks**. **The actual on-screen pixel display therefore
 could not be exercised in this harness**; that it *does* display in a real terminal ("even over SSH")
 is corroborated by `docs/kittens/diff.rst:18` and by the `render.go:358` success branch — this is
 *inferred / documentation-corroborated*, not observed here.
@@ -1712,8 +1727,9 @@ header and, in a graphics terminal, the transmitted pixels; the random bytes sta
 `human_readable(4096)`). Text passes both checks and takes the normal highlighted diff. Within the
 image branch, the placeholder-vs-pixels decision is made by whether `GetSizeIfAvailable` finds the
 image already registered with the terminal (`render.go:358`); in this harness it never does, so
-`Loading image...` (`render.go:364`) is shown and no graphics chunks are emitted — exactly the
-observed `ESC_G = 0`.
+`Loading image...` (`render.go:364`) is shown and no pixel-transmit chunks are emitted — exactly the
+observed **pixel transmit/display (`a=t`/`T`/`p`) = 0** (the only `ESC _ G` chunks seen are the
+control-plane `a=q` capability probes and `a=d` deletes).
 
 ---
 
