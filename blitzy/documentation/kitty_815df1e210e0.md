@@ -59,7 +59,7 @@ kitty 0.35.2 created by Kovid Goyal
 - **Exit status:** `0`; wall-clock ≈ **65 s**.
 - **What it did:** **90** `gcc` compile/link invocations built the C core — including every file this document traces (`kitty/child-monitor.c`, `kitty/vt-parser.c`, `kitty/screen.c`, `kitty/keys.c`, `kitty/glfw.c`, `kitty/loop-utils.c`, `kitty/monotonic.c`) — into `build/kitty/fast_data_types.so`; then `go build -v` compiled the Go tooling into the `kitten` binary at `kitty/launcher/kitten`. The run also prints `Disabling building of wayland backend` (no `wayland-protocols` present → X11-only, matching canonical CI).
 
-The **complete, unedited** build log (its command line, every line of output, and the trailing exit status) is reproduced verbatim in **[Appendix C — Complete canonical build log](#appendix-c--complete-canonical-build-log)**. The *only* alteration made there is normalizing the absolute repository path to the placeholder `<KITTY_REPO>` (it appears once, in the final `go build` target line); every compiler command, flag, Go-package line, and the exit status is byte-for-byte as emitted.
+The **complete, unedited** build log (its command line, every line of output, and the trailing exit status) is reproduced verbatim in **[Appendix C — Complete canonical build log](#appendix-c--complete-canonical-build-log)**. It is byte-for-byte as emitted — every compiler command, flag, Go-package line, the absolute repository path in the final `go build` target line, and the exit status — with no normalization or redaction applied.
 
 **Runtime versions** (with provenance): Python `>=3.8` required (`pyproject.toml:L2` — `requires-python = ">=3.8"`), highest explicitly supported is 3.11; the container's build interpreter is CPython 3.13.7. Go `1.22` (`go.mod:L3` — `go 1.22`), container `go1.22.12`. The C11 core built under `gcc (Ubuntu 15.2.0)`. The canonical build reports `Disabling building of wayland backend` (no `wayland-protocols` present → X11-only, matching canonical CI); this does not affect any pipeline behavior studied here.
 
@@ -364,7 +364,7 @@ The **poll timeout varies tick to tick** — `0.000`, `0.000`, then `0.485` s �
 
 The self-pipe is the mechanism that lets one thread preempt another's `poll()`. Its primitives live in `kitty/loop-utils.h`: `wakeup_fds[2]` (`L33`), `wakeup_read_fd` (`L39`), `signal_read_fd` (`L40`), `wakeup_loop()` (`L48`), `self_pipe()` (`L52`), and `drain_fd()` (`L76`). The documentation comment on `wakeup()` states its purpose literally — "wakeup the ChildMonitor I/O thread, **forcing it to exit from poll()** if it is waiting there" (`kitty/child-monitor.c:L298-L299`).
 
-- **I/O-thread side:** `io_loop()` includes the wakeup fd as `children_fds[0]` and, when it fires, drains it with `drain_fd(children_fds[0].fd)` (`kitty/child-monitor.c:L1513`); OS signals arrive on `children_fds[1]` and are dispatched via `read_signals(children_fds[1].fd, handle_signal)` (`L1519`).
+- **I/O-thread side:** `io_loop()` includes the wakeup fd as `children_fds[0]` and, when it fires, drains it with `drain_fd(children_fds[0].fd)` (`kitty/child-monitor.c:L1515`); OS signals arrive on `children_fds[1]` and are dispatched via `read_signals(children_fds[1].fd, handle_signal)` (`L1519`).
 - **Main-thread side:** after receiving child data, the I/O thread calls `wakeup_main_loop()` (the `WAKEUP` macro, `kitty/child-monitor.c:L1562`), **throttled by `input_delay`** (`L1566-L1569`: it only wakes the main loop if `now - last_main_loop_wakeup_at > input_delay`, otherwise it sets `has_pending_wakeups`). The main loop drains this via `check_for_wakeup_events()` (`glfw/backend_utils.c:L253`); the `wakeups_happened: N` counter above is exactly these events.
 
 This throttling is why a *surge* of child output does not translate into a storm of one-render-per-read: reads are coalesced and the main loop is woken at most about once per `input_delay`.
@@ -487,10 +487,14 @@ The parser is threaded and double-buffered, guarded by a mutex `lock` (`kitty/vt
 
 ### 3.5 Canonical test-suite corroboration (observed)
 
-The repository's own tests exercise these exact paths and pass on the running build. The complete, unedited result output of each run is shown below (the test runner also prints a 4-line environment preamble — `Running under CI`, `Using PATH…`, `Python:`, `Intrinsics:` — omitted here only because it repeats the absolute build path; verbosity defaults to 4, so every test name is listed):
+The repository's own tests exercise these exact paths and pass on the running build. The complete, unedited result output of each run is shown below — including the test runner's 4-line environment preamble (`Running under CI`, `Using PATH…`, `Python:`, `Intrinsics:`); verbosity defaults to 4, so every test name is listed:
 
 ```
 $ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module shell_integration
+Running under CI: True
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-5a524577-f6be-411d-80a0-042b13d31b1b_d17a3e/kitty_tests/kitty/launcher:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
 test_bash_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_bash_integration) ... ok
 test_fish_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_fish_integration) ... ok
 test_zsh_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_zsh_integration) ... ok
@@ -506,6 +510,10 @@ OK
 
 ```
 $ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module parser
+Running under CI: True
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-5a524577-f6be-411d-80a0-042b13d31b1b_d17a3e/kitty_tests/kitty/launcher:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
 test_base64 (kitty_tests.parser.TestParser.test_base64) ... ok
 test_charsets (kitty_tests.parser.TestParser.test_charsets) ... ok
 test_csi_code_rep (kitty_tests.parser.TestParser.test_csi_code_rep) ... ok
@@ -628,10 +636,14 @@ So the accurate picture is: the buffer that gates child-output flow control is t
 
 ### 4.5 Unstable remote — the SSH kitten path (observed)
 
-The SSH kitten's canonical GPU-less tests all pass on the running build. The complete, unedited result output (the 4-line env preamble is omitted as in §3.5) is:
+The SSH kitten's canonical GPU-less tests all pass on the running build. The complete, unedited result output (including the same 4-line env preamble as in §3.5) is:
 
 ```
 $ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module ssh
+Running under CI: True
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-5a524577-f6be-411d-80a0-042b13d31b1b_d17a3e/kitty_tests/kitty/launcher:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
 test_basic_pty_operations (kitty_tests.ssh.SSHKitten.test_basic_pty_operations) ... ok
 test_ssh_bootstrap_with_different_launchers (kitty_tests.ssh.SSHKitten.test_ssh_bootstrap_with_different_launchers) ... ok
 test_ssh_connection_data (kitty_tests.ssh.SSHKitten.test_ssh_connection_data) ... ok
@@ -659,13 +671,13 @@ Run twice for stability: the set of 8 test names and the `OK` result were identi
 
 **The shared utilities (`shell-integration/ssh/bootstrap-utils.sh`).** Both bootstraps rely on this file (the sh path sources it at `bootstrap.sh:L115`). It provides login-shell detection with graceful fallbacks (`using_getent` `bootstrap-utils.sh:L59`, `using_python` `L69`, `using_perl` `L74`, `using_passwd` `L79`), terminfo compilation (`compile_terminfo` `L18`), atomic file placement (`mv_files_and_dirs` `L9`), the per-shell integration exec wrappers (`exec_zsh_with_integration` `L102`, `exec_fish_with_integration` `L118`, `exec_bash_with_integration` `L128`, `exec_with_shell_integration` `L138`), and the final `prepare_for_exec` (`L192`) / `exec_login_shell` (`L221`) that hand control to the user's shell.
 
-**Disruption exercised (observed) — two mid-transfer failure modes.** Because no `sshd`/TCP endpoint exists in this environment, the disruption was injected at the exact layer where a real mid-transfer drop manifests to the remote — the **payload/protocol stream** the bootstrap reads. The real `shell-integration/ssh/bootstrap.sh` was copied to `/tmp` with its template tokens substituted exactly as the Go client's `prepare_script()` does (`REQUEST_DATA=0` so it reads the payload from stdin, `ECHO_ON=0`), then fed deliberately broken streams. Both scenarios were byte-identical across 2 runs (the *only* alteration to the output below is normalizing Scenario A's random `mktemp` suffix to `<TMPDIR>`; `HOME` was set to `/tmp/kitty-demo-home`):
+**Disruption exercised (observed) — two mid-transfer failure modes.** Because no `sshd`/TCP endpoint exists in this environment, the disruption was injected at the exact layer where a real mid-transfer drop manifests to the remote — the **payload/protocol stream** the bootstrap reads. The real `shell-integration/ssh/bootstrap.sh` was copied to `/tmp` with its template tokens substituted exactly as the Go client's `prepare_script()` does (`REQUEST_DATA=0` so it reads the payload from stdin, `ECHO_ON=0`), then fed deliberately broken streams (`HOME` was set to `/tmp/kitty-demo-home`). The output below is byte-for-byte as emitted, with no normalization. Scenario A's untar directory is created by `tdir=$(command mktemp -d "$HOME/.kitty-ssh-kitten-untar-XXXXXXXXXXXX")` (`shell-integration/ssh/bootstrap.sh:L108`), so its 12-character suffix is randomly generated and differs on every run — the path shown is from the captured run, and every other byte was identical across the 2 runs; Scenario B was byte-identical across both runs:
 
 ```
 # Scenario A — truncated payload (connection drops mid tar-transfer)
 # the base64 below is arbitrary non-tar bytes standing in for a half-arrived payload
 $ printf 'KITTY_DATA_START\nOK\nVGhpcyBpcyBub3QgYSB2YWxpZCB0YXJmaWxlIC0gdHJ1bmNhdGVk\n' | sh /tmp/kitty_obs/bootstrap_real_subst.sh ; echo "exit=$?"
-/tmp/kitty_obs/bootstrap_real_subst.sh: 115: .: cannot open <TMPDIR>/bootstrap-utils.sh: No such file
+/tmp/kitty_obs/bootstrap_real_subst.sh: 115: .: cannot open /tmp/kitty-demo-home/.kitty-ssh-kitten-untar-ghIg57KBsjIQ/bootstrap-utils.sh: No such file
 exit=2
 
 # Scenario B — remote/kitty signals a transfer failure after KITTY_DATA_START
@@ -755,7 +767,7 @@ All line numbers below were re-confirmed against the running build (commit `815d
 | `read_bytes` call site | inside `io_loop` | `kitty/child-monitor.c:L1531` |
 | Poll fd-readiness gate | `vt_parser_has_space_for_input()? POLLIN:0` | `kitty/child-monitor.c:L1501` |
 | I/O poll timeout | input_delay-derived / -1 | `kitty/child-monitor.c:L1505-L1512` |
-| Self-pipe drain (I/O) | `drain_fd(children_fds[0].fd)` | `kitty/child-monitor.c:L1513` |
+| Self-pipe drain (I/O) | `drain_fd(children_fds[0].fd)` | `kitty/child-monitor.c:L1515` |
 | Signal dispatch | `read_signals(..., handle_signal)` | `kitty/child-monitor.c:L1519` |
 | Wakeup doc | "forcing it to exit from poll()" | `kitty/child-monitor.c:L298-L299` |
 | Input write hand-off | `schedule_write_to_child()` | `kitty/child-monitor.c:L372` |
@@ -856,7 +868,7 @@ $        # empty — no existing source file differs from the upstream baseline
 
 ## Appendix C — Complete canonical build log
 
-This is the **complete, unedited** output of the canonical build command, captured from a *clean* tree (`python3 setup.py clean` was run immediately before). The first line is the exact command; the final line is the process exit status. The build compiles the C core into `build/kitty/fast_data_types.so` (90 `gcc` invocations) and then runs `go build -v` to produce the `kitten` binary. The **only** normalization applied is rendering the absolute repository path as the placeholder `<KITTY_REPO>` (it occurs once, in the final `go build` target line); every compiler command, compiler flag, Go-package line, and the exit status below is byte-for-byte as emitted.
+This is the **complete, unedited** output of the canonical build command, captured from a *clean* tree (`python3 setup.py clean` was run immediately before). The first line is the exact command; the final line is the process exit status. The build compiles the C core into `build/kitty/fast_data_types.so` (90 `gcc` invocations) and then runs `go build -v` to produce the `kitten` binary. No normalization or redaction is applied: every compiler command, compiler flag, Go-package line, the absolute repository path in the final `go build` target line, and the exit status below is byte-for-byte as emitted.
 
 ```
 $ python3 setup.py build --verbose
@@ -1178,6 +1190,6 @@ kitty/kittens/diff
 kitty/tools/cmd/tool
 kitty/tools/cmd/completion
 kitty/tools/cmd
-/usr/local/bin/go build -v -ldflags '-X kitty.VCSRevision=ea52a36e3c671686997954bd0bd9c36dfe964a11 -s -w' -o kitty/launcher/kitten <KITTY_REPO>/tools/cmd
+/usr/local/bin/go build -v -ldflags '-X kitty.VCSRevision=ea52a36e3c671686997954bd0bd9c36dfe964a11 -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-5a524577-f6be-411d-80a0-042b13d31b1b_d17a3e/tools/cmd
 (exit status: 0)
 ```
