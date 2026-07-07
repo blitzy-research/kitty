@@ -678,6 +678,8 @@ monotonic() = 0.000371217
 EXIT=0
 ```
 
+*(The `monotonic()` return value is a monotonic-clock reading and therefore varies run-to-run — observed as `0.000371217` here and `0.000390518` on a subsequent invocation, because each `python3 -c` launches a fresh process; the **reproducible** facts are that the native symbol is real and callable and the command exits `0`, not the specific float. This mirrors the run-to-run variation of the startup timestamp noted in §3.4.)*
+
 That is the before→after transition for the kittens: `import kittens.unicode_input.main` moves from `ModuleNotFoundError` (unbuilt) to a clean import (built), for exactly the same reason as the terminal — the native bridge became available.
 
 ### 4.5 Honest labeling
