@@ -675,7 +675,7 @@ Every `path:line` below was confirmed against the working tree at HEAD `815df1e2
 - `:201` `class ReadRequest`; `:233` `class WriteRequest`.
 - `:237` `rollover_size: int = 16 * 1024 * 1024`; `:243` `self.tempfile = Tempfile(max_size=rollover_size)`; `:246` `self.current_leftover_bytes = memoryview(b'')`.
 - `:271` `def add_base64_data`; `:286` stash tail; `:293-301` prepend prior leftover; `:305` `def flush_base64_data`; `:316-319` `def write_base64_data` / `standard_b64decode`.
-- `:406` `def parse_osc_52`; `:424` `if is_partial: return`.
+- `:406` `def parse_osc_52`; `:422-423` `if is_partial: return`.
 - `:427` `def handle_write_request`; `:429-430` write policy check (`'write-primary'`/`'write-clipboard'` ∈ `clipboard_control`).
 - `:450` `def handle_read_request`; `:453-457` `read-*-ask` vs `read-*` distinction.
 
