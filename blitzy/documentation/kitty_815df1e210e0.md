@@ -29,7 +29,8 @@ All evidence below was captured by **building and running the real system first*
 python3 setup.py build --verbose
 
 # Event-loop observability build, REQUIRED for Q2 (Makefile debug-event-loop:, L25-L26)
-make debug-event-loop        # -> python3 setup.py build --verbose --debug --extra-logging=event-loop
+make debug-event-loop        # -> python3 setup.py build --debug --extra-logging=event-loop
+                             #    (Makefile $(VVAL) is empty unless V=1/VERBOSE=1, Makefile:L1-L6, so --verbose is NOT added by plain `make debug-event-loop`)
 
 # Version banner
 ./kitty/launcher/kitty --version
@@ -52,6 +53,14 @@ $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
 
+**Canonical build — command, exit status, and complete log.** The build was captured from a *clean* tree (`python3 setup.py clean` was run first) so the log shows the full compilation rather than an incremental relink:
+
+- **Command:** `python3 setup.py build --verbose`
+- **Exit status:** `0`; wall-clock ≈ **65 s**.
+- **What it did:** **90** `gcc` compile/link invocations built the C core — including every file this document traces (`kitty/child-monitor.c`, `kitty/vt-parser.c`, `kitty/screen.c`, `kitty/keys.c`, `kitty/glfw.c`, `kitty/loop-utils.c`, `kitty/monotonic.c`) — into `build/kitty/fast_data_types.so`; then `go build -v` compiled the Go tooling into the `kitten` binary at `kitty/launcher/kitten`. The run also prints `Disabling building of wayland backend` (no `wayland-protocols` present → X11-only, matching canonical CI).
+
+The **complete, unedited** build log (its command line, every line of output, and the trailing exit status) is reproduced verbatim in **[Appendix C — Complete canonical build log](#appendix-c--complete-canonical-build-log)**. The *only* alteration made there is normalizing the absolute repository path to the placeholder `<KITTY_REPO>` (it appears once, in the final `go build` target line); every compiler command, flag, Go-package line, and the exit status is byte-for-byte as emitted.
+
 **Runtime versions** (with provenance): Python `>=3.8` required (`pyproject.toml:L2` — `requires-python = ">=3.8"`), highest explicitly supported is 3.11; the container's build interpreter is CPython 3.13.7. Go `1.22` (`go.mod:L3` — `go 1.22`), container `go1.22.12`. The C11 core built under `gcc (Ubuntu 15.2.0)`. The canonical build reports `Disabling building of wayland backend` (no `wayland-protocols` present → X11-only, matching canonical CI); this does not affect any pipeline behavior studied here.
 
 ### 0.3 The GPU-less observation harness (honest note on headless limits)
@@ -72,9 +81,9 @@ Kitty's GPU renderer needs a display. The container is headless, so two observat
 
    Those three `test_*` methods (`kitty/screen.c:L4755`, `L4762`, `L4772`) call `vt_parser_create_write_buffer()`, `vt_parser_commit_write()`, and `parse_worker()` — the very functions `read_bytes()` uses inside `io_loop()` (see the Q1 walkthrough). So the harness exercises the **real child-output parser path**, not a stand-in. This is the canonical no-display path and is labeled **harness-driven** where used.
 
-2. **A real windowed GUI under Xvfb + software GL** (llvmpipe), used specifically for the pause/resume safety-valve timeout (Q1) and the event-loop debug stream (Q2), because those require a real render loop.
+2. **A real windowed GUI under Xvfb + software GL** (llvmpipe), used for the render-dependent captures: the pause/resume safety-valve timeout (Q1), the event-loop debug stream (Q2), **and the real GLFW keystroke path (Q1 §1.2)**.
 
-Where a real end-to-end windowed GLFW keystroke capture could not be produced headlessly, the user-input path is exercised through its real encoding function (`encode_key_for_tty`, the same one `on_key_input()` calls) and labeled accordingly; the remote-control interface (`kitty/rc/`) was **never** substituted for input observation.
+The user-input path **is** exercised end-to-end through the real windowed GLFW entry point: a real `kitty` window under Xvfb receives X key events injected via **XTEST** (`xdotool`), which drive `key_callback()` (`kitty/glfw.c:L430`) → `on_key_input()` (`kitty/keys.c:L166`) → `schedule_write_to_child()` (`kitty/child-monitor.c:L372`) → the PTY, where the child records the bytes that arrive (§1.2). At the X-protocol layer, XTEST events are indistinguishable from a physical keyboard, so this drives the **real entry point**, not a stand-in. `xdotool` is only an input-injection tool (it does not touch the repository or the kitty build). The `encode_key_for_tty` encoder is shown only as supplementary corroboration, and the remote-control interface (`kitty/rc/`) was **never** substituted for input observation.
 
 ---
 
@@ -89,30 +98,33 @@ A byte stream "becomes actionable" when the VT parser classifies each byte and r
 
 ### 1.1 Child-output entry point (observed)
 
-The read path itself, quoted unelided from source:
+The read path itself, quoted **verbatim and complete** from `kitty/child-monitor.c:L1336-L1356` (no elisions, no added comments):
 
 ```c
-// kitty/child-monitor.c:L1337
+static bool
 read_bytes(int fd, Screen *screen) {
     ssize_t len;
     size_t available_buffer_space;
 
     uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
-    if (!available_buffer_space) return true;              // L1342 — backpressure early-return (see Q4)
+    if (!available_buffer_space) return true;
 
     while(true) {
-        len = read(fd, buf, available_buffer_space);        // L1345 — read directly into parser buffer
+        len = read(fd, buf, available_buffer_space);
         if (len < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             if (errno != EIO) perror("Call to read() from child fd failed");
             vt_parser_commit_write(screen->vt_parser, 0);
-            return false;                                   // EIO => child gone
+            return false;
         }
         break;
     }
-    vt_parser_commit_write(screen->vt_parser, len);         // hand bytes to the parse worker
+    vt_parser_commit_write(screen->vt_parser, len);
     return len != 0;
+}
 ```
+
+Reading it line by line (these are annotations, not part of the quoted source): the write buffer is obtained from the VT parser at **`L1341`** (`vt_parser_create_write_buffer()`); the **backpressure early-return** is `if (!available_buffer_space) return true;` at **`L1342`** (see Q4); the `read()` **directly into the parser buffer** is at **`L1345`**; an `EIO` on that read is the normal "slave closed / child exited" signal, handled at **`L1347-L1349`** (the `return false` at `L1350` ⇒ child gone); and the successful path **commits the bytes to the parse worker** via `vt_parser_commit_write()` at **`L1354`**.
 
 **Observed, end-to-end, on a real forked child on a real PTY** (harness `os.read(master_fd)` at `kitty_tests/__init__.py:L363` mirrors the `read(fd, …)` above; `parse_bytes` mirrors the create/commit/parse trio):
 
@@ -126,42 +138,75 @@ screen line0 after parsing     = 'plain BOLD done'
 
 The raw stream contained the SGR sequence `\x1b[1m` (bold on) and `\x1b[0m` (reset); after parsing, the screen line reads `plain BOLD done` — the escape bytes were classified as an attribute command and **not** drawn, while the printable bytes became screen text. That is the byte stream "becoming actionable."
 
-### 1.2 User-input entry point (observed)
+### 1.2 User-input entry point (observed through the REAL GLFW → keys.c → PTY path)
 
-`on_key_input()` (`kitty/keys.c:L166`) encodes the key with `encode_key_for_tty` (the C entry `pyencode_key_for_tty`, `kitty/keys.c:L311`) and then calls `schedule_write_to_child()`. The encoding is the exact one used on the live path. Captured encodings for plain, modifier, and special keys, under both the **legacy** encoding and the **Kitty keyboard protocol**:
+This was captured through the **real entry point**, not through the encoding function in isolation. A real `kitty` window was run under Xvfb with software GL, its child a raw-mode program that logs **each `read()` from its PTY stdin**. Real X key events were then injected into the focused window with **XTEST** (`xdotool`); from GLFW's perspective XTEST events are indistinguishable from a physical keyboard, so the full path executes: **`key_callback()` (`kitty/glfw.c:L430`) → `on_key_input(ev)` (`kitty/glfw.c:L439`) → `on_key_input()` (`kitty/keys.c:L166`), which encodes with `pyencode_key_for_tty` (`kitty/keys.c:L311`) and calls `schedule_write_to_child()` (`kitty/child-monitor.c:L372`)** — and the child observes exactly the bytes that arrive on the PTY.
 
-```
-$ ./kitty/launcher/kitty +launch /tmp/kitty_obs/q1_keys.py
-GLFW mods: SHIFT=1 CTRL=4 ALT=2
+Exact commands (real windowed kitty + XTEST injection):
 
-=== USER-INPUT PATH: key encoding (encode_key_for_tty == encode_glfw_key_event used by on_key_input keys.c:L166) ===
---- LEGACY encoding (key_encoding_flags=0) ---
-  'a' plain                    -> 'a'
-  'a' + CTRL                   -> '\x01'
-  'a' + ALT                    -> '\x1ba'
-  'a' + CTRL+ALT               -> '\x1b\x01'
-  'a' + SHIFT (shifted 'A')    -> 'A'
-  ENTER plain                  -> '\r'
-  ENTER + ALT                  -> '\x1b\r'
-  TAB plain                    -> '\t'
-  TAB + SHIFT                  -> '\x1b[Z'
-  ESC plain                    -> '\x1b'
-  UP arrow                     -> '\x1b[A'
-  UP + CTRL                    -> '\x1b[1;5A'
---- KITTY keyboard protocol (key_encoding_flags=1 = disambiguate) ---
-  'a' plain                    -> 'a'
-  'a' + CTRL                   -> '\x1b[97;5u'
-  'a' + ALT                    -> '\x1b[97;3u'
-  'a' + CTRL+ALT               -> '\x1b[97;7u'
-  ESC plain                    -> '\x1b[27u'
-  ENTER + CTRL                 -> '\x1b[13;5u'
---- KITTY keyboard protocol (key_encoding_flags=15 = all enhancements) ---
-  'a' plain                    -> '\x1b[97u'
-  'a' + CTRL                   -> '\x1b[97;5u'
-  'a' release                  -> '\x1b[97;1:3u'
+```bash
+$ Xvfb :99 -screen 0 1280x800x24 &
+$ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+      ./kitty/launcher/kitty --config NONE -o enable_audio_bell=no \
+      -e python3 /tmp/kitty_obs/f4_child_perread.py &
+$ WID=$(DISPLAY=:99 xdotool search --sync --class kitty | head -1)
+$ DISPLAY=:99 xdotool windowactivate "$WID"; DISPLAY=:99 xdotool windowfocus "$WID"
+$ for k in a ctrl+a alt+a ctrl+alt+a shift+a Return alt+Return Tab shift+Tab Escape Up ctrl+Up; do
+      DISPLAY=:99 xdotool key --clearmodifiers "$k"; sleep 0.30; done
 ```
 
-Reading the encodings: legacy `Ctrl+a` collapses to the C0 control byte `\x01`; `Alt+a` prefixes `ESC` (`\x1ba`); arrows and shifted-Tab use CSI forms (`\x1b[A`, `\x1b[Z`); `Ctrl+Up` carries the modifier as a CSI parameter (`\x1b[1;5A`). Under the Kitty protocol every key becomes a disambiguated `CSI unicode ; modifiers u` form (`Ctrl+a` → `\x1b[97;5u`, where 97 = `ord('a')`, 5 = ctrl), `ESC` becomes reportable as `\x1b[27u`, and with all enhancements on, **key releases** are reported too (`'a' release` → `\x1b[97;1:3u`, the `:3` event-type meaning release) — something the legacy encoding cannot express. This is the "input meaning" that the encoded bytes carry to the child.
+Complete captured output — one line per PTY `read()`, **default (legacy) encoding**, byte-for-byte, **identical across 2 runs**:
+
+```
+read[0] = b'a'
+read[1] = b'\x01'
+read[2] = b'\x1ba'
+read[3] = b'\x1b\x01'
+read[4] = b'A'
+read[5] = b'\r'
+read[6] = b'\x1b\r'
+read[7] = b'\t'
+read[8] = b'\x1b[Z'
+read[9] = b'\x1b'
+read[10] = b'\x1b[A'
+read[11] = b'\x1b[1;5A'
+read[12] = b'\x11'
+```
+
+Mapping each injected key to the bytes the child actually received on the PTY (`read[N]` in injection order):
+
+| Injected key (XTEST) | PTY bytes received | Meaning |
+|----------------------|--------------------|---------|
+| `a` | `b'a'` | plain printable |
+| `ctrl+a` | `b'\x01'` | C0 control byte (Ctrl collapses to 0x01) |
+| `alt+a` | `b'\x1ba'` | ESC-prefixed (Alt = meta) |
+| `ctrl+alt+a` | `b'\x1b\x01'` | ESC + C0 |
+| `shift+a` | `b'A'` | shifted printable |
+| `Return` | `b'\r'` | CR |
+| `alt+Return` | `b'\x1b\r'` | ESC + CR |
+| `Tab` | `b'\t'` | HT |
+| `shift+Tab` | `b'\x1b[Z'` | CSI Z (back-tab) |
+| `Escape` | `b'\x1b'` | ESC |
+| `Up` | `b'\x1b[A'` | CSI A (cursor up) |
+| `ctrl+Up` | `b'\x1b[1;5A'` | CSI with modifier parameter (5 = ctrl) |
+
+(`read[12] = b'\x11'` is the trailing `Ctrl+Q` sentinel used to end the child.) So legacy `Ctrl+a` collapses to the C0 control byte `\x01`; `Alt+a` prefixes `ESC`; arrows and shifted-Tab use CSI forms; `Ctrl+Up` carries the modifier as a CSI parameter — all observed arriving on the child's PTY through the real GLFW callback path, not synthesized by a helper.
+
+**Kitty keyboard protocol, also through the real path.** The child then pushed the Kitty keyboard flags itself by writing `CSI > 1 u` (`\x1b[>1u`, disambiguate) to its stdout — which kitty's parser applies to the window — before the same XTEST injection. Complete output, **identical across 2 runs**:
+
+```
+read[0] = b'a'
+read[1] = b'\x1b[97;5u'
+read[2] = b'\x1b[97;3u'
+read[3] = b'\x1b[97;7u'
+read[4] = b'\x1b[27u'
+read[5] = b'\x1b[13;5u'
+read[6] = b'\x1b[113;5u'
+```
+
+Here injection order was `a`, `ctrl+a`, `alt+a`, `ctrl+alt+a`, `Escape`, `ctrl+Return`, then the `ctrl+q` sentinel. Every key now arrives as a disambiguated `CSI unicode ; modifiers u` form: `Ctrl+a` → `\x1b[97;5u` (97 = `ord('a')`, 5 = ctrl), `Alt+a` → `\x1b[97;3u`, `Ctrl+Alt+a` → `\x1b[97;7u`, `ESC` → `\x1b[27u`, `Ctrl+Enter` → `\x1b[13;5u`; and because the protocol is active, even the `Ctrl+Q` sentinel is now reported as `\x1b[113;5u` rather than the legacy `\x11`. This is the "input meaning" that the encoded bytes carry to the child — and it was produced by the real key-callback path with the protocol enabled live.
+
+**Corroboration — the encoder in isolation.** For completeness, the same encoder the real path calls (`encode_key_for_tty` / `pyencode_key_for_tty`, `kitty/keys.c:L311`) was also exercised directly across a fuller modifier matrix, including the all-enhancements profile (`key_encoding_flags=15`) which additionally reports **key releases** — e.g. `'a' release` → `\x1b[97;1:3u` (the `:3` event-type = release), something legacy encoding cannot express. These encoder-only values agree with the real-path captures above and are provided only as supplementary corroboration; the primary evidence is the real GLFW→keys.c→PTY capture.
 
 ### 1.3 Resize — the third kind of "input" (observed)
 
@@ -269,53 +314,42 @@ A second sense of "pause a session" is Unix job control (Ctrl-Z → `SIGTSTP`, r
 
 ### 2.1 The event-loop debug build and a captured session
 
-The event-loop stream is only compiled in under the debug build (`event-loop` maps to `-DDEBUG_EVENT_LOOP`, `setup.py:L489`; `EVDBG(...)` → `timed_debug_print`, `kitty/child-monitor.c:L29-L30`, timestamp format `"[%.3f] "` from `kitty/monotonic.h:L99`):
+The event-loop stream is only compiled in under the debug build (`event-loop` maps to `-DDEBUG_EVENT_LOOP`, `setup.py:L489`; `EVDBG(...)` → `timed_debug_print`, `kitty/child-monitor.c:L29-L30`). The `"[%.3f] "` timestamp prefix on each line is emitted by `timed_debug_print()`: the `fprintf(stderr, "[%.3f] ", …)` call is at `kitty/monotonic.h:L102`, inside the function defined at `kitty/monotonic.h:L99`.
 
 ```bash
 $ make debug-event-loop
-# -> python3 setup.py build --verbose --debug --extra-logging=event-loop   (exit 0)
+# -> python3 setup.py build --debug --extra-logging=event-loop   (exit 0)
+#    NOTE: plain `make debug-event-loop` does NOT add --verbose; the Makefile only sets --verbose when V=1/VERBOSE=1 ($(VVAL), Makefile:L1-L6).
 ```
 
-A representative session was then run under Xvfb, with a child that emits a start banner, periodic ticks, a ~2000-byte burst, a self-resize, and a done marker:
+A deliberately **short, bounded** session was then run under Xvfb — a child that prints a single line and exits after ~0.2 s — so the *entire* event-loop debug stream, from process start to `main loop exiting`, is small enough to reproduce **complete and unedited** (not an excerpt). The stream is written on kitty's own stderr, captured with `2> evlog.log`:
 
 ```bash
 $ xvfb-run -a -s "-screen 0 1280x800x24" env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
-    ./kitty/launcher/kitty --config NONE -o repaint_delay=10 -e python3 /tmp/kitty_obs/q2_child.py
+    ./kitty/launcher/kitty --config NONE -o repaint_delay=10 \
+    -e sh -c 'printf "hello from child\n"; sleep 0.2'  2> evlog.log
 ```
 
-Complete, unedited excerpt of the resulting event-loop debug stream (main-thread ticks):
+Complete, unedited event-loop debug stream — the **entire session** (all 17 lines, first line to `main loop exiting`):
 
 ```
-[0.159] Failed to open systemd user bus with error: Connection refused
-[0.163] starting handleEvents(0.00)
-[0.163] pollForEvents final timeout: 0.000
-[0.163] State check timer firedProcessing global stateinput_read: 0, check_for_active_animated_images: 1[0.177] display_read_ok: 0
-[0.178] other dispatch done
-[0.178] --------- loop tick, wakeups_happened: 1 ----------
-Processing global stateinput_read: 0, check_for_active_animated_images: 0[0.178] starting handleEvents(0.00)
-[0.178] pollForEvents final timeout: 0.000
-[0.178] display_read_ok: 0
-[0.178] other dispatch done
-[0.178] --------- loop tick, wakeups_happened: 0 ----------
-[0.178] starting handleEvents(-0.00)
-[0.178] pollForEvents final timeout: 0.002
-State check timer firedProcessing global stateinput_read: 1, check_for_active_animated_images: 0[0.182] display_read_ok: 0
+[0.163] Failed to open systemd user bus with error: Connection refused
+[0.168] starting handleEvents(0.00)
+[0.168] pollForEvents final timeout: 0.000
+[0.168] State check timer firedProcessing global stateinput_read: 0, check_for_active_animated_images: 1[0.182] display_read_ok: 0
 [0.182] other dispatch done
-[0.182] --------- loop tick, wakeups_happened: 0 ----------
-[0.182] starting handleEvents(-0.00)
-[0.182] pollForEvents final timeout: 0.484
-[0.327] display_read_ok: 0
-[0.327] other dispatch done
-[0.327] --------- loop tick, wakeups_happened: 1 ----------
-Processing global stateinput_read: 0, check_for_active_animated_images: 0[0.327] starting handleEvents(-0.00)
-[0.327] pollForEvents final timeout: 0.003
-State check timer firedProcessing global stateinput_read: 1, check_for_active_animated_images: 0[0.332] display_read_ok: 0
-[0.332] other dispatch done
-[0.332] --------- loop tick, wakeups_happened: 0 ----------
-[0.332] starting handleEvents(-0.00)
-[0.332] pollForEvents final timeout: 0.333
-[0.447] display_read_ok: 0
-[0.447] other dispatch done
+[0.182] --------- loop tick, wakeups_happened: 1 ----------
+Processing global stateinput_read: 1, check_for_active_animated_images: 0[0.185] starting handleEvents(0.00)
+[0.185] pollForEvents final timeout: 0.000
+[0.185] display_read_ok: 0
+[0.185] other dispatch done
+[0.185] --------- loop tick, wakeups_happened: 0 ----------
+[0.185] starting handleEvents(-0.00)
+[0.185] pollForEvents final timeout: 0.485
+[0.374] display_read_ok: 0
+[0.375] other dispatch done
+[0.375] --------- loop tick, wakeups_happened: 1 ----------
+Processing global stateinput_read: 0, check_for_active_animated_images: 0[0.382] main loop exiting
 ```
 
 ### 2.2 Annotating the log
@@ -324,7 +358,7 @@ State check timer firedProcessing global stateinput_read: 1, check_for_active_an
 - **`State check timer fired`** → `do_state_check()` (`kitty/child-monitor.c:L1217`); **`Processing global state`** → `process_global_state()` (`kitty/child-monitor.c:L1225`); **`input_read: N, check_for_active_animated_images: M`** is emitted from `render()` (`kitty/child-monitor.c:L872`).
 - **`--------- loop tick, wakeups_happened: N ----------`** (`glfw/main_loop.h:L31`) closes each tick and reports how many self-pipe wakeups were coalesced into that tick.
 
-The **poll timeout varies tick to tick** — `0.000`, `0.002`, `0.003`, `0.333`, `0.484` s — which is the delay-based scheduling in action: when there is nothing pending the loop waits longer, and when input/render work is pending it uses a short, `input_delay`/`repaint_delay`-derived wait. The `wakeups_happened` alternates between `0` (a timer-driven tick) and `1` (an I/O-thread-driven wakeup), showing the two ways a tick is triggered.
+The **poll timeout varies tick to tick** — `0.000`, `0.000`, then `0.485` s — which is the delay-based scheduling in action: while startup/input work is pending the loop spins with a near-zero wait, and once idle it arms a longer, `input_delay`/`repaint_delay`-derived wait (here `0.485` s, actually cut short at `[0.374]` when the child's exit wakes the loop). The `wakeups_happened` alternates between `0` (a timer-driven tick) and `1` (an I/O-thread-driven wakeup), showing the two ways a tick is triggered; the **`input_read: 1`** on the second tick is the child's `hello from child` line being read and rendered, and the final line — **`main loop exiting`** — is the clean session teardown after the child exits.
 
 ### 2.3 The self-pipe wakeup (two-sided)
 
@@ -347,7 +381,7 @@ This throttling is why a *surge* of child output does not translate into a storm
 - **Child exit / window close:** `process_pending_closes()` (`kitty/child-monitor.c:L1098`), invoked at `L1246`.
 - **Signals:** `handle_signal()` (`kitty/child-monitor.c:L1362-L1382`) maps `SIGINT`/`SIGTERM`/`SIGHUP` → kill, `SIGCHLD` → child-died bookkeeping, `SIGUSR1` → reload config, `SIGUSR2` → log; it is invoked via `read_signals(...)` on the I/O thread (`L1519`). (The AAP cited this region as `L1358-L1385`; the running build places the definition at `L1362-L1382`.)
 
-**Stability note:** across 2 runs the structural markers were stable (run 1 = 15 loop ticks, run 2 = 16 — a normal one-tick wall-clock difference; `State check timer fired` appeared 8× in both). Absolute timestamps naturally vary run to run (wall clock); the *sequence and structure* are stable.
+**Stability note:** the bounded session was run twice and the complete streams were **structurally identical** — both 17 lines, both with exactly 3 `loop tick` lines, the same `wakeups_happened` sequence (`1, 0, 1`), the same single `input_read: 1`, one `State check timer fired`, and one closing `main loop exiting`. A timestamp-stripped diff of the two runs is empty; only the absolute `[%.3f]` timestamps vary run to run (wall clock), while the *sequence and structure* are stable.
 
 
 ---
@@ -401,42 +435,51 @@ The input was `b"HEL\x1b]7;file://host/tmp/x\x1b\\LO"`. The screen line reads `H
 
 ### 3.3 What a REAL bash shell actually emits (observed, canonical)
 
-The two captures above inject synthetic sequences. To corroborate with a real shell, a **real bash** was launched with `KITTY_SHELL_INTEGRATION=enabled` over a real PTY (via `safe_env_for_running_shell` + `kitty_tests.PTY`), a prompt awaited, and `echo hello` run — capturing the actual OSC bytes bash's kitty integration emits. Both runs read 529 bytes with an identical marker order:
+The two captures above inject synthetic sequences. To corroborate with a real shell, a **real bash** was launched with `KITTY_SHELL_INTEGRATION=enabled` over a real PTY (via `safe_env_for_running_shell` + `kitty_tests.PTY`), a prompt awaited, and two ordinary commands run — `echo hello` then `cd project` — capturing the actual OSC bytes bash's kitty integration emits. To keep the capture free of any host-specific identity, the run is performed in a **controlled environment**: the child's `HOSTNAME` is pinned to `kitty-demo-host` and its `HOME` to `/tmp/kitty-demo-home` (and the UTS-namespace hostname is pinned to match via `unshare -u`), so the OSC 7 CWD notification contains only these neutral, reproducible values rather than the ambient host name. The output below is Python's `repr()` of the raw bytes, so BEL appears as `\x07`. Both runs emit a byte-for-byte identical sequence of **24 OSC markers (22 × OSC 133 + 2 × OSC 7)**:
 
 ```
-$ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./kitty/launcher/kitty +launch /tmp/kitty_obs/q3_real_shell.py
------ RUN 1: total raw bytes read from real bash child = 529 -----
-OSC 133/OSC 7 sequences found: 18
-  OSC 133 (prompt/cmd markers): 17   OSC 7 (cwd): 1
-  --- byte-accurate OSC 133 markers (in order emitted) ---
-     \x1b]133;k;start_kitty\a
-     \x1b]133;D;0\a
-     \x1b]133;A\a
-     \x1b]133;k;end_kitty\a
-     \x1b]133;k;start_suffix_kitty\a
-     \x1b]133;k;end_suffix_kitty\a
-     \x1b]133;C;cmdline=echo\ hello\a
-     \x1b]133;k;start_kitty\a
-     \x1b]133;k;end_kitty\a
-     \x1b]133;k;start_suffix_kitty\a
-     \x1b]133;k;end_suffix_kitty\a
-     \x1b]133;k;start_kitty\a
-     \x1b]133;D;0\a
-     \x1b]133;A\a
-     \x1b]133;k;end_kitty\a
-     \x1b]133;k;start_suffix_kitty\a
-     \x1b]133;k;end_suffix_kitty\a
-  --- byte-accurate OSC 7 cwd notifications ---
-     \x1b]7;kitty-shell-cwd://reverse-code-generator-1cf2b534-sngfp/tmp/kitty_obs/q3home_1\a
-  screen.last_reported_cwd = b'kitty-shell-cwd://reverse-code-generator-1cf2b534-sngfp/tmp/kitty_obs/q3home_1'
-  last_cmd_exit_status     = 0
-  OSC 133 marker letters in order: k D A k k k C k k k k k D A k k k
+$ unshare -u bash -c 'hostname kitty-demo-host; \
+    CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./kitty/launcher/kitty +runpy \
+    "import runpy; runpy.run_path(\"/tmp/kitty_obs/q3_osc7_controlled.py\", run_name=\"__main__\")"'
+----- RUN 1 -----
+HOSTNAME='kitty-demo-host'  HOME='/tmp/kitty-demo-home'
+after 'echo hello': last_cmd_cmdline = 'echo hello'  last_cmd_exit_status = 0
+after 'cd project': last_reported_cwd = 'kitty-shell-cwd://kitty-demo-host/tmp/kitty-demo-home/project'
+OSC sequence count (7 + 133) = 24
+marker order:
+  OSC7 OSC133-k OSC133-D OSC133-A OSC133-k OSC133-k OSC133-k OSC133-C OSC133-k OSC133-k OSC133-k OSC133-k OSC133-k OSC133-D OSC133-A OSC133-k OSC133-k OSC133-k OSC133-C OSC133-k OSC133-k OSC133-k OSC133-k OSC7
+byte-accurate sequences (repr):
+  b'\x1b]7;kitty-shell-cwd://kitty-demo-host/tmp/kitty-demo-home\x07'
+  b'\x1b]133;k;start_kitty\x07'
+  b'\x1b]133;D;0\x07'
+  b'\x1b]133;A\x07'
+  b'\x1b]133;k;end_kitty\x07'
+  b'\x1b]133;k;start_suffix_kitty\x07'
+  b'\x1b]133;k;end_suffix_kitty\x07'
+  b'\x1b]133;C;cmdline=echo\\ hello\x07'
+  b'\x1b]133;k;start_kitty\x07'
+  b'\x1b]133;k;end_kitty\x07'
+  b'\x1b]133;k;start_suffix_kitty\x07'
+  b'\x1b]133;k;end_suffix_kitty\x07'
+  b'\x1b]133;k;start_kitty\x07'
+  b'\x1b]133;D;0\x07'
+  b'\x1b]133;A\x07'
+  b'\x1b]133;k;end_kitty\x07'
+  b'\x1b]133;k;start_suffix_kitty\x07'
+  b'\x1b]133;k;end_suffix_kitty\x07'
+  b'\x1b]133;C;cmdline=cd\\ project\x07'
+  b'\x1b]133;k;start_kitty\x07'
+  b'\x1b]133;k;end_kitty\x07'
+  b'\x1b]133;k;start_suffix_kitty\x07'
+  b'\x1b]133;k;end_suffix_kitty\x07'
+  b'\x1b]7;kitty-shell-cwd://kitty-demo-host/tmp/kitty-demo-home/project\x07'
 
------ STABILITY across 2 runs -----
-  identical marker order across runs: True
+===== STABILITY =====
+marker order identical across 2 runs: True
+OSC7/133 byte sequences identical across 2 runs: True
 ```
 
-Notable, byte-accurate real-shell facts: bash terminates its OSC 133/OSC 7 sequences with **BEL (`\a`)** rather than ST (`\x1b\\`) — the parser accepts both terminators. The command-start marker carries the command context inline: `\x1b]133;C;cmdline=echo\ hello\a`. The prompt-start `A`, command-start `C`, and command-end `D;0` are all present, interleaved with kitty-internal region markers (`133;k;start_kitty`/`end_kitty`, used to delimit prompt regions). The Screen correctly captured `last_reported_cwd` and `last_cmd_exit_status = 0` — command context and screen state stayed aligned with a real shell, not just synthetic input.
+Notable, byte-accurate real-shell facts: bash terminates its OSC 133/OSC 7 sequences with **BEL (`\x07`, i.e. `\a`)** rather than ST (`\x1b\\`) — the parser accepts both terminators. The command-start marker carries the command context inline: `\x1b]133;C;cmdline=echo\ hello` and, for the second command, `\x1b]133;C;cmdline=cd\ project`. The prompt-start `A`, command-start `C`, and command-end `D;0` are all present, interleaved with kitty-internal region markers (`133;k;start_kitty`/`end_kitty`/`start_suffix_kitty`/`end_suffix_kitty`, used to delimit prompt regions). Crucially, **OSC 7 tracks the working directory live**: the first notification reports `…/kitty-demo-home`, and after `cd project` a second reports `…/kitty-demo-home/project` — and `screen.last_reported_cwd` ends at exactly that post-`cd` path. The command-end `133;D;0` marker is likewise absorbed into the Screen's callback state: immediately after `echo hello` completes, the harness reads back `last_cmd_cmdline = 'echo hello'` and `last_cmd_exit_status = 0` (the `0` decoded directly from that `D;0` marker). Command context and screen state stayed aligned with a real shell, not just synthetic input.
 
 ### 3.4 The parser internals that guarantee this (cited)
 
@@ -444,16 +487,49 @@ The parser is threaded and double-buffered, guarded by a mutex `lock` (`kitty/vt
 
 ### 3.5 Canonical test-suite corroboration (observed)
 
-The repository's own tests exercise these exact paths and pass on the running build:
+The repository's own tests exercise these exact paths and pass on the running build. The complete, unedited result output of each run is shown below (the test runner also prints a 4-line environment preamble — `Running under CI`, `Using PATH…`, `Python:`, `Intrinsics:` — omitted here only because it repeats the absolute build path; verbosity defaults to 4, so every test name is listed):
 
 ```
 $ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module shell_integration
-Ran 6 tests in ... OK        # bash / fish / zsh, both kitten and non-kitten variants
+test_bash_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_bash_integration) ... ok
+test_fish_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_fish_integration) ... ok
+test_zsh_integration (kitty_tests.shell_integration.ShellIntegrationWithKitten.test_zsh_integration) ... ok
+test_bash_integration (kitty_tests.shell_integration.ShellIntegration.test_bash_integration) ... ok
+test_fish_integration (kitty_tests.shell_integration.ShellIntegration.test_fish_integration) ... ok
+test_zsh_integration (kitty_tests.shell_integration.ShellIntegration.test_zsh_integration) ... ok
 
-$ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module parser
-Ran 16 tests in ... OK       # incl. test_parser_threading, test_osc_codes, test_csi_codes,
-                             #       test_dcs_codes, test_utf8_parsing
+----------------------------------------------------------------------
+Ran 6 tests in 1.382s
+
+OK
 ```
+
+```
+$ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module parser
+test_base64 (kitty_tests.parser.TestParser.test_base64) ... ok
+test_charsets (kitty_tests.parser.TestParser.test_charsets) ... ok
+test_csi_code_rep (kitty_tests.parser.TestParser.test_csi_code_rep) ... ok
+test_csi_codes (kitty_tests.parser.TestParser.test_csi_codes) ... ok
+test_dcs_codes (kitty_tests.parser.TestParser.test_dcs_codes) ... ok
+test_deccara (kitty_tests.parser.TestParser.test_deccara) ... ok
+test_desktop_notify (kitty_tests.parser.TestParser.test_desktop_notify) ... ok
+test_esc_codes (kitty_tests.parser.TestParser.test_esc_codes) ... ok
+test_find_either_of_two_bytes (kitty_tests.parser.TestParser.test_find_either_of_two_bytes) ... ok
+test_graphics_command (kitty_tests.parser.TestParser.test_graphics_command) ... ok
+test_osc_codes (kitty_tests.parser.TestParser.test_osc_codes) ... ok
+test_oth_codes (kitty_tests.parser.TestParser.test_oth_codes) ... ok
+test_parser_threading (kitty_tests.parser.TestParser.test_parser_threading) ... ok
+test_simple_parsing (kitty_tests.parser.TestParser.test_simple_parsing) ... ok
+test_utf8_parsing (kitty_tests.parser.TestParser.test_utf8_parsing) ... ok
+test_utf8_simd_decode (kitty_tests.parser.TestParser.test_utf8_simd_decode) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.058s
+
+OK
+```
+
+Both modules were run twice; the set of test names and the `OK` result were identical across runs, with only the reported wall-clock duration varying slightly (shell_integration: `1.382s` then `1.478s`; parser: `0.058s` then `0.056s`) — expected timing jitter, not a behavioral difference.
 
 
 ---
@@ -552,31 +628,62 @@ So the accurate picture is: the buffer that gates child-output flow control is t
 
 ### 4.5 Unstable remote — the SSH kitten path (observed)
 
-The SSH kitten's canonical GPU-less tests all pass on the running build (stable across 2 invocations):
+The SSH kitten's canonical GPU-less tests all pass on the running build. The complete, unedited result output (the 4-line env preamble is omitted as in §3.5) is:
 
 ```
 $ CI=true LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ./test.py --module ssh
-test_basic_pty_operations ... ok
-test_ssh_bootstrap_with_different_launchers ... ok
-test_ssh_connection_data ... ok
-test_ssh_copy ... ok
-test_ssh_env_vars ... ok
-test_ssh_leading_data ... ok
-test_ssh_login_shell_detection ... ok
-test_ssh_shell_integration ... ok
+test_basic_pty_operations (kitty_tests.ssh.SSHKitten.test_basic_pty_operations) ... ok
+test_ssh_bootstrap_with_different_launchers (kitty_tests.ssh.SSHKitten.test_ssh_bootstrap_with_different_launchers) ... ok
+test_ssh_connection_data (kitty_tests.ssh.SSHKitten.test_ssh_connection_data) ... ok
+test_ssh_copy (kitty_tests.ssh.SSHKitten.test_ssh_copy) ... ok
+test_ssh_env_vars (kitty_tests.ssh.SSHKitten.test_ssh_env_vars) ... ok
+test_ssh_leading_data (kitty_tests.ssh.SSHKitten.test_ssh_leading_data) ... ok
+test_ssh_login_shell_detection (kitty_tests.ssh.SSHKitten.test_ssh_login_shell_detection) ... ok
+test_ssh_shell_integration (kitty_tests.ssh.SSHKitten.test_ssh_shell_integration) ... ok
+
 ----------------------------------------------------------------------
-Ran 8 tests in 17.705s
+Ran 8 tests in 10.306s
+
 OK
 ```
 
-**Direct observed behavior:** the bootstrap (`shell-integration/ssh/bootstrap.sh`) reads the incoming payload with **line-oriented, incremental read loops** (`while IFS= read -r line`, `bootstrap.sh:L98` and `L139`) — so it tolerates the stream arriving in arbitrary partial chunks. Crucially it maintains a **`leading_data`** buffer (`bootstrap.sh:L86`, accumulated at `L147`): any input that arrives *before* the base64/tar payload has finished transferring is captured and later replayed to the shell, so early keystrokes on a slow/laggy link are **not lost**. `test_ssh_leading_data` confirms this end-to-end — with `pre_data='before_tarfile'` the post-bootstrap screen shows `UNTAR_DONE\nld:before_tarfile` (`kitty_tests/ssh.py:L158-L169`), i.e. the leading data survived the bootstrap. If the connection or transfer breaks, the `cleanup_on_bootstrap_exit()` trap (`bootstrap.sh:L10`, armed `trap ... EXIT` at `L91`) restores `stty echo` and removes the temp dir, and `die()` (`bootstrap.sh:L16`) reports transfer failure and exits `1`.
+Run twice for stability: the set of 8 test names and the `OK` result were identical; only the wall-clock duration varied (`10.306s` then `16.585s`), reflecting the real subprocess/`tar`/shell work these tests drive, not a behavioral difference.
 
-**Honest caveat [inferred / not exercised]:** the harness uses a **local PTY** as the SSH transport stand-in; a *real* TCP disconnect / network flakiness was **not** exercised, and the bootstrap contains **no reconnection logic** (it is a one-shot bootstrap). So the observed resilience is specifically leading-data buffering and clean teardown — not session reconnection. The claim "no reconnection behavior exists" is inferred from reading the bootstrap, which has no such code path.
+**Both bootstraps are exercised.** The test's candidate interpreters are `all_possible_sh = filter(which, ('dash', 'zsh', 'bash', 'posh', 'sh', python))` (`kitty_tests/ssh.py:L64-L65`), and `check_bootstrap()` routes to the **Python** bootstrap whenever `'python' in sh` (`kitty_tests/ssh.py:L230`) and to the **POSIX-sh** bootstrap otherwise — so `shell-integration/ssh/bootstrap.py`, `shell-integration/ssh/bootstrap.sh`, and the shared `shell-integration/ssh/bootstrap-utils.sh` (sourced by the sh path) are all covered.
+
+**The client side (`kittens/ssh/main.go`) — how the payload is assembled and how garbage-on-connect is drained.** `run_ssh()` (`kittens/ssh/main.go:L597`) orchestrates the connection; it builds the remote command through `get_remote_command()` (`L511`), which calls `bootstrap_script()` (`L519`) then `wrap_bootstrap_script()` (`L523`). `bootstrap_script()` (`L422`) selects the remote bootstrap by interpreter — `shell-integration/ssh/bootstrap.<script_type>` (`L481`), where `script_type` defaults to `"sh"` (`L515`) and switches to `"py"` (`L517`) when a Python interpreter is requested — and `make_tarfile()` (`L255`) bundles the env script `data.sh` (`L321`) and the shared `bootstrap-utils.sh` (`L325`) into the base64 tar payload the bootstrap later unpacks. `wrap_bootstrap_script()` (`L486`) then wraps that script for the chosen interpreter: for Python it base64-encodes the body and wraps it as `eval(compile(base64.standard_b64decode(sys.argv[-1]), 'bootstrap.py', 'exec'))` (`L498-L499`); for sh it escapes the body via a `strings.NewReplacer` (`L505`). Most relevant to an **unstable/garbage-laden connect**, after the transport is up `run_ssh()` calls `drain_potential_tty_garbage()` (`L783` → `L530`): it puts the terminal in raw mode, writes a **DCS canary** built by `tui.DCSToKitty("echo", canary)` (`L539`), then loops in `term.ReadWithTimeout()` (`L557`) with a **2-second budget** (`give_up_at := time.Now().Add(2 * time.Second)`, `L549`) until the canary echoes back — discarding any stray bytes the remote emitted before kitty took over the tty. **[inferred from reading]** for `drain_potential_tty_garbage` specifically: it requires a live tty plus a remote and was read, not executed, in this GPU-less/no-sshd environment.
+
+**The remote bootstrap (`shell-integration/ssh/bootstrap.sh`) — resilient, incremental reads.** The bootstrap reads the incoming payload with **line-oriented, incremental read loops** (`while IFS= read -r line`, `bootstrap.sh:L98` and `L139`) — so it tolerates the stream arriving in arbitrary partial chunks. Crucially it maintains a **`leading_data`** buffer (`bootstrap.sh:L86`, accumulated at `L147`): any input that arrives *before* the base64/tar payload has finished transferring is captured and later replayed to the shell, so early keystrokes on a slow/laggy link are **not lost**. `test_ssh_leading_data` confirms this end-to-end — with `pre_data='before_tarfile'` the post-bootstrap screen shows `UNTAR_DONE\nld:before_tarfile` (`kitty_tests/ssh.py:L158-L169`), i.e. the leading data survived the bootstrap. If the connection or transfer breaks, the `cleanup_on_bootstrap_exit()` trap (`bootstrap.sh:L10`, armed `trap ... EXIT` at `L91`) restores `stty echo` and removes the temp dir, and `die()` (`bootstrap.sh:L17`) prints a red-colored transfer-failure message and exits `1`.
+
+**The Python bootstrap (`shell-integration/ssh/bootstrap.py`) mirrors the sh one.** It keeps the same `leading_data` buffer (`bootstrap.py:L23`); `iter_base64_data()` (`L172`) reads the payload line-by-line and accumulates any pre-payload lines into `leading_data` (`L181`); `get_data()` (`L203`) joins and base64-decodes the stream and untars it (`L213`); `dcs_to_kitty()` (`L73`) is the DCS channel back to kitty; and `main()` (`L286`) drives `get_data()` (`L295`). It is selected by the client's `script_type == "py"` path above and exercised whenever `all_possible_sh` includes a Python interpreter.
+
+**The shared utilities (`shell-integration/ssh/bootstrap-utils.sh`).** Both bootstraps rely on this file (the sh path sources it at `bootstrap.sh:L115`). It provides login-shell detection with graceful fallbacks (`using_getent` `bootstrap-utils.sh:L59`, `using_python` `L69`, `using_perl` `L74`, `using_passwd` `L79`), terminfo compilation (`compile_terminfo` `L18`), atomic file placement (`mv_files_and_dirs` `L9`), the per-shell integration exec wrappers (`exec_zsh_with_integration` `L102`, `exec_fish_with_integration` `L118`, `exec_bash_with_integration` `L128`, `exec_with_shell_integration` `L138`), and the final `prepare_for_exec` (`L192`) / `exec_login_shell` (`L221`) that hand control to the user's shell.
+
+**Disruption exercised (observed) — two mid-transfer failure modes.** Because no `sshd`/TCP endpoint exists in this environment, the disruption was injected at the exact layer where a real mid-transfer drop manifests to the remote — the **payload/protocol stream** the bootstrap reads. The real `shell-integration/ssh/bootstrap.sh` was copied to `/tmp` with its template tokens substituted exactly as the Go client's `prepare_script()` does (`REQUEST_DATA=0` so it reads the payload from stdin, `ECHO_ON=0`), then fed deliberately broken streams. Both scenarios were byte-identical across 2 runs (the *only* alteration to the output below is normalizing Scenario A's random `mktemp` suffix to `<TMPDIR>`; `HOME` was set to `/tmp/kitty-demo-home`):
+
+```
+# Scenario A — truncated payload (connection drops mid tar-transfer)
+# the base64 below is arbitrary non-tar bytes standing in for a half-arrived payload
+$ printf 'KITTY_DATA_START\nOK\nVGhpcyBpcyBub3QgYSB2YWxpZCB0YXJmaWxlIC0gdHJ1bmNhdGVk\n' | sh /tmp/kitty_obs/bootstrap_real_subst.sh ; echo "exit=$?"
+/tmp/kitty_obs/bootstrap_real_subst.sh: 115: .: cannot open <TMPDIR>/bootstrap-utils.sh: No such file
+exit=2
+
+# Scenario B — remote/kitty signals a transfer failure after KITTY_DATA_START
+$ printf 'KITTY_DATA_START\nError transferring data: connection reset by peer\n' | sh /tmp/kitty_obs/bootstrap_real_subst.sh ; echo "exit=$?"
+# raw bytes (repr): b'\x1b[31mError transferring data: connection reset by peer\x1b[m\n\r'
+exit=1
+```
+
+Reading these directly: In **Scenario A**, the truncated/corrupt tar produces no `bootstrap-utils.sh`, so the source line `. "$tdir/bootstrap-utils.sh"` (`bootstrap.sh:L115`) fails with `cannot open … No such file` and the POSIX shell aborts with **exit 2** — and the `EXIT` trap `cleanup_on_bootstrap_exit` (`L91`) still fires (verified: no `.kitty-ssh-kitten-untar-*` temp dir was left behind). In **Scenario B**, `get_data()` (`bootstrap.sh:L137`) sees a non-`OK` line after `KITTY_DATA_START` and calls `die "$line"` (`L17`), emitting the exact red-ANSI bytes `\x1b[31m…\x1b[m\n\r` and exiting **1**. So a disrupted transfer never hangs or silently half-installs: it terminates deterministically with a defined non-zero status and a clean teardown.
+
+**Honest caveat [inferred / not exercised]:** the tests use a **local PTY** as the SSH transport stand-in, and the disruption above was injected at the protocol/stdin layer — a *real* TCP disconnect / network flakiness across a live `sshd` was **not** exercised (no `sshd` is present). The bootstrap contains **no reconnection logic** (it is a one-shot bootstrap), so the observed resilience is specifically leading-data buffering, deterministic error exits (1 or 2), and clean teardown — **not** session reconnection. The "no reconnection behavior exists" statement is inferred from reading both bootstraps, which contain no such code path.
 
 
 ---
 
 ## 5. Q5 — End-to-end narrative: from a surge of mixed input to the interface settling
+
+**Direct answer:** a surge of mixed input becomes a coherent flow because the pipeline separates *arrival* from *interpretation* from *display* and lets each stage run at its own pace, absorbing bursts with buffering and flow control rather than racing. Input enters through **two doors** — keystrokes/paste/resize via GLFW (`kitty/glfw.c:L430` → `kitty/keys.c:L166` → `schedule_write_to_child()`), and child output via the I/O thread's `read_bytes()` (`kitty/child-monitor.c:L1337`). The Child Monitor's three-thread event loop — the "unseen conductor" — orders those arrivals by `poll()` readiness plus `input_delay`/`repaint_delay` scheduling, using a self-pipe wakeup to preempt for out-of-band events (resize, signals, queued writes). Every byte is then classified exactly once by the single `parse_worker()` (`kitty/vt-parser.c:L1496`), so ordinary text, control escapes, and OSC 133/OSC 7 shell-integration hints never drift apart. When output outruns the parser the pipeline **pushes back** — the write buffer fills, `read_bytes()` early-returns (`kitty/child-monitor.c:L1342`), and the child blocks on `write()` — so nothing is dropped. The interface "settles" when input stops arriving, the parser drains, any pending/synchronized update (mode 2026) ends, and the next `repaint_delay`-timed tick renders the final state. That is why the moving parts keep their rhythm instead of falling apart. The rest of this section walks that sequence step by step.
 
 Here is the whole rhythm, tying the observations together. The user's metaphors map onto concrete components: the **busy junction** is the multiplexed `poll()` loop; the **unseen conductor** is the Child Monitor's three-thread event loop; **keeping rhythm under a surge** is the backpressure and pending/synchronized-update machinery.
 
@@ -615,6 +722,8 @@ io_loop()                             kitty/child-monitor.c:L1481   (I/O thread 
 ```
 
 ### A.2 User-input path (keyboard → PTY)
+
+This full chain was **observed end-to-end** by injecting real X key events (XTEST/`xdotool`) into a real windowed kitty under Xvfb and recording the bytes the child receives on its PTY (§1.2).
 
 ```
 key_callback(window, key, ...)        kitty/glfw.c:L430
@@ -661,6 +770,7 @@ All line numbers below were re-confirmed against the running build (commit `815d
 | Render debug line | `render()` | `kitty/child-monitor.c:L872` |
 | Talk thread | `talk_loop()` / `"KittyPeerMon"` | `kitty/child-monitor.c:L1805/L1808` |
 | Debug timestamp | `timed_debug_print` | `kitty/child-monitor.c:L29-L30` |
+| Debug timestamp format | `fprintf(stderr, "[%.3f] ", …)` in `timed_debug_print()` (fn defined `L99`) | `kitty/monotonic.h:L102` |
 | Self-pipe primitives | `wakeup_fds`/`self_pipe`/`drain_fd` | `kitty/loop-utils.h:L33,L39,L40,L48,L52,L76` |
 | Parser buffer size | `BUF_SZ (1024u*1024u)` | `kitty/vt-parser.c:L18` |
 | Parser buffer array | `uint8_t buf[BUF_SZ + BUF_EXTRA]` | `kitty/vt-parser.c:L194` |
@@ -697,8 +807,17 @@ All line numbers below were re-confirmed against the running build (commit `815d
 | Job-control signals | `send_signal_for_key` / SIGTSTP | `kitty/child.py:L481/L493` |
 | Ring buffer FIFO | full/empty/read/write | `3rdparty/ringbuf/ringbuf.h:L44-L46`; `ringbuf.c:L122/L128/L241/L334` |
 | Pager-hist ringbuf use | `initial_pagerhist_ringbuf_sz` | `kitty/history.c:L67,L76` |
-| SSH bootstrap | leading_data / read loop / trap / die | `shell-integration/ssh/bootstrap.sh:L10,L16,L86,L91,L98,L139,L147` |
+| SSH client — orchestration | `run_ssh()` (drain call `L783`) | `kittens/ssh/main.go:L597` |
+| SSH client — remote cmd build | `get_remote_command()` (`bootstrap_script` `L519`, `wrap_bootstrap_script` `L523`) | `kittens/ssh/main.go:L511` |
+| SSH client — bootstrap select | `bootstrap.<script_type>` (`L481`); `script_type` sh `L515` / py `L517` | `kittens/ssh/main.go:L422` |
+| SSH client — tar payload | `make_tarfile()`; adds `data.sh` `L321`, `bootstrap-utils.sh` `L325` | `kittens/ssh/main.go:L255` |
+| SSH client — wrap script | py `eval(compile(...,'bootstrap.py','exec'))` `L498-L499`; sh escape `L505` | `kittens/ssh/main.go:L486` |
+| SSH client — drain tty garbage | `drain_potential_tty_garbage()`; DCS canary `L539`, 2 s budget `L549`, `ReadWithTimeout` `L557` | `kittens/ssh/main.go:L530` |
+| SSH bootstrap (sh) | cleanup `L10` / die `L17` / leading_data `L86` / trap `L91` / read loops `L98`,`L139` / source utils `L115` / accum `L147` | `shell-integration/ssh/bootstrap.sh` |
+| SSH bootstrap (py) | `leading_data` `L23` / `dcs_to_kitty` `L73` / `iter_base64_data` `L172` (accum `L181`) / `get_data` `L203` (untar `L213`) / `main` `L286` | `shell-integration/ssh/bootstrap.py` |
+| SSH bootstrap-utils | `mv_files_and_dirs` `L9` / `compile_terminfo` `L18` / login-shell detect `L59`,`L69`,`L74`,`L79` / exec wrappers `L102`,`L118`,`L128`,`L138` / `prepare_for_exec` `L192` / `exec_login_shell` `L221` | `shell-integration/ssh/bootstrap-utils.sh` |
 | SSH leading-data test | `test_ssh_leading_data` | `kitty_tests/ssh.py:L158-L169` |
+| SSH both-bootstraps coverage | `all_possible_sh` / py-vs-sh routing | `kitty_tests/ssh.py:L64-L65,L230` |
 | Harness parse path | `parse_bytes()` / `test_*` methods | `kitty_tests/__init__.py:L30`; `kitty/screen.c:L4755/L4762/L4772` |
 | Build targets | `all:` / `debug-event-loop:` | `Makefile:L12-L13/L25-L26` |
 | Test launcher | shebang / import | `test.py:L1/L8` |
@@ -709,15 +828,356 @@ All line numbers below were re-confirmed against the running build (commit `815d
 - **§1.4** — that `screen_update_cell_data()` (`kitty/screen.c:L2738`) renders from `paused_rendering.linebuf` while paused (the snapshot *copy* and the mode transition are observed; the render-read of the snapshot is inferred from reading).
 - **§1.8** — job-control suspend/resume (`SIGTSTP`/`SIGCONT`) is traced through `keys.c` → `screen.c` → `window.py` → `child.py` and cited, but a live signal delivery was not separately captured (requires `HANDLE_TERMIOS_SIGNALS` enabled by the running program).
 - **§4.4** — the `3rdparty/ringbuf/` FIFO plays **no** role in the input/backpressure path (its only usage sites, in `kitty/history.c`, are observed via grep; "no role in input path" is the inferred conclusion).
-- **§4.5** — the SSH kitten has **no reconnection logic** and a real TCP disconnect was **not** exercised (the harness uses a local PTY as the transport); leading-data buffering and clean teardown *are* observed via `test_ssh_leading_data`.
+- **§4.5** — the SSH kitten has **no reconnection logic**, and a real TCP disconnect across a live `sshd` was **not** exercised (no `sshd` is present; the disruption was injected at the protocol/stdin layer instead). Leading-data buffering, clean teardown, and the two mid-transfer failure exits (2 and 1) *are* observed (via `test_ssh_leading_data` and the disruption runs against the real `bootstrap.sh`); `drain_potential_tty_garbage()` (`kittens/ssh/main.go:L530`) was **read, not executed** (it needs a live tty plus a remote).
 
 ### B.3 Non-canonical values
 
-- **None.** No value reported above was obtained through the remote-control interface (`kitty/rc/`) or a debug hook substituted for the real entry point. The user-input encodings (§1.2) were produced by `encode_key_for_tty` — the same function `on_key_input()` calls — and the child-output, pause/resume, paste, resize, backpressure, and shell-integration captures all flow through the real parser/PTY paths (or a real windowed GUI under Xvfb for the render-dependent safety-valve timeout). The `kitty/rc/` remote-control path is *described* only where relevant and never used as an observation source.
+- **None.** No value reported above was obtained through the remote-control interface (`kitty/rc/`) or a debug hook substituted for the real entry point. The **user-input path (§1.2) is observed through the real GLFW entry point** — real X key events injected with XTEST (`xdotool`) into a real windowed kitty under Xvfb, driving `key_callback()` → `on_key_input()` → `schedule_write_to_child()` → PTY, with the child recording the bytes that arrive; the `encode_key_for_tty` values are shown only as supplementary corroboration and agree with the real-path capture. The child-output, pause/resume, paste, resize, backpressure, and shell-integration captures all flow through the real parser/PTY paths (or a real windowed GUI under Xvfb for the render-dependent safety-valve timeout and event-loop stream). The `kitty/rc/` remote-control path is *described* only where relevant and never used as an observation source.
+- **On XTEST/`xdotool`:** injecting X key events via the XTEST extension is the standard way to exercise a GUI's real input path headlessly; at the X-protocol layer these events are indistinguishable from a physical keyboard, so kitty's `key_callback()` runs identically. This is therefore the canonical input entry point, not a bypass. `xdotool` is an observation-time input tool only; it modifies neither the repository nor the kitty build.
 
 ### B.4 Method caveats
 
 - Render-dependent behavior (the 2 s pause safety valve in §1.5 and the event-loop stream in §2) was captured in a **real windowed kitty under Xvfb + software GL (llvmpipe)**; all other captures use the PTY-driven `kitty_tests` harness, which drives the same C parser API the I/O thread uses (§0.3).
 - Magnitude/timing values were run at stated scale (8 MiB burst; 5×256 KiB into a 1 MiB buffer) and confirmed across ≥2 runs; the one genuine run-to-run spread (§4.3) was reproduced and explained as a measurement artifact rather than stabilized away.
-- This investigation was strictly read-only: the only change to the repository is this single document; all temporary observation scripts lived under `/tmp` and were removed afterward.
+- **Read-only, git-verified.** This investigation was strictly read-only: the only change to the repository is this single document, and all temporary observation scripts lived under `/tmp` and were removed afterward. This is verifiable directly from git — relative to the upstream baseline commit `815df1e21` (the last non-Blitzy commit), exactly one path differs (the deliverable is *added*), and **no existing file is modified or deleted**:
 
+```console
+$ git diff --name-status 815df1e21..HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
+
+$ git diff --name-status 815df1e21..HEAD -- . ':(exclude)blitzy/documentation/kitty_815df1e210e0.md'
+$        # empty — no existing source file differs from the upstream baseline
+```
+
+  After this document is committed, `git status --porcelain` reports a clean working tree; the built artifacts (`build/`, `kitty/launcher/kitty`, `kitty/launcher/kitten`, `*.so`) never appear in git status because they are gitignored (confirmed with `git check-ignore`).
+
+
+---
+
+## Appendix C — Complete canonical build log
+
+This is the **complete, unedited** output of the canonical build command, captured from a *clean* tree (`python3 setup.py clean` was run immediately before). The first line is the exact command; the final line is the process exit status. The build compiles the C core into `build/kitty/fast_data_types.so` (90 `gcc` invocations) and then runs `go build -v` to produce the `kitten` binary. The **only** normalization applied is rendering the absolute repository path as the placeholder `<KITTY_REPO>` (it occurs once, in the final `go build` target line); every compiler command, compiler flag, Go-package line, and the exit status below is byte-for-byte as emitted.
+
+```
+$ python3 setup.py build --verbose
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+CC: ['gcc'] (15, 0)
+gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+Detected: CompilerType.gcc
+gcc -MMD -DNDEBUG -DPRIMARY_VERSION=4000 -DSECONDARY_VERSION=35 -DXT_VERSION="0.35.2" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/screen.c -o build/fast_data_types-kitty-screen.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/unicode-data.c -o build/fast_data_types-kitty-unicode-data.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/x11_window.c -o build/glfw-x11-glfw-x11_window.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/glfw.c -o build/fast_data_types-kitty-glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/graphics.c -o build/fast_data_types-kitty-graphics.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/child-monitor.c -o build/fast_data_types-kitty-child-monitor.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/fonts.c -o build/fast_data_types-kitty-fonts.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/shaders.c -o build/fast_data_types-kitty-shaders.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/vt-parser.c -o build/fast_data_types-kitty-vt-parser.c.o
+gcc -MMD -DNDEBUG -DDUMP_COMMANDS -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/vt-parser.c -o build/fast_data_types-kitty-vt-parser-dump.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/state.c -o build/fast_data_types-kitty-state.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/input.c -o build/glfw-x11-glfw-input.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/mouse.c -o build/fast_data_types-kitty-mouse.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/xkb_glfw.c -o build/glfw-x11-glfw-xkb_glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/freetype.c -o build/fast_data_types-kitty-freetype.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/window.c -o build/glfw-x11-glfw-window.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/line.c -o build/fast_data_types-kitty-line.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/glfw-wrapper.c -o build/fast_data_types-kitty-glfw-wrapper.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -Ikitty -I/usr/include/python3.13 -c kittens/transfer/algorithm.c -o build/rsync-kittens-transfer-algorithm.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/x11_init.c -o build/glfw-x11-glfw-x11_init.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/freetype_render_ui_text.c -o build/fast_data_types-kitty-freetype_render_ui_text.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/egl_context.c -o build/glfw-x11-glfw-egl_context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/disk-cache.c -o build/fast_data_types-kitty-disk-cache.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/glx_context.c -o build/glfw-x11-glfw-glx_context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/line-buf.c -o build/fast_data_types-kitty-line-buf.c.o
+gcc -MMD -DNDEBUG -DKITTY_VCS_REV="ea52a36e3c671686997954bd0bd9c36dfe964a11" -DWRAPPED_KITTENS="ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/colors.c -o build/fast_data_types-kitty-colors.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/history.c -o build/fast_data_types-kitty-history.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/keys.c -o build/fast_data_types-kitty-keys.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/x11_monitor.c -o build/glfw-x11-glfw-x11_monitor.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/fontconfig.c -o build/fast_data_types-kitty-fontconfig.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/context.c -o build/glfw-x11-glfw-context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/crypto.c -o build/fast_data_types-kitty-crypto.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/ibus_glfw.c -o build/glfw-x11-glfw-ibus_glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/key_encoding.c -o build/fast_data_types-kitty-key_encoding.c.o
+gcc -DWRAPPED_KITTENS=" ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input " -DFROM_SOURCE -DKITTY_LIB_PATH="../.." -DKITTY_CLI_BOOL_OPTIONS=" detach hold single-instance 1 wait-for-single-instance-window-close version v dump-commands debug-rendering debug-gl debug-input debug-keyboard debug-font-fallback execute e " -DKITTY_VERSION="0.35.2" -Wall -pedantic-errors -Werror -fpie -O3 -I/usr/include/python3.13 -c kitty/launcher/main.c -o build/kitty-launcher-main.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/monitor.c -o build/glfw-x11-glfw-monitor.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/font-names.c -o build/fast_data_types-kitty-font-names.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/backend_utils.c -o build/glfw-x11-glfw-backend_utils.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/charsets.c -o build/fast_data_types-kitty-charsets.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/linux_joystick.c -o build/glfw-x11-glfw-linux_joystick.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/init.c -o build/glfw-x11-glfw-init.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/dbus_glfw.c -o build/glfw-x11-glfw-dbus_glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/gl.c -o build/fast_data_types-kitty-gl.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/vulkan.c -o build/glfw-x11-glfw-vulkan.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/osmesa_context.c -o build/glfw-x11-glfw-osmesa_context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/cursor.c -o build/fast_data_types-kitty-cursor.c.o
+gcc -DWRAPPED_KITTENS=" ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input " -DFROM_SOURCE -DKITTY_LIB_PATH="../.." -DKITTY_CLI_BOOL_OPTIONS=" detach hold single-instance 1 wait-for-single-instance-window-close version v dump-commands debug-rendering debug-gl debug-input debug-keyboard debug-font-fallback execute e " -DKITTY_VERSION="0.35.2" -Wall -pedantic-errors -Werror -fpie -O3 -I/usr/include/python3.13 -c kitty/launcher/single-instance.c -o build/kitty-launcher-single-instance.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/desktop.c -o build/fast_data_types-kitty-desktop.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/loop-utils.c -o build/fast_data_types-kitty-loop-utils.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/ringbuf/ringbuf.c -o build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/simd-string.c -o build/fast_data_types-kitty-simd-string.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/systemd.c -o build/fast_data_types-kitty-systemd.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/shlex.c -o build/fast_data_types-kitty-shlex.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/child.c -o build/fast_data_types-kitty-child.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/kittens.c -o build/fast_data_types-kitty-kittens.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/codec_choose.c -o build/fast_data_types-3rdparty-base64-lib-codec_choose.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/png-reader.c -o build/fast_data_types-kitty-png-reader.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/linux_notify.c -o build/glfw-x11-glfw-linux_notify.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/rowcolumn-diacritics.c -o build/fast_data_types-kitty-rowcolumn-diacritics.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/hyperlink.c -o build/fast_data_types-kitty-hyperlink.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/wcswidth.c -o build/fast_data_types-kitty-wcswidth.c.o
+gcc -MMD -DNDEBUG -DHAS_COPY_FILE_RANGE -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/fast-file-copy.c -o build/fast_data_types-kitty-fast-file-copy.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/lib.c -o build/fast_data_types-3rdparty-base64-lib-lib.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/posix_thread.c -o build/glfw-x11-glfw-posix_thread.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/window_logo.c -o build/fast_data_types-kitty-window_logo.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/glyph-cache.c -o build/fast_data_types-kitty-glyph-cache.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/logging.c -o build/fast_data_types-kitty-logging.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/neon64/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-neon64-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/tables/tables.c -o build/fast_data_types-3rdparty-base64-lib-tables-tables.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/neon32/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-neon32-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -mavx -c 3rdparty/base64/lib/arch/avx/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-avx-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/ssse3/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-ssse3-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -msse4.2 -c 3rdparty/base64/lib/arch/sse42/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-sse42-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -msse4.1 -c 3rdparty/base64/lib/arch/sse41/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-sse41-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -mavx2 -c 3rdparty/base64/lib/arch/avx2/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-avx2-codec.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/utmp.c -o build/fast_data_types-kitty-utmp.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/avx512/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-avx512-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/generic/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-generic-codec.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/cleanup.c -o build/fast_data_types-kitty-cleanup.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/monotonic.c -o build/glfw-x11-glfw-monotonic.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/monotonic.c -o build/fast_data_types-kitty-monotonic.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -fopenmp-simd -DSIMDE_ENABLE_OPENMP -msse4.2 -c kitty/simd-string-128.c -o build/fast_data_types-kitty-simd-string-128.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -fopenmp-simd -DSIMDE_ENABLE_OPENMP -mavx2 -mno-vzeroupper -c kitty/simd-string-256.c -o build/fast_data_types-kitty-simd-string-256.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/gl-wrapper.c -o build/fast_data_types-kitty-gl-wrapper.c.o
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -Wall -O3 -shared -flto build/fast_data_types-kitty-charsets.c.o build/fast_data_types-kitty-child-monitor.c.o build/fast_data_types-kitty-child.c.o build/fast_data_types-kitty-cleanup.c.o build/fast_data_types-kitty-colors.c.o build/fast_data_types-kitty-crypto.c.o build/fast_data_types-kitty-cursor.c.o build/fast_data_types-kitty-data-types.c.o build/fast_data_types-kitty-desktop.c.o build/fast_data_types-kitty-disk-cache.c.o build/fast_data_types-kitty-fast-file-copy.c.o build/fast_data_types-kitty-font-names.c.o build/fast_data_types-kitty-fontconfig.c.o build/fast_data_types-kitty-fonts.c.o build/fast_data_types-kitty-freetype.c.o build/fast_data_types-kitty-freetype_render_ui_text.c.o build/fast_data_types-kitty-gl-wrapper.c.o build/fast_data_types-kitty-gl.c.o build/fast_data_types-kitty-glfw-wrapper.c.o build/fast_data_types-kitty-glfw.c.o build/fast_data_types-kitty-glyph-cache.c.o build/fast_data_types-kitty-graphics.c.o build/fast_data_types-kitty-history.c.o build/fast_data_types-kitty-hyperlink.c.o build/fast_data_types-kitty-key_encoding.c.o build/fast_data_types-kitty-keys.c.o build/fast_data_types-kitty-kittens.c.o build/fast_data_types-kitty-line-buf.c.o build/fast_data_types-kitty-line.c.o build/fast_data_types-kitty-logging.c.o build/fast_data_types-kitty-loop-utils.c.o build/fast_data_types-kitty-monotonic.c.o build/fast_data_types-kitty-mouse.c.o build/fast_data_types-kitty-png-reader.c.o build/fast_data_types-kitty-rowcolumn-diacritics.c.o build/fast_data_types-kitty-screen.c.o build/fast_data_types-kitty-shaders.c.o build/fast_data_types-kitty-shlex.c.o build/fast_data_types-kitty-simd-string-128.c.o build/fast_data_types-kitty-simd-string-256.c.o build/fast_data_types-kitty-simd-string.c.o build/fast_data_types-kitty-state.c.o build/fast_data_types-kitty-systemd.c.o build/fast_data_types-kitty-unicode-data.c.o build/fast_data_types-kitty-utmp.c.o build/fast_data_types-kitty-vt-parser.c.o build/fast_data_types-kitty-wcswidth.c.o build/fast_data_types-kitty-window_logo.c.o build/fast_data_types-kitty-vt-parser-dump.c.o build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon32-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse42-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-ssse3-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse41-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-generic-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx2-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx512-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon64-codec.c.o build/fast_data_types-3rdparty-base64-lib-tables-tables.c.o build/fast_data_types-3rdparty-base64-lib-codec_choose.c.o build/fast_data_types-3rdparty-base64-lib-lib.c.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -lharfbuzz -lGL -lpng16 -llcms2 -llcms2_fast_float -llcms2_threaded -pthread -lm -lcrypto -lrt -lz -o build/kitty/fast_data_types.so
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -Wall -O3 -shared -flto build/glfw-x11-glfw-context.c.o build/glfw-x11-glfw-init.c.o build/glfw-x11-glfw-input.c.o build/glfw-x11-glfw-monitor.c.o build/glfw-x11-glfw-vulkan.c.o build/glfw-x11-glfw-monotonic.c.o build/glfw-x11-glfw-window.c.o build/glfw-x11-glfw-x11_init.c.o build/glfw-x11-glfw-x11_monitor.c.o build/glfw-x11-glfw-x11_window.c.o build/glfw-x11-glfw-xkb_glfw.c.o build/glfw-x11-glfw-dbus_glfw.c.o build/glfw-x11-glfw-ibus_glfw.c.o build/glfw-x11-glfw-posix_thread.c.o build/glfw-x11-glfw-glx_context.c.o build/glfw-x11-glfw-egl_context.c.o build/glfw-x11-glfw-osmesa_context.c.o build/glfw-x11-glfw-backend_utils.c.o build/glfw-x11-glfw-linux_joystick.c.o build/glfw-x11-glfw-linux_notify.c.o -pthread -lm -lrt -ldl -lX11 -lXrandr -lXinerama -lXcursor -lxkbcommon -lxkbcommon-x11 -lxkbcommon -lX11-xcb -lX11 -lxcb -ldbus-1 -o build/kitty/glfw-x11.so
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -Ikitty -I/usr/include/python3.13 -Wall -O3 -shared -flto build/rsync-kittens-transfer-algorithm.c.o -lxxhash -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -o build/kittens/transfer/rsync.so
+gcc build/kitty-launcher-main.o build/kitty-launcher-single-instance.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -o kitty/launcher/kitty
+Updating Go generated files...
+go: downloading golang.org/x/sys v0.21.0
+go: downloading github.com/bmatcuk/doublestar/v4 v4.6.1
+go: downloading github.com/alecthomas/chroma/v2 v2.14.0
+go: downloading github.com/kovidgoyal/imaging v1.6.3
+go: downloading github.com/edwvee/exiffix v0.0.0-20240229113213-0dbb146775be
+go: downloading github.com/seancfoley/ipaddress-go v1.6.0
+go: downloading github.com/dlclark/regexp2 v1.11.0
+go: downloading golang.org/x/image v0.17.0
+go: downloading github.com/shirou/gopsutil/v3 v3.24.5
+go: downloading howett.net/plist v1.0.1
+go: downloading github.com/google/uuid v1.6.0
+go: downloading github.com/ALTree/bigfloat v0.2.0
+go: downloading golang.org/x/exp v0.0.0-20230801115018-d63ba01acd4b
+go: downloading github.com/zeebo/xxh3 v1.0.2
+go: downloading github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd
+go: downloading github.com/disintegration/imaging v1.6.2
+go: downloading github.com/klauspost/cpuid/v2 v2.2.5
+go: downloading github.com/tklauser/go-sysconf v0.3.12
+go: downloading github.com/seancfoley/bintree v1.3.1
+go: downloading github.com/tklauser/numcpus v0.6.1
+github.com/seancfoley/ipaddress-go/ipaddr/addrerr
+internal/nettrace
+log/internal
+image/color
+vendor/golang.org/x/crypto/internal/alias
+maps
+github.com/seancfoley/ipaddress-go/ipaddr/addrstr
+vendor/golang.org/x/crypto/cryptobyte/asn1
+container/list
+github.com/seancfoley/ipaddress-go/ipaddr/addrstrparam
+crypto/internal/boring/sig
+unicode/utf16
+github.com/shirou/gopsutil/v3/common
+golang.org/x/exp/constraints
+encoding
+kitty
+crypto/subtle
+crypto/internal/alias
+internal/singleflight
+vendor/golang.org/x/net/dns/dnsmessage
+hash
+math/rand/v2
+crypto/internal/randutil
+vendor/golang.org/x/text/transform
+encoding/base32
+internal/intern
+net/http/internal/ascii
+crypto/rc4
+bufio
+regexp/syntax
+context
+encoding/base64
+embed
+io/ioutil
+golang.org/x/sys/unix
+runtime/cgo
+vendor/golang.org/x/sys/cpu
+encoding/hex
+log
+net/url
+kitty/tools/utils/shlex
+flag
+vendor/golang.org/x/net/http2/hpack
+crypto/cipher
+crypto/internal/edwards25519/field
+github.com/bmatcuk/doublestar/v4
+vendor/golang.org/x/crypto/internal/poly1305
+github.com/dlclark/regexp2/syntax
+crypto/internal/nistec/fiat
+github.com/ALTree/bigfloat
+crypto/internal/bigmod
+encoding/asn1
+github.com/seancfoley/bintree/tree
+crypto/dsa
+crypto
+hash/adler32
+hash/crc32
+image/color/palette
+net/netip
+crypto/md5
+encoding/json
+golang.org/x/image/riff
+github.com/rwcarlsen/goexif/tiff
+encoding/pem
+vendor/golang.org/x/text/unicode/norm
+vendor/golang.org/x/crypto/chacha20
+database/sql/driver
+crypto/internal/edwards25519
+golang.org/x/image/tiff/lzw
+mime/quotedprintable
+net/http/internal
+compress/flate
+compress/bzip2
+image
+os/exec
+os/signal
+crypto/des
+crypto/internal/boring
+mime
+encoding/xml
+compress/lzw
+github.com/klauspost/cpuid/v2
+vendor/golang.org/x/text/unicode/bidi
+crypto/x509/pkix
+vendor/golang.org/x/crypto/cryptobyte
+crypto/internal/boring/bbig
+crypto/rand
+crypto/hmac
+crypto/sha1
+crypto/sha512
+crypto/sha256
+crypto/aes
+regexp
+vendor/golang.org/x/crypto/chacha20poly1305
+vendor/golang.org/x/crypto/hkdf
+kitty/tools/utils/secrets
+crypto/rsa
+github.com/shirou/gopsutil/v3/internal/common
+crypto/ed25519
+compress/gzip
+compress/zlib
+archive/zip
+golang.org/x/image/bmp
+golang.org/x/image/ccitt
+image/internal/imageutil
+golang.org/x/image/vp8l
+golang.org/x/image/vp8
+vendor/golang.org/x/text/secure/bidirule
+image/png
+image/draw
+image/jpeg
+crypto/internal/nistec
+github.com/rwcarlsen/goexif/exif
+golang.org/x/image/tiff
+vendor/golang.org/x/net/idna
+github.com/dlclark/regexp2
+github.com/zeebo/xxh3
+howett.net/plist
+golang.org/x/image/webp
+image/gif
+github.com/disintegration/imaging
+github.com/kovidgoyal/imaging
+crypto/ecdh
+crypto/elliptic
+crypto/ecdsa
+github.com/edwvee/exiffix
+github.com/alecthomas/chroma/v2
+github.com/tklauser/numcpus
+github.com/shirou/gopsutil/v3/mem
+github.com/tklauser/go-sysconf
+github.com/shirou/gopsutil/v3/cpu
+github.com/alecthomas/chroma/v2/styles
+github.com/alecthomas/chroma/v2/lexers
+os/user
+net
+archive/tar
+vendor/golang.org/x/net/http/httpproxy
+github.com/shirou/gopsutil/v3/net
+net/textproto
+github.com/google/uuid
+crypto/x509
+github.com/seancfoley/ipaddress-go/ipaddr
+vendor/golang.org/x/net/http/httpguts
+mime/multipart
+github.com/shirou/gopsutil/v3/process
+crypto/tls
+net/http/httptrace
+net/http
+kitty/tools/utils
+kitty/tools/tty
+kitty/tools/utils/base85
+kitty/tools/utils/paths
+kitty/tools/rsync
+kitty/tools/wcswidth
+kitty/tools/crypto
+kitty/tools/tui/shell_integration
+kitty/tools/utils/humanize
+kitty/tools/utils/style
+kitty/tools/cli/markup
+kitty/tools/tui/sgr
+kitty/tools/tui/loop
+kitty/tools/cli
+kitty/tools/config
+kitty/tools/cmd/mouse_demo
+kitty/tools/tui/shortcuts
+kitty/kittens/query_terminal
+kitty/kittens/show_key
+kitty/kittens/hyperlinked_grep
+kitty/tools/utils/shm
+kitty/tools/tui/readline
+kitty/tools/tui
+kitty/tools/utils/images
+kitty/tools/tui/subseq
+kitty/kittens/clipboard
+kitty/tools/unicode_names
+kitty/tools/cmd/edit_in_kitty
+kitty/tools/tui/graphics
+kitty/tools/cmd/run_shell
+kitty/kittens/ask
+kitty/kittens/hints
+kitty/tools/cmd/update_self
+kitty/tools/cmd/show_error
+kitty/tools/cmd/at
+kitty/tools/themes
+kitty/kittens/unicode_input
+kitty/kittens/themes
+kitty/kittens/ssh
+kitty/tools/cmd/benchmark
+kitty/kittens/icat
+kitty/kittens/choose_fonts
+kitty/kittens/transfer
+kitty/tools/cmd/pytest
+kitty/kittens/diff
+kitty/tools/cmd/tool
+kitty/tools/cmd/completion
+kitty/tools/cmd
+/usr/local/bin/go build -v -ldflags '-X kitty.VCSRevision=ea52a36e3c671686997954bd0bd9c36dfe964a11 -s -w' -o kitty/launcher/kitten <KITTY_REPO>/tools/cmd
+(exit status: 0)
+```
