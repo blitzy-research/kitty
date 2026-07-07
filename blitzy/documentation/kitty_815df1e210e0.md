@@ -21,7 +21,7 @@ The write itself is performed by the Enter handler at `kittens/choose_fonts/fina
 - **Run-first methodology:** build → launch → invoke the kitten through its real entry point → drive the TUI → observe the on-disk state transition and the restart re-read → exercise every sibling condition (`s`, `Esc`, `Ctrl+c`) and every `--reload-in` variant (`parent`, `all`, `none`). Observations preceded this write-up.
 - **How the interactive TUI was driven:** the kitten is an OpenGL-backed terminal UI, so it was run **inside a real kitty GUI window** under `DISPLAY=:99` (Xvfb) and driven with kitty **remote control** (`kitten @ launch`, `send-key`, `send-text`, `get-text`). Remote control was used only to *drive keystrokes into* and *read the screen of* the real kitten — the `choose-fonts` code path (family selection → previews → final → `Patcher.Patch`) always executed through its real entry point. No value below was obtained from a remote-control shortcut, a debug hook, or a synthetic stand-in; in particular, the reload variants in §7/§9.7 were observed against **real kitty GUI processes**, not a fake signal trap.
 - **Driving `s` (associated-text detail):** the final pane's `s` action is dispatched by `on_text` (`final.go:L101-L108`), which only fires when the key event carries associated text. `send-key s` does not populate that text field, so the `s` run was driven by sending the explicit CSI-u sequence `\e[115;1;115u` (key `115`='s', associated text codepoint `115`); this exercises the real `on_text` path, not a bypass.
-- **Reload observable:** to detect whether a *running* kitty GUI actually reloaded its config after the kitten's `SIGUSR1`, `background_opacity` was used as a telltale — it is read live via `kitten @ ls` and only changes value if the process re-reads `kitty.conf`. The GUIs ran with `auto_reload_config no` so the *only* thing that could trigger a reload was the kitten's signal.
+- **Reload observable:** to detect whether a *running* kitty GUI actually reloaded its config after the kitten's `SIGUSR1`, `background_opacity` was used as a telltale — it is read live via `kitten @ ls` and only changes value if the process re-reads `kitty.conf`. In this checkout kitty does **not** watch `kitty.conf` for changes or auto-reload it on edit — there is no config-file watcher, and a reload happens only via an explicit trigger (the `reload_config_file` mapping's `load_config_file` action, a `SIGUSR1` signal, or a remote-control command). Editing the file alone therefore never reloaded a GUI, so the *only* thing that could trigger a reload in these runs was the kitten's own `SIGUSR1`. (Note: `auto_reload_config` is **not** a valid option in kitty 0.35.2; a `kitty.conf` line by that name is reported as an unknown key — `Ignoring unknown config key: auto_reload_config` — and has no effect. The isolation above comes from kitty's no-auto-reload behavior, not from any config setting.)
 - **Isolation:** every run that could write configuration used an **isolated temporary `KITTY_CONFIG_DIRECTORY`** (`utils.ConfigDir()` honors it first — `tools/utils/paths.go:L88-L89`). The real user config at `~/.config/kitty/kitty.conf` was never touched.
 - **Grounding:** every factual claim cites a specific `file:line` and/or shows captured output. The few statements that are reasoned from code rather than directly observed are explicitly labeled **(inferred, not observed)** — in this investigation, all four final-pane actions and all three reload variants were *directly observed*, so no behavioral claim needed that label.
 
@@ -505,7 +505,7 @@ All rows were directly observed (see §6 and §9).
 | **`Esc`** | Abort → return to faces pane; nothing written | No | No | `final.go:L72-L77`; §6.4, §9.6 |
 | **`Ctrl+c`** | Quit (exit 1, `Error: canceled by user`); nothing written | No | No | `ui.go:L195-L199`, `main.go:L54-L56`; §6.4, §9.6 |
 
-**Directly observed reload behavior — against real kitty GUI processes.** Each variant ran `kitten choose-fonts --reload-in <v>` as a real child of a real kitty GUI (started with `auto_reload_config no`, so the *only* possible reload trigger is the kitten's signal). The telltale is `background_opacity`, read live via `kitten @ ls`: the config was edited to `background_opacity 0.6` *without* a signal (GUI keeps its loaded value), then the kitten was finalized; if the GUI reloaded, opacity changes to `0.6`.
+**Directly observed reload behavior — against real kitty GUI processes.** Each variant ran `kitten choose-fonts --reload-in <v>` as a real child of a real kitty GUI. Because kitty does not auto-reload `kitty.conf` on file change (a reload fires only on an explicit trigger — see §2), the *only* possible reload trigger in these runs was the kitten's signal. The telltale is `background_opacity`, read live via `kitten @ ls`: the config was edited to `background_opacity 0.6` *without* a signal (the GUI keeps its loaded value, confirming no auto-reload occurred), then the kitten was finalized; if the GUI reloaded, opacity changes to `0.6`.
 
 | `--reload-in` | `kitty.conf` block written? | Real GUI reloaded? (`background_opacity` telltale) |
 |---|---|---|
@@ -840,17 +840,16 @@ cat: /tmp/probe_kcfgc.VPbN8E/kitty.conf: No such file or directory (os error 2)
 ```
 
 ### 9.7 Reload variants — observed against REAL kitty GUIs (Q3d / condition coverage)
-Each variant ran `kitten choose-fonts --reload-in <v>` as a real child of a real kitty GUI (`auto_reload_config no`; observable = `background_opacity` via `kitten @ ls`). The signal path is `ReloadConfigInKitty` → `SIGUSR1` (`tools/config/api.go:L352-L371`), with the target validated by `is_kitty_gui_cmdline` (`api.go:L282-L303`).
+Each variant ran `kitten choose-fonts --reload-in <v>` as a real child of a real kitty GUI (kitty does not auto-reload `kitty.conf` on file change, so the only reload trigger is the kitten's signal; observable = `background_opacity` via `kitten @ ls`). The signal path is `ReloadConfigInKitty` → `SIGUSR1` (`tools/config/api.go:L352-L371`), with the target validated by `is_kitty_gui_cmdline` (`api.go:L282-L303`).
 ```
-### --reload-in parent (target GUI pid=120803, config dir=/tmp/probe_rl_parent.UKY3lP) ###
+### --reload-in parent (target GUI pid=189900, config dir=/tmp/probe_rl_parent) ###
 opacity initially loaded by GUI      : 1.0
-opacity after editing conf to 0.6 (no signal, auto_reload off): 1.0   <- GUI has NOT reloaded
+opacity after editing conf to 0.6 (no signal; kitty does not auto-reload on file change): 1.0   <- GUI has NOT reloaded
 kitten choose-fonts --reload-in parent finalized (Enter): wrote font block + reload-per-variant
 opacity after kitten's finalize      : 0.6000000238418579
 => EXPECT 0.6 (kitten sent SIGUSR1 to real GUI -> GUI reloaded conf). OBSERVED: 0.6000000238418579
 --- resulting kitty.conf (font block persisted; opacity edit preserved) ---
 allow_remote_control yes
-auto_reload_config no
 background_opacity 0.6
 
 
@@ -862,15 +861,14 @@ bold_italic_font auto
 # END_KITTY_FONTS
 ```
 ```
-### --reload-in all (target GUI pid=121167, config dir=/tmp/probe_rl_all.uRt3Me) ###
+### --reload-in all (target GUI pid=190177, config dir=/tmp/probe_rl_all) ###
 opacity initially loaded by GUI      : 1.0
-opacity after editing conf to 0.6 (no signal, auto_reload off): 1.0   <- GUI has NOT reloaded
+opacity after editing conf to 0.6 (no signal; kitty does not auto-reload on file change): 1.0   <- GUI has NOT reloaded
 kitten choose-fonts --reload-in all finalized (Enter): wrote font block + reload-per-variant
 opacity after kitten's finalize      : 0.6000000238418579
 => EXPECT 0.6 (kitten sent SIGUSR1 to real GUI -> GUI reloaded conf). OBSERVED: 0.6000000238418579
 --- resulting kitty.conf (font block persisted; opacity edit preserved) ---
 allow_remote_control yes
-auto_reload_config no
 background_opacity 0.6
 
 
@@ -882,15 +880,14 @@ bold_italic_font auto
 # END_KITTY_FONTS
 ```
 ```
-### --reload-in none (target GUI pid=121534, config dir=/tmp/probe_rl_none.PgKySL) ###
+### --reload-in none (target GUI pid=190457, config dir=/tmp/probe_rl_none) ###
 opacity initially loaded by GUI      : 1.0
-opacity after editing conf to 0.6 (no signal, auto_reload off): 1.0   <- GUI has NOT reloaded
+opacity after editing conf to 0.6 (no signal; kitty does not auto-reload on file change): 1.0   <- GUI has NOT reloaded
 kitten choose-fonts --reload-in none finalized (Enter): wrote font block + reload-per-variant
 opacity after kitten's finalize      : 1.0
 => EXPECT still 1.0 (no SIGUSR1 sent; GUI did not reload). OBSERVED: 1.0
 --- resulting kitty.conf (font block persisted; opacity edit preserved) ---
 allow_remote_control yes
-auto_reload_config no
 background_opacity 0.6
 
 
