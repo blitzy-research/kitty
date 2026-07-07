@@ -617,43 +617,73 @@ A host‑side `diff` of the two captures with those two per‑launch lines exclu
 **Shell‑integration** — parsed commands from a default interactive `bash` (`q3.si.commands`):
 
 ```
+handle_remote_print aWdub3JlYm90aCBvciBpZ25vcmVzcGFjZSBwcmVzZW50IGluIGJhc2ggSElTVENPTlRST0wgc2V0dGluZywgc2hvd2luZyBydW5uaW5nIGNvbW1hbmQgd2lsbCBub3QgYmUgcm9idXN0Cg==}
+ignoreboth or ignorespace present in bash HISTCONTROL setting, showing running command will not be robust
 process_cwd_notification 7 kitty-shell-cwd://reverse-code-generator-710e56c0-8hqwk/tmp/blitzy/kitty/blitzy-623856dd-ce2f-4dda-9254-43ab8bcf20d2_929ec9
 screen_set_mode 2004 1
+screen_delete_characters 59
 shell_prompt_marking 133 k;start_kitty
 shell_prompt_marking 133 D;0
 shell_prompt_marking 133 A
 shell_prompt_marking 133 k;end_kitty
+set_title root@reverse-code-generator-710e56c0-8hqwk: /tmp/blitzy/kitty/blitzy-623856dd-ce2f-4dda-9254-43ab8bcf20d2_929ec9
+set_icon root@reverse-code-generator-710e56c0-8hqwk: /tmp/blitzy/kitty/blitzy-623856dd-ce2f-4dda-9254-43ab8bcf20d2_929ec9
+draw root@reverse-code-generator-710e56c0-8hqwk:/tmp/blitzy/kitty/blitzy-623856dd-ce2f-4dda-9254-43ab8bcf20d2_929ec9# 
 shell_prompt_marking 133 k;start_suffix_kitty
 screen_set_cursor 5 32
 set_title /tmp/blitzy/kitty/blitzy-623856dd-ce2f-4dda-9254-43ab8bcf20d2_929ec9
 shell_prompt_marking 133 k;end_suffix_kitty
 ```
 
-…and the **exact raw bytes** that produced them (`q3.si.bytes`, 322 bytes) — showing the actual OSC/CSI escape sequences:
+…and the **exact raw bytes** that produced them (`q3.si.bytes`, **719 bytes**, byte‑identical across two runs) — showing the actual OSC/CSI/DCS escape sequences. The capture opens with a `DCS @kitty-print … ST` diagnostic carrying the base64 of *“ignoreboth or ignorespace present in bash HISTCONTROL setting…”* — emitted by Kitty's own bash integration at `shell-integration/bash/kitty.bash:230-231` because the container's `/root/.bashrc:10` sets `HISTCONTROL=ignoredups:ignorespace` — and then the handshake proper (`OSC 7`, `CSI ?2004h`, the `OSC 133` prompt marks, `OSC 0/2` title/icon) interleaved with the real default `bash` prompt draw (`root@…:/…# `, from `/root/.bashrc`'s `PS1`):
 
 ```
-00000000  1b 5d 37 3b 6b 69 74 74  79 2d 73 68 65 6c 6c 2d  |.]7;kitty-shell-|
-00000010  63 77 64 3a 2f 2f 72 65  76 65 72 73 65 2d 63 6f  |cwd://reverse-co|
-00000020  64 65 2d 67 65 6e 65 72  61 74 6f 72 2d 37 31 30  |de-generator-710|
-00000030  65 35 36 63 30 2d 38 68  71 77 6b 2f 74 6d 70 2f  |e56c0-8hqwk/tmp/|
-00000040  62 6c 69 74 7a 79 2f 6b  69 74 74 79 2f 62 6c 69  |blitzy/kitty/bli|
-00000050  74 7a 79 2d 36 32 33 38  35 36 64 64 2d 63 65 32  |tzy-623856dd-ce2|
-00000060  66 2d 34 64 64 61 2d 39  32 35 34 2d 34 33 61 62  |f-4dda-9254-43ab|
-00000070  38 62 63 66 32 30 64 32  5f 39 32 39 65 63 39 07  |8bcf20d2_929ec9.|
-00000080  1b 5b 3f 32 30 30 34 68  1b 5d 31 33 33 3b 6b 3b  |.[?2004h.]133;k;|
-00000090  73 74 61 72 74 5f 6b 69  74 74 79 07 1b 5d 31 33  |start_kitty..]13|
-000000a0  33 3b 44 3b 30 07 1b 5d  31 33 33 3b 41 07 1b 5d  |3;D;0..]133;A..]|
-000000b0  31 33 33 3b 6b 3b 65 6e  64 5f 6b 69 74 74 79 07  |133;k;end_kitty.|
-000000c0  1b 5d 31 33 33 3b 6b 3b  73 74 61 72 74 5f 73 75  |.]133;k;start_su|
-000000d0  66 66 69 78 5f 6b 69 74  74 79 07 1b 5b 35 20 71  |ffix_kitty..[5 q|
-000000e0  1b 5d 32 3b 2f 74 6d 70  2f 62 6c 69 74 7a 79 2f  |.]2;/tmp/blitzy/|
-000000f0  6b 69 74 74 79 2f 62 6c  69 74 7a 79 2d 36 32 33  |kitty/blitzy-623|
-00000100  38 35 36 64 64 2d 63 65  32 66 2d 34 64 64 61 2d  |856dd-ce2f-4dda-|
-00000110  39 32 35 34 2d 34 33 61  62 38 62 63 66 32 30 64  |9254-43ab8bcf20d|
-00000120  32 5f 39 32 39 65 63 39  07 1b 5d 31 33 33 3b 6b  |2_929ec9..]133;k|
-00000130  3b 65 6e 64 5f 73 75 66  66 69 78 5f 6b 69 74 74  |;end_suffix_kitt|
-00000140  79 07                                             |y.|
-00000142
+00000000  1b 50 40 6b 69 74 74 79  2d 70 72 69 6e 74 7c 61  |.P@kitty-print|a|
+00000010  57 64 75 62 33 4a 6c 59  6d 39 30 61 43 42 76 63  |Wdub3JlYm90aCBvc|
+00000020  69 42 70 5a 32 35 76 63  6d 56 7a 63 47 46 6a 5a  |iBpZ25vcmVzcGFjZ|
+00000030  53 42 77 63 6d 56 7a 5a  57 35 30 49 47 6c 75 49  |SBwcmVzZW50IGluI|
+00000040  47 4a 68 63 32 67 67 53  45 6c 54 56 45 4e 50 54  |GJhc2ggSElTVENPT|
+00000050  6c 52 53 54 30 77 67 63  32 56 30 64 47 6c 75 5a  |lRST0wgc2V0dGluZ|
+00000060  79 77 67 63 32 68 76 64  32 6c 75 5a 79 42 79 64  |ywgc2hvd2luZyByd|
+00000070  57 35 75 61 57 35 6e 49  47 4e 76 62 57 31 68 62  |W5uaW5nIGNvbW1hb|
+00000080  6d 51 67 64 32 6c 73 62  43 42 75 62 33 51 67 59  |mQgd2lsbCBub3QgY|
+00000090  6d 55 67 63 6d 39 69 64  58 4e 30 43 67 3d 3d 7d  |mUgcm9idXN0Cg==}|
+000000a0  1b 5c 1b 5d 37 3b 6b 69  74 74 79 2d 73 68 65 6c  |.\.]7;kitty-shel|
+000000b0  6c 2d 63 77 64 3a 2f 2f  72 65 76 65 72 73 65 2d  |l-cwd://reverse-|
+000000c0  63 6f 64 65 2d 67 65 6e  65 72 61 74 6f 72 2d 37  |code-generator-7|
+000000d0  31 30 65 35 36 63 30 2d  38 68 71 77 6b 2f 74 6d  |10e56c0-8hqwk/tm|
+000000e0  70 2f 62 6c 69 74 7a 79  2f 6b 69 74 74 79 2f 62  |p/blitzy/kitty/b|
+000000f0  6c 69 74 7a 79 2d 36 32  33 38 35 36 64 64 2d 63  |litzy-623856dd-c|
+00000100  65 32 66 2d 34 64 64 61  2d 39 32 35 34 2d 34 33  |e2f-4dda-9254-43|
+00000110  61 62 38 62 63 66 32 30  64 32 5f 39 32 39 65 63  |ab8bcf20d2_929ec|
+00000120  39 07 1b 5b 3f 32 30 30  34 68 1b 5b 35 39 50 1b  |9..[?2004h.[59P.|
+00000130  5d 31 33 33 3b 6b 3b 73  74 61 72 74 5f 6b 69 74  |]133;k;start_kit|
+00000140  74 79 07 1b 5d 31 33 33  3b 44 3b 30 07 1b 5d 31  |ty..]133;D;0..]1|
+00000150  33 33 3b 41 07 1b 5d 31  33 33 3b 6b 3b 65 6e 64  |33;A..]133;k;end|
+00000160  5f 6b 69 74 74 79 07 1b  5d 30 3b 72 6f 6f 74 40  |_kitty..]0;root@|
+00000170  72 65 76 65 72 73 65 2d  63 6f 64 65 2d 67 65 6e  |reverse-code-gen|
+00000180  65 72 61 74 6f 72 2d 37  31 30 65 35 36 63 30 2d  |erator-710e56c0-|
+00000190  38 68 71 77 6b 3a 20 2f  74 6d 70 2f 62 6c 69 74  |8hqwk: /tmp/blit|
+000001a0  7a 79 2f 6b 69 74 74 79  2f 62 6c 69 74 7a 79 2d  |zy/kitty/blitzy-|
+000001b0  36 32 33 38 35 36 64 64  2d 63 65 32 66 2d 34 64  |623856dd-ce2f-4d|
+000001c0  64 61 2d 39 32 35 34 2d  34 33 61 62 38 62 63 66  |da-9254-43ab8bcf|
+000001d0  32 30 64 32 5f 39 32 39  65 63 39 07 72 6f 6f 74  |20d2_929ec9.root|
+000001e0  40 72 65 76 65 72 73 65  2d 63 6f 64 65 2d 67 65  |@reverse-code-ge|
+000001f0  6e 65 72 61 74 6f 72 2d  37 31 30 65 35 36 63 30  |nerator-710e56c0|
+00000200  2d 38 68 71 77 6b 3a 2f  74 6d 70 2f 62 6c 69 74  |-8hqwk:/tmp/blit|
+00000210  7a 79 2f 6b 69 74 74 79  2f 62 6c 69 74 7a 79 2d  |zy/kitty/blitzy-|
+00000220  36 32 33 38 35 36 64 64  2d 63 65 32 66 2d 34 64  |623856dd-ce2f-4d|
+00000230  64 61 2d 39 32 35 34 2d  34 33 61 62 38 62 63 66  |da-9254-43ab8bcf|
+00000240  32 30 64 32 5f 39 32 39  65 63 39 23 20 1b 5d 31  |20d2_929ec9# .]1|
+00000250  33 33 3b 6b 3b 73 74 61  72 74 5f 73 75 66 66 69  |33;k;start_suffi|
+00000260  78 5f 6b 69 74 74 79 07  1b 5b 35 20 71 1b 5d 32  |x_kitty..[5 q.]2|
+00000270  3b 2f 74 6d 70 2f 62 6c  69 74 7a 79 2f 6b 69 74  |;/tmp/blitzy/kit|
+00000280  74 79 2f 62 6c 69 74 7a  79 2d 36 32 33 38 35 36  |ty/blitzy-623856|
+00000290  64 64 2d 63 65 32 66 2d  34 64 64 61 2d 39 32 35  |dd-ce2f-4dda-925|
+000002a0  34 2d 34 33 61 62 38 62  63 66 32 30 64 32 5f 39  |4-43ab8bcf20d2_9|
+000002b0  32 39 65 63 39 07 1b 5d  31 33 33 3b 6b 3b 65 6e  |29ec9..]133;k;en|
+000002c0  64 5f 73 75 66 66 69 78  5f 6b 69 74 74 79 07     |d_suffix_kitty.|
+000002cf
 ```
 
 **Before / after the shell writes.** The state transition was captured with `import -window <wid>` under Xvfb, gated to **after first paint**. While the child was still sleeping (no output yet) the window is a completely empty frame; after `printf` ran, the same window carries two rows of glyphs. Both PNGs are embedded below as `data:` URIs (each is a 640x400 grayscale PNG of only a few hundred bytes to ~2 KiB, so the document stays self-contained).
@@ -672,7 +702,7 @@ The jump from **1 unique color (blank)** to **157 unique colors (anti-aliased gl
 
 - **Byte‑exact understanding.** The child emitted exactly `68 65 6c 6c 6f 0d 0a`. `printf "hello\n"` writes six bytes (`hello\n`); the PTY line discipline's `ONLCR` turns the `\n` into `\r\n`, so the master reads seven bytes — this is why `0d 0a` (`\r\n`) appears. The parser turned those seven bytes into precisely three commands: the five text bytes into `draw hello` (→ `screen_draw_text`, `kitty/screen.c:866`, invoked from `kitty/vt-parser.c:226/236`), the `0d` into `screen_carriage_return`, and the `0a` into `screen_linefeed`. The one‑to‑one correspondence between the exact bytes and the exact screen operations is the proof the data was **understood correctly**; that both files are byte/line‑identical across two runs confirms stability.
 - **The handshake is real.** The child's own environment shows `TERM=xterm-kitty` (from `kitty/child.py:242`), `COLORTERM=truecolor` (`:243`), `KITTY_PID` (`:244`), `KITTY_PUBLIC_KEY` (`:245`), `KITTY_WINDOW_ID`, `KITTY_INSTALLATION_DIR`, and `TERMINFO` pointing at Kitty's bundled database (`kitty/child.py:255‑258`, the `terminfo_type == 'path'` branch). This is the concrete terminfo contract: the shell is told it is on an `xterm-kitty` terminal and where to find that terminfo.
-- **Shell‑integration injection is observable.** With the default `bash`, the first bytes are the shell‑integration handshake: `OSC 7` cwd reporting (`ESC ] 7 ; kitty-shell-cwd://… BEL`), `CSI ? 2004 h` (bracketed‑paste enable → `screen_set_mode 2004 1`), the `OSC 133` prompt markings (`k;start_kitty`, `D;0`, `A`, `end_kitty`, …), `CSI 5 SP q` cursor‑style (`screen_set_cursor 5 32`), and `OSC 2` window‑title (`set_title …`). Each raw escape maps one‑to‑one to a parsed command, proving Kitty both **injected** the integration (via `modify_shell_environ`, `kitty/child.py:265-267`) and **understood** the sequences the integrated shell emitted.
+- **Shell‑integration injection is observable.** With the default `bash`, the first bytes are a `DCS @kitty-print … ST` diagnostic (Kitty's bash integration warning about `HISTCONTROL=ignoredups:ignorespace`, emitted at `shell-integration/bash/kitty.bash:230-231` → parsed as `handle_remote_print`), immediately followed by the handshake proper: `OSC 7` cwd reporting (`ESC ] 7 ; kitty-shell-cwd://… BEL` → `process_cwd_notification`), `CSI ? 2004 h` (bracketed‑paste enable → `screen_set_mode 2004 1`), a `CSI 59 P` line clear (`screen_delete_characters 59`), the `OSC 133` prompt markings (`k;start_kitty`, `D;0`, `A`, `end_kitty`, …), the real `bash` prompt itself (`OSC 0` title+icon then the raw `draw root@…:/…# ` from `/root/.bashrc`'s `PS1`), then `k;start_suffix_kitty`, `CSI 5 SP q` cursor‑style (`screen_set_cursor 5 32`), `OSC 2` window‑title (`set_title …`), and `k;end_suffix_kitty`. Each raw escape maps one‑to‑one to a parsed command, proving Kitty both **injected** the integration (via `modify_shell_environ`, `kitty/child.py:265-267`) and **understood** the sequences the integrated shell emitted. (The `HISTCONTROL` warning and the `PS1` prompt draw are the shell's own behaviour driven by the container's default `/root/.bashrc`, not Kitty's injection — they appear because this is the genuine default‑user launch.)
 - **Empty → populated.** The all‑black "before" capture versus the glyph‑bearing "after" capture is the state transition the screen model undergoes as `screen_draw_text` mutates it: nothing is drawn until the child produces bytes, and the first bytes are what populate row 0.
 
 
@@ -1576,7 +1606,7 @@ Every distinct thing each question asks — including each "e.g./such as/includi
 | Q3 | `fork` | shell forked on PTY | `kitty/child.py:276` | `Child launched`; child env captured |
 | Q3 | `TERM` / terminfo | `xterm-kitty`; DB `terminfo/x/xterm-kitty` | `kitty/child.py:242`; `kitty/terminfo.py:27,500` | child env `TERM=xterm-kitty`, `TERMINFO=…` |
 | Q3 | `KITTY_*`/`COLORTERM`/`TERMINFO` env | `COLORTERM=truecolor`, `KITTY_PID`, `KITTY_PUBLIC_KEY`, `KITTY_WINDOW_ID`, `KITTY_INSTALLATION_DIR`, `TERMINFO` | `kitty/child.py:242‑245,255‑261` | complete `child_env` capture (§Q3.4) |
-| Q3 | Shell‑integration injection | OSC 7/133/2, bracketed paste, cursor style | `kitty/child.py:265‑267`; `shell-integration/{bash,zsh,fish,ssh}` | `q3.si.commands` + 322‑byte hexdump |
+| Q3 | Shell‑integration injection | OSC 7/133/2, bracketed paste, cursor style | `kitty/child.py:265‑267`; `shell-integration/{bash,zsh,fish,ssh}` | `q3.si.commands` + 719‑byte hexdump |
 | Q3 | VT‑parser → screen mutation | `draw hello`/CR/LF | `kitty/vt-parser.c:226,236`; `kitty/screen.c:866` | parsed commands vs bytes `68 65 6c 6c 6f 0d 0a` |
 | Q3 | before/after screen | blank (1 color) → glyphs (157 colors) | `kitty/screen.c:866` | embedded before/after screenshots + per‑row projections (§Q3.4) |
 | Q4 | **Fonts** | `DejaVuSansMono` + `Noto Sans CJK JP` fallback | `kitty/fonts.c:457,465,492`; `kitty/fonts/render.py:163`; `kitty/fontconfig.c`; `kitty/freetype.c` | `--debug-font-fallback` dump + embedded screenshot (§Q4.6) |
