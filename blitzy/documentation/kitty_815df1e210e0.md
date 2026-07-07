@@ -785,7 +785,7 @@ $        # (no matches)
 ```
 
 **Cause (grounded in source):** `rename_lines` sets `is_full_width: true` (`render.go:687`) and writes
-the message to `sl.right.marked_up_text` (`render.go:689`). But `render_screen_line`
+the message to `sl.right.marked_up_text` (`render.go:690`). But `render_screen_line`
 (`render.go:70`), for a full-width line, computes `available_cols = columns - margin_size`
 (`render.go:76-78`), renders only `sl.left.marked_up_text` (`render.go:80`), and then
 `if self.is_full_width { return }` (`render.go:99-101`) **returns before the right half is drawn**. The
@@ -1843,8 +1843,8 @@ re-runs only the diff step — not the file reads or highlighting.
 (`patch.go:21`) and `DIFF_DIFF = "diff -p -U _CONTEXT_ --"` (`patch.go:22`). `find_differ`
 (`patch.go:34`) prefers git (`patch.go:36`), then `diff` (`patch.go:38`), then the builtin empty
 command (`patch.go:40`). `set_diff_command` (`patch.go:44`) maps the config value: `"auto"` →
-`find_differ` (`patch.go:47`); `"builtin"`/`""` → `diff_cmd = []string{}` (`patch.go:50-51`); `"diff"`
-(`patch.go:53`); `"git"` (`patch.go:55`); a custom string via `shlex` (`patch.go:57-61`).
+`find_differ` (`patch.go:47`); `"builtin"`/`""` → `diff_cmd = []string{}` (`patch.go:48-49`); `"diff"`
+(`patch.go:50-51`); `"git"` (`patch.go:52-53`); a custom string via `shlex` (`patch.go:54-59`).
 `run_diff` (`patch.go:282`) branches on `if len(diff_cmd) == 0` (`patch.go:294`): builtin path reads
 both files via `data_for_path` and calls `Diff(path1, data1, path2, data2, num_of_context_lines)`
 (`patch.go:303`), returning nil→no-difference (`patch.go:304`); otherwise it substitutes `_CONTEXT_`
