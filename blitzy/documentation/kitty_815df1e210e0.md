@@ -264,7 +264,7 @@ The helper classification is grounded in code, not guessed (see 2.4): the build'
 `setup.py` globs every `kitty/*.glsl` at build time and classifies the vertex/fragment stages:
 
 ```text
-kitty/setup.py
+setup.py
 1040:     for x in sorted(glob.glob('kitty/*.glsl')):
 1041:         name = os.path.basename(x).partition('.')[0]
 1042:         name, sep, shader_type = name.partition('_')
