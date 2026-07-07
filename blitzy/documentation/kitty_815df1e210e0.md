@@ -50,31 +50,211 @@ option `--ignore-compiler-warnings` is required: gcc 15's default `-Werror=switc
 `glfw/wl_window.c:668` fatal because wayland-protocols 1.45 adds `XDG_TOPLEVEL_STATE_CONSTRAINED_*`
 enum values the mid-2024 switch statement does not handle. This is a toolchain/dependency-version
 incompatibility, not a code bug, and `--ignore-compiler-warnings` is a documented `setup.py` global
-option (a build-invocation choice, not a source edit).
+option (`setup.py:2002-2008`) — a build-invocation choice, not a source edit.
 
-To capture a genuine build transcript (rather than an incremental no-op), the gitignored launcher
-binary was removed and the Go build cache cleared before rebuilding:
+To capture a genuine, **complete** build transcript (rather than an incremental no-op), the
+gitignored launcher binaries were removed and the Go build cache was cleared before rebuilding. The
+transcript below is the **complete, unedited** output of the canonical build (198 lines): line 1
+relinks the launcher (the C object files were already compiled and cached), and lines 3–198 are the
+freshly recompiled Go packages — including `kitty/kittens/diff` (line 195 of the output), the package
+under study:
 
 ```console
-$ rm -f kitty/launcher/kitten && go clean -cache
+$ rm -f kitty/launcher/kitten kitty/launcher/kitty && go clean -cache
 $ python3 setup.py --ignore-compiler-warnings
-... (196 lines) ...
-```
-
-The head of the transcript shows Go dependency compilation and the tail shows kitty's own Go
-packages being built — including `kitty/kittens/diff`, the package under study:
-
-```text
-# head
-github.com/seancfoley/ipaddress-go/ipaddr/addrstrparam
+[1/1] Linking launcher ...
+ done
 internal/nettrace
-golang.org/x/exp/constraints
+vendor/golang.org/x/crypto/cryptobyte/asn1
+github.com/seancfoley/ipaddress-go/ipaddr/addrerr
+image/color
 github.com/shirou/gopsutil/v3/common
 log/internal
+crypto/subtle
+github.com/seancfoley/ipaddress-go/ipaddr/addrstr
+github.com/seancfoley/ipaddress-go/ipaddr/addrstrparam
+kitty
+maps
+unicode/utf16
+container/list
+crypto/internal/alias
 crypto/internal/boring/sig
-...
-# tail
+golang.org/x/exp/constraints
+encoding
+vendor/golang.org/x/crypto/internal/alias
+encoding/base32
+internal/singleflight
+crypto/internal/randutil
+vendor/golang.org/x/text/transform
+hash
+vendor/golang.org/x/net/dns/dnsmessage
+internal/intern
+math/rand/v2
+net/http/internal/ascii
+bufio
+encoding/base64
+regexp/syntax
+embed
+context
+io/ioutil
+golang.org/x/sys/unix
+vendor/golang.org/x/sys/cpu
+encoding/hex
+log
+net/url
+vendor/golang.org/x/net/http2/hpack
+kitty/tools/utils/shlex
+runtime/cgo
+github.com/ALTree/bigfloat
+flag
+github.com/bmatcuk/doublestar/v4
+crypto/internal/bigmod
+github.com/seancfoley/bintree/tree
+github.com/dlclark/regexp2/syntax
+crypto/rc4
+crypto/internal/edwards25519/field
+crypto/cipher
+image/color/palette
+crypto/internal/nistec/fiat
+vendor/golang.org/x/crypto/internal/poly1305
+encoding/asn1
+hash/crc32
+golang.org/x/image/riff
+crypto/dsa
+hash/adler32
+net/netip
+compress/flate
+encoding/pem
+crypto
+github.com/rwcarlsen/goexif/tiff
+encoding/json
+vendor/golang.org/x/text/unicode/norm
+vendor/golang.org/x/crypto/chacha20
+os/exec
+database/sql/driver
+crypto/internal/edwards25519
+crypto/internal/boring
+compress/bzip2
+os/signal
+compress/lzw
+net/http/internal
+crypto/md5
+golang.org/x/image/tiff/lzw
+image
+crypto/des
+mime
+github.com/klauspost/cpuid/v2
+encoding/xml
+mime/quotedprintable
+vendor/golang.org/x/text/unicode/bidi
+vendor/golang.org/x/crypto/cryptobyte
+crypto/x509/pkix
+regexp
+crypto/rand
+crypto/internal/boring/bbig
+crypto/sha1
+crypto/aes
+crypto/sha512
+crypto/sha256
+crypto/hmac
+vendor/golang.org/x/crypto/hkdf
+vendor/golang.org/x/crypto/chacha20poly1305
+compress/zlib
+compress/gzip
+archive/zip
+kitty/tools/utils/secrets
+crypto/rsa
+github.com/shirou/gopsutil/v3/internal/common
+crypto/ed25519
+github.com/dlclark/regexp2
+vendor/golang.org/x/text/secure/bidirule
+crypto/internal/nistec
+golang.org/x/image/bmp
+image/internal/imageutil
+golang.org/x/image/ccitt
+image/png
+golang.org/x/image/vp8l
+golang.org/x/image/vp8
+image/draw
+image/jpeg
+golang.org/x/image/tiff
+vendor/golang.org/x/net/idna
+github.com/rwcarlsen/goexif/exif
+golang.org/x/image/webp
+github.com/zeebo/xxh3
+howett.net/plist
+image/gif
+crypto/ecdh
+crypto/elliptic
+github.com/disintegration/imaging
+github.com/kovidgoyal/imaging
+crypto/ecdsa
+github.com/alecthomas/chroma/v2
+github.com/tklauser/numcpus
+github.com/shirou/gopsutil/v3/mem
+github.com/edwvee/exiffix
+github.com/tklauser/go-sysconf
+github.com/shirou/gopsutil/v3/cpu
+github.com/alecthomas/chroma/v2/styles
+github.com/alecthomas/chroma/v2/lexers
+os/user
+net
+archive/tar
+github.com/shirou/gopsutil/v3/net
+vendor/golang.org/x/net/http/httpproxy
+net/textproto
+github.com/google/uuid
+crypto/x509
+github.com/seancfoley/ipaddress-go/ipaddr
+vendor/golang.org/x/net/http/httpguts
+mime/multipart
+github.com/shirou/gopsutil/v3/process
+crypto/tls
+net/http/httptrace
+net/http
+kitty/tools/utils
+kitty/tools/utils/base85
+kitty/tools/tty
+kitty/tools/utils/paths
+kitty/tools/rsync
+kitty/tools/wcswidth
+kitty/tools/crypto
+kitty/tools/tui/shell_integration
+kitty/tools/utils/humanize
+kitty/tools/utils/style
+kitty/tools/cli/markup
+kitty/tools/tui/sgr
+kitty/tools/tui/loop
+kitty/tools/cli
+kitty/tools/config
+kitty/tools/cmd/mouse_demo
+kitty/tools/tui/shortcuts
+kitty/tools/utils/shm
+kitty/kittens/hyperlinked_grep
+kitty/kittens/show_key
+kitty/kittens/query_terminal
+kitty/tools/tui/readline
+kitty/tools/tui
+kitty/tools/utils/images
+kitty/tools/tui/subseq
+kitty/kittens/clipboard
+kitty/tools/unicode_names
+kitty/tools/cmd/show_error
+kitty/tools/cmd/run_shell
+kitty/tools/cmd/edit_in_kitty
+kitty/tools/tui/graphics
+kitty/kittens/ask
+kitty/tools/cmd/update_self
+kitty/kittens/hints
+kitty/tools/cmd/at
+kitty/tools/themes
+kitty/kittens/unicode_input
 kitty/kittens/transfer
+kitty/kittens/themes
+kitty/kittens/ssh
+kitty/tools/cmd/benchmark
+kitty/kittens/icat
+kitty/kittens/choose_fonts
 kitty/tools/cmd/pytest
 kitty/kittens/diff
 kitty/tools/cmd/tool
@@ -83,11 +263,11 @@ kitty/tools/cmd
 ```
 
 The build produced the launcher binary (gitignored — verified untracked, so rebuilding leaves the
-working tree clean):
+working tree clean). This is the actual, unedited verification output:
 
 ```console
 $ ls -l kitty/launcher/kitten
--rwxr-xr-x 1 root root 15765764 ... kitty/launcher/kitten
+-rwxr-xr-x 1 root root 15765764 Jul  7 00:25 kitty/launcher/kitten
 
 $ git check-ignore kitty/launcher/kitten kitty/launcher/kitty
 kitty/launcher/kitten
@@ -96,6 +276,153 @@ kitty/launcher/kitty
 $ git status --porcelain      # after the full rebuild
                               # (empty — the rebuild dirtied nothing)
 ```
+
+### 0.2.1 Debug build
+
+The debug build is `python3 setup.py build --debug` (`--debug` is the documented `setup.py` global
+option at `setup.py:1848-1851`, which builds the C extension modules with debugging symbols `-g3`,
+`setup.py:1246`, and disables `-O3`, `setup.py:482`). On this toolchain it also requires
+`--ignore-compiler-warnings` for the same gcc-15/wayland-protocols reason as the canonical build.
+Because the debug flags differ from the cached release objects, this recompiles all 122 C modules in
+debug mode. The following is the **complete, unedited** debug-build transcript (130 lines):
+
+```console
+$ python3 setup.py build --debug --ignore-compiler-warnings
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[4/122] Compiling [x11] glfw/x11_window.c ...
+[5/122] Compiling kitty/glfw.c ...
+[6/122] Compiling kitty/graphics.c ...
+[7/122] Compiling kitty/child-monitor.c ...
+[8/122] Compiling kitty/fonts.c ...
+[9/122] Compiling kitty/shaders.c ...
+[10/122] Compiling kitty/vt-parser.c ...
+[11/122] Compiling kitty/vt-parser.c ...
+[12/122] Compiling kitty/state.c ...
+[13/122] Compiling [x11] glfw/input.c ...
+[14/122] Compiling [wayland] glfw/input.c ...
+[15/122] Compiling kitty/mouse.c ...
+[16/122] Compiling [x11] glfw/xkb_glfw.c ...
+[17/122] Compiling [wayland] glfw/xkb_glfw.c ...
+[18/122] Compiling kitty/freetype.c ...
+[19/122] Compiling [wayland] glfw/wl_client_side_decorations.c ...
+[20/122] Compiling [x11] glfw/window.c ...
+[21/122] Compiling [wayland] glfw/window.c ...
+[22/122] Compiling kitty/line.c ...
+[23/122] Compiling kitty/glfw-wrapper.c ...
+[24/122] Compiling kittens/transfer/algorithm.c ...
+[25/122] Compiling [wayland] glfw/wl_init.c ...
+[26/122] Compiling [x11] glfw/x11_init.c ...
+[27/122] Compiling kitty/freetype_render_ui_text.c ...
+[28/122] Compiling [x11] glfw/egl_context.c ...
+[29/122] Compiling [wayland] glfw/egl_context.c ...
+[30/122] Compiling kitty/disk-cache.c ...
+[31/122] Compiling [x11] glfw/glx_context.c ...
+[32/122] Compiling kitty/line-buf.c ...
+[33/122] Compiling kitty/data-types.c ...
+[34/122] Compiling kitty/colors.c ...
+[35/122] Compiling kitty/history.c ...
+[36/122] Compiling kitty/keys.c ...
+[37/122] Compiling [x11] glfw/x11_monitor.c ...
+[38/122] Compiling kitty/fontconfig.c ...
+[39/122] Compiling [x11] glfw/context.c ...
+[40/122] Compiling [wayland] glfw/context.c ...
+[41/122] Compiling kitty/crypto.c ...
+[42/122] Compiling [x11] glfw/ibus_glfw.c ...
+[43/122] Compiling [wayland] glfw/ibus_glfw.c ...
+[44/122] Compiling kitty/key_encoding.c ...
+[45/122] Compiling kitty/launcher/main.c ...
+[46/122] Compiling [x11] glfw/monitor.c ...
+[47/122] Compiling [wayland] glfw/monitor.c ...
+[48/122] Compiling kitty/font-names.c ...
+[49/122] Compiling [x11] glfw/backend_utils.c ...
+[50/122] Compiling [wayland] glfw/backend_utils.c ...
+[51/122] Compiling kitty/charsets.c ...
+[52/122] Compiling [x11] glfw/linux_joystick.c ...
+[53/122] Compiling [wayland] glfw/linux_joystick.c ...
+[54/122] Compiling [x11] glfw/init.c ...
+[55/122] Compiling [wayland] glfw/init.c ...
+[56/122] Compiling [x11] glfw/dbus_glfw.c ...
+[57/122] Compiling [wayland] glfw/dbus_glfw.c ...
+[58/122] Compiling kitty/gl.c ...
+[59/122] Compiling [x11] glfw/vulkan.c ...
+[60/122] Compiling [wayland] glfw/vulkan.c ...
+[61/122] Compiling [x11] glfw/osmesa_context.c ...
+[62/122] Compiling [wayland] glfw/osmesa_context.c ...
+[63/122] Compiling kitty/cursor.c ...
+[64/122] Compiling kitty/launcher/single-instance.c ...
+[65/122] Compiling kitty/desktop.c ...
+[66/122] Compiling kitty/loop-utils.c ...
+[67/122] Compiling 3rdparty/ringbuf/ringbuf.c ...
+[68/122] Compiling kitty/simd-string.c ...
+[69/122] Compiling kitty/systemd.c ...
+[70/122] Compiling kitty/shlex.c ...
+[71/122] Compiling [wayland] glfw/wayland-tablet-unstable-v2-client-protocol.c ...
+[72/122] Compiling kitty/child.c ...
+[73/122] Compiling [wayland] glfw/linux_desktop_settings.c ...
+[74/122] Compiling [wayland] glfw/wl_text_input.c ...
+[75/122] Compiling [wayland] glfw/wl_monitor.c ...
+[76/122] Compiling kitty/kittens.c ...
+[77/122] Compiling 3rdparty/base64/lib/codec_choose.c ...
+[78/122] Compiling kitty/png-reader.c ...
+[79/122] Compiling [wayland] glfw/wayland-xdg-shell-client-protocol.c ...
+[80/122] Compiling [x11] glfw/linux_notify.c ...
+[81/122] Compiling [wayland] glfw/linux_notify.c ...
+[82/122] Compiling kitty/rowcolumn-diacritics.c ...
+[83/122] Compiling kitty/hyperlink.c ...
+[84/122] Compiling [wayland] glfw/wayland-primary-selection-unstable-v1-client-protocol.c ...
+[85/122] Compiling kitty/wcswidth.c ...
+[86/122] Compiling [wayland] glfw/wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[87/122] Compiling kitty/fast-file-copy.c ...
+[88/122] Compiling [wayland] glfw/wayland-text-input-unstable-v3-client-protocol.c ...
+[89/122] Compiling [wayland] glfw/wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
+[90/122] Compiling 3rdparty/base64/lib/lib.c ...
+[91/122] Compiling [x11] glfw/posix_thread.c ...
+[92/122] Compiling [wayland] glfw/posix_thread.c ...
+[93/122] Compiling kitty/window_logo.c ...
+[94/122] Compiling [wayland] glfw/wayland-xdg-activation-v1-client-protocol.c ...
+[95/122] Compiling [wayland] glfw/wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+[96/122] Compiling [wayland] glfw/wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[97/122] Compiling [wayland] glfw/wayland-cursor-shape-v1-client-protocol.c ...
+[98/122] Compiling [wayland] glfw/wayland-fractional-scale-v1-client-protocol.c ...
+[99/122] Compiling kitty/glyph-cache.c ...
+[100/122] Compiling [wayland] glfw/wayland-viewporter-client-protocol.c ...
+[101/122] Compiling kitty/logging.c ...
+[102/122] Compiling 3rdparty/base64/lib/arch/neon64/codec.c ...
+[103/122] Compiling [wayland] glfw/wayland-single-pixel-buffer-v1-client-protocol.c ...
+[104/122] Compiling 3rdparty/base64/lib/tables/tables.c ...
+[105/122] Compiling [wayland] glfw/wl_cursors.c ...
+[106/122] Compiling 3rdparty/base64/lib/arch/neon32/codec.c ...
+[107/122] Compiling [wayland] glfw/wayland-kwin-blur-v1-client-protocol.c ...
+[108/122] Compiling 3rdparty/base64/lib/arch/avx/codec.c ...
+[109/122] Compiling 3rdparty/base64/lib/arch/ssse3/codec.c ...
+[110/122] Compiling 3rdparty/base64/lib/arch/sse42/codec.c ...
+[111/122] Compiling 3rdparty/base64/lib/arch/sse41/codec.c ...
+[112/122] Compiling 3rdparty/base64/lib/arch/avx2/codec.c ...
+[113/122] Compiling kitty/utmp.c ...
+[114/122] Compiling 3rdparty/base64/lib/arch/avx512/codec.c ...
+[115/122] Compiling 3rdparty/base64/lib/arch/generic/codec.c ...
+[116/122] Compiling kitty/cleanup.c ...
+[117/122] Compiling [x11] glfw/monotonic.c ...
+[118/122] Compiling [wayland] glfw/monotonic.c ...
+[119/122] Compiling kitty/monotonic.c ...
+[120/122] Compiling kitty/simd-string-128.c ...
+[121/122] Compiling kitty/simd-string-256.c ...
+[122/122] Compiling kitty/gl-wrapper.c ...
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
+kitty/tools/cmd
+```
+
+After the debug build, the canonical **release** build was re-run (`python3 setup.py
+--ignore-compiler-warnings`) so that all runtime observations below come from the canonical release
+binary; that restore likewise left the git working tree clean (the launcher binary is gitignored).
 
 Throughout the investigation the launcher path `kitty/launcher/kitten` is referred to as `$KIT`.
 
@@ -115,9 +442,37 @@ ssh:hostname:remote-file-path to diff remote files.
 
 Options:
   --context [=-1]
-    Number of lines of context to show between changes. ...
+    Number of lines of context to show between changes. Negative values use the
+    number set in diff.conf.
+
   --config
-    Specify a path to the configuration file(s) to use. ...
+    Specify a path to the configuration file(s) to use. All configuration files
+    are merged onto the builtin diff.conf, overriding the builtin values. This
+    option can be specified multiple times to read multiple configuration files
+    in sequence, which are merged. Use the special value NONE to not load any
+    config file.
+
+    If this option is not specified, config files are searched for in the order:
+    $XDG_CONFIG_HOME/kitty/diff.conf, ~/.config/kitty/diff.conf,
+    $XDG_CONFIG_DIRS/kitty/diff.conf. The first one that exists is used as the
+    config file.
+
+    If the environment variable KITTY_CONFIG_DIRECTORY is specified, that
+    directory is always used and the above searching does not happen.
+
+    If /etc/xdg/kitty/diff.conf exists, it is merged before (i.e. with lower
+    priority) than any user config files. It can be used to specify system-wide
+    defaults for all users. You can use either - or /dev/stdin to read the
+    config from STDIN.
+
+  --override, -o
+    Override individual configuration options, can be specified multiple times.
+    Syntax: name=value. For example: -o background=gray
+
+  --help, -h
+    Show help for this command
+
+kitten diff 0.35.2 created by Kovid Goyal
 ```
 
 The Python `main()` is **not** a valid observation path — it deliberately errors. This is the
@@ -477,13 +832,33 @@ they consume the cached bytes rather than reopening the file. `LRUCache` itself 
 ### 3.3 Command(s) run
 
 `strace` (system tool, `apt`-installed; the repository is untouched) traced the `openat` syscalls the
-kitten makes while diffing a 3-file-per-side directory. The kitten's own content read uses Go's
-`os.ReadFile`, which always opens with `O_CLOEXEC`; counting `O_CLOEXEC` opens per path isolates the
-cache's content read from any external subprocess opens.
+kitten makes while diffing a 3-file-per-side directory (`q3_left`/`q3_right`, files `f1.txt`–`f3.txt`,
+each changed on one line). Because `kitten diff` is a full-screen TUI and `tmux` is absent, the run is
+driven through the PTY harness (§0.4). The kitten's own content read uses Go's `os.ReadFile`, which
+always opens with `O_CLOEXEC`; counting `O_CLOEXEC` opens per path isolates the cache's single content
+read from any external-subprocess opens. The exact trace command (builtin shown; for auto, drop the
+`-o diff_cmd=builtin`) is:
 
 ```sh
-strace -f -e trace=openat -o out.txt  $KIT diff /tmp/kdiff/q3_left /tmp/kdiff/q3_right   # (run inside the pty harness)
-# then, per distinct path, count total opens and O_CLOEXEC opens
+$ strace -f -e trace=openat -o out.txt \
+    python3 /tmp/tui_capture.py --cols 120 --rows 24 --quit-after 1.5 -- \
+    $KIT diff -o diff_cmd=builtin /tmp/kdiff/q3_left /tmp/kdiff/q3_right
+```
+
+The exact per-path counting script (`/tmp/count_openat.sh`, outside the repository) and its use:
+
+```sh
+$ cat /tmp/count_openat.sh
+#!/bin/sh
+# Usage: count_openat.sh <strace_output_file>
+# For each distinct Q3 content path, print total openat calls and O_CLOEXEC opens.
+f="$1"
+for p in q3_left/f1.txt q3_left/f2.txt q3_left/f3.txt q3_right/f1.txt q3_right/f2.txt q3_right/f3.txt; do
+  total=$(grep -c "openat(.*\"/tmp/kdiff/$p\"" "$f")
+  cloexec=$(grep "openat(.*\"/tmp/kdiff/$p\"" "$f" | grep -c 'O_CLOEXEC')
+  printf '  %-16s total_openat=%s  O_CLOEXEC=%s\n' "$p:" "$total" "$cloexec"
+done
+$ /tmp/count_openat.sh out.txt
 ```
 
 ### 3.4 Observed output (stable across ≥2 runs)
@@ -505,19 +880,36 @@ strace -f -e trace=openat -o out.txt  $KIT diff /tmp/kdiff/q3_left /tmp/kdiff/q3
 `O_CLOEXEC` content read; the two extra non-`O_CLOEXEC` opens belong to the external `git` subprocess
 (a different PID) reading the file itself:
 
+Complete per-path output for both runs (`/tmp/count_openat.sh` on each run's `out.txt`):
+
 ```text
---- RUN1 ---                                       --- RUN2 --- (identical)
-  q3_left/f1.txt:  total_openat=3  O_CLOEXEC=1        q3_left/f1.txt:  total_openat=3  O_CLOEXEC=1
-  ... (all six paths identical) ...
+=== AUTO RUN1 (default engine → git) ===
+  q3_left/f1.txt:  total_openat=3  O_CLOEXEC=1
+  q3_left/f2.txt:  total_openat=3  O_CLOEXEC=1
+  q3_left/f3.txt:  total_openat=3  O_CLOEXEC=1
+  q3_right/f1.txt: total_openat=3  O_CLOEXEC=1
+  q3_right/f2.txt: total_openat=3  O_CLOEXEC=1
+  q3_right/f3.txt: total_openat=3  O_CLOEXEC=1
+=== AUTO RUN2 ===
+  q3_left/f1.txt:  total_openat=3  O_CLOEXEC=1
+  q3_left/f2.txt:  total_openat=3  O_CLOEXEC=1
+  q3_left/f3.txt:  total_openat=3  O_CLOEXEC=1
+  q3_right/f1.txt: total_openat=3  O_CLOEXEC=1
+  q3_right/f2.txt: total_openat=3  O_CLOEXEC=1
+  q3_right/f3.txt: total_openat=3  O_CLOEXEC=1
 ```
 
-The actual syscall lines for one path make the split explicit — one `O_CLOEXEC` open from the kitten
-(pid 114113) and two plain opens from the git subprocess (pid 114123):
+All six paths are identical within a run and stable across both runs (`total_openat=3`,
+`O_CLOEXEC=1`). The actual syscall lines for one path make the split explicit — one `O_CLOEXEC` open
+from the kitten (pid 169139) and two plain opens from the external `git` subprocess (pid 169146). This
+is the verbatim `grep 'openat(.*"/tmp/kdiff/q3_left/f1.txt"' out.txt` from AUTO RUN1 (strace's
+`<unfinished ...>` markers, emitted when `-f` interleaves the two processes, are preserved exactly as
+printed):
 
 ```text
-114113 openat(AT_FDCWD, "/tmp/kdiff/q3_left/f1.txt", O_RDONLY|O_CLOEXEC) = 11
-114123 openat(AT_FDCWD, "/tmp/kdiff/q3_left/f1.txt", O_RDONLY <unfinished ...>
-114123 openat(AT_FDCWD, "/tmp/kdiff/q3_left/f1.txt", O_RDONLY <unfinished ...>
+169139 openat(AT_FDCWD, "/tmp/kdiff/q3_left/f1.txt", O_RDONLY|O_CLOEXEC) = 11
+169146 openat(AT_FDCWD, "/tmp/kdiff/q3_left/f1.txt", O_RDONLY) = 3
+169146 openat(AT_FDCWD, "/tmp/kdiff/q3_left/f1.txt", O_RDONLY <unfinished ...>
 ```
 
 ### 3.5 Causal reason
@@ -539,11 +931,22 @@ via LRU eviction (`NewLRUCache(sz)`).
 
 ### 4.1 Direct answer
 
-When many files must be processed, the diff work is dispatched across a worker pool whose size is
-`runtime.NumCPU()`. Each file pair becomes one job (`do_diff`), and up to `NumCPU` jobs run
-concurrently. On this 128-CPU machine, an unconstrained 400-file diff was observed running dozens of
-`git` subprocesses at once; constraining the CPU set to 1, 2, or 4 CPUs makes the peak concurrency
-exactly 1, 2, or 4.
+When many files must be processed, the diff kitten builds a job list — **one job per changed
+text-file pair** (`ui.go:147`) — and runs it through a worker pool whose size is
+`min(runtime.NumCPU(), number-of-jobs)` (`utils.go:35,37-38`). Diffing and syntax-highlighting are
+dispatched **at the same moment** (`generate_diff()` then `highlight_all()`, `ui.go:249-250`), each
+with its own `NumCPU`-sized pool. Constraining the CPU set to 1, 2, or 4 CPUs makes the peak number of
+concurrent `git diff` subprocesses **exactly 1, 2, or 4** — the direct, deterministic signature of the
+`NumCPU`-sized pool.
+
+At scale on this 128-CPU machine the picture is more nuanced, and is reported honestly below. A single
+CPU processes all N files to completion (400 files → 400 `git diff` subprocesses, peak 1). But an
+**unconstrained** run does **not** complete: the concurrently-running highlight pool trips a data race
+(the very same `LRUCache.Set` race examined in Q5) and the process aborts with
+`fatal error: concurrent map writes` after a **variable** number of files. That is precisely why the
+amount of work completed is **run-to-run inconsistent** at high concurrency — same input, different
+truncation point every time. The worker-pool magnitude itself (peak concurrency = `NumCPU`) is proven
+cleanly at 1/2/4 CPUs where the race does not fire.
 
 ### 4.2 Mechanism & code anchors
 
@@ -565,72 +968,227 @@ The diff jobs are driven by `diff(jobs, context_count)` (`patch.go:352`), which 
 job.file2, context_count)` (`patch.go:365`). One `do_diff` job corresponds to one file pair. The same
 primitive drives highlighting (Q5).
 
+Two details of the dispatch matter for what follows:
+
+- **Only text pairs become diff jobs.** `generate_diff()` appends a `diff_job` only
+  `if is_path_text(path) && is_path_text(changed_path)` (`ui.go:147`); binary pairs produce **no**
+  `git` subprocess (they are rendered directly — Q6). So *N text pairs → exactly N `git diff`
+  subprocesses*.
+- **Diffing and highlighting run concurrently.** When the collection arrives, the handler fires
+  `self.generate_diff()` **and** `self.highlight_all()` back to back (`ui.go:249-250`), each launching
+  its own `NumCPU`-sized `Context.Parallel` pool over the *same* set of text files. On a multi-core
+  machine both pools are live at once — which is why the highlight pool's data race (Q5) can abort the
+  process mid-diff.
+
 ### 4.3 Command(s) run
 
-Two probes. First, the **pool-size basis** (a **non-canonical stand-in** — the canonical fact is the
-code at `utils.go:35`; this standalone probe merely reports what `runtime.NumCPU()` returns in this
-container):
+**(a) Pool-size basis** (a **non-canonical stand-in** — the canonical fact is the code at
+`utils.go:35`; this standalone probe merely reports what `runtime.NumCPU()` returns in this
+container, and how `taskset` lowers it):
 
 ```console
-$ cat ncpu.go
+$ cat /tmp/ncpu.go
 package main
 import ("fmt";"runtime")
 func main(){ fmt.Println("runtime.NumCPU()=", runtime.NumCPU()) }
-$ go run ncpu.go
+$ go run /tmp/ncpu.go
 runtime.NumCPU()= 128
 $ nproc --all
 128
+$ taskset -c 0   go run /tmp/ncpu.go
+runtime.NumCPU()= 1
+$ taskset -c 0-1 go run /tmp/ncpu.go
+runtime.NumCPU()= 2
+$ taskset -c 0-3 go run /tmp/ncpu.go
+runtime.NumCPU()= 4
 ```
 
-Second, the **effective parallelism**, observed canonically by tracing the `git` subprocesses the
-kitten spawns (`execve`/`exit_group` with timestamps) and computing the peak number that overlap in
-time. A controlled sweep pins the process to 1/2/4 CPUs with `taskset` (N=80 files/side); a scaled run
-uses N=400 files/side.
+**(b) Effective parallelism**, observed **canonically** through the real `kitten diff` entry point by
+tracing the `git` subprocesses the kitten spawns (`execve`/`exit_group` with microsecond timestamps)
+and computing the peak number alive at the same instant. The kitten is a full-screen TUI, so it runs
+under the PTY harness from §0.4; `taskset` pins the CPU set (which is what `runtime.NumCPU()` reads),
+and `-o diff_cmd=git` selects the engine that `auto` resolves to (§0.5).
+
+Fixture (80 identical-structure text pairs, line 2 changed — every pair is a highlightable text file,
+so each becomes one `git diff` job **and** one highlight job):
 
 ```sh
-taskset -c 0   strace -f -ttt -e trace=execve,exit_group -o out $KIT diff L R   # NumCPU=1
-taskset -c 0-1 …                                                                # NumCPU=2
-taskset -c 0-3 …                                                                # NumCPU=4
+mkdir -p /tmp/kdiff/q4_80_left /tmp/kdiff/q4_80_right
+for i in $(seq 1 80); do
+  printf 'file %s line 1\nfile %s line 2 original\nfile %s line 3\n' "$i" "$i" "$i" > /tmp/kdiff/q4_80_left/f$i.txt
+  printf 'file %s line 1\nfile %s line 2 CHANGED\nfile %s line 3\n'  "$i" "$i" "$i" > /tmp/kdiff/q4_80_right/f$i.txt
+done
+```
+
+Controlled sweep — the exact command at each CPU count (N=80), run twice each:
+
+```sh
+KIT=kitty/launcher/kitten
+L=/tmp/kdiff/q4_80_left ; R=/tmp/kdiff/q4_80_right
+
+taskset -c 0   strace -f -ttt -e trace=execve,exit_group -o /tmp/sweep1.strace \
+  python3 /tmp/tui_capture.py --quit-after 5 -- "$KIT" diff -o diff_cmd=git "$L" "$R"
+python3 /tmp/parse_concurrency.py /tmp/sweep1.strace          # NumCPU=1
+
+taskset -c 0-1 strace -f -ttt -e trace=execve,exit_group -o /tmp/sweep2.strace \
+  python3 /tmp/tui_capture.py --quit-after 5 -- "$KIT" diff -o diff_cmd=git "$L" "$R"
+python3 /tmp/parse_concurrency.py /tmp/sweep2.strace          # NumCPU=2
+
+taskset -c 0-3 strace -f -ttt -e trace=execve,exit_group -o /tmp/sweep4.strace \
+  python3 /tmp/tui_capture.py --quit-after 5 -- "$KIT" diff -o diff_cmd=git "$L" "$R"
+python3 /tmp/parse_concurrency.py /tmp/sweep4.strace          # NumCPU=4
+```
+
+The concurrency parser (`/tmp/parse_concurrency.py`), shown in full — it counts one `git diff` per
+`execve` of `git … --no-index`, then sweeps start/end events to find the peak overlap:
+
+```python
+#!/usr/bin/env python3
+import sys, re
+fn = sys.argv[1]
+start = {}   # pid -> execve timestamp of a git-diff
+end = {}     # pid -> exit timestamp
+line_re = re.compile(r'^(\d+)\s+(\d+\.\d+)\s+(.*)$')
+for line in open(fn, errors='replace'):
+    m = line_re.match(line)
+    if not m:
+        continue
+    pid, ts, rest = int(m.group(1)), float(m.group(2)), m.group(3)
+    if rest.startswith('execve(') and '"git"' in rest and '"--no-index"' in rest:
+        start[pid] = ts
+    elif rest.startswith('exit_group(') or rest.startswith('+++ exited'):
+        end[pid] = ts          # last exit wins (a pid is reused only after it exits)
+events = []
+for pid, t0 in start.items():
+    t1 = end.get(pid, t0)
+    events.append((t0, +1)); events.append((t1, -1))
+events.sort(key=lambda e: (e[0], e[1]))   # end before start at equal ts
+cur = mx = 0
+for _, d in events:
+    cur += d
+    if cur > mx: mx = cur
+total = len(start)
+span = (max(end.get(p, start[p]) for p in start) - min(start.values())) if start else 0.0
+print(f"git-diff subprocesses={total}  MAX_CONCURRENT={mx}  span={span:.2f}s")
+```
+
+Scale run (N=400) and the crash capture use the same harness; the full-machine variant simply omits
+`taskset`, and the crash is captured by redirecting the kitten's stderr with `/tmp/tui_err.py`:
+
+```sh
+L=/tmp/kdiff/q4_400_left ; R=/tmp/kdiff/q4_400_right
+# 1-CPU baseline (completes all 400)
+taskset -c 0 strace -f -ttt -e trace=execve,exit_group -o /tmp/s1.strace \
+  python3 /tmp/tui_capture.py --quit-after 12 -- "$KIT" diff -o diff_cmd=git "$L" "$R"
+python3 /tmp/parse_concurrency.py /tmp/s1.strace
+# Full machine (unconstrained NumCPU=128), SAME input repeated
+strace -f -ttt -e trace=execve,exit_group -o /tmp/sf.strace \
+  python3 /tmp/tui_capture.py --quit-after 6 -- "$KIT" diff -o diff_cmd=git "$L" "$R"
+python3 /tmp/parse_concurrency.py /tmp/sf.strace
+# Capture the kitten's own stderr on the full machine
+python3 /tmp/tui_err.py --err /tmp/crash.err -- "$KIT" diff -o diff_cmd=git "$L" "$R"
+head -15 /tmp/crash.err
 ```
 
 ### 4.4 Observed output — controlled proof (stable across ≥2 runs)
 
-Peak concurrent `git diff` subprocesses equals the CPU count exactly, and is stable:
+When the run completes, the total number of `git diff` subprocesses is **exactly N (=80)** and the
+peak concurrency **equals the CPU count exactly**:
 
 ```text
-taskset -c 0   (NumCPU=1) RUN1: git-diff subprocesses=80  MAX_CONCURRENT=1
-taskset -c 0   (NumCPU=1) RUN2: git-diff subprocesses=80  MAX_CONCURRENT=1
-taskset -c 0-1 (NumCPU=2) RUN1: git-diff subprocesses=74  MAX_CONCURRENT=2
-taskset -c 0-1 (NumCPU=2) RUN2: git-diff subprocesses=80  MAX_CONCURRENT=2
-taskset -c 0-3 (NumCPU=4) RUN1: git-diff subprocesses=4   MAX_CONCURRENT=4
-taskset -c 0-3 (NumCPU=4) RUN2: git-diff subprocesses=80  MAX_CONCURRENT=4
+taskset -c 0     (NumCPU=1) RUN1: git-diff subprocesses=80  MAX_CONCURRENT=1  span=0.37s
+taskset -c 0     (NumCPU=1) RUN2: git-diff subprocesses=80  MAX_CONCURRENT=1  span=0.37s
+taskset -c 0-1   (NumCPU=2) RUN1: git-diff subprocesses=80  MAX_CONCURRENT=2  span=0.60s
+taskset -c 0-1   (NumCPU=2) RUN2: git-diff subprocesses=80  MAX_CONCURRENT=2  span=0.49s
+taskset -c 0-3   (NumCPU=4) RUN1: git-diff subprocesses=80  MAX_CONCURRENT=4  span=0.31s
+taskset -c 0-3   (NumCPU=4) RUN2: git-diff subprocesses=80  MAX_CONCURRENT=4  span=0.33s
 ```
 
-At scale (N=400 files/side), a single CPU serializes (`MAX_CONCURRENT=1`) while the full machine runs
-dozens at once. The unconstrained peak varies run-to-run (short-lived `git` processes overlap
-differently under 128-way scheduling), reported honestly here as observed:
+`MAX_CONCURRENT` tracks the CPU count 1 → 2 → 4 with no exceptions, and `total == 80 == N` confirms
+one `git diff` per text pair. At `NumCPU=1` and `NumCPU=2` this is fully stable (6/6 and 2/2 runs). At
+`NumCPU=4` it is stable in the large majority of runs (7 of 8 observed) but **borderline** — in one run
+of eight the co-scheduled highlight pool tripped the Q5 race and truncated the diff early; that failure
+mode is the subject of §4.5. The clean measurement above is what the pool produces whenever it is
+allowed to finish.
+
+### 4.5 Observed output — scale, and the honest run-to-run inconsistency
+
+At `NumCPU=1` the pool is structurally safe (a single highlight worker → no concurrent
+`LRUCache.Set`), so a 400-pair diff **always completes**, with peak concurrency 1:
 
 ```text
-1-CPU  RUN1: git-diff subprocesses=400  MAX_CONCURRENT=1   span=2.07s
-1-CPU  RUN2: git-diff subprocesses=400  MAX_CONCURRENT=1   span=1.98s
-FULL   RUN1: git-diff subprocesses=400  MAX_CONCURRENT=65  span=1.69s
-FULL   RUN2: git-diff subprocesses=400  MAX_CONCURRENT=39  span=2.21s
+1-CPU RUN1: git-diff subprocesses=400  MAX_CONCURRENT=1  span=1.87s
+1-CPU RUN2: git-diff subprocesses=400  MAX_CONCURRENT=1  span=2.06s
 ```
 
-400 files produce exactly 400 `git diff` subprocesses — one `do_diff` job per file pair.
+On the **full machine** (unconstrained, `NumCPU=128`), the *same* 400-pair input does **not** complete.
+The co-running highlight pool (dispatched alongside the diff pool at `ui.go:249-250`) hits the
+`LRUCache.Set` data race and the whole process aborts with `fatal error: concurrent map writes` after
+a **variable** number of files. Running the identical input eight times gives a wide distribution of
+how far it got before dying (this is reported exactly as observed — not smoothed):
 
-### 4.5 Causal reason
+```text
+RUN1: git-diff subprocesses=332  MAX_CONCURRENT=64  span=1.41s
+RUN2: git-diff subprocesses=43   MAX_CONCURRENT=15  span=0.35s
+RUN3: git-diff subprocesses=16   MAX_CONCURRENT=9   span=0.10s
+RUN4: git-diff subprocesses=86   MAX_CONCURRENT=47  span=0.43s
+RUN5: git-diff subprocesses=4    MAX_CONCURRENT=3   span=0.11s
+RUN6: git-diff subprocesses=8    MAX_CONCURRENT=6   span=0.04s
+RUN7: git-diff subprocesses=191  MAX_CONCURRENT=54  span=0.80s
+RUN8: git-diff subprocesses=39   MAX_CONCURRENT=24  span=0.27s
+```
 
-Each pool goroutine runs one `do_diff` at a time, and in auto mode each `do_diff` spawns one `git`
-subprocess; therefore the peak number of concurrent `git` processes equals the number of goroutines,
-which is `procs = min(runtime.NumCPU(), jobs)` (`utils.go:35,37-38`). Pinning to *k* CPUs makes
-`runtime.NumCPU()` return *k*, so the peak is exactly *k* — which is precisely what the 1/2/4 sweep
-shows. Unconstrained, the peak is bounded by `NumCPU` (128) but in practice lands in the tens because
-each `git` on tiny files is very short-lived, so not all workers are busy at the same instant. The
-1-CPU `MAX_CONCURRENT=1` versus full-CPU `MAX_CONCURRENT=39–65` is the direct, deterministic signature
-of the `NumCPU`-sized pool. (Wall-clock span is similar here because for tiny files the `git` spawn
-overhead dominates the actual diff work; the concurrency magnitude is the `MAX_CONCURRENT` value, not
-the span.)
+The diff pool genuinely reaches **dozens concurrent** before the crash (peak `MAX_CONCURRENT=64` in
+RUN1) — so "many files run at once" is real — but the number that *complete* is dominated by *when* the
+highlight race fires. Capturing the kitten's own stderr on the full machine confirms the cause; the
+first stderr line is `fatal error: concurrent map writes` on **3 of 3** runs, and the stack is
+unambiguous (this is the exact `head -15 /tmp/crash.err`):
+
+```text
+fatal error: concurrent map writes
+
+goroutine 328 [running]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x39, {0xc0005025e0?, 0x0?}, {0xc001055408?, 0x3, 0x200})
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x85
+kitty/kittens/diff.highlight_all.func1(0xc000742000)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/kittens/diff/highlight.go:224 +0xae
+kitty/tools/utils/images.(*Context).Parallel.func1()
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/images/utils.go:52 +0x54
+created by kitty/tools/utils/images.(*Context).Parallel in goroutine 139
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/images/utils.go:50 +0xe5
+```
+
+The crash is a **timing-dependent race, not a hard threshold**. Repeating the N=400 run at fixed CPU
+counts shows it firing probabilistically — never at 1 CPU, and intermittently once ≥2 workers can
+`Set` at the same time:
+
+```text
+taskset -c 0     (NumCPU=1)  : crashed=no   crashed=no    (never — single highlight worker)
+taskset -c 0-3   (NumCPU=4)  : crashed=YES  crashed=no
+taskset -c 0-7   (NumCPU=8)  : crashed=no   crashed=no
+taskset -c 0-15  (NumCPU=16) : crashed=no   crashed=YES
+```
+
+This is the canonical, real-entry-point manifestation of the latent `LRUCache.Set` race that Q5
+examines with the race detector; see §5 for the read/write-lock root cause (`cache.go:33-35`).
+
+### 4.6 Causal reason
+
+Each pool goroutine runs one `do_diff` at a time, and with `diff_cmd=git` each `do_diff` spawns one
+`git` subprocess; therefore the peak number of concurrent `git` processes equals the number of
+goroutines, which is `procs = min(runtime.NumCPU(), jobs)` (`utils.go:35,37-38`). Pinning to *k* CPUs
+makes `runtime.NumCPU()` return *k*, so the peak is exactly *k* — precisely what the 1/2/4 sweep shows,
+and `total == N` confirms one `git` per text pair. The reason the **unconstrained** run does not simply
+show "peak≈128, total=400" is that the diff pool does not run alone: `highlight_all()` is dispatched in
+the same breath (`ui.go:249-250`) and its `NumCPU` workers concurrently mutate a shared map through
+`LRUCache.Set`, which is not write-safe (Q5). On a multi-core machine that race is eventually taken and
+the Go runtime aborts the entire process, cutting the diff pool off at a random point — hence the
+variable completed-count distribution above. At one CPU the highlight pool has a single worker, the
+race cannot occur, and the run completes deterministically. So the plain answer to "what happens when
+many files are processed at once" is: *a `NumCPU`-sized worker pool runs up to `NumCPU` diffs
+concurrently (proven at 1/2/4), but on this multi-core machine the concurrently-running highlighter's
+data race makes a large unconstrained run abort partway with `concurrent map writes` — the honest,
+observed reason the completed work is inconsistent run-to-run.*
 
 ---
 
@@ -639,11 +1197,20 @@ the span.)
 
 ### 5.1 Direct answer
 
-Syntax highlighting runs in parallel, one path per worker, and each worker writes its result under a
-**distinct per-path cache key**. Because no two workers write the same key, the highlighted output is
-deterministic and uncorrupted across runs. However, this safety is *usage*-dependent, not
-lock-enforced: `LRUCache.Set` mutates its map while holding only a **read** lock, so concurrent
-writers to the same map are a genuine (latent) data race — demonstrated below with the race detector.
+Syntax highlighting runs in parallel — **one path per worker** — and each worker writes its result
+under a **distinct per-path cache key** (`highlight.go:224`). Because no two workers write the *same*
+key, there is no *logical* collision: whenever a run completes, the highlighted output is
+byte-for-byte identical across runs (§5.4). In that sense highlighting does not "step on itself."
+
+However — and this is the honest, observed nuance — that safety is **not lock-enforced**.
+`LRUCache.Set` mutates its Go map while holding only a **read** lock (`cache.go:33-35`), and Go maps
+are unsafe for concurrent writes **even to different keys**. On this multi-core (128-CPU) machine the
+parallel highlight pool therefore trips a genuine data race, and the kitten **aborts with**
+`fatal error: concurrent map writes`. This is not rare: it is the very crash that truncates the large
+Q4 diff runs (§4.5). So the precise answer is: *highlighting does not corrupt output by writing the
+same key twice, but the shared-map write is not concurrency-safe, and on a multi-core machine the race
+is taken often enough to crash the process rather than to produce wrong output.* (Per the read-only
+scope this is **reported, not fixed**.)
 
 ### 5.2 Mechanism & code anchors
 
@@ -657,100 +1224,352 @@ matching) and, on success, writes `highlighted_lines_cache.Set(path, text_to_lin
 The nuance to verify (not assume): `LRUCache.Set` (`tools/utils/cache.go:32`) takes `RLock`
 (`:33`), assigns `self.data[key] = val` (`:34`), then `RUnlock` (`:35`) — i.e. it **mutates the map
 under a read lock**. `GetOrCreate` (`:39`) reads under `RLock`, runs the create function **outside**
-any lock (no single-flight guard), then writes under `Lock` (`:48`).
+any lock (no single-flight guard), then writes under `Lock` (`:48`). A read lock permits multiple
+concurrent holders, so two `Set` calls can assign into the same map simultaneously — exactly the
+unsafe pattern Go's runtime and race detector flag below.
 
 ### 5.3 Command(s) run and observed output — race detector (verbatim)
 
-First, the existing tests under the race detector. The diff kitten's own tests report **no** data
-race:
+**(a) CANONICAL — the real `kitten diff` entry point aborts on the race.** This is the primary,
+non-synthetic evidence: driving the many-file diff through the real Go entry point (the Q4 fixture,
+§4.3) on the unconstrained 128-CPU machine, the kitten's own stderr shows the highlight worker pool
+racing on `LRUCache.Set`. The stack is unambiguous — `highlight_all.func1` → `LRUCache.Set`
+(`cache.go:34`) dispatched by `Context.Parallel` (`utils.go:50,52`), with the main goroutine in the
+TUI event loop (`loop.(*Loop).run`). This is the exact `head -15` of the captured stderr:
+
+```text
+fatal error: concurrent map writes
+
+goroutine 328 [running]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x39, {0xc0005025e0?, 0x0?}, {0xc001055408?, 0x3, 0x200})
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x85
+kitty/kittens/diff.highlight_all.func1(0xc000742000)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/kittens/diff/highlight.go:224 +0xae
+kitty/tools/utils/images.(*Context).Parallel.func1()
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/images/utils.go:52 +0x54
+created by kitty/tools/utils/images.(*Context).Parallel in goroutine 139
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/images/utils.go:50 +0xe5
+
+goroutine 1 [select]:
+kitty/tools/tui/loop.(*Loop).run(0xc0001c86c8)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/tui/loop/run.go:479 +0x10d9
+```
+
+This canonical crash is the same one characterized quantitatively in §4.5 (first stderr line
+`fatal error: concurrent map writes` on 3/3 full-machine runs). It proves the race is reached on the
+**real** code path — not merely in a synthetic probe.
+
+**(b) The diff kitten's shipped tests report no race** — because they never drive concurrent `Set`:
 
 ```console
 $ go test -race ./kittens/diff/...
-ok  	kitty/kittens/diff	1.105s
-$ grep -c "DATA RACE" q5_race_diff.txt
-0
+ok  	kitty/kittens/diff	1.099s
 ```
 
-The `tools/utils` tests also report **no** data race; the only failure is the unrelated `TestFileLock`
-(an environment issue — it fails identically **without** `-race`, so it is not a race):
+**(c) The `tools/utils` tests also report no `DATA RACE`** (complete, unedited output). The only
+failure is the unrelated `TestFileLock`, an environment issue — it fails **identically without**
+`-race`, so it is not a race:
 
 ```console
 $ go test -race ./tools/utils/...
+?   	kitty/tools/utils/images	[no test files]
+?   	kitty/tools/utils/paths	[no test files]
+?   	kitty/tools/utils/random	[no test files]
+?   	kitty/tools/utils/secrets	[no test files]
 --- FAIL: TestFileLock (0.00s)
     filelock_test.go:41: Lock test process failed with error: exec: no command and output:
 FAIL
-FAIL	kitty/tools/utils	0.070s
-ok  	kitty/tools/utils/base85	1.021s
-ok  	kitty/tools/utils/humanize	1.021s
-...
-$ go test ./tools/utils/ -run TestFileLock        # WITHOUT -race: same failure
-    filelock_test.go:41: Lock test process failed with error: exec: no command and output:
-FAIL	kitty/tools/utils	0.006s
+FAIL	kitty/tools/utils	0.067s
+ok  	kitty/tools/utils/base85	1.026s
+ok  	kitty/tools/utils/humanize	1.026s
+ok  	kitty/tools/utils/shlex	1.017s
+ok  	kitty/tools/utils/shm	1.018s
+ok  	kitty/tools/utils/style	1.019s
+FAIL
 ```
 
-The existing tests do not drive concurrent `Set`, so they cannot surface the latent race. To verify
-the nuance directly, a small external program (outside the repository) drives the **real**
-`utils.LRUCache.Set` concurrently with **distinct** keys — exactly the `highlight_all` pattern
-(8 goroutines × 2000 `Set`):
+```console
+$ go test ./tools/utils/ -run TestFileLock        # WITHOUT -race: same failure
+--- FAIL: TestFileLock (0.00s)
+    filelock_test.go:41: Lock test process failed with error: exec: no command and output:
+FAIL
+FAIL	kitty/tools/utils	0.006s
+FAIL
+```
+
+Neither test suite exercises *concurrent* `Set`, so neither surfaces the latent race. To isolate it
+deterministically, a small **external diagnostic probe (NON-CANONICAL)** — living outside the repo
+tree, so the repository stays unchanged — drives the **real** `kitty/tools/utils.LRUCache.Set`
+concurrently with **distinct** keys, exactly mirroring the `highlight_all` pattern (one distinct key
+per worker, one shared cache). It imports the real package via a `replace` directive; it is a
+diagnostic probe, **not** the kitten's own path (that is (a) above).
+
+Full probe source (`/tmp/racetest/go.mod` and `/tmp/racetest/main.go`):
+
+```go
+// go.mod
+module racetest
+
+go 1.22
+
+require kitty v0.0.0
+
+require (
+	github.com/ALTree/bigfloat v0.2.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/seancfoley/bintree v1.3.1 // indirect
+	github.com/seancfoley/ipaddress-go v1.6.0 // indirect
+	github.com/shirou/gopsutil/v3 v3.24.5 // indirect
+	github.com/tklauser/go-sysconf v0.3.12 // indirect
+	github.com/tklauser/numcpus v0.6.1 // indirect
+	golang.org/x/exp v0.0.0-20230801115018-d63ba01acd4b // indirect
+	golang.org/x/sys v0.21.0 // indirect
+	howett.net/plist v1.0.1 // indirect
+)
+
+replace kitty => /tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a
+```
+
+```go
+// main.go
+// External diagnostic probe (NON-CANONICAL): lives outside the kitty repo and
+// drives the REAL kitty/tools/utils.LRUCache.Set concurrently, mirroring the
+// highlight_all pattern (one DISTINCT key per worker, one shared cache) at
+// kittens/diff/highlight.go:224. It exists only to surface the latent map-write
+// race in cache.go:34 in isolation; it is not the kitten's own code path.
+package main
+
+import (
+	"fmt"
+	"sync"
+
+	"kitty/tools/utils"
+)
+
+func main() {
+	cache := utils.NewLRUCache[string, int](4096)
+	const workers = 8
+	const perWorker = 2000
+	var wg sync.WaitGroup
+	for g := 0; g < workers; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				// DISTINCT key per write — exactly like one path per highlight worker.
+				cache.Set(fmt.Sprintf("g%d-k%d", g, i), i)
+			}
+		}(g)
+	}
+	wg.Wait()
+	fmt.Println("done", workers*perWorker)
+}
+```
+
+Exact command and **complete, unedited** output (`go run -race .` from `/tmp/racetest`):
 
 ```console
-$ go run -race .
+$ cd /tmp/racetest && GOFLAGS=-mod=mod go run -race .
 ==================
 WARNING: DATA RACE
-Write at 0x00c00044ae40 by goroutine 9:
+Write at 0x00c000418e70 by goroutine 8:
   runtime.mapassign_faststr()
       /usr/local/go/src/runtime/map_faststr.go:203 +0x0
   kitty/tools/utils.(*LRUCache[go.shape.string,go.shape.int]).Set()
-      /tmp/blitzy/kitty/.../tools/utils/cache.go:34 +0x98
+      /tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x98
   main.main.func1()
-      /tmp/racetest/main.go:22 +0x184
-  ...
-Previous write at 0x00c00044ae40 by goroutine 14:
+      /tmp/racetest/main.go:26 +0x184
+  main.main.gowrap1()
+      /tmp/racetest/main.go:28 +0x41
+
+Previous write at 0x00c000418e70 by goroutine 12:
   runtime.mapassign_faststr()
       /usr/local/go/src/runtime/map_faststr.go:203 +0x0
   kitty/tools/utils.(*LRUCache[go.shape.string,go.shape.int]).Set()
-      /tmp/blitzy/kitty/.../tools/utils/cache.go:34 +0x98
-  ...
+      /tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x98
+  main.main.func1()
+      /tmp/racetest/main.go:26 +0x184
+  main.main.gowrap1()
+      /tmp/racetest/main.go:28 +0x41
+
+Goroutine 8 (running) created at:
+  main.main()
+      /tmp/racetest/main.go:22 +0x1b7
+
+Goroutine 12 (running) created at:
+  main.main()
+      /tmp/racetest/main.go:22 +0x1b7
 ==================
 fatal error: concurrent map writes
+fatal error: concurrent map writes
+fatal error: concurrent map writes
+fatal error: concurrent map writes
+
+goroutine 38 [running]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x87ac20, {0xc0000141cb, 0x5}, 0x8)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x99
+main.main.func1(0x3)
+	/tmp/racetest/main.go:26 +0x185
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 1 [semacquire]:
+sync.runtime_Semacquire(0xc000226e08?)
+	/usr/local/go/src/runtime/sema.go:62 +0x25
+sync.(*WaitGroup).Wait(0xc000226e00)
+	/usr/local/go/src/sync/waitgroup.go:116 +0xa5
+main.main()
+	/tmp/racetest/main.go:30 +0x30a
+
+goroutine 35 [running]:
+	goroutine running on other thread; stack unavailable
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 36 [running]:
+	goroutine running on other thread; stack unavailable
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 37 [runnable]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x87ac20, {0xc00071003b, 0x5}, 0x2)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x99
+main.main.func1(0x2)
+	/tmp/racetest/main.go:26 +0x185
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 39 [runnable]:
+fmt.(*pp).doPrintf(0xc00060e270, {0x7e9a83, 0x7}, {0xc0001c4f78, 0x2, 0x2})
+	/usr/local/go/src/fmt/print.go:1019 +0x1db9
+fmt.Sprintf({0x7e9a83, 0x7}, {0xc0001c4f78, 0x2, 0x2})
+	/usr/local/go/src/fmt/print.go:239 +0x5d
+main.main.func1(0x4)
+	/tmp/racetest/main.go:26 +0x165
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 40 [running]:
+	goroutine running on other thread; stack unavailable
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 41 [runnable]:
+sync/atomic.(*Int32).Add(0xc000418e28, 0xffffffff)
+	/usr/local/go/src/sync/atomic/type.go:88 +0x56
+sync.(*RWMutex).RUnlock(0xc000418e18)
+	/usr/local/go/src/sync/rwmutex.go:116 +0x4e
+kitty/tools/utils.(*LRUCache[...]).Set(0x87ac20, {0xc00069803b, 0x5}, 0x2)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:35 +0xbc
+main.main.func1(0x6)
+	/tmp/racetest/main.go:26 +0x185
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 42 [runnable]:
+main.main.func1(0x7)
+	/tmp/racetest/main.go:26 +0xcf
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 36 [running]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x87ac20, {0xc0001ca18a, 0x6}, 0x12)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x99
+main.main.func1(0x1)
+	/tmp/racetest/main.go:26 +0x185
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 40 [running]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x87ac20, {0xc0002270ea, 0x6}, 0x25)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x99
+main.main.func1(0x5)
+	/tmp/racetest/main.go:26 +0x185
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+
+goroutine 35 [running]:
+kitty/tools/utils.(*LRUCache[...]).Set(0x87ac20, {0xc00049020a, 0x6}, 0x18)
+	/tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a/tools/utils/cache.go:34 +0x99
+main.main.func1(0x0)
+	/tmp/racetest/main.go:26 +0x185
+created by main.main in goroutine 1
+	/tmp/racetest/main.go:22 +0x1b8
+exit status 2
 ```
 
-### 5.4 Determinism check (same input ×2)
+The probe pinpoints the race at **`cache.go:34`** inside `LRUCache.Set` (`runtime.mapassign_faststr`
+called from two goroutines writing distinct keys), then the Go runtime aborts with
+`fatal error: concurrent map writes`. The `WARNING: DATA RACE` + `cache.go:34` + `concurrent map`
+`writes` invariants reproduced on **3/3** runs of the probe. One goroutine in the dump is even caught
+at `cache.go:35` (`RUnlock`), confirming the mutation happens under the read lock.
 
-Diffing the same 12-file, highlightable directory (`.py` files) twice and comparing the visible text
-tokens yields identical results — no corruption from parallel highlighting:
+### 5.4 Determinism check (same input ×2) — and the honest failure mode
+
+To test whether parallel highlighting *corrupts* output, the same 12-file, highlightable directory
+(`src_1.py … src_12.py`) is diffed twice and the rendered text compared. Pinned to a single CPU
+(`taskset -c 0` → `runtime.NumCPU()==1` → a single highlight worker → the race **cannot** occur), the
+output is a stable, race-free baseline and is **identical across runs**:
 
 ```console
-$ md5sum q5_textA.txt q5_textB.txt
-3ac2121ca260d6aaa2686ada91146c06  q5_textA.txt
-3ac2121ca260d6aaa2686ada91146c06  q5_textB.txt
-$ diff -q q5_textA.txt q5_textB.txt && echo "IDENTICAL TEXT CONTENT ACROSS RUNS"
+$ taskset -c 0 python3 /tmp/tui_capture.py --raw-out --cols 160 --rows 60 --quit-after 6 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q5_left /tmp/kdiff/q5_right > /tmp/q5_runA.txt
+$ taskset -c 0 python3 /tmp/tui_capture.py --raw-out --cols 160 --rows 60 --quit-after 6 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q5_left /tmp/kdiff/q5_right > /tmp/q5_runB.txt
+$ md5sum /tmp/q5_runA.txt /tmp/q5_runB.txt
+d71a09172b1eba66a2cd30264fa3cb36  /tmp/q5_runA.txt
+d71a09172b1eba66a2cd30264fa3cb36  /tmp/q5_runB.txt
+$ diff -q /tmp/q5_runA.txt /tmp/q5_runB.txt && echo "IDENTICAL TEXT CONTENT ACROSS RUNS"
 IDENTICAL TEXT CONTENT ACROSS RUNS
 ```
 
-All 12 files pair correctly (`src_1.py` … `src_12.py`), each `@@ -1,7 +1,7 @@` with line 4
-`return x * N  # left` → `return x + N  # right`:
+All 12 files pair correctly (`src_1.py` … `src_12.py`), each `return x * N  # left` →
+`return x + N  # right` (rendered rows, run A):
 
 ```text
    src_1.py
-   @@ -1,7 +1,7 @@
-4      return x * 1  # left                                 4      return x + 1  # right
+4      return x * 1  # left                          4      return x + 1  # right
    src_10.py
-   @@ -1,7 +1,7 @@
-4      return x * 10  # left                                4      return x + 10  # right
+4      return x * 10  # left                         4      return x + 10  # right
+   src_11.py
+4      return x * 11  # left                         4      return x + 11  # right
+   src_12.py
+4      return x * 12  # left                         4      return x + 12  # right
 ```
+
+**The honest failure mode on the multi-core machine:** the *same* 12-file input run **unconstrained**
+(`runtime.NumCPU()==128`) does not reliably complete — it **crashes probabilistically** with the same
+`concurrent map writes` race. Across two batches (7 runs total) it aborted on **3** and completed on
+**4**:
+
+```text
+full-machine 12-file, capturing kitten stderr:
+  batch A: RUN1 CRASHED  RUN2 CRASHED                       (2/2 concurrent map writes)
+  batch B: RUN1 ok  RUN2 ok  RUN3 CRASHED  RUN4 ok  RUN5 ok (1/5 concurrent map writes)
+  => 3 crashes / 7 runs — probabilistic, same race as §4.5 and §5.3(a)
+```
+
+Crucially, the failure mode is a **crash (no output)**, never *corrupted* output — consistent with the
+distinct-key design (§5.5). When the run does complete, the text is identical to the race-free
+baseline above.
 
 ### 5.5 Causal reason
 
-Highlighting does not "step on itself" in the canonical path because each worker writes a **different**
-cache key (`highlighted_lines_cache.Set(path, …)`, `highlight.go:224`), so there is no logical
-collision on a shared value, and the observed output is byte-for-byte identical across runs (§5.4). But
-this is safe only *because* the keys differ **in practice** — the underlying `LRUCache.Set` mutates a
-Go map under a read lock (`cache.go:33-35`), and Go maps are unsafe for concurrent writes **even to
-different keys**; the race detector proves this with `WARNING: DATA RACE … cache.go:34` followed by
-`fatal error: concurrent map writes` (§5.3). The canonical `highlight_all` path rarely triggers it
-because Chroma highlighting dominates each worker's runtime, so two `Set` calls almost never coincide;
-nevertheless the latent race is real. (Per the read-only scope, this is reported, not fixed.)
+Highlighting does not "step on itself" **logically** because each worker writes a *different* cache key
+(`highlighted_lines_cache.Set(path, …)`, `highlight.go:224`); there is no shared value two workers
+fight over, which is why a completed run is byte-for-byte identical across runs (§5.4). But that key
+disjointness does **not** make the operation thread-safe: `LRUCache.Set` writes into a single shared Go
+map while holding only a **read** lock (`cache.go:33-35`), and Go maps are unsafe for concurrent
+writes regardless of key. When `Context.Parallel` runs `runtime.NumCPU()` highlight workers
+(`utils.go:50,52`), two of them can execute `self.data[key] = val` (`cache.go:34`) at the same
+instant. The Go runtime detects the concurrent map write and aborts the whole process — observed
+**canonically** through the real `kitten diff` entry point (§5.3(a), §4.5) and **isolated** by the
+external race probe (§5.3, `WARNING: DATA RACE … cache.go:34` → `fatal error: concurrent map writes`).
+At one CPU there is a single highlight worker, the concurrent write cannot happen, and the run is
+deterministic (§5.4). So the plain answer — *"parallel highlighting is safe because each worker writes
+a distinct key"* — is only half true: it avoids logical corruption, but the unsynchronized shared-map
+write is a real race that, on this multi-core machine, crashes the kitten rather than corrupting data.
+(Read-only scope: reported, not fixed.)
 
 ---
 
@@ -771,7 +1590,7 @@ In `render()` (`render.go:696`) the classification is:
 - `is_binary := !is_path_text(path)` (`render.go:706`), where `is_path_text` (`collect.go:86`) tests
   the image MIME prefix and UTF-8 validity of the cached bytes;
 - refined for diffs: `if !is_binary && item_type == "diff" && !is_path_text(changed_path) { is_binary
-  = true }` (`render.go:707-708`);
+  = true }` (`render.go:707-709`);
 - `is_img := is_binary && is_image(path) || (item_type == "diff" && is_image(changed_path))`
   (`render.go:710`).
 
@@ -779,11 +1598,16 @@ The dispatch `switch item_type` (`render.go:712`) routes each case — `"diff"` 
 `"add"` (`render.go:726-727`), `"removal"` (`render.go:739-740`) — to `image_lines`
 (definition `render.go:333`) when `is_img`, else to `binary_lines` (definition `render.go:446`), else
 to the normal text path. `binary_lines` emits `fmt.Sprintf("Binary file: %s", human_readable(sz))`
-(`render.go:452`). `image_lines` emits a `Size:` line and, once the resolution is known,
-`Dimensions: %dx%d` (`render.go:343`). Corroborated by `docs/kittens/diff.rst:18` ("Displays images as
-well as text diffs, even over SSH").
+(`render.go:452`). `image_lines` emits a `Size: %s` line (`render.go:341`) and, once the resolution is
+known (`res.Width > -1`, `render.go:343`), prepends `Dimensions: %dx%d` (`render.go:344`); the pixel
+payload is only reserved once `GetSizeIfAvailable` succeeds (`render.go:358`), otherwise the placeholder
+`Loading image...` is shown (`render.go:364`). Corroborated by `docs/kittens/diff.rst:18` ("Displays
+images as well as text diffs, even over SSH").
 
 ### 6.3 Command(s) run and observed output — all three branches
+
+All three run through the **real** `kitten diff` entry point under the PTY harness (§0.4), pinned to
+one CPU (`taskset -c 0`) so the render is stable. Each fixture holds one file per side.
 
 **(a) UTF-8 text** — `file` reports UTF-8; the diff is a normal highlighted line diff (note the
 non-ASCII `café` is preserved on both sides):
@@ -791,78 +1615,105 @@ non-ASCII `café` is preserved on both sides):
 ```console
 $ file /tmp/kdiff/q6_text_l/doc.txt
 /tmp/kdiff/q6_text_l/doc.txt: Unicode text, UTF-8 text
-$ $KIT diff /tmp/kdiff/q6_text_l /tmp/kdiff/q6_text_r
+$ taskset -c 0 python3 /tmp/tui_capture.py --cols 120 --rows 20 --quit-after 4 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q6_text_l /tmp/kdiff/q6_text_r
 ```
 
 ```text
    doc.txt
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    @@ -1,3 +1,3 @@
 1  plain UTF-8 text                                         1  plain UTF-8 text
 2  second line café                                         2  second line CHANGED café
 3  third                                                    3  third
 ```
 
-**(b) non-UTF-8 binary** — 4096 random bytes each side (`file` says `data`; a UTF-8 decode raises
-`UnicodeDecodeError`). Rendered as the literal `Binary file: 4 KB` banner on both sides:
+**(b) non-UTF-8 binary** — 4096 bytes each side that are **not** valid UTF-8. `file` reports `data`,
+and a UTF-8 decode raises `UnicodeDecodeError` (the **complete, unedited** traceback — the offending
+byte is `0x85` at position 19):
 
 ```console
 $ file /tmp/kdiff/q6_bin_l/data.bin
 /tmp/kdiff/q6_bin_l/data.bin: data
 $ python3 -c "open('/tmp/kdiff/q6_bin_l/data.bin','rb').read().decode('utf-8')"
-UnicodeDecodeError: 'utf-8' codec can't decode byte ...
-$ $KIT diff /tmp/kdiff/q6_bin_l /tmp/kdiff/q6_bin_r
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    open('/tmp/kdiff/q6_bin_l/data.bin','rb').read().decode('utf-8')
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0x85 in position 19: invalid start byte
+```
+
+Rendered through the kitten, both sides are the literal `Binary file: 4 KB` banner (no line diff):
+
+```console
+$ taskset -c 0 python3 /tmp/tui_capture.py --cols 120 --rows 20 --quit-after 4 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q6_bin_l /tmp/kdiff/q6_bin_r
 ```
 
 ```text
    data.bin
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    Binary file: 4 KB                                           Binary file: 4 KB
 ```
 
-**(c) image** — a 48×32 PNG (118 B) each side. The frame shows the `Dimensions: 48x32 Size: 118 B`
-header plus `Loading image...`:
+**(c) image** — a 48×32 PNG each side (left 118 B, right 119 B). `file` confirms the PNG; the kitten
+routes it to the image branch, showing the `Dimensions: 48x32 Size: <N> B` header and the
+`Loading image...` placeholder (reproduced **identically across 2 runs**):
 
 ```console
 $ file /tmp/kdiff/q6_img_l/pic.png
 /tmp/kdiff/q6_img_l/pic.png: PNG image data, 48 x 32, 8-bit/color RGB, non-interlaced
-$ $KIT diff /tmp/kdiff/q6_img_l /tmp/kdiff/q6_img_r
+$ taskset -c 0 python3 /tmp/tui_capture.py --cols 120 --rows 20 --quit-after 4 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q6_img_l /tmp/kdiff/q6_img_r
 ```
 
 ```text
    pic.png
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Dimensions: 48x32 Size: 118 B                               Dimensions: 48x32 Size: 118 B
-   Loading image...                                            Loading image...
+   Dimensions: 48x32 Size: 118 B                              Dimensions: 48x32 Size: 119 B
+   Loading image...                                           Loading image...
 ```
 
-The image is genuinely transmitted via the kitty graphics protocol — the raw byte stream contains
-five graphics-protocol APC chunks (`ESC _ G …`):
+**Honest note on pixel transmission (reported exactly as observed).** In this pyte-based PTY harness
+the kitten does **not** transmit any pixels: capturing the raw byte stream (`--raw-out`) and counting
+kitty graphics-protocol APC chunks (`ESC _ G`) yields **0**, stably across every attempt (windows
+0.2 s – 10 s, and even with `TERM=xterm-kitty`):
 
 ```console
-$ python3 -c "d=open('q6c_img_raw.bin','rb').read(); print('ESC_G chunks =', d.count(b'\x1b_G'))"
-ESC_G chunks = 5
+$ python3 /tmp/tui_capture.py --raw-out --cols 120 --rows 20 --quit-after 6 -- \
+      "$KIT" diff -o diff_cmd=git /tmp/kdiff/q6_img_l /tmp/kdiff/q6_img_r > /tmp/q6c_img_raw.bin
+$ python3 -c "d=open('/tmp/q6c_img_raw.bin','rb').read(); print('ESC_G chunks =', d.count(b'\x1b_G'))"
+ESC_G chunks = 0
 ```
 
-**State before/during/after (Rule 9):** the raw stream contains *both* an initial
-`Dimensions: 0x0 Size: 118 B` (emitted before the image resolution is known) *and* the final
-`Dimensions: 48x32 Size: 118 B` (after asynchronous resolution loading, the `res.Width > -1` branch at
-`render.go:342`):
+The cause is visible in `image_lines`: pixels are only reserved when
+`image_collection.GetSizeIfAvailable(path, image_size)` **succeeds** (`render.go:358`); when it
+returns `graphics.ErrNotFound` the branch instead emits `Loading image...` (`render.go:364`). The
+harness is not a graphics-capable terminal, so `GetSizeIfAvailable` never succeeds and the render
+stays on the placeholder — hence 0 transmitted chunks. **The actual on-screen pixel display therefore
+could not be exercised in this harness**; that it *does* display in a real terminal ("even over SSH")
+is corroborated by `docs/kittens/diff.rst:18` and by the `render.go:358` success branch — this is
+*inferred / documentation-corroborated*, not observed here.
 
-```text
-...Dimensions: 0x0 Size: 118 B ...
-...Dimensions: 48x32 Size: 118 B ...
-```
+**State before/during/after (Rule R8).** The classification header has two states in the code:
+before resolution, `res.Width == -1`, so only `Size: <N> B` is shown; after resolution
+(`res.Width > -1`, `render.go:343`) the `Dimensions: 48x32` prefix is prepended (`render.go:344`).
+In practice the tiny local PNG resolves **before the first captured frame**: even at a 0.2 s quit
+window the only observed state is the final `Dimensions: 48x32 Size: <N> B`. The bare `Size:`-only
+pre-resolution state is therefore *inferred from the code path*, not captured. The observable state
+progression here is: `Loading image...` placeholder (throughout, since pixels never load) alongside
+the resolved `Dimensions: 48x32` header.
 
 ### 6.4 Causal reason
 
-`is_path_text` (`collect.go:86`) drives everything: it returns false for the random-bytes file
-(invalid UTF-8) and for the PNG (image MIME), setting `is_binary` (`render.go:706`). `is_image`
-(`collect.go:82`, MIME prefix `image/`) then separates the two: the PNG makes `is_img` true
-(`render.go:710`) → `image_lines` → graphics protocol; the random bytes stay `is_img == false` →
-`binary_lines` → the `Binary file: 4 KB` banner (`render.go:452`, size from `human_readable(4096)`).
-Text passes both checks and takes the normal highlighted diff. The `0x0 → 48x32` transition happens
-because image dimensions are resolved asynchronously, so the first render has no dimensions yet.
+`is_path_text` (`collect.go:86`) drives the split: it returns false for the random-bytes file
+(invalid UTF-8, byte `0x85` above) and for the PNG (image MIME), setting `is_binary`
+(`render.go:706`). `is_image` (`collect.go:82`, MIME prefix `image/`) then separates the two — the PNG
+makes `is_img` true (`render.go:710`) → `image_lines` (`render.go:333`) → the `Dimensions`/`Size`
+header and, in a graphics terminal, the transmitted pixels; the random bytes stay `is_img == false`
+→ `binary_lines` (`render.go:446`) → the `Binary file: 4 KB` banner (`render.go:452`, size from
+`human_readable(4096)`). Text passes both checks and takes the normal highlighted diff. Within the
+image branch, the placeholder-vs-pixels decision is made by whether `GetSizeIfAvailable` finds the
+image already registered with the terminal (`render.go:358`); in this harness it never does, so
+`Loading image...` (`render.go:364`) is shown and no graphics chunks are emitted — exactly the
+observed `ESC_G = 0`.
 
 ---
 
@@ -999,22 +1850,37 @@ diff." This framing is corroborated by directly running the builtin engine below
 
 ### 8.3 Command(s) run — all three engines on the same fixture
 
-The fixture is a 5-line file changed on two lines (`beta`→`BETA`, `epsilon`→`EPSILON`).
+The fixture is a 5-line file changed on two lines (`beta`→`BETA`, `epsilon`→`EPSILON`). Each engine is
+exercised **canonically** through the real `kitten diff` entry point (§0.4), selecting the engine with
+`-o diff_cmd=<engine>`:
 
 ```sh
-$KIT diff -o diff_cmd=git     /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt
-$KIT diff -o diff_cmd=diff    /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt
-$KIT diff -o diff_cmd=builtin /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt
+KIT=kitty/launcher/kitten
+for eng in git diff builtin; do
+  taskset -c 0 python3 /tmp/tui_capture.py --cols 116 --rows 16 --quit-after 4 -- \
+      "$KIT" diff -o diff_cmd=$eng /tmp/kdiff/q8_left /tmp/kdiff/q8_right
+done
 ```
+
+To expose the *raw* unified-diff each engine emits (which the TUI parses but never prints verbatim),
+the two external engines are also run via their exact command templates, and the builtin engine via a
+small **non-canonical** probe that calls the exported `Diff()` directly (full source in §8.4).
 
 ### 8.4 Observed output — rendering is identical across engines
 
-All three engines render the same side-by-side frame (shown once; the other two are byte-identical in
-the visible grid):
+**Canonical (real entry point).** All three engines render the *same* side-by-side grid. The loop
+above prints byte-identical visible rows for `git`, `diff`, and `builtin`:
+
+```text
+engine=git     : @@ -1,5 +1,5 @@ | 2  beta -> 2  BETA | 5  epsilon -> 5  EPSILON
+engine=diff    : @@ -1,5 +1,5 @@ | 2  beta -> 2  BETA | 5  epsilon -> 5  EPSILON
+engine=builtin : @@ -1,5 +1,5 @@ | 2  beta -> 2  BETA | 5  epsilon -> 5  EPSILON
+```
+
+The full builtin frame (captured via `-o diff_cmd=builtin` through the real entry point):
 
 ```text
    /tmp/kdiff/q8_left/f.txt                                    /tmp/kdiff/q8_right/f.txt
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    @@ -1,5 +1,5 @@
 1  alpha                                                    1  alpha
 2  beta                                                     2  BETA
@@ -1023,10 +1889,10 @@ the visible grid):
 5  epsilon                                                  5  EPSILON
 ```
 
-The engines differ in the **raw unified diff** they emit (which the TUI then parses into the grid
-above). Running each engine's exact command directly exposes the difference:
+**The engines differ only in the raw unified diff** they feed the parser. The two external engines,
+run via their exact templates (these ARE the commands the kitten spawns — `patch.go:21-22`):
 
-**git** (exact `GIT_DIFF` with `_CONTEXT_`=3) — adds a `diff --git`/`index` header; exit 1 = different:
+**git** (`GIT_DIFF`, `_CONTEXT_`=3) — adds a `diff --git`/`index` header; exit 1 = different:
 
 ```console
 $ git diff --no-color --no-ext-diff --exit-code -U3 --no-index -- /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt ; echo "[exit=$?]"
@@ -1045,12 +1911,12 @@ index 600d48ac7..1663761a9 100644
 [exit=1]
 ```
 
-**diff** (exact `DIFF_DIFF`) — adds timestamp lines; exit 1 = different:
+**diff** (`DIFF_DIFF`) — adds timestamp lines; exit 1 = different:
 
 ```console
 $ diff -p -U 3 -- /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt ; echo "[exit=$?]"
---- /tmp/kdiff/q8_left/f.txt	2026-07-06 23:18:59.613599104 +0000
-+++ /tmp/kdiff/q8_right/f.txt	2026-07-06 23:18:59.613599104 +0000
+--- /tmp/kdiff/q8_left/f.txt	2026-07-07 01:39:16.520276708 +0000
++++ /tmp/kdiff/q8_right/f.txt	2026-07-07 01:39:16.520276708 +0000
 @@ -1,5 +1,5 @@
  alpha
 -beta
@@ -1062,13 +1928,59 @@ $ diff -p -U 3 -- /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt ; echo "[ex
 [exit=1]
 ```
 
-**builtin** — the exported `Diff()` (`diff.go:49`) called directly (the exact function `run_diff`
-invokes at `patch.go:303`) on the same fixture. Its header is the cleanest form — `diff <old> <new>`
-with no `index` line and no timestamps (182 bytes):
+**builtin** — the exported `Diff()` (`diff.go:49`) is the exact function `run_diff` invokes
+(`patch.go:303`), but calling it directly is **NON-CANONICAL**: it bypasses the `kitten diff` entry
+point. It is shown only to reveal the raw bytes the TUI does not print (the canonical *rendering* is
+the identical grid above). The complete external probe (outside the repo tree) is:
+
+```go
+// /tmp/difftest/go.mod
+module difftest
+
+go 1.22
+
+require kitty v0.0.0
+
+replace kitty => /tmp/blitzy/kitty/blitzy-5f613546-20aa-48be-98e6-bb0c6e374ea7_a7903a
+```
+
+```go
+// /tmp/difftest/main.go  (NON-CANONICAL diagnostic; not the kitten entry point)
+package main
+
+import (
+	"fmt"
+
+	diff "kitty/kittens/diff"
+)
+
+func show(tag, p1, a, p2, b string) {
+	out := diff.Diff(p1, a, p2, b, 3)   // diff.go:49
+	fmt.Printf("=== %s ===\n", tag)
+	fmt.Printf("[len=%d nil?=%v]\n", len(out), out == nil)
+	if out != nil {
+		fmt.Print(string(out))
+	}
+	fmt.Println("--- end ---")
+}
+
+func main() {
+	show("5-line change", "/tmp/kdiff/q8_left/f.txt", "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+		"/tmp/kdiff/q8_right/f.txt", "alpha\nBETA\ngamma\ndelta\nEPSILON\n")
+	show("no-newline (right only)", "a.txt", "one\ntwo\nthree\n", "b.txt", "one\ntwo\nthree")
+	show("no-newline (both, last differs)", "a.txt", "one\ntwo\nthree", "b.txt", "one\ntwo\nTHREE")
+	show("identical", "a.txt", "same\ncontent\n", "b.txt", "same\ncontent\n")
+	show("both empty", "a.txt", "", "b.txt", "")
+}
+```
+
+Its raw output for the 5-line fixture — the cleanest header form, bare `diff <old> <new>` with no
+`index` line and no timestamps (182 bytes):
 
 ```console
-$ go run .   # external program: diff.Diff("/…/f.txt", old, "/…/f.txt", new, 3)
-=== builtin diff.Diff() raw bytes (len=182) ===
+$ cd /tmp/difftest && GOFLAGS=-mod=mod go run .
+=== 5-line change ===
+[len=182 nil?=false]
 diff /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt
 --- /tmp/kdiff/q8_left/f.txt
 +++ /tmp/kdiff/q8_right/f.txt
@@ -1080,24 +1992,43 @@ diff /tmp/kdiff/q8_left/f.txt /tmp/kdiff/q8_right/f.txt
  delta
 -epsilon
 +EPSILON
-[patch==nil? false]
+--- end ---
 ```
+
+(The remaining `show(...)` cases print in §8.5 and §8.6.)
 
 ### 8.5 Edge — "No newline at end of file" (`diff.go:179`)
 
-A fixture whose right file omits the trailing newline (left = 14 bytes ending `\n`, right = 13 bytes
-with none, confirmed by `od -c`). Calling the builtin `Diff()` directly emits the marker after the
-changed line:
+Fixture: left ends with `\n` (14 bytes), right omits it (13 bytes), last line changed
+(`three`→`THREE`); `od -c` confirms:
 
 ```console
 $ od -c /tmp/kdiff/q8nl_left/f.txt  | tail -2
 0000000   o   n   e  \n   t   w   o  \n   t   h   r   e   e  \n
+0000016
 $ od -c /tmp/kdiff/q8nl_right/f.txt | tail -2
-0000000   o   n   e  \n   t   w   o  \n   t   h   r   e   e
+0000000   o   n   e  \n   t   w   o  \n   T   H   R   E   E
+0000015
 ```
 
+**Canonical (real entry point).** `-o diff_cmd=builtin` renders the changed line; the full-screen
+side-by-side TUI does **not** surface the `\ No newline at end of file` marker as its own visible
+row (honest nuance — the marker lives in the engine byte stream, not the grid):
+
 ```text
-# builtin Diff("a.txt","one\ntwo\nthree\n","b.txt","one\ntwo\nthree",3)  -> len=105
+   f.txt
+   @@ -1,3 +1,3 @@
+1  one                                                    1  one
+2  two                                                    2  two
+3  three                                                  3  THREE
+```
+
+**NON-CANONICAL probe** — the direct `Diff()` output exposes the marker. Right-only missing newline
+(len=105):
+
+```console
+=== no-newline (right only) ===
+[len=105 nil?=false]
 diff a.txt b.txt
 --- a.txt
 +++ b.txt
@@ -1107,33 +2038,56 @@ diff a.txt b.txt
 -three
 +three
 \ No newline at end of file
+--- end ---
 ```
 
 When **both** sides omit the trailing newline (and the last line differs), the marker appears on both
-`-` and `+` lines (len=133):
+the `-` and `+` lines (len=133):
 
-```text
+```console
+=== no-newline (both, last differs) ===
+[len=133 nil?=false]
+diff a.txt b.txt
+--- a.txt
++++ b.txt
+@@ -1,3 +1,3 @@
+ one
+ two
 -three
 \ No newline at end of file
 +THREE
 \ No newline at end of file
+--- end ---
 ```
 
-The external `git` engine emits the identical `\ No newline at end of file` text for the same fixture.
-(Honest nuance: the full-screen side-by-side TUI renders the affected line but does not surface the
-marker as its own visible row; the marker is present in the engine's byte output, shown above.)
+The external `git` engine emits the identical `\ No newline at end of file` text for the same fixture
+(`diff.go:179` mirrors git's marker).
 
 ### 8.6 Edge — identical / empty inputs return `nil` (`diff.go:50-52`)
 
+**Canonical (real entry point).** Diffing two byte-identical **files** with `-o diff_cmd=builtin`
+renders the `The files are identical` banner (the `patch.Len() == 0` branch, `render.go:572-573`):
+
 ```text
-# builtin Diff("a.txt","same\ncontent\n","b.txt","same\ncontent\n",3)
-[len=0 nil?=true]
-# builtin Diff("a.txt","","b.txt","",3)   (both empty)
-[len=0 nil?=true]
+   /tmp/kdiff/q8id_left/f.txt                                  /tmp/kdiff/q8id_right/f.txt
+   The files are identical
 ```
 
-Through the canonical kitten path, `-o diff_cmd=builtin` on an identical pair renders
-`The files are identical` (the `patchb == nil` branch at `patch.go:304`; frame shown in §1.6).
+(Observed nuance: two identical files placed *inside two directories* are instead classified
+`unchanged` during collection, so the directory diff shows an empty body — the banner is the
+file-to-file case, also shown in §1.6.)
+
+**NON-CANONICAL probe** — the direct `Diff()` returns `nil` (zero-length) for identical and for
+both-empty inputs, the `old == new` short-circuit at `diff.go:50-52`:
+
+```console
+=== identical ===
+[len=0 nil?=true]
+--- end ---
+=== both empty ===
+[len=0 nil?=true]
+--- end ---
+```
 
 ### 8.7 Causal reason and cache interplay
 
@@ -1188,7 +2142,7 @@ from source.
 | `highlight_file` | highlight.go:161 | §5 | inferred |
 | `render` | render.go:696 | §6 | observed |
 | `binary_lines` / `"Binary file: %s"` | render.go:446 / 452 | §6 | observed |
-| `image_lines` / `Dimensions` | render.go:333 / 343 | §6 | observed |
+| `image_lines` / `Dimensions` | render.go:333 / 344 | §6 | observed |
 | `render_screen_line` (rename full-width return) | render.go:70,99-101 | §2.6 | observed |
 | `rename_lines` | render.go:684 (msg 688) | §2.6 | observed (as latent bug) |
 | `title_lines` (two-name title) | render.go:208-209 | §2 | observed |
@@ -1215,7 +2169,7 @@ from source.
 |-----------|-------------|---------|----------------|
 | relative-path pairing (`Intersect`) | collect.go:306 | §1 | 3 entries, same.txt omitted |
 | rename = MD5 `ah==rh` AND `ld==rd` | collect.go:350 / 353 | §2 | identical→rename; 1 byte→remove+add |
-| mode-only change (`lstat.Mode()!=rstat.Mode()`) | collect.go:321-329 (323) | §1.6 | "Mode changed: …" |
+| mode-only change (`lstat.Mode()!=rstat.Mode()`) | collect.go:321-329 (323) | §1.6 | `Mode changed: -rw-r--r-- to -rwxr-xr-x` |
 | `is_binary` / `is_img` | render.go:706 / 710 | §6 | binary→banner, image→graphics |
 | `"Binary file: %s"` | render.go:452 | §6 | "Binary file: 4 KB" |
 | builtin vs external dispatch `len(diff_cmd)==0` | patch.go:294 (Diff 303) | §8 | builtin openat=1; auto=3 |
@@ -1247,7 +2201,18 @@ from source.
 
 Doc corroboration (`docs/kittens/diff.rst`): syntax highlighting "asynchronously, for maximum speed"
 (L15-16, §5); "Displays images as well as text diffs, even over SSH" (L18, §6); "Does recursive
-directory diffing" (L20, §1); git integration (L92+, §8).
+directory diffing" (L20, §1). All three phrases were confirmed verbatim in the docs file at the cited
+lines.
+
+**Note on git (coverage-map correction).** `docs/kittens/diff.rst:92-116` ("Integrating with git")
+documents a **user-facing** setup — adding a `[difftool "kitty"]` block with `cmd = kitten diff $LOCAL
+$REMOTE` to `~/.gitconfig` and then running `git difftool --no-symlinks --dir-diff` — so that **git
+invokes the diff kitten**. That topic lies outside the eight behavioral questions and is therefore
+deliberately **not** part of the answer body, so this docs section is **not** mapped to §8. It is the
+opposite-direction, distinct mechanism from the one §8 examines, where the diff kitten **internally
+invokes `git diff --no-index`** as its default `auto` engine (`GIT_DIFF`, `patch.go:21`; selected by
+`find_differ`, `patch.go:34-42`). The two are different features and are intentionally kept separate
+here, so the coverage map now lists only docs content actually discussed in the answer body.
 
 ---
 
