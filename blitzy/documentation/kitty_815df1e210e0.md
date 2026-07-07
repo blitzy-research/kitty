@@ -659,7 +659,10 @@ $ $KIT diff /tmp/kdiff/mo_left /tmp/kdiff/mo_right
 ```
 
 **Ignore-glob filtering** — the walk drops entries whose basename matches any `ignore_name` glob via
-`allowed` (`collect.go:230`, doublestar glob). The default `ignore_name` is **empty** (`main.py:56`),
+`allowed` (`collect.go:230`), which tests each pattern against the file's basename with Go's
+standard-library `filepath.Match` (`collect.go:233`) — the diff kitten does **not** use the
+`doublestar` package for this filter (`collect.go:5-14` imports only `path/filepath`; a `grep` for
+`doublestar` in `kittens/diff/` returns nothing). The default `ignore_name` is **empty** (`main.py:56`),
 so by default nothing is ignored (the `.git`/`*~`/`*.pyc` values in the `main.py:63-65` help text are
 documentation examples, not active defaults). With a fixture containing
 `{#draft#, keep.txt, mod.pyc, notes.txt~}` on each side, the default run shows all four; supplying the
@@ -2209,7 +2212,7 @@ from source.
 |------------|---------|----------|------|
 | Go runtime | 1.22 | go.mod:3 | build |
 | `github.com/alecthomas/chroma/v2` | v2.14.0 | go.mod:7 | syntax highlighting (§5) |
-| `github.com/bmatcuk/doublestar/v4` | v4.6.1 | go.mod:8 | `ignore_name` globs (§1.6) |
+| `github.com/bmatcuk/doublestar/v4` | v4.6.1 | go.mod:8 | present in `go.mod` but **not** imported by the diff kitten; `ignore_name` matching uses stdlib `filepath.Match` (`collect.go:233`, §1.6) |
 | `github.com/kovidgoyal/imaging` | v1.6.3 | go.mod:13 | image decode/scale (§6) |
 | `github.com/edwvee/exiffix` | v0.0.0-20240229113213 | go.mod:10 | EXIF-aware image load (§6) |
 | `golang.org/x/image` | v0.17.0 | go.mod:18 | image formats (§6) |
