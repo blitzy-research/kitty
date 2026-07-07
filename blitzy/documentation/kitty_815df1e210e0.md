@@ -146,7 +146,7 @@ $ wid=$(xdotool search --class kitty | head -1); xdotool windowfocus "$wid"
 $ xdotool key --clearmodifiers a; xdotool key --clearmodifiers b; xdotool key --clearmodifiers Return
 ```
 
-Captured output — the **complete, unedited** log for all three keystrokes (`a`, `b`, `Return`), shown exactly as `cat -v` renders the raw log file (ESC = `^[`; only the `[seconds]` timestamps vary between runs):
+Captured output — the **complete, unedited** log for all three keystrokes (`a`, `b`, `Return`), shown exactly as `cat -v` renders the raw stderr log file (ESC = `^[`). Across runs, the **substantive** keyboard lines are identical except for the volatile `[seconds]` timestamp prefix; the headless framing artifacts (XKB‑init, systemd‑bus, and focus notices) may additionally vary in count and timing, so what follows is one representative capture:
 
 ```text
 [0.061] Loading new XKB keymaps
@@ -167,10 +167,9 @@ Captured output — the **complete, unedited** log for all three keystrokes (`a`
 [1.425] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
 [1.431] ^[[32mRelease^[[m xkb_keycode: 0x24 clean_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
 [1.431] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
-Got XkbNewKeyboardNotify event with changes: key codes: 1 geometry: 1 device id: 0
 ```
 
-> **On the non‑keyboard lines.** The first four lines and the trailing `Got XkbNewKeyboardNotify …` line are headless‑environment artifacts, not pipeline events, and are retained only so the block is genuinely complete and unedited: `Loading new XKB keymaps` / `Modifier indices …` are XKB keymap initialisation (`glfw/xkb_glfw.c:672` and `:376`), `Failed to open systemd user bus …` reflects the container having no session bus, `^[[35mon_focus_change^[[m` (`kitty/glfw.c`) fires when Xvfb gives the window focus, and `Got XkbNewKeyboardNotify …` is an X‑server notice emitted at teardown. The substantive keyboard events are the `Press` / `Release` / `on_key_input` lines. Note that all three keys produce a `Press … xkb_keycode` line **before** their paired `on_key_input:` line — `a` (`0x26`), `b` (`0x38`), and `Return` (`0x24`) — which is the observable proof that the GLFW/XKB layer receives every event first.
+> **On the non‑keyboard lines.** The non‑keyboard lines in this stderr log are headless‑environment artifacts, not pipeline events, and are retained only so the block is genuinely complete and unedited: `Loading new XKB keymaps` / `Modifier indices …` are XKB keymap initialisation (`glfw/xkb_glfw.c:672` and `:376`) — the X server may (re)initialise the keymap once or twice per session, so this pair can appear more than once; `Failed to open systemd user bus …` reflects the container having no session bus; and `^[[35mon_focus_change^[[m` (`kitty/glfw.c:517`) fires when Xvfb gives the window focus. (Under `--debug-keyboard`, kitty can *additionally* print a non‑deterministic `Got XkbNewKeyboardNotify …` notice — but via `printf` to **stdout** at `glfw/x11_window.c:1200`, block‑buffered so it flushes at process exit; being on stdout it is **not** part of this stderr log and is not a pipeline event, so it is not shown above.) The substantive keyboard events are the `Press` / `Release` / `on_key_input` lines. Note that all three keys produce a `Press … xkb_keycode` line **before** their paired `on_key_input:` line — `a` (`0x26`), `b` (`0x38`), and `Return` (`0x24`) — which is the observable proof that the GLFW/XKB layer receives every event first.
 
 ### Reading the evidence (cause → effect)
 
