@@ -80,20 +80,22 @@ $ git log --oneline -1 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 815df1e21 Wire up applying of font config
 ```
 
-This answer document is added as a **follow-on commit** on the working branch
-`blitzy-c0111083-82c0-4e78-990d-87d434a60e48`; once committed, the document itself is `HEAD` and the
-documented source tree is its parent, `HEAD~1`:
+This answer document is added as one or more **documentation-only commits** on the working branch
+`blitzy-c0111083-82c0-4e78-990d-87d434a60e48`, layered on top of that source commit. Because further
+documentation-only commits may later be stacked above the source, the documented source tree is
+**not** reliably reached by a fixed relative reference such as `HEAD~1` or `HEAD~2`; always locate it
+by the absolute hash `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (as in the `git log --oneline -1
+<hash>` check above), which resolves to the same commit no matter how many documentation commits sit
+on top:
 
 ```
-$ git log --oneline -2
-{doc commit}   docs: add runtime-grounded SSH kitten end-to-end explanation   # this document (HEAD)
-815df1e21      Wire up applying of font config                                # documented source (HEAD~1)
+$ git rev-parse 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # source located by absolute hash, never HEAD~N
+815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 ```
 
-(At authoring time — before the document was committed — `git rev-parse HEAD` returned the source
-hash `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` directly; after the doc commit it advances by one,
-which is why the source is now reached as `HEAD~1`. The source files themselves are untouched, so
-all citations remain exact.)
+The documentation commits touch only this file under `blitzy/documentation/` — never any cited source
+file — so every `file:line` citation remains exact against the unchanged source tree regardless of the
+branch's relative history.
 
 **Toolchain** (the "default canonical configuration" facts):
 
