@@ -16,12 +16,13 @@ This investigation was performed by **building the `fast_data_types` C extension
 |------|-------|
 | Repository | kitty (terminal emulator) |
 | Branch (documentation name) | `kitty_815df1e210e0` |
-| HEAD commit | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (unchanged before and after the investigation) |
+| Base commit (investigation target) | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` — the revision all `file:line` citations and observed behavior pertain to |
+| kitty source tree | Byte‑for‑byte unchanged from the base commit, before and after the investigation; the only content added on top of the base commit is this document, so the branch HEAD advances past the base commit as the documentation deliverable is committed (verified: `git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD` lists only `blitzy/documentation/kitty_815df1e210e0.md`) |
 | Checkout root (on disk) | `/tmp/blitzy/kitty/blitzy-272eab58-bd8e-4c5f-bc07-aa70eba24877_c54bda` |
 | Python | 3.13.7 |
 | C compiler | gcc 15.2.0, C11 (`-std=c11` [setup.py:492]) |
 
-All `file:line` citations in this document were verified byte‑exact against this HEAD.
+All `file:line` citations in this document were verified byte‑exact against this base commit.
 
 ### 1.2 Canonical build
 
@@ -53,7 +54,7 @@ Observation follows kitty's own headless test harness — `create_lbuf` [kitty_t
 
 ### 1.4 Methodology (binding rules, satisfied)
 
-- **Ran the code first, then wrote.** The extension was built and the real rewrap path executed *before* any prose was written, and every fenced runtime block below is verbatim captured output. To keep the evidence honest, claims are drawn from three explicitly distinguished classes: **runtime‑observed** — backed by the captured output shown adjacent to the claim (all buffer states, cursor positions, continuation bits, counts, and the reproduced symptom); **source‑verified** — statements about C control flow, macro parameterization, and function/step sequencing that are fixed at compile time and therefore cannot be emitted as runtime data, confirmed by reading the cited `file:line` at this HEAD and marked **(source‑verified)**; and **inferred** — the few interpretive conclusions beyond both, marked **(inferred)**. Where a behavior is observable it was observed rather than asserted.
+- **Ran the code first, then wrote.** The extension was built and the real rewrap path executed *before* any prose was written, and every fenced runtime block below is verbatim captured output. To keep the evidence honest, claims are drawn from three explicitly distinguished classes: **runtime‑observed** — backed by the captured output shown adjacent to the claim (all buffer states, cursor positions, continuation bits, counts, and the reproduced symptom); **source‑verified** — statements about C control flow, macro parameterization, and function/step sequencing that are fixed at compile time and therefore cannot be emitted as runtime data, confirmed by reading the cited `file:line` at this base commit and marked **(source‑verified)**; and **inferred** — the few interpretive conclusions beyond both, marked **(inferred)**. Where a behavior is observable it was observed rather than asserted.
 - **Real entry point only.** Resize is driven through `Screen.resize` and the headless `LineBuf.rewrap` / `HistoryBuf.rewrap` entries that the shipped tests use — never the bypassing remote‑control hook `resize_os_window` [kitty/boss.py:1543].
 - **Both directions + edges.** Widening (soft‑wrap splitting) and narrowing (line joining + history spill) are both exercised, along with the line‑0 / last‑line edge branches and the `scrollback_fill_enlarged_window` flag on and off, plus the dummy‑char insert/remove and prompt‑preservation copy‑back edge branches (§5.5).
 - **Before / during / after + boundary.** State is captured before, at the intermediate narrow step, and after, and specifically at the screen/history boundary.
@@ -726,5 +727,5 @@ for run in (1, 2, 3):
 
 - **Issues are identified and explained only — not fixed.** No remediation was applied.
 - **Repository left unchanged.** No kitty source file (C, Python, Go, GLSL, docs, tests, config) was created, modified, or deleted. The only artifact produced is this document under `blitzy/documentation/`.
-- **Temporary script deleted.** `/tmp/obs_consolidated.py` and its captured output live in `/tmp` and are removed after use; `git status --porcelain` shows the source tree byte‑for‑byte unchanged at HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
+- **Temporary script deleted.** `/tmp/obs_consolidated.py` and its captured output live in `/tmp` and are removed after use; `git status --porcelain` shows the source tree byte‑for‑byte unchanged from the base commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; that base commit is the revision this investigation targets, and `git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD` lists only this document as added on top of it (the branch HEAD advances past the base commit solely because the documentation deliverable is committed).
 
