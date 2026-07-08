@@ -641,6 +641,43 @@ new_os_window
 launch python3 /tmp/kitty_probe/reader.py BWIN /tmp/kitty_probe/r1_5_B.log 20
 ```
 
+The raw-stdin reader harness `reader.py` used by window B here — and reused unchanged in the R4 scenarios of section (e) — is a small per-child witness. It puts its own stdin (the PTY slave the child was given) into raw mode and appends exactly one `BYTES` line per `read()`, carrying a monotonic timestamp, the byte count, and the exact `repr()` of the bytes, bracketed by `READER_STARTED`/`READER_ENDED` markers. Its full source is reproduced here so every `BYTES`/`READER_STARTED`/`READER_ENDED` line quoted in sections (b) and (e) can be traced to the exact code that emitted it [observed — running this source reproduces the log format shown throughout and the R4.1 focus-follows-input result of section (e)]:
+
+```python
+#!/usr/bin/env python3
+"""Per-child raw-stdin witness: logs every byte delivered to this child's PTY.
+Usage: reader.py <TAG> <logfile> <seconds>
+Emits one BYTES line per read() with a monotonic timestamp and the bytes repr()."""
+import os, sys, time, select, termios, tty
+
+tag = sys.argv[1] if len(sys.argv) > 1 else "WIN"
+logf = sys.argv[2] if len(sys.argv) > 2 else "/tmp/reader.log"
+dur = float(sys.argv[3]) if len(sys.argv) > 3 else 20.0
+
+fd = 0
+try:
+    old = termios.tcgetattr(fd); tty.setraw(fd)
+except Exception:
+    old = None
+f = open(logf, "w", buffering=1)
+f.write(f"READER_STARTED {tag} {time.time():.6f} mono={time.monotonic():.6f}\n")
+end = time.monotonic() + dur
+try:
+    while time.monotonic() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if fd in r:
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            f.write(f"BYTES {tag} t={time.monotonic():.6f} n={len(data)} {data!r}\n")
+finally:
+    if old is not None:
+        try: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception: pass
+    f.write(f"READER_ENDED {tag} {time.time():.6f} mono={time.monotonic():.6f}\n")
+    f.close()
+```
+
 The complete `--debug-input` log therefore contains only the session's two focus transitions and the five keys (`h e l l o`) typed into the focused window B:
 
 ```
@@ -2434,7 +2471,7 @@ The kitty I/O thread is created in `kitty/child-monitor.c` — `io_loop` is decl
 
 This section answers R4: *what happens to input generated for a window that is no longer focused or has just been closed, and how you can tell from runtime behavior.* The routing model established in sections (c) and (d) predicts the answer: the recipient is whatever `active_window()` returns **at the moment the event is processed** — the active window of the active tab of the OS window that received the platform event, selected in C at `kitty/keys.c:106-111` and consulted by `on_key_input` at `kitty/keys.c:166` [observed — sections (c)/(d)]. "Which window gets the keys" is therefore a property of *current focus*, not of which window a burst of keys was "intended" for [inferred from the routing code; confirmed by the three runtime scenarios below].
 
-Each scenario below reads the outcome from **two independent lenses** so the conclusion does not rest on a single artifact: (1) a per-child raw-stdin witness `reader.py` that logs every byte its PTY actually delivers (ground truth for *bytes per child*), and (2) the `--debug-input` trace (ground truth for *what the router did*). `reader.py` puts its stdin into raw mode and appends one `BYTES` line per `read()` with a monotonic timestamp and the exact bytes `repr()`; it is reproduced in full in section (b) and is byte-for-byte the same file used here [observed].
+Each scenario below reads the outcome from **two independent lenses** so the conclusion does not rest on a single artifact: (1) a per-child raw-stdin witness `reader.py` that logs every byte its PTY actually delivers (ground truth for *bytes per child*), and (2) the `--debug-input` trace (ground truth for *what the router did*). `reader.py` puts its stdin into raw mode and appends one `BYTES` line per `read()` with a monotonic timestamp and the exact bytes `repr()`; its full source is reproduced in section (b) (the R1.5 background-output scenario) and the same harness is reused unchanged in every R4 scenario below [observed].
 
 ### Method note (R4.4): focus is changed with a real X focus change, because there is no window manager
 
