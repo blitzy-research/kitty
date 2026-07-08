@@ -59,13 +59,48 @@ Toolchain in the container: Python 3.12.3, Go 1.23.4, gcc 13.3.0, pkg‑config 1
 The default build is `python3 setup.py` — this is exactly what the `Makefile` `all:` target runs
 (`Makefile:L12-13` → `python3 setup.py $(VVAL)`):
 
+A cold, from‑scratch canonical build compiles the C extension (122 translation units), links it and
+the launcher, then builds the Go kittens/tools — **332 lines total**, ending in `SETUP_EXIT=0`. The
+complete, unedited 332‑line log is reproduced in the appendix (§9.6); its head and tail are shown here
+(the head includes the two `kitty/vt-parser.c` compile steps that §2.2 relies on):
+
 ```
 $ cd /app                      # repository root, bind-mounted into the container
 $ python3 setup.py             # canonical build (Makefile all:)
-...
-kitty/tools/cmd/at
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[4/122] Compiling [x11] glfw/x11_window.c ...
+[5/122] Compiling kitty/glfw.c ...
+[6/122] Compiling kitty/graphics.c ...
+[7/122] Compiling kitty/child-monitor.c ...
+[8/122] Compiling kitty/fonts.c ...
+[9/122] Compiling kitty/shaders.c ...
+[10/122] Compiling kitty/vt-parser.c ...
+[11/122] Compiling kitty/vt-parser.c ...
+[12/122] Compiling kitty/state.c ...
+```
+
+*C compile steps `[13/122]`–`[122/122]` (110 further `Compiling` lines) follow, then the link phase
+(complete log in §9.6):*
+
+```
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
+```
+
+*Then ≈202 lines of Go package / kitten / tool compilation follow (`go build -v` prints each package
+path). The log ends:*
+
+```
 kitty/tools/cmd/tool
 kitty/tools/cmd/completion
+kitty/tools/cmd
 SETUP_EXIT=0
 ```
 
@@ -79,9 +114,12 @@ $ ls -la kitty/fast_data_types*.so kitty/launcher/kitty
 
 ### 2.2 This is the canonical (no `DUMP_COMMANDS`) build
 
-The `DUMP_COMMANDS` variant is a **separate compile** that is only defined for the aliased source
-`kitty/vt-parser-dump.c`; the default `kitty/fast_data_types.so` compiles `kitty/vt-parser.c`
-**without** `DUMP_COMMANDS` (`setup.py:L722`):
+The build log above already shows the tell‑tale sign: `kitty/vt-parser.c` is compiled **twice** —
+steps `[10/122]` and `[11/122]` (§2.1, §9.6). The `DUMP_COMMANDS` variant is a **separate compile**
+that is only defined for the aliased source `kitty/vt-parser-dump.c`; the default
+`kitty/fast_data_types.so` compiles `kitty/vt-parser.c` **without** `DUMP_COMMANDS`
+(`setup.py:L721-722`) — the two compile steps are the canonical (no‑`DUMP_COMMANDS`) object and the
+aliased dump‑variant object, respectively:
 
 ```
 $ sed -n '721,722p' setup.py
@@ -196,7 +234,7 @@ Key facts from this switch:
 #### Runtime proof of the three callback forms and the no‑op `B`
 
 **Command** (PROBE C — records every `cmd_output_marking(is_start, data)` the real parser fires for
-each marker fed individually; full script in Appendix §A.3):
+each marker fed individually; full script in Appendix §9.5):
 
 ```
 $ cd /app && ./kitty/launcher/kitty +launch /tmp/osc133_probe_c.py
@@ -243,7 +281,7 @@ kitty/window.py:1460           else:
 kitty/window.py:1461               self.handle_cmd_end(cmdline)
 ```
 
-`handle_cmd_end()` (`kitty/window.py:L1408-1432`) is where the exit status is recorded:
+`handle_cmd_end()` (`kitty/window.py:L1408-1451`) is where the exit status is recorded:
 
 ```
 kitty/window.py:1408       def handle_cmd_end(self, exit_status: str = '') -> None:
@@ -300,7 +338,7 @@ kitty_tests/__init__.py:79                       self.last_cmd_exit_status = int
 `Callbacks.last_cmd_exit_status` is initialized to `sys.maxsize` (`L48`, reset to `sys.maxsize` in
 `clear()` at `L106`). Because `suppress` swallows the `ValueError` from `int()` on a malformed value,
 the assignment is skipped and the **prior value is retained** — this diverges from the real `Window`
-receiver and is treated as **non‑canonical** for Q3 (see §5.4 and §6).
+receiver and is treated as **non‑canonical** for Q3 (see §6.2 and §6.3).
 
 ---
 
@@ -314,7 +352,7 @@ def osc(payload): return ESC + b']' + payload + BEL
 data = osc(b'133;A') + osc(b'133;B') + osc(b'133;C;cmdline=ls -la') + b'total 0\n' + osc(b'133;D;42')
 ```
 
-**Command** (PROBE A; full script in Appendix §A.1):
+**Command** (PROBE A; full script in Appendix §9.3):
 
 ```
 $ cd /app && ./kitty/launcher/kitty +launch /tmp/osc133_probe_a.py
@@ -465,33 +503,54 @@ For the recorded exit status, the canonical source is the **real `kitty/window.p
 not the test‑harness `Callbacks`. A genuine `Window` requires a live `Boss` / OS‑window / child process
 and cannot be constructed headlessly, so — per the sanctioned fallback — PROBE B executes the **real,
 unmodified shipped bytecode** of `Window.cmd_output_marking` (`kitty/window.py:L1453-1461`) and
-`Window.handle_cmd_end` (`kitty/window.py:L1408-1432`) bound to a scaffolded state object. **Only the
-surrounding state is scaffolded** (and the terminal `notify_with_command` collaborator is captured to
-avoid emitting a real desktop notification); the `int()`/`except` logic, the watcher payload, the option
-gate, and the body string are all produced by the real bytecode. The recording is **armed by the real
-`C` marker path** first (a prior `C` is required — see §6, nuance #3).
+`Window.handle_cmd_end` (`kitty/window.py:L1408-1451`) bound to a scaffolded state object. **Only the
+surrounding state is scaffolded** (and the terminal `notify_with_command` collaborator — the call at
+`kitty/window.py:L1433` — is captured to avoid emitting a real desktop notification); the
+`int()`/`except` logic, the watcher payload, the option gate, and the body string are all produced by
+the real bytecode. The recording is **armed by the real
+`C` marker path** first (a prior `C` is required — see the prior-`C` gating note in §7.1).
 
-**Command** (PROBE B; full script in Appendix §A.2):
+**Command** (PROBE B; full script in Appendix §9.4):
 
 ```
 $ cd /app && ./kitty/launcher/kitty +launch /tmp/osc133_probe_b.py
 ```
 
-**Complete, unedited output (RUN 1; RUN 2 is identical except for the monotonic `time` field — see §7):**
+**Complete, unedited output — BOTH internal runs (RUN 1 and RUN 2) of a single `osc133_probe_b.py` invocation. Every reported value is identical across the two runs (and across two separate whole-script invocations); the ONLY field that differs run-to-run is the monotonic `time` timestamp — see §7.2 for the byte-level stability proof:**
 
 ```
+
 ========================================================================
 CANONICAL real-Window receiver: kitty.window.Window (executed bytecode, scaffolded state)
 ========================================================================
 Genuine Window needs a live Boss/OS-window/child -> impractical headlessly;
 executing the REAL Window.cmd_output_marking / Window.handle_cmd_end bytecode bound to a scaffold.
-[env] kitty.fast_data_types.monotonic() sample = 0.034037024  (SMALL: seconds since monotonic-clock start)
+[env] kitty.fast_data_types.monotonic() sample = 0.032574718  (SMALL: seconds since monotonic-clock start)
 
 ########################## RUN 1 ##########################
 [default] get_options().notify_on_cmd_finish = ('never', 5.0, 'notify', ())
 [default] after C-arm: last_cmd_output_start_time != 0 -> True ; last_cmd_cmdline = 'ls'
 [default] Q2 code=99: last_cmd_exit_status  before=0  after=99  type(after)=int
-[default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.035097171, 'cmdline': 'ls', 'exit_status': 99}
+[default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.033644989, 'cmdline': 'ls', 'exit_status': 99}
+[default] Q2 code=99: notify_with_command call count = 0 -> notification body SUPPRESSED under default (gate L1425: when != "never" is False)
+[default] Q3 malformed exit_status='not_a_number' : last_cmd_exit_status  before=999  after=0  (canonical Window)
+           watcher payload exit_status = 0
+[default] Q3 malformed exit_status='' : last_cmd_exit_status  before=999  after=0  (canonical Window)
+           watcher payload exit_status = 0
+[toggle 'always' ] notify_on_cmd_finish = ('always', 5.0, 'notify', ())
+[toggle 'always' ] Q2 code=99: last_cmd_exit_status = 99 ; notify_with_command call count = 0
+[toggle 'always 0'] notify_on_cmd_finish = ('always', 0.0, 'notify', ())
+[toggle 'always 0'] Q2 code=99: last_cmd_exit_status = 99 ; notify_with_command call count = 1
+[toggle 'always 0'] Q2 code=99: NotificationCommand.body = 'Command ls finished with status: 99.\nClick to focus.'
+[state] Window init last_cmd_exit_status (before any marker) = 0
+[state] after C (armed), before D: last_cmd_exit_status = 0
+[state] after D;99                : last_cmd_exit_status = 99
+
+########################## RUN 2 ##########################
+[default] get_options().notify_on_cmd_finish = ('never', 5.0, 'notify', ())
+[default] after C-arm: last_cmd_output_start_time != 0 -> True ; last_cmd_cmdline = 'ls'
+[default] Q2 code=99: last_cmd_exit_status  before=0  after=99  type(after)=int
+[default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.040449111, 'cmdline': 'ls', 'exit_status': 99}
 [default] Q2 code=99: notify_with_command call count = 0 -> notification body SUPPRESSED under default (gate L1425: when != "never" is False)
 [default] Q3 malformed exit_status='not_a_number' : last_cmd_exit_status  before=999  after=0  (canonical Window)
            watcher payload exit_status = 0
@@ -511,37 +570,66 @@ executing the REAL Window.cmd_output_marking / Window.handle_cmd_end bytecode bo
 - The parsed integer `Window.last_cmd_exit_status` becomes **`99`** (`kitty/window.py:L1413`), an `int`
   (`type(after)=int`), transitioning from its init `0`.
 - The **unconditional** command‑finish watcher payload (`kitty/window.py:L1419-1420`) carries
-  **`'exit_status': 99`**: `{'is_start': False, 'time': 0.035097171, 'cmdline': 'ls', 'exit_status': 99}`.
+  **`'exit_status': 99`**: `{'is_start': False, 'time': 0.033644989, 'cmdline': 'ls', 'exit_status': 99}`.
   (`cmdline` is `'ls'` because `decode_cmdline('cmdline=ls -la')` returns the first shlex token,
   `kitty/window.py:L225-232`; this does not affect the recorded exit status.)
-- **Notification body under the default config:** `notify_with_command` is called **0 times** — the
+- **Notification body under the default config:** the `notify_with_command(cmd, self.id)` call
+  (`kitty/window.py:L1433`, the dispatch for the default `'notify'` action) is reached **0 times** — the
   body is **not constructed**. The default `notify_on_cmd_finish` is `('never', 5.0, 'notify', ())`
   (`kitty/options/definition.py:L3190`) and the gate at `kitty/window.py:L1425`
-  (`if last_cmd_output_duration >= duration and when != 'never'`) fails because `when == 'never'`.
+  (`if last_cmd_output_duration >= duration and when != 'never'`) fails because `when == 'never'`, so
+  control never reaches the `L1433` call.
 
 **Non‑default toggle to exhibit the body text (explicitly labeled NON‑DEFAULT).** Setting
 `notify_on_cmd_finish` to a non‑`'never'` value makes the body constructible. Note the honest subtlety:
 with `'always'` (which keeps the default 5.0‑second duration threshold) the body is **still not built**
 in this environment — `notify_with_command call count = 0` — because the duration gate is not satisfied
-(see §6, nuance #2, and the discrepancy note below). Dropping the threshold to zero with `'always 0'`
+(see the duration‑ordering note below). Dropping the threshold to zero with `'always 0'`
 does surface the body:
 
 - `[toggle 'always 0'] NotificationCommand.body = 'Command ls finished with status: 99.\nClick to
   focus.'` — the body, built by the real `kitty/window.py:L1429`, contains **`99`** (from the **raw
   string** `exit_status`, not the parsed int).
 
-> **Observed discrepancy with the reference reasoning (reported honestly).** A reference note
-> assumed that because `handle_cmd_end` zeroes `last_cmd_output_start_time` at `L1411` *before*
-> computing `last_cmd_output_duration = end_time - self.last_cmd_output_start_time` at `L1417`, the
-> duration would be a *huge* monotonic value that always satisfies the threshold — leaving `when !=
-> 'never'` as the only effective gate. **What I actually observed is that kitty's `monotonic()` returns
-> a SMALL value** (`0.034037024` seconds at process start; the watcher `time` field is likewise
-> `~0.035`). So `last_cmd_output_duration ≈ 0.035` seconds, and the gate `0.035 >= 5.0` is **False**.
-> The ordering "bug" (subtracting against the just‑zeroed start time, so the computed "duration" is the
-> absolute monotonic timestamp rather than the true command elapsed time) **is real**, but its
-> magnitude is small, not huge — so `when != 'never'` is *not* the only effective gate: the duration
-> threshold matters too. That is why `'always'` (threshold 5.0) does not surface the body here, while
-> `'always 0'` (threshold 0.0) does. I report the observation over the reference assumption.
+> **Duration‑ordering nuance (source‑level behavior first, then reconciled with the probe).**
+> `handle_cmd_end` zeroes `self.last_cmd_output_start_time = 0.` at `kitty/window.py:L1411`
+> **before** it computes `last_cmd_output_duration = end_time - self.last_cmd_output_start_time` at
+> `kitty/window.py:L1417`. Because the start time was *just* zeroed, that subtraction is
+> `end_time - 0. == end_time`, so the value named `last_cmd_output_duration` is actually the
+> **absolute kitty monotonic timestamp** returned by `monotonic()` — **not** the true elapsed command
+> duration. (`monotonic()` is `monotonic_() - monotonic_start_time`, `kitty/monotonic.h:L60-63`, where
+> `monotonic_start_time` is set once by `init_monotonic()` at `kitty/monotonic.h:L66-68`, so it counts
+> seconds since kitty's monotonic clock was initialized.)
+>
+> **Implication in a real session (the required behavior).** In a real, long‑running kitty session the
+> monotonic clock was initialized when kitty started — many seconds, minutes, or hours ago — so
+> `end_time` (hence the computed `last_cmd_output_duration`) is **large**, and the comparison
+> `last_cmd_output_duration >= duration` at `kitty/window.py:L1425` is **effectively always satisfied**.
+> The duration threshold is therefore not the limiting factor in normal use: the **only** effective
+> gate is `when != 'never'`. Under the default `notify_on_cmd_finish = 'never'` that gate is `False`,
+> which is why the body is never built by default (§3.4, §6).
+>
+> **Reconciliation with the probe observation (a fresh‑process artifact, not a contradiction).** The
+> probe runs in a brand‑new process, so kitty's monotonic clock was initialized only milliseconds
+> earlier and `monotonic()` returns a **small** value: the probe printed
+> `[env] kitty.fast_data_types.monotonic() sample = 0.032574718`, and the watcher `time` fields are
+> likewise `~0.033` (RUN 1) / `~0.040` (RUN 2). That `monotonic()` measures elapsed‑since‑init (small
+> now, large later) is directly observable — sampling it across two 1‑second sleeps grows it by ~1.0 s
+> each time:
+>
+> ```
+> monotonic() at process start        = 0.000489 s
+> monotonic() after sleeping 1.0 s     = 1.000584 s
+> monotonic() after sleeping 2.0 s     = 2.000663 s
+> delta t1-t0 = 1.000095 s ; delta t2-t1 = 1.000079 s  (monotonic GROWS with elapsed uptime)
+> ```
+>
+> So in *this fresh probe* `last_cmd_output_duration ≈ 0.033 s`, the comparison `0.033 >= 5.0` is
+> `False`, and that is precisely why the non‑default `'always'` toggle (which keeps the default 5.0 s
+> threshold) does **not** surface the body here while `'always 0'` (threshold `0.0`) does. This is an
+> artifact of measuring at process start and does **not** contradict the source‑level behavior above:
+> in a real long‑running session the same code path yields a large `end_time`, the duration gate is
+> effectively always satisfied, and `when != 'never'` remains the only effective gate.
 
 
 ---
@@ -628,7 +716,7 @@ application path).
 
 ### 7.1 State transitions of `last_cmd_exit_status` (before / during / after the `D` marker)
 
-The recording is armed by a prior `C` marker (nuance #3 below); the `D` marker then records the status.
+The recording is armed by a prior `C` marker (see the prior-`C` gating note below); the `D` marker then records the status.
 From PROBE B (real `Window`), the observed transition for the valid code `99`:
 
 ```
@@ -646,7 +734,7 @@ For the malformed inputs (§6.1) the transition is `999 (seeded sentinel) → 0`
 branch writes `0`. For the non‑canonical `Callbacks` (§6.2) the transition on malformed input is
 `sys.maxsize → sys.maxsize` (no change).
 
-Nuance #3 in action — the `D` handler is **gated by a prior `C`**: `handle_cmd_end` returns
+Prior-`C` gating in action — the `D` handler is **gated by a prior `C`**: `handle_cmd_end` returns
 immediately unless `last_cmd_output_start_time != 0` (`kitty/window.py:L1409-1410`); the `Callbacks`
 path is gated by `last_cmd_at != 0` (`kitty_tests/__init__.py:L76`). This is why the scenario ordering
 `A → B → C → text → D` matters: the `C` marker arms the recording and the first `D` after it records
@@ -654,28 +742,59 @@ the status.
 
 ### 7.2 Stability across ≥2 runs
 
-- **PROBE A** (Q1 measurements and the Q2 sweep) is **byte‑for‑byte identical across two runs**:
+Every reported byte length, offset, and recorded exit status was confirmed stable by running each probe
+**twice** and comparing the outputs. PROBE A and PROBE C are **byte‑for‑byte identical** across the two
+runs — proven both by an empty `diff` and by matching SHA‑256 checksums of the two run outputs:
 
 ```
-$ ./kitty/launcher/kitty +launch /tmp/osc133_probe_a.py > run1.txt
-$ ./kitty/launcher/kitty +launch /tmp/osc133_probe_a.py > run2.txt
-$ diff run1.txt run2.txt && echo IDENTICAL
-IDENTICAL: PROBE A output is byte-for-byte stable across 2 runs
+$ cd /app
+$ ./kitty/launcher/kitty +launch /tmp/osc133_probe_a.py > /tmp/probe_a_run1.txt 2>&1
+$ ./kitty/launcher/kitty +launch /tmp/osc133_probe_a.py > /tmp/probe_a_run2.txt 2>&1
+$ diff /tmp/probe_a_run1.txt /tmp/probe_a_run2.txt && echo IDENTICAL
+IDENTICAL
+$ sha256sum /tmp/probe_a_run1.txt /tmp/probe_a_run2.txt
+a8e5fa327a5343de2f97eb7270332fbde78a1f42a0a4de719e8a04ca724e9f2f  /tmp/probe_a_run1.txt
+a8e5fa327a5343de2f97eb7270332fbde78a1f42a0a4de719e8a04ca724e9f2f  /tmp/probe_a_run2.txt
 ```
 
-- **PROBE C** (dispatch‑chain evidence) is likewise **byte‑for‑byte identical across two runs**:
+```
+$ ./kitty/launcher/kitty +launch /tmp/osc133_probe_c.py > /tmp/probe_c_run1.txt 2>&1
+$ ./kitty/launcher/kitty +launch /tmp/osc133_probe_c.py > /tmp/probe_c_run2.txt 2>&1
+$ diff /tmp/probe_c_run1.txt /tmp/probe_c_run2.txt && echo IDENTICAL
+IDENTICAL
+$ sha256sum /tmp/probe_c_run1.txt /tmp/probe_c_run2.txt
+36428420095eef6803f1a3660215f2540905ca044b45dd3987a1cb2101a3505f  /tmp/probe_c_run1.txt
+36428420095eef6803f1a3660215f2540905ca044b45dd3987a1cb2101a3505f  /tmp/probe_c_run2.txt
+```
+
+The identical checksums prove that **every** value reported from PROBE A (the Q1 byte length `58`, the
+`D;42` offset `53`, the Q2 sweep `57/57/58/58/59`, the bash‑faithful offsets, and the non‑canonical
+`Callbacks` values) and from PROBE C (the A/B/C/D callback forms) appeared **identically** in both
+unchanged runs.
+
+PROBE B contains its own two runs (`RUN 1` / `RUN 2`) within a single invocation — **both are shown
+complete in §5.3** — and was additionally run as a whole script twice. Every recorded value is identical
+across the runs: `last_cmd_exit_status` (`99`; `0`; `0`), the watcher payload `exit_status` (`99`; `0`;
+`0`), the notify call counts (`0`; `0`; `1`), and the `NotificationCommand.body` string. The **only**
+field that differs run‑to‑run is the monotonic `time` timestamp — an inherent clock value, not one of
+the reported quantities. Diffing the two whole‑script invocations confirms that the only differing lines
+are the `monotonic()` sample and the two payload `time` fields:
 
 ```
-$ diff probe_c_run1.txt probe_c_run2.txt && echo IDENTICAL
-IDENTICAL: PROBE C output is byte-for-byte stable across 2 runs
+$ diff /tmp/probe_b_run1.txt /tmp/probe_b_run2.txt
+7c7
+< [env] kitty.fast_data_types.monotonic() sample = 0.032574718  (SMALL: seconds since monotonic-clock start)
+---
+> [env] kitty.fast_data_types.monotonic() sample = 0.033470629  (SMALL: seconds since monotonic-clock start)
+13c13
+< [default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.033644989, 'cmdline': 'ls', 'exit_status': 99}
+---
+> [default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.034585287, 'cmdline': 'ls', 'exit_status': 99}
+32c32
+< [default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.040449111, 'cmdline': 'ls', 'exit_status': 99}
+---
+> [default] Q2 code=99: watcher payload (on_cmd_startstop, is_start=False) = {'is_start': False, 'time': 0.04134964, 'cmdline': 'ls', 'exit_status': 99}
 ```
-
-- **PROBE B** runs the canonical `Window` measurements twice internally (`RUN 1` / `RUN 2`). Every
-  recorded value is identical across the two runs — `last_cmd_exit_status` (`99`; `0`; `0`), the
-  watcher payload `exit_status` (`99`; `0`; `0`), the notify call counts (`0`; `0`; `1`), and the body
-  string. The **only** field that differs between runs is the monotonic `time` value in the watcher
-  payload (`0.035097171` in RUN 1 vs `0.041982918` in RUN 2), which is an inherent timestamp and not
-  one of the reported quantities.
 
 All reported byte lengths, offsets, and recorded exit statuses are therefore stable.
 
@@ -712,7 +831,7 @@ harness `Callbacks` uses `suppress`, retaining its prior value — a divergence 
 - `kitty/screen.c:L2327-2356` — `shell_prompt_marking`; `case 'A'` (`L2338`, `Py_False`), `case 'C'` (`L2344`, `L2347`, `Py_True`), `case 'D'` (`L2351-2352`, `Py_None`, `"Os"` string); **no `case 'B'`**.
 - `kitty/window.py:L244, L569, L571, L572` — `last_cmd_exit_status`/`last_cmd_output_start_time`/`last_cmd_cmdline` declaration and init.
 - `kitty/window.py:L1453-1461` — `cmd_output_marking` (routes `C` to arm, `D` to `handle_cmd_end`).
-- `kitty/window.py:L1408-1432` — `handle_cmd_end`: guard (`L1409`), `try int` (`L1413`), `except → 0` (`L1415`), watcher payload (`L1419-1420`), notify gate (`L1425`), body (`L1429`).
+- `kitty/window.py:L1408-1451` — `handle_cmd_end`: guard (`L1409`), `try int` (`L1413`), `except → 0` (`L1415`), watcher payload (`L1419-1420`), notify gate (`L1425`), body (`L1429`), and the `notify_with_command(cmd, self.id)` dispatch (`L1433`) for the default `'notify'` action.
 - `kitty/window.py:L225-232` — `decode_cmdline`. `kitty/window.py:L457` — module `cmd_output`.
 - `kitty/options/definition.py:L3190` — `notify_on_cmd_finish` default `'never'`. `kitty/options/utils.py:L753-779` — `NotifyOnCmdFinish` parser.
 - `shell-integration/bash/kitty.bash:L208, L239` — BEL‑framed `C;cmdline` and `D;$?` + trailing `A`.
@@ -746,15 +865,38 @@ docker exec -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e TMPDIR=/fasttmp kitty_setup \
 
 ### 9.2 Cleanup — repository left unchanged
 
-The temporary probe scripts were removed after the investigation and the working tree verified clean.
-The only retained artifact is this document.
+The temporary probe scripts live only under the container's `/tmp` (never inside the repository) and
+were removed after the investigation. `find` confirms no probe script exists anywhere in the repository
+tree — the command prints nothing (empty output = none found):
 
 ```
-$ rm -f /tmp/osc133_probe_*.py            # inside the container
-$ find . -name 'osc133_probe*' | grep -v '/.git/'      # in the repo tree
-none in repo (good)
-$ git status --porcelain
+$ rm -f /tmp/osc133_probe_*.py                         # inside the container
+$ find . -name 'osc133_probe*' -not -path './.git/*'   # in the repo tree
+$
+```
+
+Relative to the pristine baseline, the new answer document first appears as an **untracked** file — the
+expected state for the deliverable *before* it is committed:
+
+```
+$ git status --porcelain                 # before the deliverable is committed
 ?? blitzy/documentation/kitty_815df1e210e0.md
+```
+
+After the deliverable is committed, the working tree is **clean** — `git status --porcelain` prints
+nothing (empty output = no modified, staged, or untracked files):
+
+```
+$ git status --porcelain                 # after the deliverable is committed
+$
+```
+
+The answer document is the **only** file added relative to the original repository state (baseline
+commit `815df1e210e0`, the commit immediately before this document existed):
+
+```
+$ git diff --name-status 815df1e210e0 HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 Build artifacts (`kitty/fast_data_types*.so`, `kitty/launcher/kitty`, `build/`) are gitignored and are
@@ -1078,6 +1220,348 @@ print('\nFull scenario A,B,C,text,D;42 ordered cmd_output_marking calls:')
 for i, c in enumerate(cb.marking_calls):
     print('  call %d: is_start=%s data=%s' % (i, c[0], c[1]))
 print('screen cells after full scenario =', repr(screen_contents(scr)))
+```
+
+### 9.6 Complete canonical build log (`python3 setup.py`)
+
+The complete, unedited output of a cold, from‑scratch canonical build (§2.1). It is **332 lines**:
+122 C `Compiling` steps (including the two `kitty/vt-parser.c` steps at `[10/122]`/`[11/122]`),
+5 `Linking` steps, ≈202 Go package/kitten/tool build lines, and the terminal `SETUP_EXIT=0`.
+
+```
+$ cd /app && python3 setup.py
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[4/122] Compiling [x11] glfw/x11_window.c ...
+[5/122] Compiling kitty/glfw.c ...
+[6/122] Compiling kitty/graphics.c ...
+[7/122] Compiling kitty/child-monitor.c ...
+[8/122] Compiling kitty/fonts.c ...
+[9/122] Compiling kitty/shaders.c ...
+[10/122] Compiling kitty/vt-parser.c ...
+[11/122] Compiling kitty/vt-parser.c ...
+[12/122] Compiling kitty/state.c ...
+[13/122] Compiling [x11] glfw/input.c ...
+[14/122] Compiling [wayland] glfw/input.c ...
+[15/122] Compiling kitty/mouse.c ...
+[16/122] Compiling [x11] glfw/xkb_glfw.c ...
+[17/122] Compiling [wayland] glfw/xkb_glfw.c ...
+[18/122] Compiling kitty/freetype.c ...
+[19/122] Compiling [wayland] glfw/wl_client_side_decorations.c ...
+[20/122] Compiling [x11] glfw/window.c ...
+[21/122] Compiling [wayland] glfw/window.c ...
+[22/122] Compiling kitty/line.c ...
+[23/122] Compiling kitty/glfw-wrapper.c ...
+[24/122] Compiling kittens/transfer/algorithm.c ...
+[25/122] Compiling [wayland] glfw/wl_init.c ...
+[26/122] Compiling [x11] glfw/x11_init.c ...
+[27/122] Compiling kitty/freetype_render_ui_text.c ...
+[28/122] Compiling [x11] glfw/egl_context.c ...
+[29/122] Compiling [wayland] glfw/egl_context.c ...
+[30/122] Compiling kitty/disk-cache.c ...
+[31/122] Compiling [x11] glfw/glx_context.c ...
+[32/122] Compiling kitty/line-buf.c ...
+[33/122] Compiling kitty/data-types.c ...
+[34/122] Compiling kitty/colors.c ...
+[35/122] Compiling kitty/history.c ...
+[36/122] Compiling kitty/keys.c ...
+[37/122] Compiling [x11] glfw/x11_monitor.c ...
+[38/122] Compiling kitty/fontconfig.c ...
+[39/122] Compiling [x11] glfw/context.c ...
+[40/122] Compiling [wayland] glfw/context.c ...
+[41/122] Compiling kitty/crypto.c ...
+[42/122] Compiling [x11] glfw/ibus_glfw.c ...
+[43/122] Compiling [wayland] glfw/ibus_glfw.c ...
+[44/122] Compiling kitty/key_encoding.c ...
+[45/122] Compiling kitty/launcher/main.c ...
+[46/122] Compiling [x11] glfw/monitor.c ...
+[47/122] Compiling [wayland] glfw/monitor.c ...
+[48/122] Compiling kitty/font-names.c ...
+[49/122] Compiling [x11] glfw/backend_utils.c ...
+[50/122] Compiling [wayland] glfw/backend_utils.c ...
+[51/122] Compiling kitty/charsets.c ...
+[52/122] Compiling [x11] glfw/linux_joystick.c ...
+[53/122] Compiling [wayland] glfw/linux_joystick.c ...
+[54/122] Compiling [x11] glfw/init.c ...
+[55/122] Compiling [wayland] glfw/init.c ...
+[56/122] Compiling [x11] glfw/dbus_glfw.c ...
+[57/122] Compiling [wayland] glfw/dbus_glfw.c ...
+[58/122] Compiling kitty/gl.c ...
+[59/122] Compiling [x11] glfw/vulkan.c ...
+[60/122] Compiling [wayland] glfw/vulkan.c ...
+[61/122] Compiling [x11] glfw/osmesa_context.c ...
+[62/122] Compiling [wayland] glfw/osmesa_context.c ...
+[63/122] Compiling kitty/cursor.c ...
+[64/122] Compiling kitty/launcher/single-instance.c ...
+[65/122] Compiling kitty/desktop.c ...
+[66/122] Compiling kitty/loop-utils.c ...
+[67/122] Compiling 3rdparty/ringbuf/ringbuf.c ...
+[68/122] Compiling kitty/simd-string.c ...
+[69/122] Compiling kitty/systemd.c ...
+[70/122] Compiling kitty/shlex.c ...
+[71/122] Compiling [wayland] glfw/wayland-tablet-unstable-v2-client-protocol.c ...
+[72/122] Compiling kitty/child.c ...
+[73/122] Compiling [wayland] glfw/linux_desktop_settings.c ...
+[74/122] Compiling [wayland] glfw/wl_text_input.c ...
+[75/122] Compiling [wayland] glfw/wl_monitor.c ...
+[76/122] Compiling kitty/kittens.c ...
+[77/122] Compiling 3rdparty/base64/lib/codec_choose.c ...
+[78/122] Compiling kitty/png-reader.c ...
+[79/122] Compiling [wayland] glfw/wayland-xdg-shell-client-protocol.c ...
+[80/122] Compiling [x11] glfw/linux_notify.c ...
+[81/122] Compiling [wayland] glfw/linux_notify.c ...
+[82/122] Compiling kitty/rowcolumn-diacritics.c ...
+[83/122] Compiling kitty/hyperlink.c ...
+[84/122] Compiling [wayland] glfw/wayland-primary-selection-unstable-v1-client-protocol.c ...
+[85/122] Compiling kitty/wcswidth.c ...
+[86/122] Compiling [wayland] glfw/wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[87/122] Compiling kitty/fast-file-copy.c ...
+[88/122] Compiling [wayland] glfw/wayland-text-input-unstable-v3-client-protocol.c ...
+[89/122] Compiling [wayland] glfw/wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
+[90/122] Compiling 3rdparty/base64/lib/lib.c ...
+[91/122] Compiling [x11] glfw/posix_thread.c ...
+[92/122] Compiling [wayland] glfw/posix_thread.c ...
+[93/122] Compiling kitty/window_logo.c ...
+[94/122] Compiling [wayland] glfw/wayland-xdg-activation-v1-client-protocol.c ...
+[95/122] Compiling [wayland] glfw/wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+[96/122] Compiling [wayland] glfw/wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[97/122] Compiling [wayland] glfw/wayland-cursor-shape-v1-client-protocol.c ...
+[98/122] Compiling [wayland] glfw/wayland-fractional-scale-v1-client-protocol.c ...
+[99/122] Compiling kitty/glyph-cache.c ...
+[100/122] Compiling [wayland] glfw/wayland-viewporter-client-protocol.c ...
+[101/122] Compiling kitty/logging.c ...
+[102/122] Compiling 3rdparty/base64/lib/arch/neon64/codec.c ...
+[103/122] Compiling [wayland] glfw/wayland-single-pixel-buffer-v1-client-protocol.c ...
+[104/122] Compiling 3rdparty/base64/lib/tables/tables.c ...
+[105/122] Compiling [wayland] glfw/wl_cursors.c ...
+[106/122] Compiling 3rdparty/base64/lib/arch/neon32/codec.c ...
+[107/122] Compiling [wayland] glfw/wayland-kwin-blur-v1-client-protocol.c ...
+[108/122] Compiling 3rdparty/base64/lib/arch/avx/codec.c ...
+[109/122] Compiling 3rdparty/base64/lib/arch/ssse3/codec.c ...
+[110/122] Compiling 3rdparty/base64/lib/arch/sse42/codec.c ...
+[111/122] Compiling 3rdparty/base64/lib/arch/sse41/codec.c ...
+[112/122] Compiling 3rdparty/base64/lib/arch/avx2/codec.c ...
+[113/122] Compiling kitty/utmp.c ...
+[114/122] Compiling 3rdparty/base64/lib/arch/avx512/codec.c ...
+[115/122] Compiling 3rdparty/base64/lib/arch/generic/codec.c ...
+[116/122] Compiling kitty/cleanup.c ...
+[117/122] Compiling [x11] glfw/monotonic.c ...
+[118/122] Compiling [wayland] glfw/monotonic.c ...
+[119/122] Compiling kitty/monotonic.c ...
+[120/122] Compiling kitty/simd-string-128.c ...
+[121/122] Compiling kitty/simd-string-256.c ...
+[122/122] Compiling kitty/gl-wrapper.c ...
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
+crypto/internal/alias
+unicode/utf16
+golang.org/x/exp/constraints
+container/list
+log/internal
+internal/nettrace
+github.com/seancfoley/ipaddress-go/ipaddr/addrstrparam
+github.com/seancfoley/ipaddress-go/ipaddr/addrerr
+image/color
+vendor/golang.org/x/crypto/cryptobyte/asn1
+encoding
+crypto/subtle
+vendor/golang.org/x/crypto/internal/alias
+github.com/shirou/gopsutil/v3/common
+kitty
+crypto/internal/boring/sig
+github.com/seancfoley/ipaddress-go/ipaddr/addrstr
+internal/weak
+maps
+vendor/golang.org/x/net/dns/dnsmessage
+math/rand/v2
+internal/singleflight
+hash
+encoding/base32
+crypto/rc4
+crypto/internal/randutil
+vendor/golang.org/x/text/transform
+net/http/internal/ascii
+bufio
+regexp/syntax
+encoding/binary
+context
+embed
+crypto/internal/edwards25519/field
+crypto/cipher
+runtime/cgo
+crypto/internal/nistec/fiat
+io/ioutil
+vendor/golang.org/x/sys/cpu
+encoding/hex
+net/url
+log
+vendor/golang.org/x/net/http2/hpack
+flag
+kitty/tools/utils/shlex
+github.com/bmatcuk/doublestar/v4
+github.com/ALTree/bigfloat
+crypto/internal/bigmod
+encoding/asn1
+github.com/seancfoley/bintree/tree
+crypto
+hash/adler32
+hash/crc32
+crypto/dsa
+image/color/palette
+crypto/md5
+compress/flate
+encoding/base64
+compress/bzip2
+crypto/internal/edwards25519
+internal/concurrent
+mime/quotedprintable
+golang.org/x/image/riff
+compress/lzw
+crypto/internal/boring
+golang.org/x/image/tiff/lzw
+crypto/des
+database/sql/driver
+encoding/xml
+net/http/internal
+image
+os/signal
+os/exec
+golang.org/x/sys/unix
+vendor/golang.org/x/crypto/internal/poly1305
+crypto/rand
+vendor/golang.org/x/crypto/chacha20
+github.com/rwcarlsen/goexif/tiff
+github.com/klauspost/cpuid/v2
+vendor/golang.org/x/crypto/sha3
+vendor/golang.org/x/text/unicode/bidi
+github.com/dlclark/regexp2/syntax
+vendor/golang.org/x/text/unicode/norm
+crypto/sha1
+unique
+crypto/hmac
+encoding/pem
+crypto/sha512
+crypto/internal/boring/bbig
+crypto/x509/pkix
+encoding/json
+vendor/golang.org/x/crypto/cryptobyte
+crypto/sha256
+crypto/aes
+mime
+regexp
+vendor/golang.org/x/crypto/hkdf
+kitty/tools/utils/secrets
+crypto/rsa
+compress/gzip
+compress/zlib
+archive/zip
+vendor/golang.org/x/crypto/chacha20poly1305
+net/netip
+github.com/shirou/gopsutil/v3/internal/common
+crypto/internal/mlkem768
+crypto/ed25519
+image/internal/imageutil
+golang.org/x/image/bmp
+golang.org/x/image/ccitt
+golang.org/x/image/vp8l
+image/png
+golang.org/x/image/vp8
+vendor/golang.org/x/text/secure/bidirule
+crypto/internal/nistec
+image/draw
+image/jpeg
+golang.org/x/image/tiff
+github.com/zeebo/xxh3
+howett.net/plist
+golang.org/x/image/webp
+image/gif
+vendor/golang.org/x/net/idna
+github.com/dlclark/regexp2
+github.com/kovidgoyal/imaging
+github.com/disintegration/imaging
+github.com/rwcarlsen/goexif/exif
+crypto/ecdh
+crypto/elliptic
+crypto/internal/hpke
+crypto/ecdsa
+github.com/edwvee/exiffix
+github.com/tklauser/numcpus
+github.com/shirou/gopsutil/v3/mem
+github.com/alecthomas/chroma/v2
+github.com/tklauser/go-sysconf
+github.com/shirou/gopsutil/v3/cpu
+os/user
+net
+github.com/alecthomas/chroma/v2/styles
+github.com/alecthomas/chroma/v2/lexers
+archive/tar
+vendor/golang.org/x/net/http/httpproxy
+github.com/shirou/gopsutil/v3/net
+github.com/google/uuid
+net/textproto
+crypto/x509
+github.com/seancfoley/ipaddress-go/ipaddr
+vendor/golang.org/x/net/http/httpguts
+mime/multipart
+github.com/shirou/gopsutil/v3/process
+crypto/tls
+net/http/httptrace
+net/http
+kitty/tools/utils
+kitty/tools/utils/base85
+kitty/tools/utils/paths
+kitty/tools/tty
+kitty/tools/rsync
+kitty/tools/wcswidth
+kitty/tools/crypto
+kitty/tools/tui/shell_integration
+kitty/tools/utils/humanize
+kitty/tools/utils/style
+kitty/tools/cli/markup
+kitty/tools/tui/sgr
+kitty/tools/tui/loop
+kitty/tools/cli
+kitty/tools/config
+kitty/tools/tui/shortcuts
+kitty/tools/cmd/mouse_demo
+kitty/tools/utils/shm
+kitty/kittens/hyperlinked_grep
+kitty/kittens/query_terminal
+kitty/kittens/show_key
+kitty/tools/tui/readline
+kitty/tools/tui
+kitty/tools/utils/images
+kitty/tools/tui/subseq
+kitty/kittens/clipboard
+kitty/tools/unicode_names
+kitty/tools/cmd/run_shell
+kitty/tools/tui/graphics
+kitty/tools/cmd/edit_in_kitty
+kitty/tools/cmd/show_error
+kitty/kittens/ask
+kitty/kittens/hints
+kitty/tools/cmd/update_self
+kitty/tools/cmd/at
+kitty/tools/themes
+kitty/kittens/unicode_input
+kitty/kittens/themes
+kitty/kittens/ssh
+kitty/tools/cmd/benchmark
+kitty/kittens/choose_fonts
+kitty/kittens/icat
+kitty/kittens/transfer
+kitty/tools/cmd/pytest
+kitty/kittens/diff
+kitty/tools/cmd/tool
+kitty/tools/cmd/completion
+kitty/tools/cmd
+SETUP_EXIT=0
 ```
 
 ---
