@@ -204,6 +204,12 @@ This directly resolves the user's confusion about "pushing after switching to al
 
 **Answer: the bytes a key press produces depend on the active flags value, which is read from the active buffer's stack at press time (`kitty/keys.c:L251`). Below are the exact captured bytes for the user's example key `Ctrl+Shift+a` and — crucially — for a plain unmodified `a`, in each of the four states the user named.**
 
+The user framed the question as a concrete four-state sequence, preserved here verbatim:
+
+> "For instance, press a modified key like Ctrl+Shift+a while on main with no flags pushed, then again after pushing disambiguate mode, then again after switching to alternate and pushing report-all-keys mode, then back to main."
+
+Those four states map one-to-one onto the captured output that follows: **(A)** main, no flags pushed; **(B)** main, after pushing disambiguate (`\x1b[>1u`); **(C)** alternate, after pushing report-all-keys (`\x1b[>8u`); **(D)** back on main. §5.1 (raw bytes) and §5.2 (the four-state table) give the exact bytes each state produces.
+
 ### 5.1 Raw output — bytes in each of the four states
 
 Command:
@@ -377,7 +383,7 @@ TEST 5 pushes `5` then `7` (top = `7`), then pops with `\x1b[<9u` (pop 9 — far
 
 ### 6.8 Spec corroboration
 
-The published specification states the same two rules the runtime exhibits: a push onto a full stack evicts the oldest entry, and a pop that empties the stack resets all flags; it also recommends a stack depth of at least 8 (`https://sw.kovidgoyal.net/kitty/keyboard-protocol/`; in-repo `docs/keyboard-protocol.rst:L299-303`). The measured kitty capacity is exactly the recommended minimum, 8, fixed by `kitty/screen.h:L128`.
+The published specification states the same two rules the runtime exhibits: a push onto a full stack evicts the oldest entry, and a pop that empties the stack resets all flags (`https://sw.kovidgoyal.net/kitty/keyboard-protocol/`; in-repo `docs/keyboard-protocol.rst:L299-303`). The specification deliberately leaves the exact stack size implementation-defined — it says only that terminals "should limit the size of the stack as appropriate, to prevent Denial-of-Service attacks" (`docs/keyboard-protocol.rst:L299-300`) and prescribes **no** numeric depth. kitty's exact capacity is therefore not a spec figure: it is `8` because `kitty/screen.h:L128` declares 8-slot arrays (`main_key_encoding_flags[8]`, `alt_key_encoding_flags[8]`), confirmed by the runtime capacity probe in §6.2/§6.3.
 
 
 ---
@@ -692,7 +698,7 @@ The in-repo `docs/keyboard-protocol.rst` was cross-checked against the canonical
 
 - **Independent per-screen stacks:** the spec requires the main and alternate screens to maintain their own independent keyboard mode stacks, so a program on the alternate screen can change mode without affecting or knowing the main screen's mode — confirming §3/§4/§8.
 - **Push-full evicts oldest; pop-empty resets:** the spec states a push onto a full stack evicts the oldest entry and a pop that empties the stack resets all flags — confirming §6.
-- **Recommended stack depth ≥ 8:** matches the measured capacity of exactly 8 (§6).
+- **Stack size is implementation-defined:** the spec prescribes no numeric depth — it says only that terminals should limit the stack size appropriately to prevent denial-of-service (`docs/keyboard-protocol.rst:L299-300`). kitty's exact capacity of 8 is fixed by the source (`kitty/screen.h:L128`) and confirmed at runtime (§6.2/§6.3), not by the spec.
 - **Modifier value = 1 + bitmask; Ctrl+Shift = 6:** confirming §5's modifier encoding.
 - **Flag 8 = all keys as escape codes; flag 1 alone still sends a plain letter literally:** the spec says report-all-keys makes every key — including plain printables — a CSI-u sequence, while under disambiguate alone a plain letter like `a` still sends `0x61` — confirming §5.4/§9.4.
 - **Wire forms:** push `CSI > flags u`, pop `CSI < number u`, query `CSI ? u` → reply `CSI ? flags u` — confirming §10's dispatch citations.
@@ -708,17 +714,352 @@ Four temporary scripts were written under the container's `/tmp` (outside the re
 - `/tmp/kbd_capacity.py` — pushes K=1..12 distinct sentinel values and unwinds to measure retained capacity.
 - `/tmp/kbd_pty.py` — forks a real child over a real PTY (`kitty.child.openpty`), writes the encoder bytes to the master, and confirms the child reads back byte-identical output for all six cases.
 
-Reproduction pattern (write with a heredoc from the same shell where kitty was built, run from the repo root, then delete):
+The four scripts are reproduced below **in full — no logic is elided**. Each was written under the container's `/tmp` (outside the repository tree), run from the repo root (`/workspace`, where the built `kitty.fast_data_types` extension lives), and deleted afterward. Running them at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` reproduces every raw-output block quoted above byte-for-byte (verified across repeated runs).
 
-```
-cat > /tmp/kbd_probe.py << 'PYEOF'
-import sys; sys.path.insert(0, '.')
+**`/tmp/kbd_probe.py`**
+
+```python
+#!/usr/bin/env python3
+# kbd_probe.py — headless runtime probe of kitty's per-buffer keyboard-protocol
+# progressive-enhancement flags stack (CSI > u push / CSI < u pop) across the
+# main<->alternate screen-buffer switch. Exercises TESTS 1-9.
+#
+# Run from the kitty repo root inside the canonical build container:
+#   PYTHONPATH=/workspace python3 /tmp/kbd_probe.py
+#
+# Primitives (all real code paths, no bypass):
+#   kitty_tests.BaseTest.create_screen() -> a real headless Screen object
+#   kitty_tests.parse_bytes(screen, data) -> drives the real VT parser
+#   screen.toggle_alt_screen()            -> real screen_toggle_screen_buffer
+#   screen.current_key_encoding_flags()   -> real screen_current_key_encoding_flags
+#   fast_data_types.encode_key_for_tty()  -> the SAME encoder kitty writes to the PTY
+import sys
+sys.path.insert(0, '.')
 from kitty_tests import BaseTest, parse_bytes
 import kitty.fast_data_types as fdt
-# ... TEST 1-9 as described above ...
-PYEOF
+
+bt = BaseTest()
+CTRL = fdt.GLFW_MOD_CONTROL      # 4
+SHIFT = fdt.GLFW_MOD_SHIFT       # 1
+CAPS = fdt.GLFW_MOD_CAPS_LOCK    # 64
+
+
+def enc_bytes(key, mods, flags):
+    """Encode one key event exactly as kitty would for the child, return raw bytes."""
+    out = fdt.encode_key_for_tty(key=key, mods=mods, key_encoding_flags=flags)
+    return out.encode('latin-1') if isinstance(out, str) else bytes(out)
+
+
+def hx(data):
+    return ' '.join('%02x' % b for b in data)
+
+
+def push(screen, flags):
+    """Push flags onto the active buffer's stack via a real CSI > flags u sequence."""
+    parse_bytes(screen, ('\x1b[>%du' % flags).encode('latin-1'))
+
+
+def pop(screen, n=1):
+    """Pop n entries from the active buffer's stack via a real CSI < n u sequence."""
+    parse_bytes(screen, ('\x1b[<%du' % n).encode('latin-1'))
+
+
+# ---- TEST 1: main->alt->main round-trip, repeated x3 on a fresh Screen each run ----
+print("### TEST 1: main->alt->main round-trip (repeat x3 for stability) ###")
+for run in (1, 2, 3):
+    s = bt.create_screen()
+    a = s.current_key_encoding_flags()          # fresh main: empty -> 0
+    push(s, 1); b = s.current_key_encoding_flags()   # push disambiguate on main -> 1
+    s.toggle_alt_screen(); c = s.current_key_encoding_flags()  # enter alt: own empty stack -> 0
+    push(s, 8); d = s.current_key_encoding_flags()   # push report-all-keys on alt -> 8
+    s.toggle_alt_screen(); e = s.current_key_encoding_flags()  # back to main: survived -> 1
+    print(" run%d: start-main-empty=%d | push>1u-main=%d | toggled-ALT-prepush=%d | push>8u-alt=%d | toggled-back-MAIN=%d" % (run, a, b, c, d, e))
+
+# ---- TEST 2: per-state bytes for Ctrl+Shift+a AND plain 'a' in the four named states ----
+print("### TEST 2: per-state bytes for Ctrl+Shift+a AND plain 'a' ###")
+s = bt.create_screen()
+states = []
+states.append(("A: main, no push (legacy)", s.current_key_encoding_flags()))
+push(s, 1)
+states.append(("B: main, after push >1u (disambiguate)", s.current_key_encoding_flags()))
+s.toggle_alt_screen(); push(s, 8)
+states.append(("C: alt, after push >8u (report-all-keys)", s.current_key_encoding_flags()))
+s.toggle_alt_screen()
+states.append(("D: back on main (should equal B)", s.current_key_encoding_flags()))
+for label, fl in states:
+    cs = enc_bytes(ord('a'), CTRL | SHIFT, fl)
+    pa = enc_bytes(ord('a'), 0, fl)
+    print("  [%s] flags=%d" % (label, fl))
+    print("        Ctrl+Shift+a  -> %r  hex=%s" % (cs, hx(cs)))
+    print("        plain 'a'     -> %r  hex=%s" % (pa, hx(pa)))
+
+# ---- TEST 3: overflow / eviction — push 12 distinct values on MAIN, then unwind ----
+print("### TEST 3: overflow / eviction (push >8 distinct values on MAIN) ###")
+s = bt.create_screen()
+tracks = []
+for v in range(1, 13):
+    push(s, v)
+    tracks.append(s.current_key_encoding_flags())
+print("    pushed >1u..>12u -> current tracks %s" % tracks)
+unwind = []
+for _ in range(10):
+    unwind.append(s.current_key_encoding_flags())
+    pop(s, 1)
+print("    unwind sequence of current values (read then CSI<1u each): %s" % unwind)
+
+# ---- TEST 4: overflowing MAIN's stack does NOT affect ALT's stack ----
+print("### TEST 4: overflow on MAIN does NOT affect ALT ###")
+s = bt.create_screen()
+for v in range(1, 13):
+    push(s, v)
+m1 = s.current_key_encoding_flags()
+s.toggle_alt_screen(); alt = s.current_key_encoding_flags()
+s.toggle_alt_screen(); m2 = s.current_key_encoding_flags()
+print("  after 12 pushes on main, main current = %d | alt current (never pushed) = %d | main current again = %d" % (m1, alt, m2))
+
+# ---- TEST 5: popping past the bottom empties the stack -> all flags reset to 0 ----
+print("### TEST 5: pop-to-empty resets all flags (current -> 0) ###")
+s = bt.create_screen()
+push(s, 5); f5 = s.current_key_encoding_flags()
+push(s, 7); f7 = s.current_key_encoding_flags()
+pop(s, 9); f0 = s.current_key_encoding_flags()
+print("  after push >5u=%d; after push >7u=%d; after pop <9u(over-pop) current = %d" % (f5, f7, f0))
+
+# ---- TEST 6: rapid buffer switching leakage probe (main=1, alt=8), repeated x2 ----
+print("### TEST 6: rapid buffer switching leakage probe (repeat x2) ###")
+for run in (1, 2):
+    s = bt.create_screen()
+    push(s, 1)                                   # main = 1
+    s.toggle_alt_screen(); push(s, 8)            # alt  = 8
+    s.toggle_alt_screen()                        # back on main
+    readings = []
+    for _ in range(6):
+        m = s.current_key_encoding_flags()       # read on main
+        s.toggle_alt_screen(); al = s.current_key_encoding_flags()  # read on alt
+        s.toggle_alt_screen()                    # back on main
+        readings.append((m, al))
+    noleak = all(r == (1, 8) for r in readings)
+    print("  run%d: 6 round-trips (main,alt) readings = %s | no-leakage=%s" % (run, readings, noleak))
+
+# ---- TEST 7: the three alternate-screen DECSET modes all isolate identically ----
+print("### TEST 7: DECSET 1049 vs 1047 vs 47 all give independent stacks ###")
+for enter, leave, label in [
+    (b"\x1b[?1049h", b"\x1b[?1049l", "DECSET 1049"),
+    (b"\x1b[?1047h", b"\x1b[?1047l", "DECSET 1047"),
+    (b"\x1b[?47h",   b"\x1b[?47l",   "DECSET 47  "),
+]:
+    s = bt.create_screen()
+    push(s, 1); m = s.current_key_encoding_flags()
+    parse_bytes(s, enter); ea = s.current_key_encoding_flags()
+    push(s, 8); ap = s.current_key_encoding_flags()
+    parse_bytes(s, leave); bm = s.current_key_encoding_flags()
+    print("  %s: main=%d enterAlt=%d altPush8=%d backMain=%d" % (label, m, ea, ap, bm))
+
+# ---- TEST 8: legacy lock-strip — Caps+a at flags==0 vs flags!=0 ----
+print("### TEST 8: legacy lock-strip (key_encoding.c:L36) flags==0 vs !=0 ###")
+c0 = enc_bytes(ord('a'), CAPS, 0)
+c1 = enc_bytes(ord('a'), CAPS, 1)
+print("  Caps+a  flags=0 -> %r  hex=%s" % (c0, hx(c0)))
+print("  Caps+a  flags=1 -> %r  hex=%s" % (c1, hx(c1)))
+
+# ---- TEST 9: single-flag divergence for a plain 'a' across bits 1,2,4,8,16 ----
+print("### TEST 9: single-flag divergence for plain 'a' (bits 1,2,4,8,16) ###")
+for fl in (0, 1, 2, 4, 8, 16):
+    d = enc_bytes(ord('a'), 0, fl)
+    print("  flags=%2d plain 'a' -> %r  hex=%s" % (fl, d, hx(d)))
+```
+
+**`/tmp/kbd_legacy.py`**
+
+```python
+#!/usr/bin/env python3
+# kbd_legacy.py — full legacy(flags=0) vs disambiguate(flags=1) modifier matrix
+# for the 'a' key, encoded with the SAME encoder kitty writes to the child.
+# Shows precisely where 0x01 (Ctrl+a) comes from and how the two regimes differ.
+#
+#   PYTHONPATH=/workspace python3 /tmp/kbd_legacy.py
+import sys
+sys.path.insert(0, '.')
+import kitty.fast_data_types as fdt
+
+CTRL = fdt.GLFW_MOD_CONTROL      # 4
+SHIFT = fdt.GLFW_MOD_SHIFT       # 1
+ALT = fdt.GLFW_MOD_ALT           # 2
+
+
+def enc_bytes(key, mods, flags):
+    out = fdt.encode_key_for_tty(key=key, mods=mods, key_encoding_flags=flags)
+    return out.encode('latin-1') if isinstance(out, str) else bytes(out)
+
+
+def hx(data):
+    return ' '.join('%02x' % b for b in data)
+
+
+matrix = [
+    ("a", 0),
+    ("Ctrl+a", CTRL),
+    ("Shift+a", SHIFT),
+    ("Ctrl+Shift+a", CTRL | SHIFT),
+    ("Alt+a", ALT),
+    ("Ctrl+Alt+a", CTRL | ALT),
+]
+
+for flags, title in [
+    (0, "legacy(flags=0) modifier matrix for 'a'"),
+    (1, "disambiguate(flags=1) same matrix"),
+]:
+    print("=== %s ===" % title)
+    for name, mods in matrix:
+        d = enc_bytes(ord('a'), mods, flags)
+        print("  flags=%d %s-> %r hex=%s" % (flags, name.ljust(15), d, hx(d)))
+```
+
+**`/tmp/kbd_capacity.py`**
+
+```python
+#!/usr/bin/env python3
+# kbd_capacity.py — measure the exact per-buffer stack capacity by pushing K
+# distinct sentinel values (K = 1..12) onto one buffer's stack, then unwinding
+# (read current, pop one) K+2 times and counting how many distinct non-zero
+# values were retained. Proves capacity = 8 (push-full evicts the oldest).
+#
+#   PYTHONPATH=/workspace python3 /tmp/kbd_capacity.py
+import sys
+sys.path.insert(0, '.')
+from kitty_tests import BaseTest, parse_bytes
+
+bt = BaseTest()
+
+
+def push(screen, flags):
+    parse_bytes(screen, ('\x1b[>%du' % flags).encode('latin-1'))
+
+
+def pop(screen, n=1):
+    parse_bytes(screen, ('\x1b[<%du' % n).encode('latin-1'))
+
+
+print("### capacity measurement: push K distinct values on one buffer, then read-before-pop (K+2) times ###")
+for K in range(1, 13):
+    s = bt.create_screen()
+    for v in range(1, K + 1):
+        push(s, v)                                   # push sentinel value v
+    top = s.current_key_encoding_flags()             # top of stack == last pushed
+    unwind = []
+    for _ in range(K + 2):
+        unwind.append(s.current_key_encoding_flags())  # read current
+        pop(s, 1)                                       # pop one entry
+    distinct_retained = len(set(v for v in unwind if v != 0))
+    print("  K=%2d: top=%2d  unwind=%-40s distinct_retained=%d" % (K, top, str(unwind), distinct_retained))
+```
+
+**`/tmp/kbd_pty.py`**
+
+```python
+#!/usr/bin/env python3
+# kbd_pty.py — canonical child-boundary capture. For each key event, forks a
+# real child whose stdin is a real PTY slave (from kitty.child.openpty, the same
+# openpty kitty uses for its child PTYs), puts the slave in raw mode, has the
+# parent write the encoder bytes to the master, and captures what the child
+# actually read()s. Confirms the encoder output == the bytes the child receives.
+#
+#   PYTHONPATH=/workspace python3 /tmp/kbd_pty.py
+import os
+import sys
+import termios
+sys.path.insert(0, '.')
+import kitty.fast_data_types as fdt
+from kitty.child import openpty
+
+CTRL = fdt.GLFW_MOD_CONTROL      # 4
+SHIFT = fdt.GLFW_MOD_SHIFT       # 1
+
+
+def enc_bytes(key, mods, flags):
+    out = fdt.encode_key_for_tty(key=key, mods=mods, key_encoding_flags=flags)
+    return out.encode('latin-1') if isinstance(out, str) else bytes(out)
+
+
+def hx(data):
+    return ' '.join('%02x' % b for b in data)
+
+
+def capture_at_child(payload):
+    """Fork a child reading from a real PTY slave in raw mode; return the exact
+    bytes it read after the parent writes `payload` to the master."""
+    master, slave = openpty()
+    r, w = os.pipe()                       # child -> parent channel for the read bytes
+    pid = os.fork()
+    if pid == 0:                           # ---- child ----
+        os.close(master)
+        os.close(r)
+        os.dup2(slave, 0)                  # child's stdin IS the PTY slave
+        attrs = termios.tcgetattr(0)       # put the tty in raw mode so bytes pass through untouched
+        try:
+            import tty
+            tty.cfmakeraw(attrs)
+        except AttributeError:             # cfmakeraw added to `tty` in 3.12; fall back to termios flags
+            attrs[0] = 0                   # iflag
+            attrs[1] = 0                   # oflag
+            attrs[3] = 0                   # lflag (no ICANON/ECHO/ISIG/IEXTEN)
+        attrs[6][termios.VMIN] = 0
+        attrs[6][termios.VTIME] = 5        # 0.5s idle window terminates the read
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
+        buf = b''
+        while True:
+            chunk = os.read(0, 64)
+            if not chunk:                  # idle timeout with no more data -> done
+                break
+            buf += chunk
+        os.write(w, buf)
+        os.close(w)
+        os._exit(0)
+    # ---- parent ----
+    os.close(slave)
+    os.close(w)
+    os.write(master, payload)              # parent writes the encoder bytes to the master
+    got = b''
+    while True:
+        chunk = os.read(r, 64)
+        if not chunk:
+            break
+        got += chunk
+    os.close(r)
+    os.close(master)
+    os.waitpid(pid, 0)
+    return got
+
+
+cases = [
+    ("Ctrl+Shift+a", ord('a'), CTRL | SHIFT, 0),
+    ("Ctrl+Shift+a", ord('a'), CTRL | SHIFT, 1),
+    ("Ctrl+Shift+a", ord('a'), CTRL | SHIFT, 8),
+    ("plain 'a'",    ord('a'), 0, 1),
+    ("plain 'a'",    ord('a'), 0, 8),
+    ("Ctrl+a",       ord('a'), CTRL, 0),
+]
+
+all_match = True
+for name, key, mods, flags in cases:
+    enc = enc_bytes(key, mods, flags)
+    child = capture_at_child(enc)
+    match = (child == enc)
+    all_match = all_match and match
+    label = name.ljust(12) + " flags=%d" % flags
+    print("  [%s]  encoder -> %r (%s) ; child -> %r (%s) ; MATCH=%s" % (
+        label, enc, hx(enc), child, hx(child), match))
+print("ALL MATCH: %s" % all_match)
+```
+
+Invocation and cleanup (run from the repo root inside the build container, then delete the scripts so the repository is left unchanged):
+
+```
 PYTHONPATH=/workspace python3 /tmp/kbd_probe.py
-rm -f /tmp/kbd_probe.py /tmp/kbd_legacy.py /tmp/kbd_capacity.py /tmp/kbd_pty.py /tmp/kbd_pty_rx.bin
+PYTHONPATH=/workspace python3 /tmp/kbd_legacy.py
+PYTHONPATH=/workspace python3 /tmp/kbd_capacity.py
+PYTHONPATH=/workspace python3 /tmp/kbd_pty.py
+rm -f /tmp/kbd_probe.py /tmp/kbd_legacy.py /tmp/kbd_capacity.py /tmp/kbd_pty.py
 ```
 
 After deletion, `git status --porcelain` shows no modified tracked files (build artifacts such as `*.so` and `/kitty/launcher/kitt*` are gitignored); the only new file in the repository is this document, `blitzy/documentation/kitty_815df1e210e0.md`.
