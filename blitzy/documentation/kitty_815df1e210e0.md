@@ -376,6 +376,33 @@ This literally begins `1b 5d 35 31 31 33 3b` (`ESC ] 5 1 1 3 ;`) and ends `1b 5c
 confirming the `OSC 5113 … ST` form byte-for-byte. (This run used a 1-byte file `x`; the
 payload `d=eA` base64-decodes to `b'x'`.)
 
+> **What is byte-stable vs. what varies run-to-run (observed, 4 runs).** Independently
+> re-running this capture four times confirmed two things. **(a)** The single-field frames are
+> byte-stable: the opening `ac=send` frame `[0]` and the closing `ac=finish` frame `[3]`
+> reproduce byte-for-byte on every run (only the run-random session `id` changes). **(b)** The
+> multi-field frames `[1]` (`ac=file`) and `[2]` (`ac=end_data`) always carry the **same set**
+> of keys, but the **order of those keys after `id=` varies from run to run**. This is a
+> property of the serializer, not of the wire format: `Serialize()` iterates a Go **map** —
+> `ftc_field_map()` returns `map[string]reflect.StructField` (`kittens/transfer/ftc.go:140`)
+> and the loop is `for name, field := range ftc_field_map()` (`kittens/transfer/ftc.go:171`) —
+> and Go deliberately randomizes map-iteration order on every `range`. The `id=` key is always
+> first only because it is emitted by the framing prefix,
+> `fmt.Sprintf("\x1b]%d;id=%s;", …)` (`kittens/transfer/send.go:384`), **not** by `Serialize()`.
+> The four observed key orders were:
+>
+> ```
+> frame [1] (ac=file):     [id, n, mod, prm, fid, ac]   [id, ac, n, mod, prm, fid]
+>                          [id, n, ac, fid, mod, prm]   [id, n, prm, ac, mod, fid]
+> frame [2] (ac=end_data): [id, ac, fid, d]   [id, fid, ac, d]   [id, ac, d, fid]   [id, fid, d, ac]
+> ```
+>
+> Correctness is unaffected: the receiver parses strictly *by key* into the same field map
+> (`kittens/transfer/ftc.go:140`), so wire order is irrelevant. The frame **count** (4), each
+> frame's **key set**, every **value**, and the `OSC 5113 … ST` wrapper are all stable across
+> runs; only the intra-frame key ordering of the multi-field commands is non-deterministic.
+> (The frames shown above are therefore one representative capture; the opening frame in the
+> byte-exact dump is order-stable and reproduces exactly.)
+
 ### The key schema (field → wire short-key)
 
 Every command is a `FileTransmissionCommand` (struct at `kittens/transfer/ftc.go:120`).
@@ -694,7 +721,7 @@ The mechanism, terminal-side (`kitty/file_transmission.py`):
 
 - The destination file object stats any pre-existing file when it is created:
   ```python
-  # kitty/file_transmission.py:449-451
+  # kitty/file_transmission.py:449-452
   try:
       self.existing_stat: Optional[os.stat_result] = os.stat(self.name, follow_symlinks=False)
   except OSError:
