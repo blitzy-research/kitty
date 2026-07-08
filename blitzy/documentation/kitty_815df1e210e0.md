@@ -3,7 +3,7 @@
 > **Investigation target:** the `kitty` terminal emulator at commit **`815df1e21`** ("Wire up applying of font config"), branch **`kitty_815df1e210e0`**.
 > **Methodology:** run‑first. The canonical build (`python3 setup.py build`) and the canonical test entry point (`./test.py`) were executed inside the mandated canonical environment and their **complete, unedited output** is embedded below as the primary source of truth. Every behavioral claim is paired with the exact command that produced it, the real output, and a repository‑relative `file:line` reference into the source. Counts were confirmed stable across two consecutive runs.
 > **Environment (observed):** the mandated Docker image `swe_atlas_QnA_kovidgoyal_kitty_1.0`, with the host repository bind‑mounted at `/work`. Python **3.12.3** / Go **1.23.4** / gcc **13.3.0**, Linux, `/tmp` on `tmpfs`, locale `C.UTF-8`, environment variable `CI` **unset**. All absolute paths in the captured output are shown **verbatim** (they begin with `/work/…`, the mounted repository root); nothing is abbreviated or elided.
-> **Repository integrity:** the `.so`/launcher artifacts the build produces are gitignored (`*.so` at `.gitignore:L1`, `/kitty/launcher/kitt*` at `.gitignore:L18`), so `git status --porcelain` stays empty apart from this document. No existing repository file was modified. Any temporary observation scripts were created outside the tracked tree and removed afterward.
+> **Repository integrity:** the `.so`/launcher artifacts the build produces are gitignored (`*.so` at `.gitignore:L1`, `/kitty/launcher/kitt*` at `.gitignore:L18`), so `git status --porcelain` stays empty — the build products are ignored, and the answer document is committed rather than untracked. No existing repository file was modified. Any temporary observation scripts were created outside the tracked tree and removed afterward.
 
 ---
 
@@ -345,7 +345,46 @@ Stated as prose (each arrow is a real import/call/load observed at runtime):
 
 ## 7. Loaded/imported vs merely present‑on‑disk — direct observation
 
-A throwaway harness (created outside the tracked tree and removed afterward) ran the runner's real `find_all_tests()` — which imports every test module exactly as `./test.py` does — and then inspected `sys.modules`, followed by an explicit `ctypes.CDLL` load of the X11 backend. Complete, unedited output:
+A throwaway harness (created outside the tracked tree and removed afterward) ran the runner's real `find_all_tests()` — which imports every test module exactly as `./test.py` does — and then inspected `sys.modules`, followed by an explicit `ctypes.CDLL` load of the X11 backend.
+
+**Exact commands** (container `kitty-work`, `cd /work`). The harness is written to the container's tmpfs `/tmp` — never under the tracked `/work` tree — and removed afterward; it is run through the canonical **C launcher** (`./kitty/launcher/kitty +launch`, the same shebang `./test.py` uses at `test.py:L1`) so it executes under kitty's embedded Python exactly as the suite does:
+
+```bash
+cat > /tmp/probe_loaded.py <<'PY'
+import sys, os, ctypes
+from kitty_tests.main import find_all_tests
+from kitty.constants import glfw_path
+
+# Import every test module exactly as ./test.py does, via the runner's real discovery.
+find_all_tests()
+
+print('=== .so-backed Python modules in sys.modules after find_all_tests() ===')
+loaded = {}
+for name in sorted(sys.modules):
+    mod = sys.modules.get(name)
+    f = getattr(mod, '__file__', None)
+    if f and f.endswith('.so'):
+        print(f'  {name:24s} -> {os.path.normpath(f)}')
+        loaded[os.path.realpath(f)] = name
+
+print()
+print('=== kitty native artifacts: python-import vs present-on-disk ===')
+for rel in ('kitty/fast_data_types.so', 'kittens/transfer/rsync.so', 'kitty/glfw-x11.so', 'kitty/glfw-wayland.so'):
+    on_disk = os.path.isfile(rel)
+    in_mods = os.path.realpath(rel) in loaded
+    print(f'  {rel:26s} on_disk={on_disk}  in_sys.modules={in_mods}')
+
+print()
+print('=== glfw-x11.so via ctypes.CDLL (as kitty_tests/glfw.py:L49-L50) ===')
+p = glfw_path('x11')
+lib = ctypes.CDLL(p)
+print(f"  ctypes.CDLL('{p}') loaded OK; has symbol utf_8_strndup: {hasattr(lib, 'utf_8_strndup')}")
+PY
+./kitty/launcher/kitty +launch /tmp/probe_loaded.py
+rm -f /tmp/probe_loaded.py
+```
+
+A bare `python3 /tmp/probe_loaded.py` cannot import `kitty_tests` or the native extensions (they require kitty's embedded interpreter), so it is non-canonical and not used. `os.path.normpath` only tidies the launcher-relative `__file__` form (`/work/kitty/launcher/../../…`) into its canonical path for display. Complete, unedited output:
 
 ```
 === .so-backed Python modules in sys.modules after find_all_tests() ===
@@ -434,11 +473,23 @@ What does the test output *reveal* about the dependency graph between the Python
 
 ## 11. The failure‑cascade modes (contrasted with complete verbatim output)
 
-All perturbations below are **deliberate, non‑canonical** conditions used to expose behavior the passing canonical run cannot show. Each was performed repo‑safely: the gitignored artifact was moved aside, `./test.py` re‑run, then the artifact restored and verified by `sha256sum`; `git status --porcelain` was confirmed empty (apart from this document) after every step.
+All perturbations below are **deliberate, non‑canonical** conditions used to expose behavior the passing canonical run cannot show. Each was performed repo‑safely: the gitignored artifact was moved aside, `./test.py` re‑run, then the artifact restored and verified by `sha256sum`; `git status --porcelain` was confirmed empty after every step (the moved artifact is gitignored, so it never appears, and the answer document is committed rather than untracked).
 
 ### 11.1 Mode (b), instance 1 — a missing *critical Python‑imported* extension aborts the whole run at collection time
 
-**Method:** move `kitty/fast_data_types.so` aside; run `./test.py`. **Result: exit code 1, ZERO tests run (no `Ran N tests` line) — only a traceback.** Complete, unedited output:
+**Method:** move `kitty/fast_data_types.so` aside; run `./test.py`. **Result: exit code 1, ZERO tests run (no `Ran N tests` line) — only a traceback.**
+
+**Exact commands** (container `kitty-work`, `cd /work`; the `.so` is gitignored, so moving it never dirties `git status`, and it is restored and re-hashed immediately after):
+
+```bash
+sha256sum kitty/fast_data_types.so     # record pre-move hash
+mv kitty/fast_data_types.so /tmp/       # move the CRITICAL extension aside
+./test.py; echo "exit=$?"               # <-- produces the traceback below
+mv /tmp/fast_data_types.so kitty/       # restore
+sha256sum kitty/fast_data_types.so     # confirm identical hash (git status --porcelain stays empty)
+```
+
+Complete, unedited output:
 
 ```
 Traceback (most recent call last):
@@ -486,7 +537,21 @@ ModuleNotFoundError: No module named 'kitty.fast_data_types'
 
 ### 11.2 Mode (b), instance 2 — a missing *narrow* Python‑imported extension (`rsync.so`) *also* aborts the whole run
 
-**Method:** move `kittens/transfer/rsync.so` aside; run `./test.py`. **Result: exit code 1, ZERO tests run.** Complete, unedited output:
+**Method:** move `kittens/transfer/rsync.so` aside; run `./test.py`. **Result: exit code 1, ZERO tests run.**
+
+**Exact commands** (container `kitty-work`, `cd /work`; all three invocations run with the single `.so` moved aside, then it is restored and re-hashed):
+
+```bash
+sha256sum kittens/transfer/rsync.so          # record pre-move hash
+mv kittens/transfer/rsync.so /tmp/            # move the NARROW extension aside
+./test.py; echo "exit=$?"                     # full suite         -> output block #1 below
+./test.py --module datatypes; echo "exit=$?"  # narrowed by module -> output block #2 below
+./test.py linebuf; echo "exit=$?"             # positional name    -> output block #3 below
+mv /tmp/rsync.so kittens/transfer/            # restore
+sha256sum kittens/transfer/rsync.so          # confirm identical hash (git status --porcelain stays empty)
+```
+
+The `--module datatypes` / positional-`linebuf` forms deliberately narrow the run; both still abort because `find_all_tests()` imports every module (including `file_transmission`) *before* any filter is applied. Complete, unedited output:
 
 ```
 Running under CI: False
@@ -631,7 +696,19 @@ So `rsync.so`'s "narrow" nature is purely its **source consumer count (2 modules
 
 ### 11.3 Mode (a) — a missing *file‑checked* platform artifact fails only its own test
 
-**Method:** move `kitty/glfw-wayland.so` aside; run `./test.py`. **Result: exit code 1, but `FAILED (failures=1, skipped=4)` — 144 tests still ran.** The single failing test, complete and unedited:
+**Method:** move `kitty/glfw-wayland.so` aside; run `./test.py`. **Result: exit code 1, but `FAILED (failures=1, skipped=4)` — 144 tests still ran.**
+
+**Exact commands** (container `kitty-work`, `cd /work`):
+
+```bash
+sha256sum kitty/glfw-wayland.so     # record pre-move hash
+mv kitty/glfw-wayland.so /tmp/       # move the stat-only platform backend aside
+./test.py; echo "exit=$?"            # <-- suite runs to completion (Ran 145 tests); only test_glfw_modules FAILs
+mv /tmp/glfw-wayland.so kitty/       # restore
+sha256sum kitty/glfw-wayland.so     # confirm identical hash (git status --porcelain stays empty)
+```
+
+The single failing test, complete and unedited:
 
 ```
 FAIL: test_glfw_modules (kitty_tests.check_build.TestBuild.test_glfw_modules)
@@ -660,7 +737,19 @@ FAILED (failures=1, skipped=4)
 
 ### 11.4 The `ctypes`‑loaded X11 backend — proof it is genuinely loaded, plus the CI gate
 
-**Method:** move `kitty/glfw-x11.so` aside; run `./test.py`. This backend is both *stat‑checked* (by `test_glfw_modules`) and *`ctypes`‑loaded* (by `test_utf_8_strndup`), so removing it turns `test_utf_8_strndup` into an `ERROR` — an `OSError` from the failed `dlopen` — which is the definitive proof that `glfw-x11.so` is loaded as a shared library at runtime. Complete, unedited error:
+**Method:** move `kitty/glfw-x11.so` aside; run `./test.py`. This backend is both *stat‑checked* (by `test_glfw_modules`) and *`ctypes`‑loaded* (by `test_utf_8_strndup`), so removing it turns `test_utf_8_strndup` into an `ERROR` — an `OSError` from the failed `dlopen` — which is the definitive proof that `glfw-x11.so` is loaded as a shared library at runtime.
+
+**Exact commands** (container `kitty-work`, `cd /work`):
+
+```bash
+sha256sum kitty/glfw-x11.so     # record pre-move hash
+mv kitty/glfw-x11.so /tmp/       # move the ctypes-loaded X11 backend aside
+./test.py; echo "exit=$?"        # <-- test_utf_8_strndup ERRORs (OSError from dlopen); test_glfw_modules FAILs
+mv /tmp/glfw-x11.so kitty/       # restore
+sha256sum kitty/glfw-x11.so     # confirm identical hash (git status --porcelain stays empty)
+```
+
+Complete, unedited error:
 
 ```
 ERROR: test_utf_8_strndup (kitty_tests.glfw.TestGLFW.test_utf_8_strndup)
@@ -690,7 +779,20 @@ OSError: /work/kitty/glfw-x11.so: cannot open shared object file: No such file o
 
 (In this same perturbed run, `test_glfw_modules` also `FAIL`s its `x11` stat assertion, and an *unrelated* intermittent flake in `test_disk_cache` appeared — an `AssertionError: b'\xe0\xa5\xb2666' != b'666666'` inside `fast_data_types.DiskCache`, which was fully present; that test passed in both clean canonical runs, so it is **not** attributable to the `glfw-x11.so` removal and is noted here only for evidence fidelity.)
 
-**CI gate (configuration‑sensitivity), demonstrated.** With `glfw-wayland.so` moved aside, the *same* `test_glfw_modules` has different requirements depending on `CI`. Complete, unedited output of `CI=true ./test.py --module check_build` (terminal color escape codes stripped for readability; nothing else altered) — `test_glfw_modules` passes and the run exits 0:
+**CI gate (configuration‑sensitivity), demonstrated.** With `glfw-wayland.so` moved aside, the *same* `test_glfw_modules` has different requirements depending on `CI`.
+
+**Exact commands** (container `kitty-work`, `cd /work`; the Wayland backend is moved aside so the requirement difference is observable, then restored — only ANSI color escape codes were stripped from the captured output for readability):
+
+```bash
+sha256sum kitty/glfw-wayland.so                        # record pre-move hash
+mv kitty/glfw-wayland.so /tmp/                          # move the Wayland backend aside
+CI=true ./test.py --module check_build; echo "exit=$?" # CI set   -> test_glfw_modules ok   (Wayland not required)
+./test.py --module check_build; echo "exit=$?"         # CI unset -> test_glfw_modules FAIL (Wayland required)
+mv /tmp/glfw-wayland.so kitty/                          # restore
+sha256sum kitty/glfw-wayland.so                        # confirm identical hash (git status --porcelain stays empty)
+```
+
+Complete, unedited output of `CI=true ./test.py --module check_build` (terminal color escape codes stripped for readability; nothing else altered) — `test_glfw_modules` passes and the run exits 0:
 
 ```
 Running under CI: True
@@ -778,7 +880,7 @@ kitty's runner contains an *intended* cascade guard: `itertests()` (`kitty_tests
 - **Canonical environment.** Everything above was built and run inside the **mandated Docker image** `swe_atlas_QnA_kovidgoyal_kitty_1.0` (container `kitty-work`), with the repository at commit `815df1e21` bind‑mounted at `/work` (hence the `/work/` prefix on every captured path). Toolchain observed: **Python 3.12.3**, **Go 1.23.4**, **gcc 13.3.0**; `/tmp` on `tmpfs`; locale `C.UTF-8`; the environment variable **`CI` unset**. The build floors declared by the repository are Python `>=3.8` (`pyproject.toml:L2`) and Go `1.22` (`go.mod:L3`); the image ships newer point releases, which satisfy those floors.
 - **Real entry points only.** The build used the canonical `python3 setup.py build` (`build` action dispatched at `setup.py:L2115-2121`) and the run used the canonical `./test.py` (`test.py:L1` shebang → `test.py:L7-9` → `importlib.import_module('kitty_tests.main')` at `test.py:L8`). No bypassing interface, fallback, or synthetic stand‑in was used for any reported value.
 - **Two‑run stability.** The headline figures (`Ran 145 tests`, `OK (skipped=4)`, `All Go tests succeeded`, exit `0`) were confirmed **identical across two consecutive `./test.py` runs**; the only run‑to‑run variation was the print‑order of the concurrent Go package set (its contents were identical). The `sys.modules` observation in §7 was likewise confirmed identical across two runs.
-- **Deliberate perturbations were non‑canonical and fully reverted.** Every failure‑mode demonstration in §11 was produced by temporarily moving a single gitignored `.so` aside, running `./test.py`, then restoring the artifact and verifying its `sha256sum`. After each experiment, `git status --porcelain` was confirmed to show only this one document. These perturbed runs are explicitly labeled non‑canonical; the canonical run passes.
+- **Deliberate perturbations were non‑canonical and fully reverted.** Every failure‑mode demonstration in §11 was produced by temporarily moving a single gitignored `.so` aside, running `./test.py`, then restoring the artifact and verifying its `sha256sum`. After each experiment, `git status --porcelain` was confirmed empty, and each moved `.so` was verified byte-identical to its pre-move `sha256sum`; the source-commit diff (`git diff 815df1e21..HEAD --name-status`) contains only this one document. These perturbed runs are explicitly labeled non‑canonical; the canonical run passes.
 - **Repository left unchanged (integrity).** The build products (`kitty/fast_data_types.so`, `kitty/glfw-x11.so`, `kitty/glfw-wayland.so`, `kittens/transfer/rsync.so`, `kitty/launcher/{kitty,kitten}`) are **gitignored** (`.gitignore:L1` `*.so`; `.gitignore:L18` `/kitty/launcher/kitt*`), so producing them leaves the tracked tree clean. No existing source, test, configuration, or manifest file was modified; all temporary observation scripts were created under the container's `/tmp` (never under `/work`) and removed. The only repository change introduced by this investigation is **this single answer document**. Because the deliverable was added by the implementation commit, `git status --porcelain` reports it as already committed rather than untracked, and `git diff 815df1e21..HEAD --name-status` shows exactly one added path: `A blitzy/documentation/kitty_815df1e210e0.md`.
 
 ---
