@@ -473,7 +473,7 @@ boundary points (isolates the marginal per-line cost from the fixed baseline):
 # the fixed baseline. Settled RSS for a boundary uses the [w_i, w_{i+1}) window.
 import sys
 from parse_common import parse_meta, parse_rss
-rss_path, meta_path = sys.argv[1], sys.argv[2]
+meta_path, rss_path = sys.argv[1], sys.argv[2]
 cols, rows, N, batch, pause, begin, prog, done = parse_meta(meta_path)
 rss = parse_rss(rss_path)
 walls = [w for (_, w) in prog]
@@ -516,7 +516,7 @@ window up to the **next** boundary, so a later segment's page-fault cannot bleed
 import sys, statistics, math
 from collections import Counter
 from parse_common import parse_meta, parse_rss
-rss_path, meta_path = sys.argv[1], sys.argv[2]
+meta_path, rss_path = sys.argv[1], sys.argv[2]
 cols, rows, N, batch, pause, begin, prog, done = parse_meta(meta_path)
 rss = parse_rss(rss_path)
 per_seg = 2048*(32*cols+1)/1024.0
