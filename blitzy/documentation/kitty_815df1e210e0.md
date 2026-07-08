@@ -1051,8 +1051,9 @@ Supporting pieces you will use: `PayloadGetter` (`kitty/rc/base.py:62`) wraps th
 access; `windows_for_payload()` (`kitty/rc/base.py:390`) resolves `--match`/`--match-tab`;
 `is_asynchronous` (`kitty/rc/base.py:331`) marks commands whose reply comes later. Dispatch to your
 class happens through `command_for_name(cmd['cmd'])` in `handle_cmd` (`kitty/remote_control.py:222`),
-so registering the module under `kitty/rc/` is what wires it in. There are 40 such command modules
-today — `ls` is the reference this document captured end to end.
+so registering the module under `kitty/rc/` is what wires it in. There are 39 such command modules
+today — enumerated by `all_command_names()` (`kitty/rc/base.py:459-465`), which excludes the `base`
+framework module and `__init__` — and `ls` is the reference this document captured end to end.
 
 ---
 
