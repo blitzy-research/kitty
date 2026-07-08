@@ -52,7 +52,7 @@ python3 setup.py build
 ./test.py
 ```
 
-`test.py`'s shebang is `#!./kitty/launcher/kitty +launch` (`test.py:L1`), i.e. the freshly built **C launcher** re‑executes the script under kitty's embedded Python; `main()` then does `importlib.import_module('kitty_tests.main')` (`test.py:L8`) and calls its `main()` (`test.py:L7-9`). The `setup.py test` action reaches the same place via `os.execl(texe, texe, '+launch', 'test.py')` (`setup.py:L2100-2102`). Both are the *canonical* entry point; no bypassing/fallback interface was used.
+`test.py`'s shebang is `#!./kitty/launcher/kitty +launch` (`test.py:L1`), i.e. the freshly built **C launcher** re‑executes the script under kitty's embedded Python; `main()` then does `importlib.import_module('kitty_tests.main')` (`test.py:L8`) and calls its `main()` (`test.py:L7-9`). The `setup.py test` action reaches the same place via `os.execl(texe, texe, '+launch', 'test.py')` (`setup.py:L2101-2103`). Both are the *canonical* entry point; no bypassing/fallback interface was used.
 
 ---
 
