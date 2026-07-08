@@ -514,7 +514,7 @@ what to do when a window's child is gone (destroy the window, maybe close kitty)
 builds the notification.
 
 ```python
-# kitty/window.py:1408-1450  (complete function body, verbatim — no elision)
+# kitty/window.py:1408-1451  (complete function body, verbatim — no elision)
     def handle_cmd_end(self, exit_status: str = '') -> None:
         if self.last_cmd_output_start_time == 0.:
             return
@@ -685,7 +685,7 @@ retrieval is a distinct answer (Q6).
 **Grounding.** Reaping happens in `reap_children`, which loops over `waitpid` non‑blockingly:
 
 ```c
-// kitty/child-monitor.c:1413-1425
+// kitty/child-monitor.c:1413-1426
 reap_children(ChildMonitor *self, bool enable_close_on_child_death) {
     int status;
     pid_t pid;
