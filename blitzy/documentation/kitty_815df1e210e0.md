@@ -41,7 +41,7 @@ Command:
 
 ```bash
 whoami; id
-uname -a; grep PRETTY_NAME /etc/os-release; python3 --version; gcc --version | head -1
+uname -a; grep -E 'PRETTY_NAME|^NAME=' /etc/os-release; python3 --version; gcc --version | head -1
 go version; pkg-config --modversion harfbuzz freetype2 fontconfig libpng lcms2 openssl
 git -C /home/ubuntu/kitty log -1 --format='%H %s'
 ```
