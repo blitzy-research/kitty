@@ -235,7 +235,47 @@ The `on_focus_change: window id: 0x1 focused: 1` line is printed by kitty's `win
 
 ### Input injection method (canonical) [observed]
 
-Real key events were synthesised with `xdotool key --clearmodifiers <KEY>` / `xdotool type`, which drive the X server's `XTEST` extension so events flow through the ordinary X11 event queue into `_glfwInputKeyboard()` `glfw/input.c:306` [observed]. `xdotool`'s `--window` (XSendEvent) form was deliberately **not** used, because GLFW ignores synthetic `send_event` events, which would make `--window` a non-canonical stand-in [inferred — GLFW's `send_event` filtering is read from source; the canonical `XTEST` path is what all captures below actually used].
+Real key events were synthesised with `xdotool key --clearmodifiers <KEY>` / `xdotool type`, which drive the X server's `XTEST` extension so events are injected at the server's input layer and delivered to the **X-focused** window exactly as a physical keypress would be, flowing through the ordinary X11 event queue into `_glfwInputKeyboard()` `glfw/input.c:306` [observed]. `xdotool`'s `--window` (XSendEvent) form was deliberately **not** used as the observation basis, because — as verified at runtime just below — XSendEvent **bypasses X focus**: it delivers the synthetic event to the *addressed* window regardless of which window the server considers focused, which is not how a genuine keystroke is routed, making `--window` a non-canonical stand-in [observed].
+
+One point is corrected here from observation rather than repeated as folklore: GLFW does **not** silently discard synthetic `send_event` key events. The X11 `KeyPress` branch forwards *every* `KeyPress` to the XKB decoder with no `send_event` guard — `glfw/x11_window.c:1251-1256`:
+
+```
+        case KeyPress:
+        {
+            UPDATE_KEYMAP_IF_NEEDED;
+            glfw_xkb_handle_key_event(window, &_glfw.x11.xkb, event->xkey.keycode, GLFW_PRESS);
+            return;
+        }
+```
+
+(the window selects core key events via `KeyPressMask | KeyReleaseMask` at `glfw/x11_window.c:558`). So an XSendEvent-injected `KeyPress` reaches `_glfwInputKeyboard()` `glfw/input.c:306` on the **same** in-process path as an `XTEST` event — the non-canonical property is the *focus bypass*, not any filtering. This was verified directly (window `A` = `0x2000... = 2097164` is the X-focused window; window `B` = `4194316` is a *different*, unfocused window):
+
+```
+# WID_A=2097164 (this is the X-focused window); WID_B=4194316 (a DIFFERENT, unfocused window)
+$ xdotool getwindowfocus     # which window the X server considers focused
+2097164
+
+## Test A — canonical XTEST (xdotool key, NO --window): server-level inject to the focused window
+$ xdotool key --clearmodifiers v
+# WID_A --debug-input (grep for 'v'):
+[70.594] ^[[33mon_key_input^[[m: glfw key: 0x76 native_code: 0x76 action: PRESS mods: none text: 'v' state: 0 sent key as text to child: v
+
+## Test B — XSendEvent to the FOCUSED window A (xdotool --window WID_A): synthetic send_event
+$ xdotool key --window 2097164 --clearmodifiers m
+# WID_A --debug-input (grep for 'm'):
+[70.969] ^[[33mon_key_input^[[m: glfw key: 0x6d native_code: 0x6d action: PRESS mods: none text: 'm' state: 0 sent key as text to child: m
+
+## Test C (decisive) — XSendEvent to the UNFOCUSED window B while A is focused
+$ xdotool getwindowfocus     # confirm A still focused
+2097164
+$ xdotool key --window 4194316 --clearmodifiers k
+# FOCUSED window A --debug-input (grep 'k')  -> expect NOTHING:
+(no 'k' in focused window A)
+# UNFOCUSED TARGET window B --debug-input (grep 'k') -> expect the keypress:
+[16.321] ^[[33mon_key_input^[[m: glfw key: 0x6b native_code: 0x6b action: PRESS mods: none text: 'k' state: 0 sent key as text to child: k
+```
+
+Test A shows the canonical `XTEST` key landing in the focused window `A`. Test B shows that an XSendEvent aimed *at the focused window* is accepted too — direct evidence that GLFW does not filter synthetic events. Test C is decisive: with `A` focused, an XSendEvent aimed at the **unfocused** window `B` is received by **`B`** while the focused window `A` sees nothing — the opposite of genuine keyboard delivery, which always follows focus. Repeating Test C for keys `w`, `j`, `n` produced the identical split every time (the unfocused *target* received the key; the focused window received nothing), so the focus-bypass behaviour is stable, not incidental [observed]. Every capture in this document therefore uses only the canonical `XTEST` path [observed].
 
 ---
 
@@ -442,7 +482,11 @@ Same key, `Pushed key encoding flags to: 1`, and the PRESS is `sent key as text 
 
 ### R1.4 Typing during resize & scroll (transitional states) [observed]
 
-Font-resize and scrollback shortcuts were exercised interleaved with an ordinary key. Complete log:
+This transitional case is covered in two forms: **(R1.4a)** font-size and scrollback *shortcuts* interleaved with an ordinary key, and **(R1.4b)** an actual window/terminal **geometry** resize while keys are typed. Both confirm that the input-recipient decision is independent of the window's transient geometry and scroll state.
+
+#### R1.4a Font-size & scrollback shortcuts interleaved with a key [observed]
+
+Font-resize (`change_font_size`) and scrollback shortcuts were exercised interleaved with an ordinary key. Complete log:
 
 ```
 $ cat -v /tmp/kitty_probe/r1_4_resize_scroll.log
@@ -511,7 +555,80 @@ ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) Unknown PCM default
 [4.441] ^[[33mon_key_input^[[m: glfw key: 0xe00b native_code: 0xff56 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
 ```
 
-`ctrl+shift+=` and `ctrl+shift+-` are consumed as `change_font_size` and `ctrl+shift+Up` as `scroll_line_up` — all `handled as shortcut` `kitty/keys.c:231` [observed]. The ordinary `z` pressed in the same burst is still `sent key as text to child: z` `kitty/keys.c:254`, and `shift+PageDown` is still encoded to the child as `^[ [ 6 ; 2 ~` `kitty/keys.c:261` [observed]. So resizing and scrolling do **not** perturb routing: the recipient decision is independent of transient window geometry / scroll state [observed]. (The `ALSA lib` lines are again the failed terminal bell under Xvfb, shown complete [observed].)
+`ctrl+shift+=` and `ctrl+shift+-` are consumed as `change_font_size` and `ctrl+shift+Up` as `scroll_line_up` — all `handled as shortcut` `kitty/keys.c:231` [observed]. The ordinary `z` pressed in the same burst is still `sent key as text to child: z` `kitty/keys.c:254`, and `shift+PageDown` is still encoded to the child as `^[ [ 6 ; 2 ~` `kitty/keys.c:261` [observed]. So font-size changes and scrolling do **not** perturb routing: the recipient decision is independent of these transient states [observed]. (The `ALSA lib` lines are again the failed terminal bell under Xvfb, shown complete [observed].)
+
+#### R1.4b Actual window/terminal *geometry* resize while typing [observed]
+
+R1.4a used font-size and scroll *shortcuts*; this sub-part exercises the literal requirement — **keyboard input while the terminal is resizing**. A fresh instance was launched running a child that prints its PTY size on start and on every `SIGWINCH`, and echoes each byte it receives (its stdin put in `cbreak` mode) so key receipt is visible from the child's side. The window **geometry** was then changed repeatedly with `xdotool windowsize` while ordinary keys were injected between the resizes; the geometry was witnessed before and after with `xdotool getwindowgeometry` and `xwininfo` (there is no window manager under Xvfb, so `xdotool windowsize` maps directly to an `XResizeWindow` on the client window):
+
+```
+$ xdotool getwindowgeometry 2097164    # BEFORE
+Window 2097164
+  Position: 0,0 (screen: 0)
+  Geometry: 720x496
+$ xwininfo -id 2097164 | grep -E 'Width|Height'    # BEFORE
+  Width: 720
+  Height: 496
+
+# interleave real window-geometry resizes with keystrokes (0.35s settle lets each resize commit + fire SIGWINCH)
+$ xdotool windowsize 2097164 960 600 ; xdotool key --clearmodifiers a
+$ xdotool windowsize 2097164 480 320 ; xdotool key --clearmodifiers b
+$ xdotool windowsize 2097164 1120 704 ; xdotool type --clearmodifiers cd
+$ xdotool windowsize 2097164 640 400 ; xdotool key --clearmodifiers e
+
+$ xdotool getwindowgeometry 2097164    # AFTER
+Window 2097164
+  Position: 0,0 (screen: 0)
+  Geometry: 640x400
+$ xwininfo -id 2097164 | grep -E 'Width|Height'    # AFTER
+  Width: 640
+  Height: 400
+```
+
+The X window geometry demonstrably changes (`720x496` → … → `640x400`). The child confirms that the **terminal itself** — the PTY, not merely the X window — resized, and that the interleaved keystrokes arrived, in chronological order:
+
+```
+INITIAL rows=27 cols=80
+CHILD-RECEIVED: b'a'
+SIGWINCH rows=33 cols=106
+CHILD-RECEIVED: b'b'
+SIGWINCH rows=17 cols=53
+CHILD-RECEIVED: b'c'
+CHILD-RECEIVED: b'd'
+SIGWINCH rows=39 cols=124
+CHILD-RECEIVED: b'e'
+SIGWINCH rows=22 cols=71
+```
+
+Each `xdotool windowsize` produced a `SIGWINCH` whose `rows`/`cols` track the requested pixel size (`960x600`→`33x106`, `480x320`→`17x53`, `1120x704`→`39x124`, `640x400`→`22x71`), and every injected key is received by the child (`CHILD-RECEIVED: b'a'` … `b'e'`) *interleaved* with those resizes [observed]. kitty's own `--debug-input` lens shows the same five keys routed to the child during the resize burst — and, notably, **no** resize line of any kind:
+
+```
+[16.932] ^[[31mPress^[[m xkb_keycode: 0x26 clean_sym: a composed_sym: a text: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[16.932] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
+[16.935] ^[[32mRelease^[[m xkb_keycode: 0x26 clean_sym: a mods: none glfw_key: 97 (a) xkb_key: 97 (a)
+[16.936] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[17.300] Mouse cursor left window: 1[17.300] ^[[31mPress^[[m xkb_keycode: 0x38 clean_sym: b composed_sym: b text: b mods: none glfw_key: 98 (b) xkb_key: 98 (b)
+^[[33mon_key_input^[[m: glfw key: 0x62 native_code: 0x62 action: PRESS mods: none text: 'b' state: 0 sent key as text to child: b
+[17.305] ^[[32mRelease^[[m xkb_keycode: 0x38 clean_sym: b mods: none glfw_key: 98 (b) xkb_key: 98 (b)
+[17.305] ^[[33mon_key_input^[[m: glfw key: 0x62 native_code: 0x62 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[17.667] Mouse cursor entered window: 1 at 640.000000x400.000000
+[17.674] ^[[31mPress^[[m xkb_keycode: 0x36 clean_sym: c composed_sym: c text: c mods: none glfw_key: 99 (c) xkb_key: 99 (c)
+[17.674] ^[[33mon_key_input^[[m: glfw key: 0x63 native_code: 0x63 action: PRESS mods: none text: 'c' state: 0 sent key as text to child: c
+[17.676] ^[[32mRelease^[[m xkb_keycode: 0x36 clean_sym: c mods: none glfw_key: 99 (c) xkb_key: 99 (c)
+[17.676] ^[[33mon_key_input^[[m: glfw key: 0x63 native_code: 0x63 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[17.678] ^[[31mPress^[[m xkb_keycode: 0x28 clean_sym: d composed_sym: d text: d mods: none glfw_key: 100 (d) xkb_key: 100 (d)
+[17.679] ^[[33mon_key_input^[[m: glfw key: 0x64 native_code: 0x64 action: PRESS mods: none text: 'd' state: 0 sent key as text to child: d
+[17.681] ^[[32mRelease^[[m xkb_keycode: 0x28 clean_sym: d mods: none glfw_key: 100 (d) xkb_key: 100 (d)
+[17.681] ^[[33mon_key_input^[[m: glfw key: 0x64 native_code: 0x64 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[18.047] Mouse cursor left window: 1[18.047] ^[[31mPress^[[m xkb_keycode: 0x1a clean_sym: e composed_sym: e text: e mods: none glfw_key: 101 (e) xkb_key: 101 (e)
+^[[33mon_key_input^[[m: glfw key: 0x65 native_code: 0x65 action: PRESS mods: none text: 'e' state: 0 sent key as text to child: e
+[18.050] ^[[32mRelease^[[m xkb_keycode: 0x1a clean_sym: e mods: none glfw_key: 101 (e) xkb_key: 101 (e)
+[18.050] ^[[33mon_key_input^[[m: glfw key: 0x65 native_code: 0x65 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+```
+
+Two things are observed here. First, every key is `sent key as text to child` `kitty/keys.c:254` even as the geometry is changing — routing is unaffected by the resize [observed]. Second, `--debug-input` prints **nothing** for the resize itself; a `grep -Ec 'on_resize|resize|Configure'` over this burst returns `0` [observed]. That silence is by design, not an omission: a window resize enters kitty on a *separate* callback path — `framebuffer_size_callback()` `kitty/glfw.c:330` and `live_resize_callback()` `kitty/glfw.c:316` (registered at `kitty/glfw.c:1285-1286`) — which only set `live_resize` state and update the GL surface, after which the viewport and the child's `winsize` (the `SIGWINCH` above) are committed in the debounced tick loop `kitty/child-monitor.c:1047-1076`. None of those functions calls the `debug_input` printer, so the keyboard lens is intentionally silent on geometry changes; there is no `on_resize` log line anywhere in this pipeline [observed; mechanism grounded in the cited source]. This is precisely why the resize is witnessed with `xdotool`/`xwininfo`/`SIGWINCH` rather than a debug-input line. The recipient decision (`active_window()` `kitty/keys.c:106-111`) is therefore independent of window geometry: keys keep reaching the focused window's child throughout a live resize [observed]. (The incidental `Mouse cursor left/entered window` lines appear because the pointer, held still, crosses the window edge as the geometry shrinks and grows — corroborating that the geometry really is changing during the key burst [observed].)
+
+The resize-while-typing burst was repeated; the second run behaved identically — geometry changing across the burst (`640x400` → `880x560` → `1200x736` → `560x352`), each `SIGWINCH` tracking it (`31x97`, `40x133`, `19x62`), every interleaved key (`p`, `q`, `r`) reaching the child, and still zero resize lines in `--debug-input` — so this transitional behaviour is stable, not incidental [observed].
 
 ### R1.5 Background output while a *different* window is focused (decisive) [observed]
 
@@ -3191,7 +3308,7 @@ This section is the explicit coverage check the prompt asks for. Each row names 
 | **R1** overlapping activity: multiple **OS windows** | (b) R1.1 | `new_os_window` action line in `--debug-input`, plus `xdotool search --class kitty` listing **two** distinct X window ids | ✅ |
 | **R1** rapid focus switching | (b) R1.1 | successive `on_focus_change` lines (`window id 0x1 focused 1` → `0x2 focused 1`) | ✅ |
 | **R1** plain + modifier / alternate keys | (b) R1.2, R1.3 | plain-text byte for `a`/`c` (`sent key as text to child`), `0x3` (ETX) for `ctrl+c`, and CSI-u `^[ [ 9 7 u` (= `ESC[97u`) for the same `a` under the Kitty Keyboard Protocol (release `^[ [ 9 7 ; 1 : 3 u`) | ✅ |
-| **R1** typing during resize & scroll (transitional) | (b) R1.4 | keys logged as `sent key as text to child` interleaved with `on_resize`/scroll activity | ✅ |
+| **R1** typing during resize & scroll (transitional) | (b) R1.4a / R1.4b | keys `sent key as text to child` interleaved with (a) `change_font_size` / `scroll_line_up` shortcuts and (b) **real window-geometry resizes** — `xdotool getwindowgeometry` / `xwininfo` show the geometry changing and the child's `SIGWINCH` `rows`/`cols` track it, while `--debug-input` emits no resize line (resize is a separate path, `kitty/glfw.c:330`) | ✅ |
 | **R1** background output while a *different* window is focused | (b) R1.5 | emitter window streams output while `--debug-input` shows keys routed to the *focused* window's child only | ✅ |
 | **R1** key auto-repeat (held key) | (b) R1.6 | one `PRESS` followed by many `REPEAT` events for a single held key | ✅ |
 | **R2a** which component sees input *first* | (c) R2a | top native frames are `libglfw` → `_glfwInputKeyboard()` `glfw/input.c:306` in the merged stack (d) | ✅ |
