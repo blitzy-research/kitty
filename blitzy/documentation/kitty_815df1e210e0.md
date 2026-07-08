@@ -39,7 +39,7 @@ All observation was performed inside the pinned Docker image specified by the pr
 #   (alias andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1)
 # Canonical toolchain in-image: Python 3.12.3, gcc 13.3.0, Go 1.23.4, pkg-config 1.8.1.
 
-cd /workspace                       # the repo, bind-mounted at commit 815df1e210e0…
+cd /workspace                       # the repo, bind-mounted at commit 815df1e210e0
 python3 setup.py --skip-building-kitten
 # -> compiles the C extension kitty/fast_data_types.so (which hosts Screen,
 #    parse_bytes/test_parse_written_data, and encode_key_for_tty) and the
@@ -126,21 +126,39 @@ memset(self->alt_key_encoding_flags, 0, sizeof(self->alt_key_encoding_flags));
 The function that performs the main↔alt switch is `screen_toggle_screen_buffer` (`kitty/screen.c:L1068`). It decides direction from which line buffer is active:
 
 ```c
-// kitty/screen.c:L1068-1069
-static void
+// kitty/screen.c:L1067-1095   (complete function body, quoted verbatim — no elided logic)
+void
 screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_screen) {
     bool to_alt = self->linebuf == self->main_linebuf;
-    ...
+    self->active_hyperlink_id = 0;
+    if (to_alt) {
+        if (clear_alt_screen) {
+            linebuf_clear(self->alt_linebuf, BLANK_CHAR);
+            grman_clear(self->alt_grman, true, self->cell_size);
+        }
+        if (save_cursor) screen_save_cursor(self);
+        self->linebuf = self->alt_linebuf;
+        self->tabstops = self->alt_tabstops;
+        self->key_encoding_flags = self->alt_key_encoding_flags;
+        self->grman = self->alt_grman;
+        screen_cursor_position(self, 1, 1);
+        cursor_reset(self->cursor);
+    } else {
+        self->linebuf = self->main_linebuf;
+        self->tabstops = self->main_tabstops;
+        self->key_encoding_flags = self->main_key_encoding_flags;
+        if (save_cursor) screen_restore_cursor(self);
+        self->grman = self->main_grman;
+    }
+    screen_history_scroll(self, SCROLL_FULL, false);
+    self->is_dirty = true;
+    self->grman->layers_dirty = true;
+    clear_selection(&self->selections);
+    global_state.check_for_active_animated_images = true;
+}
 ```
 
-and its **entire** effect on the keyboard-flags state is one of two pointer assignments:
-
-```c
-// kitty/screen.c:L1079   (entering the ALT screen)
-self->key_encoding_flags = self->alt_key_encoding_flags;
-// kitty/screen.c:L1086   (returning to the MAIN screen)
-self->key_encoding_flags = self->main_key_encoding_flags;
-```
+Its **entire** effect on the keyboard-flags state is one of the two pointer assignments visible in the body above: `self->key_encoding_flags = self->alt_key_encoding_flags;` at `kitty/screen.c:L1079` when entering the ALT screen (`to_alt` true), and `self->key_encoding_flags = self->main_key_encoding_flags;` at `kitty/screen.c:L1086` when returning to the MAIN screen (`to_alt` false). No other statement in the function touches `key_encoding_flags` — the only other assignment anywhere in the file is the init path at `kitty/screen.c:L150`.
 
 There is **no** `memcpy` between the two arrays and **no** memset of either array anywhere in the switch. The specific function that performs the work is `screen_toggle_screen_buffer`, and the specific statements are the two pointer re-assignments at `L1079`/`L1086`. **Cause → effect:** because switching only changes *which array is read*, and never changes the *contents* of either array, (a) the two stacks are independent and (b) whatever was on the main array before entering alt is still there, unchanged, when you come back. This is proven at runtime in §4 (round-trip) and §8 (rapid-switch leakage probe).
 
@@ -456,7 +474,7 @@ if opts.KeyMode == "kitty" {
 The commands to run (documented for a display-enabled host):
 
 ```
-./kitty/launcher/kitty +kitten show-key -m kitty     # human-readable enhanced protocol; press Ctrl+Shift+a, then a
+./kitty/launcher/kitten show-key -m kitty            # human-readable enhanced protocol; press Ctrl+Shift+a, then a
 ./kitty/launcher/kitty sh -c 'cat -v'                 # raw rendering; press Ctrl+Shift+a, then a, then Ctrl+a
 # query current flags from inside the terminal:  printf '\x1b[?u'  ->  terminal replies  CSI ? <flags> u
 ```
@@ -677,7 +695,7 @@ So the two orders genuinely differ, but the difference is *which stack the push 
 
 **Spec — `docs/keyboard-protocol.rst`:** `L186` "1 + 0b101" for ctrl+shift (=6); `L275-282` flag bit table (1 disambiguate / 2 report-event-types / 4 report-alternate-keys / 8 report-all-keys / 16 report-associated-text); `L293-297` push `CSI > flags u` (default 0) / pop `CSI < number u` (default 1); `L299-303` separate stacks, pop-empties → reset, push-full → evict oldest; `L306-309` main/alt own independent stacks.
 
-**Harness — `kitty_tests/`:** `__init__.py:L30` `parse_bytes`; `L208` `BaseTest`; `L237` `create_screen`; `L243` `create_pty`; `L277` `class PTY` (forks a real child). `keys.py:L16` `enc = defines.encode_key_for_tty`; `L22` `csi(...)`; `L407` `Ctrl+Shift+i` @flags0 → `\x1b[105;6u` (confirms the CSI-u form); `L412` plain `a` @flags0 → `a`; `L454-455` plain `a` @flag8 → `\x1b[97u`; `L457` `Ctrl+a` @flag8 → `\x1b[97;5u`. `screen.py:L501,L503` `toggle_alt_screen()` usage pattern (`parse_bytes` usage e.g. `screen.py:L97`).
+**Harness — `kitty_tests/`:** `kitty_tests/__init__.py:L30` `parse_bytes`; `L208` `BaseTest`; `L237` `create_screen`; `L243` `create_pty`; `L277` `class PTY` (forks a real child). `kitty_tests/keys.py:L16` `enc = defines.encode_key_for_tty`; `L22` `csi(...)`; `L407` `Ctrl+Shift+i` @flags0 → `\x1b[105;6u` (confirms the CSI-u form); `L412` plain `a` @flags0 → `a`; `L454-455` plain `a` @flag8 → `\x1b[97u`; `L457` `Ctrl+a` @flag8 → `\x1b[97;5u`. `kitty_tests/screen.py:L501,L503` `toggle_alt_screen()` usage pattern (`parse_bytes` usage e.g. `kitty_tests/screen.py:L97`).
 
 **Out-of-scope mapping stack (do not conflate) — `kitty/keys.py`:** `L67` `keyboard_mode_stack`; `L93` `pop_keyboard_mode`; `L108` `_push_keyboard_mode`.
 
