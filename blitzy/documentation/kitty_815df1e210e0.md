@@ -381,7 +381,7 @@ payload `d=eA` base64-decodes to `b'x'`.)
 Every command is a `FileTransmissionCommand` (struct at `kittens/transfer/ftc.go:120`).
 On the wire the field names are abbreviated to reduce overhead; the struct's JSON tags give
 the exact mapping (verified against the source), and the protocol keys table in
-`docs/file-transfer-protocol.rst` (rows at lines 565–574) documents each value's type:
+`docs/file-transfer-protocol.rst` (rows at lines 565–575) documents each value's type:
 
 | Struct field  | Wire key | Type / notes                                                             |
 |---------------|----------|--------------------------------------------------------------------------|
@@ -889,6 +889,16 @@ by a few kilobytes because the progress bar repaints a variable number of times;
 protocol-relevant `OSC 5113` wire bytes do not vary. The second transfer's raw stream is a
 stable 4,133 bytes.
 
+**Environment note — the *exact* wire-byte totals are not universal constants.** The two
+absolute figures above (5,373,074 and 2,993) are stable *within this environment*, but they
+include one-time, environment-dependent framing — chiefly the **destination path carried in
+the `n=` field** and the per-session `id` — so a different destination path or session shifts
+both totals by a few bytes (an independent run in another environment measured, e.g.,
+≈ 5,373,091 and ≈ 3,019 with the same experiment). What is reproducible **everywhere** is the
+content-determined part: the **980 vs 1** data-frame split, the **2755-char** delta base64
+payload, `total_data_in_delta = 2000`, and therefore the **≈ 1795× (three-orders-of-magnitude)**
+reduction. The magnitude and mechanism — not the exact byte constants — are the answer to Q6.
+
 ### Mechanism attribution (corroborated by the engine)
 
 Driving the same 4 MB v1 → v2 pair directly through the rsync engine and inspecting the
@@ -955,9 +965,27 @@ produces `action=status … status=CANCELED`. The handler emits it via
 (`FileTransmission().handle_serialized_command(...)`); complete, unedited responses:
 
 ```
-driver: FileTransmission().handle_serialized_command(receive); then handle_serialized_command(cancel)
+driver: FileTransmission().handle_serialized_command(receive, size=1); then handle_serialized_command(cancel)
    {'action': 'status', 'id': 'c1', 'status': 'OK'}
    {'action': 'status', 'id': 'c1', 'status': 'CANCELED'}
+```
+
+The `receive` command **must carry `size=1`** for a *receive* session to reach `CANCELED`.
+A bare `receive` with no `size` is immediately *spec-complete* with zero file specs
+(`spec_complete = expected_num_of_args <= len(file_specs)`, and `size` seeds
+`ActiveSend.expected_num_of_args`), so the handler answers `ENOENT:No files found` via
+`send_status_response(code=ErrorCode.ENOENT, …, msg='No files found')`
+(`kitty/file_transmission.py:953`) and drops the session **before** any `cancel` can apply.
+Supplying `size=1` keeps the session active, so the subsequent `cancel` reaches
+`send_status_response(ErrorCode.CANCELED, …)` (`kitty/file_transmission.py:936`). A `send`
+session stays active the same way, so `send; then cancel` also yields `CANCELED` without a
+`size` field. All three cases, complete and unedited (real handler, driven via
+`./kitty/launcher/kitty +launch`):
+
+```
+receive_no_size_then_cancel [{'action': 'status', 'id': 'c0', 'status': 'OK'}, {'action': 'status', 'id': 'c0', 'status': 'ENOENT:No files found'}]
+receive_size1_then_cancel   [{'action': 'status', 'id': 'c1', 'status': 'OK'}, {'action': 'status', 'id': 'c1', 'status': 'CANCELED'}]
+send_then_cancel            [{'action': 'status', 'id': 'c2', 'status': 'OK'}, {'action': 'status', 'id': 'c2', 'status': 'CANCELED'}]
 ```
 
 ### Refusal / permission & file errors
@@ -982,7 +1010,7 @@ read spec` is the missing-file error (`TransmissionError` with `code='ENOENT'`).
 ### Quiet levels
 
 `q=0` verbose, `q=1` errors only, `q=2` silent (keys table, `docs/file-transfer-protocol.rst`
-rows at 565–574). Observed by repeating the EPERM refusal at each level; complete, unedited
+rows at 565–575). Observed by repeating the EPERM refusal at each level; complete, unedited
 output:
 
 ```
@@ -1028,9 +1056,9 @@ some files to this computer…") for a receive session. The user's answer is pro
 seen above).
 
 The password-**bypass** option is looked up separately, at the top of the session objects:
-`byp = get_options().file_transfer_confirmation_bypass` in `ActiveSend.__init__`
+`byp = get_options().file_transfer_confirmation_bypass` in `ActiveReceive.__init__`
 (`kitty/file_transmission.py:592`, inside the `__init__` at `:588`) and
-`ActiveReceive.__init__` (`kitty/file_transmission.py:721`, inside the `__init__` at `:716`);
+`ActiveSend.__init__` (`kitty/file_transmission.py:721`, inside the `__init__` at `:716`);
 if it matches, `bypass_ok` is set and `start_send`/`start_receive` short-circuit the prompt.
 
 The harness's `PtyFileTransmission(allow=True)` is the **canonical stand-in for the user
@@ -1134,8 +1162,8 @@ Every citation below was verified against HEAD `815df1e210e0a9ab4622f5c7f2d6891d
   `:1174` `handle_receive_confirmation` (accepted→OK / refused→EPERM);
   `:1191` `start_receive` (raises the "send files" confirm);
   `:1204` `handle_send_confirmation`
-- **Bypass-option lookup only:** `:588` `ActiveSend.__init__` (`:592`
-  `file_transfer_confirmation_bypass`); `:716` `ActiveReceive.__init__` (`:721` same option)
+- **Bypass-option lookup only:** `:588` `ActiveReceive.__init__` (`:592`
+  `file_transfer_confirmation_bypass`); `:716` `ActiveSend.__init__` (`:721` same option)
 
 **Rsync engine:**
 
@@ -1156,7 +1184,7 @@ Every citation below was verified against HEAD `815df1e210e0a9ab4622f5c7f2d6891d
 - `docs/file-transfer-protocol.rst` — Overall design @16, Canceling a session @195,
   Transmitting binary deltas @338, The format of signatures and deltas @409, Compression @487,
   Bypassing explicit user authorization @507, Encoding of transfer commands as escape codes @540
-  (keys table rows @565-574; `bypass`/`pw` row @567)
+  (keys table rows @565-575; `bypass`/`pw` row @567)
 - `docs/kittens/transfer.rst` — `--permissions-bypass` @68, Delta transfers @77,
   `--transmit-deltas` @81
 
