@@ -73,7 +73,7 @@ $ docker run --rm --entrypoint /bin/bash \
     -c 'git config --global --add safe.directory /work; python3 setup.py'
 ```
 
-The **complete, unedited** output of this command (331 lines) is reproduced in the Evidence Appendix **§7.0**. It exits **0** and emits **no warnings or errors** under the project's default strict flags `-pedantic-errors -Werror` (`setup.py:L491`). The reflow-relevant steps appear verbatim in that log: `[1/122] Compiling kitty/screen.c`, `[7/122] Compiling kitty/child-monitor.c`, `[22/122] Compiling kitty/line.c`, `[32/122] Compiling kitty/line-buf.c`, `[35/122] Compiling kitty/history.c`, and `[1/5] Linking kitty/fast_data_types`.
+The **complete, unedited** output of this command (360 lines on the first build of a fresh clone; 331 lines on a subsequent clean rebuild, see §7.0) is reproduced in the Evidence Appendix **§7.0**. It exits **0** and emits **no warnings or errors** under the project's default strict flags `-pedantic-errors -Werror` (`setup.py:L491`). The reflow-relevant steps appear verbatim in that log: `[1/122] Compiling kitty/screen.c`, `[7/122] Compiling kitty/child-monitor.c`, `[22/122] Compiling kitty/line.c`, `[32/122] Compiling kitty/line-buf.c`, `[35/122] Compiling kitty/history.c`, and `[1/5] Linking kitty/fast_data_types`.
 
 *Step 4 — import AFTER build (succeeds; all reflow classes present):*
 
@@ -96,7 +96,7 @@ $ docker run --rm --entrypoint /bin/bash \
 -rwxr-xr-x 1 root root 1213072 Jul  8 05:53 kitty/fast_data_types.so
 ```
 
-**Build timing (stated scale + stability across ≥2 runs).** Scale: a **full clean build** — the 122-unit C-extension compile + 5 link steps plus the (out-of-scope) Go `kitten` CLI, from a pristine clone with the gitignored `build/`, `kitty/fast_data_types.so`, and `kitty/launcher/{kitty,kitten}` binaries removed before each run. Timed with the shell `SECONDS` builtin, two consecutive clean builds took **41 s** and **42 s** (both exit 0) — stable across runs. The exact instrumented command and its complete output are in **§7.0**.
+**Build timing (stated scale + stability across ≥2 runs).** Scale: a **full clean build** — the 122-unit C-extension compile + 5 link steps plus the (out-of-scope) Go `kitten` CLI, on an already-generated clone with the gitignored `build/`, `kitty/fast_data_types.so`, and `kitty/launcher/{kitty,kitten}` binaries removed before each run (the one-time Wayland generation is retained in `glfw/`, so these rebuilds emit 331 lines beginning at `[1/122]`; a fresh clone's very first build instead emits 360 lines — see §7.0). Timed with the shell `SECONDS` builtin, two consecutive clean builds took **41 s** and **42 s** (both exit 0) — stable across runs. The exact instrumented command and its complete output are in **§7.0**.
 
 **Read-only guarantee.** All build artifacts (`kitty/fast_data_types.so`, `build/`, `kitty/launcher/{kitty,kitten}`) are git-ignored, and the build and probes ran against the `/tmp/reflow_fresh` clone, so the working repository was never written to. The final-delivery `git status --porcelain` and source-modification checks on the working repository are shown in **§10**.
 
@@ -214,7 +214,7 @@ Direct reading: the visible grid overflowed at the narrower width, and the overf
   ALT history count: before resize=0, after resize=0  (stays 0 => overflow DISCARDED)
 ```
 
-Direct reading: on the alternate screen, history stays empty across the resize. **Cause→effect:** `realloc_lb` for the alt screen passes `NULL` [kitty/screen.c:L394]; with `historybuf == NULL`, `next_dest_line` cannot spill [kitty/rewrap.h:L29-L33], so overflowing rows are dropped.
+Direct reading: on the alternate screen, history stays empty across the resize — and this holds for **both resize directions**: a narrower `resize(4,5)` (`B2-alt` above) and a wider `resize(4,10)` (`B2-alt-wider`, added in **§7.2**) each leave the alternate‑screen history at `count 0→0` (observed deterministic `[0, 0, 0]` across 3 runs). **Cause→effect:** `realloc_lb` for the alt screen passes `NULL` [kitty/screen.c:L394]; with `historybuf == NULL`, `next_dest_line` cannot spill [kitty/rewrap.h:L29-L33], so overflowing rows are dropped regardless of whether the window narrows or widens.
 
 **Cursor is remapped through reflow.** Narrower `resize(4,5)`: cursor `(10,3) → (4,3)`. Wider `resize(4,10)`: cursor `(5,3) → (9,1)`. **Cause→effect:** the `CursorTrack` structure [kitty/screen.c:L226-L232] carries the cursor position through `rewrap_inner`'s remap logic [kitty/rewrap.h:L84-L89].
 
@@ -305,7 +305,7 @@ Direct reading: the content reflows correctly (`AAAAABBBBB` → `AAA/AAB/BBB/B` 
     hist(0)='EEEEE'  wrapped=True
 ```
 
-Direct reading: rows `A,B,C` (the original scrollback content) were rewrapped first; their last row `hist(4)='CCCCC'` lost its flag. Rows `D,E` (spilled from the visible grid *after* the history pass) carry correct `wrapped=True` flags. **Cause→effect:** continuity between pre‑existing history and newly pushed rows depends entirely on the last‑cell flag of the last old‑history row, which the independent history pass drops (§4.2). Because history is rewrapped to the new column count *before* any screen overflow is known, the two halves can never be stitched by the current design.
+Direct reading: rows `A,B,C` (the original scrollback content) were rewrapped first; their last row `hist(4)='CCCCC'` lost its flag. Rows `D,E` (spilled from the visible grid *after* the history pass) carry correct `wrapped=True` flags. **Cause→effect:** continuity between pre‑existing history and newly pushed rows depends entirely on the last‑cell flag of the last old‑history row, which the independent history pass drops (§4.2). Because history is rewrapped to the new column count *before* any screen overflow is known, the two halves can never be stitched by the current design. **Stable across >=2 runs:** the dropped-flag history index is deterministic at `[4, 4, 4]` over 3 runs on identical fresh input (§7.3).
 
 ### 4.4 Candidate issue (3) — trailing‑blank trim vs. continued lines, and cursor‑at‑EOL *(REFUTED as a defect; works correctly)*
 
@@ -324,7 +324,7 @@ Direct reading: rows `A,B,C` (the original scrollback content) were rewrapped fi
   after resize(4,8): cursor=(4,2)
 ```
 
-Direct reading: 25 `X` at width 7 reflow to `XXXXXXX×3 + XXXX` and the cursor lands at end‑of‑content `(4,3)`; a pending‑wrap cursor at `(10,1)` remaps to `(4,2)` after a width‑8 reflow. **Cause→effect:** tracked x is clamped to the trimmed limit [kitty/rewrap.h:L74-L76] and remapped during copy [kitty/rewrap.h:L84-L89]; the width‑exact/continued cases were already shown correct in A1/A4 (§2.2). This candidate is **not** a source of the boundary bug.
+Direct reading: 25 `X` at width 7 reflow to `XXXXXXX×3 + XXXX` and the cursor lands at end‑of‑content `(4,3)`; a pending‑wrap cursor at `(10,1)` remaps to `(4,2)` after a width‑8 reflow. **Cause→effect:** tracked x is clamped to the trimmed limit [kitty/rewrap.h:L74-L76] and remapped during copy [kitty/rewrap.h:L84-L89]; the width‑exact/continued cases were already shown correct in A1/A4 (§2.2). This candidate is **not** a source of the boundary bug. **Stable across >=2 runs:** the remapped cursor is deterministic — `[(4, 3), (4, 3), (4, 3)]` after 25 X then `resize(4,7)`, and `[(4, 2), (4, 2), (4, 2)]` after 20 Y then `resize(4,8)`, over 3 runs (§7.3).
 
 ### 4.5 Candidate issue (4) — intentional reflow bypasses *(CONFIRMED by design; NOT active in these runs)*
 
@@ -337,7 +337,7 @@ Direct reading: 25 `X` at width 7 reflow to `XXXXXXX×3 + XXXX` and the cursor l
   => prompt-protection path NOT triggered without OSC-133 prompt marks (by-design bypass inactive).
 ```
 
-`prevent_current_prompt_from_rewrapping` [kitty/screen.c:L302-L343] is guarded by `prompt_settings.redraws_prompts_at_all` [kitty/screen.c:L305]; it deliberately copies the current prompt out and blanks it (trusting the shell to redraw). The blank‑`OUTPUT_START` dummy `<` insertion [kitty/screen.c:L353-L360] likewise deviates from pure reflow on purpose (and is removed afterward [kitty/screen.c:L439-L443]). Because the harness draws plain text with no OSC‑133 prompt marks, neither path fires — so **neither explains the seam split**; the split is a genuine defect, distinct from these intentional bypasses.
+`prevent_current_prompt_from_rewrapping` [kitty/screen.c:L302-L343] is guarded by `prompt_settings.redraws_prompts_at_all` [kitty/screen.c:L305]; it deliberately copies the current prompt out and blanks it (trusting the shell to redraw). The blank‑`OUTPUT_START` dummy `<` insertion [kitty/screen.c:L353-L360] likewise deviates from pure reflow on purpose (and is removed afterward [kitty/screen.c:L439-L443]). Because the harness draws plain text with no OSC‑133 prompt marks, neither path fires — so **neither explains the seam split**; the split is a genuine defect, distinct from these intentional bypasses. **Stable across >=2 runs:** the post-resize `vis(0)` is deterministic at `['FFFFF', 'FFFFF', 'FFFFF']` (reflowed, not blanked) over 3 runs (§7.3).
 
 ### 4.6 Candidate issue (5) — deferred pager‑history rewrap *(code‑confirmed; not exercised by visible reflow)*
 
@@ -350,7 +350,7 @@ Direct reading: 25 `X` at width 7 reflow to `XXXXXXX×3 + XXXX` and the cursor l
   pagerhist_as_text() length after column-changing resize = 0
 ```
 
-`historybuf_rewrap` sets `other->pagerhist->rewrap_needed = true` **only when the column count changes** (`other->xnum != self->xnum`) and the ring buffer is in use [kitty/history.c:L607-L608] (`rewrap_needed` is declared at [kitty/data-types.h:L271]), deferring the pager‑history reflow to a lazy path. In this harness the pager history is empty, so the deferred path is not triggered by the visible reflow. Per scope this is kept shallow; it does not affect the visible history↔screen boundary. **(Inferred from code that the flag is set on column change; the runtime shows the pager history simply empty here.)**
+`historybuf_rewrap` sets `other->pagerhist->rewrap_needed = true` **only when the column count changes** (`other->xnum != self->xnum`) and the ring buffer is in use [kitty/history.c:L607-L608] (`rewrap_needed` is declared at [kitty/data-types.h:L271]), deferring the pager‑history reflow to a lazy path. In this harness the pager history is empty, so the deferred path is not triggered by the visible reflow. Per scope this is kept shallow; it does not affect the visible history↔screen boundary. **(Inferred from code that the flag is set on column change; the runtime shows the pager history simply empty here.)** **Stable across >=2 runs:** the pager-history `(before, after)` length is deterministic at `[(0, 0), (0, 0), (0, 0)]` over 3 runs (§7.3).
 
 ### 4.7 Damage is permanent and compounds *(CONFIRMED)*
 
@@ -388,7 +388,7 @@ The option defaults to `False` [kitty/options/types.py:L570] (definition `opt('s
       vis(7)=''
 ```
 
-Direct reading: with the option **disabled** (default), the extra rows created by the taller window are left **blank** and history is untouched (`3→3`); with it **enabled**, kitty pulls rows **up from scrollback** to fill the enlarged window (`history 3→0`, visible now shows `A…G`). **Cause→effect:** the growth path runs only when `is_main && OPT(scrollback_fill_enlarged_window)` [kitty/screen.c:L428], popping history via `historybuf_pop_line` [kitty/screen.c:L432], shifting the grid with `INDEX_DOWN` [kitty/screen.c:L433], and copying the popped line in with `linebuf_copy_line_to` [kitty/screen.c:L434]. Note: this option governs only *height‑growth fill*; it does **not** repair the seam continuation‑flag drop of §4.2.
+Direct reading: with the option **disabled** (default), the extra rows created by the taller window are left **blank** and history is untouched (`3→3`); with it **enabled**, kitty pulls rows **up from scrollback** to fill the enlarged window (`history 3→0`, visible now shows `A…G`). **Cause→effect:** the growth path runs only when `is_main && OPT(scrollback_fill_enlarged_window)` [kitty/screen.c:L428], popping history via `historybuf_pop_line` [kitty/screen.c:L432], shifting the grid with `INDEX_DOWN` [kitty/screen.c:L433], and copying the popped line in with `linebuf_copy_line_to` [kitty/screen.c:L434]. Note: this option governs only *height‑growth fill*; it does **not** repair the seam continuation‑flag drop of §4.2. **Stable across >=2 runs:** the difference is deterministic — `fill=False` history `(before, after)` `[(3, 3), (3, 3), (3, 3)]` vs. `fill=True` `[(3, 0), (3, 0), (3, 0)]` over 3 runs (§7.3).
 
 ---
 
@@ -457,9 +457,38 @@ $ docker run --rm --entrypoint /bin/bash \
     -c 'git config --global --add safe.directory /work; python3 setup.py'
 ```
 
-**Complete, unedited output (331 lines).** Lines 1–129 build the C extension (the reflow subject: 122 `Compiling` steps + 5 `Linking` steps, including `[1/5] Linking kitty/fast_data_types`); lines 130–331 build the out-of-scope Go `kitten` CLI, whose package-compile order varies run-to-run (a parallel Go build). The command exits **0** with no warnings or errors under `-pedantic-errors -Werror` (`setup.py:L491`):
+**Complete, unedited output — 360 lines (first build of a fresh clone).** This is the full output of `python3 setup.py` on a pristine `git clone` that has no pre-generated sources. Lines 1–29 are the one-time Wayland protocol code generation (28 `[N/28] Generating …-client-protocol.{h,c}` steps + a ` done` marker); lines 30–158 build the C extension (the reflow subject: 122 `Compiling` steps + 5 `Linking` steps, including `[1/5] Linking kitty/fast_data_types`); lines 159–360 build the out-of-scope Go `kitten` CLI, whose package-compile order varies run-to-run (a parallel Go build). The command exits **0** with no warnings or errors under `-pedantic-errors -Werror` (`setup.py:L491`). **Why the generation step is shown here but not in the timing runs below:** the 28 generated files are written into the git-ignored `glfw/` directory (e.g. `glfw/wayland-xdg-shell-client-protocol.h`) and therefore persist across rebuilds, so the `[N/28] Generating …` lines appear **only on the very first build of a fresh clone**. A subsequent *clean* rebuild that removes only the git-ignored `build/`, `kitty/fast_data_types.so`, and `kitty/launcher/{kitty,kitten}` (exactly what the timing runs below do) retains the generated `glfw/` sources and so **skips generation**, emitting **331 lines** that begin directly at `[1/122] Compiling kitty/screen.c`. Both magnitudes were observed to be stable across repeated runs (360 lines across 3 fresh-clone first builds; 331 lines on clean rebuilds):
 
 ```text
+[1/28] Generating wayland-xdg-shell-client-protocol.h ...
+[2/28] Generating wayland-xdg-shell-client-protocol.c ...
+[3/28] Generating wayland-viewporter-client-protocol.h ...
+[4/28] Generating wayland-viewporter-client-protocol.c ...
+[5/28] Generating wayland-relative-pointer-unstable-v1-client-protocol.h ...
+[6/28] Generating wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[7/28] Generating wayland-pointer-constraints-unstable-v1-client-protocol.h ...
+[8/28] Generating wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[9/28] Generating wayland-xdg-decoration-unstable-v1-client-protocol.h ...
+[10/28] Generating wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+[11/28] Generating wayland-primary-selection-unstable-v1-client-protocol.h ...
+[12/28] Generating wayland-primary-selection-unstable-v1-client-protocol.c ...
+[13/28] Generating wayland-text-input-unstable-v3-client-protocol.h ...
+[14/28] Generating wayland-text-input-unstable-v3-client-protocol.c ...
+[15/28] Generating wayland-xdg-activation-v1-client-protocol.h ...
+[16/28] Generating wayland-xdg-activation-v1-client-protocol.c ...
+[17/28] Generating wayland-tablet-unstable-v2-client-protocol.h ...
+[18/28] Generating wayland-tablet-unstable-v2-client-protocol.c ...
+[19/28] Generating wayland-cursor-shape-v1-client-protocol.h ...
+[20/28] Generating wayland-cursor-shape-v1-client-protocol.c ...
+[21/28] Generating wayland-fractional-scale-v1-client-protocol.h ...
+[22/28] Generating wayland-fractional-scale-v1-client-protocol.c ...
+[23/28] Generating wayland-single-pixel-buffer-v1-client-protocol.h ...
+[24/28] Generating wayland-single-pixel-buffer-v1-client-protocol.c ...
+[25/28] Generating wayland-kwin-blur-v1-client-protocol.h ...
+[26/28] Generating wayland-kwin-blur-v1-client-protocol.c ...
+[27/28] Generating wayland-wlr-layer-shell-unstable-v1-client-protocol.h ...
+[28/28] Generating wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
+ done
 [1/122] Compiling kitty/screen.c ...
 [2/122] Compiling kitty/unicode-data.c ...
 [3/122] Compiling [wayland] glfw/wl_window.c ...
@@ -589,133 +618,133 @@ $ docker run --rm --entrypoint /bin/bash \
 [4/5] Linking kittens/transfer/rsync ...
 [5/5] Linking launcher ...
  done
-internal/nettrace
-github.com/shirou/gopsutil/v3/common
-crypto/subtle
-unicode/utf16
 vendor/golang.org/x/crypto/cryptobyte/asn1
-encoding
-github.com/seancfoley/ipaddress-go/ipaddr/addrerr
-image/color
-github.com/seancfoley/ipaddress-go/ipaddr/addrstr
-kitty
 vendor/golang.org/x/crypto/internal/alias
-crypto/internal/alias
 log/internal
-crypto/internal/boring/sig
+github.com/seancfoley/ipaddress-go/ipaddr/addrstr
+github.com/shirou/gopsutil/v3/common
+github.com/seancfoley/ipaddress-go/ipaddr/addrerr
+crypto/internal/alias
+kitty
 container/list
+image/color
+crypto/internal/boring/sig
+unicode/utf16
+crypto/subtle
+encoding
 github.com/seancfoley/ipaddress-go/ipaddr/addrstrparam
+internal/nettrace
 golang.org/x/exp/constraints
 internal/weak
 maps
-internal/singleflight
-crypto/internal/randutil
-hash
 vendor/golang.org/x/net/dns/dnsmessage
+internal/singleflight
 math/rand/v2
+hash
+crypto/internal/randutil
 vendor/golang.org/x/text/transform
 net/http/internal/ascii
 bufio
-crypto/rc4
 encoding/base32
+crypto/rc4
 regexp/syntax
 encoding/binary
 context
 embed
-runtime/cgo
-crypto/internal/edwards25519/field
-crypto/cipher
-crypto/internal/nistec/fiat
 io/ioutil
+runtime/cgo
 vendor/golang.org/x/sys/cpu
 encoding/hex
-log
-net/url
-kitty/tools/utils/shlex
-flag
-github.com/bmatcuk/doublestar/v4
 vendor/golang.org/x/net/http2/hpack
-crypto/internal/bigmod
+net/url
+log
+kitty/tools/utils/shlex
+github.com/bmatcuk/doublestar/v4
+flag
+crypto/cipher
+crypto/internal/edwards25519/field
+crypto/internal/nistec/fiat
 github.com/ALTree/bigfloat
 encoding/asn1
+crypto/internal/bigmod
 github.com/seancfoley/bintree/tree
 crypto/dsa
-image/color/palette
 crypto
 hash/adler32
 hash/crc32
+image/color/palette
 crypto/md5
 golang.org/x/image/riff
+crypto/internal/boring
+internal/concurrent
 compress/bzip2
 compress/flate
-crypto/internal/edwards25519
-internal/concurrent
-encoding/base64
-os/exec
-crypto/internal/boring
+mime/quotedprintable
 database/sql/driver
 net/http/internal
-golang.org/x/image/tiff/lzw
 compress/lzw
-os/signal
-image
 encoding/xml
-mime/quotedprintable
 crypto/des
+os/exec
+golang.org/x/image/tiff/lzw
+os/signal
+crypto/internal/edwards25519
+image
 vendor/golang.org/x/text/unicode/bidi
+encoding/base64
+unique
 vendor/golang.org/x/crypto/chacha20
 vendor/golang.org/x/crypto/internal/poly1305
 github.com/rwcarlsen/goexif/tiff
-github.com/klauspost/cpuid/v2
-vendor/golang.org/x/crypto/sha3
-github.com/dlclark/regexp2/syntax
-vendor/golang.org/x/text/unicode/norm
-golang.org/x/sys/unix
-unique
-crypto/x509/pkix
-vendor/golang.org/x/crypto/cryptobyte
 crypto/internal/boring/bbig
 crypto/hmac
-crypto/rand
-crypto/sha512
+github.com/klauspost/cpuid/v2
 crypto/sha1
+github.com/dlclark/regexp2/syntax
+crypto/sha512
+crypto/rand
+vendor/golang.org/x/text/unicode/norm
+vendor/golang.org/x/crypto/sha3
 crypto/aes
 crypto/sha256
-encoding/pem
-encoding/json
-mime
+golang.org/x/sys/unix
+crypto/x509/pkix
+vendor/golang.org/x/crypto/cryptobyte
 vendor/golang.org/x/crypto/hkdf
 regexp
-vendor/golang.org/x/crypto/chacha20poly1305
+encoding/pem
+mime
+encoding/json
 kitty/tools/utils/secrets
 crypto/rsa
+vendor/golang.org/x/crypto/chacha20poly1305
 net/netip
 crypto/internal/mlkem768
-crypto/ed25519
-github.com/shirou/gopsutil/v3/internal/common
 compress/gzip
 compress/zlib
 archive/zip
+crypto/ed25519
+github.com/shirou/gopsutil/v3/internal/common
 golang.org/x/image/bmp
-image/internal/imageutil
 golang.org/x/image/ccitt
-golang.org/x/image/vp8l
+image/internal/imageutil
 golang.org/x/image/vp8
-image/png
+golang.org/x/image/vp8l
 vendor/golang.org/x/text/secure/bidirule
-crypto/internal/nistec
+image/png
 image/draw
 image/jpeg
 golang.org/x/image/tiff
-github.com/zeebo/xxh3
+crypto/internal/nistec
 golang.org/x/image/webp
-howett.net/plist
 image/gif
+github.com/zeebo/xxh3
+howett.net/plist
 vendor/golang.org/x/net/idna
+github.com/disintegration/imaging
+github.com/kovidgoyal/imaging
 github.com/dlclark/regexp2
 github.com/rwcarlsen/goexif/exif
-github.com/kovidgoyal/imaging
-github.com/disintegration/imaging
 crypto/ecdh
 crypto/elliptic
 crypto/internal/hpke
@@ -731,8 +760,8 @@ github.com/shirou/gopsutil/v3/cpu
 github.com/alecthomas/chroma/v2/styles
 github.com/alecthomas/chroma/v2/lexers
 archive/tar
-github.com/shirou/gopsutil/v3/net
 vendor/golang.org/x/net/http/httpproxy
+github.com/shirou/gopsutil/v3/net
 net/textproto
 github.com/google/uuid
 crypto/x509
@@ -745,8 +774,8 @@ net/http/httptrace
 net/http
 kitty/tools/utils
 kitty/tools/utils/base85
-kitty/tools/tty
 kitty/tools/utils/paths
+kitty/tools/tty
 kitty/tools/rsync
 kitty/tools/wcswidth
 kitty/tools/crypto
@@ -757,9 +786,9 @@ kitty/tools/cli/markup
 kitty/tools/tui/sgr
 kitty/tools/tui/loop
 kitty/tools/cli
-kitty/tools/config
-kitty/tools/cmd/mouse_demo
 kitty/tools/tui/shortcuts
+kitty/tools/cmd/mouse_demo
+kitty/tools/config
 kitty/tools/utils/shm
 kitty/kittens/hyperlinked_grep
 kitty/kittens/query_terminal
@@ -770,21 +799,21 @@ kitty/tools/utils/images
 kitty/tools/tui/subseq
 kitty/kittens/clipboard
 kitty/tools/unicode_names
-kitty/tools/cmd/show_error
-kitty/tools/cmd/run_shell
-kitty/tools/tui/graphics
-kitty/tools/cmd/update_self
 kitty/kittens/hints
+kitty/tools/cmd/show_error
+kitty/tools/tui/graphics
+kitty/tools/cmd/run_shell
 kitty/tools/cmd/edit_in_kitty
+kitty/tools/cmd/update_self
 kitty/kittens/ask
 kitty/tools/cmd/at
 kitty/tools/themes
 kitty/kittens/unicode_input
+kitty/kittens/themes
+kitty/kittens/ssh
 kitty/tools/cmd/benchmark
 kitty/kittens/icat
 kitty/kittens/choose_fonts
-kitty/kittens/themes
-kitty/kittens/ssh
 kitty/kittens/transfer
 kitty/tools/cmd/pytest
 kitty/kittens/diff
@@ -793,7 +822,7 @@ kitty/tools/cmd/completion
 kitty/tools/cmd
 ```
 
-**Exit code + timing across two consecutive clean builds** (scale: a full clean build — 122 C compile units + 5 link steps + the out-of-scope Go `kitten` CLI — from a pristine clone, with the gitignored `build/`, `kitty/fast_data_types.so`, and `kitty/launcher/{kitty,kitten}` binaries removed before each run; timed with the shell `SECONDS` builtin):
+**Exit code + timing across two consecutive clean builds** (scale: a full clean build — 122 C compile units + 5 link steps + the out-of-scope Go `kitten` CLI — on an already-generated clone, with only the gitignored `build/`, `kitty/fast_data_types.so`, and `kitty/launcher/{kitty,kitten}` binaries removed before each run (the one-time Wayland generation from the first build above is retained in `glfw/`, so these clean rebuilds skip it and emit the 331-line compile+link+Go sequence beginning at `[1/122]`); timed with the shell `SECONDS` builtin):
 
 ```text
 $ docker run --rm --entrypoint /bin/bash \
@@ -1145,6 +1174,23 @@ s2.resize(4, 5)
 print(f"  ALT history count: before resize={altb}, after resize={s2.historybuf.count}  (stays 0 => overflow DISCARDED)")
 dump(s2, "ALT AFTER resize(4,5)")
 
+print("\n### B2-alt-wider: ALTERNATE screen, draw at 4x5, resize WIDER (4,10) -> overflow DISCARDED (NULL history)")
+s3 = bt.create_screen(cols=5, lines=4, scrollback=30)
+s3.toggle_alt_screen()
+print(f"  after toggle_alt_screen: is_main={s3.is_main_linebuf()} using_alt={s3.is_using_alternate_linebuf()}")
+s3.draw(BLOCKS)
+altwb = s3.historybuf.count
+dump(s3, "ALT BEFORE resize 4x5")
+s3.resize(4, 10)
+print(f"  ALT history count: before resize={altwb}, after resize={s3.historybuf.count}  (stays 0 => overflow DISCARDED on WIDENING too)")
+dump(s3, "ALT AFTER resize(4,10)")
+altw_counts = []
+for _r in range(3):
+    _s = bt.create_screen(cols=5, lines=4, scrollback=30)
+    _s.toggle_alt_screen(); _s.draw(BLOCKS); _s.resize(4, 10)
+    altw_counts.append(_s.historybuf.count)
+print(f"  >=2 RUNS: ALT-wider history count after resize over 3 runs={altw_counts}  (deterministic={len(set(altw_counts))==1})")
+
 print("\n=== probe_b.py complete ===")
 ```
 
@@ -1257,6 +1303,31 @@ Input: one continuous draw of 70 chars = A*10 B*10 C*10 D*10 E*10 F*10 G*10
       vis(3)='GGGGG'        wrapped=False is_continued=True
     >>> LOGICAL LINES reconstructed (oldest->newest, split on wrapped=False): 1 line(s)
           logical[0] len= 20 = 'FFFFFFFFFFGGGGGGGGGG'
+
+### B2-alt-wider: ALTERNATE screen, draw at 4x5, resize WIDER (4,10) -> overflow DISCARDED (NULL history)
+  after toggle_alt_screen: is_main=False using_alt=True
+  [ALT BEFORE resize 4x5] is_main=False using_alt=True cursor=(5,3) grid=4x5
+    HISTORY count=0 (line0 = MOST RECENT / closest to visible top):
+    VISIBLE 4 rows:
+      vis(0)='FFFFF'        wrapped=True is_continued=False
+      vis(1)='FFFFF'        wrapped=True is_continued=True
+      vis(2)='GGGGG'        wrapped=True is_continued=True
+      vis(3)='GGGGG'        wrapped=False is_continued=True
+    >>> LOGICAL LINES reconstructed (oldest->newest, split on wrapped=False): 1 line(s)
+          logical[0] len= 20 = 'FFFFFFFFFFGGGGGGGGGG'
+  ALT history count: before resize=0, after resize=0  (stays 0 => overflow DISCARDED on WIDENING too)
+  [ALT AFTER resize(4,10)] is_main=False using_alt=True cursor=(9,1) grid=4x10
+    HISTORY count=0 (line0 = MOST RECENT / closest to visible top):
+    VISIBLE 4 rows:
+      vis(0)='FFFFFFFFFF'   wrapped=True is_continued=False
+      vis(1)='GGGGGGGGGG'   wrapped=False is_continued=True
+      vis(2)=''             wrapped=False is_continued=False
+      vis(3)=''             wrapped=False is_continued=False
+    >>> LOGICAL LINES reconstructed (oldest->newest, split on wrapped=False): 3 line(s)
+          logical[0] len= 20 = 'FFFFFFFFFFGGGGGGGGGG'
+          logical[1] len=  0 = ''
+          logical[2] len=  0 = ''
+  >=2 RUNS: ALT-wider history count after resize over 3 runs=[0, 0, 0]  (deterministic=True)
 
 === probe_b.py complete ===
 ```
@@ -1371,6 +1442,13 @@ for label, (nl, nc, sc) in {
 
 # ---------------------------------------------------------------------------
 print("\n### C3. Candidate (2) spillover ordering/column dependence: locate the dropped flag.")
+# QA-C Issue 2: >=2-run distribution on IDENTICAL fresh input -> where does the flag drop?
+_c3 = []
+for _r in range(3):
+    _s = bt.create_screen(cols=10, lines=4, scrollback=40); _s.draw(BLOCKS); _s.resize(4, 5)
+    _h = _s.historybuf
+    _c3.append(next((i for i in range(_h.count) if (not _h.line(i).last_char_has_wrapped_flag() and i != 0)), None))
+print(f"  >=2 RUNS: dropped-flag history index over 3 runs={_c3}  (deterministic={len(set(_c3))==1})")
 s = bt.create_screen(cols=10, lines=4, scrollback=40)
 s.draw(BLOCKS)
 s.resize(4, 5)
@@ -1383,6 +1461,15 @@ for i in range(hb.count - 1, -1, -1):
 
 # ---------------------------------------------------------------------------
 print("\n### C4. Candidate (3) trailing-blank trim vs continued + cursor-at-EOL clamping.")
+# QA-C Issue 2: >=2-run distribution on IDENTICAL fresh input -> cursor after each resize
+_c4a, _c4b = [], []
+for _r in range(3):
+    _s = bt.create_screen(cols=10, lines=4, scrollback=40); _s.draw('X' * 25); _s.resize(4, 7)
+    _c4a.append((_s.cursor.x, _s.cursor.y))
+    _t = bt.create_screen(cols=10, lines=4, scrollback=40); _t.draw('Y' * 20); _t.resize(4, 8)
+    _c4b.append((_t.cursor.x, _t.cursor.y))
+print(f"  >=2 RUNS: cursor after 25X->resize(4,7) over 3 runs={_c4a}  (deterministic={len(set(_c4a))==1})")
+print(f"  >=2 RUNS: cursor after 20Y->resize(4,8) over 3 runs={_c4b}  (deterministic={len(set(_c4b))==1})")
 s = bt.create_screen(cols=10, lines=4, scrollback=40)
 s.draw('X' * 25)
 print(f"  after draw 25 X at width 10: cursor=({s.cursor.x},{s.cursor.y})")
@@ -1400,6 +1487,12 @@ print(f"  after resize(4,8): cursor=({s.cursor.x},{s.cursor.y})")
 # ---------------------------------------------------------------------------
 print("\n### C5. Candidate (4) intentional bypasses: prevent_current_prompt_from_rewrapping")
 print("###     guarded by prompt_settings.redraws_prompts_at_all [kitty/screen.c:L305].")
+# QA-C Issue 2: >=2-run distribution on IDENTICAL fresh input -> is vis(0) reflowed (not blanked)?
+_c5 = []
+for _r in range(3):
+    _s = bt.create_screen(cols=10, lines=4, scrollback=40); _s.draw(BLOCKS); _s.resize(4, 5)
+    _c5.append(str(_s.linebuf.line(0)))
+print(f"  >=2 RUNS: vis(0) after resize over 3 runs={_c5}  (deterministic={len(set(_c5))==1})")
 s = bt.create_screen(cols=10, lines=4, scrollback=40)
 s.draw(BLOCKS)
 s.resize(4, 5)
@@ -1408,6 +1501,13 @@ print(f"  => prompt-protection path NOT triggered without OSC-133 prompt marks (
 
 # ---------------------------------------------------------------------------
 print("\n### C6. Candidate (5) pager-history: rewrap_needed set only on COLUMN change [kitty/history.c:L607-L608].")
+# QA-C Issue 2: >=2-run distribution on IDENTICAL fresh input -> pager-history (before,after) length
+_c6 = []
+for _r in range(3):
+    _s = bt.create_screen(cols=10, lines=4, scrollback=40); _s.draw(BLOCKS)
+    _b = len(_s.historybuf.pagerhist_as_text()); _s.resize(4, 4); _a = len(_s.historybuf.pagerhist_as_text())
+    _c6.append((_b, _a))
+print(f"  >=2 RUNS: pagerhist (before,after) length over 3 runs={_c6}  (deterministic={len(set(_c6))==1})")
 s = bt.create_screen(cols=10, lines=4, scrollback=40)
 s.draw(BLOCKS)
 ph_before = s.historybuf.pagerhist_as_text()
@@ -1429,6 +1529,15 @@ for (nl, nc) in [(4, 5), (4, 7), (4, 10)]:
 
 # ---------------------------------------------------------------------------
 print("\n### C8. scrollback_fill_enlarged_window BOTH states, on a TALLER (enlarged) resize.")
+# QA-C Issue 2: >=2-run distribution on IDENTICAL fresh input -> history (before,after) per fill state
+_c8 = {False: [], True: []}
+for _r in range(3):
+    for _f in (False, True):
+        _s = bt.create_screen(cols=10, lines=4, scrollback=40, options={'scrollback_fill_enlarged_window': _f})
+        _s.draw(BLOCKS); _hbb = _s.historybuf.count; _s.resize(8, 10)
+        _c8[_f].append((_hbb, _s.historybuf.count))
+print(f"  >=2 RUNS: fill=False history (before,after) over 3 runs={_c8[False]}  (deterministic={len(set(_c8[False]))==1})")
+print(f"  >=2 RUNS: fill=True  history (before,after) over 3 runs={_c8[True]}  (deterministic={len(set(_c8[True]))==1})")
 def fill_run(fill):
     s = bt.create_screen(cols=10, lines=4, scrollback=40,
                          options={'scrollback_fill_enlarged_window': fill})
@@ -1480,6 +1589,7 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
      final-run logical lines: ['AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDDEEEEEEEEEE', 'FFFFFFFFFFGGGGGGGGGG']
 
 ### C3. Candidate (2) spillover ordering/column dependence: locate the dropped flag.
+  >=2 RUNS: dropped-flag history index over 3 runs=[4, 4, 4]  (deterministic=True)
   history rows oldest->newest with wrap flags:
     hist(9)='AAAAA'  wrapped=True
     hist(8)='AAAAA'  wrapped=True
@@ -1493,6 +1603,8 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
     hist(0)='EEEEE'  wrapped=True
 
 ### C4. Candidate (3) trailing-blank trim vs continued + cursor-at-EOL clamping.
+  >=2 RUNS: cursor after 25X->resize(4,7) over 3 runs=[(4, 3), (4, 3), (4, 3)]  (deterministic=True)
+  >=2 RUNS: cursor after 20Y->resize(4,8) over 3 runs=[(4, 2), (4, 2), (4, 2)]  (deterministic=True)
   after draw 25 X at width 10: cursor=(5,2)
   after resize(4,7): cursor=(4,3)  visible:
     vis(0)='XXXXXXX' wrapped=True
@@ -1504,10 +1616,12 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
 
 ### C5. Candidate (4) intentional bypasses: prevent_current_prompt_from_rewrapping
 ###     guarded by prompt_settings.redraws_prompts_at_all [kitty/screen.c:L305].
+  >=2 RUNS: vis(0) after resize over 3 runs=['FFFFF', 'FFFFF', 'FFFFF']  (deterministic=True)
   after resize, content reflowed (NOT blanked): vis(0)='FFFFF'
   => prompt-protection path NOT triggered without OSC-133 prompt marks (by-design bypass inactive).
 
 ### C6. Candidate (5) pager-history: rewrap_needed set only on COLUMN change [kitty/history.c:L607-L608].
+  >=2 RUNS: pagerhist (before,after) length over 3 runs=[(0, 0), (0, 0), (0, 0)]  (deterministic=True)
   pagerhist_as_text() length before resize = 0
   pagerhist_as_text() length after column-changing resize = 0
   (pager history empty in this harness path -> deferred rewrap not exercised by visible reflow; shallow per scope.)
@@ -1519,6 +1633,8 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
   after resize(4,10): logical-line count = 3  ['AAAAAAAAAABBBBBBBBBBCCCCCCCCCC', 'DDDDDDDDDDEEEEEEEEEE', 'FFFFFFFFFFGGGGGGGGGG']
 
 ### C8. scrollback_fill_enlarged_window BOTH states, on a TALLER (enlarged) resize.
+  >=2 RUNS: fill=False history (before,after) over 3 runs=[(3, 3), (3, 3), (3, 3)]  (deterministic=True)
+  >=2 RUNS: fill=True  history (before,after) over 3 runs=[(3, 0), (3, 0), (3, 0)]  (deterministic=True)
   fill=False: history count 3->3 after grow-to-8-lines; visible rows:
       vis(0)='DDDDDDDDDD'
       vis(1)='EEEEEEEEEE'
@@ -1564,18 +1680,18 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
 - [x] `realloc_lb` → `linebuf_rewrap` [kitty/screen.c:L234-L242, L240; main L384; alt L394] — §3.1
 - [x] `CursorTrack` [kitty/screen.c:L226-L232] — §3.1, observed cursor remap §3.2
 - [x] `Screen.resize` binding [kitty/screen.c:L3929-L3934] — §3.1
-- [x] Narrower & wider; main (spill) vs alt (discard); before/after contents, continuations, cursor — §3.2, §7.2
+- [x] Narrower & wider × main & alternate; main spills to history, alternate discards (NULL history) on **both** narrower (`B2-alt`) and wider (`B2-alt-wider`, `history 0→0`, deterministic `[0,0,0]`/3 runs); before/after contents, continuations, cursor — §3.2, §7.2
 
 **(c) Line‑continuation‑propagation issues** — §4
 - [x] `next_char_was_wrapped` [kitty/data-types.h:L206]; `SGR_MASK` exclusion [L214]; `is_continued` [L233] + derivation [kitty/line-buf.c:L145] — §4.1
 - [x] setters [kitty/line-buf.c:L193-L198; kitty/history.c:L302-L307] — §4.1
 - [x] Candidate (1) seam not jointly reflowed — **CONFIRMED**, isolated flag‑drop — §4.2
-- [x] Candidate (2) spillover ordering/column dependence — **CONFIRMED** — §4.3
-- [x] Candidate (3) trim vs continued + cursor‑at‑EOL — **REFUTED as defect** — §4.4
-- [x] Candidate (4) intentional bypasses (`prevent_current_prompt_from_rewrapping` [kitty/screen.c:L302-L343]; dummy `<` [L353-L360]) — **by design, inactive here** — §4.5
-- [x] Candidate (5) pager‑history `rewrap_needed` [kitty/history.c:L607-L608; kitty/data-types.h:L271] — **code‑confirmed, not exercised** — §4.6
+- [x] Candidate (2) spillover ordering/column dependence — **CONFIRMED** — §4.3, §7.3 (deterministic `[4, 4, 4]`/3 runs)
+- [x] Candidate (3) trim vs continued + cursor‑at‑EOL — **REFUTED as defect** — §4.4, §7.3 (deterministic `[(4, 3), (4, 3), (4, 3)]` / `[(4, 2), (4, 2), (4, 2)]`, 3 runs)
+- [x] Candidate (4) intentional bypasses (`prevent_current_prompt_from_rewrapping` [kitty/screen.c:L302-L343]; dummy `<` [L353-L360]) — **by design, inactive here** — §4.5, §7.3 (deterministic `['FFFFF', 'FFFFF', 'FFFFF']`/3 runs)
+- [x] Candidate (5) pager‑history `rewrap_needed` [kitty/history.c:L607-L608; kitty/data-types.h:L271] — **code‑confirmed, not exercised** — §4.6, §7.3 (deterministic `[(0, 0), (0, 0), (0, 0)]`/3 runs)
 - [x] Damage permanence/compounding — **CONFIRMED** — §4.7
-- [x] `scrollback_fill_enlarged_window` [kitty/options/types.py:L570] both states [kitty/screen.c:L428-L434] — §4.8, §7.3
+- [x] `scrollback_fill_enlarged_window` [kitty/options/types.py:L570] both states [kitty/screen.c:L428-L434] — §4.8, §7.3 (deterministic `fill=False` `[(3, 3), (3, 3), (3, 3)]` vs `fill=True` `[(3, 0), (3, 0), (3, 0)]`, 3 runs)
 
 **(d) Complete data flow** — §5
 - [x] `Window.set_geometry` [kitty/window.py:L850-L854] → `Screen.resize` → `screen_resize` → history‑first → prompt protection → screen‑second → continuation setters → spill — §5.1
