@@ -734,7 +734,8 @@ from source) from **[observed-at-runtime]** (confirmed by a measurement in §5�
   in §5.1]**
 
   ```
-  kitty/history.c:276:static index_type historybuf_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
+  kitty/history.c:275:static index_type
+  kitty/history.c:276:historybuf_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
   kitty/history.c:277:    index_type idx = (self->start_of_data + self->count) % self->ynum;
   kitty/history.c:279:    if (self->count == self->ynum) {
   kitty/history.c:280:        pagerhist_push(self, as_ansi_buf);
