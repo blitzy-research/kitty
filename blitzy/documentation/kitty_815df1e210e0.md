@@ -42,8 +42,8 @@ input travelling through three consistently-appearing stages:
 2. **Intermediate processing (who transforms it).** `on_key_input` **encodes** the key
    (`encode_glfw_key_event`, `kitty/keys.c:251`) and **writes the resulting bytes to the
    child shell's PTY**. Three different observable branches fire depending on the key:
-   a *text* branch (`keys.c:252-254`), an *encoded* branch (`keys.c:255-268`), and an
-   *unencodable* branch (`keys.c:270-271`). The child echoes bytes back; Kitty's
+   a *text* branch (`kitty/keys.c:252-254`), an *encoded* branch (`kitty/keys.c:255-268`), and an
+   *unencodable* branch (`kitty/keys.c:270-271`). The child echoes bytes back; Kitty's
    **Child Monitor** reads those bytes on its **I/O thread** (`read_bytes`,
    `kitty/child-monitor.c:1337`) and parses them on the **main thread** (`parse_input`,
    `kitty/child-monitor.c:451`) via the **VT parser** (`run_worker`,
@@ -60,8 +60,13 @@ input travelling through three consistently-appearing stages:
    (`kitty/shaders.c:1009`) → `swap_window_buffers` (`kitty/child-monitor.c:810`). At
    runtime this manifested as the GPU pipeline initializing (`GL version string: '4.5
    (Core Profile) Mesa ...'`, `kitty/gl.c:72`), zero GL errors across all renders, and a
-   measured, reproducible **113-pixel** change in the window's framebuffer — confined to a
-   single 11×18 glyph cell — the moment the typed character appeared on screen.
+   measured framebuffer change **confined to a single glyph cell** (an ~11×18-pixel box at the
+   cursor) the moment the typed character appeared on screen. The *size* of that change is not
+   an environment constant — it tracks the text cursor's blink phase at the capture instants
+   (directly observed as **85** changed pixels when the cursor bar is unlit just before the key
+   and **113** when it is lit; other fixed capture timings give a stable **77** or **107**) —
+   but the **one-cell** redraw, the **zero** pixels changed outside that cell, and the
+   **exactly-one-byte** dump growth are invariant on every run (full evidence in §5).
 
 A useful mental model that the traces confirm: **reading the child's bytes happens on a
 separate thread (the I/O thread) from parsing + rendering (the main thread)**, which is
@@ -76,12 +81,12 @@ flowchart LR
     C --> D["kitty/keys.c:166 on_key_input<br/>:176 trace, :251 encode"]
     D --> E["write encoded bytes to child PTY"]
     E --> F["child (/bin/bash) echoes bytes"]
-    F --> G["child-monitor.c:1337 read_bytes (I/O thread)"]
-    G --> H["child-monitor.c:451 parse_input (main thread)<br/>vt-parser.c:1417 run_worker"]
-    H --> I["vt-parser.c:236 screen_draw_text -> screen.c:849 draw_text<br/>screen.c:850 is_dirty = true"]
-    I --> J["child-monitor.c:871 render()<br/>shaders.c:418 dirty guard"]
-    J --> K["shaders.c:970 send_cell_data_to_gpu<br/>:1009 draw_cells"]
-    K --> L["child-monitor.c:810 swap_window_buffers<br/>(new frame on screen)"]
+    F --> G["kitty/child-monitor.c:1337 read_bytes (I/O thread)"]
+    G --> H["kitty/child-monitor.c:451 parse_input (main thread)<br/>kitty/vt-parser.c:1417 run_worker"]
+    H --> I["kitty/vt-parser.c:236 screen_draw_text -> kitty/screen.c:849 draw_text<br/>kitty/screen.c:850 is_dirty = true"]
+    I --> J["kitty/child-monitor.c:871 render()<br/>kitty/shaders.c:418 dirty guard"]
+    J --> K["kitty/shaders.c:970 send_cell_data_to_gpu<br/>:1009 draw_cells"]
+    K --> L["kitty/child-monitor.c:810 swap_window_buffers<br/>(new frame on screen)"]
 ```
 
 ---
@@ -191,18 +196,18 @@ $ DISPLAY=:99 ./kitty/launcher/kitty \
       --title kitty-dbg  > /tmp/kitty_trace.log 2>&1 &
 ```
 
-- `--debug-input` / `--debug-keyboard` (`dest=debug_keyboard`, `cli.py:996-999`) — *"Print
+- `--debug-input` / `--debug-keyboard` (`dest=debug_keyboard`, `kitty/cli.py:996-999`) — *"Print
   out key and mouse events as they are received."*
-- `--debug-rendering` / `--debug-gl` (`cli.py:989-993`) — *"Debug rendering commands. This
+- `--debug-rendering` / `--debug-gl` (`kitty/cli.py:989-993`) — *"Debug rendering commands. This
   will cause all OpenGL calls to check for errors instead of ignoring them. Also prints
   out miscellaneous debug information."*
-- `--dump-bytes /tmp/kitty_dump.bytes` (`cli.py:985-986`) — *"Path to file in which to
+- `--dump-bytes /tmp/kitty_dump.bytes` (`kitty/cli.py:985-986`) — *"Path to file in which to
   store the raw bytes received from the child process."*
 
 **Where the trace output goes (important for reading the evidence below).** Kitty's
 keyboard/XKB debug lines are emitted by `timed_debug_print` (`kitty/monotonic.h:99-108`),
 which writes to **stderr** and prefixes each logical line with a monotonic timestamp
-`[seconds]` (re-armed after any line containing a newline, `monotonic.h:107`). These
+`[seconds]` (re-armed after any line containing a newline, `kitty/monotonic.h:107`). These
 stderr lines are **unbuffered**, so they appear in real time and in emission order. By
 contrast, two kinds of lines are written to **stdout**, which is *block-buffered* when
 redirected to a file and therefore flushed only at process exit:
@@ -345,15 +350,15 @@ For the same `a` keypress, the captured `on_key_input` line was (complete, `cat 
 [2.163] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
 ```
 
-**Cause → effect.** After the trace at `keys.c:176`, `on_key_input` calls
+**Cause → effect.** After the trace at `kitty/keys.c:176`, `on_key_input` calls
 `encode_glfw_key_event(...)` at **`kitty/keys.c:251`** (implemented in
 `kitty/key_encoding.c`; shortcut/mapping is resolved via `kitty/keys.py`). The return
 value selects one of three branches — and the `--debug-input` trace tells us *which one
 fired*:
 
-- **Text branch** (`if (size == SEND_TEXT_TO_CHILD)`, `keys.c:252`): the key's Unicode
-  text is written to the child (`schedule_write_to_child`, `keys.c:253`) and the program
-  prints `sent key as text to child: %s` (**`keys.c:254`**). That is exactly the tail of
+- **Text branch** (`if (size == SEND_TEXT_TO_CHILD)`, `kitty/keys.c:252`): the key's Unicode
+  text is written to the child (`schedule_write_to_child`, `kitty/keys.c:253`) and the program
+  prints `sent key as text to child: %s` (**`kitty/keys.c:254`**). That is exactly the tail of
   the line above — so `a` took the **text** branch and the byte `a` was written to the PTY.
   (The text branch prints the raw text with no per-byte legend, so there is no trailing
   space here — contrast the encoded branch in §6.)
@@ -406,8 +411,11 @@ Because `--dump-bytes` selects the dumping worker, the parser's per-command clas
 is **directly observable at runtime**: `DumpCommands.__call__` (`kitty/boss.py:239-250`)
 prints each parsed command via `safe_print`. Immediately after the `a`-then-Enter sequence,
 the captured stdout showed the parser turning the child's echoed bytes into concrete screen
-operations. The following is a **contiguous, gap-free slice** of that parsed-command stream
-(the complete stream — every line, unedited — is reproduced in §10.4b):
+operations. (This stdout stream is block-buffered and is flushed to the log only when kitty
+is shut down *gracefully*, e.g. by typing `exit` + Enter — see §10.2 for the exact command and
+§10.4b for the flush-versus-termination-method evidence.) The following is a **contiguous,
+gap-free slice** of that parsed-command stream (the complete stream — every line, unedited —
+is reproduced in §10.4b):
 
 ```text
 draw a
@@ -432,15 +440,15 @@ the `REPORT_DRAW(...)` at `:235` is what surfaces as the `draw` line). The C fun
 `screen_draw_text` (defined at **`kitty/screen.c:865-868`**) in turn calls `draw_text`
 (**`kitty/screen.c:849`**), and `draw_text` sets the screen dirty on its very first
 statement: `self->is_dirty = true` at **`kitty/screen.c:850`**. So the printable-text dirty
-path is `draw` → `screen_draw_text` (`vt-parser.c:236` → `screen.c:866`) → `draw_text`
-(`screen.c:849`) → `is_dirty = true` (`screen.c:850`).
+path is `draw` → `screen_draw_text` (`kitty/vt-parser.c:236` → `kitty/screen.c:866`) → `draw_text`
+(`kitty/screen.c:849`) → `is_dirty = true` (`kitty/screen.c:850`).
 
 > **Note on `is_dirty`.** `kitty/screen.c` sets `self->is_dirty = true` at many sites; the
-> ones at `screen.c:119`, `:197`, and `:415` are the **init / reset / resize** paths, *not*
+> ones at `kitty/screen.c:119`, `:197`, and `:415` are the **init / reset / resize** paths, *not*
 > the printable-text path. The path exercised by typing a character is the `draw_text` one
-> (`screen.c:849`, setting `is_dirty = true` at **`screen.c:850`**), reached from the
-> `screen_draw_text` wrapper (`screen.c:865-868`) via the parser's `draw` command
-> (`vt-parser.c:235-236`). The `draw a` command itself is observed
+> (`kitty/screen.c:849`, setting `is_dirty = true` at **`kitty/screen.c:850`**), reached from the
+> `screen_draw_text` wrapper (`kitty/screen.c:865-868`) via the parser's `draw` command
+> (`kitty/vt-parser.c:235-236`). The `draw a` command itself is observed
 > in the dump; the interior `is_dirty = true` C assignment behind it is the code path that
 > connects the observed `draw a` to the observed screen update in §5.
 
@@ -460,7 +468,7 @@ and §10.4a; the single encoded keypress byte is:
 **Cause → effect.** Enter is a functional key (`glfw key: 0xe001`, X11 `native_code:
 0xff0d`) with no directly-printable text, so it takes the **encoded** branch and Kitty
 writes a single carriage-return byte `0x0d` to the PTY (`sent encoded key to child: 0xd `,
-`keys.c:261-268`). bash receives the `\r`, executes the buffered line `a`, and echoes back
+`kitty/keys.c:261-268`). bash receives the `\r`, executes the buffered line `a`, and echoes back
 `bash: a: command not found` plus a freshly-drawn prompt (the `\033 ] 133 ; ...` sequences
 are bash's OSC 133 shell-integration marks). Those echoed bytes are exactly what the parser
 consumes to update the screen model (§4c) and then the display (§5).
@@ -494,10 +502,10 @@ cell — the instant a typed character appeared.
    grep for GL-error patterns over every run's log returned nothing — which means the
    cell-upload and draw calls in the render path executed successfully.
 
-3. **The framebuffer measurably changed when the character appeared (exact, auditable).**
+3. **The framebuffer measurably changed when the character appeared — confined to one cell
+   (auditable) — and the *size* of the change tracks the cursor's blink phase.**
    In a dedicated before/after run, the same 1280×800 window framebuffer was grabbed with
-   Pillow before and after pressing `a`, and compared pixel-by-pixel. The exact code and
-   its exact output:
+   Pillow before and after pressing `a`, and compared pixel-by-pixel. The exact code:
 
    ```python
    # PIL.ImageGrab against the Xvfb display :99, then exact per-pixel RGB compare
@@ -509,36 +517,60 @@ cell — the instant a typed character appeared.
    changed = sum(1 for y in range(800) for x in range(1280) if pb[x,y] != pa[x,y])
    ```
 
+   One representative capture (with the cursor bar lit just before the keypress):
+
    ```text
    BEFORE: dump_bytes=383 framebuffer=(1280, 800)
    AFTER:  dump_bytes=384 framebuffer=(1280, 800)
    DUMP_GREW_BY=1 byte(s)
    PIXELS_CHANGED_before_vs_after=113
    CHANGED_BBOX=x[216..226] y[2..19]  w=11 h=18
+   PIXELS_CHANGED_OUTSIDE_BBOX=0
    ```
 
-   **113 pixels** changed, and *every one* of them lay inside an 11×18 bounding box — exactly
-   one monospace glyph cell (a cross-check counting changed pixels outside that box returned
-   `0`). The dump grew by exactly **1 byte** (the echoed `a`). This is the observable proof
-   that the display was re-rendered as a direct result of the keypress, and it is stable:
-   the identical metric (`PIXELS_CHANGED=113`, `dump_bytes` 383→384, same bounding box) was
-   reproduced on **every one of six consecutive** before/after runs.
+   **What is invariant (reproduced on every run).** *Every* changed pixel lies inside a single
+   ~11×18-pixel bounding box — exactly one monospace glyph cell — and a cross-check counting
+   changed pixels *outside* that box returns `0` on every run. The dump grows by exactly
+   **1 byte** (the echoed `a`), and no GL error is ever printed. That is the observable proof
+   that the keypress drove a **one-cell** re-render. (The box's absolute *x*-offset just follows
+   the prompt width, so it shifts with the container hostname; its ~11×18 *size* and one-cell
+   confinement do not.)
 
-   *(Why 113, and why the exact count depends on the cursor.)* `PIXELS_CHANGED` counts the
-   pixels that **differ** between the before and after frames, so it captures everything the
-   redraw touched in that cell — not just the glyph. Before the keypress the target cell is
-   **not blank**: it already holds the text cursor, which in this run renders as a **steady,
-   thin vertical bar** — an ASCII grayscale map of the region shows a 2-pixel-wide lit column
-   running the full cell height (measured in §7: region grayscale `0/37.1/204`, 36 lit
-   pixels). Pressing `a` repaints the cell: the old cursor bar is cleared, the `a` glyph is
-   drawn, and the cursor advances to the next cell — so the pixels that change span the
-   departing cursor, the new glyph, and the arriving cursor's leading edge, totalling **113**.
-   The count is therefore a function of whether the cursor is lit at the two capture instants:
-   a capture with the cell blank (cursor off or absent) collapses toward the glyph's own ~85
-   pixels; with the bar cursor present — as it consistently is here, identically across all
-   **nine** runs (six in §5's stability check plus three re-verification runs) — it is 113.
-   The single-cell 11×18 bounding box, the `+1` dump byte, and the fact of the one-cell redraw
-   are invariant either way.
+   **What varies, and why (the exact count is cursor-blink-phase-dependent — reported as the
+   distribution it actually is).** The raw `PIXELS_CHANGED` *count* is **not** a single fixed
+   number. It counts the pixels that **differ** between the two frames, so it also captures the
+   text cursor, which **blinks** under Kitty's defaults (`cursor_blink_interval = -1`,
+   `kitty/options/definition.py:349`; `cursor_stop_blinking_after = 15.0`s, `:358`). The blink is
+   directly observable: grabbing the **idle** window repeatedly (no key pressed) shows the
+   framebuffer toggling by exactly **36 px** — a 2-pixel-wide × 18-pixel-tall lit column, i.e.
+   the cursor bar — between consecutive frames:
+
+   ```text
+   # 20 consecutive idle grabs, pixels changed vs the previous frame (NO keypress):
+   idle-diff histogram: {0: 6, 36: 14}      # the 36-px cursor bar blinking on / off
+   ```
+
+   Because the "before" grab may catch that bar lit or unlit, the keypress delta is
+   correspondingly larger or smaller. Grabbing **10 fresh launches** at varied capture timing
+   makes the dependence explicit — the count is a clean function of the before-cursor state,
+   while the one-cell bounding box never changes:
+
+   ```text
+   BEFORE_cursor_lit_px | changed_count | bbox
+        0               |      85       | 11×18    # cursor OFF before -> glyph + advanced cursor
+        0               |      85       | 11×18
+       36               |     113       | 11×18    # cursor ON  before -> ALSO clears the old bar
+       36               |     113       | 11×18
+   ```
+
+   So the *same* keypress has been observed to change **85** pixels (cursor unlit before the
+   key), **113** (cursor lit before), and — with other fixed capture timings — a stable **77**
+   or **107**; the exact value is whatever the blink phase dictates at the two grab instants, not
+   an environment constant. (This is why an earlier draft's single "stable" figure did not
+   reproduce for reviewers using different capture timing: 85 and 113 are the cursor-off and
+   cursor-on endpoints of the same phenomenon.) The invariants — **one** ~11×18 cell, `+1` dump
+   byte, `0` pixels changed outside the cell, `0` GL errors — hold in **every** case; only the
+   count *inside* that one cell moves with the cursor.
 
 **Cause → effect (the render chain).** The dirty flag set by the parser (§4c) is what makes
 the next render cycle re-upload cell data instead of reusing the previous frame:
@@ -570,8 +602,9 @@ the next render cycle re-upload cell data instead of reusing the previous frame:
 > mainly adds the GL-version banner, per-call GL error checking, and frame-timeout
 > warnings). It is therefore labeled inferred-from-reading — but it is tightly bracketed by
 > runtime observations on both sides: the parser input (dumped bytes) and the observed
-> `draw a` command on one side, and the parser/render output (the exact 113-pixel framebuffer
-> change confined to one glyph cell, plus zero GL errors) on the other.
+> `draw a` command on one side, and the parser/render output (the one-glyph-cell framebuffer
+> change — 85–113 changed pixels depending on cursor blink phase, `0` outside the cell — plus
+> zero GL errors) on the other.
 
 **Why the frame appears a few milliseconds after the byte — timing.** Kitty intentionally
 coalesces input before repainting, governed by two default timing knobs:
@@ -596,7 +629,7 @@ trailing space before the newline; to make that byte-exact, the encoded lines ar
 shown in a `cat -A` view where end-of-line is marked `$`, so a trailing space appears as a
 literal space immediately before that `$` (e.g. `0xd $`).
 
-### 6a. Printable character `a` — text branch (`keys.c:252-254`)
+### 6a. Printable character `a` — text branch (`kitty/keys.c:252-254`)
 
 ```text
 [2.163] ^[[33mon_key_input^[[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
@@ -608,9 +641,9 @@ no trailing space:
 ```
 Echoed byte (complete `od -An -c`): `a`. The key has printable text, so
 `encode_glfw_key_event` returns `SEND_TEXT_TO_CHILD` and the text is written directly
-(`keys.c:253-254`).
+(`kitty/keys.c:253-254`).
 
-### 6b. Enter (Return) — encoded branch, single byte (`keys.c:255-268`)
+### 6b. Enter (Return) — encoded branch, single byte (`kitty/keys.c:255-268`)
 
 ```text
 [3.286] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
@@ -620,10 +653,10 @@ Byte-exact (`cat -A`, note the trailing space before `$`):
 [3.286] ^[[33mon_key_input^[[m: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd $
 ```
 Encoded output: `0xd` (carriage return). No printable text, so it is encoded; `0x0d` is a
-non-printable byte, hence the legend prints it as `0xd ` (`keys.c:266`, with the trailing
+non-printable byte, hence the legend prints it as `0xd ` (`kitty/keys.c:266`, with the trailing
 space the legend appends to every byte). The complete 352 echoed bytes appear in §10.4a.
 
-### 6c. Ctrl-C — encoded branch producing a control byte (`keys.c:255-268`)
+### 6c. Ctrl-C — encoded branch producing a control byte (`kitty/keys.c:255-268`)
 
 Two `on_key_input` lines fire — first the bare Ctrl press (not encodable), then `c` with
 the Ctrl modifier:
@@ -641,11 +674,11 @@ in §10.4a; they begin with `^ C` (the terminal's echo of the interrupt) followe
 prompt.
 
 **Cause → effect for the signal.** The encoded output is a single byte
-(`size == 1`), so `keys.c:256` checks `screen->modes.mHANDLE_TERMIOS_SIGNALS`. That private
+(`size == 1`), so `kitty/keys.c:256` checks `screen->modes.mHANDLE_TERMIOS_SIGNALS`. That private
 mode is **off in the default configuration**, so the signal route
-`screen_send_signal_for_key(...)` (`keys.c:257`, `kitty/screen.c:2404`) is **not** taken —
+`screen_send_signal_for_key(...)` (`kitty/keys.c:257`, `kitty/screen.c:2404`) is **not** taken —
 which is exactly why the trace shows the byte-write path `sent encoded key to child: 0x3 `
-(`keys.c:259-268`) rather than an early return. The `0x03` byte is written to the PTY, and
+(`kitty/keys.c:259-268`) rather than an early return. The `0x03` byte is written to the PTY, and
 the kernel's terminal line discipline (termios `ISIG`) converts it into `SIGINT` for bash's
 foreground process group. The observable result — `^C` echoed and a new prompt whose OSC 133
 `D;130` marks the exit status — confirms the interrupt happened. *(The
@@ -653,7 +686,7 @@ foreground process group. The observable result — `^C` echoed and a new prompt
 from reading the mode's default; the byte-write path actually taken is directly observed in
 the trace.)*
 
-### 6d. Arrow key (Up) — encoded branch, multi-byte CSI sequence (`keys.c:255-268`)
+### 6d. Arrow key (Up) — encoded branch, multi-byte CSI sequence (`kitty/keys.c:255-268`)
 
 ```text
 [5.552] ^[[33mon_key_input^[[m: glfw key: 0xe008 native_code: 0xff52 action: PRESS mods: none text: '' state: 0 sent encoded key to child: ^[ [ A 
@@ -664,13 +697,13 @@ Byte-exact (`cat -A`):
 ```
 Encoded output: `^[ [ A ` — i.e. the three bytes `ESC` `[` `A` (the classic ANSI cursor-up
 sequence, CSI A), each followed by the legend's space. The legend prints ESC as `^[ `
-(`keys.c:263`) and the printable `[` and `A` as `%c ` (`keys.c:265`). This is a
+(`kitty/keys.c:263`) and the printable `[` and `A` as `%c ` (`kitty/keys.c:265`). This is a
 **special/functional key** that *is* encodable, so it produces a multi-byte escape sequence
 rather than being dropped. Echoed byte (complete `od -An -c`): `a` — in this session bash's
 line editor recalled the previous command from history when Up was pressed on an empty line,
 echoing the single recalled character.
 
-### 6e. Function key (F1) — encoded branch, SS3 sequence (`keys.c:255-268`)
+### 6e. Function key (F1) — encoded branch, SS3 sequence (`kitty/keys.c:255-268`)
 
 ```text
 [6.678] ^[[33mon_key_input^[[m: glfw key: 0xe014 native_code: 0xffbe action: PRESS mods: none text: '' state: 0 sent encoded key to child: ^[ O P 
@@ -686,7 +719,7 @@ sequence, so the child echoed a single `\a` (BEL) byte. *(In every run this BEL 
 produced 8 lines of unrelated `ALSA lib ...` stderr noise from the sound library; that noise
 is environmental, not part of Kitty's pipeline, and is shown verbatim in §10.4.)*
 
-### 6f. Bare modifier (Shift alone) — unencodable branch (`keys.c:270-271`)
+### 6f. Bare modifier (Shift alone) — unencodable branch (`kitty/keys.c:270-271`)
 
 ```text
 [7.806] ^[[33mon_key_input^[[m: glfw key: 0xe061 native_code: 0xffe1 action: PRESS mods: shift text: '' state: 0 ignoring as keyboard mode does not support encoding this event
@@ -694,8 +727,8 @@ is environmental, not part of Kitty's pipeline, and is shown verbatim in §10.4.
 Echoed bytes: **none (0 bytes)** — the complete byte slice for this condition is empty. A
 bare modifier press has no text and no encodable representation in the active
 (default/legacy) keyboard mode, so `encode_glfw_key_event` returns a non-positive size and
-control reaches the `else` at `keys.c:270`, printing
-`ignoring as keyboard mode does not support encoding this event` (`keys.c:271`). This is
+control reaches the `else` at `kitty/keys.c:270`, printing
+`ignoring as keyboard mode does not support encoding this event` (`kitty/keys.c:271`). This is
 the honest edge case: **not every key produces child output** — a bare modifier is
 consumed with nothing sent, and correspondingly nothing was captured by `--dump-bytes`.
 
@@ -732,20 +765,23 @@ pixel metric in §5).
 
 - **Before** — the prompt is drawn and no character has been typed into the target cell. The
   dump file held only the 383 startup bytes. The captured framebuffer region (bounding box
-  `x[216..226] y[2..19]`) held no glyph, but it was **not** all background: a grayscale readout
-  of that region returned `min/mean/max = 0/37.1/204` with 36 non-background pixels — the text
-  **cursor**, rendered in this run as a steady thin vertical bar (an ASCII grayscale map of the
-  region shows a 2-pixel-wide lit column running the full cell height). Conceptually:
+  `x[216..226] y[2..19]`) held **no glyph**; it contained at most the **text cursor**, which
+  under Kitty's defaults **blinks** (`cursor_blink_interval = -1`; `cursor_stop_blinking_after
+  = 15.0`s). So the "before" state depends on which half of the blink the grab lands in: in its
+  **lit** phase a grayscale readout of that region returns `min/mean/max = 0/36.9/203` with
+  **36** non-background pixels — a 2-pixel-wide vertical bar running the full cell height; in its
+  **unlit** phase the same region reads essentially background (0 non-background pixels). Neither
+  contains the `a` glyph. Conceptually (cursor shown in its lit phase):
 
   ```text
-  root@b6e195005451:/app#      (cursor after "# ", no character typed; cell shows only the cursor bar)
+  root@b6e195005451:/app#      (cursor after "# ", no character typed; cell shows only the — blinking — cursor bar)
   ```
 
 - **During** — the `a` key is pressed. `on_key_input` takes the text branch and writes `a`
   to the PTY; the child echoes it back (the dump grew from **383 → 384** bytes, i.e. exactly
   the one echoed `a`). The parser consumes that byte and issues the observed `draw a`
-  command (§4c), which runs `screen_draw_text` (`vt-parser.c:236`) → `draw_text`
-  (`screen.c:849`), setting `is_dirty = true` (`screen.c:850`). Captured trace for
+  command (§4c), which runs `screen_draw_text` (`kitty/vt-parser.c:236`) → `draw_text`
+  (`kitty/screen.c:849`), setting `is_dirty = true` (`kitty/screen.c:850`). Captured trace for
   this instant:
 
   ```text
@@ -757,23 +793,26 @@ pixel metric in §5).
 
 - **After** — the render cycle re-uploads the cell and swaps the buffer; the glyph is now
   on screen. The same framebuffer region now contained glyph pixels: its grayscale readout
-  returned `min/mean/max = 0/76.2/220` with 85 non-background pixels — the `a` glyph (plus the
+  returned `min/mean/max = 0/75.9/220` with 85 non-background pixels — the `a` glyph (plus the
   leading edge of the cursor, now advanced one cell to the right).
 
   ```text
   root@b6e195005451:/app# a     (the "a" is now displayed, cursor advanced one cell)
   ```
 
-  A pixel comparison of the before and after framebuffers reported **exactly 113 changed
-  pixels**, *all* inside the single 11×18 cell-sized box (`0` changed pixels outside it) — the
-  observable proof that the display was re-rendered as a direct result of the keypress. (The
-  count is 113, not the glyph's own ~85 lit pixels, because the redraw also clears the cursor
-  bar that occupied the cell beforehand and advances the cursor; see §5.)
+  A pixel comparison of the before and after framebuffers reported **all** changed pixels
+  *inside* the single ~11×18 cell-sized box (`0` changed pixels outside it) — the observable
+  proof that the display was re-rendered as a direct result of the keypress. The exact *count*
+  of changed pixels inside that cell tracks the cursor's blink phase at the two grabs: **113**
+  when the cursor bar is lit in the "before" frame (as in the capture above), **85** when it is
+  unlit, and a stable **77** or **107** under other fixed capture timings — see the full
+  distribution and its cause in §5.
 
 This before → during → after transition is the concrete, observed demonstration of the
-whole pipeline: the cell holds no glyph (only the cursor bar) until the echoed byte is parsed
-into a `draw a` command (setting `is_dirty`), and only after the subsequent render cycle does
-the character appear on screen (113 changed pixels in one cell).
+whole pipeline: the cell holds no glyph (only the blinking cursor bar) until the echoed byte is
+parsed into a `draw a` command (setting `is_dirty`), and only after the subsequent render cycle
+does the character appear on screen — a redraw confined to that one cell (whose exact
+changed-pixel count, 85–113, tracks the cursor blink phase; see §5).
 
 ---
 
@@ -911,7 +950,23 @@ $ WID=$(xdotool search --sync --name kitty-dbg | head -1)
 $ xdotool windowactivate --sync "$WID"; xdotool windowfocus --sync "$WID"
 $ xdotool key a         # (and Return, ctrl+c, Up, F1, Shift_L)
 # child spawned:  /bin/bash --posix
+# Finally, shut kitty down GRACEFULLY so the block-buffered stdout (the parsed
+# VT-command dump, §10.4b) is flushed to the log — type `exit` + Enter in the shell:
+$ xdotool type --window "$WID" exit; xdotool key --window "$WID" Return
 ```
+
+> **Why the shutdown command matters (parser-stream provenance).** The per-key `on_key_input`
+> traces and the `--dump-bytes` file are written *live* (unbuffered stderr / a binary file), so
+> they are captured regardless of how kitty ends. The **parsed VT-command stream** in §10.4b is
+> different: it is printed to **stdout** by `DumpCommands.__call__` (`kitty/boss.py:239-250`) via
+> `safe_print`, and stdout is **block-buffered** when redirected to a file, so it is flushed only
+> when the process exits *cleanly*. Typing `exit` + Enter makes the child `bash` exit, which
+> closes the last OS window; with `confirm_os_window_close=0` kitty then quits cleanly and the
+> Python interpreter's normal shutdown flushes the buffer. This was verified directly — the
+> graceful exit above yields the §10.4b stream, and so do **Ctrl-D** (EOF at the prompt) and
+> **`kill <pid>`** (SIGTERM); only a hard **`kill -9`** (SIGKILL) loses the buffer, in which case
+> the §10.4b block is absent while the stderr traces and the `--dump-bytes` file are unaffected.
+> The measured draw-line counts flushed by each method are shown in §10.4b.
 
 ### 10.3 Full startup trace (run 1, `cat -v`) — complete, 8 stderr lines
 
@@ -1076,7 +1131,25 @@ Because `--dump-bytes` selects the dumping worker (`parse_worker_dump`,
 stdout by `DumpCommands.__call__` (`kitty/boss.py:239-250`) via `safe_print`. Below is the
 **complete stream** for the `a` → Enter → Ctrl-C → `a` portion of the session — **every
 line, unedited**, exactly as captured (the §4c slice `draw a … draw bash: a: command not
-found` is a contiguous middle section of this). Because stdout is block-buffered and flushed
+found` is a contiguous middle section of this).
+
+**How this block is obtained (provenance — it requires a graceful exit).** This stdout stream
+is **block-buffered** and therefore flushed to the log only when kitty exits *cleanly*, so it
+was captured by ending the session with the graceful-shutdown command shown in §10.2
+(`xdotool type exit; xdotool key Return`). The dependence was verified directly by ending the
+same `a`+Enter session four different ways and counting the flushed `draw` lines in the log:
+
+```text
+termination method            draw-command lines flushed to stdout log
+  kill -9   (SIGKILL)           0     <- buffer lost; parser stream ABSENT
+  kill <pid>(SIGTERM)           4     <- flushed
+  Ctrl-D    (EOF at prompt)     5     <- flushed
+  exit+Enter(shell exit)        6     <- flushed (most complete; used here)
+```
+
+So a hard `kill -9` would make this entire block disappear (while the live stderr
+`on_key_input` traces and the binary `--dump-bytes` file are unaffected); every graceful exit
+reproduces it. Because stdout is block-buffered and flushed
 at process exit, this stream appears in the trace file after the stderr `on_key_input`
 lines even though the parsing happens on the main thread as the bytes arrive; the
 `[seconds]`-timestamped stderr lines in §10.4 establish the true emission order. The last
@@ -1227,9 +1300,17 @@ The launch path that reaches the `on_key_input` → parser → render machinery 
 - **Complete output.** Every per-condition runtime capture — the `on_key_input` trace
   slices (§6, §10.4), the full multi-byte echoed-byte dumps (§10.4a), and the complete
   parser-command stream (§10.4b) — is shown complete and unedited. No block presented as a
-  complete runtime capture is elided. The `...` tokens that remain in this document fall
-  into exactly three non-elision categories: (1) **verbatim build output** — `setup.py`
-  itself prints each progress line as `Compiling <file> ...` with a literal ellipsis, so the
+  complete runtime capture is elided. One provenance caveat applies to the §10.4b
+  parser-command stream specifically: `--dump-commands` writes through
+  `DumpCommands.__call__` → `safe_print`, i.e. Python's block-buffered `stdout`, so the
+  stream is flushed to the terminal only when Kitty exits **gracefully** (the exact
+  graceful-shutdown command is given in §10.2; a `kill -9` on the process suppresses the
+  flush and the stream never appears). The §10.4b block is therefore the complete, unedited
+  stream **as captured on a graceful exit** — nothing within it is trimmed; the caveat
+  concerns only the exit condition required to make the buffer flush at all. The `...`
+  tokens that remain in this document fall into exactly three non-elision categories:
+  (1) **verbatim build output** — `setup.py` itself prints each progress line as
+  `Compiling <file> ...` with a literal ellipsis, so the
   §2 and §10.1 progress lines reproduce that character-for-character; (2) the §10.1
   **abbreviated compile command** (`gcc … -g3 -Og …`), which is reproduced in full in §2 —
   verbatim including its duplicate `-I` search paths, soft-wrapped only for page width; and
@@ -1247,7 +1328,8 @@ The launch path that reaches the `on_key_input` → parser → render machinery 
   `draw a` command in the `--dump-bytes` command stream, §4c); only the interior C
   assignment `is_dirty = true` behind `draw a`, and the interior render chain, are labeled
   *(inferred from reading)*, and both are bracketed by observed endpoints (dumped bytes /
-  `draw a` on one side, the exact 113-pixel one-cell framebuffer change on the other).
+  `draw a` on one side, the one-cell framebuffer change — 85–113 changed pixels by cursor
+  blink phase, `0` outside the cell — on the other).
 - **Read-only + cleanup.** No Kitty source file was modified. All tracing used Kitty's own
   built-in flags; all helper scripts, the trace log, the `--dump-bytes` file, and the
   before/after screenshots lived outside the repository (or were deleted), leaving the
