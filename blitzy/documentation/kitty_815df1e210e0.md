@@ -653,7 +653,7 @@ read_bytes(int fd, Screen *screen) {
 
 ### 5.5 Observed teardown scenarios (before / during / after)
 
-**Scenario 1 — ordinary close: child self-exits (`SIGCHLD`).** Command `sh -c "echo BYE_FROM_CHILD; exit 7"`. kitty sent **no** kill/SIGHUP; the child exit is reaped by the coalescing loop. Producing command, and the `strace` lines for the traced syscalls (the trace is filtered to `-e trace=wait4,getpgid,kill`; every line emitted for those syscalls is shown below, unedited within that filter) — child TID `59796`, I/O thread TID `59795`:
+**Scenario 1 — ordinary close: child self-exits (`SIGCHLD`).** Command `sh -c "echo BYE_FROM_CHILD; exit 7"`. The child's *exit status* is **always** `WIFEXITED(status)` — it chose its own exit — and is reaped by the coalescing `wait4(-1, …, WNOHANG)` loop. Whether kitty **additionally** emits a cleanup `SIGHUP` is **run-to-run variable** (a race, characterised as a distribution just below), because a self-exiting child races two independent removal triggers on the I/O thread (see *mechanism* below). The trace immediately below is a **representative reap-first run** (the majority ordering): the reap wins, so when `hangup` later runs, `getpgid` sees the already-reaped pid as `ESRCH` and **no** `SIGHUP` is sent (Guard 3, §7.2). The trace is filtered to `-e trace=wait4,getpgid,kill`; every line emitted for those syscalls is shown, unedited within that filter — child TID `59796`, I/O thread TID `59795`:
 
 ```bash
 env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/evidence/sc1_selfexit.strace \
@@ -667,7 +667,54 @@ env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe strace -f -tt -e
 59795 05:50:47.361112 getpgid(59796)    = -1 ESRCH (No such process)
 ```
 
-*Before:* child alive, running the command. *During:* `WIFEXITED … WEXITSTATUS == 7` — the exact exit status is captured faithfully. *After:* the follow-up `wait4` returns `ECHILD`, so the reap loop terminates; the subsequent `getpgid(59796) = -1 ESRCH` with **no** following `kill` is Guard 3 firing (see §7.2).
+*Before:* child alive, running the command. *During:* `WIFEXITED … WEXITSTATUS == 7` — the exact exit status is captured faithfully. *After:* the follow-up `wait4` returns `ECHILD`, so the reap loop terminates; in this representative reap-first run the subsequent `getpgid(59796) = -1 ESRCH` with **no** following `kill` is Guard 3 firing (see §7.2).
+
+**Run-to-run distribution of the self-exit teardown (20 identical runs) — the cleanup `SIGHUP` is race-dependent, the exit *status* is not.** The reap-first trace above is the *majority* ordering, not the only one. Because a self-exiting child races two independent I/O-thread removal triggers (see *mechanism* below), whether kitty emits a redundant cleanup `SIGHUP` before the reap varies run-to-run. Running the **identical, unchanged** self-exit command `sh -c 'exit 7'` 20 times, each traced separately (the `echo` in the representative trace above is immaterial to the teardown race — it only writes to the PTY before the same `exit 7`), yields the following distribution:
+
+Producing commands (20 identical runs, then a classifier):
+
+```bash
+for i in $(seq 1 20); do
+  env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+    strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/evidence/selfexit/r${i}.strace \
+    ./kitty/launcher/kitty --debug-rendering --config NONE sh -c 'exit 7' >/dev/null 2>&1
+done
+for i in $(seq 1 20); do
+  if grep -q 'kill(-[0-9]*, SIGHUP)' /home/ubuntu/evidence/selfexit/r${i}.strace; \
+    then echo hangup-first; else echo reap-first; fi
+done | sort | uniq -c
+```
+
+Observed output of the classifier:
+
+```text
+      5 hangup-first
+     15 reap-first
+```
+
+| Ordering | Runs (of 20) | `getpgid(pid)` | `kill(-pid, SIGHUP)` | Reaped status |
+|---|---|---|---|---|
+| **reap-first** (majority) | **15 / 20** | `-1 ESRCH` | **not** sent (Guard 3 no-ops) | `WIFEXITED(status)`, `WEXITSTATUS == 7` |
+| **hangup-first** (minority) | **5 / 20** | succeeds (returns pid) | **sent** (`= 0`, to the already-exited group) | `WIFEXITED(status)`, `WEXITSTATUS == 7` |
+
+**The reaped exit *status* is invariant across both orderings** — always `WIFEXITED(status)` with `WEXITSTATUS == 7`. A `SIGHUP` emitted in the hangup-first ordering lands on a child that has **already exited on its own** (a zombie), so it is discarded and never changes the reaped status. What varies run-to-run is *only* whether the redundant cleanup `SIGHUP` is emitted before the reap collects the status.
+
+Representative **hangup-first** run from the same 20-run session (child TID `189955`, I/O thread `189954`), showing the child self-exit and every `getpgid`/`kill`/`wait4` line unedited (an earlier startup `SIGWINCH` delivery and kitty's own clean `+++ exited with 0 +++` ~1 s later are outside this teardown window):
+
+```text
+189955 10:55:24.115115 +++ exited with 7 +++
+189954 10:55:24.115258 getpgid(189955)  = 189955
+189954 10:55:24.115294 kill(-189955, SIGHUP) = 0
+189954 10:55:24.115386 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 7}], WNOHANG, NULL) = 189955
+189954 10:55:24.115451 wait4(-1, 0x7e75dbffee60, WNOHANG, NULL) = -1 ECHILD (No child processes)
+```
+
+**Mechanism (why the ordering varies).** A self-exiting child makes *two* things ready on the I/O thread's single `poll` set at essentially the same instant. (1) The kernel delivers `SIGCHLD`, which becomes readable on the `signalfd`/self-pipe (an `EXTRA_FDS` slot) and drives `reap_children`'s coalescing `wait4(-1, &status, WNOHANG)` loop (`kitty/child-monitor.c:1413-1430`), reaping the zombie by pid. (2) The child's PTY slave closes, so its PTY-master fd reaches end-of-file/`EIO` on read — the read path treats this as the child going away and marks it `needs_removal = true` (`kitty/child-monitor.c:1535`; the `EIO` read-path behaviour is described in §5.4), which the next-tick `remove_children` (`:1313`) drains via `cleanup_child` (`:1306`, whose `hangup(children[i].pid)` call is at `:1308`) → `hangup` → `getpgid(pid)` then `killpg(pgid, SIGHUP)` (`kitty/child-monitor.c:1294-1302`). Both run on the **same** I/O thread, so exactly one is serviced first within a given `poll` iteration:
+
+- If the `SIGCHLD` reap (1) is serviced first, the pid is already gone when `hangup` runs, so `getpgid(pid)` returns `ESRCH` and Guard 3 suppresses the `kill` — the **reap-first** ordering (15/20).
+- If the `EIO`-driven removal (2) is serviced first, `hangup`'s `getpgid` still sees the unreaped zombie's valid pgid and `killpg(pgid, SIGHUP)` is sent (harmlessly), *then* the `SIGCHLD` reap collects the status — the **hangup-first** ordering (5/20).
+
+The observed 15/20-vs-5/20 split *is* the direct measurement of that race; the two-trigger explanation is grounded in the two code paths anchored above. Either way the child dies exactly once, by its own `exit(7)`, and is reaped exactly once as `WIFEXITED`.
 
 **Scenario 2 (a.k.a. Scenario 4) — kitty-initiated close: `hangup` → `killpg(pgid, SIGHUP)`.** Command `sh -c "exec sleep 600"`, closed via RC `close-window` (remote control used **only to trigger** the real close, never as a substitute for the observed mechanism). Producing commands, and the `strace` lines for the traced syscalls (filtered to `-e trace=wait4,getpgid,kill`; every line emitted for those syscalls is shown below, unedited within that filter) — I/O thread `59876`, child `59877`:
 
@@ -692,7 +739,7 @@ env DISPLAY=:99 ./kitty/launcher/kitty @ --to "unix:${SOCK}" close-window --matc
 59876 05:50:53.694063 wait4(-1, 0x7ca210ff8e60, WNOHANG, NULL) = -1 ECHILD (No child processes)
 ```
 
-*During:* the I/O thread (`59876`) issues `kill(-59877, SIGHUP)` — i.e. `killpg(pgid, SIGHUP)` from `hangup` (`kitty/child-monitor.c:1299`); the child first receives a `SIGHUP {si_code=SI_KERNEL}` (the PTY master closing in `cleanup_child`'s `safe_close`, `:1307`) and is then `killed by SIGHUP`. *After:* reaped as `WIFSIGNALED … WTERMSIG == SIGHUP`, then `ECHILD`. **Contrast with Scenario 1:** self-exit is `WIFEXITED(status)` with *no* kitty-sent signal; kitty-initiated close is `WIFSIGNALED(SIGHUP)` preceded by `kill(-pgid, SIGHUP)` — both funnel through the *same* `reap_children` `WNOHANG` loop.
+*During:* the I/O thread (`59876`) issues `kill(-59877, SIGHUP)` — i.e. `killpg(pgid, SIGHUP)` from `hangup` (`kitty/child-monitor.c:1299`); the child first receives a `SIGHUP {si_code=SI_KERNEL}` (the PTY master closing in `cleanup_child`'s `safe_close`, `:1307`) and is then `killed by SIGHUP`. *After:* reaped as `WIFSIGNALED … WTERMSIG == SIGHUP`, then `ECHILD`. **Contrast with Scenario 1 — the deterministic discriminator is the reaped *status*, not the presence of a signal.** Here the child is **alive** when `kill(-59877, SIGHUP)` is sent, so the signal is **causal**: it kills the child and the reap is **always** `WIFSIGNALED(status)` with `WTERMSIG == SIGHUP`. In the self-exit case (Scenario 1) the child has **already** exited, so the reap is **always** `WIFEXITED(status)`, and any `SIGHUP` that appears there (the hangup-first ordering, 5/20 above) is **redundant** — it lands on a zombie and cannot change the status. The reliable way to tell the two teardowns apart is therefore `WIFSIGNALED(SIGHUP)` vs `WIFEXITED`, **not** the mere presence of a `kill` (which can appear in either case). Both paths funnel through the *same* `reap_children` `WNOHANG` loop.
 
 **Scenario 3 — resize while a child was already removed (the R6 conflicting-view race), forced at scale.** When a resize is requested for a window whose child was **already removed** from both `children[]` and `add_queue[]`, `resize_pty`'s two `FIND` lookups miss and it takes the `else` branch, emitting exactly one harmless `log_error` (`kitty/child-monitor.c:610`). This is examined in depth in §7.3–§7.4 (it is the directly-observed R6 reconciliation). Below is a labelled **excerpt** — the first two and the last `Failed to send resize signal` lines of one run; each line shown is complete and unedited, and a single run emits hundreds of such lines (the full per-run counts are given in §7.3):
 
@@ -1144,7 +1191,7 @@ hangup(pid_t pid) {
 }
 ```
 
-(`kitty/child-monitor.c:1294-1302`.) `errno = 0` then `pgid = getpgid(pid)` (`:1295-1296`); if that sets `errno == ESRCH` the child is already gone, so it **returns immediately** at `:1297` (no kill attempted); otherwise `killpg(pgid, SIGHUP)` at `:1299` is issued, and even its failure is tolerated when `errno == ESRCH` at `:1300`. **Observation status: OBSERVED.** In the self-exit teardown (§5.5, Scenario 1), after the child exited on its own, the trace shows `getpgid(59796) = -1 ESRCH` with **no** following `kill` — the `:1297` early-return firing on a real, unmodified run:
+(`kitty/child-monitor.c:1294-1302`.) `errno = 0` then `pgid = getpgid(pid)` (`:1295-1296`); if that sets `errno == ESRCH` the child is already gone, so it **returns immediately** at `:1297` (no kill attempted); otherwise `killpg(pgid, SIGHUP)` at `:1299` is issued, and even its failure is tolerated when `errno == ESRCH` at `:1300`. **Observation status: OBSERVED — both branches.** Across the 20 identical self-exit runs characterised in §5.5, Scenario 1, the `:1297` `ESRCH` early-return fired in the **majority (15/20) reap-first** ordering — the trace below shows `getpgid(59796) = -1 ESRCH` with **no** following `kill` — while the alternative `:1299` `killpg(pgid, SIGHUP)` branch fired in the **minority (5/20) hangup-first** ordering, where the `SIGHUP` lands harmlessly on the already-exited child (see the §5.5 distribution table and its hangup-first trace). Whether Guard 3 short-circuits at `:1297` or proceeds to `:1299` is exactly the race documented in §5.5; the reaped status is `WIFEXITED(7)` either way. The reap-first trace (a real, unmodified run):
 
 ```text
 59796 05:50:47.360814 +++ exited with 7 +++
@@ -1232,7 +1279,7 @@ The ratio is `≈ 22000 µs / 103 µs ≈ 214×`: a real close command arrives a
 | Guard | Location | View reconciled | Status | Evidence |
 |-------|----------|-----------------|--------|----------|
 | `resize_pty` dual-`FIND` + `else log_error` | `child-monitor.c:606-610` | Python (window present) vs C (child removed) | **OBSERVED, forced at scale** | §7.3 distribution: overlap {481,528}, selfexit {5165,5281}; add queue: 0 always; 0 crashes |
-| `hangup` `ESRCH` tolerance | `child-monitor.c:1297,1300` | C (wants to `SIGHUP`) vs OS (child already exited) | **OBSERVED** | §5.5/§7.2: `getpgid(59796) = -1 ESRCH`, no kill |
+| `hangup` `ESRCH` tolerance | `child-monitor.c:1297,1300` | C (wants to `SIGHUP`) vs OS (child already exited) | **OBSERVED (both branches)** | §5.5/§7.2, 20 runs: 15/20 reap-first `getpgid = -1 ESRCH` (no kill); 5/20 hangup-first `kill(-pid, SIGHUP) = 0` on the already-exited child |
 | `on_child_death` pop-and-early-return | `boss.py:883-885` | Python-vs-Python (death_notify vs prior close) | NOT OBSERVED (silent; read-only forbids instrumenting) | code-grounded; reachable via `boss.py:1780-1781` before `child-monitor.c:522` |
 | `mark_child_for_close` `add_queue[]` branch | `child-monitor.c:552-558` | C live vs C pending (cancel just-created child) | NOT OBSERVED (measured-unreachable via real path) | §7.4: 103 µs residency vs 22 ms trigger floor (214×); add queue: 0 across ~9000+ samples |
 
