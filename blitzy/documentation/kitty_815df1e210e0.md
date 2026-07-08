@@ -406,7 +406,6 @@ kitty implements **five underline styles** and a **separate strikethrough**, and
 
 ```
 $ sed -n '733,742p' kitty/line.c
-static const char*
 decoration_as_sgr(uint8_t decoration) {
     switch(decoration) {
         case 1: return "4;";
@@ -650,6 +649,7 @@ send_prerendered_sprites(FontGroup *fg) {
     PyObject *args = PyObject_CallFunction(prerender_function, "IIIIIIIffdd", fg->cell_width, fg->cell_height, fg->baseline, fg->underline_position, fg->underline_thickness, fg->strikethrough_position, fg->strikethrough_thickness, OPT(cursor_beam_thickness), OPT(cursor_underline_thickness), fg->logical_dpi_x, fg->logical_dpi_y);
     if (args == NULL) { PyErr_Print(); fatal("Failed to pre-render cells"); }
     PyObject *cell_addresses = PyTuple_GET_ITEM(args, 0);
+    for (ssize_t i = 0; i < PyTuple_GET_SIZE(cell_addresses); i++) {
 ```
 
 `prerender_function` (`kitty/fonts/render.py:L364`) returns exactly **10** special sprites:
