@@ -182,7 +182,7 @@ Direct reading: the two full‑width blanks in `'123  '` are **preserved** (`'  
 
 Resize is orchestrated by `screen_resize(Screen *self, unsigned int lines, unsigned int columns)` [kitty/screen.c:L346]. The relevant ordering, cited:
 
-- **History is rewrapped FIRST and independently.** `realloc_hb(...)` [kitty/screen.c:L216-L223] allocates the new `HistoryBuf`, carries the pager history across (`ans->pagerhist = old->pagerhist` [kitty/screen.c:L219]), and calls `historybuf_rewrap(old, ans, as_ansi_buf)` [kitty/screen.c:L221]. It is invoked at [kitty/screen.c:L375] — **before** the visible grid.
+- **History is rewrapped FIRST and independently.** `realloc_hb(...)` [kitty/screen.c:L216-L223] allocates the new `HistoryBuf`, carries the pager history across (`ans->pagerhist = old->pagerhist` [kitty/screen.c:L220]), and calls `historybuf_rewrap(old, ans, as_ansi_buf)` [kitty/screen.c:L221]. It is invoked at [kitty/screen.c:L375] — **before** the visible grid.
 - **The visible grid is rewrapped SECOND.** `realloc_lb(...)` [kitty/screen.c:L234-L242] calls `linebuf_rewrap(...)` [kitty/screen.c:L240]. Crucially, the **main** screen passes the already‑rewrapped `self->historybuf` [kitty/screen.c:L384] so visible overflow spills **down** into scrollback, whereas the **alternate** screen passes `NULL` [kitty/screen.c:L394] so its overflow is **discarded**.
 - **Cursor & savepoints are carried through** via the `CursorTrack` struct [kitty/screen.c:L226-L232] and the `setup_cursor` macro [kitty/screen.c:L366-L370].
 - **Python binding.** `resize(Screen *self, PyObject *args)` parses `"|II"` (a=lines, b=columns) and calls `screen_resize(self, a, b)` [kitty/screen.c:L3929-L3934].
@@ -427,7 +427,7 @@ graph TD
 
 ### 5.3 Contrast: the PTY window‑size path is **not** buffer reflow
 
-A terminal resize has a second, independent half that must not be conflated with reflow: telling the child process about the new size. `pty_resize(int fd, struct winsize *dim)` [kitty/child-monitor.c:L577] issues `ioctl(fd, TIOCSWINSZ, dim)` [kitty/child-monitor.c:L579] (retrying on `EINTR`), exposed through the `resize_pty` binding [kitty/child-monitor.c:L591] which parses `"kHHHH"` (window id + `ws_row`/`ws_col`/`ws_xpixel`/`ws_ypixel`). This delivers the new `winsize`/`SIGWINCH` to the child; it performs **no** buffer reflow and is entirely separate from the `screen_resize` path traced above.
+A terminal resize has a second, independent half that must not be conflated with reflow: telling the child process about the new size. `pty_resize(int fd, struct winsize *dim)` [kitty/child-monitor.c:L577] issues `ioctl(fd, TIOCSWINSZ, dim)` [kitty/child-monitor.c:L579] (retrying on `EINTR`), exposed through the `resize_pty` binding [kitty/child-monitor.c:L592] which parses `"kHHHH"` (window id + `ws_row`/`ws_col`/`ws_xpixel`/`ws_ypixel`). This delivers the new `winsize`/`SIGWINCH` to the child; it performs **no** buffer reflow and is entirely separate from the `screen_resize` path traced above.
 
 ### 5.4 Runtime confirmation that these links execute
 
@@ -908,7 +908,7 @@ for (yl, xl) in [(5, 5), (8, 5), (3, 5)]:
     print(f"  -> rewrap to {yl}x{xl}: (nclb,ncla)=({nclb},{ncla})")
     dump_lb(lb2, f"DST {yl}x{xl}")
 
-print("\n### A6. HISTORYBUF.rewrap: filled_history_buf(5,5) -> same-width(8,5) fast path")
+print("\n### A6. HISTORYBUF.rewrap: filled_history_buf(5,5) -> same-width(8,5) 1:1 copy (NOT the memcpy fast path; ynum differs)")
 def filled_history_buf(ynum=5, xnum=5):
     lb = filled_line_buf(ynum, xnum)
     ans = HistoryBuf(ynum, xnum)
@@ -919,7 +919,7 @@ hb = filled_history_buf(5, 5)
 dump_hb(hb, "SRC HB 5x5")
 hb2 = HistoryBuf(8, 5)
 hb.rewrap(hb2)
-dump_hb(hb2, "DST HB 8x5 (same width -> fast path)")
+dump_hb(hb2, "DST HB 8x5 (same width -> 1:1 copy, not memcpy fast path)")
 
 print("\n### A7. HISTORYBUF.rewrap WIDTH CHANGE with a soft-wrapped logical line spanning 2 rows")
 src = create_lbuf('ABCDE', 'fghij')   # one logical line ABCDEfghij (row0 fills width 5 -> continued)
@@ -1016,14 +1016,14 @@ OBJECTIVE (a) - REWRAP CORE, driven via LineBuf.rewrap / HistoryBuf.rewrap
     y=1: content='33333'        is_continued=False last_char_wrapped=False
     y=2: content='44444'        is_continued=False last_char_wrapped=False
 
-### A6. HISTORYBUF.rewrap: filled_history_buf(5,5) -> same-width(8,5) fast path
+### A6. HISTORYBUF.rewrap: filled_history_buf(5,5) -> same-width(8,5) 1:1 copy (NOT the memcpy fast path; ynum differs)
   [SRC HB 5x5] count=5 ynum=5 xnum=5
     line(0)='44444'        last_char_wrapped=False
     line(1)='33333'        last_char_wrapped=False
     line(2)='22222'        last_char_wrapped=False
     line(3)='11111'        last_char_wrapped=False
     line(4)='00000'        last_char_wrapped=False
-  [DST HB 8x5 (same width -> fast path)] count=5 ynum=8 xnum=5
+  [DST HB 8x5 (same width -> 1:1 copy, not memcpy fast path)] count=5 ynum=8 xnum=5
     line(0)='44444'        last_char_wrapped=False
     line(1)='33333'        last_char_wrapped=False
     line(2)='22222'        last_char_wrapped=False
@@ -1580,7 +1580,7 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
 **(d) Complete data flow** — §5
 - [x] `Window.set_geometry` [kitty/window.py:L850-L854] → `Screen.resize` → `screen_resize` → history‑first → prompt protection → screen‑second → continuation setters → spill — §5.1
 - [x] Mermaid call‑flow diagram — §5.2
-- [x] PTY contrast `pty_resize` [kitty/child-monitor.c:L577] / `resize_pty` [kitty/child-monitor.c:L591] — §5.3
+- [x] PTY contrast `pty_resize` [kitty/child-monitor.c:L577] / `resize_pty` [kitty/child-monitor.c:L592] — §5.3
 - [x] Runtime confirmation the links execute — §5.4
 
 **Evidence discipline**
@@ -1594,7 +1594,7 @@ OBJECTIVE (c) - CONTINUATION PROPAGATION ACROSS THE HISTORY<->SCREEN SEAM
 
 `kitty/rewrap.h`, `kitty/line-buf.c`, `kitty/history.c`, `kitty/screen.c`, `kitty/line.c`, `kitty/lineops.h`, `kitty/data-types.h`, `kitty/window.py`, `kitty/child-monitor.c`, `kitty/options/definition.py`, `kitty/options/parse.py`, `kitty/options/types.py`, `kitty_tests/datatypes.py`, `kitty_tests/__init__.py`, `docs/changelog.rst`, `setup.py`, `pyproject.toml`.
 
-All `file:line` anchors — in both the main prose and the evidence appendix — are repository-relative and were re-verified against branch `kitty_815df1e210e0` during this investigation; they resolve to the cited code with no offsets.
+All `file:line` anchors — in both the main prose and the evidence appendix — are repository-relative and were re-verified by symbol name and behavior against branch `kitty_815df1e210e0` during this investigation; each resolves to the named function, struct, or statement it cites (single‑line anchors are given at that construct's line, and multi‑line ranges bracket it).
 
 ---
 ## 10. Read‑only guarantee (verification)
