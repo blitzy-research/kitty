@@ -95,6 +95,8 @@ kitty 0.35.2 created by Kovid Goyal
 
 The `/app` checkout is the exact investigation commit (`git -C /app rev-parse HEAD` → `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`). Unlike a bare headless host, this container ships `wayland-protocols`, so the Wayland backend **is** built (steps `[1/28]…[28/28]` above) alongside X11/software-GL; this is orthogonal to every flow-control path documented here. The build produces `kitty/launcher/kitty`, `kitty/launcher/kitten`, and `kitty/fast_data_types.so` (the compiled terminal core the in-process observation harness imports).
 
+**Build-state note (reproducibility).** The exact step indices above (`[1/28]…[28/28]`, `[1/122]…[122/122]`), the ~380-line log length, and the ~55 s wall time reflect this *from-clean* build capture; they are **build-state dependent**, not invariants. An incremental rebuild against the already-built `/app` recompiles only what changed and therefore prints fewer steps and a shorter log — re-running `python3 setup.py` here produced a ~209-line log that still exited 0 with zero warnings. The reproducible invariants, independent of build state, are: the build **exits 0 with zero warnings/errors**, the toolchain versions (§2.3), and `kitty --version` → `kitty 0.35.2 created by Kovid Goyal`.
+
 ### 2.3 Toolchain (canonical container)
 
 The versions inside the canonical container that produced the build above:
@@ -532,6 +534,41 @@ matching `kitty/vt-parser.c:646-648`. The first explicitly names *"too much data
 ## 9. Evidence appendix (exact command + complete unedited output)
 
 All observation scripts lived under `/tmp/kitty_obs/` on the host, mounted into the canonical container (§2.2) at the same path (`-v /tmp/kitty_obs:/tmp/kitty_obs`); they are outside the repository and are removed as the final cleanup step so the tree is left unchanged (§9.8). Except where a block is explicitly labelled **NON-CANONICAL** (the native GUI-under-Xvfb thread roster in §9.6(a-supplementary)), each block below was run in the **canonical container** via `docker exec kitty-obs bash -c 'cd /app && python3 …'` and shows the exact command and the **complete, unedited** stdout.
+
+**Harness provenance & how to reproduce these without the removed scripts.** The `/tmp/kitty_obs/*.py` paths in the commands below are the *archival capture commands*: each observation harness was a small **temporary** script that lived only under `/tmp/kitty_obs/` (on the host, bind-mounted into the container) and was **intentionally removed after capture** to satisfy the read-only rule (§0.7), so the repository is left byte-for-byte unchanged apart from this document (§9.8). None of them is a bespoke debug hook — every harness is a thin driver over kitty's **own in-tree test helpers** (`kitty_tests.parse_bytes`, `kitty_tests.graphics.send_command`, `BaseTest.create_screen`) exercising the real `Screen` / `GraphicsManager` / `ChildMonitor` (construction spelled out in §2.4), so any reader can reconstruct them. The canonical reconstruction pattern for the graphics-response harnesses — re-run in the canonical container (§2.2) and **byte-identical across ≥2 runs** — is:
+
+```python
+import sys
+sys.path.insert(0, '/app')                       # kitty source root (the /app checkout, pinned commit)
+from kitty_tests import BaseTest                  # kitty's own in-tree test base
+from kitty_tests.graphics import send_command     # builds ESC _ G <keys> ; <b64 payload> ESC \, returns wtcbuf
+
+class H(BaseTest):
+    def runTest(self): pass
+
+h = H()
+s = h.create_screen()                             # real Screen + GraphicsManager (grman)
+# q=0: full response; q=1: OK suppressed but error emitted; q=2: all suppressed
+print("q=0 OK   :", send_command(s, 'a=t,q=0,i=1,s=1,v=1,f=24', b'\x01\x02\x03'))
+print("q=0 ERR  :", send_command(s, 'a=t,q=0,i=1,s=10,v=10,f=24', b'\x00\x01\x02\x03'))
+print("q=1 OK   :", send_command(s, 'a=t,q=1,i=1,s=1,v=1,f=24', b'\x01\x02\x03'))
+print("q=1 ERR  :", send_command(s, 'a=t,q=1,i=1,s=10,v=10,f=24', b'\x00\x01\x02\x03'))
+print("q=2 OK   :", send_command(s, 'a=t,q=2,i=1,s=1,v=1,f=24', b'\x01\x02\x03'))
+print("q=2 ERR  :", send_command(s, 'a=t,q=2,i=1,s=10,v=10,f=24', b'\x00\x01\x02\x03'))
+```
+
+which, run via `docker exec kitty-obs bash -c 'cd /app && python3 …'`, produces (byte-identical to §9.4a/§9.5):
+
+```text
+q=0 OK   : b'\x1b_Gi=1;OK\x1b\\'
+q=0 ERR  : b'\x1b_Gi=1;ENODATA:Insufficient image data: 4 < 300\x1b\\'
+q=1 OK   : b''
+q=1 ERR  : b'\x1b_Gi=1;ENODATA:Insufficient image data: 4 < 300\x1b\\'
+q=2 OK   : b''
+q=2 ERR  : b''
+```
+
+Swapping the control keys/payload reproduces every §9.3–§9.5 block (e.g. `a=t` transmit floods for the 320 MiB quota in §9.3; the five APC conditions in §9.4a); the threaded-I/O harness (§9.6a) is the same pattern over a real `ChildMonitor(lambda *a: None, None).start()` reading `/proc/self/task/*/comm`. The two write-buffer harnesses (§9.4b `write_buf` 100 MiB cap and §9.4c `EAGAIN`-retain/drain) drive the **live** `ChildMonitor` io_loop with a pre-filled PTY (a real background thread), so their wall-clock timing is environment-sensitive; their *result* is nonetheless deterministic by the exact byte arithmetic shown there (99 × 1 048 580 = 103 809 420, and one more framed chunk crosses the 104 857 600 cap). The response-gating and storage behaviors are additionally reproducible with **no** custom harness at all, through kitty's own test suite: `CI=true ./kitty/launcher/kitty +launch test.py --module graphics suppressing_gr_command_responses disk_cache` → `Ran 2 tests … OK` (§9.5a).
 
 ### 9.1 B1 — 1 MiB parser buffer fills, admission gate closes, then reopens (canonical)
 
@@ -1076,7 +1113,7 @@ The two checks prove different facts, and conflating them is the mistake this se
 - **Canonical build/config:** kitty was built and run in its **default configuration** inside the canonical Docker container — image name, exact `docker run` + `python3 setup.py`, complete build tail, and `kitty --version` in §2.2; container toolchain (Python 3.12.3 / Go 1.23.4 / gcc 13.3.0) in §2.3. The build exited 0 with zero warnings; no non-default build flag or option override was used.
 - **Canonical path:** all headline values come from the real parser / `GraphicsManager` / a real in-process `ChildMonitor` I/O thread, exercised in the canonical container (§2.2); no remote-control or debug-hook value is presented as canonical, and the single native GUI-under-Xvfb run (§9.6a-supplementary) is explicitly labelled **non-canonical** (the container ships no Xvfb).
 - **Actual output for every claim:** complete unedited outputs with their exact commands are in §9; byte-sensitive results are shown as `repr()`/hexdump.
-- **Read-only repo:** only `blitzy/documentation/kitty_815df1e210e0.md` is added; all temp scripts were under `/tmp/kitty_obs/` and removed; final `git status` shows only the new file (§9.8).
+- **Read-only repo:** only `blitzy/documentation/kitty_815df1e210e0.md` is added relative to the pinned upstream baseline; all temp scripts were under `/tmp/kitty_obs/` and removed; final `git status --porcelain` is empty (§9.8).
 
 ### 10.4 Explicitly inferred-from-code items (and why)
 
