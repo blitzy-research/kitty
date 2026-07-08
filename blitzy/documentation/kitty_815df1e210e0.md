@@ -124,7 +124,7 @@ OK (skipped=4)
 All Go tests succeeded, ran in 14.7 seconds
 ```
 
-`kitty_tests/` contains **no** child-monitor or window-lifecycle test (`kitty_tests/main.py:57` enumerates the module tests: screen, layout, keys, parser, glfw, …), which is exactly why the lifecycle-race behaviour here is observed with purpose-built temporary drivers rather than an existing test.
+`kitty_tests/` contains **no** child-monitor or window-lifecycle test (`find_all_tests` at `kitty_tests/main.py:57` auto-discovers the test modules, excluding `main`/`gr`; none is a child-monitor/lifecycle test), which is exactly why the lifecycle-race behaviour here is observed with purpose-built temporary drivers rather than an existing test.
 
 ### 1.6 Exact run invocation (A6)
 
@@ -190,7 +190,7 @@ add_child(ChildMonitor *self, PyObject *args) {
 }
 ```
 
-(`kitty/child-monitor.c:305-321`: `INCREF_CHILD` at `:316`, `add_queue_count++` at `:317`, `wakeup_io_loop` at `:318`, `Py_RETURN_NONE` at `:320`.)
+(`kitty/child-monitor.c:305-321`: `INCREF_CHILD` at `:316`, `add_queue_count++` at `:317`, `children_mutex(unlock)` at `:318`, `wakeup_io_loop` at `:319`, `Py_RETURN_NONE` at `:320`.)
 
 2. **First geometry → resize the PTY.** `Window.set_geometry` computes the PTY size, applies the de-dup guard, calls `resize_pty`, and — because the child is not yet launched — marks the terminal ready and prints `Child launched`. The **complete** method (no elision):
 
@@ -300,7 +300,7 @@ Complete `--debug-rendering` stderr:
 [0.339] Child launched
 ```
 
-This is the byte-exact format from `kitty/window.py:873`: `SIGWINCH sent to child in window: {id} with size: {current_pty_size}`, where `current_pty_size = (screen.lines, screen.columns, width_px, height_px)`. Window 1's `Child launched` precedes any command output; when window 2 is added the layout shrinks window 1 to `(11, 70, 630, 198)` and emits the `SIGWINCH sent` line; window 2's own `Child launched` follows.
+This is the byte-exact format from `kitty/window.py:873`: `SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}`, where `current_pty_size = (screen.lines, screen.columns, width_px, height_px)`. Window 1's `Child launched` precedes any command output; when window 2 is added the layout shrinks window 1 to `(11, 70, 630, 198)` and emits the `SIGWINCH sent` line; window 2's own `Child launched` follows.
 
 Corroborating `strace` (complete producing command and complete filtered output):
 
@@ -984,6 +984,21 @@ Processing global stateinput_read: 0, check_for_active_animated_images: 0[1.471]
 
 Each `loop tick wakeups_happened: 1` corresponds to one `poll()` return being serviced; the reaper runs within such a tick whenever that tick's signal-fd drain set `ss.child_died`, which is why the child-exit-to-reap gap is normally one tick.
 
+### 6.6 A platform-specific startup-timing guard: the macOS early-`SIGWINCH` delay
+
+**Direct answer.** There is exactly one *platform-specific* timing guard in the tree aimed at a `SIGWINCH` reaching a freshly-started child too early, and it is **macOS-only**: the `edit` entry point (used when editing a file inside kitty, e.g. via `kitten edit`, which `exec`s an editor such as `vim` in a kitty window) sleeps **50 ms before launching the editor**, so that the `SIGWINCH` kitty sends when it first sets the PTY size — the `ioctl(TIOCSWINSZ)` of §3, which makes the kernel signal the child's process group — does not arrive before the editor is ready to handle it. The construct is `kitty/entry_points.py:80-83`, inside `edit()` (defined at `kitty/entry_points.py:76`); every line is shown, nothing elided:
+
+```python
+    if is_macos:
+        # On macOS vim fails to handle SIGWINCH if it occurs early, so add a small delay.
+        import time
+        time.sleep(0.05)
+```
+
+Line by line: the branch is gated on `is_macos` at `kitty/entry_points.py:80`; the source comment at `:81` states the exact reason — *"On macOS vim fails to handle SIGWINCH if it occurs early, so add a small delay."*; `time.sleep(0.05)` at `:83` is the 50 ms delay; the editor is then launched by `os.execv(exe, args[1:])` at `kitty/entry_points.py:93`, i.e. the sleep is inserted immediately before the `exec`, widening the gap between the child appearing and any early resize signal reaching it.
+
+**NOT OBSERVED (inferred from source).** This branch was not exercised at runtime: the platform under test is **Linux** (§1; `uname -a` reports `x86_64 … GNU/Linux`), so `is_macos` is `False`, the branch is skipped entirely, and no delay is inserted — on Linux the editor is `exec`'d without it. It is documented here for completeness because it is the single place in the codebase where kitty *deliberately delays* to keep an early resize `SIGWINCH` from racing a child's startup, which is squarely on point for R5 (how timing affects `SIGWINCH` delivery relative to a child becoming ready). The general, cross-platform ordering that stops a child from running before its size is known is the `mark_terminal_ready` startup gate of §3.2 — which *is* observed on Linux; this macOS `sleep(0.05)` is an additional, OS-specific hardening layered on top of that gate.
+
 ---
 
 
@@ -995,13 +1010,13 @@ Each `loop tick wakeups_happened: 1` corresponds to one `poll()` return being se
 
 There are exactly three in-memory answers to "is this window/child alive?", owned by three different subsystems:
 
-1. **The Python controller view** — `Boss.window_id_map`, a **`WeakValueDictionary`** (so entries vanish automatically when a `Window` is garbage-collected), plus each tab's `WindowList`:
+1. **The Python controller view** — `Boss.window_id_map`, a **`WeakValueDictionary`** (so entries vanish automatically when a `Window` is garbage-collected), plus each tab's `WindowList` and its `WindowGroup`s:
 
    ```python
         self.window_id_map: WeakValueDictionary[int, Window] = WeakValueDictionary()
    ```
 
-   (`kitty/boss.py:344`.)
+   (`kitty/boss.py:344`.) Each tab's `WindowList` maintains its own **`WindowList.id_map`** — a plain `Dict[int, Window]` for that tab's windows, created empty in `WindowList.__init__` (`kitty/window_list.py:148`: `self.id_map: Dict[int, WindowType] = {}`), populated by `WindowList.add_window` (`kitty/window_list.py:339`: `self.id_map[window.id] = window`), and cleared by `WindowList.remove_window` (`kitty/window_list.py:380`: `self.id_map.pop(q.id, None)`). The `WindowList` also owns a list of window-groups (`kitty/window_list.py:149`: `self.groups: List[WindowGroup] = []`); each **`WindowGroup`** (`class WindowGroup` at `kitty/window_list.py:28`) holds the concrete list of windows that belong to that group in `self.windows: List[WindowType] = []` (`kitty/window_list.py:31`), and `WindowGroup.remove_window` (`kitty/window_list.py:84`) drops a window from its group during teardown. These per-tab structures are unwound by **`Tab.remove_window`** (`kitty/tabs.py:580`: `def remove_window(self, window: Window, destroy: bool = True) -> None:`), whose first action delegates to the list (`kitty/tabs.py:581`: `self.windows.remove_window(window)`), so `WindowList.remove_window` pops `id_map` and prunes the now-empty `WindowGroup` — keeping this Python view in step with the C `children[]` and GUI `global_state` views.
 2. **The C I/O-thread view** — the child-monitor's three static arrays and their mutex:
 
    ```c
