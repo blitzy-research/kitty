@@ -107,11 +107,11 @@ Because the default build uses `-pedantic-errors -Werror` (setup.py:L491) and `k
   and **every** scroll was **confirmed on the display** — `kitty @ get-text --extent=screen` showed the
   visible viewport had moved to older content after each scroll (the top visible line number dropped by
   ≥ 20,000, which streaming can never cause). The **display-confirmed** scroll latency (issue scroll →
-  externally observe the viewport moved) was **p50 ≈ 50.8–51.1 ms under load (2 runs) vs ≈ 47.6 ms idle**.
+  externally observe the viewport moved) was **p50 ≈ 50.8–51.1 ms under load (2 runs) vs ≈ 47.7 ms idle**.
   That end-to-end figure decomposes into the **non-canonical remote-control injection/round-trip overhead**
   (trigger subprocess p50 ≈ 25 ms; a no-op `get-text` round trip p50 ≈ 23–26 ms) plus the display update
   itself, which completed **within a single confirmation round-trip in every trial** (`polls_to_confirm`
-  min = median = max = 1). The **marginal** cost of the heavy load is therefore only **~3.2–3.5 ms** (loaded
+  min = median = max = 1). The **marginal** cost of the heavy load is therefore only **~3.1–3.4 ms** (loaded
   − idle), consistent with `input_delay=3` ms / `repaint_delay=10` ms. Responsiveness comes from kitty
   reading child output on a **separate `io_loop` thread** while rendering on the main thread, and from
   kitty **explicitly deprioritizing repaint when input is pending** (definition.py:L874).
@@ -1361,7 +1361,7 @@ kitty_rss_kb_during=331720
 LABEL=idle n_ok=60/60 DROP_MIN=20000
 ipc_noop_ms:  min=22.1 p50=23.3 mean=23.7 p90=25.1 max=29.8
 trigger_ms:   min=21.2 p50=23.3 mean=23.4 p90=25.0 max=26.4
-display_ms:   min=43.0 p50=47.6 mean=47.5 p90=49.9 max=50.6
+display_ms:   min=43.0 p50=47.7 mean=47.5 p90=49.9 max=50.6
 polls_to_confirm: min=1 median=1.0 max=1
 display_raw_ms=48.1 48.2 49.9 49.1 48.1 49.8 47.2 47.1 50.2 48.4 44.5 49.1 46.9 49.0 46.5 49.4 44.7 46.9 46.0 49.9 48.3 48.3 47.9 45.1 44.9 47.4 47.8 43.0 48.9 45.5 44.9 46.2 48.5 46.4 45.9 48.4 47.1 46.7 48.4 50.0 46.4 50.6 47.8 45.8 47.4 46.3 49.6 46.1 47.5 47.6 45.9 47.6 48.4 47.7 49.9 48.0 46.6 49.3 47.9 44.9
 CASE_T2 idle done
@@ -1386,15 +1386,15 @@ completes within a single round-trip - i.e. **well under 25 ms**, consistent wit
 batching cadence (definition.py:L866).
 
 **The observable sign of prioritization: a tiny, bounded load penalty.** Comparing the loaded runs to the
-idle baseline (`display_ms` p50 **47.6 ms**) isolates the marginal cost of heavy output:
+idle baseline (`display_ms` p50 **47.7 ms**) isolates the marginal cost of heavy output:
 
 | Run | `display_ms` p50 (ms) | vs idle (ms) |
 |-----|----------------------:|-------------:|
-| Idle (no streaming) | 47.6 | - |
-| Loaded run 1 | 50.8 | **+3.2** |
-| Loaded run 2 | 51.1 | **+3.5** |
+| Idle (no streaming) | 47.7 | - |
+| Loaded run 1 | 50.8 | **+3.1** |
+| Loaded run 2 | 51.1 | **+3.4** |
 
-The scroll path pays only **~3.2-3.5 ms** extra while the parser/history path is saturated at ~230k lines/s.
+The scroll path pays only **~3.1-3.4 ms** extra while the parser/history path is saturated at ~230k lines/s.
 That small, bounded penalty is the visible sign that kitty **prioritizes interactivity over throughput**, and
 its magnitude matches the documented **`input_delay = 3 ms`** (definition.py:L878) - the interval kitty waits
 before reading more child output so that input and rendering are serviced first. The two loaded runs agree to
@@ -1420,7 +1420,7 @@ and almost certainly better than, the ~50 ms upper bound measured here.
 
 **Answer to T2 (headline).** Yes - the terminal remains fully responsive while streaming at ~230k lines/s:
 every one of 120 scroll trials was display-confirmed, the marginal latency added by heavy output is only
-**~3.2-3.5 ms** (matching `input_delay = 3 ms`), and kitty's actual render completes in under one ~25 ms IPC
+**~3.1-3.4 ms** (matching `input_delay = 3 ms`), and kitty's actual render completes in under one ~25 ms IPC
 round-trip. The visible prioritization signal is precisely that small, bounded penalty - a direct consequence
 of reading child output on a separate `io_loop` thread from the main-thread renderer.
 
@@ -1786,7 +1786,7 @@ section that answers it from observed evidence.
 | 1 | "what happens to memory consumption as the history accumulates?" | T1 | Sec. 5.1-5.3 | Bounded plateau at the cap; linear ~2,273 B/line while below it (measured tables, both runs, 3 configs) |
 | 2 | "I'd like to see actual memory measurements, not just understand the theory." | T1 | Sec. 5.1-5.5 | Full `/proc` `VmRSS` lines-vs-RSS tables, before/during/after, 2 runs each; not code-reading |
 | 3 | "does the terminal remain responsive?" | T2 | Sec. 6.2-6.5 | Yes - 120/120 scrolls display-confirmed while streaming at ~230k lines/s |
-| 4 | "What latency or lag can I observe between my scroll input and the display updating?" | T2 | Sec. 6.2-6.5 | ~50 ms display-confirmed upper bound (IPC-dominated); marginal load cost only ~3.2-3.5 ms; render < one ~25 ms round-trip |
+| 4 | "What latency or lag can I observe between my scroll input and the display updating?" | T2 | Sec. 6.2-6.5 | ~50 ms display-confirmed upper bound (IPC-dominated); marginal load cost only ~3.1-3.4 ms; render < one ~25 ms round-trip |
 | 5 | "visible signs of the system prioritizing one operation over another?" | T2 | Sec. 6.5 | Yes - the bounded ~3 ms load penalty matching `input_delay=3 ms`, from `io_loop`/main-thread decoupling |
 | 6 | "At what point does the buffer's behavior change as it grows, for example, when does allocation of new storage occur" | T3 | Sec. 7.2-7.6 | At every `SEGMENT_SIZE=2,048`-line boundary, one `add_segment()` `calloc`; stops at the `ynum` cap |
 | 7 | "can I observe this happening through memory monitoring?" | T3 | Sec. 7.2 | Yes - discrete ~4,552 kB `VmRSS` steps, resolved by 20 ms `/proc` sampling |
@@ -1860,6 +1860,6 @@ after the runs, leaving the repository unchanged except for the deliverable.
 | Large/infinite: linear ~2,273 B/line, no plateau until cap | Sec. 5.2, 5.3 tables | screen.c:L100; history.c:L39 |
 | Allocation step = one 2,048-row segment ~= 4,552 kB | Sec. 7.3 boundary table; Sec. 8 binding 4,556 kB | history.c:L18,L25 |
 | 40 full boundaries + 1 partial (82,000 lines) | Sec. 7.5 | history.c:L37-39 |
-| Responsive under load; +3.2-3.5 ms marginal | Sec. 6.2-6.5 (120/120 confirmed) | child-monitor.c:L229,L291; definition.py:L878 |
+| Responsive under load; +3.1-3.4 ms marginal | Sec. 6.2-6.5 (120/120 confirmed) | child-monitor.c:L229,L291; definition.py:L878 |
 | Repository unchanged except deliverable | Sec. 10 | container /app + destination git |
 
