@@ -2,7 +2,7 @@
 
 *A runtime-verified investigation of the clipboard transport, timing, concurrency, object ownership, and races in the kitty terminal emulator.*
 
-Source branch token `kitty_815df1e210e0` — named after **base/source commit** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (the unmodified parent this read-only investigation is based on). The actual **working-tree HEAD** at which this document was authored and runtime-verified is `63970cb5bce5439c0bd9c5fefc9dd364478dd779` (see §2.1); the base commit and the destination HEAD are distinct and are kept distinct throughout.
+Source branch token `kitty_815df1e210e0` — named after **base/source commit** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (the unmodified parent this read-only investigation is based on). This document was authored and runtime-verified on branch `blitzy-e887c911-d451-47bd-84e6-41695624502a`, on a **documentation-only descendant** of that base — the content was runtime-verified at ancestor commit `63970cb5bce5439c0bd9c5fefc9dd364478dd779`, and the delivered HEAD is one or more further **doc-only** commits layered on top (see §2.1 and §11.2). The base commit and the destination HEAD are distinct and are kept distinct throughout; because finalizing this file is itself a doc-only commit, the exact destination-HEAD hash advances with each revision and is therefore **described rather than pinned** in the body (a file cannot contain the hash of the commit that writes it).
 
 ---
 
@@ -22,7 +22,7 @@ All observation was performed against a from-source build of kitty inside the de
 
 ```
 $ cat /etc/os-release | head -2
-PRETTY_NAME="Ubuntu 25.10 (Questing Quokka)"
+PRETTY_NAME="Ubuntu 25.10"
 NAME="Ubuntu"
 
 $ python3 --version         # venv at /opt/kitty-venv (source /opt/kitty-venv/bin/activate)
@@ -36,17 +36,20 @@ gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
 
 $ git rev-parse --abbrev-ref HEAD
 blitzy-e887c911-d451-47bd-84e6-41695624502a
-$ git rev-parse HEAD
-63970cb5bce5439c0bd9c5fefc9dd364478dd779
-$ git rev-parse 815df1e21   # the source/base commit that names this document
+$ git rev-parse 815df1e21              # the source/base commit that names this document
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
-$ git log --oneline -3
+$ git log --oneline -1 815df1e21       # base commit subject (immutable)
+815df1e21 Wire up applying of font config
+$ git merge-base --is-ancestor 815df1e21 HEAD && echo "base 815df1e21 is an ancestor of HEAD"
+base 815df1e21 is an ancestor of HEAD
+$ git diff --name-only 815df1e21 HEAD  # the ENTIRE base->HEAD delta is only this document
+blitzy/documentation/kitty_815df1e210e0.md
+$ git log --oneline 815df1e21..63970cb5b   # doc-only commits through the runtime-verification HEAD (immutable range)
 63970cb5b docs(blitzy): address code-review findings on clipboard-transport answer
 d922f81a9 docs(blitzy): runtime-verified answer on kitty C-core<->Python clipboard transport
-815df1e21 Wire up applying of font config
 ```
 
-> **Note on stated versions and commits.** The interpreter actually used is **Python 3.13.7** (not 3.12.3, which appears as a guess in the task's evidence base). `pyproject.toml:2` requires `>=3.8`; `go.mod:3` pins `go 1.22`; the installed Go 1.24.4 satisfies it. The destination working branch is `blitzy-e887c911-…` and its **actual HEAD is `63970cb5bce5439c0bd9c5fefc9dd364478dd779`** — the commit that adds this document. The identifier `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` is **not** the current HEAD: it is the **source/base commit** (`git log` subject *"Wire up applying of font config"*), the unmodified parent on which this investigation is based and after which the `kitty_815df1e210e0` source token — and hence this document's filename — is named. As shown by `git log` above, HEAD (`63970cb5b`) is a descendant of the base (`815df1e21`) that adds only this Markdown file; every C/Python source line cited below is byte-for-byte unchanged from the base commit (proven in §11.2).
+> **Note on stated versions and commits.** The interpreter actually used is **Python 3.13.7** (not 3.12.3, which appears as a guess in the task's evidence base). `pyproject.toml:2` requires `>=3.8`; `go.mod:3` pins `go 1.22`; the installed Go 1.24.4 satisfies it. The destination working branch is `blitzy-e887c911-…`, and the identifier `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` is the **immutable source/base commit** (`git log` subject *"Wire up applying of font config"*) — **not** the destination HEAD — the unmodified parent on which this investigation is based and after which the `kitty_815df1e210e0` source token, and hence this document's filename, is named. The destination HEAD is a **documentation-only descendant** of that base: the content was authored and runtime-verified at ancestor commit `63970cb5bce5439c0bd9c5fefc9dd364478dd779`, and the deliverable is finalized by one or more further **doc-only** commits layered on top. The exact HEAD hash is deliberately **not pinned** here — because finalizing this file is itself a doc-only commit, any literal hash would necessarily be stale (a file cannot embed the hash of the commit that writes it); instead the provenance is anchored to **immutable endpoints** in the capture above: `git merge-base --is-ancestor 815df1e21 HEAD` confirms the base is an ancestor of HEAD, and `git diff --name-only 815df1e21 HEAD` confirms the entire base→HEAD delta is exactly this one Markdown file — an invariant that holds no matter how many doc-only commits are stacked. Every C/Python source line cited below is therefore byte-for-byte unchanged from the base commit (proven in §11.2).
 
 ### 2.2 Build command and outcome
 
@@ -1091,7 +1094,7 @@ sys.getswitchinterval() = 0.005 s
 
 ## 7. SQ-5 — Expensive scrollback scan → memory management
 
-**Direct answer.** Memory has **two distinct parts**. (1) The **persistent, dominant** cost is the **C-side scrollback storage**: `HistoryBuf` holds cells in fixed **2048-line segments** (`SEGMENT_SIZE`, `kitty/history.c:15`), each segment allocated by a **single `calloc`** in `add_segment` (`kitty/history.c:18-28`) sized `xnum·2048·sizeof(CPUCell) + xnum·2048·sizeof(GPUCell) + 2048·sizeof(LineAttrs)` (`kitty/history.c:23-25`). At `xnum=80` with `sizeof(CPUCell)=12`, `sizeof(GPUCell)=20`, `sizeof(LineAttrs)=4`, that is exactly **5,251,072 bytes (~5.01 MiB) per 2048-line segment** — and the measured RSS step per segment matches that theory to a ratio of **1.00**. (2) A scan additionally materializes a **transient, owned Python object** on the Python heap (measured **~4.86 MB** for `as_text`, **~16.78 MB** for `pagerhist_as_bytes`/`pagerhist_as_text` at 60,000 lines × 80 cols); this object is freed once the kitten consumes it. The scan does not change how the C scrollback itself is managed — it **reads** the segmented C storage and **materializes a Python copy**.
+**Direct answer.** Memory has **two distinct parts**. (1) The **persistent, dominant** cost is the **C-side scrollback storage**: `HistoryBuf` holds cells in fixed **2048-line segments** (`SEGMENT_SIZE`, `kitty/history.c:15`), each segment allocated by a **single `calloc`** in `add_segment` (`kitty/history.c:18-28`) sized `xnum·2048·sizeof(CPUCell) + xnum·2048·sizeof(GPUCell) + 2048·sizeof(LineAttrs)` (`kitty/history.c:23-25`). At `xnum=80` with `sizeof(CPUCell)=12`, `sizeof(GPUCell)=20`, `sizeof(LineAttrs)=4`, that is exactly **5,251,072 bytes (~5.01 MiB) per 2048-line segment** — and the measured RSS step per segment matches that theory to a ratio of **1.00**. (2) A scan additionally materializes a **transient, owned Python object** on the Python heap (measured **~4.80 MB** for `as_text`, **~16.78 MB** for `pagerhist_as_bytes`/`pagerhist_as_text` at 60,000 lines × 80 cols); this object is freed once the kitten consumes it. The scan does not change how the C scrollback itself is managed — it **reads** the segmented C storage and **materializes a Python copy**.
 
 ### 7.1 Python object footprint of each scan (owned copies), N=2
 
@@ -1110,7 +1113,7 @@ $ ./kitty/launcher/kitty +launch /tmp/ext_probes/G_memory.py
     pagerhist_as_text  len_chars=16777216  sys.getsizeof=16777257 bytes
 ```
 
-**Reading the output.** The retained sizes are **bit-for-bit identical across both inner runs and both process runs** (deterministic): `as_text` produces a `str` of **4,860,040 bytes**, while both `pagerhist_*` scans produce **~16.78 MB** objects (the pager-history ring buffer is larger than the visible-line reconstruction here). These are the **transient** allocations a scan adds; they are dwarfed by the persistent C storage below and are released after consumption. *(Inferred from the code: `pagerhist_as_text` decodes the `bytes` result to `str`, so both representations coexist momentarily — a transient ~2× construction peak — but this is not separately measured here and is labeled inferred.)*
+**Reading the output.** The retained sizes are **bit-for-bit identical across both inner runs and both process runs** (deterministic): `as_text` produces a `str` of **4,800,040 bytes**, while both `pagerhist_*` scans produce **~16.78 MB** objects (the pager-history ring buffer is larger than the visible-line reconstruction here). These are the **transient** allocations a scan adds; they are dwarfed by the persistent C storage below and are released after consumption. *(Inferred from the code: `pagerhist_as_text` decodes the `bytes` result to `str`, so both representations coexist momentarily — a transient ~2× construction peak — but this is not separately measured here and is labeled inferred.)*
 
 ### 7.2 C-side segment growth (RSS step per 2048-line segment), N=3
 
@@ -1123,7 +1126,7 @@ $ ./kitty/launcher/kitty +launch /tmp/ext_probes/G_memory.py
   run2: base_rss=27332608 bytes; per-segment RSS deltas (bytes) = [5812224, 5255168, 5251072, 5251072, 5251072, 5251072, 5251072, 5251072]
   run3: base_rss=64798720 bytes; per-segment RSS deltas (bytes) = [5070848, 53248, 0, 0, 0, 0, 0, 5206016]
   theoretical_per_segment_bytes=5251072 (~5.01 MiB)
-  observed per-segment RSS delta: min=0 median=5251072.0 max=5251072 n=24
+  observed per-segment RSS delta: min=0 median=5251072.0 max=6631424 n=24
   median_observed/theoretical = 1.00
 ```
 
