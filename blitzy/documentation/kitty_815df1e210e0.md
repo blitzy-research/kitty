@@ -31,9 +31,10 @@ This is a **read‑only** investigation. Per the user's verbatim instruction —
 |---|---|
 | Canonical image | `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (from `ghcr.io/scaleapi/swe-atlas`) |
 | Repository checkout | `/tmp/blitzy/kitty/blitzy-616b2c75-5ea1-415a-9c80-ac1890def288_1d39c3` |
-| Implementation branch | `blitzy-616b2c75-5ea1-415a-9c80-ac1890def288` (the working branch this answer document is committed on; current HEAD `29ed48c2b`) |
+| Implementation branch | `blitzy-616b2c75-5ea1-415a-9c80-ac1890def288` (the working branch this answer document is committed on). Committing this document advances the branch HEAD, so the branch's exact commit is build‑time dependent; at the checkout used for the runtime captures below it is `47761d982` (`git rev-parse HEAD` → `47761d9822565c26996cf95ea1e1227ace4e18a6`). |
 | Source / deliverable branch | `kitty_815df1e210e0` (names the kitty source snapshot under investigation; the deliverable file is `kitty_815df1e210e0.md`) |
-| Source commit (investigated) | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (the kitty 0.35.2 snapshot; parent of the implementation-branch HEAD `29ed48c2b`) |
+| Source commit (investigated) | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (the kitty 0.35.2 snapshot under investigation). The kitty **source** is byte‑identical across the implementation‑branch commits — only this answer document differs — so every substantive runtime value below is unaffected by which of those commits is checked out. |
+| Build‑time VCS stamp | kitty bakes `KITTY_VCS_REV = git rev-parse HEAD` into the extension **at build time** (`setup.py:L674-L678`, `setup.py:L724-L726`) and shows its first 10 chars in the version banner (`kitty/cli.py:L490-L491`). A build at the investigated source commit stamps `815df1e210`; the build used for the runtime captures below (HEAD `47761d982`) stamps **`47761d9822`**. This 10‑char hash is the only reported value that tracks HEAD. |
 | kitty version | `0.35.2` (`kitty/constants.py:L25` — `version: Version = Version(0, 35, 2)`) |
 | OS | Ubuntu 25.10 (questing) |
 | Python | 3.13.7 (system) |
@@ -543,7 +544,7 @@ cat /tmp/obs/debug_config_stripped.txt
 **Complete, unedited output** (kitty's own `debug_config()`; the ANSI SGR color escapes are removed exactly as kitty itself does for its clipboard copy — `re.sub(r'\x1b.+?m', '', output)` at `kitty/boss.py:L3065`):
 
 ```
-kitty 0.35.2 (815df1e210) created by Kovid Goyal
+kitty 0.35.2 (47761d9822) created by Kovid Goyal
 Linux reverse-code-generator-a9970399-dpchg 6.6.122+ #1 SMP Thu Apr  2 09:59:00 UTC 2026 x86_64
 Ubuntu 25.10 reverse-code-generator-a9970399-dpchg /dev/tty
 
@@ -566,8 +567,10 @@ Paths:
   system shell: /bin/bash
 Loaded config overrides:
   watcher /tmp/obs/obs_watcher.py
+  confirm_os_window_close 0
 
 Config options different from defaults:
+confirm_os_window_close 0
 watcher:
 {'/tmp/obs/obs_watcher.py': '/tmp/obs/obs_watcher.py'}
 
@@ -577,7 +580,7 @@ Important environment variables seen by the kitty process:
 	LC_CTYPE                            C.UTF-8
 ```
 
-The backend line is **`Running under: X11`** — kitty's own runtime determination via `kitty.debug_config.compositor_name()`, so it reflects the backend actually selected, not an assumption. (The `watcher` entries under “Loaded config overrides” / “Config options different from defaults” are the temporary observation harness itself, removed afterward so the repository is left unchanged.)
+The backend line is **`Running under: X11`** — kitty's own runtime determination via `kitty.debug_config.compositor_name()`, so it reflects the backend actually selected, not an assumption. The two overrides shown under “Loaded config overrides” (`watcher /tmp/obs/obs_watcher.py` and `confirm_os_window_close 0`) — and, correspondingly, the two entries under “Config options different from defaults” — are exactly the two `-o` flags passed by the observation command above (`confirm_os_window_close` sorts before `watcher` there because `compare_opts()` iterates `sorted(defaults._fields)`, `kitty/debug_config.py:L73`); they are the temporary observation harness itself, removed afterward so the repository is left unchanged. The banner's `47761d9822` is the **build‑time VCS stamp** (`git rev-parse HEAD`'s first 10 chars at build time — see the *Build‑time VCS stamp* row of the environment table above and the note in part (g)); it is not a runtime‑detected value.
 
 ### GLX vs EGL vs OSMESA — mechanism and evidence
 
@@ -915,9 +918,21 @@ export DISPLAY=:99; export LIBGL_ALWAYS_SOFTWARE=1
     "cell_width": 9,
     "cell_height": 18
   },
-  "cell_size_for_window": [9, 18],
+  "cell_size_for_window": [
+    9,
+    18
+  ],
   "opengl_version_string": "'4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5",
   "compositor_name": "X11",
+  "opts.font_size": 11.0,
+  "opts.initial_window_width": [
+    640,
+    "px"
+  ],
+  "opts.initial_window_height": [
+    400,
+    "px"
+  ],
   "current_fonts": {
     "medium": "DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0",
     "bold": "DejaVuSansMono-Bold: /root/.local/share/fonts/DejaVuSansMono-Bold.ttf:0",
@@ -927,15 +942,7 @@ export DISPLAY=:99; export LIBGL_ALWAYS_SOFTWARE=1
 }
 ```
 
-This confirms scale `1.0`, DPI `96.0`, window `640 × 400` px, framebuffer `640 × 400`, and (foreshadowing part (e)) cell `9 × 18`. Kitty's resolved options corroborate the pixel unit:
-
-```
-opts.font_size = 11.0
-opts.initial_window_width = (640, 'px')
-opts.initial_window_height = (400, 'px')
-```
-
-The unit is literally `'px'`. (This corrects any description of the initial size as "cells"; on the default path it is pixels.)
+This confirms scale `1.0`, DPI `96.0`, window `640 × 400` px, framebuffer `640 × 400`, and (foreshadowing part (e)) cell `9 × 18`. The same block also records kitty's resolved options directly from `get_options()`: `"opts.font_size": 11.0`, `"opts.initial_window_width": [640, "px"]`, and `"opts.initial_window_height": [400, "px"]`. The unit is literally `px` (the second element of each `[value, unit]` pair). This corrects any description of the initial size as "cells"; on the default path it is pixels.
 
 ### HiDPI edge condition (non-1.0 scale)
 
@@ -1475,7 +1482,7 @@ Observationally, the merged debug log for a run orders these events as: the **`G
 The complete output of kitty's own `debug_config()` — the exact function kitty's built‑in `debug_config` action calls at `kitty/boss.py:L3064` — is captured in‑process by the watcher shown in **part (b)** (the command is given there). It is reproduced **complete** here (the ANSI SGR color escapes are removed exactly as kitty itself does for its clipboard copy — `re.sub(r'\x1b.+?m', '', output)` at `kitty/boss.py:L3065`):
 
 ```
-kitty 0.35.2 (815df1e210) created by Kovid Goyal
+kitty 0.35.2 (47761d9822) created by Kovid Goyal
 Linux reverse-code-generator-a9970399-dpchg 6.6.122+ #1 SMP Thu Apr  2 09:59:00 UTC 2026 x86_64
 Ubuntu 25.10 reverse-code-generator-a9970399-dpchg /dev/tty
 
@@ -1498,8 +1505,10 @@ Paths:
   system shell: /bin/bash
 Loaded config overrides:
   watcher /tmp/obs/obs_watcher.py
+  confirm_os_window_close 0
 
 Config options different from defaults:
+confirm_os_window_close 0
 watcher:
 {'/tmp/obs/obs_watcher.py': '/tmp/obs/obs_watcher.py'}
 
@@ -1509,7 +1518,7 @@ Important environment variables seen by the kitty process:
 	LC_CTYPE                            C.UTF-8
 ```
 
-The `815df1e210` in the banner is the short commit hash, matching the checkout; `Running under: X11` is kitty's own backend determination (via `kitty.debug_config.compositor_name()`); the `OpenGL:` line is the renderer. The `watcher` entries under “Loaded config overrides” / “Config options different from defaults” are the temporary observation harness itself, removed afterward so the repository is left unchanged.
+The `47761d9822` in the banner is the **build‑time VCS stamp**, not a runtime‑detected value: `setup.py`'s `get_vcs_rev()` runs `git rev-parse HEAD` at build time (`setup.py:L674-L678`) and bakes it into the extension as `KITTY_VCS_REV` (`setup.py:L724-L726`); `kitty/cli.py` prints its first 10 characters in the version banner (`kitty/cli.py:L490-L491`). It therefore reflects whichever commit is checked out **when the extension is built**. The investigated source commit is `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, whose first 10 chars are `815df1e210`; the build used for these captures was made on the implementation branch, whose HEAD (`47761d982`) is stamped as `47761d9822`. Because committing this answer document advances the branch HEAD, this hash tracks HEAD — but the kitty **source** is byte‑identical across those commits (only this document differs), so every substantive runtime value in this document is unaffected by which commit is stamped. `Running under: X11` is kitty's own backend determination (via `kitty.debug_config.compositor_name()`); the `OpenGL:` line is the renderer. The two entries under “Loaded config overrides” / “Config options different from defaults” (`watcher` and `confirm_os_window_close 0`) are exactly the two `-o` flags of the temporary observation harness, removed afterward so the repository is left unchanged.
 
 **Cause → effect (why this order).** kitty must know the **cell size before the visible window is created**, because window geometry and layout depend on cell size, which depends on DPI. It cannot query real DPI without a GL‑capable window, so it creates a *hidden temporary* window first (`kitty/glfw.c:L1198`) purely to read content scale/DPI (`L1200`), computes cell metrics once at that real DPI (`L1202`), sizes and creates the real window (`L1208`), then destroys the temp. `gl_init()` runs on the *first* window only (`L1212`) because GLAD's function pointers and the version/extension gates are process‑global — they need loading exactly once. Font descriptors are stored earlier (in `set_font_family`) but metrics are deferred to this point so they are computed at the true DPI, not a guessed one — which is precisely why the "two‑phase" premise does not hold.
 
