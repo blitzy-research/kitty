@@ -16,12 +16,12 @@ Direct proof (fresh processes, same temporary config dir; full transcript in **Q
 
 ```
 # A brand-new kitty reading the PERSISTED config resolves the chosen family:
-$ KITTY_CONFIG_DIRECTORY="$CFG" kitty --debug-font-fallback bash -c true
-[0.161]   Normal: FiraCodeRoman-Regular: /root/.local/share/fonts/FiraCode-VF.ttf:131072
+$ KITTY_CONFIG_DIRECTORY="$CFG" xvfb-run -a kitty/launcher/kitty --debug-font-fallback bash -c true
+[0.173]   Normal: FiraCodeRoman-Regular: /root/.local/share/fonts/FiraCode-VF.ttf:131072
 
 # The SAME binary with default settings (--config NONE) does NOT get Fira Code:
-$ kitty --config NONE --debug-font-fallback bash -c true
-[0.159]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
+$ xvfb-run -a kitty/launcher/kitty --config NONE --debug-font-fallback bash -c true
+[0.161]   Normal: DejaVuSansMono: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
 ```
 
 The only difference between those two fresh launches is the persisted `kitty.conf` — hence the selection is remembered across restarts.
@@ -247,13 +247,13 @@ The `kitten` binary itself is built into the launcher directory: `dest = os.path
 
 ### The kitten needs to find the `kitty` executable
 
-The kitten spawns its Python enumeration backend by executing the `kitty` binary, which it locates via `KittyExe` (a `sync.OnceValue`) [tools/utils/paths.go:L69-L86]: it first tries the exe of `$KITTY_PID`'s parent process, then the sibling `kitty` next to the running executable (`kitty/launcher/kitty`), and finally the `$KITTY_PATH_TO_KITTY_EXE` fallback [tools/utils/paths.go:L85]. When driving the kitten outside a real kitty window, exporting `KITTY_PATH_TO_KITTY_EXE=<abs>/kitty/launcher/kitty` guarantees resolution.
+The kitten spawns its Python enumeration backend by executing the `kitty` binary, which it locates via `KittyExe` (a `sync.OnceValue`) [tools/utils/paths.go:L69-L86]: it first tries the exe of the process identified by `$KITTY_PID` (the parent kitty instance the kitten runs inside), accepted only if that path is absolute and its basename is `kitty` [tools/utils/paths.go:L70-L73]; then the sibling `kitty` next to the running executable (`kitty/launcher/kitty`) [tools/utils/paths.go:L79-L81]; and finally the `$KITTY_PATH_TO_KITTY_EXE` fallback [tools/utils/paths.go:L85]. When driving the kitten outside a real kitty window, exporting `KITTY_PATH_TO_KITTY_EXE=<abs>/kitty/launcher/kitty` guarantees resolution.
 
 ### `--help` resolves (unedited)
 
 ```
 $ kitty/launcher/kitten choose-fonts --help
-Usage: kitten choose-fonts
+Usage: kitten choose-fonts 
 
 Choose the fonts used in kitty
 
@@ -414,7 +414,7 @@ Error: bogus is not a valid value for --reload-in. Valid values: parent, all, no
 
 ```
 $ kitty/launcher/kitten choose-fonts --reload-in all --help
-Usage: kitten choose-fonts
+Usage: kitten choose-fonts 
 
 Choose the fonts used in kitty
 
@@ -434,7 +434,7 @@ kitten choose-fonts 0.35.2 created by Kovid Goyal
 
 ```
 $ kitty/launcher/kitten choose-fonts --reload-in none --help
-Usage: kitten choose-fonts
+Usage: kitten choose-fonts 
 
 Choose the fonts used in kitty
 
@@ -466,7 +466,7 @@ Because `clone.Hidden = false` [kittens/choose_fonts/main.go:L97], the underscor
 
 ```
 $ kitty/launcher/kitten choose_fonts --help
-Usage: kitten choose_fonts
+Usage: kitten choose_fonts 
 
 Choose the fonts used in kitty
 
