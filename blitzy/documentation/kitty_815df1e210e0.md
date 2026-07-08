@@ -184,7 +184,7 @@ The `--ignore-compiler-warnings` flag is runtime-neutral [inferred — this is a
 
 ```
 $ ls -l kitty/launcher/kitty
--rwxr-xr-x 1 root root 40384 kitty/launcher/kitty
+-rwxr-xr-x 1 root root 40384 Jul  8 05:50 kitty/launcher/kitty
 $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
@@ -3190,7 +3190,7 @@ This section is the explicit coverage check the prompt asks for. Each row names 
 | **R1** overlapping activity: multiple tabs | (b) R1.1 | `--debug-input` shows `new_tab` action + focus moving between window ids `0x1`/`0x2` | ✅ |
 | **R1** overlapping activity: multiple **OS windows** | (b) R1.1 | `new_os_window` action line in `--debug-input`, plus `xdotool search --class kitty` listing **two** distinct X window ids | ✅ |
 | **R1** rapid focus switching | (b) R1.1 | successive `on_focus_change` lines (`window id 0x1 focused 1` → `0x2 focused 1`) | ✅ |
-| **R1** plain + modifier / alternate keys | (b) R1.2, R1.3 | legacy byte for `a`, `\x01` for Ctrl-A, and CSI-u (`ESC[97;5u`) for the same key under the Kitty Keyboard Protocol | ✅ |
+| **R1** plain + modifier / alternate keys | (b) R1.2, R1.3 | plain-text byte for `a`/`c` (`sent key as text to child`), `0x3` (ETX) for `ctrl+c`, and CSI-u `^[ [ 9 7 u` (= `ESC[97u`) for the same `a` under the Kitty Keyboard Protocol (release `^[ [ 9 7 ; 1 : 3 u`) | ✅ |
 | **R1** typing during resize & scroll (transitional) | (b) R1.4 | keys logged as `sent key as text to child` interleaved with `on_resize`/scroll activity | ✅ |
 | **R1** background output while a *different* window is focused | (b) R1.5 | emitter window streams output while `--debug-input` shows keys routed to the *focused* window's child only | ✅ |
 | **R1** key auto-repeat (held key) | (b) R1.6 | one `PRESS` followed by many `REPEAT` events for a single held key | ✅ |
