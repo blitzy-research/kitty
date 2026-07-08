@@ -62,7 +62,7 @@ The primitives exercised, and the exact code they reach:
 |-----------|---------|-----------|
 | `create_screen(cols=80, lines=24)` (via `kitty_tests.BaseTest`) | builds a real headless `Screen` | `kitty_tests/__init__.py:L237`, `L208` |
 | `parse_bytes(s, b'\x1b[>1u')` | the real VT parser → CSI-u dispatch | `kitty_tests/__init__.py:L30`; `kitty/vt-parser.c:L1217` |
-| `s.toggle_alt_screen()` | `screen_toggle_screen_buffer(self, true, true)` | `kitty/screen.c:L4449`, `L4451`, `L1068` |
+| `s.toggle_alt_screen()` | `screen_toggle_screen_buffer(self, true, true)` | `kitty/screen.c:L4449`, `L4450`, `L1068` |
 | `s.current_key_encoding_flags()` | `screen_current_key_encoding_flags` | `kitty/screen.c:L3951`, `L1204` |
 | `fdt.encode_key_for_tty(key=…, mods=…, key_encoding_flags=…)` | `pyencode_key_for_tty` → `encode_glfw_key_event` | `kitty/keys.c:L311`, `L319` |
 
@@ -665,7 +665,7 @@ So the two orders genuinely differ, but the difference is *which stack the push 
 - `L1234` — `screen_push_key_encoding_flags`; `L1235` `q = val & 0x7f`; `L1236` `sz = arraysz(...) == 8`; `L1238-1239` find top idx; **`L1241` `memmove` shift-down = silent evict-oldest**; `L1242` else set occupied bit + advance; `L1243` write new top.
 - `L1248` — `screen_pop_key_encoding_flags`; clears `num` occupied slots top-down; over-pop → all-zero → reset.
 - `L3951` — Python binding `Screen.current_key_encoding_flags()`.
-- `L4449` — Python binding `Screen.toggle_alt_screen()`; `L4451` calls `screen_toggle_screen_buffer(self, true, true)` (DECSET-1049 semantics).
+- `L4449` — Python binding `Screen.toggle_alt_screen()`; `L4450` calls `screen_toggle_screen_buffer(self, true, true)` (DECSET-1049 semantics).
 
 **VT-parser CSI-u dispatch — `kitty/vt-parser.c`:** `L1217` `case 'u'`; `L1224-1225` `?` → report; `L1229` `=` → set(0,1); `L1233` `>` → push(0) [default value 0]; `L1237` `<` → pop(1) [default number 1]; `~L1240` error.
 
@@ -677,7 +677,7 @@ So the two orders genuinely differ, but the difference is *which stack the push 
 
 **Spec — `docs/keyboard-protocol.rst`:** `L186` "1 + 0b101" for ctrl+shift (=6); `L275-282` flag bit table (1 disambiguate / 2 report-event-types / 4 report-alternate-keys / 8 report-all-keys / 16 report-associated-text); `L293-297` push `CSI > flags u` (default 0) / pop `CSI < number u` (default 1); `L299-303` separate stacks, pop-empties → reset, push-full → evict oldest; `L306-309` main/alt own independent stacks.
 
-**Harness — `kitty_tests/`:** `__init__.py:L30` `parse_bytes`; `L208` `BaseTest`; `L237` `create_screen`; `L243` `create_pty`; `L277` `class PTY` (forks a real child). `keys.py:L16` `enc = defines.encode_key_for_tty`; `L22` `csi(...)`; `L407` `Ctrl+Shift+i` @flags0 → `\x1b[105;6u` (confirms the CSI-u form); `L412` plain `a` @flags0 → `a`; `L454-455` plain `a` @flag8 → `\x1b[97u`; `L457` `Ctrl+a` @flag8 → `\x1b[97;5u`. `screen.py:L501,L503` `toggle_alt_screen()` / `parse_bytes` usage pattern.
+**Harness — `kitty_tests/`:** `__init__.py:L30` `parse_bytes`; `L208` `BaseTest`; `L237` `create_screen`; `L243` `create_pty`; `L277` `class PTY` (forks a real child). `keys.py:L16` `enc = defines.encode_key_for_tty`; `L22` `csi(...)`; `L407` `Ctrl+Shift+i` @flags0 → `\x1b[105;6u` (confirms the CSI-u form); `L412` plain `a` @flags0 → `a`; `L454-455` plain `a` @flag8 → `\x1b[97u`; `L457` `Ctrl+a` @flag8 → `\x1b[97;5u`. `screen.py:L501,L503` `toggle_alt_screen()` usage pattern (`parse_bytes` usage e.g. `screen.py:L97`).
 
 **Out-of-scope mapping stack (do not conflate) — `kitty/keys.py`:** `L67` `keyboard_mode_stack`; `L93` `pop_keyboard_mode`; `L108` `_push_keyboard_mode`.
 
