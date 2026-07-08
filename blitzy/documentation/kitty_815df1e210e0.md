@@ -16,7 +16,7 @@ Decomposed into six sub-questions, each answered explicitly below and re-checked
 - **R5** — How does timing affect signal delivery and internal bookkeeping?
 - **R6** — Are there moments where the system must resolve conflicting views of what is still alive, and how?
 
-**Methodology (how the evidence was produced).** kitty was built from source in its default configuration and driven through real window create → run → resize → close sequences via the real launcher binary. All build and runtime observation was performed **as a non-root normal user** (`ubuntu`, `uid=1000`) inside the task's Docker container against a private copy of the repository at `/home/ubuntu/kitty` (the destination repository tree on the host was never used for building and is left pristine). Behaviour was observed with kitty's own `--debug-rendering` logging, an `--extra-logging=event-loop` debug build, and external `strace` syscall tracing. Every behavioural claim below is immediately followed by the *complete, unedited* output that demonstrates it, the exact command that produced it, and a `file:line` code anchor. Statements that could not be directly observed at runtime are explicitly labelled **inferred** or **NOT OBSERVED**. All line numbers were re-verified against the source at commit `815df1e21` (see *Appendix B*), and the complete, unabridged build/test logs are reproduced in *Appendix D*.
+**Methodology (how the evidence was produced).** kitty was built from source in its default configuration and driven through real window create → run → resize → close sequences via the real launcher binary. All build and runtime observation was performed **as a non-root normal user** (`ubuntu`, `uid=1000`) inside the task's Docker container against a private copy of the repository at `/home/ubuntu/kitty` (the destination repository tree on the host was never used for building and is left pristine). Behaviour was observed with kitty's own `--debug-rendering` logging, an `--extra-logging=event-loop` debug build, and external `strace` syscall tracing. Every behavioural claim below is grounded in a `file:line` source anchor and in observed runtime output, presented next to the claim together with the command that produced it. Where a syscall trace is filtered to the relevant calls (via `strace -e trace=…`) or a high-volume log is shown as a labelled first-/last-line excerpt, that filtering is stated explicitly at the point of use; the complete, unabridged build/test logs (*Appendix D*) and the full, verbatim text of every temporary driver script (*Appendix A*) are reproduced so each run is fully reproducible. Statements that could not be directly observed at runtime are explicitly labelled **inferred** or **NOT OBSERVED**. All line numbers were re-verified against the source at commit `815df1e21` (see *Appendix B*).
 
 ---
 
@@ -417,7 +417,7 @@ All `TIOCSWINSZ` calls from the trace — exactly **three** (initial launch + A 
    **Observed thread identity.** Tracing thread `comm` names and which TID issues which syscall (producing command below), the `TIOCSWINSZ` `ioctl` is issued by the main thread (`TID==PID`, `comm=kitty`), while `wait4` reaping is issued by the I/O thread (`comm=KittyChildMon`):
 
    ```bash
-   env DISPLAY=:99 ... strace -f -tt -e trace=ioctl,wait4 -o /home/ubuntu/evidence/f5_thread.strace \
+   env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe strace -f -tt -e trace=ioctl,wait4 -o /home/ubuntu/evidence/f5_thread.strace \
      ./kitty/launcher/kitty --debug-rendering --config NONE sh -c 'exec sleep 5'
    # thread comm names read from /proc/<pid>/task/<tid>/comm
    ```
@@ -653,10 +653,10 @@ read_bytes(int fd, Screen *screen) {
 
 ### 5.5 Observed teardown scenarios (before / during / after)
 
-**Scenario 1 — ordinary close: child self-exits (`SIGCHLD`).** Command `sh -c "echo BYE_FROM_CHILD; exit 7"`. kitty sent **no** kill/SIGHUP; the child exit is reaped by the coalescing loop. Producing command and complete key `strace` lines (child TID `59796`, I/O thread TID `59795`):
+**Scenario 1 — ordinary close: child self-exits (`SIGCHLD`).** Command `sh -c "echo BYE_FROM_CHILD; exit 7"`. kitty sent **no** kill/SIGHUP; the child exit is reaped by the coalescing loop. Producing command, and the `strace` lines for the traced syscalls (the trace is filtered to `-e trace=wait4,getpgid,kill`; every line emitted for those syscalls is shown below, unedited within that filter) — child TID `59796`, I/O thread TID `59795`:
 
 ```bash
-env DISPLAY=:99 ... strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/evidence/sc1_selfexit.strace \
+env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/evidence/sc1_selfexit.strace \
   ./kitty/launcher/kitty --debug-rendering --config NONE sh -c 'echo BYE_FROM_CHILD; exit 7'
 ```
 
@@ -669,11 +669,17 @@ env DISPLAY=:99 ... strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/ev
 
 *Before:* child alive, running the command. *During:* `WIFEXITED … WEXITSTATUS == 7` — the exact exit status is captured faithfully. *After:* the follow-up `wait4` returns `ECHILD`, so the reap loop terminates; the subsequent `getpgid(59796) = -1 ESRCH` with **no** following `kill` is Guard 3 firing (see §7.2).
 
-**Scenario 2 (a.k.a. Scenario 4) — kitty-initiated close: `hangup` → `killpg(pgid, SIGHUP)`.** Command `sh -c "exec sleep 600"`, closed via RC `close-window`. Producing command and complete key `strace` lines (I/O thread `59876`, child `59877`):
+**Scenario 2 (a.k.a. Scenario 4) — kitty-initiated close: `hangup` → `killpg(pgid, SIGHUP)`.** Command `sh -c "exec sleep 600"`, closed via RC `close-window` (remote control used **only to trigger** the real close, never as a substitute for the observed mechanism). Producing commands, and the `strace` lines for the traced syscalls (filtered to `-e trace=wait4,getpgid,kill`; every line emitted for those syscalls is shown below, unedited within that filter) — I/O thread `59876`, child `59877`:
 
 ```bash
-# kitty started under: strace -f -tt -e trace=wait4,getpgid,kill -o sc4_close.strace ... sh -c 'exec sleep 600'
-# then, after ~1s:  kitty @ --to unix:$SOCK close-window --match all
+# Persistent kitty started under strace with remote control enabled (same launcher/RC pattern as Appendix A):
+SOCK=/tmp/kitty_sc4
+env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+  strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/evidence/sc4_close.strace \
+  ./kitty/launcher/kitty --debug-rendering --config NONE \
+    -o allow_remote_control=yes --listen-on "unix:${SOCK}" sh -c 'exec sleep 600' &
+# then, after ~1s, trigger the real close through the canonical RC client:
+env DISPLAY=:99 ./kitty/launcher/kitty @ --to "unix:${SOCK}" close-window --match all
 ```
 
 ```text
@@ -688,7 +694,7 @@ env DISPLAY=:99 ... strace -f -tt -e trace=wait4,getpgid,kill -o /home/ubuntu/ev
 
 *During:* the I/O thread (`59876`) issues `kill(-59877, SIGHUP)` — i.e. `killpg(pgid, SIGHUP)` from `hangup` (`kitty/child-monitor.c:1299`); the child first receives a `SIGHUP {si_code=SI_KERNEL}` (the PTY master closing in `cleanup_child`'s `safe_close`, `:1307`) and is then `killed by SIGHUP`. *After:* reaped as `WIFSIGNALED … WTERMSIG == SIGHUP`, then `ECHILD`. **Contrast with Scenario 1:** self-exit is `WIFEXITED(status)` with *no* kitty-sent signal; kitty-initiated close is `WIFSIGNALED(SIGHUP)` preceded by `kill(-pgid, SIGHUP)` — both funnel through the *same* `reap_children` `WNOHANG` loop.
 
-**Scenario 3 — resize while a child was already removed (the R6 conflicting-view race), forced at scale.** When a resize is requested for a window whose child was **already removed** from both `children[]` and `add_queue[]`, `resize_pty`'s two `FIND` lookups miss and it takes the `else` branch, emitting exactly one harmless `log_error` (`kitty/child-monitor.c:610`). This is examined in depth in §7.3–§7.4 (it is the directly-observed R6 reconciliation). Representative complete lines (first two + last of one run):
+**Scenario 3 — resize while a child was already removed (the R6 conflicting-view race), forced at scale.** When a resize is requested for a window whose child was **already removed** from both `children[]` and `add_queue[]`, `resize_pty`'s two `FIND` lookups miss and it takes the `else` branch, emitting exactly one harmless `log_error` (`kitty/child-monitor.c:610`). This is examined in depth in §7.3–§7.4 (it is the directly-observed R6 reconciliation). Below is a labelled **excerpt** — the first two and the last `Failed to send resize signal` lines of one run; each line shown is complete and unedited, and a single run emits hundreds of such lines (the full per-run counts are given in §7.3):
 
 ```text
 ### overlap_run1 — first 2 and last failed-resize lines (complete, unedited)
@@ -742,6 +748,8 @@ init_signal_handlers(LoopData *ld) {
 (`kitty/loop-utils.c:34-56`.) The mask is built first, common to both branches: `sigemptyset(&ld->signals)` at `:37` and the `for (…) sigaddset(&ld->signals, ld->handled_signals[i])` loop at `:38`. The active Linux path is the `#ifdef HAS_SIGNAL_FD` block `:40-44`: `sigprocmask(SIG_BLOCK, &ld->signals, NULL)` at `:41` blocks default delivery, and `ld->signal_read_fd = signalfd(-1, &ld->signals, SFD_NONBLOCK | SFD_CLOEXEC)` at `:42` creates the non-blocking, close-on-exec signal fd. **No `sigaction`, no `SA_RESTART`** in this branch. The inactive `#else` branch (`:46-53`) is the classic self-pipe: `self_pipe(ld->signal_fds, true)` at `:48` plus `struct sigaction act = {.sa_sigaction=handle_signal, .sa_flags=SA_SIGINFO | SA_RESTART, .sa_mask = ld->signals}` at `:51` and the `sigaction(ld->handled_signals[i], &act, NULL)` install loop at `:52`. It compiles only where `signalfd` is unavailable.
 
 **Why the child's `ERESTARTSYS` (§3.2) is not evidence of this.** The `ERESTARTSYS` seen on the child's blocking `read` in the startup-gate trace is the **kernel** restarting the child process's own interrupted syscall after the child received `SIGWINCH`; it reflects the child's default signal disposition, not any flag kitty set. kitty's parent-side path here installs no `sigaction` at all, so it cannot be the source of an `SA_RESTART` behaviour. The two are unrelated.
+
+**Why this is *not* Python's deferred signal delivery.** A Python program that wanted to react to `SIGCHLD` would normally use CPython's *deferred* signal-delivery model: a handler installed with `signal.signal(...)` does **not** run inside the low-level C signal handler but is deferred until the next bytecode/evaluation boundary, and `signal.set_wakeup_fd(fd)` is used to write a byte to `fd` so that a `select`/`poll` event loop wakes up promptly. **kitty's child monitor deliberately uses none of this.** There is no `signal.set_wakeup_fd` anywhere in the Python tree — `grep -rn set_wakeup_fd kitty/` returns **no matches** — and the child monitor installs no parent-side Python `SIGCHLD` handler. Delivery instead happens entirely in C on the I/O thread: `init_signal_handlers` **blocks** the handled set with `sigprocmask(SIG_BLOCK, …)` (`kitty/loop-utils.c:41`) and reads deliveries synchronously from the `signalfd` (`kitty/loop-utils.c:42`) that is polled alongside the child PTYs, so a `SIGCHLD` is consumed by `read_signals` → `handle_signal` (§6.2–§6.3) on the next `poll()` tick rather than by a deferred Python callback. The **only** place Python touches these signals is child-spawn bookkeeping, not the parent loop: when the I/O thread starts, `Boss.start` copies the C monitor's handled-signal numbers into a module-level Python set — `for signum in self.child_monitor.handled_signals():` / `handled_signals.add(signum)` (`kitty/boss.py:1185-1186`; the set is declared `handled_signals: Set[int] = set()` at `kitty/constants.py:263`). That set exists purely so a freshly-spawned child can **reset** those signals to their defaults before `exec`, via `clear_handled_signals` used as the `preexec_fn` (`kitty/boss.py:2416`), which runs `signal.pthread_sigmask(signal.SIG_UNBLOCK, handled_signals)` (`kitty/constants.py:271`) and then, for each signal, `signal.signal(s, signal.SIG_DFL)` (`kitty/constants.py:272-273`). So the single `signal.signal(...)` call on this path installs `SIG_DFL` **in the about-to-`exec` child** — undoing kitty's inherited blocking so the child starts with default dispositions — it is not a deferred handler running inside the kitty process. **(Labelled: grounded by source inspection plus the `set_wakeup_fd` `grep`; the absence of a parent-side Python signal handler is a code-level fact verified against the tree, not an inference about behaviour.)**
 
 The signal fd is created by `LoopData` and stored in `signal_read_fd`:
 
@@ -921,7 +929,7 @@ mark_child_for_removal(ChildMonitor *self, pid_t pid) {
 
 ```bash
 for i in $(seq 1 10); do
-  env DISPLAY=:99 ... strace -f -tt -e trace=wait4 -o /home/ubuntu/evidence/timing_$i.strace \
+  env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe strace -f -tt -e trace=wait4 -o /home/ubuntu/evidence/timing_$i.strace \
     ./kitty/launcher/kitty --debug-rendering --config NONE sh -c 'exit 0'
 done
 # gap = (first successful wait4 timestamp) - (SIGCHLD-visible timestamp), in ms
@@ -1171,7 +1179,7 @@ driver_rapid2.sh      selfexit  150  1    151             5166           5165   
 driver_rapid2.sh      selfexit  150  2    151             5282           5281                   0        0
 ```
 
-**Observed distribution (reported, not stabilised):** the "Failed to send resize signal" count is **run-to-run variable** — `overlap`: {481, 528}; `selfexit`: {5165, 5281} — so it is reported as a distribution per the methodology rule, not collapsed to a single number. The low-churn RC-close driver (`driver_rapid.sh`, N=50×2) produced **0** failed resizes: the conflict only appears under genuine overlap/self-exit churn. Representative complete failed-resize lines (first two + last of a run, unedited) — note the **`children count`** shrinking toward 0 and **`add queue: 0`** in every case:
+**Observed distribution (reported, not stabilised):** the "Failed to send resize signal" count is **run-to-run variable** — `overlap`: {481, 528}; `selfexit`: {5165, 5281} — so it is reported as a distribution per the methodology rule, not collapsed to a single number. The low-churn RC-close driver (`driver_rapid.sh`, N=50×2) produced **0** failed resizes: the conflict only appears under genuine overlap/self-exit churn. Below is a labelled **excerpt** — the first two and the last failed-resize lines of a run (each line complete and unedited; the full per-run totals are the `overlap`: {481, 528} / `selfexit`: {5165, 5281} distributions reported above) — note the **`children count`** shrinking toward 0 and **`add queue: 0`** in every case:
 
 ```text
 ### overlap_run1 — first 2 and last failed-resize lines (complete, unedited)
