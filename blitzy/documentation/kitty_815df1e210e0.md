@@ -59,10 +59,14 @@ Toolchain in the container: Python 3.12.3, Go 1.23.4, gcc 13.3.0, pkg‑config 1
 The default build is `python3 setup.py` — this is exactly what the `Makefile` `all:` target runs
 (`Makefile:L12-13` → `python3 setup.py $(VVAL)`):
 
-A cold, from‑scratch canonical build compiles the C extension (122 translation units), links it and
-the launcher, then builds the Go kittens/tools — **332 lines total**, ending in `SETUP_EXIT=0`. The
-complete, unedited 332‑line log is reproduced in the appendix (§9.6); its head and tail are shown here
-(the head includes the two `kitty/vt-parser.c` compile steps that §2.2 relies on):
+The canonical `python3 setup.py` build compiles the C extension (122 translation units), links it and
+the launcher, then builds the Go kittens/tools, ending in `SETUP_EXIT=0`. The complete, unedited log
+reproduced in the appendix (§9.6) is **332 lines**, captured with the generated Wayland
+client‑protocol sources (`glfw/wayland-*-client-protocol.[ch]`, gitignored) already present; a fully
+clean build from a pristine checkout (or after `python3 setup.py clean`) first emits an additional
+28‑step Wayland‑protocol *Generating* phase (steps `[1/28]` through `[28/28]`), for **381 lines
+total** — the C compile, link, and Go phases shown below are identical either way. Its head and tail
+are shown here (the head includes the two `kitty/vt-parser.c` compile steps that §2.2 relies on):
 
 ```
 $ cd /app                      # repository root, bind-mounted into the container
@@ -1224,9 +1228,13 @@ print('screen cells after full scenario =', repr(screen_contents(scr)))
 
 ### 9.6 Complete canonical build log (`python3 setup.py`)
 
-The complete, unedited output of a cold, from‑scratch canonical build (§2.1). It is **332 lines**:
-122 C `Compiling` steps (including the two `kitty/vt-parser.c` steps at `[10/122]`/`[11/122]`),
-5 `Linking` steps, ≈202 Go package/kitten/tool build lines, and the terminal `SETUP_EXIT=0`.
+The complete, unedited output of the canonical `python3 setup.py` build (§2.1), captured with the
+generated Wayland client‑protocol sources already present. It is **332 lines**: 122 C `Compiling`
+steps (including the two `kitty/vt-parser.c` steps at `[10/122]`/`[11/122]`), 5 `Linking` steps,
+≈202 Go package/kitten/tool build lines, and the terminal `SETUP_EXIT=0`. A fully clean build from a
+pristine checkout (or after `python3 setup.py clean`) additionally emits a 28‑step Wayland‑protocol
+*Generating* phase (`[1/28]` through `[28/28]`) before the `[1/122]` C compile step below, for **381
+lines total**; the C compile, link, and Go phases are identical either way.
 
 ```
 $ cd /app && python3 setup.py
