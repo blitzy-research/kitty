@@ -651,7 +651,7 @@ active_window columns x lines: 88 x 26
   xwininfo:   Height: 480
 
 -- non-canonical resize via remote control (labeled) --
-$ kitten @ resize-os-window --width 1000 --height 600
+$ kitten @ resize-os-window --action=os-window --width 1000 --height 600
 Error: os-window is not a valid value for --action. Valid values: resize, toggle-fullscreen, toggle-maximized
 rc=1
 ----- geometry [AFTER (after RC resize-os-window 1000x600)] -----
@@ -686,7 +686,7 @@ active_tab_id: [3]
 num_tabs: 3
 ```
 
-Reading the state transitions: **[BEFORE]** 640x400 px = 71x22 cells; **[DURING]** after `XResizeWindow 1200x700` -> 133x38 cells; then `800x480` -> 88x26 cells. The grid recomputation is a real C operation in the screen/window layer. The remote-control resize is shown twice on purpose: the first attempt (`resize-os-window --width ... --height ...` with no `--action`) produces a **genuine error** — `os-window is not a valid value for --action` — a real edge/error path, unedited; the corrected form is shown next.
+Reading the state transitions: **[BEFORE]** 640x400 px = 71x22 cells; **[DURING]** after `XResizeWindow 1200x700` -> 133x38 cells; then `800x480` -> 88x26 cells. The grid recomputation is a real C operation in the screen/window layer. The remote-control resize is shown twice on purpose: the first attempt passes an invalid action value (`resize-os-window --action=os-window --width ... --height ...`) and produces a **genuine error** — `os-window is not a valid value for --action` — because `os-window` is not one of the accepted `--action` choices (`kitty/rc/resize_os_window.py:31` `default=resize`, `:32` `choices=resize,toggle-fullscreen,toggle-maximized`), so the command is rejected with `rc=1` before any resize and the window geometry is left unchanged; a real edge/error path, unedited; the corrected form is shown next. (Note: omitting `--action` entirely does **not** error — it defaults to the valid `resize` action and returns `rc=0` — which is why the invalid value must be supplied explicitly to exercise this error path.)
 
 The corrected **non-canonical (remote-control)** resize path, labelled as such, with its own before/after:
 
@@ -4668,10 +4668,10 @@ start address 0x0000000000000000
 ===== symbol table summary =====
 defined text (T/t): 1032
 dynamic symbols (nm -D): 391
-total ELF symtab entries (readelf -s .symtab): 1714
+total ELF symtab entries (readelf -s .symtab): 2605
 ```
 
-There are **1032 defined text symbols**. The complete per-subsystem symbol lists (each is the full `nm` grep for that subsystem, not a sample) prove where each responsibility lives:
+There are **1032 defined text symbols**. Of the three summary counts, the **1032** defined-text (`T`/`t`) and **391** dynamic (`nm -D`) figures are toolchain-stable and reproduce exactly across rebuilds; the **total ELF symtab** figure is **build-dependent** — it additionally counts local/temporary symbols whose number varies with the compiler and LTO version, so it is not a fixed constant across toolchains (this canonical `gcc 15.2.0` build reports **2605** via `readelf -s kitty/fast_data_types.so | grep "Symbol table '.symtab'"`; a different toolchain will report a different total). The complete per-subsystem symbol lists (each is the full `nm` grep for that subsystem, not a sample) prove where each responsibility lives:
 
 **VT/escape parser (`kitty/vt-parser.c`)** — note `csi_parse_loop`, `do_parse`, `_parse_sgr`, and the SIMD `utf8_decode_to_esc_{128,256,scalar}` seen live in §9.1-9.2:
 
