@@ -604,7 +604,7 @@ Both runs sustain **~7.8k-8.1k truecolor-SGR lines/second (~23-24 MB/s)** — th
 
 ### 3.5 What the system is actually doing during the load
 
-Each byte written by the child is read by kitty's C I/O thread (`KittyChildMon`, running `io_loop`, `kitty/child-monitor.c`), handed to the C escape-sequence parser (`do_parse` -> `csi_parse_loop` / `_parse_sgr`, `kitty/vt-parser.c`), which updates the C screen model (`kitty/screen.c`) and evicts old lines into (and out of) the disk-backed scrollback; the main thread then submits GPU draw calls (`draw_cells`, `kitty/shaders.c`) via the GL binding in `glfw-x11.so`. §6 shows the CPU cost of exactly these threads, and §9 catches these exact C functions live on the stack. The remote-control thread (`KittyPeerMon`) stays completely idle throughout (0.00 CPU-seconds, §6) — proof the load flows through the PTY, not the control interface.
+Each byte written by the child is read by kitty's C I/O thread (`KittyChildMon`, running `io_loop`, `kitty/child-monitor.c`), handed to the C escape-sequence parse driver (`do_parse`, `kitty/child-monitor.c:438`), which invokes the CSI/SGR parsers (`csi_parse_loop` / `_parse_sgr`, `kitty/vt-parser.c`) via `self->parse_func`; those parsers update the C screen model (`kitty/screen.c`) and evict old lines into (and out of) the disk-backed scrollback; the main thread then submits GPU draw calls (`draw_cells`, `kitty/shaders.c`) via the GL binding in `glfw-x11.so`. §6 shows the CPU cost of exactly these threads, and §9 catches these exact C functions live on the stack. The remote-control thread (`KittyPeerMon`) stays completely idle throughout (0.00 CPU-seconds, §6) — proof the load flows through the PTY, not the control interface.
 
 ## 4. Sub-question 1 (continued) — Repeated window resizes and tab switching
 
@@ -2111,6 +2111,7 @@ sample kitty/icat Go symbols:
 Read straight from the evidence, with no embellishment:
 
 - `kitten` is a **Go** binary — `go version -m` reports `go1.22.12`, module `kitty`, entry package `kitty/tools/cmd`, with the full Go dependency set (chroma, gopsutil, imaging, xxh3, uuid, ...). `go.mod` declares `module kitty` (`go.mod:1`) and `go 1.22` (`go.mod:3`). `kitten --version` prints `kitten 0.35.2`.
+- The `vcs.revision` / `-X kitty.VCSRevision=...` value shown in the `go version -m` block above is a **build-time VCS stamp, and is therefore build-dependent** (exactly like the `.symtab` total discussed in §9.4). `setup.py` derives it by running `git rev-parse HEAD` at build time (`get_vcs_rev()`, `setup.py:674`/`:678`) and injects it into the Go link step as `-X kitty.VCSRevision={vcs_rev}` (`setup.py:1149`/`:1151`); the token therefore records whichever commit was `HEAD` when the binary was compiled. The value captured here, `797063af42c146f8b4f24232b74c471dd3451aea`, is this investigation's **first** commit (short `797063af4`), which was `HEAD` at authoring time; the block's own `vcs.time=2026-07-08T05:04:59Z` and `vcs.modified=false` confirm a clean build from that commit. Because it tracks `HEAD`, it **changes with every subsequent commit or rebuild**: a binary rebuilt after the later documentation commits (`fcd2a0101`, then `5bbc495ca`) re-stamps `vcs.revision` to that newer `HEAD`, so `go version -m` on such a rebuild reports the newer hash even though the command itself reproduces identically (only this one build-time token drifts). Every toolchain-stable claim below is unaffected: Go `go1.22.12`, module `kitty`, entry package `kitty/tools/cmd`, `CGO_ENABLED=1`, the `-s -w` strip, and the `CGO_ENABLED=0` static-vs-dynamic contrast all reproduce exactly.
 - It is a **dynamically linked** ELF executable (`file` says so; `INTERP` = `/lib64/ld-linux-x86-64.so.2`), and its **only** external shared library is `libc.so.6` (`readelf -d` NEEDED = `libc.so.6`; `ldd` shows just `libc` + `linux-vdso` + the loader).
 - That single dynamic dependency exists **solely because of cgo**: `go version -m` shows `CGO_ENABLED=1` (kitty enables cgo for `gopsutil`). To prove the linkage is cgo-caused and not intrinsic, the same entry package was rebuilt with cgo disabled, to `/tmp` (repo untouched):
 
@@ -4673,7 +4674,7 @@ total ELF symtab entries (readelf -s .symtab): 2605
 
 There are **1032 defined text symbols**. Of the three summary counts, the **1032** defined-text (`T`/`t`) and **391** dynamic (`nm -D`) figures are toolchain-stable and reproduce exactly across rebuilds; the **total ELF symtab** figure is **build-dependent** — it additionally counts local/temporary symbols whose number varies with the compiler and LTO version, so it is not a fixed constant across toolchains (this canonical `gcc 15.2.0` build reports **2605** via `readelf -s kitty/fast_data_types.so | grep "Symbol table '.symtab'"`; a different toolchain will report a different total). The complete per-subsystem symbol lists (each is the full `nm` grep for that subsystem, not a sample) prove where each responsibility lives:
 
-**VT/escape parser (`kitty/vt-parser.c`)** — note `csi_parse_loop`, `do_parse`, `_parse_sgr`, and the SIMD `utf8_decode_to_esc_{128,256,scalar}` seen live in §9.1-9.2:
+**VT/escape parser (`kitty/vt-parser.c`)** — note `csi_parse_loop`, `_parse_sgr`, and the SIMD `utf8_decode_to_esc_{128,256,scalar}` seen live in §9.1-9.2; this functional group also lists `do_parse`, which is the parse *driver* defined in `kitty/child-monitor.c:438` (it invokes these `vt-parser.c` parsers via `self->parse_func`), not a `vt-parser.c` function itself:
 
 ```text
 00000000000c1d00 t _parse_sgr.isra.0
@@ -5045,7 +5046,7 @@ The observed split is therefore: **performance-critical, GPU/SIMD-bound work -> 
 | Version banner (default build) | `kitty 0.35.2` | `kitty/constants.py:25` | §2.1 |
 | Canonical build command | `python3 setup.py` (fails: `wl_window.c:668 -Werror=switch`) | `setup.py:492`; `Makefile all` | §3.1 |
 | Adapted build result | `[exit status: 0]`, 85 units + Go `kitten` | `setup.py:1091,1130` | §3.2 |
-| Heavy SGR color output | ~7.8-8.1k truecolor lines/s; parsed by `do_parse` | `kitty/vt-parser.c` | §3.3-3.5, §9.1 |
+| Heavy SGR color output | ~7.8-8.1k truecolor lines/s; parsed by `do_parse` driver -> `csi_parse_loop`/`_parse_sgr` | `kitty/child-monitor.c:438`; `kitty/vt-parser.c` | §3.3-3.5, §9.1 |
 | Heavy scrollback churn | 548,899 lines (~274x the 2000-line scrollback), run 1 | — | §3.4 |
 | Repeated window resizes | 640x400=71x22 -> 1200x700=133x38 -> 800x480=88x26 (X11) | — | §4.1 |
 | Tab switching | 1 tab -> 3 tabs; active `[1]`->`[3]` | — | §4.2 |
