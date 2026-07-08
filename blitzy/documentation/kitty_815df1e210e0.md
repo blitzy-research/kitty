@@ -967,13 +967,21 @@ TERM=xterm-kitty
 TERMINFO=/tmp/blitzy/kitty/blitzy-61d9eb76-da5a-4ec8-b98b-0684d01d3069_c9f5b1/terminfo
 ```
 
-Kitty also exports process‑identity variables (`KITTY_PID` changes each run; `KITTY_WINDOW_ID`/`KITTY_INSTALLATION_DIR` are stable):
+Kitty also exports process‑identity variables. As with the terminal variables above, the child's stdout is the PTY (not Kitty's own streams), so the child writes them to a file that is then read back with `cat` on the host. Running the capture **twice** shows `KITTY_WINDOW_ID`/`KITTY_INSTALLATION_DIR` are **stable** while `KITTY_PID` **changes each run**:
 
 ```
 $ ./kitty/launcher/kitty -o close_on_child_death=yes \
-      sh -c 'env | grep -E "^KITTY_(PID|WINDOW_ID|INSTALLATION_DIR)=" | sort'
+      sh -c 'env | grep -E "^KITTY_(PID|WINDOW_ID|INSTALLATION_DIR)=" | sort > /tmp/kittytest/kitty_identity_1.txt'
+$ cat /tmp/kittytest/kitty_identity_1.txt
 KITTY_INSTALLATION_DIR=/tmp/blitzy/kitty/blitzy-61d9eb76-da5a-4ec8-b98b-0684d01d3069_c9f5b1
-KITTY_PID=83594
+KITTY_PID=224586
+KITTY_WINDOW_ID=1
+
+$ ./kitty/launcher/kitty -o close_on_child_death=yes \
+      sh -c 'env | grep -E "^KITTY_(PID|WINDOW_ID|INSTALLATION_DIR)=" | sort > /tmp/kittytest/kitty_identity_2.txt'
+$ cat /tmp/kittytest/kitty_identity_2.txt
+KITTY_INSTALLATION_DIR=/tmp/blitzy/kitty/blitzy-61d9eb76-da5a-4ec8-b98b-0684d01d3069_c9f5b1
+KITTY_PID=224662
 KITTY_WINDOW_ID=1
 ```
 
@@ -987,11 +995,12 @@ Each terminal variable, its observed value, and its source:
 | `COLORTERM` | `truecolor` | `kitty/child.py:L243` (`env['COLORTERM'] = 'truecolor'`) | advertises 24‑bit color |
 | `TERMINFO` | `<repo>/terminfo` | `kitty/child.py:L258` (`env['TERMINFO'] = tdir`) | because `opts.terminfo_type == 'path'` (`child.py:L255`; default `'path'` at `definition.py:L3256`) |
 
-Note on `KITTY_SHELL_INTEGRATION`: for a **non‑integration shell** like `sh` it is **not set at all** — it is exported only by `modify_shell_environ()` in `kitty/shell_integration.py` for supported shells (see §4.4). A direct probe confirms its absence for `sh`:
+Note on `KITTY_SHELL_INTEGRATION`: for a **non‑integration shell** like `sh` it is **not set at all** — it is exported only by `modify_shell_environ()` in `kitty/shell_integration.py` for supported shells (see §4.4). A direct probe (again writing to a file, since the child's stdout is the PTY) confirms its absence for `sh`:
 
 ```
 $ ./kitty/launcher/kitty -o close_on_child_death=yes \
-      sh -c 'if env | grep -q "^KITTY_SHELL_INTEGRATION="; then env | grep "^KITTY_SHELL_INTEGRATION="; else echo "KITTY_SHELL_INTEGRATION: (unset)"; fi'
+      sh -c 'if env | grep -q "^KITTY_SHELL_INTEGRATION="; then env | grep "^KITTY_SHELL_INTEGRATION="; else echo "KITTY_SHELL_INTEGRATION: (unset)"; fi > /tmp/kittytest/kitty_ksi.txt'
+$ cat /tmp/kittytest/kitty_ksi.txt
 KITTY_SHELL_INTEGRATION: (unset)
 ```
 
@@ -1201,14 +1210,45 @@ non_background_pixels=880
 top colors: (0, 0, 0):1023120  (221, 221, 221):103  (173, 173, 173):27  (177, 177, 177):26  (158, 158, 158):25  (193, 193, 193):25  (220, 220, 220):24  (218, 218, 218):23
 ```
 
-The two runs' full analyses (pixel counts + ASCII reconstruction) are provably identical — `diff` reports no differences and their MD5s match:
+The `analyze_fb.py` helper used above is a small, self‑contained Pillow script (created under `/tmp`, removed afterward). Its complete source is shown here so the analysis — and the hashes below — are fully reproducible:
 
 ```
+$ cat /tmp/analyze_fb.py
+#!/usr/bin/env python3
+# Framebuffer pixel analyzer: proves anti-aliased glyphs were drawn.
+# Usage: python3 analyze_fb.py <image.png>
+import sys
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+from collections import Counter
+from PIL import Image
+
+img = Image.open(sys.argv[1]).convert("RGB")
+w, h = img.size
+total = w * h
+counts = Counter(img.getdata())
+distinct = len(counts)
+# The dominant color is the background (the vast majority of pixels).
+(bg_color, bg_count) = counts.most_common(1)[0]
+non_bg = total - bg_count
+print(f"size={w}x{h} total_pixels={total}")
+print(f"distinct_colors={distinct}")
+print(f"background_color={bg_color} background_pixels={bg_count}")
+print(f"non_background_pixels={non_bg}")
+top = counts.most_common(8)
+print("top colors: " + "  ".join(f"{c}:{n}" for (c, n) in top))
+```
+
+Redirecting each run's analyzer output into a file and comparing proves the two runs are byte‑for‑byte identical — `diff` reports no differences and their MD5s match. The hash is stable across independent captures in this environment (the exact value is environment‑specific, like the pixel counts noted below):
+
+```
+$ python3 /tmp/analyze_fb.py /tmp/kittytest/kitty_fb1.png > /tmp/kittytest/fb1_analysis.txt
+$ python3 /tmp/analyze_fb.py /tmp/kittytest/kitty_fb2.png > /tmp/kittytest/fb2_analysis.txt
 $ diff /tmp/kittytest/fb1_analysis.txt /tmp/kittytest/fb2_analysis.txt && echo IDENTICAL
 IDENTICAL
 $ md5sum /tmp/kittytest/fb1_analysis.txt /tmp/kittytest/fb2_analysis.txt
-823279cec5b2a0fc8a02e220e0b5fa82  /tmp/kittytest/fb1_analysis.txt
-823279cec5b2a0fc8a02e220e0b5fa82  /tmp/kittytest/fb2_analysis.txt
+373533ae3ec746dbdec1e8d450d2002e  /tmp/kittytest/fb1_analysis.txt
+373533ae3ec746dbdec1e8d450d2002e  /tmp/kittytest/fb2_analysis.txt
 ```
 
 **What this proves (causal reasoning).** A binary black/white render would yield exactly **two** colors. The observed **144 distinct colors** — dominated by `(221,221,221)` = `#dddddd` (Kitty's default `foreground`, `kitty/options/definition.py:L1459`) surrounded by a gradient of gray values `(173,173,173)`, `(177,177,177)`, `(158,158,158)`, `(193,193,193)`, `(220,220,220)`, `(218,218,218)`, … — are exactly the partial‑coverage edge pixels produced by FreeType's anti‑aliased rasterization (`FT_RENDER_MODE_NORMAL`, `kitty/freetype.c:L904`) composited through the cell fragment shader (`kitty/cell_fragment.glsl`). The **880 non‑background pixels** are the drawn text. Both `distinct_colors=144` and `non_background_pixels=880` are **identical** across the two captures above (`diff` empty, MD5 equal), confirming stability.
