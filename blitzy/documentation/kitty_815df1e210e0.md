@@ -67,7 +67,7 @@ $ ls -la kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten
 -rwxr-xr-x 1 root root    36224 Jul  8 05:26 kitty/launcher/kitty
 ```
 
-So the canonical build exits `0` and produces the three artifacts discussed throughout: the native extension `kitty/fast_data_types.so` (≈1.21 MB), the C launcher `kitty/launcher/kitty` (≈36 KB), and the Go binary `kitty/launcher/kitten` (≈16 MB). The build transcript is progress output (`[N/28]` codegen/compile steps, then `[N/5]` link steps); the reproducible invariants are the `exit=0`, the three artifact sizes, and the ELF BuildIDs (content‑derived hashes shown in the `file` output below — observed identical across rebuilds in this environment), while the modification timestamps are inherently per‑build wall‑clock times and therefore differ run‑to‑run.
+So the canonical build exits `0` and produces the three artifacts discussed throughout: the native extension `kitty/fast_data_types.so` (≈1.21 MB), the C launcher `kitty/launcher/kitty` (≈36 KB), and the Go binary `kitty/launcher/kitten` (≈16 MB). The build transcript is progress output (`[N/28]` codegen/compile steps, then `[N/5]` link steps); the reproducible invariants are the `exit=0`, the three artifact sizes, and the ELF BuildIDs (content‑derived hashes shown in the `file` output below — observed identical across rebuilds in this environment), while the modification timestamps are inherently per‑build wall‑clock times and therefore differ run‑to‑run. The transcript's *total line count* is likewise not an invariant — the number of emitted progress lines depends on how much must actually be rebuilt (in particular, a cold Go build‑cache recompiles every Go package and emits many more progress lines than a warm one), so the **159** lines shown here reflect this environment's warm Go cache rather than a fixed count.
 
 The strictness and aggressive optimisation of the C build were captured directly (verbose rebuild of one extension source, `kitty/line.c`):
 
@@ -136,7 +136,7 @@ $ wc -l kitty/boss.py kitty/main.py kitty/entry_points.py kitty/constants.py
 
 `kitty/boss.py` (3,094 lines, the `Boss` controller) manages windows, tabs, layouts, and dispatches events — coordination work, done once per user action, not once per byte.
 
-*(A caveat on counting in a built tree: after `python3 setup.py`, the built `/built` tree reports `h=47` and 338 Go files — 80 more than the source — because the build **generates** two headers (`kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h`, taking `.h` from 45 to 47) and 80 additional Go source files (72 of them under `tools/cmd/`). The canonical **source** counts above are therefore taken from the unbuilt `/host_src`.)*
+*(A caveat on counting in a built tree: after `python3 setup.py`, the built `/built` tree reports `h=47` and 338 Go files — 80 more than the source — because the build **generates** two headers (`kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h`, taking `.h` from 45 to 47) and 80 additional Go source files (43 of them under `tools/cmd/`, which brings the built‑tree `tools/cmd/` total to 72). The canonical **source** counts above are therefore taken from the unbuilt `/host_src`.)*
 
 ## 2. Where the C↔Python boundary is (observed)
 
