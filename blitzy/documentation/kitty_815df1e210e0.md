@@ -17,7 +17,9 @@
 > **complete and unedited**; the only normalization ever applied is explicitly named
 > (e.g. `cat -v` to make an ESC byte visible as `^[`, or `cat -A` to make a trailing
 > space visible — under `cat -A` a trailing space prints as a literal space immediately
-> before the `$` end-of-line marker, e.g. `0xd $`).
+> before the `$` end-of-line marker, e.g. `0xd $`; and soft line-wrapping of the single
+> long `gcc` compile command in §2 for page width, which adds, removes, and reorders no
+> token — its duplicate `-I` paths are preserved exactly as emitted).
 
 ---
 
@@ -58,7 +60,7 @@ input travelling through three consistently-appearing stages:
    (`kitty/shaders.c:1009`) → `swap_window_buffers` (`kitty/child-monitor.c:810`). At
    runtime this manifested as the GPU pipeline initializing (`GL version string: '4.5
    (Core Profile) Mesa ...'`, `kitty/gl.c:72`), zero GL errors across all renders, and a
-   measured, reproducible **85-pixel** change in the window's framebuffer — confined to a
+   measured, reproducible **113-pixel** change in the window's framebuffer — confined to a
    single 11×18 glyph cell — the moment the typed character appeared on screen.
 
 A useful mental model that the traces confirm: **reading the child's bytes happens on a
@@ -134,7 +136,10 @@ excerpt — the complete per-condition runtime captures in §6 and §10 are show
 ```
 
 It is genuinely a *debug* build. The exact compile command recorded in
-`build/compile_commands.json` for `kitty/keys.c` (complete and unedited) is:
+`build/compile_commands.json` for `kitty/keys.c` is reproduced below **exactly as
+emitted** — including the duplicate `-I` search paths (explained in the note right after
+the block); the only normalization is soft line-wrapping for page width, which adds,
+removes, and reorders no token:
 
 ```text
 gcc -MMD -DDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall
@@ -142,10 +147,20 @@ gcc -MMD -DDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wal
 -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2
 -DKITTY_DEBUG_BUILD -fno-omit-frame-pointer -fcf-protection=full -march=native
 -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2
--I/usr/include/harfbuzz -I/usr/include/glib-2.0
+-I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2
+-I/usr/include/libpng16 -I/usr/include/glib-2.0
 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/python3.12
 -c kitty/keys.c -o build/fast_data_types-kitty-keys.c.o
 ```
+
+The three `-I/usr/include/libpng16` and two `-I/usr/include/freetype2` entries above are not
+a transcription artifact — they are emitted verbatim by the build. `setup.py` composes the
+compile flags by concatenating the `pkg-config --cflags` output of every library Kitty
+links, and several of those advertise the same system include directories: `pkg-config
+--cflags freetype2`, `fontconfig`, and `harfbuzz` each emit both `-I/usr/include/freetype2`
+and `-I/usr/include/libpng16`, and `libpng` emits `-I/usr/include/libpng16` again; the lists
+are concatenated without de-duplication, so the redundant paths survive into the final
+command. They are harmless — the compiler simply re-searches an already-searched directory.
 
 The debug flags in that command come from the **C-extension** compile path in `setup.py`,
 not the launcher: `-g3` (`setup.py:476`), `-Og` (`setup.py:479`, appended for gcc ≥ 5.0
@@ -498,16 +513,32 @@ cell — the instant a typed character appeared.
    BEFORE: dump_bytes=383 framebuffer=(1280, 800)
    AFTER:  dump_bytes=384 framebuffer=(1280, 800)
    DUMP_GREW_BY=1 byte(s)
-   PIXELS_CHANGED_before_vs_after=85
+   PIXELS_CHANGED_before_vs_after=113
    CHANGED_BBOX=x[216..226] y[2..19]  w=11 h=18
    ```
 
-   **85 pixels** changed, and *every one* of them lay inside an 11×18 bounding box — exactly
+   **113 pixels** changed, and *every one* of them lay inside an 11×18 bounding box — exactly
    one monospace glyph cell (a cross-check counting changed pixels outside that box returned
    `0`). The dump grew by exactly **1 byte** (the echoed `a`). This is the observable proof
    that the display was re-rendered as a direct result of the keypress, and it is stable:
-   the identical metric (`PIXELS_CHANGED=85`, same bounding box) was observed again in a
-   second before/after run.
+   the identical metric (`PIXELS_CHANGED=113`, `dump_bytes` 383→384, same bounding box) was
+   reproduced on **every one of six consecutive** before/after runs.
+
+   *(Why 113, and why the exact count depends on the cursor.)* `PIXELS_CHANGED` counts the
+   pixels that **differ** between the before and after frames, so it captures everything the
+   redraw touched in that cell — not just the glyph. Before the keypress the target cell is
+   **not blank**: it already holds the text cursor, which in this run renders as a **steady,
+   thin vertical bar** — an ASCII grayscale map of the region shows a 2-pixel-wide lit column
+   running the full cell height (measured in §7: region grayscale `0/37.1/204`, 36 lit
+   pixels). Pressing `a` repaints the cell: the old cursor bar is cleared, the `a` glyph is
+   drawn, and the cursor advances to the next cell — so the pixels that change span the
+   departing cursor, the new glyph, and the arriving cursor's leading edge, totalling **113**.
+   The count is therefore a function of whether the cursor is lit at the two capture instants:
+   a capture with the cell blank (cursor off or absent) collapses toward the glyph's own ~85
+   pixels; with the bar cursor present — as it consistently is here, identically across all
+   **nine** runs (six in §5's stability check plus three re-verification runs) — it is 113.
+   The single-cell 11×18 bounding box, the `+1` dump byte, and the fact of the one-cell redraw
+   are invariant either way.
 
 **Cause → effect (the render chain).** The dirty flag set by the parser (§4c) is what makes
 the next render cycle re-upload cell data instead of reusing the previous frame:
@@ -539,7 +570,7 @@ the next render cycle re-upload cell data instead of reusing the previous frame:
 > mainly adds the GL-version banner, per-call GL error checking, and frame-timeout
 > warnings). It is therefore labeled inferred-from-reading — but it is tightly bracketed by
 > runtime observations on both sides: the parser input (dumped bytes) and the observed
-> `draw a` command on one side, and the parser/render output (the exact 85-pixel framebuffer
+> `draw a` command on one side, and the parser/render output (the exact 113-pixel framebuffer
 > change confined to one glyph cell, plus zero GL errors) on the other.
 
 **Why the frame appears a few milliseconds after the byte — timing.** Kitty intentionally
@@ -699,13 +730,15 @@ Because typing changes state, the target screen cell was observed **before**, **
 and **after** a single `a` keypress, in a dedicated run (the same run that produced the
 pixel metric in §5).
 
-- **Before** — the prompt is drawn and the target cell is empty. The dump file held only
-  the 383 startup bytes. The captured framebuffer region (bounding box `x[216..226]
-  y[2..19]`) was entirely background: a grayscale readout of that region returned
-  `min/mean/max = 0/0.0/0` (all black), i.e. no glyph. Conceptually:
+- **Before** — the prompt is drawn and no character has been typed into the target cell. The
+  dump file held only the 383 startup bytes. The captured framebuffer region (bounding box
+  `x[216..226] y[2..19]`) held no glyph, but it was **not** all background: a grayscale readout
+  of that region returned `min/mean/max = 0/37.1/204` with 36 non-background pixels — the text
+  **cursor**, rendered in this run as a steady thin vertical bar (an ASCII grayscale map of the
+  region shows a 2-pixel-wide lit column running the full cell height). Conceptually:
 
   ```text
-  root@b6e195005451:/app#      (cursor after "# ", no character typed; target cell empty)
+  root@b6e195005451:/app#      (cursor after "# ", no character typed; cell shows only the cursor bar)
   ```
 
 - **During** — the `a` key is pressed. `on_key_input` takes the text branch and writes `a`
@@ -724,20 +757,23 @@ pixel metric in §5).
 
 - **After** — the render cycle re-uploads the cell and swaps the buffer; the glyph is now
   on screen. The same framebuffer region now contained glyph pixels: its grayscale readout
-  returned `min/mean/max = 0/76.2/220` with 81 non-background pixels — i.e. the `a` glyph.
+  returned `min/mean/max = 0/76.2/220` with 85 non-background pixels — the `a` glyph (plus the
+  leading edge of the cursor, now advanced one cell to the right).
 
   ```text
   root@b6e195005451:/app# a     (the "a" is now displayed, cursor advanced one cell)
   ```
 
-  A pixel comparison of the before and after framebuffers reported **exactly 85 changed
-  pixels**, *all* inside the single 11×18 glyph cell (`0` changed pixels outside it) — the
-  observable proof that the display was re-rendered as a direct result of the keypress.
+  A pixel comparison of the before and after framebuffers reported **exactly 113 changed
+  pixels**, *all* inside the single 11×18 cell-sized box (`0` changed pixels outside it) — the
+  observable proof that the display was re-rendered as a direct result of the keypress. (The
+  count is 113, not the glyph's own ~85 lit pixels, because the redraw also clears the cursor
+  bar that occupied the cell beforehand and advances the cursor; see §5.)
 
 This before → during → after transition is the concrete, observed demonstration of the
-whole pipeline: the cell is unchanged (all-black) until the echoed byte is parsed into a
-`draw a` command (setting `is_dirty`), and only after the subsequent render cycle does the
-character appear on screen (85 changed pixels in one cell).
+whole pipeline: the cell holds no glyph (only the cursor bar) until the echoed byte is parsed
+into a `draw a` command (setting `is_dirty`), and only after the subsequent render cycle does
+the character appear on screen (113 changed pixels in one cell).
 
 ---
 
@@ -859,9 +895,10 @@ $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
 
-(The complete keys.c compile command, unedited, is reproduced in §2. The `...` above appear
-only in this build-log summary, which is explicitly an excerpt of the 380-line log; every
-per-condition *runtime* capture below is shown in full.)
+(The complete keys.c compile command is reproduced verbatim in §2 — duplicate `-I` search
+paths and all, soft-wrapped only for page width. The `...` above appear only in this
+build-log summary, which is explicitly an excerpt of the 380-line log; every per-condition
+*runtime* capture below is shown in full.)
 
 ### 10.2 Launch (real GUI binary + built-in tracing flags)
 
@@ -1194,8 +1231,9 @@ The launch path that reaches the `on_key_input` → parser → render machinery 
   into exactly three non-elision categories: (1) **verbatim build output** — `setup.py`
   itself prints each progress line as `Compiling <file> ...` with a literal ellipsis, so the
   §2 and §10.1 progress lines reproduce that character-for-character; (2) the §10.1
-  **abbreviated compile command** (`gcc … -g3 -Og …`), which is reproduced in full,
-  unedited, in §2; and (3) **inline source/prose notation** — function-signature shorthand
+  **abbreviated compile command** (`gcc … -g3 -Og …`), which is reproduced in full in §2 —
+  verbatim including its duplicate `-I` search paths, soft-wrapped only for page width; and
+  (3) **inline source/prose notation** — function-signature shorthand
   (e.g. `encode_glfw_key_event(...)`, `run_worker(...)`), quoted C-source fragments (e.g. the
   `kitty/shaders.c:418` guard), ANSI-escape shorthand (`^[[35m...^[[m`), and short prose
   pointers to trace lines that are themselves reproduced complete elsewhere (e.g. `Modifier
@@ -1209,7 +1247,7 @@ The launch path that reaches the `on_key_input` → parser → render machinery 
   `draw a` command in the `--dump-bytes` command stream, §4c); only the interior C
   assignment `is_dirty = true` behind `draw a`, and the interior render chain, are labeled
   *(inferred from reading)*, and both are bracketed by observed endpoints (dumped bytes /
-  `draw a` on one side, the exact 85-pixel one-cell framebuffer change on the other).
+  `draw a` on one side, the exact 113-pixel one-cell framebuffer change on the other).
 - **Read-only + cleanup.** No Kitty source file was modified. All tracing used Kitty's own
   built-in flags; all helper scripts, the trace log, the `--dump-bytes` file, and the
   before/after screenshots lived outside the repository (or were deleted), leaving the
