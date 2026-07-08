@@ -240,9 +240,9 @@ verbatim (no `{kitty_pid}` munging — see §3.4).
 
 `expand_listen_on()` (`kitty/main.py:325-343`) only rewrites the address when it comes from the
 config file (`from_config_file=True`, set in `setup_environment`, `kitty/main.py:403-409`). It
-(a) appends `-{kitty_pid}` to a slash-less `unix:` spec lacking the placeholder
+(a) appends `-{kitty_pid}` to any config-file `unix:` spec lacking the placeholder
 (`kitty/main.py:329-330`), (b) substitutes `{kitty_pid}` with `str(os.getpid())`
-(`kitty/main.py:331`), and (c) resolves a bare name into `tempfile.gettempdir()`
+(`kitty/main.py:331`), and (c) resolves a relative (non-absolute) name into `tempfile.gettempdir()`
 (`kitty/main.py:337-339`).
 
 Throwaway config `/tmp/obs_kitty.conf` containing `listen_on unix:mykitty`, launched with
@@ -261,6 +261,13 @@ All three transforms are visible: the bare name `mykitty` was resolved into `/tm
 and `-{kitty_pid}` was appended and substituted with the process PID. The base path
 (`/tmp/mykitty-`) is **stable**; the PID suffix **varies per run and equals `KITTY_PID`**
 (= `os.getpid()`, `kitty/main.py:331`). `boss.listening_on` reflects this resolved spec.
+
+An absolute config-file path takes the same suffix: transform (a) is **not** limited to slash-less
+names. Launching the real launcher with a config `listen_on unix:/tmp/abs_probe` created the socket
+at `/tmp/abs_probe-{kitty_pid}` (observed `/tmp/abs_probe-1032` then `/tmp/abs_probe-1198` across two
+runs). Only transform (c)'s temp-dir resolution is gated on a relative name
+(`not os.path.isabs(path)`, `kitty/main.py:337`) — an absolute path skips (c) but still receives the
+(a) suffix.
 
 For TCP, a `:0` port is turned into an OS-assigned port (`kitty/main.py:340-342`, rewritten back in
 `kitty/boss.py:184-188`):
@@ -462,7 +469,7 @@ added by the tracer).
 ### 6.1 Socket transport (driven by `kitten @ ls --to unix:/tmp/test`)
 
 ```
-[  0.212] TRACE boss.peer_message_received     peer_id=1 is_rc=True msg=b'\x1bP@kitty-cmd{"cmd":"ls","version":[0,26,0],"payl'
+[  0.212] TRACE boss.peer_message_received     peer_id=1 is_rc=True msg=b'\x1bP@kitty-cmd{"cmd":"ls","version":[0,26,0],"payload":{}}\x1b\\'
 [  0.212] TRACE boss._handle_remote_command    peer_id=1 window=None cmd=b'{"cmd":"ls","version":[0,26,0],"payload":{}}'
 [  0.212] TRACE remote_control.parse_cmd       serialized=b'{"cmd":"ls","version":[0,26,0],"payload":{}}'
 [  0.212] TRACE boss._execute_remote_command   cmd=ls peer_id=1
