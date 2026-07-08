@@ -19,18 +19,18 @@
 
 ## Table of Contents
 
-- [§0. Environment, Build & Invocation](#0-environment-build--invocation)
-- [§1. Q1 — Where input first enters (ingestion / entry point)](#1-q1--where-input-first-enters-ingestion--entry-point)
-- [§2. Q2 — The "unseen conductor" (threads, `poll()` ordering, coalescing)](#2-q2--the-unseen-conductor-threads-poll-ordering-coalescing)
-- [§3. Q3 — Keeping shell-integration hints aligned (VT parser, OSC 133, pending mode)](#3-q3--keeping-shell-integration-hints-aligned-vt-parser-osc-133-pending-mode)
-- [§4. Q4 — Backpressure & unstable remote (application-level flow control vs. XON/XOFF)](#4-q4--backpressure--unstable-remote-application-level-flow-control-vs-xonxoff)
-- [§5. Q5 — Full end-to-end settle (concurrent keystrokes + paste + resize → quiescence)](#5-q5--full-end-to-end-settle-concurrent-keystrokes--paste--resize--quiescence)
-- [§6. Canonical timing / magnitude values (observed, multi-run stability)](#6-canonical-timing--magnitude-values-observed-multi-run-stability)
+- [§0. Environment, Build and Invocation](#0-environment-build-and-invocation)
+- [§1. Q1: Where input first enters (ingestion, entry point)](#1-q1-where-input-first-enters-ingestion-entry-point)
+- [§2. Q2: The "unseen conductor" (threads, `poll()` ordering, coalescing)](#2-q2-the-unseen-conductor-threads-poll-ordering-coalescing)
+- [§3. Q3: Keeping shell-integration hints aligned (VT parser, OSC 133, pending mode)](#3-q3-keeping-shell-integration-hints-aligned-vt-parser-osc-133-pending-mode)
+- [§4. Q4: Backpressure and unstable remote (application-level flow control vs. XON/XOFF)](#4-q4-backpressure-and-unstable-remote-application-level-flow-control-vs-xonxoff)
+- [§5. Q5: Full end-to-end settle (concurrent keystrokes, paste, resize to quiescence)](#5-q5-full-end-to-end-settle-concurrent-keystrokes-paste-resize-to-quiescence)
+- [§6. Canonical timing and magnitude values (observed, multi-run stability)](#6-canonical-timing-and-magnitude-values-observed-multi-run-stability)
 - [§7. Coverage pass](#7-coverage-pass)
 
 ---
 
-## 0. Environment, Build & Invocation
+## 0. Environment, Build and Invocation
 
 ### 0.1 Container and toolchain actually used
 
@@ -145,7 +145,7 @@ the GLFW → `keys.c`/`mouse.c` path is exercised end-to-end.
 
 ---
 
-## 1. Q1 — Where input first enters (ingestion / entry point)
+## 1. Q1: Where input first enters (ingestion, entry point)
 
 > *"When the terminal sends a surge of raw input, especially if a session is being paused and then
 > resumed, how does that stream become something the application can react to, and where does it first
@@ -163,7 +163,7 @@ the parser buffer is full, the I/O thread stops asking to read; when space frees
 ### 1.2 The entry point, observed
 
 The AAP/checkpoint names this entry point as the `read()` inside `read_bytes()` at
-`[kitty/child-monitor.c:L1337-L1356; read() at L1346]`. That is exactly the function and span exercised
+`[kitty/child-monitor.c:L1337-L1356; read() at L1345; error guard at L1346]`. That is exactly the function and span exercised
 below. Reading the pinned source at commit `815df1e210e0` confirms the citation: `read_bytes()` opens at
 **L1337** and its closing brace is at **L1356**, so the whole span is `[L1337-L1356]`; within that span the
 `read()` syscall statement is on **L1345** and the immediately-following `if (len < 0)` guard is on
@@ -462,7 +462,7 @@ rather than a storm of tiny per-byte events, and it is the exact place where the
 ---
 
 
-## 2. Q2 — The "unseen conductor" (threads, `poll()` ordering, coalescing)
+## 2. Q2: The "unseen conductor" (threads, `poll()` ordering, coalescing)
 
 > *"…an unseen conductor managing timing, ordering, and state handoffs, so how are those
 > responsibilities split up, and what decides which event gets handled first?"*
@@ -708,335 +708,474 @@ with open("/tmp/kitty_obs/pacer_emitted.txt", "w") as f:
     f.write("PACER_EMITTED_LINES=%d DURATION_S=%.3f\n" % (NLINES, dt))
 ```
 
-Command (identical for both runs):
+Command (identical for every run; shown here for run *N*, N ∈ 1..5):
 
 ```
-setsid ./kitty/launcher/kitty --config NONE \
-  sh -c "python3 /tmp/kitty_obs/pacer.py 50000 200 0.0008; sleep 1.2" > q2_surge_runN.log 2>&1 &
-grep -aE "loop tick, wakeups_happened|pollForEvents final timeout" q2_surge_runN.log
+timeout 60 setsid ./kitty/launcher/kitty --config NONE \
+  sh -c "python3 /tmp/kitty_obs/pacer.py 50000 200 0.0008; sleep 1.2" > /tmp/kitty_obs/q2_surge_runN.log 2>&1
+grep -aE "loop tick, wakeups_happened|pollForEvents final timeout" /tmp/kitty_obs/q2_surge_runN.log
 ```
 
-Both runs confirm the emitter wrote the full 50 000 lines:
+All five runs confirm the emitter wrote the full 50 000 lines:
 
 ```
-RUN 1: PACER_EMITTED_LINES=50000 DURATION_S=0.753
-RUN 2: PACER_EMITTED_LINES=50000 DURATION_S=0.691
+RUN 1: PACER_EMITTED_LINES=50000 DURATION_S=0.625
+RUN 2: PACER_EMITTED_LINES=50000 DURATION_S=0.625
+RUN 3: PACER_EMITTED_LINES=50000 DURATION_S=0.629
+RUN 4: PACER_EMITTED_LINES=50000 DURATION_S=0.554
+RUN 5: PACER_EMITTED_LINES=50000 DURATION_S=0.512
 ```
 
-**The decisive magnitude:** 50 000 lines produced only **~66 wakeup-bearing main-loop ticks**, not 50 000.
-Complete wakeup distributions (computed from the complete raw output shown below — every tick line is
-accounted for):
+**The reproducible mechanism (stable across all five runs).** The 50 000-line burst is compressed into only a
+few hundred wakeup-bearing main-loop ticks — never one tick per line. The decisive invariant is that **no
+tick ever carries more than one wakeup** (observed `max wakeups_happened per tick = 1` in every one of the five
+runs): the I/O-thread `WAKEUP` gate only wakes the main loop once per `input_delay` window
+`[kitty/child-monitor.c:L1562-L1570]` (the source comment there — "we only wakeup the main loop after
+input_delay as wakeup is an expensive operation" — is the rationale), and `drain_wakeup_fd`
+`[glfw/backend_utils.c:L218]` folds whatever wakeups arrive into the single boolean `eld->wakeup_data_read`
+that `[glfw/main_loop.h:L31]` logs as `wakeups_happened`. Two further values are stable in every run: the
+**surge inter-tick cadence has a median of 3.0 ms** (= `input_delay`, default `3` at
+`[kitty/options/definition.py:L878]`), because `poll()` returns early each time the I/O thread posts a wakeup;
+and the loop **snaps back to the ~0.5 s idle cadence** the instant the surge stops.
+
+**The absolute tick count is environment-sensitive `[N]` and must not be read as canonical.** How many ticks
+50 000 lines coalesce into depends on how many flush-chunks land inside each 3 ms `input_delay` window, which
+in turn depends on emitter speed, CPU, and OS scheduling — so it varies both run-to-run and across machines.
+The distribution actually observed in this container (headless Xvfb + llvmpipe software GL, instrumented
+`make debug-event-loop` build), computed from the complete raw logs of all five runs, was:
 
 ```
-RUN 1 (70 ticks total):   3 × wakeups_happened: 0     67 × wakeups_happened: 1
-RUN 2 (68 ticks total):   3 × wakeups_happened: 0     65 × wakeups_happened: 1
+run  total_ticks  wakeups_happened:0  wakeups_happened:1  max/tick   surge gap ms (median/mean/min/max)   ratio
+  1      198              83                  115             1            3.0 / 3.3 / 0 / 39             253:1
+  2      197              81                  116             1            3.0 / 3.3 / 0 / 33             254:1
+  3      195              80                  115             1            3.0 / 3.3 / 0 / 43             256:1
+  4      165              63                  102             1            3.0 / 3.5 / 0 / 41             303:1
+  5      152              61                   91             1            3.0 / 3.5 / 0 / 66             329:1
 ```
 
-That is a coalescing ratio of roughly **750 : 1** (50 000 lines ÷ ~66 wakeup ticks), stable in shape across
-both runs (both ~66–67 wakeup ticks; both exactly 3 idle `wakeups_happened: 0` ticks — one startup render
-plus two after the surge ends). The tick **cadence** (from the timestamps below) is also stable across runs:
-during the surge the median inter-tick gap is **5.0 ms in both runs** (mean 11.4 ms run 1 / 10.8 ms run 2;
-min 0 ms, max 37 ms run 1 / 49 ms run 2) — i.e. `input_delay` (3 ms) plus the parse+render time — whereas the
-idle gaps before/after the surge are ~0.5 s. The `pollForEvents final timeout` values are **not** the driver:
-they are the wait until the nearest ~0.5 s housekeeping timer, counting steadily down across successive
-ticks (the full `0.4xx → 0.0xx` sequence is visible verbatim in the complete raw output below) while
-`poll()` keeps returning **early** (~5 ms) each time the I/O thread posts a wakeup; the timeout resets to
-~0.495 the moment the surge stops and the loop goes idle.
+That is a coalescing ratio in the **hundreds-to-one** range (≈ 253:1 – 329:1 here; ~50 000 lines ÷ 152–198
+ticks) — the burst is folded by two to three orders of magnitude. The **shape** is stable across runs (every
+run shows the same `max = 1` invariant, the same 3.0 ms surge median, and the same idle snap-back) while the
+**exact counts differ**: total ticks ranged 152–198 across these five runs; an independent QA rerun of the
+identical script observed 186 and 198 ticks (median gap 3 ms); and a faster reference environment previously
+produced as few as ~70 ticks. Because of that spread, the counts are reported as an observed range, not a
+single canonical figure. Note also that `wakeups_happened: 0` ticks are **not** confined to idle: 61–83 of
+them occur here interleaved *throughout* the surge, each time the loop wakes on the poll timeout or a
+housekeeping/render timer rather than on an I/O wakeup — so a small fixed "idle-only" wakeup0 count is not a
+stable property. The `pollForEvents final timeout` values are not the driver: they count down toward the
+nearest ~0.5 s housekeeping timer while `poll()` keeps returning early (~3 ms) on each I/O wakeup, then reset
+to ~0.497 the moment the surge stops and the loop goes idle.
 
-Complete, unedited event-loop output — **RUN 1** (140 lines):
+Complete, unedited event-loop output — **RUN 1** (198 ticks, 396 filtered lines; the representative run whose
+row is cited above), captured by the exact command shown above and filtered to the two event-loop log lines
+with `grep -aE "loop tick, wakeups_happened|pollForEvents final timeout"`:
 
 ```
-[0.167] pollForEvents final timeout: 0.000
-[0.182] --------- loop tick, wakeups_happened: 1 ----------
-[0.182] pollForEvents final timeout: 0.000
-[0.182] --------- loop tick, wakeups_happened: 0 ----------
-[0.182] pollForEvents final timeout: 0.002
-[0.184] --------- loop tick, wakeups_happened: 1 ----------
-[0.190] pollForEvents final timeout: 0.483
-[0.190] --------- loop tick, wakeups_happened: 1 ----------
-[0.196] pollForEvents final timeout: 0.477
-[0.196] --------- loop tick, wakeups_happened: 1 ----------
-[0.202] pollForEvents final timeout: 0.471
-[0.202] --------- loop tick, wakeups_happened: 1 ----------
-[0.224] pollForEvents final timeout: 0.465
-[0.224] --------- loop tick, wakeups_happened: 1 ----------
-[0.229] pollForEvents final timeout: 0.443
-[0.229] --------- loop tick, wakeups_happened: 1 ----------
-[0.234] pollForEvents final timeout: 0.438
+[0.159] pollForEvents final timeout: 0.000
+[0.171] --------- loop tick, wakeups_happened: 1 ----------
+[0.171] pollForEvents final timeout: 0.000
+[0.171] --------- loop tick, wakeups_happened: 0 ----------
+[0.171] pollForEvents final timeout: 0.488
+[0.173] --------- loop tick, wakeups_happened: 1 ----------
+[0.173] pollForEvents final timeout: 0.003
+[0.180] --------- loop tick, wakeups_happened: 1 ----------
+[0.180] pollForEvents final timeout: 0.001
+[0.185] --------- loop tick, wakeups_happened: 0 ----------
+[0.185] pollForEvents final timeout: 0.478
+[0.185] --------- loop tick, wakeups_happened: 1 ----------
+[0.185] pollForEvents final timeout: 0.001
+[0.185] --------- loop tick, wakeups_happened: 1 ----------
+[0.185] pollForEvents final timeout: 0.000
+[0.189] --------- loop tick, wakeups_happened: 0 ----------
+[0.189] pollForEvents final timeout: 0.473
+[0.189] --------- loop tick, wakeups_happened: 1 ----------
+[0.189] pollForEvents final timeout: 0.000
+[0.193] --------- loop tick, wakeups_happened: 0 ----------
+[0.193] pollForEvents final timeout: 0.469
+[0.193] --------- loop tick, wakeups_happened: 1 ----------
+[0.193] pollForEvents final timeout: 0.001
+[0.197] --------- loop tick, wakeups_happened: 0 ----------
+[0.197] pollForEvents final timeout: 0.465
+[0.197] --------- loop tick, wakeups_happened: 1 ----------
+[0.197] pollForEvents final timeout: 0.000
+[0.200] --------- loop tick, wakeups_happened: 0 ----------
+[0.200] pollForEvents final timeout: 0.462
+[0.200] --------- loop tick, wakeups_happened: 1 ----------
+[0.200] pollForEvents final timeout: 0.000
+[0.200] --------- loop tick, wakeups_happened: 1 ----------
+[0.200] pollForEvents final timeout: 0.000
+[0.203] --------- loop tick, wakeups_happened: 0 ----------
+[0.203] pollForEvents final timeout: 0.459
+[0.203] --------- loop tick, wakeups_happened: 1 ----------
+[0.203] pollForEvents final timeout: 0.000
+[0.207] --------- loop tick, wakeups_happened: 0 ----------
+[0.207] pollForEvents final timeout: 0.455
+[0.207] --------- loop tick, wakeups_happened: 1 ----------
+[0.207] pollForEvents final timeout: 0.000
+[0.210] --------- loop tick, wakeups_happened: 0 ----------
+[0.210] pollForEvents final timeout: 0.452
+[0.210] --------- loop tick, wakeups_happened: 1 ----------
+[0.210] pollForEvents final timeout: 0.000
+[0.213] --------- loop tick, wakeups_happened: 0 ----------
+[0.213] pollForEvents final timeout: 0.449
+[0.213] --------- loop tick, wakeups_happened: 1 ----------
+[0.213] pollForEvents final timeout: 0.001
+[0.217] --------- loop tick, wakeups_happened: 0 ----------
+[0.217] pollForEvents final timeout: 0.445
+[0.217] --------- loop tick, wakeups_happened: 1 ----------
+[0.217] pollForEvents final timeout: 0.001
+[0.221] --------- loop tick, wakeups_happened: 0 ----------
+[0.221] pollForEvents final timeout: 0.441
+[0.221] --------- loop tick, wakeups_happened: 1 ----------
+[0.221] pollForEvents final timeout: 0.001
+[0.230] --------- loop tick, wakeups_happened: 0 ----------
+[0.230] pollForEvents final timeout: 0.438
+[0.230] --------- loop tick, wakeups_happened: 1 ----------
+[0.234] pollForEvents final timeout: 0.429
 [0.234] --------- loop tick, wakeups_happened: 1 ----------
-[0.239] pollForEvents final timeout: 0.433
-[0.239] --------- loop tick, wakeups_happened: 1 ----------
-[0.272] pollForEvents final timeout: 0.428
-[0.272] --------- loop tick, wakeups_happened: 1 ----------
-[0.277] pollForEvents final timeout: 0.395
-[0.277] --------- loop tick, wakeups_happened: 1 ----------
-[0.282] pollForEvents final timeout: 0.390
-[0.282] --------- loop tick, wakeups_happened: 1 ----------
-[0.287] pollForEvents final timeout: 0.385
-[0.287] --------- loop tick, wakeups_happened: 1 ----------
-[0.292] pollForEvents final timeout: 0.380
+[0.234] pollForEvents final timeout: 0.000
+[0.242] --------- loop tick, wakeups_happened: 0 ----------
+[0.242] pollForEvents final timeout: 0.425
+[0.242] --------- loop tick, wakeups_happened: 1 ----------
+[0.245] pollForEvents final timeout: 0.417
+[0.245] --------- loop tick, wakeups_happened: 1 ----------
+[0.245] pollForEvents final timeout: 0.001
+[0.281] --------- loop tick, wakeups_happened: 0 ----------
+[0.281] pollForEvents final timeout: 0.413
+[0.281] --------- loop tick, wakeups_happened: 1 ----------
+[0.281] pollForEvents final timeout: 0.000
+[0.285] --------- loop tick, wakeups_happened: 0 ----------
+[0.285] pollForEvents final timeout: 0.378
+[0.285] --------- loop tick, wakeups_happened: 1 ----------
+[0.288] pollForEvents final timeout: 0.374
+[0.288] --------- loop tick, wakeups_happened: 1 ----------
+[0.288] pollForEvents final timeout: 0.000
+[0.292] --------- loop tick, wakeups_happened: 0 ----------
+[0.292] pollForEvents final timeout: 0.370
 [0.292] --------- loop tick, wakeups_happened: 1 ----------
-[0.324] pollForEvents final timeout: 0.375
-[0.324] --------- loop tick, wakeups_happened: 1 ----------
-[0.329] pollForEvents final timeout: 0.343
-[0.329] --------- loop tick, wakeups_happened: 1 ----------
-[0.334] pollForEvents final timeout: 0.338
-[0.334] --------- loop tick, wakeups_happened: 1 ----------
-[0.339] pollForEvents final timeout: 0.333
-[0.339] --------- loop tick, wakeups_happened: 1 ----------
-[0.373] pollForEvents final timeout: 0.327
-[0.373] --------- loop tick, wakeups_happened: 1 ----------
-[0.378] pollForEvents final timeout: 0.294
-[0.378] --------- loop tick, wakeups_happened: 1 ----------
-[0.383] pollForEvents final timeout: 0.289
+[0.292] pollForEvents final timeout: 0.000
+[0.295] --------- loop tick, wakeups_happened: 0 ----------
+[0.295] pollForEvents final timeout: 0.367
+[0.295] --------- loop tick, wakeups_happened: 1 ----------
+[0.295] pollForEvents final timeout: 0.000
+[0.298] --------- loop tick, wakeups_happened: 0 ----------
+[0.298] pollForEvents final timeout: 0.364
+[0.298] --------- loop tick, wakeups_happened: 1 ----------
+[0.298] pollForEvents final timeout: 0.000
+[0.301] --------- loop tick, wakeups_happened: 0 ----------
+[0.301] pollForEvents final timeout: 0.361
+[0.301] --------- loop tick, wakeups_happened: 1 ----------
+[0.301] pollForEvents final timeout: 0.000
+[0.305] --------- loop tick, wakeups_happened: 1 ----------
+[0.305] pollForEvents final timeout: 0.000
+[0.305] --------- loop tick, wakeups_happened: 1 ----------
+[0.305] pollForEvents final timeout: 0.000
+[0.309] --------- loop tick, wakeups_happened: 0 ----------
+[0.309] pollForEvents final timeout: 0.354
+[0.309] --------- loop tick, wakeups_happened: 1 ----------
+[0.309] pollForEvents final timeout: 0.000
+[0.312] --------- loop tick, wakeups_happened: 0 ----------
+[0.312] pollForEvents final timeout: 0.350
+[0.312] --------- loop tick, wakeups_happened: 1 ----------
+[0.312] pollForEvents final timeout: 0.000
+[0.315] --------- loop tick, wakeups_happened: 0 ----------
+[0.315] pollForEvents final timeout: 0.347
+[0.315] --------- loop tick, wakeups_happened: 1 ----------
+[0.315] pollForEvents final timeout: 0.001
+[0.330] --------- loop tick, wakeups_happened: 0 ----------
+[0.330] pollForEvents final timeout: 0.343
+[0.330] --------- loop tick, wakeups_happened: 1 ----------
+[0.333] pollForEvents final timeout: 0.329
+[0.333] --------- loop tick, wakeups_happened: 1 ----------
+[0.333] pollForEvents final timeout: 0.001
+[0.337] --------- loop tick, wakeups_happened: 0 ----------
+[0.337] pollForEvents final timeout: 0.325
+[0.337] --------- loop tick, wakeups_happened: 1 ----------
+[0.337] pollForEvents final timeout: 0.000
+[0.345] --------- loop tick, wakeups_happened: 0 ----------
+[0.345] pollForEvents final timeout: 0.322
+[0.345] --------- loop tick, wakeups_happened: 1 ----------
+[0.380] pollForEvents final timeout: 0.314
+[0.380] --------- loop tick, wakeups_happened: 1 ----------
+[0.380] pollForEvents final timeout: 0.001
+[0.381] --------- loop tick, wakeups_happened: 1 ----------
+[0.384] pollForEvents final timeout: 0.278
 [0.384] --------- loop tick, wakeups_happened: 1 ----------
-[0.394] pollForEvents final timeout: 0.283
-[0.394] --------- loop tick, wakeups_happened: 1 ----------
-[0.430] pollForEvents final timeout: 0.268
+[0.384] pollForEvents final timeout: 0.001
+[0.388] --------- loop tick, wakeups_happened: 0 ----------
+[0.388] pollForEvents final timeout: 0.274
+[0.388] --------- loop tick, wakeups_happened: 1 ----------
+[0.388] pollForEvents final timeout: 0.000
+[0.391] --------- loop tick, wakeups_happened: 0 ----------
+[0.391] pollForEvents final timeout: 0.271
+[0.391] --------- loop tick, wakeups_happened: 1 ----------
+[0.391] pollForEvents final timeout: 0.000
+[0.394] --------- loop tick, wakeups_happened: 0 ----------
+[0.395] pollForEvents final timeout: 0.267
+[0.395] --------- loop tick, wakeups_happened: 1 ----------
+[0.395] pollForEvents final timeout: 0.000
+[0.398] --------- loop tick, wakeups_happened: 0 ----------
+[0.398] pollForEvents final timeout: 0.264
+[0.398] --------- loop tick, wakeups_happened: 1 ----------
+[0.398] pollForEvents final timeout: 0.001
+[0.399] --------- loop tick, wakeups_happened: 1 ----------
+[0.399] pollForEvents final timeout: 0.000
+[0.402] --------- loop tick, wakeups_happened: 0 ----------
+[0.402] pollForEvents final timeout: 0.260
+[0.402] --------- loop tick, wakeups_happened: 1 ----------
+[0.402] pollForEvents final timeout: 0.000
+[0.405] --------- loop tick, wakeups_happened: 0 ----------
+[0.405] pollForEvents final timeout: 0.257
+[0.405] --------- loop tick, wakeups_happened: 1 ----------
+[0.405] pollForEvents final timeout: 0.000
+[0.409] --------- loop tick, wakeups_happened: 0 ----------
+[0.409] pollForEvents final timeout: 0.253
+[0.409] --------- loop tick, wakeups_happened: 1 ----------
+[0.409] pollForEvents final timeout: 0.000
+[0.412] --------- loop tick, wakeups_happened: 0 ----------
+[0.412] pollForEvents final timeout: 0.250
+[0.412] --------- loop tick, wakeups_happened: 1 ----------
+[0.412] pollForEvents final timeout: 0.000
+[0.415] --------- loop tick, wakeups_happened: 0 ----------
+[0.415] pollForEvents final timeout: 0.247
+[0.415] --------- loop tick, wakeups_happened: 1 ----------
+[0.415] pollForEvents final timeout: 0.001
+[0.419] --------- loop tick, wakeups_happened: 0 ----------
+[0.419] pollForEvents final timeout: 0.243
+[0.419] --------- loop tick, wakeups_happened: 1 ----------
+[0.419] pollForEvents final timeout: 0.000
+[0.430] --------- loop tick, wakeups_happened: 0 ----------
+[0.430] pollForEvents final timeout: 0.239
 [0.430] --------- loop tick, wakeups_happened: 1 ----------
-[0.441] pollForEvents final timeout: 0.237
-[0.441] --------- loop tick, wakeups_happened: 1 ----------
-[0.452] pollForEvents final timeout: 0.226
-[0.452] --------- loop tick, wakeups_happened: 1 ----------
-[0.472] pollForEvents final timeout: 0.215
-[0.472] --------- loop tick, wakeups_happened: 1 ----------
-[0.478] pollForEvents final timeout: 0.195
-[0.478] --------- loop tick, wakeups_happened: 1 ----------
-[0.488] pollForEvents final timeout: 0.189
+[0.438] pollForEvents final timeout: 0.229
+[0.438] --------- loop tick, wakeups_happened: 1 ----------
+[0.446] pollForEvents final timeout: 0.221
+[0.446] --------- loop tick, wakeups_happened: 1 ----------
+[0.480] pollForEvents final timeout: 0.213
+[0.480] --------- loop tick, wakeups_happened: 1 ----------
+[0.480] pollForEvents final timeout: 0.001
+[0.481] --------- loop tick, wakeups_happened: 1 ----------
+[0.484] pollForEvents final timeout: 0.178
+[0.484] --------- loop tick, wakeups_happened: 1 ----------
+[0.484] pollForEvents final timeout: 0.001
+[0.488] --------- loop tick, wakeups_happened: 0 ----------
+[0.488] pollForEvents final timeout: 0.174
 [0.488] --------- loop tick, wakeups_happened: 1 ----------
-[0.493] pollForEvents final timeout: 0.179
-[0.493] --------- loop tick, wakeups_happened: 1 ----------
-[0.524] pollForEvents final timeout: 0.174
-[0.524] --------- loop tick, wakeups_happened: 1 ----------
-[0.530] pollForEvents final timeout: 0.143
+[0.488] pollForEvents final timeout: 0.001
+[0.491] --------- loop tick, wakeups_happened: 0 ----------
+[0.491] pollForEvents final timeout: 0.171
+[0.491] --------- loop tick, wakeups_happened: 1 ----------
+[0.491] pollForEvents final timeout: 0.000
+[0.495] --------- loop tick, wakeups_happened: 0 ----------
+[0.495] pollForEvents final timeout: 0.167
+[0.495] --------- loop tick, wakeups_happened: 1 ----------
+[0.495] pollForEvents final timeout: 0.000
+[0.498] --------- loop tick, wakeups_happened: 0 ----------
+[0.498] pollForEvents final timeout: 0.164
+[0.498] --------- loop tick, wakeups_happened: 1 ----------
+[0.498] pollForEvents final timeout: 0.001
+[0.501] --------- loop tick, wakeups_happened: 0 ----------
+[0.501] pollForEvents final timeout: 0.161
+[0.501] --------- loop tick, wakeups_happened: 1 ----------
+[0.501] pollForEvents final timeout: 0.000
+[0.504] --------- loop tick, wakeups_happened: 0 ----------
+[0.504] pollForEvents final timeout: 0.157
+[0.504] --------- loop tick, wakeups_happened: 1 ----------
+[0.504] pollForEvents final timeout: 0.001
+[0.505] --------- loop tick, wakeups_happened: 1 ----------
+[0.505] pollForEvents final timeout: 0.001
+[0.509] --------- loop tick, wakeups_happened: 0 ----------
+[0.509] pollForEvents final timeout: 0.153
+[0.509] --------- loop tick, wakeups_happened: 1 ----------
+[0.509] pollForEvents final timeout: 0.001
+[0.512] --------- loop tick, wakeups_happened: 0 ----------
+[0.512] pollForEvents final timeout: 0.150
+[0.512] --------- loop tick, wakeups_happened: 1 ----------
+[0.512] pollForEvents final timeout: 0.000
+[0.515] --------- loop tick, wakeups_happened: 0 ----------
+[0.515] pollForEvents final timeout: 0.147
+[0.515] --------- loop tick, wakeups_happened: 1 ----------
+[0.515] pollForEvents final timeout: 0.000
+[0.518] --------- loop tick, wakeups_happened: 0 ----------
+[0.518] pollForEvents final timeout: 0.144
+[0.518] --------- loop tick, wakeups_happened: 1 ----------
+[0.518] pollForEvents final timeout: 0.001
+[0.530] --------- loop tick, wakeups_happened: 0 ----------
+[0.530] pollForEvents final timeout: 0.140
 [0.530] --------- loop tick, wakeups_happened: 1 ----------
-[0.537] pollForEvents final timeout: 0.137
-[0.537] --------- loop tick, wakeups_happened: 1 ----------
-[0.548] pollForEvents final timeout: 0.129
-[0.548] --------- loop tick, wakeups_happened: 1 ----------
-[0.553] pollForEvents final timeout: 0.119
-[0.553] --------- loop tick, wakeups_happened: 1 ----------
-[0.575] pollForEvents final timeout: 0.113
-[0.575] --------- loop tick, wakeups_happened: 1 ----------
-[0.580] pollForEvents final timeout: 0.092
-[0.580] --------- loop tick, wakeups_happened: 1 ----------
-[0.585] pollForEvents final timeout: 0.087
+[0.533] pollForEvents final timeout: 0.129
+[0.533] --------- loop tick, wakeups_happened: 1 ----------
+[0.533] pollForEvents final timeout: 0.001
+[0.536] --------- loop tick, wakeups_happened: 0 ----------
+[0.536] pollForEvents final timeout: 0.126
+[0.536] --------- loop tick, wakeups_happened: 1 ----------
+[0.536] pollForEvents final timeout: 0.001
+[0.540] --------- loop tick, wakeups_happened: 0 ----------
+[0.540] pollForEvents final timeout: 0.121
+[0.540] --------- loop tick, wakeups_happened: 1 ----------
+[0.540] pollForEvents final timeout: 0.001
+[0.579] --------- loop tick, wakeups_happened: 0 ----------
+[0.579] pollForEvents final timeout: 0.118
+[0.579] --------- loop tick, wakeups_happened: 1 ----------
+[0.582] pollForEvents final timeout: 0.080
+[0.582] --------- loop tick, wakeups_happened: 1 ----------
+[0.582] pollForEvents final timeout: 0.000
+[0.585] --------- loop tick, wakeups_happened: 0 ----------
+[0.585] pollForEvents final timeout: 0.077
 [0.585] --------- loop tick, wakeups_happened: 1 ----------
-[0.590] pollForEvents final timeout: 0.082
-[0.590] --------- loop tick, wakeups_happened: 1 ----------
-[0.627] pollForEvents final timeout: 0.077
-[0.627] --------- loop tick, wakeups_happened: 1 ----------
+[0.585] pollForEvents final timeout: 0.001
+[0.588] --------- loop tick, wakeups_happened: 0 ----------
+[0.588] pollForEvents final timeout: 0.074
+[0.588] --------- loop tick, wakeups_happened: 1 ----------
+[0.588] pollForEvents final timeout: 0.001
+[0.592] --------- loop tick, wakeups_happened: 0 ----------
+[0.592] pollForEvents final timeout: 0.070
+[0.592] --------- loop tick, wakeups_happened: 1 ----------
+[0.592] pollForEvents final timeout: 0.001
+[0.596] --------- loop tick, wakeups_happened: 1 ----------
+[0.596] pollForEvents final timeout: 0.000
+[0.596] --------- loop tick, wakeups_happened: 1 ----------
+[0.596] pollForEvents final timeout: 0.000
+[0.599] --------- loop tick, wakeups_happened: 0 ----------
+[0.599] pollForEvents final timeout: 0.063
+[0.599] --------- loop tick, wakeups_happened: 1 ----------
+[0.599] pollForEvents final timeout: 0.000
+[0.602] --------- loop tick, wakeups_happened: 0 ----------
+[0.602] pollForEvents final timeout: 0.060
+[0.602] --------- loop tick, wakeups_happened: 1 ----------
+[0.602] pollForEvents final timeout: 0.001
+[0.605] --------- loop tick, wakeups_happened: 0 ----------
+[0.605] pollForEvents final timeout: 0.056
+[0.605] --------- loop tick, wakeups_happened: 1 ----------
+[0.605] pollForEvents final timeout: 0.001
+[0.609] --------- loop tick, wakeups_happened: 0 ----------
+[0.609] pollForEvents final timeout: 0.053
+[0.609] --------- loop tick, wakeups_happened: 1 ----------
+[0.609] pollForEvents final timeout: 0.001
+[0.612] --------- loop tick, wakeups_happened: 0 ----------
+[0.612] pollForEvents final timeout: 0.050
+[0.612] --------- loop tick, wakeups_happened: 1 ----------
+[0.612] pollForEvents final timeout: 0.001
+[0.615] --------- loop tick, wakeups_happened: 0 ----------
+[0.615] pollForEvents final timeout: 0.047
+[0.615] --------- loop tick, wakeups_happened: 1 ----------
+[0.615] pollForEvents final timeout: 0.001
+[0.618] --------- loop tick, wakeups_happened: 0 ----------
+[0.618] pollForEvents final timeout: 0.043
+[0.618] --------- loop tick, wakeups_happened: 1 ----------
+[0.618] pollForEvents final timeout: 0.001
+[0.632] --------- loop tick, wakeups_happened: 0 ----------
 [0.632] pollForEvents final timeout: 0.040
 [0.632] --------- loop tick, wakeups_happened: 1 ----------
-[0.637] pollForEvents final timeout: 0.035
-[0.637] --------- loop tick, wakeups_happened: 1 ----------
-[0.642] pollForEvents final timeout: 0.030
-[0.642] --------- loop tick, wakeups_happened: 1 ----------
-[0.672] pollForEvents final timeout: 0.025
-[0.672] --------- loop tick, wakeups_happened: 1 ----------
-[0.677] pollForEvents final timeout: 0.495
-[0.677] --------- loop tick, wakeups_happened: 1 ----------
-[0.682] pollForEvents final timeout: 0.490
+[0.635] pollForEvents final timeout: 0.027
+[0.635] --------- loop tick, wakeups_happened: 1 ----------
+[0.635] pollForEvents final timeout: 0.001
+[0.636] --------- loop tick, wakeups_happened: 1 ----------
+[0.636] pollForEvents final timeout: 0.000
+[0.644] --------- loop tick, wakeups_happened: 0 ----------
+[0.644] pollForEvents final timeout: 0.023
+[0.644] --------- loop tick, wakeups_happened: 1 ----------
+[0.679] pollForEvents final timeout: 0.015
+[0.679] --------- loop tick, wakeups_happened: 1 ----------
+[0.682] pollForEvents final timeout: 0.480
 [0.682] --------- loop tick, wakeups_happened: 1 ----------
-[0.687] pollForEvents final timeout: 0.485
-[0.687] --------- loop tick, wakeups_happened: 1 ----------
-[0.692] pollForEvents final timeout: 0.480
-[0.692] --------- loop tick, wakeups_happened: 1 ----------
-[0.727] pollForEvents final timeout: 0.475
-[0.727] --------- loop tick, wakeups_happened: 1 ----------
-[0.732] pollForEvents final timeout: 0.440
-[0.732] --------- loop tick, wakeups_happened: 1 ----------
-[0.743] pollForEvents final timeout: 0.435
-[0.743] --------- loop tick, wakeups_happened: 1 ----------
-[0.772] pollForEvents final timeout: 0.424
-[0.772] --------- loop tick, wakeups_happened: 1 ----------
-[0.777] pollForEvents final timeout: 0.395
-[0.777] --------- loop tick, wakeups_happened: 1 ----------
-[0.782] pollForEvents final timeout: 0.390
-[0.782] --------- loop tick, wakeups_happened: 1 ----------
-[0.788] pollForEvents final timeout: 0.384
-[0.788] --------- loop tick, wakeups_happened: 1 ----------
-[0.798] pollForEvents final timeout: 0.379
-[0.798] --------- loop tick, wakeups_happened: 1 ----------
-[0.824] pollForEvents final timeout: 0.369
-[0.824] --------- loop tick, wakeups_happened: 1 ----------
-[0.829] pollForEvents final timeout: 0.343
-[0.829] --------- loop tick, wakeups_happened: 1 ----------
-[0.834] pollForEvents final timeout: 0.338
-[0.834] --------- loop tick, wakeups_happened: 1 ----------
-[0.839] pollForEvents final timeout: 0.333
-[0.839] --------- loop tick, wakeups_happened: 1 ----------
-[0.872] pollForEvents final timeout: 0.328
-[0.872] --------- loop tick, wakeups_happened: 1 ----------
-[0.877] pollForEvents final timeout: 0.295
-[0.877] --------- loop tick, wakeups_happened: 1 ----------
-[0.882] pollForEvents final timeout: 0.290
-[0.882] --------- loop tick, wakeups_happened: 1 ----------
-[0.887] pollForEvents final timeout: 0.285
-[0.887] --------- loop tick, wakeups_happened: 1 ----------
-[0.924] pollForEvents final timeout: 0.280
-[0.924] --------- loop tick, wakeups_happened: 1 ----------
-[0.930] pollForEvents final timeout: 0.243
-[0.930] --------- loop tick, wakeups_happened: 1 ----------
-[0.935] pollForEvents final timeout: 0.237
-[0.935] --------- loop tick, wakeups_happened: 1 ----------
-[0.939] pollForEvents final timeout: 0.232
-[1.177] --------- loop tick, wakeups_happened: 0 ----------
-[1.177] pollForEvents final timeout: 0.495
-[1.677] --------- loop tick, wakeups_happened: 0 ----------
-[1.677] pollForEvents final timeout: 0.495
-[2.140] --------- loop tick, wakeups_happened: 1 ----------
-```
-
-Complete, unedited event-loop output — **RUN 2** (136 lines):
-
-```
-[0.162] pollForEvents final timeout: 0.000
-[0.176] --------- loop tick, wakeups_happened: 1 ----------
-[0.176] pollForEvents final timeout: 0.000
-[0.176] --------- loop tick, wakeups_happened: 0 ----------
-[0.176] pollForEvents final timeout: 0.486
-[0.177] --------- loop tick, wakeups_happened: 1 ----------
-[0.177] pollForEvents final timeout: 0.003
-[0.186] --------- loop tick, wakeups_happened: 1 ----------
-[0.193] pollForEvents final timeout: 0.475
-[0.193] --------- loop tick, wakeups_happened: 1 ----------
-[0.199] pollForEvents final timeout: 0.469
-[0.199] --------- loop tick, wakeups_happened: 1 ----------
-[0.205] pollForEvents final timeout: 0.463
-[0.205] --------- loop tick, wakeups_happened: 1 ----------
-[0.210] pollForEvents final timeout: 0.456
-[0.210] --------- loop tick, wakeups_happened: 1 ----------
-[0.215] pollForEvents final timeout: 0.452
-[0.215] --------- loop tick, wakeups_happened: 1 ----------
-[0.219] pollForEvents final timeout: 0.447
-[0.219] --------- loop tick, wakeups_happened: 1 ----------
-[0.268] pollForEvents final timeout: 0.435
-[0.268] --------- loop tick, wakeups_happened: 1 ----------
-[0.275] pollForEvents final timeout: 0.393
-[0.275] --------- loop tick, wakeups_happened: 1 ----------
-[0.286] pollForEvents final timeout: 0.386
-[0.286] --------- loop tick, wakeups_happened: 1 ----------
-[0.291] pollForEvents final timeout: 0.376
-[0.291] --------- loop tick, wakeups_happened: 1 ----------
-[0.296] pollForEvents final timeout: 0.371
-[0.296] --------- loop tick, wakeups_happened: 1 ----------
-[0.301] pollForEvents final timeout: 0.366
-[0.301] --------- loop tick, wakeups_happened: 1 ----------
-[0.313] pollForEvents final timeout: 0.361
-[0.313] --------- loop tick, wakeups_happened: 1 ----------
-[0.318] pollForEvents final timeout: 0.349
-[0.318] --------- loop tick, wakeups_happened: 1 ----------
-[0.323] pollForEvents final timeout: 0.344
-[0.323] --------- loop tick, wakeups_happened: 1 ----------
-[0.365] pollForEvents final timeout: 0.339
-[0.365] --------- loop tick, wakeups_happened: 1 ----------
-[0.371] pollForEvents final timeout: 0.297
-[0.371] --------- loop tick, wakeups_happened: 1 ----------
-[0.376] pollForEvents final timeout: 0.291
-[0.376] --------- loop tick, wakeups_happened: 1 ----------
-[0.381] pollForEvents final timeout: 0.286
-[0.381] --------- loop tick, wakeups_happened: 1 ----------
-[0.386] pollForEvents final timeout: 0.281
-[0.386] --------- loop tick, wakeups_happened: 1 ----------
-[0.392] pollForEvents final timeout: 0.275
-[0.392] --------- loop tick, wakeups_happened: 1 ----------
-[0.413] pollForEvents final timeout: 0.270
-[0.413] --------- loop tick, wakeups_happened: 1 ----------
-[0.418] pollForEvents final timeout: 0.249
-[0.418] --------- loop tick, wakeups_happened: 1 ----------
-[0.461] pollForEvents final timeout: 0.244
-[0.461] --------- loop tick, wakeups_happened: 1 ----------
-[0.466] pollForEvents final timeout: 0.201
-[0.466] --------- loop tick, wakeups_happened: 1 ----------
-[0.471] pollForEvents final timeout: 0.196
-[0.471] --------- loop tick, wakeups_happened: 1 ----------
-[0.476] pollForEvents final timeout: 0.191
-[0.476] --------- loop tick, wakeups_happened: 1 ----------
-[0.480] pollForEvents final timeout: 0.186
-[0.480] --------- loop tick, wakeups_happened: 1 ----------
-[0.485] pollForEvents final timeout: 0.182
-[0.485] --------- loop tick, wakeups_happened: 1 ----------
-[0.490] pollForEvents final timeout: 0.177
-[0.490] --------- loop tick, wakeups_happened: 1 ----------
-[0.513] pollForEvents final timeout: 0.172
-[0.513] --------- loop tick, wakeups_happened: 1 ----------
-[0.518] pollForEvents final timeout: 0.149
-[0.518] --------- loop tick, wakeups_happened: 1 ----------
-[0.561] pollForEvents final timeout: 0.144
-[0.561] --------- loop tick, wakeups_happened: 1 ----------
-[0.566] pollForEvents final timeout: 0.101
-[0.566] --------- loop tick, wakeups_happened: 1 ----------
-[0.571] pollForEvents final timeout: 0.096
-[0.571] --------- loop tick, wakeups_happened: 1 ----------
-[0.576] pollForEvents final timeout: 0.091
-[0.576] --------- loop tick, wakeups_happened: 1 ----------
-[0.580] pollForEvents final timeout: 0.086
-[0.581] --------- loop tick, wakeups_happened: 1 ----------
-[0.585] pollForEvents final timeout: 0.081
-[0.585] --------- loop tick, wakeups_happened: 1 ----------
-[0.590] pollForEvents final timeout: 0.077
-[0.590] --------- loop tick, wakeups_happened: 1 ----------
-[0.613] pollForEvents final timeout: 0.072
-[0.613] --------- loop tick, wakeups_happened: 1 ----------
-[0.617] pollForEvents final timeout: 0.049
-[0.617] --------- loop tick, wakeups_happened: 1 ----------
-[0.661] pollForEvents final timeout: 0.044
-[0.661] --------- loop tick, wakeups_happened: 1 ----------
-[0.666] pollForEvents final timeout: 0.001
-[0.666] --------- loop tick, wakeups_happened: 1 ----------
-[0.671] pollForEvents final timeout: 0.496
-[0.671] --------- loop tick, wakeups_happened: 1 ----------
-[0.676] pollForEvents final timeout: 0.491
-[0.676] --------- loop tick, wakeups_happened: 1 ----------
-[0.681] pollForEvents final timeout: 0.486
-[0.681] --------- loop tick, wakeups_happened: 1 ----------
-[0.686] pollForEvents final timeout: 0.481
+[0.682] pollForEvents final timeout: 0.001
+[0.686] --------- loop tick, wakeups_happened: 0 ----------
+[0.686] pollForEvents final timeout: 0.476
 [0.686] --------- loop tick, wakeups_happened: 1 ----------
-[0.697] pollForEvents final timeout: 0.476
-[0.697] --------- loop tick, wakeups_happened: 1 ----------
-[0.713] pollForEvents final timeout: 0.465
-[0.713] --------- loop tick, wakeups_happened: 1 ----------
-[0.717] pollForEvents final timeout: 0.449
-[0.718] --------- loop tick, wakeups_happened: 1 ----------
-[0.761] pollForEvents final timeout: 0.444
-[0.761] --------- loop tick, wakeups_happened: 1 ----------
-[0.766] pollForEvents final timeout: 0.401
-[0.766] --------- loop tick, wakeups_happened: 1 ----------
-[0.770] pollForEvents final timeout: 0.396
-[0.770] --------- loop tick, wakeups_happened: 1 ----------
-[0.775] pollForEvents final timeout: 0.392
-[0.775] --------- loop tick, wakeups_happened: 1 ----------
-[0.780] pollForEvents final timeout: 0.387
+[0.686] pollForEvents final timeout: 0.000
+[0.689] --------- loop tick, wakeups_happened: 0 ----------
+[0.689] pollForEvents final timeout: 0.472
+[0.689] --------- loop tick, wakeups_happened: 1 ----------
+[0.689] pollForEvents final timeout: 0.001
+[0.690] --------- loop tick, wakeups_happened: 1 ----------
+[0.693] pollForEvents final timeout: 0.469
+[0.693] --------- loop tick, wakeups_happened: 1 ----------
+[0.693] pollForEvents final timeout: 0.000
+[0.696] --------- loop tick, wakeups_happened: 0 ----------
+[0.696] pollForEvents final timeout: 0.466
+[0.696] --------- loop tick, wakeups_happened: 1 ----------
+[0.696] pollForEvents final timeout: 0.001
+[0.699] --------- loop tick, wakeups_happened: 0 ----------
+[0.699] pollForEvents final timeout: 0.463
+[0.699] --------- loop tick, wakeups_happened: 1 ----------
+[0.699] pollForEvents final timeout: 0.000
+[0.702] --------- loop tick, wakeups_happened: 0 ----------
+[0.702] pollForEvents final timeout: 0.459
+[0.702] --------- loop tick, wakeups_happened: 1 ----------
+[0.702] pollForEvents final timeout: 0.000
+[0.706] --------- loop tick, wakeups_happened: 0 ----------
+[0.706] pollForEvents final timeout: 0.456
+[0.706] --------- loop tick, wakeups_happened: 1 ----------
+[0.706] pollForEvents final timeout: 0.001
+[0.709] --------- loop tick, wakeups_happened: 0 ----------
+[0.709] pollForEvents final timeout: 0.453
+[0.709] --------- loop tick, wakeups_happened: 1 ----------
+[0.709] pollForEvents final timeout: 0.000
+[0.712] --------- loop tick, wakeups_happened: 0 ----------
+[0.712] pollForEvents final timeout: 0.450
+[0.712] --------- loop tick, wakeups_happened: 1 ----------
+[0.712] pollForEvents final timeout: 0.000
+[0.715] --------- loop tick, wakeups_happened: 0 ----------
+[0.715] pollForEvents final timeout: 0.446
+[0.715] --------- loop tick, wakeups_happened: 1 ----------
+[0.715] pollForEvents final timeout: 0.001
+[0.730] --------- loop tick, wakeups_happened: 0 ----------
+[0.730] pollForEvents final timeout: 0.443
+[0.730] --------- loop tick, wakeups_happened: 1 ----------
+[0.733] pollForEvents final timeout: 0.429
+[0.733] --------- loop tick, wakeups_happened: 1 ----------
+[0.733] pollForEvents final timeout: 0.001
+[0.742] --------- loop tick, wakeups_happened: 0 ----------
+[0.742] pollForEvents final timeout: 0.425
+[0.742] --------- loop tick, wakeups_happened: 1 ----------
+[0.745] pollForEvents final timeout: 0.417
+[0.745] --------- loop tick, wakeups_happened: 1 ----------
+[0.745] pollForEvents final timeout: 0.001
+[0.780] --------- loop tick, wakeups_happened: 0 ----------
+[0.780] pollForEvents final timeout: 0.413
 [0.780] --------- loop tick, wakeups_happened: 1 ----------
-[0.790] pollForEvents final timeout: 0.382
+[0.780] pollForEvents final timeout: 0.001
+[0.781] --------- loop tick, wakeups_happened: 1 ----------
+[0.784] pollForEvents final timeout: 0.378
+[0.784] --------- loop tick, wakeups_happened: 1 ----------
+[0.784] pollForEvents final timeout: 0.000
+[0.787] --------- loop tick, wakeups_happened: 0 ----------
+[0.787] pollForEvents final timeout: 0.375
+[0.787] --------- loop tick, wakeups_happened: 1 ----------
+[0.787] pollForEvents final timeout: 0.001
+[0.790] --------- loop tick, wakeups_happened: 0 ----------
+[0.790] pollForEvents final timeout: 0.372
 [0.790] --------- loop tick, wakeups_happened: 1 ----------
-[0.824] pollForEvents final timeout: 0.361
-[0.824] --------- loop tick, wakeups_happened: 1 ----------
-[0.836] pollForEvents final timeout: 0.338
-[0.836] --------- loop tick, wakeups_happened: 1 ----------
-[0.861] pollForEvents final timeout: 0.326
-[0.861] --------- loop tick, wakeups_happened: 1 ----------
-[0.866] pollForEvents final timeout: 0.301
-[0.866] --------- loop tick, wakeups_happened: 1 ----------
-[0.870] pollForEvents final timeout: 0.296
-[0.870] --------- loop tick, wakeups_happened: 1 ----------
-[0.875] pollForEvents final timeout: 0.292
-[1.171] --------- loop tick, wakeups_happened: 0 ----------
-[1.171] pollForEvents final timeout: 0.495
-[1.671] --------- loop tick, wakeups_happened: 0 ----------
-[1.671] pollForEvents final timeout: 0.495
-[2.073] --------- loop tick, wakeups_happened: 1 ----------
+[0.790] pollForEvents final timeout: 0.001
+[0.794] --------- loop tick, wakeups_happened: 0 ----------
+[0.794] pollForEvents final timeout: 0.368
+[0.794] --------- loop tick, wakeups_happened: 1 ----------
+[0.794] pollForEvents final timeout: 0.000
+[0.797] --------- loop tick, wakeups_happened: 0 ----------
+[0.797] pollForEvents final timeout: 0.365
+[0.797] --------- loop tick, wakeups_happened: 1 ----------
+[0.797] pollForEvents final timeout: 0.000
+[0.800] --------- loop tick, wakeups_happened: 0 ----------
+[0.800] pollForEvents final timeout: 0.362
+[0.800] --------- loop tick, wakeups_happened: 1 ----------
+[0.800] pollForEvents final timeout: 0.001
+[0.803] --------- loop tick, wakeups_happened: 0 ----------
+[0.803] pollForEvents final timeout: 0.358
+[1.165] --------- loop tick, wakeups_happened: 0 ----------
+[1.165] pollForEvents final timeout: 0.497
+[1.665] --------- loop tick, wakeups_happened: 0 ----------
+[1.665] pollForEvents final timeout: 0.497
+[2.004] --------- loop tick, wakeups_happened: 1 ----------
 ```
 
-Reading the two runs together: the loop begins idle, transitions into a dense ~5 ms surge cadence (every
-tick `wakeups_happened: 1`) for the ~0.7 s the emitter runs, then snaps back to the ~0.5 s idle cadence
-(`wakeups_happened: 0`) the instant the surge stops (run 1: ticks at 1.177 and 1.677; run 2: 1.171 and
-1.671). The 50 000-line burst never produces more than one wakeup per tick — proving the two coalescing
-layers work exactly as the source above predicts: the I/O-thread `WAKEUP` gate `[kitty/child-monitor.c:L1562-L1570]`
-compresses per-window reads into one wakeup, and `drain_wakeup_fd` `[glfw/backend_utils.c:L217-L230]` folds
-whatever wakeups do arrive into a single boolean tick. That is why the system speeds up smoothly under load
-instead of thrashing on per-line wakeups.
+Reading the runs together: the loop begins idle, transitions into a dense ~3 ms surge cadence for the ~0.6 s
+the emitter runs (`wakeups_happened` alternating between 1 and 0 as I/O wakeups and timer/timeout wakeups
+interleave, but never exceeding 1 per tick), then snaps back to the ~0.5 s idle cadence (`wakeups_happened:
+0`) the instant the surge stops (run 1: the last surge tick is at 0.803, then idle ticks at 1.165 and 1.665).
+No run produces more than one wakeup per tick — proving the two coalescing layers work exactly as the source
+above predicts, which is why the system speeds up smoothly under load instead of thrashing on per-line
+wakeups.
 
 ### 2.7 Lifecycle: who starts and stops the conductor (`boss.py`)
 
@@ -1058,7 +1197,7 @@ speeds up smoothly under load instead of thrashing on per-byte wakeups.
 ---
 
 
-## 3. Q3 — Keeping shell-integration hints aligned (VT parser, OSC 133, pending mode)
+## 3. Q3: Keeping shell-integration hints aligned (VT parser, OSC 133, pending mode)
 
 > *"When shell integration hints arrive mixed in with ordinary text, how does the system keep screen
 > state, command context, and input meaning aligned without drifting out of sync?"*
@@ -1075,13 +1214,20 @@ pinned to exactly the row the text landed on.
 
 ### 3.2 Byte classification (one ordered pass)
 
-The parser's escape dispatch is `consume_esc` `[kitty/vt-parser.c:L260]`. The relevant transitions,
-quoted:
+The parser's escape dispatch is `consume_esc` `[kitty/vt-parser.c:L260]`. Its first-character
+`switch(ch)` selects the next parser state; the six transition cases are quoted verbatim below (the
+`case ESC_OSC` line — `ESC ]` → OSC state — is L270):
 
+```
+$ sed -n '269,274p' kitty/vt-parser.c
+```
 ```c
-case ESC_DCS: SET_STATE(DCS); break;
-case ESC_OSC: SET_STATE(OSC); break;      // L270  ESC ]  ->  OSC state
-case ESC_CSI: SET_STATE(CSI); reset_csi(&self->csi); break;
+            case ESC_DCS: SET_STATE(DCS); break;
+            case ESC_OSC: SET_STATE(OSC); break;
+            case ESC_CSI: SET_STATE(CSI); reset_csi(&self->csi); break;
+            case ESC_APC: SET_STATE(APC); break;
+            case ESC_SOS: SET_STATE(SOS); break;
+            case ESC_PM: SET_STATE(PM); break;
 ```
 
 `ESC ]` moves the parser into OSC state `[kitty/vt-parser.c:L270]`; ordinary bytes remain in the NORMAL
@@ -1551,7 +1697,7 @@ update is shown as one coherent frame rather than a flickering half-update.
 ---
 
 
-## 4. Q4 — Backpressure & unstable remote (application-level flow control vs. XON/XOFF)
+## 4. Q4: Backpressure and unstable remote (application-level flow control vs. XON/XOFF)
 
 > *"…does it behave differently when there is heavy backpressure or an unstable remote connection?"*
 
@@ -1909,7 +2055,7 @@ and as the **`EIO`**-on-read branch (§1.5) when a read is in flight at the drop
 ---
 
 
-## 5. Q5 — Full end-to-end settle (concurrent keystrokes + paste + resize → quiescence)
+## 5. Q5: Full end-to-end settle (concurrent keystrokes, paste, resize to quiescence)
 
 > *"…what really happens from the moment that mixed input arrives to the moment the interface settles
 > again, and how all those moving parts manage to keep their rhythm instead of slowly falling apart."*
@@ -2354,13 +2500,35 @@ SigBlk: 0000000000014a03   ->  {SIGHUP(1),SIGINT(2),SIGUSR1(10),SIGUSR2(12),SIGT
 Both match `#define KITTY_HANDLED_SIGNALS SIGINT, SIGHUP, SIGTERM, SIGCHLD, SIGUSR1, SIGUSR2, 0`
 `[kitty/child-monitor.c:L121]` (registered via `signalfd(-1, &ld->signals, SFD_NONBLOCK|SFD_CLOEXEC)`
 `[kitty/loop-utils.c:L42]`, installed at `[kitty/child-monitor.c:L173]`). The dispatch switch is
-`handle_signal` `[kitty/child-monitor.c:L1360-L1383]`:
+`handle_signal` `[kitty/child-monitor.c:L1361-L1383]`:
 
+```
+$ sed -n '1361,1383p' kitty/child-monitor.c
+```
 ```c
-        case SIGINT: case SIGTERM: case SIGHUP: ss->kill_signal = true;   break;   // L1365-L1368
-        case SIGCHLD:                           ss->child_died  = true;   break;   // L1370-L1371
-        case SIGUSR1:                           ss->reload_config = true; break;   // L1373-L1374
-        case SIGUSR2: log_error("Received SIGUSR2: %d\n", siginfo->si_value.sival_int); break;   // L1376
+static bool
+handle_signal(const siginfo_t *siginfo, void *data) {
+    SignalSet *ss = data;
+    switch(siginfo->si_signo) {
+        case SIGINT:
+        case SIGTERM:
+        case SIGHUP:
+            ss->kill_signal = true;
+            break;
+        case SIGCHLD:
+            ss->child_died = true;
+            break;
+        case SIGUSR1:
+            ss->reload_config = true;
+            break;
+        case SIGUSR2:
+            log_error("Received SIGUSR2: %d\n", siginfo->si_value.sival_int);
+            break;
+        default:
+            break;
+    }
+    return true;
+}
 ```
 
 **SIGUSR1 → config reload (EFFECT, observed).** With `background #112233` in the config, editing the file
@@ -2430,7 +2598,7 @@ backlog — it settles instead of "slowly falling apart."
 ---
 
 
-## 6. Canonical timing / magnitude values (observed, multi-run stability)
+## 6. Canonical timing and magnitude values (observed, multi-run stability)
 
 Each value below was read from the **canonical** build through a real entry point and confirmed stable
 across at least two runs. The timing options are compiled defaults declared in
@@ -2500,10 +2668,13 @@ declared default. The cadence timing was captured on the **NON-CANONICAL** event
 gate logic and the values themselves are canonical.
 
 **The render gate, in source.** Every main-loop tick calls `render(monotonic_t now, bool input_read)`
-`[kitty/child-monitor.c:L871]`. Its first act is the throttle gate:
+`[kitty/child-monitor.c:L870-L878]` (the function's return type `static void` is L870; the signature is
+L871). Its first act is the throttle gate, quoted verbatim:
 
+```
+$ sed -n '870,878p' kitty/child-monitor.c
+```
 ```c
-// kitty/child-monitor.c:L871-L876 (quoted verbatim, not elided)
 static void
 render(monotonic_t now, bool input_read) {
     EVDBG("input_read: %d, check_for_active_animated_images: %d", input_read, global_state.check_for_active_animated_images);
@@ -2648,12 +2819,12 @@ with a concrete value, a `file:line` reference, observed evidence, sibling/alter
 causal reason. `[C]` = canonical build; `[N]` = NON-CANONICAL instrumented build; `[H]` = real compiled
 `fast_data_types` parser harness; `[SSH]` = real loopback ssh.
 
-### Q1 — Ingestion / entry point
+### Q1: Ingestion and entry point
 
 | Named item | Where covered | Evidence | `file:line` |
 |------------|---------------|----------|-------------|
 | `read_bytes()` | §1.2, §1.5 | strace read on PTY master + verbatim source `[C]` | `[kitty/child-monitor.c:L1337-L1356]` |
-| the `read()` syscall | §1.2 | marker read `= 40` bytes (`\r\r\n`), stable 2+ runs `[C]` | `[kitty/child-monitor.c:L1337-L1356; read() at L1346]`; source line adjacent at L1345 |
+| the `read()` syscall | §1.2 | marker read `= 40` bytes (`\r\r\n`), stable 2+ runs `[C]` | `[kitty/child-monitor.c:L1337-L1356; read() at L1345; error guard at L1346]` |
 | `EINTR`/`EAGAIN` retry | §1.5 | verbatim source; source-verified, **not observed on child fd** (blocking fd + poll-gated + signalfd); benign `EAGAIN` shown on separate wakeup eventfd `[C]` | `[kitty/child-monitor.c:L1347]` |
 | `EIO` = child-gone | §1.5 | `read()` returns `-1 EIO` after child `exit` (full line in §1.5) `[C]` | `[kitty/child-monitor.c:L1348-L1350]` |
 | keystroke path `keys.c`/`key_encoding.{c,py}`/`keys.py` | §1.6 | byte-exact legacy vs kitty-protocol writes (7 keys) `[C]` | `[kitty/keys.c:L166,L93]`, `[kitty/key_encoding.c:L414,L65]`, `[kitty/keys.py:L40,L154]`, `[kitty/key_encoding.py:L15,L127,L149]` |
@@ -2664,7 +2835,7 @@ causal reason. `[C]` = canonical build; `[N]` = NON-CANONICAL instrumented build
 | `write_to_child` | §1.4 | `write(10, "stty -a\n", 8) = 8` `[C]` | `[kitty/child-monitor.c:L1443]` |
 | paused/resumed cross-ref | §1.1, §4 | forward reference to §4 gate | `[kitty/child-monitor.c:L1501]` |
 
-### Q2 — The unseen conductor
+### Q2: The unseen conductor
 
 | Named item | Where | Evidence | `file:line` |
 |------------|-------|----------|-------------|
@@ -2672,11 +2843,11 @@ causal reason. `[C]` = canonical build; `[N]` = NON-CANONICAL instrumented build
 | main/render `main_loop` | §2.2 | tick cadence `[N]` | `[kitty/child-monitor.c:L1259]` (do_parse L438) |
 | talk thread `read_from_peer` | §2.2 | `KittyPeerMon` in `/proc` `[C]` | `[kitty/child-monitor.c:L1714]` (L1808) |
 | `poll()` ordering + `EXTRA_FDS` | §2.4, §5.3 | fixed `[fd7,fd8,fd10]` order `[C]` | `[kitty/child-monitor.c:L35,L1501-L1503,L1515-L1541]` |
-| `WAKEUP` / `input_delay` | §2.3, §2.6 | quoted macro + comment; 50k-line surge dist `{0:3,1:67}`/`{0:3,1:65}` `[N]` | `[kitty/child-monitor.c:L1562-L1570]` |
+| `WAKEUP` / `input_delay` | §2.3, §2.6 | quoted macro + comment; 50k-line surge coalesces to 152–198 wakeup-bearing ticks across 5 runs (invariant: max 1 wakeup/tick; median inter-tick gap 3.0 ms = input_delay); absolute counts env-sensitive `[N]` | `[kitty/child-monitor.c:L1562-L1570]` |
 | `loop-utils.{c,h}` / `threading.h` | §2.2, §5.7 | signalfd/eventfd plumbing `[C]` | `[kitty/loop-utils.c:L42]`, `kitty/threading.h` |
 | `boss.py` lifecycle | §2.7 | thread/child presence after start `[C]` | `[kitty/boss.py:L370,L585,L1183,L2172]` |
 
-### Q3 — Shell-integration alignment
+### Q3: Shell-integration alignment
 
 | Named item | Where | Evidence | `file:line` |
 |------------|-------|----------|-------------|
@@ -2690,7 +2861,7 @@ causal reason. `[C]` = canonical build; `[N]` = NON-CANONICAL instrumented build
 | `shell_integration.py` setup_* + `modify_shell_environ` | §3.7 | dispatch + zsh skip edge `[C]` | `[kitty/shell_integration.py:L16,L27,L49,L70,L218]` |
 | bash / zsh / fish / ssh scripts | §3.4, §3.5, §3.7 | real per-shell OSC 133 bytes `[C]`; remote ssh row additionally verified byte-for-byte with `hexdump -C` **and** `cat -v` (123-byte decode matches `read()=123`) `[SSH]` | `shell-integration/{bash,zsh,fish,ssh}` |
 
-### Q4 — Backpressure & unstable remote
+### Q4: Backpressure and unstable remote
 
 | Named item | Where | Evidence | `file:line` |
 |------------|-------|----------|-------------|
@@ -2699,13 +2870,13 @@ causal reason. `[C]` = canonical build; `[N]` = NON-CANONICAL instrumented build
 | `BUF_SZ` 1 MiB | §4.3 | saturation to `1048576` ×2 `[H]` | `[kitty/vt-parser.c:L18]` |
 | `write_space_created` → `wakeup_io_loop` | §4.2, §4.4 | fd7 eventfd wake restores POLLIN `[C]` | `[kitty/vt-parser.c:L1438]`, `[kitty/child-monitor.c:L442]` |
 | parse-trigger coalescing | §4.8 | quoted 3-way condition | `[kitty/vt-parser.c:L1425]` |
-| child blocks on `write()` | §4.5 | `write(...) = 65536 <3.987936>` `[C]` | (kernel PTY, consequence of L1501) |
+| child blocks on `write()` | §4.5 | `write(...) = 65536 <3.997263>` `[C]` | (kernel PTY, consequence of L1501) |
 | XON/XOFF vs RTS/CTS contrast | §4.6 | `stty -a`: `-crtscts ixon -ixoff`; no DC1/DC3 `[C]` | terminology → observed |
 | `kittens/ssh/{main.py,main.go,config.go,utils.go,askpass.go}` | §4.7 | real loopback ssh; propagation `[SSH]` | `[kittens/ssh/main.go:L325-L357]`, `main.py:L122,L170` |
 | dropped-link edge (idle remote) → SIGCHLD reap | §4.7 | `read(7<anon_inode:[signalfd]>) = 128` (signo `\21`=17) on ssh kill `[SSH]` | `[kitty/child-monitor.c:L1519,L1370-L1371,L1526]` |
 | child-gone → `EIO` (read in flight) | §1.5 | `read(10</dev/pts/ptmx>) = -1 EIO` after child exit `[C]` | `[kitty/child-monitor.c:L1348-L1350]` |
 
-### Q5 — Full end-to-end settle
+### Q5: Full end-to-end settle
 
 | Named item | Where | Evidence | `file:line` |
 |------------|-------|----------|-------------|
