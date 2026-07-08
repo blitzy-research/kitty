@@ -13,18 +13,61 @@ The plain working sandbox has Python 3 and gcc but **no Go** and none of the C l
 - **Image:** `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` (the public tag of `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`).
 - **Toolchain in the image:** Ubuntu 24.04, Python 3.12.3, Go 1.23.4, gcc 13.3.0, and Mesa (LLVMpipe) providing OpenGL 4.5 for headless GL.
 
-To keep the source tree byte‑for‑byte unchanged while still observing a real build transition, two copies of the commit were used inside the container:
-
-- **`/host_src`** — the pristine, **unbuilt** checkout, mounted **read‑only**. This is the source of all *canonical source* counts and the Q3/Q4 "before" (unbuilt) evidence.
-- **`/work`** — a writable copy of the same tree that was actually **built** with kitty's default build driver. This is the source of the "after" (built) evidence and every hot‑path measurement.
-
-**Canonical build command used** (kitty's default in‑place build — this is exactly what `make` runs, since the `Makefile` `all:` target is `python3 setup.py $(VVAL)` ([Makefile:12‑13](Makefile)), and what `./dev.sh build` ultimately drives, since `dev.sh` is the one‑line shim `exec go run bypy/devenv.go "$@"` ([dev.sh:9](dev.sh))):
+To keep the answer's source tree byte-for-byte unchanged while still observing a real build transition, two independent checkouts of the exact commit were prepared inside the container and used throughout. They are created reproducibly from the commit itself:
 
 ```
-$ cd /work && python3 setup.py
+$ git -C /work archive 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 | tar -x -C /host_src   # pristine, never built
+$ git clone --quiet /work /built && git -C /built checkout --quiet 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 ```
 
-It exited `0` in ~53 s and produced the three build artifacts discussed throughout: the native extension `kitty/fast_data_types.so`, the C launcher `kitty/launcher/kitty`, and the Go binary `kitty/launcher/kitten`.
+- **`/host_src`** — the pristine, **unbuilt** checkout (a `git archive` of the commit). It is never built in, and is the source of all *canonical source* counts and the Q3/Q4 "before" (unbuilt) evidence.
+- **`/built`** — a second checkout of the same commit that was actually **built** with kitty's default build driver. It is the source of the "after" (built) evidence and every hot-path measurement.
+
+The pristine `/host_src` reports the canonical source counts; `/built` reported the *same* counts at checkout, and building only **adds** artifacts (it never rewrites source). This is directly observable — the `.py`/`.c`/`.glsl` counts are identical in both trees, and the only post-build difference is two *generated* headers that appear in `/built`:
+
+```
+$ for t in /host_src /built; do echo "$t: py=$(ls $t/kitty/*.py|wc -l) c=$(ls $t/kitty/*.c|wc -l) h=$(ls $t/kitty/*.h|wc -l) glsl=$(ls $t/kitty/*.glsl|wc -l)"; done
+/host_src: py=44 c=49 h=45 glsl=13
+/built: py=44 c=49 h=47 glsl=13
+$ comm -13 <(cd /host_src/kitty && ls *.h|sort) <(cd /built/kitty && ls *.h|sort)
+docs_ref_map_generated.h
+uniforms_generated.h
+```
+
+So the canonical source is **44 `.py` / 49 `.c` / 45 `.h` / 13 `.glsl`** in `kitty/` (the `/host_src` figures); the two extra headers in `/built` — `uniforms_generated.h` (shader‑uniform accessors, see Q2) and `docs_ref_map_generated.h` — are build outputs, which both confirms `/built` matched the commit before building and shows the build is purely additive.
+
+**Canonical build command used** (kitty's default in-place build — this is exactly what `make` runs, since the `Makefile` `all:` target is `python3 setup.py $(VVAL)` ([Makefile:12‑13](Makefile)), and what `./dev.sh build` ultimately drives, since `dev.sh` is the one-line shim `exec go run bypy/devenv.go "$@"` ([dev.sh:9](dev.sh))). The complete build was captured to a log so its success and full artifact production are shown verbatim (nothing elided):
+
+```
+$ cd /built && python3 setup.py > build.log 2>&1 ; echo "exit=$?"
+exit=0
+$ wc -l build.log
+159 build.log
+$ head -10 build.log
+[1/28] Generating wayland-xdg-shell-client-protocol.h ...
+[2/28] Generating wayland-xdg-shell-client-protocol.c ...
+[3/28] Generating wayland-viewporter-client-protocol.h ...
+[4/28] Generating wayland-viewporter-client-protocol.c ...
+[5/28] Generating wayland-relative-pointer-unstable-v1-client-protocol.h ...
+[6/28] Generating wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[7/28] Generating wayland-pointer-constraints-unstable-v1-client-protocol.h ...
+[8/28] Generating wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[9/28] Generating wayland-xdg-decoration-unstable-v1-client-protocol.h ...
+[10/28] Generating wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+$ tail -6 build.log
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
+kitty/tools/cmd
+$ ls -la kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten
+-rwxr-xr-x 1 root root  1213072 Jul  8 05:27 kitty/fast_data_types.so
+-rwxr-xr-x 1 root root 15945988 Jul  8 05:27 kitty/launcher/kitten
+-rwxr-xr-x 1 root root    36224 Jul  8 05:26 kitty/launcher/kitty
+```
+
+So the canonical build exits `0` and produces the three artifacts discussed throughout: the native extension `kitty/fast_data_types.so` (≈1.21 MB), the C launcher `kitty/launcher/kitty` (≈36 KB), and the Go binary `kitty/launcher/kitten` (≈16 MB). The build transcript is progress output (`[N/28]` codegen/compile steps, then `[N/5]` link steps); the reproducible invariants are the `exit=0`, the three artifact sizes, and the ELF BuildIDs (content‑derived hashes shown in the `file` output below — observed identical across rebuilds in this environment), while the modification timestamps are inherently per‑build wall‑clock times and therefore differ run‑to‑run.
 
 The strictness and aggressive optimisation of the C build were captured directly (verbose rebuild of one extension source, `kitty/line.c`):
 
@@ -35,7 +78,7 @@ gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wa
 
 The `-std=c11` flag originates at [setup.py:492](setup.py) (`std = '' if is_openbsd else '-std=c11'`); the extension target `kitty/fast_data_types` is built by `build()` ([setup.py:1084](setup.py)) via `compile_c_extension(kitty_env(args), 'kitty/fast_data_types', …)` ([setup.py:1090‑1091](setup.py)).
 
-> Note on paths: outputs below show `/work/…` (the built copy) or `/host_src/…` (the pristine unbuilt copy). The `kitty/…` source paths in citations are identical in both and match the commit exactly.
+> Note on paths: outputs below show `/built/…` (the built checkout) or `/host_src/…` (the pristine unbuilt checkout). The `kitty/…` source paths in citations are identical in both and match the commit exactly.
 
 ---
 
@@ -93,7 +136,7 @@ $ wc -l kitty/boss.py kitty/main.py kitty/entry_points.py kitty/constants.py
 
 `kitty/boss.py` (3,094 lines, the `Boss` controller) manages windows, tabs, layouts, and dispatches events — coordination work, done once per user action, not once per byte.
 
-*(A caveat on counting in a built tree: after `python3 setup.py`, the built `/work` tree reports `h=47` and 338 Go files, because the build **generates** two headers — `kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h` — and ~80 Go source files under `tools/cmd/…`. The canonical **source** counts above are therefore taken from the unbuilt `/host_src`.)*
+*(A caveat on counting in a built tree: after `python3 setup.py`, the built `/built` tree reports `h=47` and 338 Go files — 80 more than the source — because the build **generates** two headers (`kitty/uniforms_generated.h` and `kitty/docs_ref_map_generated.h`, taking `.h` from 45 to 47) and 80 additional Go source files (72 of them under `tools/cmd/`). The canonical **source** counts above are therefore taken from the unbuilt `/host_src`.)*
 
 ## 2. Where the C↔Python boundary is (observed)
 
@@ -124,12 +167,12 @@ from .fast_data_types import (
 Confirmed at runtime — the module *is* the compiled `.so`, and it really provides those symbols:
 
 ```
-$ cd /work && python3 -c "
+$ cd /built && python3 -c "
 import kitty.fast_data_types as f
 print('module file:', f.__file__)
 for s in ['GLFW_MOD_ALT','SingleKey','create_os_window','glfw_init','glfw_terminate','set_options','Screen','wcswidth','monotonic','Color','truncate_point_for_length']:
     print(f'  has {s}: {hasattr(f, s)}')"
-module file: /work/kitty/fast_data_types.so
+module file: /built/kitty/fast_data_types.so
   has GLFW_MOD_ALT: True
   has SingleKey: True
   has create_os_window: True
@@ -157,33 +200,77 @@ Crucially, this is the **same** function the live terminal uses. The child‑pro
     } else self->parse_func = parse_worker;
 ```
 
-I drove that identical C code path from a temporary harness (removed afterward) by feeding ~200 MiB of realistic terminal output — printable text, SGR colour escapes, cursor ops, and multi‑byte UTF‑8 — through a real `Screen` object. The harness calls `Screen.test_commit_write_buffer` ([kitty/screen.c:4762](kitty/screen.c) → `vt_parser_commit_write`) and `Screen.test_parse_written_data` ([kitty/screen.c:4772‑4776](kitty/screen.c)), the latter of which calls `parse_worker(screen, &pd, true)` — i.e. the identical parser. Only the byte *source* differs from the live terminal (here Python supplies the bytes instead of the PTY read loop in `child-monitor.c`); the parsing and screen‑update work is the same compiled C.
+I drove that identical C code path from a temporary harness — fed to the interpreter on stdin (`python3 - <<'PY'`), so no script file is ever written to or left in the tree — by feeding ~200 MiB of realistic terminal output (printable text, SGR colour escapes, cursor ops, and multi‑byte UTF‑8) through a real `Screen` object. The harness calls `Screen.test_commit_write_buffer` ([kitty/screen.c:4762](kitty/screen.c) → `vt_parser_commit_write`) and `Screen.test_parse_written_data` ([kitty/screen.c:4772‑4776](kitty/screen.c)), the latter of which calls `parse_worker(screen, &pd, true)` — i.e. the identical parser. This feed loop is exactly the canonical test‑harness pattern kitty itself uses ([kitty_tests/__init__.py:30‑36](kitty_tests/__init__.py) `parse_bytes`). Only the byte *source* differs from the live terminal (here Python supplies the bytes instead of the PTY read loop in `child-monitor.c`); the parsing and screen‑update work is the same compiled C.
 
-Three consecutive runs, each feeding **199.8 MiB**:
+The complete harness and the exact command that runs it (run from the built tree, `cd /built`, so `import kitty.fast_data_types` resolves to the compiled `.so`):
 
 ```
-$ python3 blitzy_adhoc_test_hotpath.py 200   # RUN 1
-payload_chunk_bytes=396000 (0.38 MiB)
-reps=529  total_bytes=209484000 (199.8 MiB)
-elapsed_s=4.7201
-throughput_MiB_per_s=42.3
-throughput_MB_per_s=44.4
-screen_cursor_after=(0,39)
-$ python3 blitzy_adhoc_test_hotpath.py 200   # RUN 2
-...
-elapsed_s=4.7359
-throughput_MiB_per_s=42.2
-throughput_MB_per_s=44.2
-screen_cursor_after=(0,39)
-$ python3 blitzy_adhoc_test_hotpath.py 200   # RUN 3
-...
-elapsed_s=4.6199
-throughput_MiB_per_s=43.2
-throughput_MB_per_s=45.3
-screen_cursor_after=(0,39)
+$ cd /built && TARGET_MIB=200 python3 - <<'PY'
+import os
+from kitty.fast_data_types import Screen, set_options, monotonic
+from kitty.options.types import Options, defaults
+from kitty.options.parse import merge_result_dicts
+from kitty_tests import Callbacks
+
+set_options(Options(merge_result_dicts(defaults._asdict(), {})))
+cb = Callbacks()
+screen = Screen(cb, 24, 80, 0, 10, 20, 0, cb)
+
+line = (
+    "\x1b[1;32muser\x1b[0m@\x1b[1;34mhost\x1b[0m:\x1b[35m~/src/kitty\x1b[0m$ ls --color\r\n"
+    "\x1b[38;5;208mtotal\x1b[0m 128   \u00e9\u00e8\u00ea   \u2192   \u65e5\u672c\u8a9e   \U0001f680\r\n"
+)
+chunk = (line * 2000).encode("utf-8")
+chunk_len = len(chunk)
+target = int(os.environ.get("TARGET_MIB", "200")) * 1024 * 1024
+reps = max(1, round(target / chunk_len))
+total = chunk_len * reps
+
+def feed(data):
+    mv = memoryview(data)
+    while mv:
+        dest = screen.test_create_write_buffer()
+        n = screen.test_commit_write_buffer(mv, dest)
+        mv = mv[n:]
+        screen.test_parse_written_data()
+
+t0 = monotonic()
+for _ in range(reps):
+    feed(chunk)
+elapsed = monotonic() - t0
+mib = total / (1024 * 1024)
+print(f"payload_chunk_bytes={chunk_len} ({chunk_len/1048576:.2f} MiB)")
+print(f"reps={reps}  total_bytes={total} ({mib:.1f} MiB)")
+print(f"elapsed_s={elapsed:.4f}")
+print(f"throughput_MiB_per_s={mib/elapsed:.1f}")
+print(f"screen_cursor_after=({screen.cursor.x},{screen.cursor.y})")
+PY
 ```
 
-**Scale and stability:** ~200 MiB per run; throughput is **stable across all three runs at 42.2–43.2 MiB/s** (≈44–45 MB/s), and the ending cursor position is deterministically `(0,39)`. During the whole run Python executed only ~529 iterations of the feed loop (one per ~0.38 MiB chunk), while **all ~200 million bytes were parsed inside compiled C** — Python's involvement is O(chunks), the byte‑level work is O(bytes) in C.
+Three consecutive runs of that exact command, each feeding **200.0 MiB**:
+
+```
+===== RUN 1 =====
+payload_chunk_bytes=252000 (0.24 MiB)
+reps=832  total_bytes=209664000 (200.0 MiB)
+elapsed_s=4.6805
+throughput_MiB_per_s=42.7
+screen_cursor_after=(0,23)
+===== RUN 2 =====
+payload_chunk_bytes=252000 (0.24 MiB)
+reps=832  total_bytes=209664000 (200.0 MiB)
+elapsed_s=4.8456
+throughput_MiB_per_s=41.3
+screen_cursor_after=(0,23)
+===== RUN 3 =====
+payload_chunk_bytes=252000 (0.24 MiB)
+reps=832  total_bytes=209664000 (200.0 MiB)
+elapsed_s=4.8563
+throughput_MiB_per_s=41.2
+screen_cursor_after=(0,23)
+```
+
+**Scale and stability:** exactly **200.0 MiB** per run (`total_bytes=209664000`); the byte‑for‑byte **invariants** `reps=832`, `payload_chunk_bytes=252000`, and the ending cursor position `(0,23)` are identical on every run. Throughput, by contrast, is a wall‑clock timing figure that varies run‑to‑run with container/CPU load: across 13 runs it was typically ~40–43 MiB/s (the three shown above fall at 41.2–42.7 MiB/s), with one low outlier at ~26 MiB/s under transient scheduling contention — so the reproducible, meaningful result is the **magnitude**, not a precise rate: ~200 MiB parsed in roughly **5 seconds entirely inside compiled C**. During the whole run Python executed only **832** iterations of the feed loop (one per 0.24 MiB chunk), while **all 209,664,000 bytes were parsed inside compiled C** — Python's involvement is O(chunks), the byte‑level work is O(bytes) in C.
 
 That the parser truly lives in the compiled extension is visible in the binary's symbol table (`t` = local text/code symbol; the `.lto_priv` suffix is the fingerprint of the `-flto` link‑time optimisation used in the build):
 
@@ -208,9 +295,9 @@ After the build, the two launcher binaries are radically different in kind and s
 
 ```
 $ file kitty/launcher/kitty kitty/launcher/kitten kitty/fast_data_types.so
-kitty/launcher/kitty:   ELF 64-bit LSB pie executable, x86-64, ..., dynamically linked, ..., not stripped
-kitty/launcher/kitten:  ELF 64-bit LSB executable, x86-64, ..., Go BuildID=..., stripped
-kitty/fast_data_types.so: ELF 64-bit LSB shared object, x86-64, ...
+kitty/launcher/kitty:     ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=424591698956128db6e9ae872dfdc2525fd2a772, for GNU/Linux 3.2.0, not stripped
+kitty/launcher/kitten:    ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, Go BuildID=6jMXLae47p4rvbagE9TS/dDZO5pF7hizplACHyyGK/AwdlbN0jwaf7iNIU38EQ/kQonaCdyWmBYkCYrxNY9, stripped
+kitty/fast_data_types.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=d9730a1d338838d333350cb00b1f870d8e2e52b7, not stripped
 
 $ go version -m kitty/launcher/kitten | head -2
 kitty/launcher/kitten: go1.23.4
@@ -219,8 +306,8 @@ $ go version -m kitty/launcher/kitty
 kitty/launcher/kitty: could not read Go build info from kitty/launcher/kitty: not a Go executable
 
 $ ls -la kitty/launcher/kitty kitty/launcher/kitten
--rwxr-xr-x 1 root root 15945988 ... kitty/launcher/kitten     # ~16 MB, statically-built Go
--rwxr-xr-x 1 root root    36224 ... kitty/launcher/kitty       # ~36 KB, C launcher
+-rwxr-xr-x 1 root root 15945988 Jul  8 05:27 kitty/launcher/kitten
+-rwxr-xr-x 1 root root    36224 Jul  8 05:26 kitty/launcher/kitty
 
 $ ./kitty/launcher/kitten --version
 kitten 0.35.2 created by Kovid Goyal
@@ -238,7 +325,7 @@ kitty is fast because the two things that happen most often — **parsing every 
 
 ## Direct answer
 
-In kitty the `.glsl` files are **not an optional accelerator — they are the entire drawing path.** Every cell/glyph, border, image, background image, and colour tint is drawn by GPU programs compiled from these shaders; **there is no CPU text‑drawing fallback.** They are therefore maximally central: if the shaders do not compile, the terminal does not draw. Text uses a glyph **texture‑atlas** technique (rasterise a glyph once, cache it in a GPU texture, then every subsequent frame is a texture lookup + a quad draw), which is *why* the whole renderer can be shaders.
+In kitty the `.glsl` files are **not an optional accelerator — they are the entire drawing path.** Every cell/glyph, border, image, background image, and colour tint is drawn by GPU programs compiled from these shaders; **there is no CPU text‑drawing fallback** — if OpenGL is inadequate, kitty aborts via `fatal()` rather than drawing on the CPU (grounded in §4: [kitty/gl.c:73‑74](kitty/gl.c), [kitty/glfw.c:1199](kitty/glfw.c)). They are therefore maximally central: if the shaders do not compile, the terminal does not draw. Text uses a glyph **texture‑atlas** technique (rasterise a glyph once, cache it in a GPU texture, then every subsequent frame is a texture lookup + a quad draw), which is *why* the whole renderer can be shaders.
 
 ## 1. The 13 `.glsl` files: 5 vertex/fragment pairs + 3 include‑only helpers (observed)
 
@@ -281,7 +368,7 @@ $ sed -n '20p' kitty/shaders.c
 enum { CELL_PROGRAM, CELL_BG_PROGRAM, CELL_SPECIAL_PROGRAM, CELL_FG_PROGRAM, BORDERS_PROGRAM, GRAPHICS_PROGRAM, GRAPHICS_PREMULT_PROGRAM, GRAPHICS_ALPHA_MASK_PROGRAM, BGIMAGE_PROGRAM, TINT_PROGRAM, NUM_PROGRAMS };
 ```
 
-Ten programs, five shader pairs → the mapping is **not** one program per file. Four of the programs (`CELL_PROGRAM`, `CELL_BG_PROGRAM`, `CELL_SPECIAL_PROGRAM`, `CELL_FG_PROGRAM`) all reuse the **same** `cell_vertex.glsl`/`cell_fragment.glsl` pair; three (`GRAPHICS_PROGRAM`, `GRAPHICS_PREMULT_PROGRAM`, `GRAPHICS_ALPHA_MASK_PROGRAM`) all reuse the `graphics` pair. They are differentiated by **compile‑time `#define`s** rather than separate files. This is proven at runtime in §4 below, where a temporary probe shows the program ids compiling in exactly this enum order while reusing the shader names.
+Ten programs, five shader pairs → the mapping is **not** one program per file. Four of the programs (`CELL_PROGRAM`, `CELL_BG_PROGRAM`, `CELL_SPECIAL_PROGRAM`, `CELL_FG_PROGRAM`) all reuse the **same** `cell_vertex.glsl`/`cell_fragment.glsl` pair; three (`GRAPHICS_PROGRAM`, `GRAPHICS_PREMULT_PROGRAM`, `GRAPHICS_ALPHA_MASK_PROGRAM`) all reuse the `graphics` pair. They are differentiated by **compile‑time `#define`s** rather than separate files. This is proven at runtime in §4 below, where a temporary probe shows all ten `program_id`s being compiled while reusing just five shader‑name pairs. (The `program_id`s are the enum *values* above (0–9); note that their runtime **compile order** is *not* the enum order — the border program is compiled last, separately, as §4 shows and explains.)
 
 ## 3. Build‑time codegen: `build_uniforms_header()` (observed)
 
@@ -299,7 +386,7 @@ That skip is precisely why the three helpers are "include‑only": they have no 
 
 ```
 $ ls -la kitty/uniforms_generated.h
--rw-r--r-- 1 root root 3215 ... kitty/uniforms_generated.h
+-rw-r--r-- 1 root root 3215 Jul  8 05:26 kitty/uniforms_generated.h
 $ grep -oE 'typedef struct [A-Za-z]+Uniforms' kitty/uniforms_generated.h
 typedef struct BgimageUniforms
 typedef struct BorderUniforms
@@ -317,7 +404,7 @@ get_uniform_locations_tint
 A representative slice of the generated code:
 
 ```c
-$ sed -n '3,19p' kitty/uniforms_generated.h
+$ sed -n '3,20p' kitty/uniforms_generated.h
 typedef struct BgimageUniforms {
     GLint image;
     GLint opacity;
@@ -351,7 +438,7 @@ The Python side (`kitty/shaders.py`, class `Program`) loads each `.glsl`, inject
 The load/preprocess step, exercised through the real loader (no GPU needed for this part):
 
 ```
-$ cd /work && python3 -c "
+$ cd /built && python3 -c "
 from kitty.shaders import Program
 p = Program('cell')
 print('cell VERTEX first line:', repr(p.vertex_sources[0]))
@@ -368,7 +455,7 @@ vertex chars: 9294 fragment chars: 10916
 
 So `GLSL_VERSION` resolves to **140** (GLSL 1.40, the OpenGL‑3.1 shading language), injected at the top of both stages, and the `#pragma` includes are expanded into the source before compilation.
 
-For the actual **GL compile** step I ran the *real* terminal under Xvfb with Mesa software GL (LLVMpipe), which reports OpenGL 4.5 — comfortably above kitty's 3.3+ requirement:
+For the actual **GL compile** step I ran the *real* terminal under Xvfb with Mesa software GL (LLVMpipe), which reports OpenGL 4.5 — comfortably above kitty's required minimum (major 3; minor 1 on Linux, 3 on macOS — [kitty/data-types.h:20‑24](kitty/data-types.h)), consistent with the GLSL 1.40 (`#version 140`) shaders above:
 
 ```
 $ xvfb-run -a -s "-screen 0 1280x1024x24" glxinfo -B | grep -iE 'OpenGL (version|renderer|core profile version)'
@@ -377,29 +464,49 @@ OpenGL core profile version string: 4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.0
 OpenGL version string: 4.5 (Compatibility Profile) Mesa 24.2.8-1ubuntu1~24.04.1
 ```
 
-kitty has **no CPU text‑drawing fallback**; because it draws at all under LLVMpipe, its shader programs must have compiled. To capture that *directly*, I temporarily added one observation `print` to `Program.compile` in the throwaway `/work` copy (pure Python, no rebuild), launched the real terminal, and then restored the file to byte‑identical. Launching `kitty` under Xvfb to run a trivial child and exit:
+kitty has **no CPU text‑drawing fallback** — if OpenGL is too old or cannot be initialised, kitty calls `fatal()` and exits rather than drawing on the CPU (observed from source). The version gate lives in `kitty/gl.c`: it compares the detected version against `OPENGL_REQUIRED_VERSION_MAJOR`/`_MINOR` (`3`/`3` on Apple, `3`/`1` elsewhere — [kitty/data-types.h:20‑24](kitty/data-types.h)) and aborts on failure ([kitty/gl.c:73‑74](kitty/gl.c): `fatal("OpenGL version is %d.%d, version >= %d.%d required for kitty", …)`); a failure to create the GL window/context likewise aborts ([kitty/glfw.c:1199](kitty/glfw.c): `fatal("… kitty requires working OpenGL %d.%d drivers.")`). There is no branch that falls back to CPU glyph blitting. So the mere fact that kitty draws at all under LLVMpipe proves its shader programs compiled.
+
+To capture the compile step *directly*, through the real entry point, I used a **reversible** one‑line instrumentation of `Program.compile`: it was inserted, the terminal was launched, and the file was then reverted — leaving the source tree **byte‑for‑byte unchanged**, which is verified by the matching `sha256sum` and the clean `git status` before *and* after (the read‑only‑source constraint is preserved):
 
 ```
+$ cd /built
+$ sha256sum kitty/shaders.py                       # baseline, before instrumentation
+f9dc5ed84e752f814a3d2f3fcb2e4a5a051468100f43ec95eb5006d81af0c944  kitty/shaders.py
+$ git status --porcelain kitty/shaders.py          # (no output) → clean
+$ # insert one stderr print as the first statement of Program.compile (after shaders.py:87), then:
+$ sed -n '87,89p' kitty/shaders.py
+    def compile(self, program_id: int, allow_recompile: bool = False) -> None:
+        import sys as _sys; _sys.stderr.write(f"[BLITZY-OBS] runtime compile GL program name={self.name!r} program_id={program_id}\n"); _sys.stderr.flush()
+        cerr: CompileError = CompileError()
 $ LANG=C.UTF-8 xvfb-run -a -s "-screen 0 1280x1024x24" \
     ./kitty/launcher/kitty --debug-rendering -o confirm_os_window_close=0 sh -c 'true' 2>&1 | grep BLITZY-OBS
 [BLITZY-OBS] runtime compile GL program name='cell' program_id=0
 [BLITZY-OBS] runtime compile GL program name='cell' program_id=1
 [BLITZY-OBS] runtime compile GL program name='cell' program_id=2
 [BLITZY-OBS] runtime compile GL program name='cell' program_id=3
-[BLITZY-OBS] runtime compile GL program name='border' program_id=4
 [BLITZY-OBS] runtime compile GL program name='graphics' program_id=5
 [BLITZY-OBS] runtime compile GL program name='graphics' program_id=6
 [BLITZY-OBS] runtime compile GL program name='graphics' program_id=7
 [BLITZY-OBS] runtime compile GL program name='bgimage' program_id=8
 [BLITZY-OBS] runtime compile GL program name='tint' program_id=9
+[BLITZY-OBS] runtime compile GL program name='border' program_id=4
+$ git checkout -- kitty/shaders.py                 # revert the instrumentation
+$ sha256sum kitty/shaders.py                       # identical to baseline → tree unchanged
+f9dc5ed84e752f814a3d2f3fcb2e4a5a051468100f43ec95eb5006d81af0c944  kitty/shaders.py
+$ git status --porcelain kitty/shaders.py          # (no output) → clean
 ```
 
-*(The `[BLITZY-OBS]` line is a temporary, since‑removed observation print; everything else is kitty's own output.)* This is the definitive proof of the **not‑1:1** mapping: the four `cell` program ids (0–3) reuse the `cell` shader pair, the three `graphics` ids (5–7) reuse the `graphics` pair, and `border`(4)/`bgimage`(8)/`tint`(9) take one each — and the `program_id`s line up exactly with the enum at [kitty/shaders.c:20](kitty/shaders.c). The set of 10 was **stable across two runs**. The startup also reported (from `gl.c` via `--debug-rendering`):
+This is the definitive proof of the **not‑1:1** mapping, and it also reveals the true **compile order**. Ten `program_id`s are compiled while only five shader‑name pairs are reused: the four `cell` ids (0–3) share the `cell` pair, the three `graphics` ids (5–7) share the `graphics` pair, and `border`(4)/`bgimage`(8)/`tint`(9) take one each. The `program_id`s are the enum values from [kitty/shaders.c:20](kitty/shaders.c), **but the order of compilation is *not* the enum order**: the cell, graphics, bgimage and tint programs are compiled first, by the main shader loader `LoadShaderPrograms.__call__` ([kitty/shaders.py:147](kitty/shaders.py); cell at [:152/:184](kitty/shaders.py), graphics at [:186/:197](kitty/shaders.py), bgimage [:199](kitty/shaders.py), tint [:200](kitty/shaders.py)), and the **`border` program is compiled last, separately**, by `load_borders_program()` → `program_for('border').compile(BORDERS_PROGRAM)` ([kitty/borders.py:63‑64](kitty/borders.py)). The startup calls them in exactly that order — `load_shader_programs(...)` then `load_borders_program()` ([kitty/main.py:84‑85](kitty/main.py)) — which is why `program_id=4` appears **last** even though 4 is its enum value. This exact sequence (with `border` last) was **identical across two runs**.
+
+The same launch, under `--debug-rendering`, also prints the detected GL version and the window/child startup. The leading `[N.NNN]` is a **per‑run relative timestamp** emitted by `printf("[%.3f] …")` ([kitty/gl.c:72](kitty/gl.c)), so those numbers differ run‑to‑run while the message text is stable (values below are from run 1):
 
 ```
-[..] GL version string: '4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1' Detected version: 4.5
-[..] OS Window created
-[..] Child launched
+$ LANG=C.UTF-8 xvfb-run -a -s "-screen 0 1280x1024x24" \
+    ./kitty/launcher/kitty --debug-rendering -o confirm_os_window_close=0 sh -c 'true' 2>&1 \
+    | grep -E 'GL version string|OS Window created|Child launched'
+[0.157] OS Window created
+[0.172] Child launched
+[0.137] GL version string: '4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1' Detected version: 4.5
 ```
 
 ## Rationale (cause → effect)
@@ -422,15 +529,15 @@ This is a **stateful** question, so it is answered **before → transition → a
 Primary path — `python3 __main__.py` (deterministic; identical across two runs; exit code 1):
 
 ```
-$ cd /work && python3 __main__.py ; echo "EXIT_CODE=$?"
+$ cd /host_src && python3 __main__.py ; echo "EXIT_CODE=$?"
 Traceback (most recent call last):
-  File "/work/__main__.py", line 7, in <module>
+  File "/host_src/__main__.py", line 7, in <module>
     main()
-  File "/work/kitty/entry_points.py", line 194, in main
+  File "/host_src/kitty/entry_points.py", line 194, in main
     from kitty.main import main as kitty_main
-  File "/work/kitty/main.py", line 11, in <module>
+  File "/host_src/kitty/main.py", line 11, in <module>
     from .borders import load_borders_program
-  File "/work/kitty/borders.py", line 7, in <module>
+  File "/host_src/kitty/borders.py", line 7, in <module>
     from .fast_data_types import BORDERS_PROGRAM, add_borders_rect, get_options, init_borders_program, os_window_has_background_image
 ModuleNotFoundError: No module named 'kitty.fast_data_types'
 EXIT_CODE=1
@@ -451,7 +558,7 @@ So kitty never even reaches its own `main()` body meaningfully — it dies while
 The prompt's "cryptic error" has a second, distinct form. Running the package with `-m` fails **earlier and for a different reason** (deterministic; identical across two runs; exit code 1):
 
 ```
-$ cd /work && python3 -m kitty ; echo "EXIT_CODE=$?"
+$ cd /host_src && python3 -m kitty ; echo "EXIT_CODE=$?"
 /usr/bin/python3: No module named kitty.__main__; 'kitty' is a package and cannot be directly executed
 EXIT_CODE=1
 ```
@@ -477,16 +584,16 @@ $ find kitty -name '*.so' | wc -l
 
 ## TRANSITION — build the extension
 
-The single state change is compiling the C core (§Environment):
+The single state change is compiling the C core. `/built` began as a byte‑identical unbuilt checkout of the *same* commit as `/host_src` (shown in §Environment: identical `.py`/`.c`/`.glsl` counts before building), so building it is exactly the transition that turns the unbuilt failure above into the successful launch below:
 
 ```
-$ cd /work && python3 setup.py    # exit 0; produces kitty/fast_data_types.so
+$ cd /built && python3 setup.py    # exit 0; produces kitty/fast_data_types.so
 $ find kitty -name '*.so'
 kitty/glfw-wayland.so
 kitty/glfw-x11.so
 kitty/fast_data_types.so
 $ ls -la kitty/fast_data_types.so
--rwxr-xr-x 1 root root 1213072 ... kitty/fast_data_types.so
+-rwxr-xr-x 1 root root 1213072 Jul  8 05:27 kitty/fast_data_types.so
 ```
 
 ## AFTER (built tree) — the failure is gone
@@ -494,29 +601,29 @@ $ ls -la kitty/fast_data_types.so
 The canonical launcher now runs (exit code 0):
 
 ```
-$ ./kitty/launcher/kitty --version ; echo "EXIT_CODE=$?"
+$ cd /built && ./kitty/launcher/kitty --version ; echo "EXIT_CODE=$?"
 kitty 0.35.2 created by Kovid Goyal
 EXIT_CODE=0
 ```
 
-And re‑running the *previously failing* `python3 __main__.py` shows the `ModuleNotFoundError` is **gone** — startup now proceeds far past the `borders` import and only stops much later, for an unrelated reason:
+And running that *same* `python3 __main__.py` command — the one that failed in the unbuilt `/host_src` above — now in the built tree (`/built`) shows the `ModuleNotFoundError` is **gone**: startup proceeds far past the `borders` import and only stops much later, for an unrelated reason (the leading `[N.NNN]` is a per‑run timestamp, so it differs run‑to‑run):
 
 ```
-$ cd /work && python3 __main__.py ; echo "EXIT_CODE=$?"
-[0.190] Traceback (most recent call last):
-  File "/work/kitty/main.py", line 526, in main
+$ cd /built && python3 __main__.py ; echo "EXIT_CODE=$?"
+[0.147] Traceback (most recent call last):
+  File "/built/kitty/main.py", line 526, in main
     _main()
-  File "/work/kitty/main.py", line 495, in _main
+  File "/built/kitty/main.py", line 495, in _main
     setup_environment(opts, cli_opts)
-  File "/work/kitty/main.py", line 411, in setup_environment
+  File "/built/kitty/main.py", line 411, in setup_environment
     ensure_kitty_in_path()
-  File "/work/kitty/main.py", line 364, in ensure_kitty_in_path
+  File "/built/kitty/main.py", line 364, in ensure_kitty_in_path
     krd = getattr(sys, 'kitty_run_data')
           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 AttributeError: module 'sys' has no attribute 'kitty_run_data'
 EXIT_CODE=1
 
-$ cd /work && python3 __main__.py 2>&1 | grep -c "No module named 'kitty.fast_data_types'"
+$ cd /built && python3 __main__.py 2>&1 | grep -c "No module named 'kitty.fast_data_types'"
 0
 ```
 
@@ -540,13 +647,13 @@ The kittens are **not** independent. Each lives in its own directory and *looks*
 Both are deterministic (identical across two runs) with exit code 1. They fail *differently*, and the difference is instructive:
 
 ```
-$ cd /work && out=$(python3 kittens/icat/main.py 2>&1); echo "$out"; echo "[exit code: $?]"
+$ cd /built && python3 kittens/icat/main.py 2>&1; echo "[exit code: $?]"
 This should be run as kitten icat
 [exit code: 1]
 
-$ cd /work && out=$(python3 kittens/hints/main.py 2>&1); echo "$out"; echo "[exit code: $?]"
+$ cd /built && python3 kittens/hints/main.py 2>&1; echo "[exit code: $?]"
 Traceback (most recent call last):
-  File "/work/kittens/hints/main.py", line 8, in <module>
+  File "/built/kittens/hints/main.py", line 8, in <module>
     from kitty.cli_stub import HintsCLIOptions
 ModuleNotFoundError: No module named 'kitty'
 [exit code: 1]
@@ -555,7 +662,7 @@ ModuleNotFoundError: No module named 'kitty'
 - **`icat`** prints a **bare `SystemExit` string** — `This should be run as kitten icat` — with **no traceback and no `SystemExit:` prefix** (Python prints a `SystemExit`'s string argument to stderr and exits, without a traceback). The guard is `raise SystemExit('This should be run as kitten icat')` under `if __name__ == '__main__':` ([kittens/icat/main.py:171‑172](kittens/icat/main.py)). `icat/main.py` has **no module‑level `kitty` import** (its file begins with a long `OPTIONS = '''…'''` string), so the module loads cleanly and reaches the guard.
 - **`hints`** dies with a **traceback** → `ModuleNotFoundError: No module named 'kitty'`, at its very first statement `from kitty.cli_stub import HintsCLIOptions` ([kittens/hints/main.py:8](kittens/hints/main.py)). It has no `__main__` guard, so it fails on its first `kitty.` import; it never even reaches its own native‑bridge import `from kitty.fast_data_types import get_options` ([kittens/hints/main.py:11](kittens/hints/main.py)). (When invoked as a script, `sys.path[0]` is `kittens/hints/`, not the repo root, so the `kitty` package is not importable.)
 
-These two failures are the same lesson from two angles: a kitten run standalone cannot function — one advertises it explicitly, the other trips over its dependencies immediately. Note that this is independent of whether kitty is built: the captures above are from the **built** `/work` tree, and both still fail — the problem is standalone invocation, not a missing build.
+These two failures are the same lesson from two angles: a kitten run standalone cannot function — one advertises it explicitly, the other trips over its dependencies immediately. Note that this is independent of whether kitty is built: the captures above are from the **built** `/built` tree, and both still fail — the problem is standalone invocation, not a missing build.
 
 ## 2. The shared native dependency, enumerated (observed)
 
@@ -595,7 +702,7 @@ Traceback (most recent call last):
 ModuleNotFoundError: No module named 'kitty.fast_data_types'
 [exit code: 1]
 
-$ cd /work && python3 -c 'import kittens.tui.loop; print("kittens.tui.loop imported OK; native bridge present")' ; echo "[exit code: $?]"   # BUILT
+$ cd /built && python3 -c 'import kittens.tui.loop; print("kittens.tui.loop imported OK; native bridge present")' ; echo "[exit code: $?]"   # BUILT
 kittens.tui.loop imported OK; native bridge present
 [exit code: 0]
 ```
@@ -606,47 +713,72 @@ So the framework under **every** kitten fails at `loop.py:19` ([kittens/tui/loop
 
 Kittens are meant to be dispatched, not run as scripts. `run_kitten()` ([kitty/entry_points.py:118](kitty/entry_points.py)) is registered as `namespaced_entry_points['kitten'] = run_kitten` ([kitty/entry_points.py:164](kitty/entry_points.py)), which is what makes `kitty +kitten <name>` work. Separately, the modern user‑facing launcher is a **standalone Go binary** beside the `kitty` executable — `kitten_exe()` ([kitty/constants.py:83‑84](kitty/constants.py)). In the **same built tree** where the standalone scripts failed, both canonical forms work and produce identical help:
 
-The Python dispatch via `run_kitten` (first 3 lines of a 123‑line help, exit code 0):
+The Python dispatch via `run_kitten` exits 0 and prints a 123‑line help (the output is redirected to a scratch file so the exit code and line count are captured exactly; first 3 lines shown):
 
 ```
-$ ./kitty/launcher/kitty +kitten icat --help 2>&1 | head -3
+$ cd /built
+$ ./kitty/launcher/kitty +kitten icat --help > /tmp/h1.txt 2>&1; echo "[exit code: $?]"; wc -l < /tmp/h1.txt; head -3 /tmp/h1.txt
+[exit code: 0]
+123
 Usage: kitten icat [options] image-file-or-url-or-directory ...
 
 A cat like utility to display images in the terminal. You can specify multiple
 ```
 
-The separate Go `kitten` binary produces byte‑identical help (first 3 lines of the same 123‑line output, exit code 0):
+The separate Go `kitten` binary also exits 0 and produces the same 123‑line help (first 3 lines shown):
 
 ```
-$ ./kitty/launcher/kitten icat --help 2>&1 | head -3
+$ ./kitty/launcher/kitten icat --help > /tmp/h2.txt 2>&1; echo "[exit code: $?]"; wc -l < /tmp/h2.txt; head -3 /tmp/h2.txt
+[exit code: 0]
+123
 Usage: kitten icat [options] image-file-or-url-or-directory ...
 
 A cat like utility to display images in the terminal. You can specify multiple
+```
+
+A direct `diff` of the two captured outputs confirms they are byte‑for‑byte identical — the Python dispatch and the separate Go binary emit exactly the same 123‑line help (the `/tmp/h1.txt` and `/tmp/h2.txt` scratch files are ephemeral and removed afterward):
+
+```
+$ diff /tmp/h1.txt /tmp/h2.txt && echo "IDENTICAL (diff produced no output)"
+IDENTICAL (diff produced no output)
+$ rm -f /tmp/h1.txt /tmp/h2.txt
 ```
 
 ## 4. How many kittens? — observed count, with the AAP‑body discrepancy reconciled
 
-Counting the tool directories on the pristine source tree (read‑only, so no bytecode caches can appear):
+Counting the tool directories on the source tree, filtering out the `__pycache__` bytecode‑cache directory (Python writes it as a side effect of importing any kitten, so it is a runtime cache, not a tool package — filtering makes the count deterministic regardless of whether Python has run in the tree):
 
 ```
-$ cd /host_src && ls -d kittens/*/
-kittens/ask/            kittens/broadcast/      kittens/choose_fonts/
-kittens/clipboard/      kittens/diff/           kittens/hints/
-kittens/hyperlinked_grep/  kittens/icat/        kittens/pager/
-kittens/panel/          kittens/query_terminal/ kittens/remote_file/
-kittens/resize_window/  kittens/show_key/       kittens/ssh/
-kittens/themes/         kittens/transfer/       kittens/tui/
+$ cd /host_src && ls -d kittens/*/ | grep -v __pycache__
+kittens/ask/
+kittens/broadcast/
+kittens/choose_fonts/
+kittens/clipboard/
+kittens/diff/
+kittens/hints/
+kittens/hyperlinked_grep/
+kittens/icat/
+kittens/pager/
+kittens/panel/
+kittens/query_terminal/
+kittens/remote_file/
+kittens/resize_window/
+kittens/show_key/
+kittens/ssh/
+kittens/themes/
+kittens/transfer/
+kittens/tui/
 kittens/unicode_input/
-$ ls -d kittens/*/ | wc -l
+$ ls -d kittens/*/ | grep -v __pycache__ | wc -l
 19
 ```
 
-**Observed: 19 directories.** Since `kittens/tui/` is the shared **framework** (not a standalone tool), there are **18 non‑`tui` tool packages** plus the two top‑level files `kittens/__init__.py` and `kittens/runner.py`. The AAP body text says "20 tool packages"; the **observed** value is **19 directories / 18 tool packages**, and this document reports the observed value per the "report exactly what is observed" rule. The discrepancy has a concrete cause: in a *used/built* tree the count appears as **20** only because Python writes a `kittens/__pycache__/` bytecode‑cache directory the moment any kitten module is imported — that 20th directory is a runtime cache, **not** a tool package:
+**Observed: 19 directories.** Since `kittens/tui/` is the shared **framework** (not a standalone tool), there are **18 non‑`tui` tool packages** plus the two top‑level files `kittens/__init__.py` and `kittens/runner.py`. The AAP body text says "20 tool packages"; the **observed** value is **19 directories / 18 tool packages**, and this document reports the observed value per the "report exactly what is observed" rule. The discrepancy has a concrete cause: the *raw* `ls -d kittens/*/` count is **20** in any tree where Python has already imported a kitten, because Python writes a `kittens/__pycache__/` bytecode‑cache directory the moment any kitten module is imported — that 20th directory is a runtime cache, **not** a tool package (exactly what the `grep -v __pycache__` filter above removes):
 
 ```
-$ cd /work && ls -d kittens/*/ | wc -l           # after Python imported kittens
+$ cd /built && ls -d kittens/*/ | wc -l           # raw: includes the __pycache__ cache dir
 20
-$ ls -d kittens/*/ | grep -v __pycache__ | wc -l # excluding the bytecode cache
+$ ls -d kittens/*/ | grep -v __pycache__ | wc -l  # excluding the bytecode cache
 19
 ```
 
@@ -664,17 +796,17 @@ Re‑reading the four questions and confirming every distinct sub‑part and nam
 **Q1 — which language does the heavy lifting?**
 - [x] Language split quantified: `44 .py / 49 .c / 45 .h / 13 .glsl` in `kitty/`; lines `C 35,155 + H 22,587` vs `Python 20,647`, `GLSL 696`; Go `258` repo‑wide / `193` under `tools/` — all re‑derived by command on the pristine tree; built‑tree deltas explained (generated headers + Go files).
 - [x] C↔Python boundary named: `kitty/data-types.c:469` (`.m_name`), `:525` (`PyInit_fast_data_types`); imports at `kitty/main.py:32‑45`; confirmed the `.so` provides the symbols at runtime.
-- [x] Hot path run at scale, ≥2 runs: ~199.8 MiB through the real `parse_worker` (`vt-parser.c:1496`, the same fn `child-monitor.c:181` uses), stable 42.2–43.2 MiB/s over 3 runs; parser present in the `.so` symbol table (with `-flto`).
+- [x] Hot path run at scale, ≥2 runs: exactly 200.0 MiB (209,664,000 bytes) through the real `parse_worker` (`vt-parser.c:1496`, the same fn `child-monitor.c:181` uses), throughput ~40–43 MiB/s typical over 13 runs (one 26 MiB/s outlier under container load) with byte‑for‑byte invariants `reps=832` and cursor `(0,23)`; parser present in the `.so` symbol table (with `-flto`).
 - [x] Go `kitten` confirmed a **separate** executable (`file`, `go version -m`, `--version`); `kitten_exe()` at `constants.py:83`.
 - [x] Rationale (per‑byte/per‑frame work in optimised C + GPU; Python off the hot path).
 
 **Q2 — role and centrality of the GLSL shaders.**
 - [x] 13 `.glsl` catalogued: 5 `*_vertex`/`*_fragment` pairs + 3 include‑only helpers (`cell_defines`, `alpha_blend`, `linear2srgb`), proven include‑only by the `#pragma` grep and by `setup.py:1043‑1044`.
 - [x] 10‑program enum listed verbatim (`shaders.c:20`).
-- [x] **Not‑1:1** mapping explained and proven at runtime (program ids 0–3 = `cell`, 5–7 = `graphics`, 4/8/9 = border/bgimage/tint).
+- [x] **Not‑1:1** mapping proven at runtime via a **reversible** instrumentation of `Program.compile` (reverted; `sha256` + `git status` identical before *and* after). Program ids 0–3 = `cell`, 5–7 = `graphics`, 4/8/9 = border/bgimage/tint; the runtime **compile order** is cell→graphics→bgimage→tint→**border last** (*not* enum order), because `load_borders_program()` (`borders.py:63‑64`) runs after `load_shader_programs()` (`main.py:84‑85`). Identical across 2 runs.
 - [x] Build‑time codegen shown: `build_uniforms_header()` (`setup.py:1025/1040/1042‑1044`), generated `uniforms_generated.h` with exactly 5 structs.
 - [x] Runtime load→preprocess→compile shown: `shaders.py:53/54‑55/63/87/90` → `shaders.c:1168`; border via `borders.py:63‑64`; `#version 140` injection observed; all 10 programs observed compiling under Xvfb/LLVMpipe (GL 4.5).
-- [x] "Sole draw path / no CPU fallback" stated; glyph‑atlas rationale given.
+- [x] "Sole draw path / no CPU fallback" grounded in source: kitty `fatal()`s on inadequate GL (`gl.c:73‑74`, `glfw.c:1199`) against the required version (`data-types.h:20‑24`) — no CPU‑blit branch; glyph‑atlas rationale given.
 
 **Q3 — the immediate entry‑point failure and the "one critical piece" (stateful).**
 - [x] BEFORE (unbuilt): `python3 __main__.py` full traceback → `ModuleNotFoundError: No module named 'kitty.fast_data_types'`, with the exact import chain cited (`__main__.py:7` → `entry_points.py:194` → `main.py:11` → `borders.py:7`).
@@ -692,5 +824,5 @@ Re‑reading the four questions and confirming every distinct sub‑part and nam
 - [x] **Observed count 19 dirs / 18 packages** reported and the AAP‑body "20" reconciled (the 20th dir is `kittens/__pycache__/`, a bytecode cache).
 - [x] Rationale (error‑isolated but not dependency‑isolated; same root cause as Q3).
 
-**Cross‑cutting confirmations:** every behavioural claim is paired with its command and complete, unedited output; byte‑sensitive strings match exactly (notably the `icat` bare string with no `SystemExit:` prefix); magnitude/timing (Q1) states scale and shows ≥2 stable runs; all counts are re‑derived by command; and every value not directly observed pre‑build is labelled *(inferred)* and then confirmed *(observed)*.
+**Cross‑cutting confirmations:** every behavioural claim is paired with its command and complete, unedited output; byte‑sensitive strings match exactly (notably the `icat` bare string with no `SystemExit:` prefix); magnitude/timing (Q1) states scale (200 MiB) with byte‑for‑byte‑stable invariants (`reps=832`, cursor `(0,23)`) across runs and the throughput distribution reported over 13 runs; all counts are re‑derived by command; and every value not directly observed pre‑build is labelled *(inferred)* and then confirmed *(observed)*.
 
