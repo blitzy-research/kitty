@@ -459,6 +459,32 @@ def on_child_death(self, window_id: int) -> None:
     window = self.window_id_map.pop(window_id, None)
 ```
 
+**Observed** — through the **real entry point**, kitty tracks exactly one live child (the `sh`), and
+when that child exits `0` kitty exits cleanly (an un‑reaped/untracked child would leave kitty
+hanging). The child prints its lines then `sleep 3` so it can be caught while alive; kitty's own
+(benign) stderr is redirected to a file so the process listing is uncluttered. Structurally stable
+across two runs (only the pids differ):
+
+```console
+$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
+$ ./kitty/launcher/kitty sh -c 'printf "l1\nl2\nl3\n"; sleep 3; true' 2>/tmp/k.err &
+$ KPID=$!                                                # the kitty process
+$ sleep 1.2                                              # while the child is still alive…
+$ ps --ppid "$KPID" -o pid,ppid,stat,args --no-headers   # …the child kitty is TRACKING:
+   8346    8278 Ss+  sh -c printf "l1\nl2\nl3\n"; sleep 3; true
+$ wait "$KPID"; echo "kitty_rc=$?"                       # child exits 0 → death callback fires
+kitty_rc=0
+$ cat /tmp/k.err                                         # kitty's only stderr (benign)
+[0.155] Failed to open systemd user bus with error: No medium found
+```
+
+That single child row is the live entry the C `ChildMonitor` holds in its `Child` array
+(`kitty/child-monitor.c:65-71`, whose `pid` field is this child's pid — here `8346`); `Ss+` marks it
+the session leader in kitty's pty. When it exits, reaping (Q5/Q6) runs and `ChildMonitor` invokes the
+death callback with the window id, which `Boss.on_child_death` (`kitty/boss.py:881`) uses to pop and
+destroy the window; the last window closing makes kitty exit `0`. The clean `kitty_rc=0` (no hang) is
+the runtime proof that the tracking→death loop executed.
+
 **Critical nuance (do not conflate).** The C monitor calls the death callback with **only the
 window id**, *not* the exit status:
 
@@ -680,10 +706,25 @@ reap_children(ChildMonitor *self, bool enable_close_on_child_death) {
 terminated children and returns. The retrieved `status` word is passed on to
 `mark_monitored_pids(pid, status)`.
 
-**Observed** (same C demonstration as Q5, two runs, identical): for a child that exits `0`,
-`waitpid(-1,&status,WNOHANG)` returns the child's pid, the raw status word is `0`, and it decodes to
-exit code `0`. In kitty's own runs, the fact that kitty exits cleanly with `kitty_rc=0` and never
-hangs confirms the child was reaped (an un‑reaped child would leave the monitor waiting).
+**Observed** — `strace` is unavailable in this container, so kitty's exact reaping call is
+reproduced by the same minimal C program used for Q5 (a temporary observation script, since
+deleted), whose `waitpid` line is `kitty/child-monitor.c:1418` verbatim: it forks a child that exits
+`0`, waits for `SIGCHLD`, then retrieves the status. Shown here for the **retrieval** half; stable
+across two runs (only the reaped pid differs):
+
+```console
+$ gcc -Wall -o /tmp/reap_demo /tmp/reap_demo.c && /tmp/reap_demo
+SIGCHLD delivered to parent: got=1
+waitpid(-1,&status,WNOHANG) -> reaped pid=8454
+raw status word = 0
+WIFEXITED(status) = 1
+WEXITSTATUS(status) = 0
+```
+
+For a child that exits `0`, `waitpid(-1, &status, WNOHANG)` returns the child's pid and the raw
+status word is `0`, which decodes to exit code `0`. In kitty's own runs, the fact that kitty exits
+cleanly with `kitty_rc=0` and never hangs confirms the child was reaped (an un‑reaped child would
+leave the monitor waiting).
 
 **Critical nuance — the decoding macros are conventional, not literal in kitty.** The raw status
 word is conventionally decoded with the POSIX macros `WIFEXITED` / `WEXITSTATUS` (as the C demo
