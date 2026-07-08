@@ -34,7 +34,7 @@ Every factual claim below is grounded in **observed runtime output** captured by
 
 ### 1.1 Build prerequisites (what was actually needed)
 
-The authoritative dependency list is `.github/workflows/ci.py:L85-L88` (apt) plus `python3 -m pip install Pillow pygments` (`.github/workflows/ci.py:L94`). This environment is a **generic Ubuntu 25.10 container** (not the AAP‑referenced prebuilt image), in which those prerequisites were installed **from scratch during environment setup** — the full `ci.py` apt list, plus `libssl-dev` (for `libcrypto`, used by the Go tools) and the two pip helpers (`Pillow`, `pygments`) — so by the time this investigation ran they were **already present at authoring time** and **nothing further had to be installed** to build or run. The relevant packages, verified present at authoring time:
+The authoritative dependency list is `.github/workflows/ci.py:L85-L88` (apt) plus `python3 -m pip install Pillow pygments` (`.github/workflows/ci.py:L95`). This environment is a **generic Ubuntu 25.10 container** (not the AAP‑referenced prebuilt image), in which those prerequisites were installed **from scratch during environment setup** — the full `ci.py` apt list, plus `libssl-dev` (for `libcrypto`, used by the Go tools) and the two pip helpers (`Pillow`, `pygments`) — so by the time this investigation ran they were **already present at authoring time** and **nothing further had to be installed** to build or run. The relevant packages, verified present at authoring time:
 
 ```
 $ dpkg -l | grep -E 'libssl-dev|libsimde-dev|libgl1-mesa-dev|libfontconfig-dev|libharfbuzz-dev|xvfb|imagemagick|x11-apps'
