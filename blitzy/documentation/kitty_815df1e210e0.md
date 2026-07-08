@@ -18,14 +18,68 @@ Everything below is reproduced from live runs of the real `Screen` ingest path; 
 
 ## 1. How this was investigated (methodology + build)
 
-### 1.1 Canonical build
+### 1.1 Canonical build and the observed build outcome
 
 - **Canonical command:** `python3 setup.py build` → builds the CPython extension `kitty/fast_data_types.so`, which exposes `HistoryBuf` and `Screen`.
-- **Import‑check command:** `PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q0_import_check.py`
 
-The import check confirms the observable substrate (unedited, stable across 2 runs):
+**Observed: the canonical command, run as a normal user would, FAILS in this sandbox (exit 1).** The 122 per‑file `[N/122] Compiling …` lines are deterministic build progress (full log = 134 lines) and are summarized between the first two and the last; every answer‑bearing line (the compiler error banner and the exit code) is shown complete and unedited:
 
+```text
+$ python3 setup.py build ; echo "CANONICAL_EXIT=$?"
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+… (deterministic per-file "[N/122] Compiling …" progress lines 3–121; full log = 134 lines) …
+[122/122] Compiling kitty/gl-wrapper.c ...
+glfw/wl_window.c: In function ‘xdgToplevelHandleConfigure’:
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT’ not handled in switch [-Werror=switch]
+  668 |         switch (*state) {
+      |         ^~~~~~
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_RIGHT’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_TOP’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM’ not handled in switch [-Werror=switch]
+cc1: all warnings being treated as errors
+ done
+Compiling [wayland] glfw/wl_window.c ...
+gcc -MMD -DNDEBUG -D_GLFW_WAYLAND -D_GLFW_BUILD_DLL -DHAS_MEMFD_CREATE -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/wl_window.c -o build/glfw-wayland-glfw-wl_window.c.o
+CANONICAL_EXIT=1
 ```
+
+The failure is a **compile‑time** `-Werror=switch` in GLFW's Wayland window code (`glfw/wl_window.c:668`), because wayland‑protocols 1.45 adds `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values the `switch (*state)` does not handle. It aborts **before any linking** (there are no `Linking …` lines), so the pure‑canonical command does not even produce `fast_data_types.so` here. This is unrelated to the scrollback subsystem.
+
+- **Build actually used (NON‑CANONICAL override):** `CFLAGS='-Wno-error=switch' python3 setup.py build` — suppresses only that one unrelated GLFW switch warning. **Observed: this succeeds fully (exit 0)**, including all link steps and the trailing Go step, because the Go toolchain (Go 1.24.4) is present in this sandbox. Compile progress summarized as above (full log = 131 lines); every answer‑bearing line (the link steps, the Go step, the exit code) is complete and unedited:
+
+```text
+$ CFLAGS='-Wno-error=switch' python3 setup.py build ; echo "CFLAGS_EXIT=$?"
+[1/122] Compiling kitty/screen.c ...
+… (deterministic per-file "[N/122] Compiling …" progress lines 2–121; full log = 131 lines) …
+[122/122] Compiling kitty/gl-wrapper.c ...
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
+kitty/tools/cmd
+CFLAGS_EXIT=0
+```
+
+The `.so` links at step `[1/5]`; the final `kitty/tools/cmd` line is the Go build of the `kitten` helper, which completes without the AAP‑anticipated "go tool was not found" error (reconciled in §1.2). This is the extension used for every observation below.
+
+- **Import‑check command:** `PYTHONPATH="$(pwd)" python3 q0_import_check.py`, where `q0_import_check.py` is:
+
+```python
+import kitty.fast_data_types as f
+print("HistoryBuf present:", hasattr(f, "HistoryBuf"))
+print("Screen present:", hasattr(f, "Screen"))
+print("PagerHistoryBuf top-level present:", hasattr(f, "PagerHistoryBuf"))
+print("SCROLL_LINE:", f.SCROLL_LINE, "SCROLL_PAGE:", f.SCROLL_PAGE, "SCROLL_FULL:", f.SCROLL_FULL)
+print("HistoryBuf public attrs:", sorted(a for a in dir(f.HistoryBuf) if not a.startswith("__")))
+```
+
+It confirms the observable substrate (complete, unedited; stable across 2 runs):
+
+```text
 HistoryBuf present: True
 Screen present: True
 PagerHistoryBuf top-level present: False
@@ -36,12 +90,8 @@ HistoryBuf public attrs: ['as_ansi', 'count', 'dirty_lines', 'line', 'pagerhist_
 ### 1.2 Sandbox environment artifacts — disclosed as **NON‑CANONICAL** (not project defaults)
 
 - **Toolchain / interpreter actually observed here:** Python **3.13.7**; the built `kitty/fast_data_types.so` is **1,253,792 bytes**. (These are environment‑specific values, reported honestly rather than assumed.)
-- **Build‑config override actually used:** the canonical `python3 setup.py build` hit the wayland‑protocols 1.45 enum skew:
-  ```
-  glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT' not handled in switch [-Werror=switch]
-  cc1: all warnings being treated as errors
-  ```
-  so the extension was built with the override **`CFLAGS='-Wno-error=switch' python3 setup.py build`**. This override is an **environment artifact, NOT a canonical default** — it only suppresses an unrelated GLFW `-Werror=switch` in the Wayland window code and does not touch the scrollback subsystem. In this sandbox that build **succeeds fully (exit 0)** including the launcher link, because the Go toolchain (Go 1.24.4) is present; the trailing Go step that produces the `kitten` binary is not exercised by this investigation.
+- **The `CFLAGS='-Wno-error=switch'` override is an environment artifact, NOT a canonical default.** It suppresses only the one unrelated GLFW `-Werror=switch` shown complete in §1.1 (`glfw/wl_window.c:668`, from the wayland‑protocols 1.45 enum skew) and does not touch the scrollback subsystem. The complete, unedited output for **both** the pure‑canonical command (`CANONICAL_EXIT=1`) and the override (`CFLAGS_EXIT=0`) is embedded in §1.1.
+- **Reconciliation with the AAP's build note (reported exactly as observed, not as predicted).** The AAP anticipated that `python3 setup.py build` would exit **1** only because a *trailing Go step* (building the `kitten` binary) would fail with "the go tool was not found," *after* `fast_data_types` had already linked. **That is not what happens in this sandbox.** What I actually observed is: **(a)** the pure‑canonical command exits 1 for a *different* reason — the compile‑time wayland `-Werror=switch` at `glfw/wl_window.c:668`, which aborts *before* any linking, so `fast_data_types.so` is not produced at all by the canonical command; and **(b)** under the override the Go toolchain (Go 1.24.4) **is** present, so the trailing `kitty/tools/cmd` Go step **succeeds** and the overall exit is **0** (`CFLAGS_EXIT=0`). Both outcomes are shown with complete output in §1.1; neither matches the AAP's "go tool not found" prediction, and I report the observed reality rather than the prediction.
 - **Observation tools installed via apt (non‑canonical, for observation only):** `strace` and `gdb`. These do not alter the build or the project.
 
 ### 1.3 Runtime observability method
@@ -103,10 +153,10 @@ The line store is a **fixed ring of `ynum` slots** addressed by `start_of_data` 
 Scale: **20000 lines fed** into a `scrollback=10000` buffer (`ynum = 10000 ≫ 2048`, so multiple segments are forced), pager OFF, 80 columns. Run twice for stability.
 
 ```
-PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q1_segments.py
+PYTHONPATH="$(pwd)" python3 q1_segments.py
 ```
 
-The script (`/tmp/blitzy_adhoc/q1_segments.py`):
+The script (`q1_segments.py`):
 
 ```python
 from kitty_tests import BaseTest
@@ -181,20 +231,165 @@ Exactly **one** segment `mmap` fires between `before_create_screen` and `after_c
 
 ### 3.5 Deeper evidence — `gdb` (`add_segment` fires 4× during the burst)
 
-`add_segment` is a `static` function that LTO builds emit only under the mangled local symbol `add_segment.lto_priv.0` (confirmed with `nm`/`objdump`), so a plain `break add_segment` never resolves. Bootstrapping at the clean symbol `historybuf_add_line` (so the `.so` is mapped) and then `rbreak ^add_segment` binds it. It fires **4 times** during the burst, with the backtrace:
+`add_segment` is a `static` function that LTO builds emit only under the mangled local symbol `add_segment.lto_priv.0` (confirmed with `nm`/`objdump`), so a plain `break add_segment` never resolves. The session therefore **bootstraps** at the clean exported symbol: `set breakpoint pending on; break historybuf_add_line; run`; when that first hit maps the `.so`, I `delete` it and set `break add_segment.lto_priv.0`, then `continue` through the burst. `add_segment` fires **exactly 4 times**, and every hit yields a **byte‑identical** backtrace. The complete, unedited session is reproduced below — the **full `.so` path is shown (no `.../` elision)** and **all four backtraces appear in full (frames #0–#15)**:
 
-```
->>> add_segment fired
-#0  0x00007ffff6e6aff0 in add_segment.lto_priv () from .../kitty/fast_data_types.so
-#1  0x00007ffff6e6b774 in init_line.lto_priv () from .../kitty/fast_data_types.so
-#2  0x00007ffff6e6bfef in historybuf_add_line () from .../kitty/fast_data_types.so
-#3  0x00007ffff6e95796 in linefeed.lto_priv () from .../kitty/fast_data_types.so
+```text
+Function "historybuf_add_line" not defined.
+Breakpoint 1 (historybuf_add_line) pending.
+=MARK before_create_screen
+=MARK after_create_screen count=0
+
+Breakpoint 1, 0x00007ffff6e6bfc0 in historybuf_add_line () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+Breakpoint 2 at 0x7ffff6e6aff0
+
+Breakpoint 2, 0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+>>> add_segment fired (lazy carve #1 during burst)
+#0  0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#1  0x00007ffff6e6b774 in init_line.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#2  0x00007ffff6e6bfef in historybuf_add_line () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#3  0x00007ffff6e95796 in linefeed.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
 #4  0x00000000005746f4 in _PyEval_EvalFrameDefault ()
+#5  0x000000000056ccd3 in PyEval_EvalCode ()
+#6  0x00000000006cba75 in ?? ()
+#7  0x00000000006c89c1 in ?? ()
+#8  0x00000000006da3a5 in ?? ()
+#9  0x00000000006d9da8 in ?? ()
+#10 0x00000000006d9be5 in ?? ()
+#11 0x00000000006d8e07 in Py_RunMain ()
+#12 0x00000000006a6074 in Py_BytesMain ()
+#13 0x00007ffff7c3c575 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007ffff7c3c628 in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+#15 0x00000000006a53f5 in _start ()
+
+Breakpoint 2, 0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+>>> add_segment fired (lazy carve #2 during burst)
+#0  0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#1  0x00007ffff6e6b774 in init_line.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#2  0x00007ffff6e6bfef in historybuf_add_line () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#3  0x00007ffff6e95796 in linefeed.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#4  0x00000000005746f4 in _PyEval_EvalFrameDefault ()
+#5  0x000000000056ccd3 in PyEval_EvalCode ()
+#6  0x00000000006cba75 in ?? ()
+#7  0x00000000006c89c1 in ?? ()
+#8  0x00000000006da3a5 in ?? ()
+#9  0x00000000006d9da8 in ?? ()
+#10 0x00000000006d9be5 in ?? ()
+#11 0x00000000006d8e07 in Py_RunMain ()
+#12 0x00000000006a6074 in Py_BytesMain ()
+#13 0x00007ffff7c3c575 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007ffff7c3c628 in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+#15 0x00000000006a53f5 in _start ()
+
+Breakpoint 2, 0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+>>> add_segment fired (lazy carve #3 during burst)
+#0  0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#1  0x00007ffff6e6b774 in init_line.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#2  0x00007ffff6e6bfef in historybuf_add_line () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#3  0x00007ffff6e95796 in linefeed.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#4  0x00000000005746f4 in _PyEval_EvalFrameDefault ()
+#5  0x000000000056ccd3 in PyEval_EvalCode ()
+#6  0x00000000006cba75 in ?? ()
+#7  0x00000000006c89c1 in ?? ()
+#8  0x00000000006da3a5 in ?? ()
+#9  0x00000000006d9da8 in ?? ()
+#10 0x00000000006d9be5 in ?? ()
+#11 0x00000000006d8e07 in Py_RunMain ()
+#12 0x00000000006a6074 in Py_BytesMain ()
+#13 0x00007ffff7c3c575 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007ffff7c3c628 in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+#15 0x00000000006a53f5 in _start ()
+
+Breakpoint 2, 0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+>>> add_segment fired (lazy carve #4 during burst)
+#0  0x00007ffff6e6aff0 in add_segment.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#1  0x00007ffff6e6b774 in init_line.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#2  0x00007ffff6e6bfef in historybuf_add_line () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#3  0x00007ffff6e95796 in linefeed.lto_priv () from /tmp/blitzy/kitty/blitzy-1ae7073f-401f-435a-bd53-f8e3e21db63e_9e7cd4/kitty/fast_data_types.so
+#4  0x00000000005746f4 in _PyEval_EvalFrameDefault ()
+#5  0x000000000056ccd3 in PyEval_EvalCode ()
+#6  0x00000000006cba75 in ?? ()
+#7  0x00000000006c89c1 in ?? ()
+#8  0x00000000006da3a5 in ?? ()
+#9  0x00000000006d9da8 in ?? ()
+#10 0x00000000006d9be5 in ?? ()
+#11 0x00000000006d8e07 in Py_RunMain ()
+#12 0x00000000006a6074 in Py_BytesMain ()
+#13 0x00007ffff7c3c575 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007ffff7c3c628 in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+#15 0x00000000006a53f5 in _start ()
+A debugging session is active.
+
+	Inferior 1 [process 77478] will be killed.
+
+Quit anyway? (y or n) [answered Y; input not from terminal]
 ```
 
-(The eager seg‑0 carve happened inside `create_screen`, *before* the bootstrap breakpoint on `historybuf_add_line` was armed, which is exactly why `gdb` sees 4 rather than 5. Combined with the 5 `mmap`s in §3.4 this closes the loop: 1 eager + 4 lazy = 5.)
+(The eager seg‑0 carve happened inside `create_screen`, *before* the bootstrap breakpoint on `historybuf_add_line` was armed — which is exactly why `gdb` sees **4 lazy** carves, not 5. Combined with the **5** segment `mmap`s in §3.4 this closes the loop: **1 eager + 4 lazy = 5**. Frames #4–#15 (`_PyEval_EvalFrameDefault → PyEval_EvalCode → … → Py_RunMain → Py_BytesMain → __libc_start_main → _start`) confirm the carve is driven by the **real Python `Screen` ingest path**, not a synthetic direct call.)
 
-### 3.6 Cause→effect (the specific code doing the work)
+### 3.6 Single‑segment case (`ynum ≤ 2048`): eager seg‑0 only, **zero** lazy carves
+
+The run above deliberately crosses 2048 boundaries. The coverage‑complete contrast is the **single‑segment** case: when `scrollback ≤ 2048` the total segment count is `ceil(ynum / 2048) = 1`, so **only the eager seg‑0 carve occurs and no lazy `add_segment` ever fires**, regardless of burst size. This is the "no hesitation at all" boundary. Driven through the same real `Screen` ingest path with `scrollback = 2000` (`ynum = 2000 ≤ 2048`) and a 6000‑line burst (3× capacity, to force saturation + eviction). Invoked as `PYTHONPATH="$(pwd)" python3 q1b_single_segment.py`, where `q1b_single_segment.py` is:
+
+```python
+# Finding 6: explicit SINGLE-SEGMENT condition (ynum <= SEGMENT_SIZE=2048 -> ceil(ynum/2048)=1).
+# Only segment 0 (carved EAGERLY at construction) is ever allocated; segment_for() never
+# triggers a lazy add_segment() because SEGMENT_SIZE*num_segments (2048*1) >= ynum stops the loop.
+from kitty_tests import BaseTest
+class _T(BaseTest):
+    def runTest(self): pass
+def rss_kb():
+    for ln in open('/proc/self/status'):
+        if ln.startswith('VmRSS'): return int(ln.split()[1])
+def run(tag, ynum):
+    bt=_T()
+    s=bt.create_screen(cols=80, lines=24, scrollback=ynum, options={'scrollback_pager_history_size':0})
+    hb=s.historybuf
+    exp_seg = -(-hb.ynum // 2048)   # ceil(ynum/2048)
+    rss0=rss_kb()
+    print(f"[{tag}] ynum={hb.ynum} (<=2048 -> expected_segments={exp_seg}) BEFORE: count={hb.count} RSS={rss0}KB")
+    snaps={}
+    for i in range(ynum*3):                 # feed 3x capacity to force saturation + eviction
+        s.draw("X"*40); s.linefeed(); s.carriage_return()
+        for m in (ynum//2, ynum-1, ynum):
+            if hb.count==m and m not in snaps: snaps[m]=rss_kb()
+    for m in sorted(snaps):
+        print(f"    count={m:5d} RSS={snaps[m]:8d}KB")
+    print(f"[{tag}] AFTER {ynum*3} lines: count={hb.count} (==ynum -> SATURATED) RSS={rss_kb()}KB delta_since_before={rss_kb()-rss0}KB")
+    return hb.count, hb.ynum
+a=run("RUN1", 2000); b=run("RUN2", 2000)
+print("STABLE=", a==b)
+```
+
+Observed output (complete, unedited; stable across 2 runs):
+
+```text
+[RUN1] ynum=2000 (<=2048 -> expected_segments=1) BEFORE: count=0 RSS=26268KB
+    count= 1000 RSS=   28908KB
+    count= 1999 RSS=   31408KB
+    count= 2000 RSS=   31412KB
+[RUN1] AFTER 6000 lines: count=2000 (==ynum -> SATURATED) RSS=31412KB delta_since_before=5144KB
+[RUN2] ynum=2000 (<=2048 -> expected_segments=1) BEFORE: count=0 RSS=26548KB
+    count= 1000 RSS=   28964KB
+    count= 1999 RSS=   31460KB
+    count= 2000 RSS=   31464KB
+[RUN2] AFTER 6000 lines: count=2000 (==ynum -> SATURATED) RSS=31464KB delta_since_before=4916KB
+STABLE= True
+```
+
+`count` saturates at `ynum = 2000` and RSS rises by a **single** ~5 MiB step (`delta_since_before` = 5144 KB / 4916 KB across the two runs — one segment), then stays flat through all 6000 lines. Confirmed under `strace`: exactly **one** segment‑sized `mmap` (the eager seg‑0 at construction, between the `before_create_screen` and `after_create_screen` markers) and **zero** during the 6000‑line burst:
+
+```text
+write(2, "=MARK before_create_screen\n", 27) = 27
+mmap(NULL, 5255168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ea4b8721000
+write(2, "=MARK after_create_screen count="..., 44) = 44
+write(2, "=MARK after_burst count=2000 ynu"..., 39) = 39
+-- count of segment mmaps (expect 1: only eager seg0) --
+1
+```
+
+**Cause→effect:** below 2049 lines the carving mechanism is a no‑op after construction, because `segment_for`'s guard `while (… && SEGMENT_SIZE * self->num_segments < self->ynum) add_segment(self);` (`kitty/history.c:36-42`) is already false once `num_segments == 1` and `ynum ≤ 2048` (`2048 * 1 ≥ ynum`). So there are **no** mid‑burst allocation spikes at all — the single‑segment case transitions perfectly smoothly, in direct contrast to the 4 lazy‑carve spikes of §3.3–§3.5.
+
+### 3.7 Cause→effect (the specific code doing the work)
 
 Each new history line is written through `historybuf_add_line` (`kitty/history.c:286-291`) → `historybuf_push` (`kitty/history.c:275-284`) → `init_line`, which resolves the line's slot via `segment_for()` (`kitty/history.c:36-42`). The carve is triggered by the loop condition inside `segment_for`:
 
@@ -229,10 +424,45 @@ historybuf_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
 
 ### 4.2 Command
 
-`ynum = 8` (via `cols=20, lines=5, scrollback=8`), feeding 40 short lines `line0000…line0039`, in two configurations — OFF (`scrollback_pager_history_size = 0`) and ON (`= 4 MiB`). Run twice.
+`ynum = 8` (via `cols=20, lines=5, scrollback=8`), feeding 40 short lines `line0000…line0039`, in two configurations — OFF (`scrollback_pager_history_size = 0`) and ON (`= 4 MiB`). Run twice. Invoked as `PYTHONPATH="$(pwd)" python3 q2_pager.py`, where `q2_pager.py` is:
 
-```
-PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q2_pager.py
+```python
+# Q2: segmented line-ring <-> pager byte-ring coupling, at ynum=8, OFF (default) vs ON (4 MiB).
+# The pager is fed ONLY when the line-ring evicts (count==ynum) -> historybuf_push calls
+# pagerhist_push at kitty/history.c:280. Run twice for stability.
+from kitty_tests import BaseTest
+class _T(BaseTest):
+    def runTest(self): pass
+NLINES = 40
+def feed(pager_sz):
+    bt=_T()
+    s=bt.create_screen(cols=20, lines=5, scrollback=8,
+                       options={'scrollback_pager_history_size': pager_sz})
+    hb=s.historybuf
+    first_full=None; first_pager=None
+    for i in range(NLINES):
+        s.draw(f"line{i:04d}"); s.linefeed(); s.carriage_return()
+        pb=len(hb.pagerhist_as_bytes())
+        if first_full is None and hb.count==hb.ynum: first_full=(i, hb.count, pb)
+        if first_pager is None and pb>0: first_pager=(i, hb.count, pb)
+    return s, hb, first_full, first_pager
+def run(tag):
+    print(f"=== {tag} ===")
+    s,hb,ff,fp = feed(0)
+    b=hb.pagerhist_as_bytes()
+    print(f"[OFF] pager_sz=0 ynum={hb.ynum} final count={hb.count} final pager_bytes={len(b)}")
+    print(f"[OFF] pagerhist_as_bytes()={b!r} len={len(b)}")
+    s,hb,ff,fp = feed(4*1024*1024)
+    b=hb.pagerhist_as_bytes()
+    print(f"[ON ] pager_sz={4*1024*1024} ynum={hb.ynum} final count={hb.count} final pager_bytes={len(b)}")
+    print(f"[ON ] first count==ynum (line-ring FULL): {ff}   # (fed_index, count, pager_bytes)")
+    print(f"[ON ] first pager_bytes>0 (eviction feeds ring): {fp}")
+    print(f"[ON ] pager head: {hb.pagerhist_as_text()[:70]!r}")
+    return len(b), ff, fp
+a=run("RUN A"); b=run("RUN B (stability)")
+print("STABLE final_pager_bytes:", a[0]==b[0], "| A=", a[0], "B=", b[0])
+print("first_full A vs B:", a[1], b[1])
+print("first_pager A vs B:", a[2], b[2])
 ```
 
 ### 4.3 Observed output (complete, unedited; stable across 2 runs)
@@ -244,14 +474,14 @@ PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q2_pager.py
 [ON ] pager_sz=4194304 ynum=8 final count=8 final pager_bytes=364
 [ON ] first count==ynum (line-ring FULL): (11, 8, 0)   # (fed_index, count, pager_bytes)
 [ON ] first pager_bytes>0 (eviction feeds ring): (12, 8, 13)
-[ON ] pager head: '\x1b[mline0000\r\n\x1b[mline0001\r\n\x1b[mline0002\r\n\x1b[mline0003\r\n\x1b[mline0004\r\n\x1b[mline0005\r\n\x1b['
+[ON ] pager head: '\x1b[mline0000\r\n\x1b[mline0001\r\n\x1b[mline0002\r\n\x1b[mline0003\r\n\x1b[mline0004\r\n\x1b[mli'
 === RUN B (stability) ===
 [OFF] pager_sz=0 ynum=8 final count=8 final pager_bytes=0
 [OFF] pagerhist_as_bytes()=b'' len=0
 [ON ] pager_sz=4194304 ynum=8 final count=8 final pager_bytes=364
 [ON ] first count==ynum (line-ring FULL): (11, 8, 0)   # (fed_index, count, pager_bytes)
 [ON ] first pager_bytes>0 (eviction feeds ring): (12, 8, 13)
-[ON ] pager head: '\x1b[mline0000\r\n\x1b[mline0001\r\n\x1b[mline0002\r\n\x1b[mline0003\r\n\x1b[mline0004\r\n\x1b[mline0005\r\n\x1b['
+[ON ] pager head: '\x1b[mline0000\r\n\x1b[mline0001\r\n\x1b[mline0002\r\n\x1b[mline0003\r\n\x1b[mline0004\r\n\x1b[mli'
 STABLE final_pager_bytes: True | A= 364 B= 364
 first_full A vs B: (11, 8, 0) (11, 8, 0)
 first_pager A vs B: (12, 8, 13) (12, 8, 13)
@@ -281,10 +511,36 @@ It is **not perfectly smooth** — the growth is mostly cheap per‑line increme
 
 ### 5.2 Command
 
-`ynum = 8`, pager `maximum_size = 4 MiB`, 100 columns, feeding **60000** ~90‑char lines. Run twice.
+`ynum = 8`, pager `maximum_size = 4 MiB`, 100 columns, feeding **60000** ~90‑char lines. Run twice. Invoked as `PYTHONPATH="$(pwd)" python3 q3_pager_growth.py`, where `q3_pager_growth.py` is:
 
-```
-PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q3_pager_growth.py
+```python
+# Q3: pager-ring growth "hesitation" — starts at MIN(1MiB,max), extends in >=1MiB steps with a
+# full ringbuf_copy per extend (kitty/history.c:89-101), then PLATEAUS at maximum_size (:92 cap).
+# ynum=8 so the line-ring saturates almost immediately and every further line feeds the pager.
+from kitty_tests import BaseTest
+class _T(BaseTest):
+    def runTest(self): pass
+def rss_kb():
+    for ln in open('/proc/self/status'):
+        if ln.startswith('VmRSS'): return int(ln.split()[1])
+MAX=4*1024*1024
+def run(tag):
+    bt=_T()
+    s=bt.create_screen(cols=100, lines=5, scrollback=8,
+                       options={'scrollback_pager_history_size': MAX})
+    hb=s.historybuf
+    print(f"[{tag}] pager maximum_size={MAX} bytes (~{MAX/1048576:.2f} MiB); "
+          f"starts at MIN(1MiB,max)={min(1048576,MAX)} bytes; ynum={hb.ynum}")
+    for i in range(1, 60001):
+        s.draw("Q"*90); s.linefeed(); s.carriage_return()
+        if i % 10000 == 0:
+            pb=len(hb.pagerhist_as_bytes())
+            print(f"    fed={i:6d} count={hb.count} pager_bytes={pb:9d} (~{pb/1048576:.3f} MiB) RSS={rss_kb()}KB")
+    pb=len(hb.pagerhist_as_bytes())
+    print(f"[{tag}] FINAL pager_bytes={pb} -> PLATEAU at maximum_size => retention bound")
+    return pb
+a=run("RUN1"); b=run("RUN2")
+print("STABLE final:", a==b, "| RUN1=", a, "RUN2=", b)
 ```
 
 ### 5.3 Observed output (complete, unedited; stable across 2 runs)
@@ -313,22 +569,43 @@ The pager grows ~0.95 MiB per 10000 lines and **plateaus at exactly `maximum_siz
 
 ### 5.4 Deeper evidence — `strace` of the ring extends (the copy‑on‑grow spikes)
 
-`ringbuf_new` does `malloc(capacity+1)` (`3rdparty/ringbuf/ringbuf.c`), which for ≥1 MiB is served by `mmap`. Bracketed with `=MARK` writes:
+`ringbuf_new` (`3rdparty/ringbuf/ringbuf.c:50`) sets `rb->size = capacity + 1` (`3rdparty/ringbuf/ringbuf.c:56`) and then does `rb->buf = malloc(rb->size)` (`3rdparty/ringbuf/ringbuf.c:57`), which for a ≥1 MiB ring is served by `mmap`. Bracketing the run with `=MARK` writes and filtering `mmap`s ≥ 1 MiB gives the complete, unedited trace (full args and real return addresses — no elision):
 
-```
-=MARK before_create
-mmap(NULL, 1052672, ...)   <- RING init 1MiB (MIN(1MiB,max)); alloc_pagerhist -> ringbuf_new
-mmap(NULL, 6565888, ...)   <- history SEGMENT 0 @100 cols (eager): 2048*(100*32+1)=6,555,648 + overhead
-mmap(NULL, 1052672, ...)   <- RING init 1MiB again (reset -> pagerhist_clear)
-=MARK after_create
-mmap(NULL, 2101248, ...)   <- RING extend ->2MiB + full ringbuf_copy
-mmap(NULL, 3149824, ...)   <- RING extend ->3MiB + full ringbuf_copy
-mmap(NULL, 4198400, ...)   <- RING extend ->4MiB (=maximum_size) + full ringbuf_copy
-mmap(NULL, 4198400, ...)   <- pagerhist_as_bytes() read-out buffer (PyBytes of used size)
-=MARK after_burst count=8 pager_bytes=4194304
+```text
+write(2, "=MARK before_create\n", 20)   = 20
+mmap(NULL, 1052672, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f30593ea000
+mmap(NULL, 6565888, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f3058da7000
+mmap(NULL, 1052672, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f3058ca6000
+write(2, "=MARK after_create\n", 19)    = 19
+mmap(NULL, 2101248, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f3058aa5000
+mmap(NULL, 3149824, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f30587a4000
+mmap(NULL, 4198400, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f30583a3000
+write(2, "=MARK after_burst count=8\n", 26) = 26
+mmap(NULL, 4198400, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f30589a6000
+write(2, "=MARK after_readout pager_bytes="..., 40) = 40
 ```
 
-There is **no allocation beyond 4 MiB**, confirming the `if (buffer_size >= ph->maximum_size) return false;` cap at `kitty/history.c:92` and the plateau in §5.3. Note `pagerhist_extend` has **no standalone symbol** — LTO inlines it into `pagerhist_write_bytes` — which is precisely why the ring extends are observed via `strace` on the `mmap` sizes rather than a `gdb` breakpoint on the function.
+Each size mapped to its cause: `1052672` is the ring's initial `MIN(1 MiB, maximum_size)` from `alloc_pagerhist → ringbuf_new` — it appears **twice** (the first `ringbuf_new`, then the reset that re‑creates it at construction); `6565888` is the eager history **segment 0** at 100 columns (`2048*(100*32+1)` = 6,555,648 + allocator overhead), **not** a ring allocation; `2101248 → 3149824 → 4198400` are the three ring **extends** to 2, 3, then 4 MiB, each preceded by a full `ringbuf_copy` of the used bytes; and the trailing `4198400` after `after_burst` is the `pagerhist_as_bytes()` read‑out `PyBytes` buffer, again not a ring extend.
+
+For completeness, the full histogram of every `mmap` ≥ 1 MiB during the run (leading number = count, then the size):
+
+```text
+      7 mmap(NULL, 1048576,
+      2 mmap(NULL, 1052672,
+      1 mmap(NULL, 1097752,
+      1 mmap(NULL, 1297128,
+      1 mmap(NULL, 1405608,
+      1 mmap(NULL, 2101248,
+      1 mmap(NULL, 2371152,
+      1 mmap(NULL, 3149824,
+      2 mmap(NULL, 4198400,
+      1 mmap(NULL, 6037232,
+      1 mmap(NULL, 6368296,
+      1 mmap(NULL, 6565888,
+      1 mmap(NULL, 7982240,
+```
+
+The **largest ring‑related size is `4198400`** (4 MiB + one page), which appears exactly twice (the final extend to `maximum_size` and the read‑out buffer) and never grows past it — confirming the `if (buffer_size >= ph->maximum_size) return false;` cap at `kitty/history.c:92` and the plateau in §5.3. The sizes above 4,198,400 (`6565888` = the 100‑column history segment, plus incidental `6037232` / `6368296` / `7982240` CPython/harness allocations) are **not** the ring. Note `pagerhist_extend` has **no standalone symbol** — LTO inlines it into `pagerhist_write_bytes` — which is precisely why the ring extends are observed via `strace` on the `mmap` sizes rather than a `gdb` breakpoint on the function.
 
 ### 5.5 Cause→effect
 
@@ -350,26 +627,85 @@ present identically at **`kitty/screen.c:2716`** (`screen_update_only_line_graph
 
 ### 6.2 Command
 
-`cols=80, lines=5, scrollback=10000`; ~200 lines pre‑loaded, then for each mode: scroll up, feed a **300‑line burst with no render**, then render once. Plus a saturation case at `scrollback=30`. The render step uses the exposed `update_only_line_graphics_data()` method, which runs the `:2716` re‑anchor. Run twice.
+`cols=80, lines=5, scrollback=10000`; ~200 lines pre‑loaded, then for each mode: scroll up, feed a **300‑line burst with no render**, then render once. Plus a saturation case at `scrollback=30`. `history_line_added_count` (hlac) is **directly observed** via the exposed `Screen` member (`kitty/screen.c:4908` — a `T_UINT` `PyMemberDef`, so `s.history_line_added_count` reads it live; it is a *measured* value, not inferred). The render step uses the exposed `update_only_line_graphics_data()` method, which runs the `:2716` re‑anchor and then zeroes hlac via `screen_reset_dirty` (`:2599-2601`). Run twice. Invoked as `PYTHONPATH="$(pwd)" python3 q4_scroll.py`, where `q4_scroll.py` is:
 
-```
-PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q4_scroll.py
+```python
+# Q4: concurrent scroll while data arrives. history_line_added_count (hlac) is DIRECTLY OBSERVED
+# via the exposed Screen member (kitty/screen.c:4908); render re-anchors scrolled_by via
+# scrolled_by = MIN(scrolled_by + hlac, count) at kitty/screen.c:2716. Run twice for stability.
+import kitty.fast_data_types as fdt
+from kitty_tests import BaseTest
+class _T(BaseTest):
+    def runTest(self): pass
+def fresh(scrollback=10000, preload=200):
+    bt=_T()
+    s=bt.create_screen(cols=80, lines=5, scrollback=scrollback,
+                       options={'scrollback_pager_history_size':0})
+    for i in range(preload):
+        s.draw("Y"*70); s.linefeed(); s.carriage_return()
+    s.update_only_line_graphics_data()   # render -> screen_reset_dirty resets hlac to 0
+    return s
+def run(tag):
+    print(f"########## {tag} ##########")
+    print(f"ScrollType enum values: SCROLL_LINE={fdt.SCROLL_LINE} SCROLL_PAGE={fdt.SCROLL_PAGE} "
+          f"SCROLL_FULL={fdt.SCROLL_FULL}  (kitty/screen.h:13)")
+    for name,val in [("SCROLL_LINE",fdt.SCROLL_LINE),("SCROLL_PAGE",fdt.SCROLL_PAGE),("SCROLL_FULL",fdt.SCROLL_FULL)]:
+        s=fresh()
+        s.scroll(val, True)
+        sb0=s.scrolled_by; c0=s.historybuf.count
+        print(f"[{name}] after scroll({name},upwards=True): scrolled_by={sb0}  (count={c0}) hlac(observed)={s.history_line_added_count}")
+        for i in range(300):
+            s.draw("Z"*70); s.linefeed(); s.carriage_return()
+        hlac=s.history_line_added_count; sbf=s.scrolled_by; c1=s.historybuf.count
+        print(f"[{name}] burst of 300 more WHILE scrolled (no render yet): scrolled_by={sbf} (FROZEN=={sb0}) count={c1} hlac(OBSERVED)={hlac}")
+        s.update_only_line_graphics_data()
+        print(f"[{name}] after render (re-anchor): scrolled_by={s.scrolled_by} = MIN({sb0}+{hlac}, count={c1}) ; hlac reset={s.history_line_added_count}")
+        print()
+    # Saturation case
+    print("=== SATURATION (scrollback=30) ===")
+    s=fresh(scrollback=30, preload=200)
+    s.scroll(fdt.SCROLL_FULL, True)
+    print(f"count={s.historybuf.count}(==ynum={s.historybuf.ynum} SATURATED) scrolled_by={s.scrolled_by}(==count, pinned at oldest)")
+    for i in range(50):
+        s.draw("W"*70); s.linefeed(); s.carriage_return()
+    s.update_only_line_graphics_data()
+    print(f"after 50 more + render: count={s.historybuf.count}(still {s.historybuf.ynum}) scrolled_by={s.scrolled_by} -- cannot exceed count; oldest content already evicted, view slides off")
+run("RUN1"); print(); run("RUN2 (stability)")
 ```
 
 ### 6.3 Observed output (complete, unedited; stable across 2 runs)
 
-```
+```text
+########## RUN1 ##########
 ScrollType enum values: SCROLL_LINE=-999999 SCROLL_PAGE=-999998 SCROLL_FULL=-999997  (kitty/screen.h:13)
-[SCROLL_LINE] after scroll(SCROLL_LINE,upwards=True): scrolled_by=1  (count=196)
-[SCROLL_LINE] burst of 300 more WHILE scrolled (no render yet): scrolled_by=1 (FROZEN==1) count=496 hlac_inferred=300
+[SCROLL_LINE] after scroll(SCROLL_LINE,upwards=True): scrolled_by=1  (count=196) hlac(observed)=0
+[SCROLL_LINE] burst of 300 more WHILE scrolled (no render yet): scrolled_by=1 (FROZEN==1) count=496 hlac(OBSERVED)=300
 [SCROLL_LINE] after render (re-anchor): scrolled_by=301 = MIN(1+300, count=496) ; hlac reset=0
 
-[SCROLL_PAGE] after scroll(SCROLL_PAGE,upwards=True): scrolled_by=4  (count=196)
-[SCROLL_PAGE] burst of 300 more WHILE scrolled (no render yet): scrolled_by=4 (FROZEN==4) count=496 hlac_inferred=300
+[SCROLL_PAGE] after scroll(SCROLL_PAGE,upwards=True): scrolled_by=4  (count=196) hlac(observed)=0
+[SCROLL_PAGE] burst of 300 more WHILE scrolled (no render yet): scrolled_by=4 (FROZEN==4) count=496 hlac(OBSERVED)=300
 [SCROLL_PAGE] after render (re-anchor): scrolled_by=304 = MIN(4+300, count=496) ; hlac reset=0
 
-[SCROLL_FULL] after scroll(SCROLL_FULL,upwards=True): scrolled_by=196  (count=196)
-[SCROLL_FULL] burst of 300 more WHILE scrolled (no render yet): scrolled_by=196 (FROZEN==196) count=496 hlac_inferred=300
+[SCROLL_FULL] after scroll(SCROLL_FULL,upwards=True): scrolled_by=196  (count=196) hlac(observed)=0
+[SCROLL_FULL] burst of 300 more WHILE scrolled (no render yet): scrolled_by=196 (FROZEN==196) count=496 hlac(OBSERVED)=300
+[SCROLL_FULL] after render (re-anchor): scrolled_by=496 = MIN(196+300, count=496) ; hlac reset=0
+
+=== SATURATION (scrollback=30) ===
+count=30(==ynum=30 SATURATED) scrolled_by=30(==count, pinned at oldest)
+after 50 more + render: count=30(still 30) scrolled_by=30 -- cannot exceed count; oldest content already evicted, view slides off
+
+########## RUN2 (stability) ##########
+ScrollType enum values: SCROLL_LINE=-999999 SCROLL_PAGE=-999998 SCROLL_FULL=-999997  (kitty/screen.h:13)
+[SCROLL_LINE] after scroll(SCROLL_LINE,upwards=True): scrolled_by=1  (count=196) hlac(observed)=0
+[SCROLL_LINE] burst of 300 more WHILE scrolled (no render yet): scrolled_by=1 (FROZEN==1) count=496 hlac(OBSERVED)=300
+[SCROLL_LINE] after render (re-anchor): scrolled_by=301 = MIN(1+300, count=496) ; hlac reset=0
+
+[SCROLL_PAGE] after scroll(SCROLL_PAGE,upwards=True): scrolled_by=4  (count=196) hlac(observed)=0
+[SCROLL_PAGE] burst of 300 more WHILE scrolled (no render yet): scrolled_by=4 (FROZEN==4) count=496 hlac(OBSERVED)=300
+[SCROLL_PAGE] after render (re-anchor): scrolled_by=304 = MIN(4+300, count=496) ; hlac reset=0
+
+[SCROLL_FULL] after scroll(SCROLL_FULL,upwards=True): scrolled_by=196  (count=196) hlac(observed)=0
+[SCROLL_FULL] burst of 300 more WHILE scrolled (no render yet): scrolled_by=196 (FROZEN==196) count=496 hlac(OBSERVED)=300
 [SCROLL_FULL] after render (re-anchor): scrolled_by=496 = MIN(196+300, count=496) ; hlac reset=0
 
 === SATURATION (scrollback=30) ===
@@ -380,11 +716,11 @@ after 50 more + render: count=30(still 30) scrolled_by=30 -- cannot exceed count
 ### 6.4 Cause→effect
 
 - **SCROLL_LINE** sets `scrolled_by = 1` (`screen_history_scroll` maps `SCROLL_LINE → amt=1`, `kitty/screen.c:4094`). **SCROLL_PAGE** sets `4` (`lines-1 = 5-1`, `:4097`). **SCROLL_FULL** sets `196` (`= count`, `:4100`).
-- During the 300‑line burst **without a render**, `scrolled_by` stays **frozen** at its pre‑burst value while `count` grows (196 → 496) and `history_line_added_count` silently accumulates to 300. Nothing re‑anchors because the re‑anchor only runs inside the render functions.
+- During the 300‑line burst **without a render**, `scrolled_by` stays **frozen** at its pre‑burst value while `count` grows (196 → 496) and `history_line_added_count` accumulates to **300** — read directly as `hlac(OBSERVED)=300` in §6.3, not inferred. Nothing re‑anchors because the re‑anchor only runs inside the render functions.
 - The next render folds `hlac` in via `MIN(scrolled_by + hlac, count)`: `1+300→301`, `4+300→304`, `196+300→496`. This keeps the viewport pinned to the *same old line* as new data arrives — the user does not get yanked around.
 - **Saturation:** once `count` has hit its ceiling (`ynum = 30`), `scrolled_by` is clamped by the `MIN(…, count)` term and **cannot grow past `count`**. After 50 more lines + render, `count` is still 30 and `scrolled_by` is still 30 — the oldest content has already been evicted, so the anchored view "slides off" the bottom of history.
 
-This is cause→effect through `history_line_added_count` accumulated between renders, **not** true multi‑threaded contention: there is no lock around `HistoryBuf`, and the same code path performs both the push and the re‑anchor. (`history_line_added_count` is not exposed to Python, so its value is *inferred* from the number of lines fed during the frozen window — 300 — which the post‑render `scrolled_by` arithmetic confirms exactly.)
+This is cause→effect through `history_line_added_count` accumulated between renders, **not** true multi‑threaded contention: there is no lock around `HistoryBuf`, and the same code path performs both the push and the re‑anchor. (`history_line_added_count` **is** exposed to Python as a writable `T_UINT` `Screen` member at `kitty/screen.c:4908`, so the frozen‑window value **300** is read directly via `s.history_line_added_count` — it is **observed, not inferred** — and the post‑render `scrolled_by` arithmetic `MIN(scrolled_by + 300, count)` confirms it exactly before `screen_reset_dirty` zeroes it at `kitty/screen.c:2599-2601`.)
 
 ---
 
@@ -410,36 +746,119 @@ This is cause→effect through `history_line_added_count` accumulated between re
 
 ### 7.3 Command + observed output — Q5a wrapping (complete, unedited; stable 2×)
 
-```
-PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q5_wrap.py
+Drawing a single 25‑char logical line at `cols=10` (so it wraps into 3 physical rows `ABCDEFGHIJ | KLMNOPQRST | UVWXY`), pager ON, then feeding **20** short unwrapped lines `z0…z19` to evict the wrapped rows and several unwrapped rows into the pager. Invoked as `PYTHONPATH="$(pwd)" python3 q5_wrap.py`, where `q5_wrap.py` is:
+
+```python
+# Q5a: wrapping serialization. cols=10, draw a 25-char logical line -> 3 physical rows
+# (ABCDEFGHIJ | KLMNOPQRST | UVWXY). Pager ON; feed enough short unwrapped lines to evict the
+# wrapped rows AND several unwrapped rows into the pager (oldest-first), so both cases show.
+# pagerhist_push (kitty/history.c:269-270): every physical row ends '\r'; '\n' is appended
+# only when the last cell is NOT a wrap continuation (next_char_was_wrapped == false).
+from kitty_tests import BaseTest
+class _T(BaseTest):
+    def runTest(self): pass
+def run(tag):
+    bt=_T()
+    s=bt.create_screen(cols=10, lines=5, scrollback=5,
+                       options={'scrollback_pager_history_size': 4*1024*1024})
+    s.draw("ABCDEFGHIJKLMNOPQRSTUVWXY"); s.linefeed(); s.carriage_return()
+    for i in range(20):
+        s.draw(f"z{i}"); s.linefeed(); s.carriage_return()
+    txt=s.historybuf.pagerhist_as_text()
+    print(f"=== {tag}: Q5a wrapping (cols=10, draw 25 chars -> 3 physical rows, then 20 short lines) ===")
+    print(f"pagerhist_as_text()={txt!r}")
+    print("  -> wrapped rows (ABCDEFGHIJ, KLMNOPQRST) end '\\r' only; unwrapped rows (UVWXY, z*) end '\\r\\n'  (history.c:269-270)")
+    return txt
+a=run("RUN1"); b=run("RUN2 (stability)")
+print("STABLE Q5a:", a==b)
 ```
 
-Drawing a single 25‑char logical line at `cols=10` (so it wraps into 3 physical rows `ABCDEFGHIJ | KLMNOPQRST | UVWXY`), pager ON, then evicting it with short unwrapped lines:
+Observed output (complete, unedited; **both runs shown, identical**):
 
-```
-=== Q5a wrapping (cols=10, draw 25 chars -> 3 physical rows) ===
-pagerhist_as_text()='\x1b[mABCDEFGHIJ\r\x1b[mKLMNOPQRST\r\x1b[mUVWXY\r\n\x1b[mz0\r\n\x1b[mz1\r\n\x1b[mz2\r\n\x1b[mz3\r\n\x1b[mz4\r\n\x1b[mz5\r\n\x1b[mz6\r\n\x1b[m'
-  -> wrapped rows end '\r' only; unwrapped row ends '\r\n'  (history.c:269-270)
+```text
+=== RUN1: Q5a wrapping (cols=10, draw 25 chars -> 3 physical rows, then 20 short lines) ===
+pagerhist_as_text()='\x1b[mABCDEFGHIJ\r\x1b[mKLMNOPQRST\r\x1b[mUVWXY\r\n\x1b[mz0\r\n\x1b[mz1\r\n\x1b[mz2\r\n\x1b[mz3\r\n\x1b[mz4\r\n\x1b[mz5\r\n\x1b[mz6\r\n\x1b[mz7\r\n\x1b[mz8\r\n\x1b[mz9\r\n\x1b[mz10\r\n'
+  -> wrapped rows (ABCDEFGHIJ, KLMNOPQRST) end '\r' only; unwrapped rows (UVWXY, z*) end '\r\n'  (history.c:269-270)
+=== RUN2 (stability): Q5a wrapping (cols=10, draw 25 chars -> 3 physical rows, then 20 short lines) ===
+pagerhist_as_text()='\x1b[mABCDEFGHIJ\r\x1b[mKLMNOPQRST\r\x1b[mUVWXY\r\n\x1b[mz0\r\n\x1b[mz1\r\n\x1b[mz2\r\n\x1b[mz3\r\n\x1b[mz4\r\n\x1b[mz5\r\n\x1b[mz6\r\n\x1b[mz7\r\n\x1b[mz8\r\n\x1b[mz9\r\n\x1b[mz10\r\n'
+  -> wrapped rows (ABCDEFGHIJ, KLMNOPQRST) end '\r' only; unwrapped rows (UVWXY, z*) end '\r\n'  (history.c:269-270)
+STABLE Q5a: True
 ```
 
-The two wrapped physical rows (`ABCDEFGHIJ`, `KLMNOPQRST`) end with **`\r` only**; the logical line‑end `UVWXY` and each short line `z0…z6` end with **`\r\n`** — exactly the `:270` condition.
+The two wrapped physical rows (`ABCDEFGHIJ`, `KLMNOPQRST`) end with **`\r` only**; the logical line‑end `UVWXY` and each short line `z0…z10` (the oldest‑first slice that reaches the pager) end with **`\r\n`** — exactly the `:270` condition.
 
 ### 7.4 Command + observed output — Q5b rewrap on resize (complete, unedited; stable 2×)
 
-```
-PYTHONPATH="$(pwd)" python3 /tmp/blitzy_adhoc/q5b_pager_rewrap.py
+Invoked as `PYTHONPATH="$(pwd)" python3 q5b_pager_rewrap.py`, where `q5b_pager_rewrap.py` is:
+
+```python
+# Q5b: rewrap on column resize (line-ring via historybuf_rewrap; pager-ring via pagerhist_rewrap_to).
+# Q5c: retention — the line ring never exceeds ynum. resize(lines, cols) REPLACES the HistoryBuf,
+# so we re-read s.historybuf after each resize.
+from kitty_tests import BaseTest
+class _T(BaseTest):
+    def runTest(self): pass
+def run(tag):
+    print(f"########## {tag} ##########")
+    # --- line-ring rewrap ---
+    bt=_T()
+    s=bt.create_screen(cols=10, lines=5, scrollback=200, options={'scrollback_pager_history_size':0})
+    for i in range(20):
+        s.draw("ABCDEFGHIJKLMNOPQRSTUVWXY"); s.linefeed(); s.carriage_return()
+    print("=== Q5b line-ring rewrap on resize (20 wrapped logical lines @10 cols) ===")
+    print(f"BEFORE resize: count={s.historybuf.count} xnum={s.historybuf.xnum}")
+    s.resize(5, 40)
+    print(f"AFTER resize->40 cols: count={s.historybuf.count} xnum={s.historybuf.xnum}   (widening reflows: fewer physical rows)")
+    s.resize(5, 5)
+    print(f"AFTER resize->5  cols: count={s.historybuf.count} xnum={s.historybuf.xnum}    (narrowing: more physical rows)")
+    # --- pager-ring rewrap ---
+    bt=_T()
+    s2=bt.create_screen(cols=10, lines=5, scrollback=5, options={'scrollback_pager_history_size':4*1024*1024})
+    for i in range(20):
+        s2.draw("ABCDEFGHIJKLMNOPQRSTUVWXY"); s2.linefeed(); s2.carriage_return()
+    print("=== Q5b-2 pager-ring rewrap (ynum=5 so eviction fills pager) ===")
+    p0=s2.historybuf.pagerhist_as_text()
+    print(f"BEFORE resize xnum={s2.historybuf.xnum}: pager={p0[:45]!r} len={len(p0)}")
+    s2.resize(5, 40)
+    p1=s2.historybuf.pagerhist_as_text()
+    print(f"AFTER  resize->40 xnum={s2.historybuf.xnum}: pager={p1[:45]!r}    len={len(p1)}  reflowed={p0!=p1}")
+    # --- retention ---
+    bt=_T()
+    s3=bt.create_screen(cols=20, lines=5, scrollback=40, options={'scrollback_pager_history_size':0})
+    for i in range(500):
+        s3.draw("r"*15); s3.linefeed(); s3.carriage_return()
+    print("=== Q5c retention: line ring never exceeds ynum ===")
+    print(f"fed 500, count={s3.historybuf.count} == ynum={s3.historybuf.ynum} (line ring never exceeds ynum)")
+    return (s.historybuf.count, len(p0), len(p1), s3.historybuf.count)
+a=run("RUN1"); print(); b=run("RUN2 (stability)")
+print("STABLE Q5b/c:", a==b, "| RUN1=", a, "RUN2=", b)
 ```
 
-```
+Observed output (complete, unedited; **both runs shown, identical**):
+
+```text
+########## RUN1 ##########
 === Q5b line-ring rewrap on resize (20 wrapped logical lines @10 cols) ===
 BEFORE resize: count=56 xnum=10
 AFTER resize->40 cols: count=19 xnum=40   (widening reflows: fewer physical rows)
 AFTER resize->5  cols: count=96 xnum=5    (narrowing: more physical rows)
 === Q5b-2 pager-ring rewrap (ynum=5 so eviction fills pager) ===
-BEFORE resize xnum=10: pager='\x1b[mABCDEFGHIJ\r\x1b[mKLMNOPQRST\r\x1b[mUVWXY\r\n\x1b[mABCDEFGHIJ\r\x1b[mKLMNO' len=646
-AFTER  resize->40 xnum=40: pager='\x1b[mABCDEFGHIJ\x1b[mKLMNOPQRST\x1b[mUVWXY\n\x1b[mABCDEFGHIJ\x1b[mKLMNOPQRS'    len=595  reflowed=True
+BEFORE resize xnum=10: pager='\x1b[mABCDEFGHIJ\r\x1b[mKLMNOPQRST\r\x1b[mUVWXY\r\n\x1b[mABCD' len=646
+AFTER  resize->40 xnum=40: pager='\x1b[mABCDEFGHIJ\x1b[mKLMNOPQRST\x1b[mUVWXY\n\x1b[mABCDEFG'    len=595  reflowed=True
 === Q5c retention: line ring never exceeds ynum ===
 fed 500, count=40 == ynum=40 (line ring never exceeds ynum)
+
+########## RUN2 (stability) ##########
+=== Q5b line-ring rewrap on resize (20 wrapped logical lines @10 cols) ===
+BEFORE resize: count=56 xnum=10
+AFTER resize->40 cols: count=19 xnum=40   (widening reflows: fewer physical rows)
+AFTER resize->5  cols: count=96 xnum=5    (narrowing: more physical rows)
+=== Q5b-2 pager-ring rewrap (ynum=5 so eviction fills pager) ===
+BEFORE resize xnum=10: pager='\x1b[mABCDEFGHIJ\r\x1b[mKLMNOPQRST\r\x1b[mUVWXY\r\n\x1b[mABCD' len=646
+AFTER  resize->40 xnum=40: pager='\x1b[mABCDEFGHIJ\x1b[mKLMNOPQRST\x1b[mUVWXY\n\x1b[mABCDEFG'    len=595  reflowed=True
+=== Q5c retention: line ring never exceeds ynum ===
+fed 500, count=40 == ynum=40 (line ring never exceeds ynum)
+STABLE Q5b/c: True | RUN1= (96, 646, 595, 40) RUN2= (96, 646, 595, 40)
 ```
 
 > Implementation note: `screen.resize()` **replaces** the `HistoryBuf` object (a new buffer is built by `historybuf_rewrap`, `kitty/screen.c:221`). The script therefore re‑reads `s.historybuf` after each resize; a stale reference to the pre‑resize object shows an unchanged `xnum`/`count` and is a measurement error, not a behavior.
@@ -489,7 +908,7 @@ All anchors confirmed against HEAD `815df1e21`.
 
 **`kitty/options/definition.py`:** `scrollback_lines` = `2000` `:372`; `scrollback_pager_history_size` = `0` `:406-407`. **`kitty/options/utils.py`:** MB→bytes parse `:564`.
 
-**`3rdparty/ringbuf/ringbuf.h` / `.c`:** `ringbuf_new` `:41`; `ringbuf_reset` `:65`; `ringbuf_capacity` `:73`; `ringbuf_bytes_free` `:80`; `ringbuf_bytes_used` `:87`; `ringbuf_memcpy_into` `:154`; `ringbuf_copy` `:252`; buffer `malloc` in `ringbuf.c`.
+**`3rdparty/ringbuf/ringbuf.h` (declarations):** `ringbuf_new` `:41`; `ringbuf_reset` `:65`; `ringbuf_capacity` `:73`; `ringbuf_bytes_free` `:80`; `ringbuf_bytes_used` `:87`; `ringbuf_memcpy_into` `:154`; `ringbuf_copy` `:252`. **`3rdparty/ringbuf/ringbuf.c` (implementations):** `ringbuf_new` `:50` → `rb->size = capacity + 1` `:56` → `rb->buf = malloc(rb->size)` `:57` (the `malloc(capacity+1)` whose ≥ 1 MiB request is served by `mmap`, as traced in §5.4); `ringbuf_copy` `:359` (the copy‑on‑grow invoked by `pagerhist_extend` on every ring extend, §5.5).
 
 **`kitty_tests/__init__.py`:** `parse_bytes` `:30`; `Callbacks` `:39`; harness pager default (`scrollback_pager_history_size = 1024`) `:224`; `create_screen` `:237`; `Screen(...)` `:240`. **`kitty_tests/datatypes.py`:** `test_historybuf` `:487`; `HistoryBuf(3000,5)` `:501`. **`kitty/window.py`:** `pagerhist()` `:355-356`; `as_text()` `:363`; `cmd_output()` `:457`.
 
@@ -509,6 +928,6 @@ Confirming every named item in the prompt is addressed with observed evidence:
 
 **Named mechanisms/functions/flags — each named explicitly above:** `SEGMENT_SIZE` (§3,§8), `add_segment` (§3), `segment_for` (§3), `historybuf_push` (§3,§4), `pagerhist_push` (§4), `pagerhist_extend` (§5), `alloc_pagerhist` (§4,§5), `pagerhist_rewrap_to` (§7), `historybuf_add_line` (§1,§3), `INDEX_UP` (§1,§6), `history_line_added_count` (§6), `scrolled_by` (§6), `screen_history_scroll` (§6), `scrollback_lines` (§9), `scrollback_pager_history_size` (§2,§4), `ringbuf_copy` (§5), `ringbuf_new` (§5), `next_char_was_wrapped` (§7).
 
-**Conditions exercised:** pager OFF vs ON (§4); single‑segment (≤2048) trivially vs multi‑segment (≫2048, `ynum=10000`) (§3); 2048‑boundary crossings (§3); ring‑full growth (§5); concurrent scroll during burst (§6); column‑resize rewrap (§7); before/during/after snapshots of `count`/`ynum`/`xnum`/RSS/pager length (§3–§7).
+**Conditions exercised:** pager OFF vs ON (§4); single‑segment (`ynum = 2000 ≤ 2048` — observed: eager seg‑0 only, **zero** lazy carves, exactly 1 segment `mmap`, §3.6) vs multi‑segment (`ynum = 10000 ≫ 2048` — 5 segments, 1 eager + 4 lazy carves, §3.1–§3.5); 2048‑boundary crossings (§3); ring‑full growth (§5); concurrent scroll during burst (§6); column‑resize rewrap (§7); before/during/after snapshots of `count`/`ynum`/`xnum`/RSS/pager length (§3–§7).
 
 **Evidence discipline:** every behavioral claim above is backed by its own unedited command output; the **only** *inferred* statement is the `fatal()` OOM abort (§5), which is deliberately not triggered because it would abort the process.
