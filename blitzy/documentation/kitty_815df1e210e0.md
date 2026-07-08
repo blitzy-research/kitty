@@ -16,6 +16,14 @@
 | Interpreter used (observed) | **CPython 3.13.7** (see note below) |
 | Verdict | **Expected, intended, documented, conventional syntax — not a defect** |
 
+> **Grounding of the table above.** Every entry is **Observed** or **From source** (per the tag key in *"How to read this document"* below); none is a bare assertion.
+> - **Repository** — identifies the upstream kitty project (`github.com/kovidgoyal/kitty`). *(The working checkout's `origin` is a Blitzy mirror of that project; the upstream identity is what the citations refer to.)*
+> - **Commit investigated** (`815df1e…`) — **Observed** from source control: it is the base commit this work derives from and an ancestor of the current `HEAD`; the subject module is byte‑identical between the two, so every `file:line` citation below remains valid.
+> - **Branch** (`kitty_815df1e210e0`) — **Observed**: the source branch this deliverable is named after exists as `origin/kitty_815df1e210e0`.
+> - **Subject module**, its **296‑line** length, and its **pure‑Python** nature — **From source `kitty/search_query_parser.py`** (the line count and stdlib‑only imports are re‑derived in the reproducibility appendix, section (f), and section (a)).
+> - **Real entry point** and **real consumers** — **From source `kitty/search_query_parser.py:L292` (body `L296`)** and **`kitty/boss.py:L471,L505`** (walked through in section (b)).
+> - **Interpreter** — **Observed** (`python3 --version` → `Python 3.13.7`; see the note directly below).
+
 > **Note on the interpreter version.** The task brief anticipated CPython 3.12.3, but the container's actual canonical interpreter — the one this investigation actually ran — is **CPython 3.13.7** (Observed: `python3 --version` → `Python 3.13.7`; the probe self‑reports `# python 3.13.7`). The parser is pure Python performing deterministic set logic, so the results are interpreter‑independent; every result below was byte‑identical across two runs. This document reports the **actually observed** interpreter to stay faithful to the run‑first, be‑exact methodology.
 
 ---
@@ -285,6 +293,8 @@ REPO_ROOT = os.environ.get("KITTY_REPO", "<repo root>")
 sys.path.insert(0, REPO_ROOT)
 from kitty.search_query_parser import ParseException, search
 
+print(f"# python {sys.version.split()[0]}")
+
 universe = {
     1: "apple pie", 2: "banana split", 3: "cherry cake",
     4: "apple banana cherry smoothie", 5: "date bar",
@@ -349,14 +359,21 @@ The repository contains a second, unrelated thing called "search": **`kittens/di
 
 ## Appendix B — Industry context (why implicit‑`AND` is a conventional design, not a defect)
 
-*(This section is external framing, not a claim about kitty's source.)*
+*(This section is external framing, not a claim about kitty's source. The claims below are **Web research (observed 2026‑07‑08)** against the first‑party documentation cited under "Sources" at the end of this appendix.)*
 
 Treating an unquoted space between terms as an **implicit boolean operator** is a widespread convention in query languages; the *default* operator simply varies by system:
 
-- Some systems make a bare space an implicit **`AND`** and require parentheses for grouping — for example Google's Issue Tracker and many code‑search tools. This is the same choice kitty makes.
-- Others make it an implicit **`OR`**: Apache Lucene's classic query‑parser documentation, for instance, describes `OR` as the default conjunction operator used when no operator appears between two terms, and engines such as Apache Solr and Elasticsearch expose a **configurable default operator** (`AND` or `OR`).
+- **Implicit `AND` — the same choice kitty makes.** Google's Issue Tracker treats a bare space between criteria as an implicit `AND` and uses parentheses for grouping; its documentation states that *"Space characters outside of quotation marks act as implicit AND operators"* and requires operators to be uppercase `AND`/`OR`/`NOT` [G1].
+- **Implicit `OR`.** Apache Lucene's classic query‑parser documentation states that *"The OR operator is the default conjunction operator"* — i.e. when no operator appears between two terms, `OR` is used, yielding a set union [L1]. Apache Solr's standard query parser documents the identical default‑`OR` behavior (it is built on Lucene) [S1], while Elasticsearch's `query_string` query exposes a **configurable `default_operator`** whose valid values are `OR` (the default) or `AND` [E1].
 
 What stays consistent across all of them is the remedy for "match any of several values": use an **explicit `OR`**, quote multi‑word phrases, or repeat the field for each value. That is exactly the corrective guidance in section (e), and it confirms that kitty's whitespace‑as‑implicit‑`AND` choice (`kitty/search_query_parser.py:L221-223`) is a **conventional, defensible design decision — not a defect.**
+
+**Sources (Web research, observed 2026‑07‑08):**
+
+- **[G1]** Google Issue Tracker — *Search Query Language*: <https://developers.google.com/issue-tracker/concepts/search-query-language>
+- **[L1]** Apache Lucene — *Query Parser Syntax* (classic query parser, "Boolean operators"): <https://lucene.apache.org/core/2_9_4/queryparsersyntax.html>
+- **[S1]** Apache Solr Reference Guide — *Standard Query Parser* ("Boolean operators"): <https://solr.apache.org/guide/solr/latest/query-guide/standard-query-parser.html>
+- **[E1]** Elasticsearch Reference — *Query string query* (`default_operator`): <https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-query-string-query>
 
 ---
 
