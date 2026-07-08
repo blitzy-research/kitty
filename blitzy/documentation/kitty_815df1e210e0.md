@@ -1664,7 +1664,7 @@ Two subtleties matter for an accurate statement of the result:
   (82,000 - 81,920) into a freshly-`calloc`-ed 41st segment, so although the full 2,048-row block is
   *reserved*, `VmRSS` reflects only the **touched/faulted pages** - about 80/2048 ~= 3.9 percent - which is
   why the final delta is just **+264 kB**, not another ~4,552 kB. In total **41 segments** back the buffer
-  (the initial `create_historybuf` segment plus 40 lazily added by `add_segment()`), of which segments 1-39
+  (the initial `create_historybuf` segment plus 40 lazily added by `add_segment()`), of which segments 1-40
   are full and the 41st is ~4 percent full.
 
 - **Jitter comes in pairs summing to exactly 2x4552 = 9,104 kB.** Where a delta deviates from 4,552 kB it is
