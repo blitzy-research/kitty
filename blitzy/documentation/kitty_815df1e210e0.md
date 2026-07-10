@@ -694,7 +694,7 @@ These are the most directly "visible" signs — the client receives real bytes. 
 
 #### F.3.1 The response‑suppression cross‑product (`q=0` / `q=1` / `q=2` × success / error) + the `I=` case
 
-The `q` (quiet) key is honoured by `finish_command_response` (`kitty/graphics.c:L759-L781`): `if (g->quiet) { if (is_ok_response || g->quiet > 1) return NULL; }`. So `q=1` suppresses only the success (`OK`) reply while errors still go out, and `q=2` suppresses **everything**. A response is emitted only when `g->id || g->image_number` is set, and it prints `i=%u` for the id (`L764`) and `,I=%u` for the image number (`L766`). The full cross‑product was exercised through the real PTY — **success** = a valid query carrying an id (`a=q` → `OK`), **error** = a put referencing a non‑existent image (`a=p` → `ENOENT`). Complete, unedited capture:
+The `q` (quiet) key is honoured by `finish_command_response` (`kitty/graphics.c:L759-L781`): `if (g->quiet) { if (is_ok_response || g->quiet > 1) return NULL; }`. So `q=1` suppresses only the success (`OK`) reply while errors still go out, and `q=2` suppresses **everything**. A response is emitted only when `g->id || g->image_number` is set, and it prints `i=%u` for the id (`L773`) and `,I=%u` for the image number (`L774`). The full cross‑product was exercised through the real PTY — **success** = a valid query carrying an id (`a=q` → `OK`), **error** = a put referencing a non‑existent image (`a=p` → `ENOENT`). Complete, unedited capture:
 
 ```
 === q0_success ===
@@ -764,10 +764,10 @@ Reading the cross‑product against the source:
 | error | 1 | `ENOENT` sent | `\x1b_Gi=902;ENOENT:…\x1b\\` (85 B) | error is not an OK response and `quiet == 1` (not `> 1`) |
 | success | 2 | **suppressed** | `b''` (0 B) | `is_ok_response` true → `return NULL` |
 | error | 2 | **suppressed** | `b''` (0 B) | `g->quiet > 1` → `return NULL` even for errors |
-| `I=` (error) | 0 | `ENOENT` sent | `\x1b_G,I=777;ENOENT:…id: 0 and number: 777\x1b\\` (86 B) | only `image_number` set → response prints `,I=777` (the `,I=%u` branch, `L766`); `g->id == 0` so no `i=` |
+| `I=` (error) | 0 | `ENOENT` sent | `\x1b_G,I=777;ENOENT:…id: 0 and number: 777\x1b\\` (86 B) | only `image_number` set → response prints `,I=777` (the `,I=%u` branch, `L774`); `g->id == 0` so no `i=` |
 | `q` absent (error) | — | `ENOENT` sent | `\x1b_Gi=904;ENOENT:…\x1b\\` (85 B) | `quiet` defaults to `0`; identical to `q=0` |
 
-The three suppressed cases (`q1_success`, `q2_success`, `q2_error`) each returned `b''` — a real, bounded **no‑response window** (the probe waited out its per‑command quiet window and read zero bytes), which is the observable form of "kitty silently dropped the reply." The `I=` case is the direct manifestation of the `,I=%u` branch at `L766`: with only an image number and no id, the reply opens `\x1b_G,I=777;…` (note the leading comma and the absent `i=`).
+The three suppressed cases (`q1_success`, `q2_success`, `q2_error`) each returned `b''` — a real, bounded **no‑response window** (the probe waited out its per‑command quiet window and read zero bytes), which is the observable form of "kitty silently dropped the reply." The `I=` case is the direct manifestation of the `,I=%u` branch at `L774`: with only an image number and no id, the reply opens `\x1b_G,I=777;…` (note the leading comma and the absent `i=`).
 
 #### F.3.2 The three distinct transfer size‑limit error branches
 
