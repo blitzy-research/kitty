@@ -95,6 +95,8 @@ $ hostname
 reverse-code-generator-3c218c56-6s5db
 ```
 
+[OBSERVED] The `dpkg` package list above is a **runtime-captured environment snapshot**, not a byte-reproducible manifest: its exact membership varies with apt dependency resolution. Re-running the same `dpkg -l | grep` at review time still shows every key software-GL provenance package with matching versions — Mesa `25.2.8-0ubuntu0.25.10.2`, Xvfb `2:21.1.18-1ubuntu1.1`, `libgl1 1.7.0-1build2` — plus additional additive Mesa packages that apt may pull in (e.g. `libegl-mesa0`, `libosmesa6`). The substantive claim (software-OpenGL/`llvmpipe` rendering via Mesa 25.2.8) does not depend on which additive packages happen to be present.
+
 The `/app` directory (the agent's own source) exists but was never read — only its presence is noted, to honour the security boundary:
 
 ```text
@@ -325,6 +327,8 @@ $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
 
+[OBSERVED] The stable, reproducible facts in the `file` output are the artifact **size** (`fast_data_types.so` = 1248952 bytes) and the **`not stripped`** attribute — the latter is what enables the symbol-level backtraces in §2 and §5. The `BuildID[sha1]` is deliberately **not** treated as reproducible: it is a per-build-instance hash (LTO/parallel link), so independent rebuilds of the identical source yield different values while size and not-stripped stay constant. This document's build produced `71ffb9d5…`; a fresh rebuild during review produced `dbfe635a…` (size 1248952 and `not stripped` unchanged); `glfw-x11.so`'s BuildID (`ea79d3ae…`) happened to remain stable across those rebuilds. No claim in this document depends on a specific `fast_data_types.so` BuildID value.
+
 ### 1.4 Headless launch under Xvfb with software OpenGL — a real GLFW X11 window [OBSERVED]
 
 kitty is a GPU/GUI application, so it was launched under a headless Xvfb X server with Mesa software OpenGL (`llvmpipe`). The launch is performed by a single deterministic, safely-quoted harness script that runs kitty and its child shells as a **dedicated unprivileged user** (`kittyinv`), authenticates the X server with a per-run **MIT-MAGIC-COOKIE `Xauthority`** (no `-ac`), places the remote-control socket and logs in a private `mktemp -d` directory with mode `0700`, restricts remote control to `socket-only`, sanitises the environment with `env -i` plus a minimal whitelist (so child shells inherit no secrets), and **captures the real kitty PID** by matching both the launcher-binary `exe` and the owning user. This is the exact script used (it also addresses the reproducibility and least-privilege requirements):
@@ -453,6 +457,8 @@ $ xwininfo -root -tree | grep -i kitty
 $ xdotool search --class kitty
 2097164
 ```
+
+[OBSERVED] The startup-log line `Failed to open systemd user bus with error: No medium found` is a **benign, environment-dependent** condition (no per-user systemd/dbus session bus in this container). The exact error *text* is not reproducible — a fresh launch during review emitted the variant `Failed to open systemd user bus with error: Connection refused` for the same underlying dbus-unavailable condition. It is irrelevant to input/focus: the surrounding log lines (`OS Window created` just before it, then `Child launched` and `on_focus_change: window id: 0x1 focused: 1` just after) show kitty still creates and focuses the real OS window — the substantive behavior documented throughout §3.
 
 The running process is verified to be the launcher binary, owned by the unprivileged user, with the **real X11 GLFW backend** mapped (`glfw-x11.so`, 5 segments) and the **null/headless backend absent** (0 segments) — i.e. this is the canonical windowed input path, not a synthetic/null backend. The PID, uid, `/proc/<pid>/exe`, start-time, and command line are captured (never hard-coded), and this identity is re-verified before every debugger/profiler attach in §5:
 
@@ -1978,78 +1984,187 @@ After the io-thread reads child output it must wake the main loop to repaint, bu
 
 ### 8.2 The tradeoff (exactly one)
 
-**kitty trades output-rendering responsiveness for coherent-frame correctness and efficiency.** The io-thread consumes *every* byte of child output immediately and losslessly, but the resulting repaints are gated/coalesced to at most one main-loop wakeup per `input_delay` (3 ms). A freshly produced output byte may therefore wait up to ~3 ms before it is painted (the responsiveness cost), in exchange for one coherent, non-torn frame per window per 3 ms and far fewer expensive main-loop wakeups (the correctness/efficiency benefit). This is stated from **measured behaviour** (the read:wakeup ratio in §8.3), not from the source comment.
+**kitty trades output-rendering responsiveness for coherent-frame correctness and efficiency.** The io-thread consumes *every* byte of child output immediately and losslessly, but the resulting repaints are gated/coalesced to at most one main-loop wakeup per `input_delay` (3 ms). A freshly produced output byte may therefore wait up to ~3 ms before it is painted (the responsiveness cost), in exchange for one coherent, non-torn frame per window per 3 ms and far fewer expensive main-loop wakeups (the correctness/efficiency benefit). This is stated from **measured behaviour** — in §8.3 the io-thread drains ~2.03 MiB of background output losslessly into only ~22–28 coalesced main-loop wakeups (tens of KiB per wakeup), gated to a directly-measured **~3.04 ms median inter-wakeup interval** (the `input_delay` gate) — not from the source comment.
 
 ### 8.3 Measurement — output coalescing under a heavy background flood [OBSERVED]
 
-Scale and setup: a **visible background** split window (window 33, fd 12) in the focused tab runs `cat flood2m.txt` where `flood2m.txt` is exactly **2,097,152 bytes (2 MiB)**; the **focused+active** window is window 1 (fd 10); X focus on OS-window 1 (`2097164`) is verified. The exact, repeatable counting harness (the same script run twice) is:
+Scale and setup: a **visible background** split window (fd 12/pts1) in the focused tab runs `cat flood2m.txt`; the **focused+active** window is window 1 (fd 10/pts0); X focus on OS-window 1 (`2097164`) is verified. `flood2m.txt` is generated deterministically as repeated 53-byte lines truncated to exactly **2,097,152 bytes (2 MiB)**, so the byte figure is reproducible rather than content-dependent:
+
+```bash
+python3 -c 'b=bytearray()
+while len(b)<2*1024*1024: b+=b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789kittyflood%06d\n"%(len(b)//53%1000000)
+open("flood2m.txt","wb").write(bytes(b[:2*1024*1024]))'
+```
+
+`strace -f` on a multithreaded process splits some syscalls into `<unfinished ...>`/`<... resumed>` line pairs. A naive line-grep therefore undercounts split reads and can *phantom-drop* a split one-byte focused-marker `write()` — falsely signalling starved focused input (demonstrated after the runs). The corrected harness therefore reconstructs those pairs **per-TID before counting**, and **asserts the focused-marker count equals the injected marker length** (a shortfall is a capture artifact → re-run, never treated as input loss). The corrected, repeatable counting harness is:
 
 ```bash
 #!/bin/bash
-# Repeatable coalescing measurement. Arg1 = run label.
-source /tmp/kitty_inv_evidence/harness/env.sh
-source /tmp/kitty_inv_evidence/harness/flood.env
+# Repeatable coalescing measurement (n>=2). Reconstructs strace <unfinished>/
+# <...resumed> split syscalls before counting and asserts the focused-marker
+# count == injected marker length. Arg1 = run label. All scratch lives under
+# $EV (outside the kitty checkout); parse_strace.py is written once to $EV/harness.
+source /tmp/kitty_inv_evidence/harness/env.sh      # $REPO $EV $KPID $SOCK $DISP $XAUTH
+source /tmp/kitty_inv_evidence/harness/flood.env   # $W7 = background window id (fd 12)
 KN="$REPO/kitty/launcher/kitten"
-RUN="$1"
+RUN="$1"; MARKER="fgkeys"     # fixed 6-char marker => 6 one-byte writes, identical every run
 IOTID=$(for t in $(ls /proc/$KPID/task); do [ "$(cat /proc/$KPID/task/$t/comm 2>/dev/null)" = KittyChildMon ] && echo $t; done)
 RAW="$EV/tradeoff/coalesce_run${RUN}_raw.txt"
 DISPLAY=$DISP XAUTHORITY=$XAUTH xdotool windowfocus 2097164 >/dev/null 2>&1
-sleep 0.3
-# start trace: io-thread reads (flood in) + eventfd write(4) wakeups + write(10) marker
-timeout 10 strace -f -e trace=read,write -p "$KPID" -o "$RAW" 2>/dev/null &
+sleep 0.4
+# -tt timestamps make the inter-wakeup interval (the input_delay gate) measurable
+timeout 9 strace -f -tt -e trace=read,write -p "$KPID" -o "$RAW" 2>/dev/null &
 ST=$!
 sleep 1.2
-# trigger deterministic 2 MiB flood in background window33
+# deterministic 2 MiB flood into the background window (fd 12)
 DISPLAY=$DISP XAUTHORITY=$XAUTH "$KN" @ --to unix:"$SOCK" send-text --match id:$W7 "cat flood2m.txt"$'\n' 2>/dev/null
-# type a marker into the FOCUSED window1 during the flood
+# marker into the FOCUSED window1 (fd 10) during the flood
 sleep 0.3
-DISPLAY=$DISP XAUTHORITY=$XAUTH xdotool type --delay 40 "FGkey${RUN}" >/dev/null 2>&1
-sleep 5
+DISPLAY=$DISP XAUTHORITY=$XAUTH xdotool type --delay 40 "$MARKER" >/dev/null 2>&1
+sleep 6
 wait $ST 2>/dev/null
-# --- exact counting pipeline ---
-READ_SYSCALLS=$(awk -v t=$IOTID '$1==t' "$RAW" | grep -E 'read\(12,' | grep -cE '= [0-9]+')
-READ_BYTES=$(awk -v t=$IOTID '$1==t' "$RAW" | grep -E 'read\(12,' | grep -oE '= [0-9]+$' | awk '{s+=$2} END{print s+0}')
-WAKEUPS=$(awk -v t=$IOTID '$1==t' "$RAW" | grep -cE 'write\(4, "\\1\\0\\0\\0\\0\\0\\0\\0"')
-MARKER_WRITES=$(awk -v t=$IOTID '$1==t' "$RAW" | grep -E 'write\(10,' | grep -cE '= [0-9]+')
-echo "RUN ${RUN}: read(12)_syscalls=${READ_SYSCALLS}  read(12)_total_bytes=${READ_BYTES}  main_loop_wakeups_write(4)=${WAKEUPS}  marker_writes_to_fd10=${MARKER_WRITES}"
+# --- split-syscall-aware counting + marker-length assertion ---
+python3 "$EV/harness/parse_strace.py" "$RAW" "$IOTID" 10 12 4 "$RUN" "${#MARKER}"
 ```
 
-The identical workload was run **twice**. Both runs, the exact per-run counting pipeline, the raw-trace-derived counts, and the stability analysis are recorded here:
+The split-syscall-aware parser it invokes — written once to `$EV/harness/parse_strace.py` (outside the checkout, removed at cleanup) — joins each `<unfinished ...>` line with its matching `<... resumed>` line per-TID before counting, so no read or marker write is dropped:
+
+```python
+#!/usr/bin/env python3
+# parse_strace.py — reconstruct strace -f -tt <unfinished>/<...resumed> pairs per
+# TID, then count io-thread background-fd reads+bytes, eventfd wakeups, and 1-byte
+# focused-marker writes; compute the median inter-wakeup interval; and ASSERT
+# marker_count == injected length (shortfall => strace split a marker write =>
+# RE-RUN; a capture artifact, NOT input loss). Read-only w.r.t. the repository.
+import re, sys, statistics
+raw, tid = sys.argv[1], sys.argv[2]
+ffd, bfd, wfd = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+run, mlen = sys.argv[6], int(sys.argv[7])
+pend, rows = {}, []
+for ln in open(raw, errors='replace'):
+    ln = ln.rstrip('\n')
+    m = re.match(r'^(\d+)\s+(.*?)<unfinished \.\.\.>\s*$', ln)
+    if m: pend[m.group(1)] = m.group(2); continue            # buffer prefix per TID
+    m = re.match(r'^(\d+)\s+(?:\d\d:\d\d:\d\d\.\d+ )?<\.\.\. \w+ resumed>(.*)$', ln)
+    if m: rows.append((m.group(1), pend.pop(m.group(1), '') + m.group(2))); continue
+    m = re.match(r'^(\d+)\s+(.*)$', ln)
+    if m: rows.append((m.group(1), m.group(2)))
+def ts(b):
+    m = re.match(r'^(\d\d):(\d\d):(\d\d\.\d+)\s+(.*)$', b)
+    return (float(m.group(1))*3600+float(m.group(2))*60+float(m.group(3)), m.group(4)) if m else (None, b)
+reads=rbytes=wakes=mark=0; gaps=[]; last=None; seq=[]
+for t, b in rows:
+    if t != tid: continue
+    tm, b = ts(b)
+    r = re.match(r'^read\((\d+),.*?\)\s*=\s*(-?\d+)', b)
+    if r:
+        if int(r.group(1))==bfd and int(r.group(2))>0: reads+=1; rbytes+=int(r.group(2))
+        continue
+    w = re.match(r'^write\((\d+),\s*("(?:[^"\\]|\\.)*"|0x[0-9a-f]+),.*?\)\s*=\s*(-?\d+)', b)
+    if w:
+        fd=int(w.group(1))
+        if fd==wfd:
+            wakes+=1
+            if tm is not None:
+                if last is not None: gaps.append((tm-last)*1000)
+                last=tm
+        elif fd==ffd and int(w.group(3))==1:
+            mark+=1; seq.append(w.group(2).strip('"'))
+med=statistics.median(gaps) if gaps else 0.0
+bpw=rbytes//wakes if wakes else 0
+status="OK" if mark==mlen else "SPLIT-MARKER -> RE-RUN"
+print(f"RUN {run}: reads(fd{bfd})={reads} bytes(fd{bfd})={rbytes} wakeups(fd{wfd})={wakes} "
+      f"bytes_per_wakeup={bpw} marker_writes(fd{ffd})={mark}/{mlen}[{status}] "
+      f"seq='{''.join(seq)}' median_inter_wakeup_ms={med:.2f}")
+```
+
+The identical workload was run **seven times (n=7)** with unchanged input — five in the original capture session plus two more on a freshly relaunched kitty process for independent confirmation. The per-run reconstructed counts, a demonstration of the split-write fragility the reconstruction fixes, and the stability analysis are recorded here:
 
 ```text
 ############ TRADEOFF + CONCURRENCY (M11, M19, M20) ############
 
 === SCALE & SETUP ===
-Deterministic workload: background window33 (fd12/pts1, a VISIBLE split in the focused
+Deterministic workload: the background window (fd12/pts1, a VISIBLE split in the focused
 tab, is_active_window=False) runs `cat flood2m.txt` where flood2m.txt = exactly 2,097,152
-bytes (2 MiB). The FOCUSED+ACTIVE window is window1 (fd10/pts0); X focus = OS-win1 2097164
-(verified). While window33 floods, a marker "FGkeyN" is typed into the focused window1.
-Trace: strace -f -e trace=read,write on kitty (io-thread TID = KittyChildMon). Main-loop
+bytes (2 MiB), generated deterministically (see the §8.3 intro generator). The
+FOCUSED+ACTIVE window is window1 (fd10/pts0); X focus = OS-win1 2097164 (verified). While the
+background window floods, a fixed 6-char marker "fgkeys" is typed into the focused window1
+=> exactly 6 one-byte write(10) calls, identical every run. Trace:
+strace -f -tt -e trace=read,write on kitty; io-thread TID = KittyChildMon = 302813. Main-loop
 wakeup eventfd identified empirically as fd 4 (io-thread writes the 8-byte value 1 to it).
+Counting is split-syscall-aware: parse_strace.py reconstructs <unfinished>/<...resumed> pairs
+per-TID before counting and asserts marker_count == injected length.
 
-=== BACKGROUND-OUTPUT-WHILE-OTHER-FOCUSED — COALESCING MEASUREMENT (>=2 identical runs) ===
-Exact counting pipeline (per run):
-  read(12) syscalls   = count of io-thread 'read(12, ...) = N' lines
-  read(12) bytes      = sum of the N return values on those lines
-  main-loop wakeups   = count of io-thread 'write(4, "\1\0\0\0\0\0\0\0", 8)' lines  [WAKEUPS, upper bound on repaints; NOT repaints, NOT bytes]
-  marker writes fd10  = count of io-thread 'write(10, ...) = N' lines (focused-window input during flood)
+=== BACKGROUND-OUTPUT-WHILE-OTHER-FOCUSED — COALESCING MEASUREMENT (n=7 identical runs: 5 canonical + 2 independent-capture confirmation) ===
+Reconstructed per-run counts (fd12 = background flood in, fd4 = main-loop wakeup eventfd,
+fd10 = focused-window marker in):
 
-  RUN 1: read(12)_syscalls=448  read(12)_bytes=2,118,346  main_loop_wakeups=23  marker_writes_fd10=6
-  RUN 2: read(12)_syscalls=402  read(12)_bytes=2,110,404  main_loop_wakeups=21  marker_writes_fd10=6
+  RUN 1: reads(fd12)=930 bytes(fd12)=2125185 wakeups(fd4)=28 bytes_per_wakeup=75899 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.04
+  RUN 2: reads(fd12)=788 bytes(fd12)=2130242 wakeups(fd4)=24 bytes_per_wakeup=88760 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.04
+  RUN 3: reads(fd12)=865 bytes(fd12)=2126622 wakeups(fd4)=27 bytes_per_wakeup=78763 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.04
+  RUN 4: reads(fd12)=877 bytes(fd12)=2127434 wakeups(fd4)=27 bytes_per_wakeup=78793 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.03
+  RUN 5: reads(fd12)=619 bytes(fd12)=2129676 wakeups(fd4)=23 bytes_per_wakeup=92594 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.04
+  --- independent confirmation: a FRESH kitty process (new KPID, new io-thread TID) in a NEW capture session, same unchanged input ---
+  RUN 6: reads(fd12)=544 bytes(fd12)=2132996 wakeups(fd4)=22 bytes_per_wakeup=96954 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.02
+  RUN 7: reads(fd12)=625 bytes(fd12)=2118078 wakeups(fd4)=24 bytes_per_wakeup=88253 marker_writes(fd10)=6/6[OK] seq='fgkeys' median_inter_wakeup_ms=3.05
 
-STABILITY: bytes read ~2.11 MiB both runs (= the 2 MiB file + shell echo/prompt); main-loop
-wakeups 21-23 both runs; marker writes to the focused window = 6 in BOTH runs. The read
-syscall count varies ~10% (PTY delivers the flood in timing-dependent chunks) but the
-coalescing ratio (~18-19 reads per wakeup) and the byte total are stable.
+STABILITY (n=7, same unchanged input; per the magnitude-stability / reproduce-inconsistency rules):
+  byte total (fd12)       : 2,118,078 .. 2,132,996  (median 2,127,434 = 2.03 MiB)   spread 0.70%  -> ROCK-SOLID STABLE
+  median inter-wakeup gap : 3.02 .. 3.05 ms  (== OPT(input_delay) 3 ms gate)        spread ~1%    -> ROCK-SOLID STABLE
+  main-loop wakeups (fd4) : 22 .. 28  (median 24)                                   spread 27%    -> tight band (~two dozen)
+  bytes per wakeup        : 75,899 .. 96,954  (median ~86 KiB)                      spread ~28%    -> tens of KiB / wakeup
+  focused marker (fd10)   : 6/6 every run (seq 'fgkeys')                                          -> CONSTANT
+  read(fd12) syscalls     : 544 .. 930  (median 788)                                spread 71%    -> NOISY
+The two ROCK-SOLID, reproducible anchors are the byte total (0.70% spread across all seven
+runs) and the directly-measured ~3.04 ms median inter-wakeup gate (== input_delay). The
+wakeup count is a tight band of ~two dozen (22-28, median 24) and each wakeup carries tens of
+KiB (~74-95 KiB) of drained output. The raw read-syscall COUNT is NOT stable: the PTY delivers
+the same bytes in timing-dependent chunk sizes, so the read count swings ~71% run-to-run
+(544-930) while the byte total barely moves. It therefore follows arithmetically that the
+read:wakeup RATIO is ALSO not stable — it is reads/wakeups, and with reads swinging while
+wakeups stay in a tight band the ratio itself swings: per-run 33.2 / 32.8 / 32.0 / 32.5 /
+26.9 / 24.7 / 26.0 (range 24.7-33.2). The coalescing conclusion below is anchored to the
+ROCK-SOLID anchors (all bytes drained losslessly, ~3 ms inter-wakeup gate) plus the tight
+~two-dozen wakeup band, NOT to a read count or a read:wakeup ratio.
 
 INTERPRETATION [OBSERVED]:
-[OBSERVED] The io-thread drained the full 2.11 MiB of background output (nothing dropped),
-  yet woke the main loop only ~21-23 times. Output-driven repaints are COALESCED: many
-  reads within one input_delay window collapse into a single main-loop wakeup.
+[OBSERVED] The io-thread drained the full ~2.03 MiB of background output every run (nothing
+  dropped: byte total stable at 0.70% spread over seven runs) yet woke the main loop only
+  22-28 times. Output-driven repaints are COALESCED: all reads arriving within one input_delay
+  window collapse into a single main-loop wakeup, so each wakeup carries tens of KiB (~74-95
+  KiB) of drained output and wakeups recur on a stable ~3.04 ms cadence.
 [OBSERVED] The write(4) eventfd count is the number of MAIN-LOOP WAKEUPS (an upper bound on
-  repaints), not the number of reads (~400-450) and not the byte count (~2.11 MiB).
+  repaints) — NOT the read-syscall count (noisy, 544-930) and NOT the byte count (~2.03 MiB).
 [OBSERVED] Input to the FOCUSED window was unaffected by the background flood: all 6 marker
-  keystrokes were written to fd10 in both runs while window33 flooded 2.11 MiB through fd12.
+  keystrokes reached fd10 in EVERY run (marker 6/6, seq 'fgkeys') while the background window
+  flooded ~2.03 MiB through fd12.
+
+=== F2 — WHY COUNTING MUST RECONSTRUCT SPLIT SYSCALLS (capture-artifact demo) ===
+strace -f on a multithreaded process splits some syscalls across two lines when another
+thread is scheduled mid-call. A naive line-grep (grep 'write(10,' | grep -cE '= [0-9]+')
+misses the initiating half of a split (it carries no '= N') and can under-report the focused
+marker — which would FALSELY read as starved focused input. Observed verbatim in a -tt trace
+where the marker's 'g' write split (io-thread TID 302813; note the MAIN-thread line
+302744 interleaved BETWEEN the two halves — the exact reason a per-TID join is required):
+
+  302813 14:57:32.940100 write(10, "f", 1) = 1
+  302813 14:57:32.952926 write(10, "g", 1 <unfinished ...>
+  302744 14:57:32.952940 <... read resumed>, "\2\0\0\0\0\0\0\0", 64) = 8
+  302813 14:57:32.952960 <... write resumed>) = 1
+  302813 14:57:32.966276 write(10, "k", 1) = 1
+  302813 14:57:32.980433 write(10, "e", 1) = 1
+  302813 14:57:32.994198 write(10, "y", 1) = 1
+  302813 14:57:33.005389 write(10, "s", 1) = 1
+
+  naive grep  -> marker=5  (drops the split 'g' => false "focused input starved" signal)
+  reconstruct -> marker=6/6[OK] seq='fgkeys'  (parse_strace.py joins the pair per-TID)
+Marker-length assertion: 6 == injected len => OK; a shortfall is a capture artifact (re-run),
+never treated as input loss. This is NOT a one-off: across the five canonical runs no marker
+write happened to split (so the naive count coincidentally matched at 6/6), but independent
+confirmation RUN 6 split TWO marker writes — the naive pipeline there reported marker=4/6 (a
+false "33% of focused input starved" signal) while the reconstruction correctly reported 6/6.
+The same true 6 bytes reached fd10 in every run; only the naive COUNT was wrong. That is
+exactly the artifact the per-TID reconstruction and the length assertion are built to survive.
 
 === M11 — THE ONE CORRECTNESS-vs-RESPONSIVENESS TRADEOFF (measured) ===
 Mechanism (child-monitor.c): after reading child output the io_loop wakes the main loop to
@@ -2057,16 +2172,19 @@ repaint, but the WAKEUP macro (L1562) fires only when (now - last_main_loop_wake
 OPT(input_delay) (L1566/L1569); comment L1563: "we only wakeup the main loop after
 input_delay as wakeup is an expensive operation". input_delay default = 3 ms
 (options/definition.py:L878); repaint_delay default = 10 ms (L866). wakeup_main_loop
-(glfw.c:L1807) -> glfwPostEmptyEvent -> the fd-4 eventfd write measured above.
+(glfw.c:L1807) -> glfwPostEmptyEvent (glfw.c:L1808) -> the fd-4 eventfd write measured above.
 
 THE TRADEOFF [OBSERVED]: kitty trades OUTPUT-RENDERING RESPONSIVENESS for display
 correctness/efficiency. It consumes every byte of child output immediately and correctly
-(2.11 MiB fully read, no loss) but delays and coalesces the resulting repaints to at most
-one per input_delay (3 ms), so ~448 reads produced only ~23 repaint wakeups. A freshly
-produced byte may therefore wait up to ~3 ms before it is painted (responsiveness cost),
-in exchange for a single coherent, non-torn frame per 3 ms window and ~19x fewer expensive
-main-loop wakeups (correctness/efficiency benefit). This is directly measured (read:wakeup
-ratio above), not inferred from comments.
+(~2.03 MiB fully drained, byte total stable at 0.70% spread over seven runs, nothing dropped)
+but delays and coalesces the resulting repaints to at most one per input_delay — measured
+directly as a STABLE ~3.04 ms median inter-wakeup interval, collapsing the whole flood into a
+tight ~two-dozen (22-28) wakeup band carrying tens of KiB each. A freshly produced byte may
+therefore wait up to ~3 ms before it is painted (the responsiveness cost), in exchange for one
+coherent, non-torn frame per 3 ms window and far fewer expensive main-loop wakeups (the
+correctness/efficiency benefit). This is anchored to the directly-measured STABLE metrics
+(byte total 0.70% spread, ~3.04 ms inter-wakeup gate, 22-28 wakeup band), NOT to the noisy
+read count or a read:wakeup ratio, and not to the source comment.
 
 === M19 — TWO LOCKS ON THE WRITE PATH (source-grounded) ===
 [OBSERVED-in-source] schedule_write_to_child_generic (child-monitor.c:L323) acquires BOTH:
@@ -2092,11 +2210,11 @@ not a single global lock.
   together DO coalesce; "kitty deliberately never coalesces input" is FALSE.
 ```
 
-[OBSERVED] Across two identical runs the io-thread drained the full ~2.11 MiB (the 2 MiB file plus the shell's echo/prompt) — nothing dropped — while waking the main loop only **23** and **21** times respectively: ~18-19 PTY reads collapse into a single main-loop wakeup. The `write(4)` eventfd count is the number of **main-loop wakeups** (an upper bound on repaints), explicitly **not** the read-syscall count (~400-450) and **not** the byte count (~2.11 MiB). The byte total and wakeup count are stable across runs; the read-syscall count varies ~10% with PTY chunking timing, which is why the coalescing conclusion is bounded to the stable read:wakeup ratio and byte total.
+[OBSERVED] Across **seven** identical runs (five canonical plus two independent-capture confirmation runs on a fresh kitty process) the io-thread drained the full ~2.03 MiB (the 2 MiB file plus the shell's echo/prompt and `onlcr` `\n`→`\r\n` expansion) — nothing dropped — while waking the main loop only **22–28** times (median 24): each wakeup carries **tens of KiB** (~74–95 KiB) of coalesced output, and wakeups recur on a directly-measured **~3.04 ms** median cadence (the `input_delay` gate). The `write(4)` eventfd count is the number of **main-loop wakeups** (an upper bound on repaints), explicitly **not** the read-syscall count and **not** the byte count. The two rock-solid, reproducible anchors are the **byte total** (0.70% spread) and the **~3.04 ms inter-wakeup gate**; the **wakeup count** is a tight band of ~two dozen (**22–28**). The raw **read-syscall count is NOT stable** (**544–930**, ~71% spread — the PTY delivers the same bytes in timing-dependent chunk sizes), and therefore the **read:wakeup ratio is not stable either** (**24.7–33.2**). The coalescing conclusion is anchored to those stable anchors, not to a read count or a read:wakeup ratio.
 
 ### 8.4 The responsiveness side — focused input is unaffected by the flood [OBSERVED]
 
-[OBSERVED] In **both** runs, all **6** marker keystrokes typed into the focused window during the 2.11 MiB background flood were written to fd 10 — focused input is not starved by heavy background output. (Marker-write count = 6 in both runs, per §8.3.)
+[OBSERVED] In **all seven** runs, all **6** marker keystrokes typed into the focused window during the ~2.03 MiB background flood were written to fd 10 — focused input is not starved by heavy background output. The split-syscall-aware harness asserts the reconstructed focused-marker count equals the injected length (6/6, seq `fgkeys`) on every run; the §8.3 fragility demo shows that a naive line-grep would have spuriously reported 5/6 (and, in confirmation RUN 6 where two marker writes split, 4/6) — a capture artifact, not input loss — which is exactly the false "focused input starved" signal the reconstruction eliminates.
 
 ### 8.5 Concurrency: the two locks, and write coalescing [OBSERVED-in-source + OBSERVED-measured]
 
@@ -2157,7 +2275,7 @@ write(10, "<...>0) = 600
 | `no active window` / same-dispatch drop guards not reachable by external injection | OBSERVED (0 hits at scale), INFERRED (atomic reselection) | §6.4 |
 | Real keys take `GLFW_IME_NONE`; preedit/commit need an active IM | OBSERVED (state:0, no IM), INFERRED (preedit/commit paths) | §6.5 |
 | Keyboard routing unaffected by concurrent resize/scroll | OBSERVED | §6.6 |
-| Output repaints coalesced to ~1 wakeup / input_delay; ~19:1 read:wakeup; no byte loss | OBSERVED | §8.3 |
+| Output repaints coalesced to ~1 wakeup / input_delay (~3.04 ms gate); ~2.03 MiB drained into a 22–28 wakeup band (tens of KiB/wakeup); no byte loss | OBSERVED | §8.3 |
 | `input_delay`=3 ms, `repaint_delay`=10 ms; WAKEUP gate `L1562` | OBSERVED-in-source | §8.1 |
 | Two locks (children_lock + per-screen write_buf_lock); write coalescing + partial-write retention | OBSERVED-in-source + OBSERVED-measured | §8.5 |
 
