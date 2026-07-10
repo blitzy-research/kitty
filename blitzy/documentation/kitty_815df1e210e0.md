@@ -432,13 +432,31 @@ byte histogram (100B buckets): [0-99]=64 [100-199]=146 [200-299]=1012 [300-399]=
 
 The rate is shown as the exact division `53995 / 5.029346 = 10735.9883 reads/s` (endpoints and precision explicit, so there is no rounding ambiguity). The dominant reads sit in the 400–599-byte range; median (504) and mode (469) are ~500 bytes. Per-run values and cross-run spread are in §9.
 
-### Backpressure — the flow-control gate [OBSERVED not-triggered; INFERRED full engagement]
+### Backpressure — the flow-control gate [OBSERVED engaged; run-to-run variable]
 
-The read loop only asks for `POLLIN` on the PTY fd while the parser has room: `children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;` at `kitty/child-monitor.c:1501`, where `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1477`, declared `kitty/vt-parser.h:36`) reports whether the 1 MiB buffer has space.
+The read loop only asks for `POLLIN` on the PTY fd while the parser has room: `children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;` at `kitty/child-monitor.c:1501`, where `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1477`, body `ans = self->read.sz + self->write.pending < BUF_SZ;` at `kitty/vt-parser.c:1481`, declared `kitty/vt-parser.h:36`) reports whether the 1 MiB buffer still has space. Because the per-read request size is `BUF_SZ − write.offset` (`self->write.offset = self->read.sz + self->write.pending; *sz = BUF_SZ - self->write.offset;` in `vt_parser_create_write_buffer`, `kitty/vt-parser.c:1451`), the occupancy the gate watches equals `BUF_SZ − requested_size`, and the gate returns `false` — setting `events = 0` for fd 8 — **iff occupancy reaches `BUF_SZ` (100 %)**.
 
-- **[OBSERVED]** the buffer occupancy the gate watches *was* seen rising and falling. Occupancy = `BUF_SZ − requested_size`; a second documented script measured, per run, the peak: run 1 **149,688 B (14.3 %)**, run 2 **620,193 B (59.1 %)**, run 3 **117,957 B (11.2 %)**, and the 10 s run 4 **317,051 B (30.2 %)** — the parser buffer filling partway toward the 1 MiB cap, then draining.
-- **[OBSERVED]** across **all four runs** (three 5 s runs and a 10 s run of ~109 k reads) fd 8 was polled with `events=POLLIN` throughout and **never** with `events=0`; i.e. `POLLIN` was never actually withheld (`0` such polls in every run). For the plain repeated-text workload of `yes hello`, the main-thread parser drained the buffer fast enough that the gate always found space. This is the honest result of a genuine, varied effort (four runs, up to 10 s / ~109 k reads, peak occupancy 59 %): the throttle did not need to engage at this scale.
-- **[INFERRED]** were accumulation to reach `BUF_SZ`, `vt_parser_has_space_for_input` would return `false`, `events` would be set to `0` at `kitty/child-monitor.c:1501`, and no `read` would be issued on fd 8 until the main thread drained the buffer via `parse_input` (`kitty/child-monitor.c:451`) → `do_parse` (`kitty/child-monitor.c:438`). The observed rising occupancy is the leading edge of exactly this mechanism; its full engagement (a poll with `events=0`) is inferred from the code, not observed here.
+- **[OBSERVED]** peak occupancy is strongly **run-to-run variable and does reach the 1 MiB ceiling**. An expanded canonical sweep of **18 `yes hello` floods** (fourteen 8 s idle-host runs, one 20 s idle-host scale-up of ~205 k reads, and three 8 s runs under induced host-CPU contention — all typed into the real window, interrupted with a real Ctrl-C, traced on the I/O thread) measured per-run peak occupancy = `BUF_SZ − min(request size)` spanning **13.86 % up to 99.94 %** — i.e. from nearly empty to essentially the full 1 MiB cap. Representative peaks: an idle-host 8 s run reached **1,047,919 B (99.94 %)** (smallest read request `657 B`), another **957,168 B (91.28 %)**, another **812,562 B (77.49 %)**, while the majority stayed at ~14–23 %. The buffer therefore does fill to capacity on some runs, not merely "partway" toward the cap.
+- **[OBSERVED]** `POLLIN` **withholding (full backpressure engagement) was directly observed** — in a minority of runs. Counting polls that watch fd 8 with `events=0`, engagement occurred in **2 of the 18 runs**: an idle-host 8 s run with **37** such polls (99.94 % peak occupancy) and a contended-host 8 s run with **1** (99.80 %); the other 16 runs — including the 20 s / ~205 k-read scale-up — showed **0**. Engagement is therefore **run-to-run variable and scheduling-sensitive**: whenever the main-thread parser keeps pace, occupancy stays low and `POLLIN` is never withheld; when the parser transiently falls behind (more likely under host-CPU contention, as on a shared multi-core host), occupancy hits `BUF_SZ` and the gate withholds `POLLIN`. Because engagement is intrinsically intermittent, its per-run *count* is **not** stable across runs — the stable, reproducible facts are the per-read/rate metrics in §9, while the reproducible *qualitative* fact confirmed here is that engagement **can and does** occur. The raw, unedited transition from an idle-host run (buffer filling → request size shrinking → `POLLIN` withheld) is:
+
+  ```
+  11:09:13.347120 read(8, "hello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nh"..., 5091) = 1867
+  11:09:13.347149 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 1) = 1 ([{fd=8, revents=POLLIN}])
+  11:09:13.347178 read(8, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r"..., 3224) = 1876
+  11:09:13.347217 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 1) = 1 ([{fd=8, revents=POLLIN}])
+  11:09:13.347247 read(8, "\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r"..., 1348) = 1348
+  11:09:13.347275 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 1) = 0 (Timeout)
+  ```
+
+  The request size collapses (`5091 → 3224 → 1348 B`) as the parser buffer fills, and the very next `poll` drops fd 8 to `events=0` — `POLLIN` withheld. A contended-host run shows the complementary **resume** path, where the withheld poll returns because the main thread posts its 8-byte wakeup token on fd 6:
+
+  ```
+  11:13:35.069865 read(8, "hello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nhello\r\nh"..., 2111) = 2111
+  11:13:35.069900 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 1) = 1 ([{fd=6, revents=POLLIN}])
+  11:13:35.070511 read(6, "\1\0\0\0\0\0\0\0", 1024) = 8
+  ```
+
+- **[OBSERVED mechanism; INFERRED only for the exact `BUF_SZ` equality]** the two exit paths above are exactly the designed backpressure cycle: once occupancy reaches `BUF_SZ`, `vt_parser_has_space_for_input` returns `false`, `events` is set to `0` at `kitty/child-monitor.c:1501`, and no `read` is issued on fd 8 until the main thread drains the buffer via `parse_input` (`kitty/child-monitor.c:451`) → `do_parse` (`kitty/child-monitor.c:438`) and signals the I/O thread (the 8-byte `read(6, "\1\0…", 1024)` wakeup above). That engagement occurs (a poll with `events=0`) is **[OBSERVED]**; that it triggers *precisely at* `BUF_SZ` rather than some lower watermark is **[INFERRED]** from the gate predicate `read.sz + write.pending < BUF_SZ` (`kitty/vt-parser.c:1481`), independently corroborated by the observed request-size shrinkage to a few hundred bytes immediately before each `events=0`.
 
 ---
 
@@ -613,7 +631,7 @@ This first-character `switch` is the exact point where an escape sequence's intr
 
 The same unchanged input (`yes hello` typed into the real window, interrupted with a real Ctrl-C) was run **three times at a 5 s scale** (the stability triple) plus a **10 s scale-up** run (run 4) to probe for buffer saturation. All measurements are on the I/O thread (TID 100425), under strace, via the documented `q3_stats.py`. Every run recovered the prompt (exit-status `133;D;130`). **[OBSERVED]**:
 
-| Run | Wall window | Flood reads | Reads/sec | Mean B | Median B | Mode B | Max B | read→read med (µs) | poll→read med (µs) | `POLLIN` withheld |
+| Run | Wall window | Flood reads | Reads/sec | Mean B | Median B | Mode B | Max B | read→read med (µs) | poll→read med (µs) | `POLLIN` withheld (this run) |
 |-----|-------------|-------------|-----------|--------|----------|--------|-------|--------------------|--------------------|-------------------|
 | 1   | 5.029346 s  | 53 995      | 10 735.99 | 591.09 | 504 | 469 | 20 209 | 55 | 28 | 0 |
 | 2   | 5.039648 s  | 51 410      | 10 201.11 | 668.35 | 546 | 511 | 20 186 | 57 | 28 | 0 |
@@ -631,7 +649,7 @@ The same unchanged input (`yes hello` typed into the real window, interrupted wi
 | bytes/read mode | 469 | 511 | **8.49 %** |
 | bytes/read mean | 557.35 | 668.35 | **18.33 %** |
 
-**Explicit stability criterion & conclusion.** Treating a metric as *stable* when its range ÷ mean ≤ 10 % across the three unchanged 5 s runs: the timing metrics (poll→read 0.00 %, read→read 3.55 %), the read rate (5.15 %), and the byte central tendency (median 8.01 %, mode 8.49 %) **all pass**, and the 10 s scale-up (run 4) falls inside the same bands. The one metric that does **not** pass is the **mean** bytes/read (18.33 %) — because the per-read size distribution is heavy-tailed (individual reads span single digits to ~14–20 KB), the arithmetic mean is a poor stability estimator; the **median (~504–546 B)** and **mode (~469–511 B)** are the robust "typical bytes-per-read" figures. Increasing the scale to 10 s / ~109 k reads did not change the picture and still did not force `POLLIN` withholding (the parser kept pace with the plain-text stream). Caveat: these cadences are measured **under strace**, which adds per-syscall overhead, so absolute reads/sec is a lower bound; the qualitative change (back-to-back large reads vs. blocking 1-byte reads) and the byte-size distribution are the robust findings.
+**Explicit stability criterion & conclusion.** Treating a metric as *stable* when its range ÷ mean ≤ 10 % across the three unchanged 5 s runs: the timing metrics (poll→read 0.00 %, read→read 3.55 %), the read rate (5.15 %), and the byte central tendency (median 8.01 %, mode 8.49 %) **all pass**, and the 10 s scale-up (run 4) falls inside the same bands. The one metric that does **not** pass is the **mean** bytes/read (18.33 %) — because the per-read size distribution is heavy-tailed (individual reads span single digits to ~14–20 KB), the arithmetic mean is a poor stability estimator; the **median (~504–546 B)** and **mode (~469–511 B)** are the robust "typical bytes-per-read" figures. Increasing the scale to 10 s / ~109 k reads did not change the per-read/rate picture. In these particular four runs the main-thread parser kept pace and the `POLLIN`-withheld count was `0` — but that outcome is **run-to-run variable, not a ceiling**: an expanded canonical sweep (18 floods) drove peak occupancy to **~99.9 %** and **did withhold `POLLIN`** (poll `events=0` on fd 8) in some runs, so the `0` column above reflects these four scheduling-lucky runs rather than a scale limit (see §6, *Backpressure — the flow-control gate*, for the raw `events=0` evidence and the full distribution). Caveat: these cadences are measured **under strace**, which adds per-syscall overhead, so absolute reads/sec is a lower bound; the qualitative change (back-to-back large reads vs. blocking 1-byte reads) and the byte-size distribution are the robust findings.
 
 ---
 
@@ -650,7 +668,7 @@ The same unchanged input (`yes hello` typed into the real window, interrupted wi
 | Q3b | Frequency | ~10 201–10 892 reads/sec (4 runs); read→read median 55–57 µs (poll→read latency 28 µs, distinct) | dispatch `kitty/child-monitor.c:1529`–`1531` |
 | Q3c | Typical bytes/read | median 504–546, mode 469–511 (robust); mean 557–668; up to ~20 KB | buffer `kitty/vt-parser.c:18` |
 | Q3 stability | ≥2-run stability | stable across 3×5 s + 1×10 s; per-metric spread + criterion | §9 |
-| Q3 backpressure | flow-control gate | occupancy peaked 59 % (run 2); `POLLIN` never withheld at this scale (INFERRED: withheld at `BUF_SZ`) | `kitty/child-monitor.c:1501`; `kitty/vt-parser.c:1477` |
+| Q3 backpressure | flow-control gate | occupancy run-to-run variable, peaking ~14 % → **99.94 %**; `POLLIN` **withheld (`events=0`) — OBSERVED** in a minority of runs (engagement at `BUF_SZ`) | `kitty/child-monitor.c:1501`; `kitty/vt-parser.c:1481` |
 | Q4 | fd integer | **8** (process-specific; `/dev/pts/ptmx`) | reg. `kitty/child-monitor.c:1286`; retain `kitty/child.py:338` |
 | Q5a | Reader function | `read_bytes()` — I/O thread (TID 100425 `KittyChildMon`) | `kitty/child-monitor.c:1337` (read `:1345`) |
 | Q5b | Parser function | `consume_input()` — Main thread | `kitty/vt-parser.c:1367` |
@@ -669,14 +687,14 @@ The same unchanged input (`yes hello` typed into the real window, interrupted wi
 | Returned bytes: 1/keystroke, 11 Enter (2 echo + 9 control), 47/114/163 output, 347 total / 16 reads | **[OBSERVED]** | `strace` (clean single-thread; `-f` reconciled) |
 | `yes hello`: ~10.2–10.9 k reads/s; read→read 55–57 µs vs poll→read 28 µs; median ~500 B; stable ×3 + 10 s | **[OBSERVED]** | `strace` + `q3_stats.py`, 4 runs |
 | Ctrl-C → exit status `133;D;130` (SIGINT) → prompt recovers | **[OBSERVED]** | `strace` after-state |
-| Parser-buffer occupancy rises (peak 59 %) then drains; `POLLIN` never withheld at this scale | **[OBSERVED]** | `strace` read 3rd arg + `events=` field |
+| Parser-buffer occupancy is run-to-run variable (peak ~14 % → 99.94 %); `POLLIN` **withheld (`events=0`) observed** in some runs, not in others | **[OBSERVED]** | `strace` read 3rd arg + `events=` field |
 | fd number = 8 | **[OBSERVED]** | `strace`, `/proc`, `lsof` |
 | Reader executes on the I/O thread (`KittyChildMon`, TID 100425) | **[OBSERVED]** | `/proc/.../task/100425/comm` + `strace` |
 | Both text and escape bytes are present in the reads | **[OBSERVED]** | `strace` payloads |
 | Shell resolution `pw_shell or '/bin/sh'` | **[INFERRED]** | `kitty/constants.py:181` |
 | Spawn chain (fork/setsid/TIOCSCTTY/dup2/execvp) | **[INFERRED]** | `kitty/child.c:81`–`159` |
 | `read()` lives in `read_bytes()`; buffer sizing formula | **[INFERRED]** | `kitty/child-monitor.c:1337`/`1345`; `kitty/vt-parser.c:1451` |
-| Backpressure gate & `POLLIN` withholding *at `BUF_SZ`* (full engagement not observed here) | **[INFERRED]** | `kitty/child-monitor.c:1501`; `kitty/vt-parser.c:1477` |
+| Backpressure engagement — `POLLIN` withheld (poll `events=0` on fd 8) under buffer saturation — **directly observed** (run-to-run variable); that it triggers *precisely at* `BUF_SZ` is inferred from the gate predicate | **[OBSERVED engagement; INFERRED exact threshold]** | `strace` `events=0` polls; `kitty/child-monitor.c:1501`; `kitty/vt-parser.c:1481` |
 | Text/escape routing `consume_input`→`consume_normal`/`consume_esc` | **[INFERRED]** | `kitty/vt-parser.c:1367`/`230`/`261` |
 | Parsing dispatched on the Main thread | **[INFERRED]** | `kitty/child-monitor.c:451`/`452`/`438` |
 | fd registration into the poll set | **[INFERRED]** | `kitty/child-monitor.c:1286`/`1287`/`35`/`86` |
