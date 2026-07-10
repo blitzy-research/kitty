@@ -362,35 +362,55 @@ Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell
   xnum=80: 80*2048*12 + 80*2048*20 + 2048*4 = 5251072 bytes (~5.008 MiB)
 
 --- CONFIG scrollback=2000: ynum=2000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=1 [INFERRED] ---
-  FRESH: count=0 inferred_segments=1[INF] rss=32916KB [OBSERVED]
-  SATURATE at lines_fed=2023: count==ynum=2000 rss=38184KB [OBSERVED]
+  FRESH: count=0 inferred_segments=1[INF] rss=26388KB [OBSERVED]
+  SATURATE at lines_fed=2023: count==ynum=2000 rss=31672KB [OBSERVED]
   RSS SLOPE (first segment, count 256->1792): 2562.7 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
-  END: count=2000 ynum=2000 capped_at_ynum=True final_segments[INF]=1 rss=38184KB [OBSERVED]
+  END: count=2000 ynum=2000 capped_at_ynum=True final_segments[INF]=1 rss=31672KB [OBSERVED]
 
 --- CONFIG scrollback=5000: ynum=5000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=3 [INFERRED] ---
-  FRESH: count=0 inferred_segments=1[INF] rss=32592KB [OBSERVED]
-  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=37732KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42860KB [OBSERVED count/INF seg]
-  SATURATE at lines_fed=5023: count==ynum=5000 rss=44988KB [OBSERVED]
-  RSS SLOPE (first segment, count 256->1792): 2560.0 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
-  END: count=5000 ynum=5000 capped_at_ynum=True final_segments[INF]=3 rss=44988KB [OBSERVED]
+  FRESH: count=0 inferred_segments=1[INF] rss=26824KB [OBSERVED]
+  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=36956KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42084KB [OBSERVED count/INF seg]
+  SATURATE at lines_fed=5023: count==ynum=5000 rss=42084KB [OBSERVED]
+  RSS SLOPE (first segment, count 256->1792): 2562.7 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
+  END: count=5000 ynum=5000 capped_at_ynum=True final_segments[INF]=3 rss=42084KB [OBSERVED]
 
 --- CONFIG scrollback=10000: ynum=10000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=5 [INFERRED] ---
-  FRESH: count=0 inferred_segments=1[INF] rss=32592KB [OBSERVED]
-  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=37732KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42860KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=6168 count=6145: segments 3->4 (crossed 2048-line boundary) rss=47988KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=8216 count=8193: segments 4->5 (crossed 2048-line boundary) rss=53116KB [OBSERVED count/INF seg]
-  SATURATE at lines_fed=10023: count==ynum=10000 rss=57508KB [OBSERVED]
-  RSS SLOPE (first segment, count 256->1792): 2560.0 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
-  END: count=10000 ynum=10000 capped_at_ynum=True final_segments[INF]=5 rss=57508KB [OBSERVED]
+  FRESH: count=0 inferred_segments=1[INF] rss=31984KB [OBSERVED]
+  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=37012KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42140KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=6168 count=6145: segments 3->4 (crossed 2048-line boundary) rss=47272KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=8216 count=8193: segments 4->5 (crossed 2048-line boundary) rss=52404KB [OBSERVED count/INF seg]
+  SATURATE at lines_fed=10023: count==ynum=10000 rss=52404KB [OBSERVED]
+  RSS SLOPE (first segment, count 256->1792): 0.0 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
+  END: count=10000 ynum=10000 capped_at_ynum=True final_segments[INF]=5 rss=52404KB [OBSERVED]
 
 ```
 
-> **Run 2 was structurally identical** — the `CONFIG`, `FRESH`, `CARVE`,
-> `SATURATE`, and `END` lines matched byte-for-byte (verified by diffing the two
-> runs with the RSS/SLOPE lines filtered out); only the absolute RSS values differ
-> by a few KB between runs.
+> **Run 2 was structurally identical.** Every `CONFIG`, `FRESH`, `CARVE`, `SATURATE`,
+> and `END` field (all `lines_fed`, `count`, and segment counts) matched the run above
+> **byte-for-byte** (verified by diffing the two runs with the `rss=` and `RSS SLOPE`
+> lines filtered out). The `rss=` absolute values and the derived `RSS SLOPE` are
+> **nondeterministic** — they depend on OS page management and on execution order, and
+> are therefore **excluded** from that byte-for-byte guarantee:
+>
+> - **Absolute `rss=` values** drift by a few KB between runs and by **several MB across
+>   build environments** (the reconciled build above starts at ~26 MB for
+>   `scrollback=2000`; an earlier capture of the same probe on a different build started
+>   nearer ~33 MB). Only the **per-segment growth deltas** — ≈ 5 MB across each
+>   2048-line span (§2.4) — are stable across environments.
+> - **First-segment `RSS SLOPE`** is a *derived* point value that ranges from **0 up to
+>   ~2570 bytes/line** across configs, runs and page-warmth. In this environment it is
+>   stable per config across both runs: `scrollback=2000` ≈ **2562.7** (occasionally
+>   2565.3), `scrollback=5000` ≈ **2562.7**, and `scrollback=10000` = **0.0**. The third
+>   config *collapses to 0.0* precisely because it runs third in the same process: its
+>   first-segment window (`count 256→1792`) reuses pages the OS already made resident
+>   during the earlier `2000`/`5000` configs, so there is no fresh RSS delta to measure
+>   there. Measured **first, in a fresh process with cold pages**, `scrollback=10000`
+>   instead reads ≈ **2568–2571 bytes/line** — confirming the collapse is a
+>   warm-page / execution-order artifact, **not** a change in allocation behaviour. The
+>   **deterministic** per-line cost, `80 × 32 = 2560` bytes (§2.4, from the `calloc`
+>   arithmetic), is the figure the cold-page slopes converge to.
 
 ### 2.4 What this shows (answering SQ1)
 
@@ -407,14 +427,22 @@ Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell
   `capped_at_ynum=True`; feeding thousands more lines never grows `count` past `ynum`
   — the excess is handled by eviction (see SQ2). **[OBSERVED]**
 - **Memory is reserved per-segment but backed lazily, so RSS climbs smoothly.** The
-  probe's self-computed `RSS SLOPE` inside the first segment was **2562.7 bytes/line**
-  (scrollback=2000) and **2560.0 bytes/line** (5000 and 10000) — matching
-  `80 cols × (sizeof(CPUCell)+sizeof(GPUCell)) = 80 × 32 = 2560` bytes, i.e. each line
-  only touches its own row of cells. The 5.25 MB per-segment `calloc` is therefore
-  **not** paid as a visible 5 MB step; it materializes gradually as pages are first
-  written (note how RSS rises by ~5 MB smoothly across each 2048-line span, e.g.
-  32916→38184 KB for the first segment). **[OBSERVED]** This is the concrete, measured
-  meaning of the buffer "filling and stretching."
+  **deterministic** per-line cost is `80 cols × (sizeof(CPUCell)+sizeof(GPUCell)) =
+  80 × 32 = 2560` bytes — each line touches only its own row of cells. **[INFERRED —
+  `calloc` arithmetic; CPUCell=12 / GPUCell=20 `static_assert`s]** The probe's
+  self-computed first-segment `RSS SLOPE` is a *nondeterministic corroboration* of that
+  figure: across configs, runs and page-warmth it ranges from **0 up to ~2570
+  bytes/line**. In the run above it reads **2562.7** (scrollback=2000), **2562.7**
+  (5000) and **0.0** (10000); the last collapses to zero only because that config runs
+  third in the same process and reuses warm pages, and reads ≈ **2568–2571** when
+  measured first in a fresh process (see the §2.3 variance note). What *is* stable and
+  load-bearing is that the **5.25 MB per-segment `calloc` is not paid as a single
+  visible 5 MB step** — it materializes gradually as pages are first written, so RSS
+  rises by **~5 MB smoothly across each 2048-line span**. For example the
+  `scrollback=10000` run climbs `31984 → 37012 → 42140 → 47272 → 52404 KB` — ≈ 5.0 MB
+  per carved segment, reproduced across both runs. **[OBSERVED]** This gradual
+  ~5 MB-per-segment climb is the concrete, measured meaning of the buffer "filling and
+  stretching."
 
 ---
 
@@ -1436,7 +1464,7 @@ ring's boundary behavior (SQ3) differ between disabled and enabled.
 | Fresh buffer = exactly 1 segment | OBSERVED | §2.3 + [kitty/history.c:117-133] |
 | Max segments = `ceil(ynum/2048)`; carves at count 2049/4097/6145/8193 | OBSERVED | §2.3 |
 | Per-segment `calloc` = 5,251,072 B @ xnum=80 | INFERRED | [kitty/history.c:17-28] arithmetic; CPUCell=12/GPUCell=20 static_asserts + LineAttrs=4 (enum-bitfield, `_Static_assert` probe) |
-| RSS grows gradually (~2560 B/line), not in segment-sized steps | OBSERVED | §2.3 RSS slope |
+| RSS grows gradually (~5 MB per 2048-line segment), not in one segment-sized step | OBSERVED | §2.4 per-segment climb (e.g. 31984→37012→…→52404 KB); derived first-segment RSS slope is nondeterministic (ranges 0–~2570 B/line, §2.3), converging on the [INFERRED] per-line cost 80×32=2560 B |
 | Disabled tier drops evicted lines (3977 dropped) | OBSERVED | §3.3 |
 | Enabled tier costs exactly 33 B per evicted line (this fixed line) | OBSERVED | §3.3 |
 | Visible ring increment = evicted x bytes/line (payload) | OBSERVED | §3.3 (+33000/batch) |
