@@ -896,27 +896,36 @@ defaults to `'640'` and `initial_window_height` to `'400'`
 the **else** branch (returns 640×400 directly). When the size is given in **cells**, the closure
 takes the `L90`/`L96` branch and the **cell metrics determine the pixel size**.
 
-Both branches were exercised with the following **safe** observation script — `set -euo pipefail`,
-exported `DISPLAY`, captured PIDs, readiness polling, a targeted cleanup `trap`, `wait`s, exact
-`xwininfo` geometry, child PTY grid read-back, and explicit exit status. No `xrdb` is used. (Cache is
-disabled with `-o remember_window_size=no` because `remember_window_size` defaults to `yes` and would
-otherwise reuse `~/.cache/kitty/main.json`.)
+Both branches were exercised with the following **safe, hardened** observation script. Its safety
+properties: `set -euo pipefail`; the `MODE` argument is validated against a `default|cells`
+allowlist (an unrecognised value exits before anything runs); all temporary files live under an
+unpredictable `mktemp -d` working directory, so a pre-planted symlink on a guessable `/tmp` name
+cannot be followed to clobber another file; the grid-file path is handed to the launched child
+**through the environment** (`GRIDFILE=… ./kitty/launcher/kitty … sh -c 'stty size > "$GRIDFILE" …'`)
+rather than being interpolated into the `sh -c` string, so a metacharacter in the path cannot break
+out of the quoting; PIDs are captured for **targeted** `kill`s (never `pkill`/`killall`); readiness
+is polled; a cleanup `trap` removes the working directory on exit; and the workflow reads exact
+`xwininfo` geometry plus the child PTY grid and returns an explicit exit status. No `xrdb` is used.
+(Cache is disabled with `-o remember_window_size=no` because `remember_window_size` defaults to `yes`
+and would otherwise reuse `~/.cache/kitty/main.json`.)
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-MODE="$1"                # "default" or "cells"
-DISP=":97"; GRIDFILE="/tmp/grid_${MODE}.txt"; rm -f "$GRIDFILE"
+MODE="${1:-}"            # "default" or "cells"
+case "$MODE" in default|cells) ;; *) echo "usage: $0 default|cells" >&2; exit 2 ;; esac
+WORKDIR="$(mktemp -d /tmp/kitty-obs.XXXXXX)"   # unpredictable temp dir (mktemp -d uses O_EXCL)
+DISP=":97"; GRIDFILE="$WORKDIR/grid.txt"
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
 EXTRA=(); [ "$MODE" = "cells" ] && EXTRA=(-o initial_window_width=80c -o initial_window_height=24c)
-Xvfb "$DISP" -screen 0 1920x1080x24 >"/tmp/xvfb_${MODE}.log" 2>&1 & XVFB_PID=$!
+Xvfb "$DISP" -screen 0 1920x1080x24 >"$WORKDIR/xvfb.log" 2>&1 & XVFB_PID=$!
 export DISPLAY="$DISP"; KITTY_PID=""
 cleanup() { rc=$?; [ -n "$KITTY_PID" ] && { kill "$KITTY_PID" 2>/dev/null||true; wait "$KITTY_PID" 2>/dev/null||true; }; \
-            kill "$XVFB_PID" 2>/dev/null||true; wait "$XVFB_PID" 2>/dev/null||true; return $rc; }
+            kill "$XVFB_PID" 2>/dev/null||true; wait "$XVFB_PID" 2>/dev/null||true; rm -rf "$WORKDIR"; return $rc; }
 trap cleanup EXIT
 for _ in $(seq 1 50); do xdpyinfo -display "$DISP" >/dev/null 2>&1 && break; sleep 0.1; done
-./kitty/launcher/kitty --config NONE -o remember_window_size=no "${EXTRA[@]}" \
-  sh -c "stty size > '$GRIDFILE' 2>&1; sleep 6" & KITTY_PID=$!
+GRIDFILE="$GRIDFILE" ./kitty/launcher/kitty --config NONE -o remember_window_size=no "${EXTRA[@]}" \
+  sh -c 'stty size > "$GRIDFILE" 2>&1; sleep 6' & KITTY_PID=$!
 ready=0; for _ in $(seq 1 150); do [ -s "$GRIDFILE" ] && { ready=1; break; }; sleep 0.1; done
 [ "$ready" -eq 1 ] || { echo "TIMEOUT ($MODE)"; exit 3; }
 CLASSLINE="$(xwininfo -root -tree 2>/dev/null | grep -i '("kitty" "kitty")' | head -1)"
@@ -931,7 +940,7 @@ echo "[$MODE] DONE ok"
 
 ```console
 $ bash geometry_probe.sh default ; echo "DEFAULT_WORKFLOW_EXIT=$?"
-[0.153] Failed to open systemd user bus with error: No medium found
+[0.147] Failed to open systemd user bus with error: No medium found
 [default]      0x20000c "sh": ("kitty" "kitty")  640x400+0+0  +0+0
   Width: 640
   Height: 400
@@ -950,7 +959,7 @@ complete, unedited; workflow exit 0):
 
 ```console
 $ bash geometry_probe.sh cells ; echo "CELLS_WORKFLOW_EXIT=$?"
-[0.147] Failed to open systemd user bus with error: No medium found
+[0.146] Failed to open systemd user bus with error: No medium found
 [cells]      0x20000c "sh": ("kitty" "kitty")  721x433+0+0  +0+0
   Width: 721
   Height: 433
@@ -1040,8 +1049,43 @@ the Talk thread (`KittyPeerMon`) starts only for single-instance IPC / remote-co
 ### 7.2 Runtime corroboration — observed thread names
 
 The model was verified at runtime by listing `/proc/<pid>/task/*/comm` for the running launcher in
-the **default** configuration (safe `set -euo pipefail` probe; two unchanged runs, identical; exit 0
-both). Complete, unedited output:
+the **default** configuration. The exact temporary probe (removed afterward; it lived only under
+`/tmp`, never in the repo) is a safe `set -euo pipefail` script that creates its own headless
+display under an unpredictable `mktemp -d` working directory, launches the **default-config**
+launcher, samples each running thread's `comm` in ascending TID order (≈ creation order), and
+categorises the names. It takes no arguments (no injection surface), uses **targeted** `kill`s on
+captured PIDs (never `pkill`/`killall`), and removes its working directory via a cleanup `trap`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+DISP=":98"
+export LANG=C.UTF-8 LC_ALL=C.UTF-8 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+WORKDIR="$(mktemp -d /tmp/kitty-tc.XXXXXX)"
+Xvfb "$DISP" -screen 0 1920x1080x24 >"$WORKDIR/xvfb.log" 2>&1 & XVFB_PID=$!
+export DISPLAY="$DISP"; KITTY_PID=""
+cleanup() { [ -n "$KITTY_PID" ] && { kill "$KITTY_PID" 2>/dev/null||true; wait "$KITTY_PID" 2>/dev/null||true; }; \
+            kill "$XVFB_PID" 2>/dev/null||true; wait "$XVFB_PID" 2>/dev/null||true; rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+for _ in $(seq 1 50); do xdpyinfo -display "$DISP" >/dev/null 2>&1 && break; sleep 0.1; done
+./kitty/launcher/kitty --config NONE sh -c 'sleep 6' & KITTY_PID=$!
+for _ in $(seq 1 150); do [ -d "/proc/$KITTY_PID/task" ] && break; sleep 0.1; done
+sleep 2   # allow the GL/driver worker pool to spin up fully
+# Read each thread's comm in ascending numeric TID order (≈ creation order)
+comms() { for t in $(ls "/proc/$KITTY_PID/task" | sort -n); do cat "/proc/$KITTY_PID/task/$t/comm" 2>/dev/null; done; }
+total=$(comms | wc -l)
+llvmpipe=$(comms | grep -c '^llvmpipe' || true)
+kittyc=$(comms | grep -cx 'kitty' || true)
+echo "kitty pid = $KITTY_PID"
+echo "total OS threads = $total"
+echo "  llvmpipe-* (software-GL worker pool) = $llvmpipe"
+echo "  comm==kitty (main + kitty-created + driver-helper, unnamed) = $kittyc"
+echo "  other-named threads:"
+comms | grep -v '^llvmpipe' | grep -vx 'kitty' | awk '!seen[$0]++' | sed 's/^/    /'
+echo "DONE ok"
+```
+
+Two unchanged runs, identical; exit 0 both. Complete, unedited output:
 
 ```console
 $ bash threadcount_probe.sh ; echo "TC_EXIT=$?"          # run 1
@@ -1132,7 +1176,7 @@ export LANG=C.UTF-8 LC_ALL=C.UTF-8 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpi
 |---|---------|---------|
 | 1 | Canonical build | `cd /app && python3 setup.py build` |
 | 2 | Version banner | `./kitty/launcher/kitty --version` |
-| 3 | Canonical headless launch (startup log) | `xvfb-run -a -s "-screen 0 1920x1080x24" ./kitty/launcher/kitty --debug-rendering --debug-font-fallback --config NONE sh -c "printf ready; sleep 3"` |
+| 3 | Canonical headless launch (startup log) | `xvfb-run -a -s "-screen 0 1920x1080x24" ./kitty/launcher/kitty --debug-rendering --debug-font-fallback --config NONE sh -c 'sleep 1.5'` |
 | 4 | Renderer / GL profile contrast | `xvfb-run -a -s "-screen 0 1920x1080x24" glxinfo -B` |
 | 5 | Window geometry (default & cells) | `bash geometry_probe.sh default` / `bash geometry_probe.sh cells` (script in [§6.4](#64-both-closure-branches-exercised-at-runtime--a-safe-reproducible-workflow)) |
 | 6 | Cell metrics (supplemental) | `PYTHONPATH=/app python3 cellmetrics_probe.py` (script in [§6.2](#62-step-2--cell-metrics-are-computed-at-the-detected-dpi)) |
