@@ -394,6 +394,7 @@ for i in $(seq 1 80); do
 done
 WRAPPER_PID="$(pgrep -f "runuser -u $USERNAME" | head -1)"
 
+mkdir -p "$EV/harness"
 cat > "$EV/harness/env.sh" <<EOF
 export REPO="$REPO"
 export EV="$EV"
@@ -815,7 +816,7 @@ Thread 1 "kitty" hit Temporary breakpoint 2, _PyObject_CallMethod_SizeT (obj=0x7
 [Inferior 1 (process 136335) detached]
 ```
 
-[OBSERVED] For an ordinary printable key, the C function `on_key_input` (`kitty/keys.c:L166`) calls `dispatch_possible_special_key` for every `GLFW_PRESS`/`GLFW_REPEAT` (`kitty/keys.c:L228`), which crosses into Python `Boss.dispatch_possible_special_key` (`kitty/boss.py:L1408`) and thence `KeyboardState.dispatch_possible_special_key` (`kitty/keys.py:L154`). [INFERRED, from those sources] that Python call returns `False` when no keymap consumes the key, after which control returns to C for text/encoding and PTY enqueue (§4). So **every** press/repeat enters Python for shortcut lookup; plain text is *not* a Python-bypassing path.
+[OBSERVED] For an ordinary printable key, the C function `on_key_input` (`kitty/keys.c:L166`) calls `dispatch_possible_special_key` for every `GLFW_PRESS`/`GLFW_REPEAT` (`kitty/keys.c:L228`), which crosses into Python `Boss.dispatch_possible_special_key` (`kitty/boss.py:L1408`) and thence `Mappings.dispatch_possible_special_key` (`kitty/keys.py:L154`). [INFERRED, from those sources] that Python call returns `False` when no keymap consumes the key, after which control returns to C for text/encoding and PTY enqueue (§4). So **every** press/repeat enters Python for shortcut lookup; plain text is *not* a Python-bypassing path.
 
 ### 2.3 The six input conditions, driven through the real path [OBSERVED]
 
@@ -1847,7 +1848,7 @@ count of on_key_input lines in this window = 800
 
 ### 6.5 IME / preedit state [OBSERVED + INFERRED]
 
-`on_key_input` switches on `ev->ime_state` (`kitty/keys.c:L188-L216`); the debug line prints `state: %d`. A genuine environment check confirmed **no input method** is configured or running (no `XMODIFIERS`/`*_IM_MODULE`, no `ibus`/`fcitx` daemon or binary). Every real keystroke reports `state: 0` = `GLFW_IME_NONE` (`kitty/keys.c:L207`, the real-key path), and zero IME-path debug lines are produced. The `PREEDIT_CHANGED` (`kitty/keys.c:L195`) and `COMMIT_TEXT` (`kitty/keys.c:L202`, which calls `schedule_write_to_child`) branches require an active IM to emit GLFW IME events; this is labelled [INFERRED] **after** the documented environment check, since no IM is present or installable offline:
+`on_key_input` switches on `ev->ime_state` (`kitty/keys.c:L187-L216`); the debug line prints `state: %d`. A genuine environment check confirmed **no input method** is configured or running (no `XMODIFIERS`/`*_IM_MODULE`, no `ibus`/`fcitx` daemon or binary). Every real keystroke reports `state: 0` = `GLFW_IME_NONE` (`kitty/keys.c:L207`, the real-key path), and zero IME-path debug lines are produced. The `PREEDIT_CHANGED` (`kitty/keys.c:L195`) and `COMMIT_TEXT` (`kitty/keys.c:L202`, which calls `schedule_write_to_child`) branches require an active IM to emit GLFW IME events; this is labelled [INFERRED] **after** the documented environment check, since no IM is present or installable offline:
 
 ```text
 ############ BOUNDARY 5: IME / preedit state (M4) ############
@@ -2080,7 +2081,7 @@ child-array lookup/lifetime, and a PER-SCREEN write_buf_lock for buffer mutation
 not a single global lock.
 
 === M20 — write_to_child COALESCING & PARTIAL-WRITE RETENTION (source + measured) ===
-[OBSERVED-in-source] write_to_child (child-monitor.c:L1447-1473): while(written <
+[OBSERVED-in-source] write_to_child (child-monitor.c:L1447-1476): while(written <
   write_buf_used) write(fd, write_buf+written, write_buf_used-written) [L1448] — writes as
   much as possible per call; ret==0 -> break (L1460); EINTR -> continue (L1462);
   EAGAIN/EWOULDBLOCK -> break (L1463); other errno -> perror + discard (L1464); leftover
@@ -2101,7 +2102,7 @@ not a single global lock.
 
 [OBSERVED-in-source] The enqueue path `schedule_write_to_child_generic` (`kitty/child-monitor.c:L323`) takes **two distinct locks**, not one: first `children_mutex` (`L334`, i.e. `pthread_mutex_lock(&children_lock)`, macro `L76`) to look up the target child in the `children[]` array, then the **per-screen** `screen_mutex(lock, write)` (`L338`, i.e. `&screen->write_buf_lock`, macro `L74`) to append into that window's `write_buf` (memcpy `L354`, `write_buf_used +=` `L355`) before waking the io-loop (`L363`). `write_to_child` (`kitty/child-monitor.c:L1443`) independently takes the same per-screen `write_buf_lock` (`L1446`) to flush on the io-thread.
 
-[OBSERVED-in-source] `write_to_child` (`kitty/child-monitor.c:L1447-L1473`) does **not** guarantee the whole buffer is written per `POLLOUT`: `while (written < write_buf_used)` issuing `write(fd, buf, remaining)` writes as much as possible, breaks on a zero return (`L1460`), continues on `EINTR` (`L1462`), **breaks on `EAGAIN`/`EWOULDBLOCK`** (`L1463`), discards on any other errno (`L1464`), and retains any leftover via `memmove` (`L1471-L1476`). [OBSERVED-measured] A single 600-byte bulk enqueue is therefore flushed as **one** `write(10, buf, 600)=600`, not 600 one-byte writes — bytes pending together coalesce; per-keystroke typing yields 1-byte writes only because each key is enqueued separately. The claim that “kitty deliberately never coalesces input” is false:
+[OBSERVED-in-source] `write_to_child` (`kitty/child-monitor.c:L1447-L1476`) does **not** guarantee the whole buffer is written per `POLLOUT`: `while (written < write_buf_used)` issuing `write(fd, buf, remaining)` writes as much as possible, breaks on a zero return (`L1460`), continues on `EINTR` (`L1462`), **breaks on `EAGAIN`/`EWOULDBLOCK`** (`L1463`), discards on any other errno (`L1464`), and retains any leftover via `memmove` (`L1471-L1476`). [OBSERVED-measured] A single 600-byte bulk enqueue is therefore flushed as **one** `write(10, buf, 600)=600`, not 600 one-byte writes — bytes pending together coalesce; per-keystroke typing yields 1-byte writes only because each key is enqueued separately. The claim that “kitty deliberately never coalesces input” is false:
 
 ```text
 ############ M20: write_to_child COALESCING (bulk enqueue -> few large write() calls) ############
