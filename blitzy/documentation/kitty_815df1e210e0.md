@@ -5,8 +5,9 @@
 > paths, then captured verbatim. Each claim is tagged **[OBSERVED]** (measured at
 > runtime) or **[INFERRED]** (derived from source, labelled with the exact
 > `file:line`). The temporary observation scripts are reproduced inline in full so
-> the numbers can be regenerated; they lived in a scratch directory
-> (`/tmp/kitty_probe`) outside the repository and were removed afterwards. **No
+> the numbers can be regenerated; they lived in a **private, per-session scratch
+> directory** outside the repository (created with `mktemp -d` under `umask 077` and
+> removed on exit — see §1.6). **No
 > existing repository file was modified**; the sole repository change is this answer
 > document (full observed-vs-inferred ledger in §8.1). Build artifacts are gitignored,
 > so before committing this document `git status --porcelain` shows only the one new
@@ -42,8 +43,13 @@ command pours out an enormous amount of text very fast:
 3. **Allocation is lazy at the OS level.** A carved segment reserves
    `xnum*2048*sizeof(CPUCell) + xnum*2048*sizeof(GPUCell) + 2048*sizeof(LineAttrs)`
    bytes in one `calloc` [kitty/history.c:17-28] — **5,251,072 bytes at `xnum=80`
-   [INFERRED]** — but resident memory climbs **gradually**, measured at exactly
-   **2560 bytes per line** as pages are touched, not in discrete multi-megabyte jumps.
+   [INFERRED]** — of which the cell payload is a **source-derived 2560 bytes/line**
+   (`80 × (12+20)`) and the whole-`calloc` amortizes to **2564 bytes/line**
+   (`5,251,072 / 2048`, the extra 4 = `LineAttrs`). Resident memory then climbs
+   **gradually** as pages are touched; its measured slope is **nondeterministic** — on
+   this build ≈ **2562.7 bytes/line**, while other environments range from ~0 (warm-page
+   reuse) to ~2570 (§2.4) — so it is reported as a **distribution**, not a fixed value,
+   and never as one discrete multi-megabyte jump.
 4. **The pager tier is disabled by default** (`scrollback_pager_history_size = 0`
    [kitty/options/definition.py:406]). While disabled, evicted lines are simply
    **dropped**. When enabled, each evicted line is serialized into the ring
@@ -89,22 +95,12 @@ $ gcc --version | head -1
 gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
 ```
 
-The per-file compile invocation shows the canonical **optimized** flags
-(`-DNDEBUG -O3 -flto -march=native -std=c11 -pedantic-errors -Werror`), and the link
-step produces `fast_data_types.so` from all module objects — including
-`build/fast_data_types-kitty-history.c.o` and
-`build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o` (object list collapsed for length):
+With `--verbose`, `setup.py` prints every `gcc` command. Three are reproduced here **verbatim and complete** (no elision): the `data-types.c` compile — the one line that carries the `-DKITTY_VCS_REV` provenance macro (see below); the `history.c` compile — the subject file of this investigation; and the final **link**, which lists **every** one of the ~62 object files (including `build/fast_data_types-kitty-history.c.o` and `build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o`) that make up `fast_data_types.so`:
 
 ```console
-gcc -MMD -DNDEBUG -DKITTY_VCS_REV="8740dc29e4ac701184d2952de49ceea10f1bf943" ... \
-  -Wextra -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv \
-  -fstack-protector-strong -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 \
-  -flto -fcf-protection=full -march=native -mtune=native ... \
-  -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
-gcc ... -O3 -shared -flto \
-  [... all module .o files, incl. build/fast_data_types-kitty-history.c.o \
-       and build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o ...] \
-  -lpython3.13 ... -o build/kitty/fast_data_types.so
+gcc -MMD -DNDEBUG -DKITTY_VCS_REV="9e8a0069a671fb4e3f1ba6551c4bd9d1da0a82fa" -DWRAPPED_KITTENS="ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/history.c -o build/fast_data_types-kitty-history.c.o
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -Wall -O3 -shared -flto build/fast_data_types-kitty-charsets.c.o build/fast_data_types-kitty-child-monitor.c.o build/fast_data_types-kitty-child.c.o build/fast_data_types-kitty-cleanup.c.o build/fast_data_types-kitty-colors.c.o build/fast_data_types-kitty-crypto.c.o build/fast_data_types-kitty-cursor.c.o build/fast_data_types-kitty-data-types.c.o build/fast_data_types-kitty-desktop.c.o build/fast_data_types-kitty-disk-cache.c.o build/fast_data_types-kitty-fast-file-copy.c.o build/fast_data_types-kitty-font-names.c.o build/fast_data_types-kitty-fontconfig.c.o build/fast_data_types-kitty-fonts.c.o build/fast_data_types-kitty-freetype.c.o build/fast_data_types-kitty-freetype_render_ui_text.c.o build/fast_data_types-kitty-gl-wrapper.c.o build/fast_data_types-kitty-gl.c.o build/fast_data_types-kitty-glfw-wrapper.c.o build/fast_data_types-kitty-glfw.c.o build/fast_data_types-kitty-glyph-cache.c.o build/fast_data_types-kitty-graphics.c.o build/fast_data_types-kitty-history.c.o build/fast_data_types-kitty-hyperlink.c.o build/fast_data_types-kitty-key_encoding.c.o build/fast_data_types-kitty-keys.c.o build/fast_data_types-kitty-kittens.c.o build/fast_data_types-kitty-line-buf.c.o build/fast_data_types-kitty-line.c.o build/fast_data_types-kitty-logging.c.o build/fast_data_types-kitty-loop-utils.c.o build/fast_data_types-kitty-monotonic.c.o build/fast_data_types-kitty-mouse.c.o build/fast_data_types-kitty-png-reader.c.o build/fast_data_types-kitty-rowcolumn-diacritics.c.o build/fast_data_types-kitty-screen.c.o build/fast_data_types-kitty-shaders.c.o build/fast_data_types-kitty-shlex.c.o build/fast_data_types-kitty-simd-string-128.c.o build/fast_data_types-kitty-simd-string-256.c.o build/fast_data_types-kitty-simd-string.c.o build/fast_data_types-kitty-state.c.o build/fast_data_types-kitty-systemd.c.o build/fast_data_types-kitty-unicode-data.c.o build/fast_data_types-kitty-utmp.c.o build/fast_data_types-kitty-vt-parser.c.o build/fast_data_types-kitty-wcswidth.c.o build/fast_data_types-kitty-window_logo.c.o build/fast_data_types-kitty-vt-parser-dump.c.o build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon32-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse42-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-ssse3-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse41-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-generic-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx2-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx512-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon64-codec.c.o build/fast_data_types-3rdparty-base64-lib-tables-tables.c.o build/fast_data_types-3rdparty-base64-lib-codec_choose.c.o build/fast_data_types-3rdparty-base64-lib-lib.c.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -lharfbuzz -lGL -lpng16 -llcms2 -llcms2_fast_float -llcms2_threaded -pthread -lm -lcrypto -lrt -lz -o build/kitty/fast_data_types.so
 ```
 
 Result (captured):
@@ -115,7 +111,7 @@ EXIT_STATUS=0
 $ ls -l kitty/fast_data_types.so
 -rwxr-xr-x 1 root root 1253792 kitty/fast_data_types.so
 $ sha256sum kitty/fast_data_types.so
-74ca07a607f821ef3b78e530449445bceca003a8bbb2477d1181b959ca34a238  kitty/fast_data_types.so
+75d31e7a8c5038bb2742bc2b1bea8ab31ed2128dc805e6930336972e68461138  kitty/fast_data_types.so
 $ python3 -c "import kitty.fast_data_types as f; print('HistoryBuf', 'HistoryBuf' in dir(f), '| Screen', 'Screen' in dir(f))"
 HistoryBuf True | Screen True
 ```
@@ -127,6 +123,8 @@ build itself produced **no tracked change** — `git status --porcelain` reports
 single new documentation file (see §8.3). Every probe in this document was run against
 **this** canonical `.so`.
 
+**Why the `.so` sha256 is pinned to a commit [OBSERVED].** The `-DKITTY_VCS_REV="…"` token on the `data-types.c` line above is the current commit hash. `setup.py`'s `get_vcs_rev()` [setup.py:674] runs `git rev-parse HEAD` (overridable with `--vcs-rev`) and passes it as a `-D` macro [setup.py:726], which `data-types.c` bakes into the module as a string literal via `PyModule_AddStringMacro(module, KITTY_VCS_REV)` [kitty/data-types.c:585-586]. Because that 40-character string is compiled in, the module's sha256 is a function of *(source + embedded commit)*. This was verified directly: at HEAD `9e8a0069a671…` the canonical build is sha256 `75d31e7a8c5038bb2742bc2b1bea8ab31ed2128dc805e6930336972e68461138`, size `1,253,792`; rebuilding with `--vcs-rev 9e8a0069a671fb4e3f1ba6551c4bd9d1da0a82fa` reproduces that sha256 exactly, while rebuilding with a sentinel `--vcs-rev 0000000000000000000000000000000000000000` yields a **different** sha256 (`184814dad4755d851c5c441cb53de149bc6a9d67d524972bec622d456a55e4e6`) at the **identical** size `1,253,792` — i.e. only the embedded string moved; the machine code is unchanged. **Every sha256 in this document is therefore reported for binaries built at commit `9e8a0069a671fb4e3f1ba6551c4bd9d1da0a82fa`** (the HEAD of this investigation).
+
 ### 1.2 Supplemental builds (labelled non-canonical)
 
 Two additional builds were produced only to cross-check boundary behavior; they are
@@ -134,13 +132,15 @@ Two additional builds were produced only to cross-check boundary behavior; they 
 
 | Build | Command | Size (bytes) | sha256 (prefix) | Key flags | ASan syms |
 |-------|---------|--------------|-----------------|-----------|-----------|
-| **canonical** | `CI=true python3 setup.py build --verbose` | 1,253,792 | `74ca07a6…` | `-DNDEBUG -O3 -flto -march=native` | 0 |
-| debug (suppl.) | `python3 setup.py build --debug --verbose` | 6,285,120 | `8ec2b699…` | `-DDEBUG -Og -g` | — |
-| sanitize (suppl.) | `python3 setup.py build --debug --sanitize --verbose` | 20,275,512 | `1b1d9aa8…` | `-DDEBUG -Og -fsanitize=address,undefined -g` | 29 |
+| **canonical** | `CI=true python3 setup.py build --verbose` | 1,253,792 | `75d31e7a…` | `-DNDEBUG -O3 -flto -march=native` | 0 |
+| debug (suppl.) | `python3 setup.py build --debug --verbose` | 6,285,120 | `a82e15e5…` | `-DDEBUG -Og -g` | — |
+| sanitize (suppl.) | `python3 setup.py build --debug --sanitize --verbose` | 20,275,512 | `f754c850…` | `-DDEBUG -Og -fsanitize=address,undefined -g` | 29 |
 
 The sanitize build is used once, in §4, as **non-canonical corroboration** of the
 large-burst pager path (run under `LD_PRELOAD` of the ASan runtime), after which the
 canonical `.so` was restored and its sha256 re-verified.
+
+All three binaries were built at commit `9e8a0069a671fb4e3f1ba6551c4bd9d1da0a82fa`; their full sha256 values are debug `a82e15e5cb3ceda8927150737f4cf1ad99a9a216f73742461b2126c60f8fba3a` and sanitize `f754c850b5dd144479039d59efe192206881c67fb5f1fe2784f4a861432a1d59` (canonical `75d31e7a…` as above). The sanitize sha256 is **deterministic across relinks** and its module carries **29 dynamic `__asan_` references** (`nm -D … | grep -c asan`).
 
 ### 1.3 Canonical entry point (and an honest note on harness fidelity)
 
@@ -174,7 +174,9 @@ exposes:
   [kitty/history.c:556-558]; segment count is **not** exposed, so every segment-count
   figure here is **[INFERRED]** from `count`/`ynum`.
 - `HistoryBuf.pagerhist_as_bytes()` [kitty/fast_data_types.pyi:1085] — returns the
-  pager ring's used bytes (empty `b""` when the tier is unallocated/empty).
+  pager ring's used bytes **[OBSERVED]**. It reads empty `b""` both when the tier is
+  **disabled** (the allocator returns `NULL` for size ≤ 0 — **[SOURCE-DERIVED,
+  kitty/history.c:69-81]**) and when it is allocated but still empty.
 - `Screen.scrolled_by` — read-only member [kitty/fast_data_types.pyi:1119,
   kitty/screen.c:4903].
 - `Screen.visual_line(y)`, `Screen.scroll(amt, upwards)`,
@@ -209,12 +211,17 @@ pass `scrollback_pager_history_size` in **bytes** directly (e.g. `4194304` for 4
 
 ### 1.6 Reproducibility conventions
 
-Every probe below: (a) is a complete, self-contained script (shown in full); (b) was
-run from the repository root as `PYTHONDONTWRITEBYTECODE=1 python3 <script>`; (c) was
-run **twice** on the canonical `.so`; (d) had its structural magnitudes confirmed
-**identical** across both runs (timing-only fields vary and are reported as
-distributions). Scripts lived in `/tmp/kitty_probe` (outside the repo) and were
-deleted afterwards.
+Every probe below is a complete, self-contained script (shown in full) and was run from the repository root **at least twice**, on the canonical `.so`; its structural magnitudes were confirmed **identical** across every run (SQ1 was additionally run five times to characterize its nondeterministic RSS distribution; timing-only fields vary and are reported as distributions). To keep scripts and any preserved binaries private and out of the repository, each session created an **unpredictable, owner-only** scratch directory and removed it on any exit — the convention referenced by every probe block that follows:
+
+```bash
+umask 077                                             # 0700 files/dirs, owner-only
+scratch=$(mktemp -d /tmp/kitty-history.XXXXXX)        # unpredictable name, mode 0700
+trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM        # scoped cleanup on any exit
+# … write the probe to "$scratch/<name>.py" …
+PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/<name>.py"  # paths always quoted
+```
+
+All paths are quoted, cleanup is scoped to `"$scratch"` (never a broad `rm`), and no script or preserved binary is ever written inside the repository tree — so `git status --porcelain` stays empty except for this one document.
 
 ---
 
@@ -353,64 +360,65 @@ if __name__ == '__main__':
 ```
 
 
-### 2.3 Observed output (canonical build, run 1 of 2 — complete, unedited)
+### 2.3 Observed output (canonical build, run 1 of 3 — complete, unedited)
 
 ```console
-$ PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq1_segments.py
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq1_segments.py"
 === SQ1: segment allocation / carving (pager DISABLED) ===
 Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell=12@228 GPUCell=20@221; LineAttrs=4 (enum bitfield @231-239, no static_assert)]:
   xnum=80: 80*2048*12 + 80*2048*20 + 2048*4 = 5251072 bytes (~5.008 MiB)
 
 --- CONFIG scrollback=2000: ynum=2000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=1 [INFERRED] ---
-  FRESH: count=0 inferred_segments=1[INF] rss=26388KB [OBSERVED]
-  SATURATE at lines_fed=2023: count==ynum=2000 rss=31672KB [OBSERVED]
+  FRESH: count=0 inferred_segments=1[INF] rss=31840KB [OBSERVED]
+  SATURATE at lines_fed=2023: count==ynum=2000 rss=37108KB [OBSERVED]
   RSS SLOPE (first segment, count 256->1792): 2562.7 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
-  END: count=2000 ynum=2000 capped_at_ynum=True final_segments[INF]=1 rss=31672KB [OBSERVED]
+  END: count=2000 ynum=2000 capped_at_ynum=True final_segments[INF]=1 rss=37108KB [OBSERVED]
 
 --- CONFIG scrollback=5000: ynum=5000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=3 [INFERRED] ---
-  FRESH: count=0 inferred_segments=1[INF] rss=26824KB [OBSERVED]
-  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=36956KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42084KB [OBSERVED count/INF seg]
-  SATURATE at lines_fed=5023: count==ynum=5000 rss=42084KB [OBSERVED]
+  FRESH: count=0 inferred_segments=1[INF] rss=32100KB [OBSERVED]
+  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=37236KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42364KB [OBSERVED count/INF seg]
+  SATURATE at lines_fed=5023: count==ynum=5000 rss=44496KB [OBSERVED]
   RSS SLOPE (first segment, count 256->1792): 2562.7 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
-  END: count=5000 ynum=5000 capped_at_ynum=True final_segments[INF]=3 rss=42084KB [OBSERVED]
+  END: count=5000 ynum=5000 capped_at_ynum=True final_segments[INF]=3 rss=44496KB [OBSERVED]
 
 --- CONFIG scrollback=10000: ynum=10000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=5 [INFERRED] ---
-  FRESH: count=0 inferred_segments=1[INF] rss=31984KB [OBSERVED]
-  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=37012KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42140KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=6168 count=6145: segments 3->4 (crossed 2048-line boundary) rss=47272KB [OBSERVED count/INF seg]
-  CARVE at lines_fed=8216 count=8193: segments 4->5 (crossed 2048-line boundary) rss=52404KB [OBSERVED count/INF seg]
-  SATURATE at lines_fed=10023: count==ynum=10000 rss=52404KB [OBSERVED]
-  RSS SLOPE (first segment, count 256->1792): 0.0 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
-  END: count=10000 ynum=10000 capped_at_ynum=True final_segments[INF]=5 rss=52404KB [OBSERVED]
-
+  FRESH: count=0 inferred_segments=1[INF] rss=32100KB [OBSERVED]
+  CARVE at lines_fed=2072 count=2049: segments 1->2 (crossed 2048-line boundary) rss=37236KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=4120 count=4097: segments 2->3 (crossed 2048-line boundary) rss=42364KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=6168 count=6145: segments 3->4 (crossed 2048-line boundary) rss=47492KB [OBSERVED count/INF seg]
+  CARVE at lines_fed=8216 count=8193: segments 4->5 (crossed 2048-line boundary) rss=52620KB [OBSERVED count/INF seg]
+  SATURATE at lines_fed=10023: count==ynum=10000 rss=57012KB [OBSERVED]
+  RSS SLOPE (first segment, count 256->1792): 2562.7 bytes/line [OBSERVED]  (cf. 80 cols x (12+20)=2560 [INFERRED])
+  END: count=10000 ynum=10000 capped_at_ynum=True final_segments[INF]=5 rss=57012KB [OBSERVED]
 ```
 
-> **Run 2 was structurally identical.** Every `CONFIG`, `FRESH`, `CARVE`, `SATURATE`,
-> and `END` field (all `lines_fed`, `count`, and segment counts) matched the run above
-> **byte-for-byte** (verified by diffing the two runs with the `rss=` and `RSS SLOPE`
-> lines filtered out). The `rss=` absolute values and the derived `RSS SLOPE` are
-> **nondeterministic** — they depend on OS page management and on execution order, and
-> are therefore **excluded** from that byte-for-byte guarantee:
+> **Runs 2 and 3 were structurally identical.** Every `CONFIG`, `FRESH`, `CARVE`,
+> `SATURATE`, and `END` field — all `lines_fed`, `count`, and inferred segment counts —
+> matched the run above **byte-for-byte** (verified by diffing with the `rss=` and
+> `RSS SLOPE` lines filtered out). The `rss=` absolute values and the derived
+> `RSS SLOPE` are **nondeterministic** — they reflect OS page management and execution
+> order — and are therefore reported as **distributions**, not fixed values:
 >
-> - **Absolute `rss=` values** drift by a few KB between runs and by **several MB across
->   build environments** (the reconciled build above starts at ~26 MB for
->   `scrollback=2000`; an earlier capture of the same probe on a different build started
->   nearer ~33 MB). Only the **per-segment growth deltas** — ≈ 5 MB across each
->   2048-line span (§2.4) — are stable across environments.
-> - **First-segment `RSS SLOPE`** is a *derived* point value that ranges from **0 up to
->   ~2570 bytes/line** across configs, runs and page-warmth. In this environment it is
->   stable per config across both runs: `scrollback=2000` ≈ **2562.7** (occasionally
->   2565.3), `scrollback=5000` ≈ **2562.7**, and `scrollback=10000` = **0.0**. The third
->   config *collapses to 0.0* precisely because it runs third in the same process: its
->   first-segment window (`count 256→1792`) reuses pages the OS already made resident
->   during the earlier `2000`/`5000` configs, so there is no fresh RSS delta to measure
->   there. Measured **first, in a fresh process with cold pages**, `scrollback=10000`
->   instead reads ≈ **2568–2571 bytes/line** — confirming the collapse is a
->   warm-page / execution-order artifact, **not** a change in allocation behaviour. The
->   **deterministic** per-line cost, `80 × 32 = 2560` bytes (§2.4, from the `calloc`
->   arithmetic), is the figure the cold-page slopes converge to.
+> - **Absolute `rss=`** drifts a few KB between runs and by **several MB across build
+>   environments**: on this reconciled build the fresh baseline is **31,576–32,104 KB**
+>   across five runs (three in-process + two fresh-process); an earlier capture of the
+>   same probe on a different build started nearer **26 MB**. Only the per-segment
+>   growth deltas are stable (third bullet).
+> - **First-segment `RSS SLOPE`** is a derived point value. On this build it reads a
+>   **stable 2562.7 bytes/line** for all three configs in all five runs — sitting
+>   between the source-derived payload `80×32 = 2560` and the whole-`calloc`
+>   amortization `5,251,072/2048 = 2564`. It is **environment-dependent**, however: an
+>   earlier build recorded the same slope anywhere from **~0** (when a config runs
+>   after others and its first-segment window reuses already-resident pages) **up to
+>   ~2570** (cold pages). That **0 … ~2570 range is the distribution**; the fixed,
+>   load-bearing figures are the two deterministic constants **2560** and **2564**.
+> - **Per-carve boundary delta**, measured in a **fresh, cold-page process** (each
+>   config in its own interpreter): **+5,388 KB** at the first carve and **+5,132 KB** at
+>   every subsequent carve — i.e. ≈ the `5,251,072`-byte (`5,128 KiB`) `calloc`, realized
+>   as pages are first written. Because this is RSS, a boundary that happens to reuse
+>   resident pages can instead show a **delayed or near-zero** delta; the reservation
+>   itself is deterministic, its RSS realization is not.
 
 ### 2.4 What this shows (answering SQ1)
 
@@ -426,22 +434,24 @@ Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell
 - **`count` saturates at `ynum` and stays there.** Every config ends
   `capped_at_ynum=True`; feeding thousands more lines never grows `count` past `ynum`
   — the excess is handled by eviction (see SQ2). **[OBSERVED]**
-- **Memory is reserved per-segment but backed lazily, so RSS climbs smoothly.** The
-  **deterministic** per-line cost is `80 cols × (sizeof(CPUCell)+sizeof(GPUCell)) =
-  80 × 32 = 2560` bytes — each line touches only its own row of cells. **[INFERRED —
-  `calloc` arithmetic; CPUCell=12 / GPUCell=20 `static_assert`s]** The probe's
-  self-computed first-segment `RSS SLOPE` is a *nondeterministic corroboration* of that
-  figure: across configs, runs and page-warmth it ranges from **0 up to ~2570
-  bytes/line**. In the run above it reads **2562.7** (scrollback=2000), **2562.7**
-  (5000) and **0.0** (10000); the last collapses to zero only because that config runs
-  third in the same process and reuses warm pages, and reads ≈ **2568–2571** when
-  measured first in a fresh process (see the §2.3 variance note). What *is* stable and
-  load-bearing is that the **5.25 MB per-segment `calloc` is not paid as a single
-  visible 5 MB step** — it materializes gradually as pages are first written, so RSS
-  rises by **~5 MB smoothly across each 2048-line span**. For example the
-  `scrollback=10000` run climbs `31984 → 37012 → 42140 → 47272 → 52404 KB` — ≈ 5.0 MB
-  per carved segment, reproduced across both runs. **[OBSERVED]** This gradual
-  ~5 MB-per-segment climb is the concrete, measured meaning of the buffer "filling and
+- **Memory is reserved per-segment but backed lazily, so RSS climbs gradually
+  rather than in one visible step.** The **deterministic** part is the `calloc`
+  reservation: `5,251,072` bytes/segment — a cell payload of `80 × (12+20) = 2560`
+  bytes/line and a whole-`calloc` amortization of `5,251,072 / 2048 = 2564` bytes/line
+  (the extra 4 = `LineAttrs`/line). **[INFERRED — `calloc` arithmetic; CPUCell=12 /
+  GPUCell=20 `static_assert`s, LineAttrs=4]** What is **measured** — and reported as a
+  distribution, because it reflects OS page management — is how that reservation
+  becomes resident: on this build the first-segment slope reads a stable **2562.7
+  bytes/line** across all three configs and all five runs (it lies between 2560 and
+  2564), and the per-carve boundary delta measured in a fresh cold-page process is
+  **+5,388 KB** (first carve) then **+5,132 KB** (subsequent) — ≈ the 5.25 MB `calloc`
+  (`5,128 KiB`), paid **gradually as pages are touched, never as one discrete 5 MB
+  step**. The `scrollback=10000` run above climbs
+  `32100 → 37236 → 42364 → 47492 → 52620 → 57012 KB` (≈ 5.13 MB per carved segment here).
+  **[OBSERVED — nondeterministic; a different environment can show delayed or near-zero
+  per-carve deltas, and first-segment slopes from ~0 to ~2570, §2.3]** This gradual,
+  page-by-page materialization of each 5.25 MB segment is the concrete, measured
+  meaning of the buffer "filling and
   stretching."
 
 ---
@@ -515,8 +525,8 @@ def part_disabled():
     bt = P()
     s = bt.create_screen(cols=80, lines=24, scrollback=2000,
                          options={'scrollback_pager_history_size': 0})
-    print(f"fresh: pagerhist_as_bytes()={s.historybuf.pagerhist_as_bytes()!r} "
-          f"(empty -> alloc_pagerhist returned NULL, history.c:69-81) [OBSERVED]")
+    print(f"fresh: pagerhist_as_bytes()={s.historybuf.pagerhist_as_bytes()!r} [OBSERVED empty bytes]; "
+          f"alloc_pagerhist returns NULL for size 0 [SOURCE-DERIVED history.c:69-81]")
     n = 1
     print(f"{'fed':>6} {'count':>6} {'hlac[local]':>11} {'evicted':>8} {'ring_bytes':>10}")
     for _ in range(6):
@@ -576,9 +586,9 @@ if __name__ == '__main__':
 ### 3.3 Observed output (canonical build, run 1 of 2 — complete, unedited)
 
 ```console
-$ PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq2_ring.py
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq2_ring.py"
 === SQ2-A: pager DISABLED (scrollback_pager_history_size=0) ===
-fresh: pagerhist_as_bytes()=b'' (empty -> alloc_pagerhist returned NULL, history.c:69-81) [OBSERVED]
+fresh: pagerhist_as_bytes()=b'' [OBSERVED empty bytes]; alloc_pagerhist returns NULL for size 0 [SOURCE-DERIVED history.c:69-81]
    fed  count hlac[local]  evicted ring_bytes
   1000    977         977        0          0
   2000   1977        1977        0          0
@@ -606,7 +616,6 @@ FIRST eviction batch: fed=3023 count=2000 evicted=1000 ring_bytes=33000 [OBSERVE
 RESULT: each batch's ring growth == (batch evictions) x (bytes/line) = PAYLOAD volume of evicted lines (NOT a fixed 1MiB extend granularity). [OBSERVED]
   (internal ring capacity grows via pagerhist_extend MAX(1MiB,minsz), history.c:89-102,
    but pagerhist_as_bytes() reports bytes_USED = payload, history.c:460-483) [INFERRED]
-
 ```
 
 > **Run 2 was byte-identical** to run 1 (verified by a full `diff` of the two
@@ -736,58 +745,106 @@ if __name__ == '__main__':
 ```
 
 
-Observed output (canonical build, run 1 of 2 — complete, unedited):
+Observed output (canonical build — **two runs, both complete and unedited**). The
+`fed`/`count`/`evicted`/`ring_bytes`/`ring_delta` columns are byte-identical across
+the two runs; only the timing columns (`batch_ms` and the latency summary) vary, and
+they stay within the same narrow distribution (median ≈ 0.63 ms, max ≈ 1.1 ms,
+ratio < 1.8x). **Run 1 of 2:**
 
 ```console
-$ PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq3_boundary.py
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq3_boundary.py"
 === SQ3 ring boundary: maximum_size=1048576 bytes (1 MiB) ===
     fed  count   evicted  ring_bytes ring_delta  batch_ms note
-   1000    977         0           0         +0     1.040 
-   6000   2000      3977      131241     +33000     0.620 
-  11000   2000      8977      296241     +33000     0.613 
-  16000   2000     13977      461241     +33000     0.613 
-  21000   2000     18977      626241     +33000     0.608 
-  26000   2000     23977      791241     +33000     0.620 
-  31000   2000     28977      956241     +33000     0.619 
-  35000   2000     32977     1048576         +0     0.631 << ring PLATEAU: bytes_used stops growing (overwrite oldest, ringbuf.c:231-234)
-  36000   2000     33977     1048576         +0     0.636 
-  41000   2000     38977     1048576         +0     0.643 
-  46000   2000     43977     1048576         +0     0.628 
-  51000   2000     48977     1048576         +0     0.648 
-  56000   2000     53977     1048576         +0     0.628 
-  61000   2000     58977     1048576         +0     0.630 
-  66000   2000     63977     1048576         +0     0.623 
-  71000   2000     68977     1048576         +0     0.662 
-  76000   2000     73977     1048576         +0     0.649 
-  78000   2000     75977     1048576         +0     0.656 
-  79000   2000     76977     1048576         +0     0.656 
-  80000   2000     77977     1048576         +0     0.640 
+   1000    977         0           0         +0     1.061 
+   6000   2000      3977      131241     +33000     0.633 
+  11000   2000      8977      296241     +33000     0.628 
+  16000   2000     13977      461241     +33000     0.612 
+  21000   2000     18977      626241     +33000     0.611 
+  26000   2000     23977      791241     +33000     0.604 
+  31000   2000     28977      956241     +33000     0.617 
+  35000   2000     32977     1048576         +0     0.638 << ring PLATEAU: bytes_used stops growing (overwrite oldest, ringbuf.c:231-234)
+  36000   2000     33977     1048576         +0     0.643 
+  41000   2000     38977     1048576         +0     0.627 
+  46000   2000     43977     1048576         +0     0.640 
+  51000   2000     48977     1048576         +0     0.638 
+  56000   2000     53977     1048576         +0     0.632 
+  61000   2000     58977     1048576         +0     0.634 
+  66000   2000     63977     1048576         +0     0.629 
+  71000   2000     68977     1048576         +0     0.643 
+  76000   2000     73977     1048576         +0     0.646 
+  78000   2000     75977     1048576         +0     0.637 
+  79000   2000     76977     1048576         +0     0.633 
+  80000   2000     77977     1048576         +0     0.639 
 PLATEAU first observed at fed=35000; final ring_bytes=1048576 (<= maximum_size=1048576) [OBSERVED]
 per-batch latency (batch=1000 lines, n=80 batches) [OBSERVED]:
-  min=0.602ms median=0.632ms mean=0.643ms p99=1.040ms max=1.118ms
+  min=0.604ms median=0.633ms mean=0.643ms p99=1.061ms max=1.124ms
+  max/median ratio = 1.78x (no catastrophic stall at plateau crossing at this resolution) [OBSERVED]
+
+=== SQ3 ring boundary: maximum_size=4096 bytes (tiny 4 KiB edge) ===
+    fed  count   evicted  ring_bytes ring_delta  batch_ms note
+   1000    977         0           0         +0     0.853 
+   4000   2000      1977        4096         +0     0.633 << ring PLATEAU: bytes_used stops growing (overwrite oldest, ringbuf.c:231-234)
+   6000   2000      3977        4096         +0     0.635 
+  11000   2000      8977        4096         +0     0.627 
+  16000   2000     13977        4096         +0     0.633 
+  18000   2000     15977        4096         +0     0.624 
+  19000   2000     16977        4096         +0     0.638 
+  20000   2000     17977        4096         +0     0.633 
+PLATEAU first observed at fed=4000; final ring_bytes=4096 (<= maximum_size=4096) [OBSERVED]
+per-batch latency (batch=1000 lines, n=20 batches) [OBSERVED]:
+  min=0.621ms median=0.633ms mean=0.656ms p99=0.884ms max=0.884ms
+  max/median ratio = 1.40x (no catastrophic stall at plateau crossing at this resolution) [OBSERVED]
+
+```
+
+**Run 2 of 2** (complete, unedited — identical structural columns; timing within the
+same distribution):
+
+```console
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq3_boundary.py"
+=== SQ3 ring boundary: maximum_size=1048576 bytes (1 MiB) ===
+    fed  count   evicted  ring_bytes ring_delta  batch_ms note
+   1000    977         0           0         +0     1.004 
+   6000   2000      3977      131241     +33000     0.622 
+  11000   2000      8977      296241     +33000     0.608 
+  16000   2000     13977      461241     +33000     0.610 
+  21000   2000     18977      626241     +33000     0.614 
+  26000   2000     23977      791241     +33000     0.617 
+  31000   2000     28977      956241     +33000     0.616 
+  35000   2000     32977     1048576         +0     0.644 << ring PLATEAU: bytes_used stops growing (overwrite oldest, ringbuf.c:231-234)
+  36000   2000     33977     1048576         +0     0.636 
+  41000   2000     38977     1048576         +0     0.635 
+  46000   2000     43977     1048576         +0     0.644 
+  51000   2000     48977     1048576         +0     0.635 
+  56000   2000     53977     1048576         +0     0.630 
+  61000   2000     58977     1048576         +0     0.655 
+  66000   2000     63977     1048576         +0     0.657 
+  71000   2000     68977     1048576         +0     0.664 
+  76000   2000     73977     1048576         +0     0.652 
+  78000   2000     75977     1048576         +0     0.662 
+  79000   2000     76977     1048576         +0     0.651 
+  80000   2000     77977     1048576         +0     0.633 
+PLATEAU first observed at fed=35000; final ring_bytes=1048576 (<= maximum_size=1048576) [OBSERVED]
+per-batch latency (batch=1000 lines, n=80 batches) [OBSERVED]:
+  min=0.605ms median=0.636ms mean=0.652ms p99=1.077ms max=1.125ms
   max/median ratio = 1.77x (no catastrophic stall at plateau crossing at this resolution) [OBSERVED]
 
 === SQ3 ring boundary: maximum_size=4096 bytes (tiny 4 KiB edge) ===
     fed  count   evicted  ring_bytes ring_delta  batch_ms note
-   1000    977         0           0         +0     0.842 
-   4000   2000      1977        4096         +0     0.642 << ring PLATEAU: bytes_used stops growing (overwrite oldest, ringbuf.c:231-234)
-   6000   2000      3977        4096         +0     0.629 
-  11000   2000      8977        4096         +0     0.631 
-  16000   2000     13977        4096         +0     0.629 
-  18000   2000     15977        4096         +0     0.635 
-  19000   2000     16977        4096         +0     0.639 
-  20000   2000     17977        4096         +0     0.629 
+   1000    977         0           0         +0     0.862 
+   4000   2000      1977        4096         +0     0.652 << ring PLATEAU: bytes_used stops growing (overwrite oldest, ringbuf.c:231-234)
+   6000   2000      3977        4096         +0     0.642 
+  11000   2000      8977        4096         +0     0.644 
+  16000   2000     13977        4096         +0     0.650 
+  18000   2000     15977        4096         +0     0.646 
+  19000   2000     16977        4096         +0     0.640 
+  20000   2000     17977        4096         +0     0.643 
 PLATEAU first observed at fed=4000; final ring_bytes=4096 (<= maximum_size=4096) [OBSERVED]
 per-batch latency (batch=1000 lines, n=20 batches) [OBSERVED]:
-  min=0.621ms median=0.632ms mean=0.655ms p99=0.874ms max=0.874ms
-  max/median ratio = 1.38x (no catastrophic stall at plateau crossing at this resolution) [OBSERVED]
+  min=0.639ms median=0.646ms mean=0.668ms p99=0.874ms max=0.874ms
+  max/median ratio = 1.35x (no catastrophic stall at plateau crossing at this resolution) [OBSERVED]
 
 ```
-
-> The `fed`/`count`/`evicted`/`ring_bytes`/`ring_delta` columns were **byte-identical
-> across both runs**; only the timing columns vary. Run 2's latency summary was
-> `median 0.643ms max 1.106ms` (1 MiB) and `median 0.644ms max 0.882ms` (4 KiB) —
-> the same shape, confirming the distribution is stable.
 
 ### 4.3 Probe — large-burst fragility (1M + 10M lines), plus a sanitizer cross-check
 
@@ -845,10 +902,36 @@ if __name__ == '__main__':
 ```
 
 
-Observed output (canonical build, run 1 of 2 — complete, unedited):
+Observed output (canonical build — **two runs, both complete and unedited**;
+every `count`/`evicted`/`ring_bytes` value is identical across the two runs, only
+`elapsed`/throughput differ, and both runs exit 0). **Run 1 of 2:**
 
 ```console
-$ PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq3_fragility.py
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq3_fragility.py"
+=== SQ3 fragility: 1000000 lines, pager=8388608 bytes (1M, 8 MiB ring) ===
+  progress   1000000 lines | count=2000 evicted=997977 ring_bytes=8388608 elapsed=0.50s [OBSERVED]
+  DONE 1000000 lines: count=2000 ynum=2000 evicted=997977 ring_bytes=8388608 elapsed=0.50s (2.01 M lines/s) NO CRASH [OBSERVED]
+
+=== SQ3 fragility: 10000000 lines, pager=8388608 bytes (10M, 8 MiB ring) ===
+  progress   1000000 lines | count=2000 evicted=997977 ring_bytes=8388608 elapsed=0.48s [OBSERVED]
+  progress   2000000 lines | count=2000 evicted=1997977 ring_bytes=8388608 elapsed=0.97s [OBSERVED]
+  progress   3000000 lines | count=2000 evicted=2997977 ring_bytes=8388608 elapsed=1.46s [OBSERVED]
+  progress   4000000 lines | count=2000 evicted=3997977 ring_bytes=8388608 elapsed=1.95s [OBSERVED]
+  progress   5000000 lines | count=2000 evicted=4997977 ring_bytes=8388608 elapsed=2.44s [OBSERVED]
+  progress   6000000 lines | count=2000 evicted=5997977 ring_bytes=8388608 elapsed=2.94s [OBSERVED]
+  progress   7000000 lines | count=2000 evicted=6997977 ring_bytes=8388608 elapsed=3.42s [OBSERVED]
+  progress   8000000 lines | count=2000 evicted=7997977 ring_bytes=8388608 elapsed=3.92s [OBSERVED]
+  progress   9000000 lines | count=2000 evicted=8997977 ring_bytes=8388608 elapsed=4.42s [OBSERVED]
+  progress  10000000 lines | count=2000 evicted=9997977 ring_bytes=8388608 elapsed=4.91s [OBSERVED]
+  DONE 10000000 lines: count=2000 ynum=2000 evicted=9997977 ring_bytes=8388608 elapsed=4.91s (2.04 M lines/s) NO CRASH [OBSERVED]
+
+EXIT_OK: both bursts completed without segfault -> regression fb87fc32 corroborated [OBSERVED]
+```
+
+**Run 2 of 2** (complete, unedited — identical structural values; only elapsed/throughput differ):
+
+```console
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq3_fragility.py"
 === SQ3 fragility: 1000000 lines, pager=8388608 bytes (1M, 8 MiB ring) ===
   progress   1000000 lines | count=2000 evicted=997977 ring_bytes=8388608 elapsed=0.49s [OBSERVED]
   DONE 1000000 lines: count=2000 ynum=2000 evicted=997977 ring_bytes=8388608 elapsed=0.49s (2.05 M lines/s) NO CRASH [OBSERVED]
@@ -857,27 +940,24 @@ $ PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq3_fragility.py
   progress   1000000 lines | count=2000 evicted=997977 ring_bytes=8388608 elapsed=0.48s [OBSERVED]
   progress   2000000 lines | count=2000 evicted=1997977 ring_bytes=8388608 elapsed=0.97s [OBSERVED]
   progress   3000000 lines | count=2000 evicted=2997977 ring_bytes=8388608 elapsed=1.47s [OBSERVED]
-  progress   4000000 lines | count=2000 evicted=3997977 ring_bytes=8388608 elapsed=1.97s [OBSERVED]
-  progress   5000000 lines | count=2000 evicted=4997977 ring_bytes=8388608 elapsed=2.46s [OBSERVED]
-  progress   6000000 lines | count=2000 evicted=5997977 ring_bytes=8388608 elapsed=2.96s [OBSERVED]
-  progress   7000000 lines | count=2000 evicted=6997977 ring_bytes=8388608 elapsed=3.46s [OBSERVED]
-  progress   8000000 lines | count=2000 evicted=7997977 ring_bytes=8388608 elapsed=3.97s [OBSERVED]
-  progress   9000000 lines | count=2000 evicted=8997977 ring_bytes=8388608 elapsed=4.47s [OBSERVED]
-  progress  10000000 lines | count=2000 evicted=9997977 ring_bytes=8388608 elapsed=4.96s [OBSERVED]
-  DONE 10000000 lines: count=2000 ynum=2000 evicted=9997977 ring_bytes=8388608 elapsed=4.96s (2.02 M lines/s) NO CRASH [OBSERVED]
+  progress   4000000 lines | count=2000 evicted=3997977 ring_bytes=8388608 elapsed=1.96s [OBSERVED]
+  progress   5000000 lines | count=2000 evicted=4997977 ring_bytes=8388608 elapsed=2.45s [OBSERVED]
+  progress   6000000 lines | count=2000 evicted=5997977 ring_bytes=8388608 elapsed=2.95s [OBSERVED]
+  progress   7000000 lines | count=2000 evicted=6997977 ring_bytes=8388608 elapsed=3.44s [OBSERVED]
+  progress   8000000 lines | count=2000 evicted=7997977 ring_bytes=8388608 elapsed=3.92s [OBSERVED]
+  progress   9000000 lines | count=2000 evicted=8997977 ring_bytes=8388608 elapsed=4.41s [OBSERVED]
+  progress  10000000 lines | count=2000 evicted=9997977 ring_bytes=8388608 elapsed=4.90s [OBSERVED]
+  DONE 10000000 lines: count=2000 ynum=2000 evicted=9997977 ring_bytes=8388608 elapsed=4.90s (2.04 M lines/s) NO CRASH [OBSERVED]
 
 EXIT_OK: both bursts completed without segfault -> regression fb87fc32 corroborated [OBSERVED]
 ```
-
-> **Run 2 was structurally identical** — every `count`/`evicted`/`ring_bytes` value
-> matched (only elapsed/throughput differ); both runs exited 0.
 
 **Non-canonical sanitizer cross-check.** The same path (1,000,000 lines, pager
 enabled — ~8x the historical ~120k crash threshold) was re-run against the
 **supplemental ASan+UBSan build** (§1.2), loaded via `LD_PRELOAD` of the ASan
 runtime. This build is **not** canonical; it is used only to let the sanitizer
 watch the ring boundary. Afterwards the canonical `.so` was restored and its
-sha256 re-verified (`74ca07a6…`), with `git status --porcelain` empty.
+sha256 re-verified (`75d31e7a…`), with `git status --porcelain` empty.
 
 The exact `sq3_sanitize.py` used (complete and self-contained — the same canonical
 code path as `sq3_fragility.py` above, but driven as a single 1,000,000-line burst
@@ -941,20 +1021,59 @@ if __name__ == '__main__':
     sanitize_burst(1000000, 8388608)
 ```
 
-```console
-$ cp /tmp/kitty_probe/fast_data_types.sanitize.so kitty/fast_data_types.so
-$ LD_PRELOAD=/usr/lib/gcc/x86_64-linux-gnu/15/libasan.so \
+Because a sanitizer `.so` is **not** the canonical build, the cross-check runs as a fully self-contained sequence that **builds** the sanitizer extension on the spot, **preserves** and later **restores** the canonical bytes, and **verifies** the restoration — all inside the private scratch of §1.6, so no artifact is left behind and the canonical `.so` is provably unchanged afterwards:
+
+```bash
+umask 077
+sanscratch=$(mktemp -d /tmp/kitty-history.XXXXXX)
+trap 'rm -rf -- "$sanscratch"' EXIT HUP INT TERM
+cp -p "$scratch/sq3_sanitize.py" "$sanscratch/sq3_sanitize.py"   # the probe shown above
+
+echo "# 1) preserve canonical bytes"
+cp -p kitty/fast_data_types.so "$sanscratch/fast_data_types.canonical.so"
+sha256sum "$sanscratch/fast_data_types.canonical.so"
+
+echo "# 2) build sanitizer extension (overwrites kitty/fast_data_types.so)"
+python3 setup.py build --debug --sanitize --verbose > "$sanscratch/build.log" 2>&1; echo "build_exit=$?"
+sha256sum kitty/fast_data_types.so
+echo "dynamic __asan_ refs: $(nm -D kitty/fast_data_types.so | grep -c asan)"
+
+echo "# 3) run cross-check under ASan runtime (halt_on_error=1 aborts on ANY diagnostic)"
+LD_PRELOAD=$(gcc -print-file-name=libasan.so) \
   ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
-  PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq3_sanitize.py
-  progress 200000 count=2000 evicted=197977 ring_bytes=2066642 elapsed=0.55s [OBSERVED asan]
-  progress 400000 count=2000 evicted=397977 ring_bytes=4266642 elapsed=0.98s [OBSERVED asan]
-  progress 600000 count=2000 evicted=597977 ring_bytes=6466642 elapsed=1.40s [OBSERVED asan]
-  progress 800000 count=2000 evicted=797977 ring_bytes=8388608 elapsed=1.83s [OBSERVED asan]
-  progress 1000000 count=2000 evicted=997977 ring_bytes=8388608 elapsed=2.27s [OBSERVED asan]
-DONE 1000000 lines under ASAN+UBSAN: count=2000 evicted=997977 ring_bytes=8388608 NO SANITIZER ERROR [OBSERVED asan]
-$ echo "SANITIZE_EXIT=$?"
-SANITIZE_EXIT=0
+  PYTHONDONTWRITEBYTECODE=1 python3 "$sanscratch/sq3_sanitize.py"
+echo "SANITIZE_EXIT=$?"
+
+echo "# 4) restore canonical bytes + verify"
+cp -p "$sanscratch/fast_data_types.canonical.so" kitty/fast_data_types.so
+sha256sum kitty/fast_data_types.so
+python3 -c "import kitty.fast_data_types as f; print('restored import OK | VCS', f.KITTY_VCS_REV)"
+git status --porcelain
 ```
+
+Captured output:
+
+```console
+# 1) preserve canonical bytes
+75d31e7a8c5038bb2742bc2b1bea8ab31ed2128dc805e6930336972e68461138  $sanscratch/fast_data_types.canonical.so
+# 2) build sanitizer extension (overwrites kitty/fast_data_types.so)
+build_exit=0
+f754c850b5dd144479039d59efe192206881c67fb5f1fe2784f4a861432a1d59  kitty/fast_data_types.so
+dynamic __asan_ refs: 29
+# 3) run cross-check under ASan runtime (halt_on_error=1 aborts on ANY diagnostic)
+  progress 200000 count=2000 evicted=197977 ring_bytes=2066642 elapsed=0.56s [OBSERVED asan]
+  progress 400000 count=2000 evicted=397977 ring_bytes=4266642 elapsed=0.98s [OBSERVED asan]
+  progress 600000 count=2000 evicted=597977 ring_bytes=6466642 elapsed=1.41s [OBSERVED asan]
+  progress 800000 count=2000 evicted=797977 ring_bytes=8388608 elapsed=1.83s [OBSERVED asan]
+  progress 1000000 count=2000 evicted=997977 ring_bytes=8388608 elapsed=2.28s [OBSERVED asan]
+DONE 1000000 lines under ASAN+UBSAN: count=2000 evicted=997977 ring_bytes=8388608 NO SANITIZER ERROR [OBSERVED asan]
+SANITIZE_EXIT=0
+# 4) restore canonical bytes + verify
+75d31e7a8c5038bb2742bc2b1bea8ab31ed2128dc805e6930336972e68461138  kitty/fast_data_types.so
+restored import OK | VCS 9e8a0069a671fb4e3f1ba6551c4bd9d1da0a82fa
+```
+
+The canonical sha256 after restoration equals the sha256 before the swap (`75d31e7a…`), `git status --porcelain` prints nothing, and the module re-imports with `KITTY_VCS_REV = 9e8a0069a671…` — the sanitizer build left **no** trace.
 
 ### 4.4 What this shows (answering SQ3)
 
@@ -966,8 +1085,8 @@ SANITIZE_EXIT=0
   [3rdparty/ringbuf/ringbuf.c:231-234]. **[OBSERVED]**
 - **"Smooth" is a measured claim, not an assertion.** Crossing the plateau boundary
   produced **no count discontinuity and no catastrophic latency spike**: per-batch
-  latency (1000 lines/batch) had **median 0.632 ms, p99 1.040 ms, max 1.118 ms —
-  a max/median ratio of 1.77x** for the 1 MiB run (1.72x on run 2). The precise
+  latency (1000 lines/batch) had **median 0.633 ms, p99 1.061 ms, max 1.124 ms —
+  a max/median ratio of 1.78x** for the 1 MiB run (1.77x on run 2). The precise
   claim is therefore: *at a 1000-line-batch resolution, no error, no count
   discontinuity, and no latency outlier beyond ~1.8x median was observed at any
   boundary.* Sub-batch micro-stalls below this resolution are **not** ruled out.
@@ -1029,6 +1148,19 @@ renders each frame with `update_only_line_graphics_data` (applying the cap at
 records the identity of the top/bottom viewport rows via `visual_line`
 [kitty/screen.c:4788] across the saturation boundary while scrolled back.
 
+It is written to **prove canonical completion**, not merely to sample a few frames.
+The child emits `N = 40000` uniquely-numbered `S########` lines (77 columns, no wrap)
+followed by a unique completion marker `COMPLETE_MARKER_815DF1E21`, then exits. The
+parent **drains to EOF/EIO** (an `OSError`/`EIO` from the closed PTY is treated as the
+canonical end-of-stream, with **no early `break`**), reaps the child with
+`wait_till_child_exits(require_exit_code=0)` so a **natural exit status of 0** is
+asserted, and then **verifies the full byte stream**: every one of the 40000 emitted
+lines was received, the marker appears **exactly once**, and the marker is the **final
+content token** (no partial tail). The only teardown is a `finally` block that reaps
+**without swallowing** — it sends `SIGTERM` and waits *only if the child was not
+already reaped naturally* (i.e. an assertion failed), then lets the exception
+propagate. There is **no** unconditional `SIGKILL` and **no** bare `except: pass`.
+
 This is **real-PTY-through-parser corroboration**: the bytes traverse a genuine
 kernel PTY and the same VT parser + Screen code the production child-monitor drives,
 but the read loop here is the in-process test harness, **not** the C
@@ -1036,29 +1168,34 @@ but the read loop here is the in-process test harness, **not** the C
 
 ```python
 #!/usr/bin/env python3
-# SQ4 probe: a REAL child emits at full speed through a real PTY while the user
-# is scrolled back. We pull child bytes through the real VT parser
-# (PTY.process_input_from_child -> parse_bytes), render each frame
-# (update_only_line_graphics_data: applies scrolled_by cap @screen.c:2716 and
-# resets history_line_added_count @2717), and watch the viewport row identities.
-# This is real-PTY-through-parser corroboration, NOT the C child-monitor.c loop.
+# SQ4 probe (canonical: a REAL child on a REAL PTY through the real VT parser).
+# Demonstrates the scroll pin -> cap -> drift semantics AND proves canonical
+# COMPLETION: the child emits N uniquely-numbered 'S########' lines then a unique
+# completion marker and exits naturally. The parent pulls bytes through the real
+# parser (PTY.process_input_from_child -> parse_bytes), renders each frame
+# (update_only_line_graphics_data applies the scrolled_by cap @screen.c:2716 and
+# resets history_line_added_count @2597-2601), drains to EOF/EIO, reaps the child
+# with natural exit status 0, and verifies the marker appears exactly once as the
+# final content token (no partial tail) with every emitted line received.
 import sys, os, time, signal
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.getcwd())
 from kitty_tests import BaseTest
 
 TOTAL = int(os.environ.get("SQ4_TOTAL", "40000"))
-PAD = 68  # pad each line with spaces so ~78 bytes/line -> ~100 lines per 8192-byte read
+MARKER = "COMPLETE_MARKER_815DF1E21"
+PAD = 68  # 'S%08d'(9) + 68 spaces = 77 cols < 80 -> one screen row per line, no wrap
 CHILD = (
     "import sys\n"
-    f"N={TOTAL}; PAD={PAD}\n"
-    "i=0; buf=[]\n"
-    "while i<N:\n"
-    "    buf.append(('L%08d'%i)+(' '*PAD)); i+=1\n"
+    f"N={TOTAL}; PAD={PAD}; MARKER={MARKER!r}\n"
+    "buf=[]\n"
+    "for i in range(N):\n"
+    "    buf.append(('S%08d'%i)+(' '*PAD))\n"
     "    if len(buf)>=500:\n"
     "        sys.stdout.write('\\n'.join(buf)+'\\n'); sys.stdout.flush(); buf=[]\n"
     "if buf:\n"
-    "    sys.stdout.write('\\n'.join(buf)+'\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('\\n'.join(buf)+'\\n')\n"
+    "sys.stdout.write(MARKER+'\\n'); sys.stdout.flush()\n"
 )
 
 class P(BaseTest):
@@ -1068,12 +1205,8 @@ class P(BaseTest):
 def label(line):
     t = str(line).strip()
     return t.split()[0] if t else "(blank)"
-
-def top(s):
-    return label(s.visual_line(0))
-
-def bottom(s):
-    return label(s.visual_line(s.lines - 1))
+def top(s):    return label(s.visual_line(0))
+def bottom(s): return label(s.visual_line(s.lines - 1))
 
 def main():
     bt = P()
@@ -1081,161 +1214,180 @@ def main():
     pty.turn_off_echo()
     s = pty.screen
     ynum = s.historybuf.ynum
-    print(f"child argv: python -c <bulk print, N={TOTAL}, {PAD}-space pad>  ynum={ynum} lines={s.lines} [OBSERVED]")
+    print(f"child argv: python -c <prints N={TOTAL} 'S########' lines then marker "
+          f"{MARKER!r}, then exits 0>  ynum={ynum} lines={s.lines} [OBSERVED]")
     t0 = time.perf_counter()
-    # BEFORE: fill history to ~1000 lines, not scrolled
-    while s.historybuf.count < 1000:
-        if pty.process_input_from_child(timeout=2) == 0:
-            break
-    s.update_only_line_graphics_data()
-    print(f"[BEFORE] t={time.perf_counter()-t0:.3f}s scrolled_by={s.scrolled_by} "
-          f"count={s.historybuf.count} top={top(s)} bottom={bottom(s)} [OBSERVED]")
-    # scroll back 500 lines into old output
-    s.scroll(500, True)
-    pinned = top(s)
-    print(f"[SCROLL +500] scrolled_by={s.scrolled_by} count={s.historybuf.count} "
-          f"top(pinned)={pinned} bottom={bottom(s)} [OBSERVED]\n")
-    print(f"{'phase':>9} {'t_s':>6} {'sby':>5} {'count':>5} {'top':>11} {'bottom':>11} {'pin?':>4} note")
-    saturated = False
-    drift_frames = 0
-    frames = 0
-    while True:
-        got = pty.process_input_from_child(timeout=2)  # ONE read/frame (~100 lines)
-        s.update_only_line_graphics_data()              # apply cap @2716 + reset hlac @2717
-        frames += 1
-        cnt, sby, tr = s.historybuf.count, s.scrolled_by, top(s)
-        pin = "YES" if tr == pinned else "no"
-        note = ""
-        phase = "DURING"
-        if cnt >= ynum and not saturated:
-            saturated = True
-            phase = "SATURATE"
-            note = f"count==ynum={ynum}; scrolled_by capped by MIN(...,count)"
-        if saturated and tr != pinned:
-            drift_frames += 1
-            if drift_frames == 1:
-                note = (note + " ; " if note else "") + f"VIEWPORT DRIFT: top left {pinned} (pinned line evicted)"
-        print(f"{phase:>9} {time.perf_counter()-t0:>6.3f} {sby:>5} {cnt:>5} {tr:>11} {bottom(s):>11} {pin:>4} {note}")
-        if drift_frames >= 4:
-            break
-        if got == 0 and cnt >= ynum:
-            break
     try:
-        os.kill(pty.child_pid, signal.SIGKILL); os.waitpid(pty.child_pid, 0)
-    except Exception:
-        pass
-    print(f"\nSUMMARY: pre-saturation, scrolled_by rose in lockstep and top stayed pinned to "
-          f"{pinned} (pin=YES); after count saturated at ynum={ynum}, scrolled_by was capped at "
-          f"count and once the pinned line was evicted the viewport drifted (pin=no). [OBSERVED]")
+        while s.historybuf.count < 1000:
+            if pty.process_input_from_child(timeout=2) == 0:
+                break
+        s.update_only_line_graphics_data()
+        print(f"[BEFORE] t={time.perf_counter()-t0:.3f}s scrolled_by={s.scrolled_by} "
+              f"count={s.historybuf.count} top={top(s)} bottom={bottom(s)} [OBSERVED]")
+        s.scroll(500, True)
+        pinned = top(s)
+        print(f"[SCROLL +500] scrolled_by={s.scrolled_by} count={s.historybuf.count} "
+              f"top(pinned)={pinned} bottom={bottom(s)} [OBSERVED]\n")
+        print(f"{'phase':>9} {'t_s':>6} {'sby':>5} {'count':>5} {'top':>11} {'bottom':>11} {'pin?':>4} note")
+        saturated = first_drift = False
+        frames = 0
+        while True:
+            try:
+                got = pty.process_input_from_child(timeout=2)
+                eof = False
+            except OSError:                 # EIO: child closed the PTY (canonical EOF)
+                got, eof = 0, True
+            s.update_only_line_graphics_data()   # cap @2716 + reset hlac @2597-2601
+            frames += 1
+            cnt, sby, tr = s.historybuf.count, s.scrolled_by, top(s)
+            pin = "YES" if tr == pinned else "no"
+            note = ""; phase = "DURING"
+            if cnt >= ynum and not saturated:
+                saturated = True; phase = "SATURATE"
+                note = f"count==ynum={ynum}; scrolled_by now capped by MIN(...,count)"
+            if saturated and tr != pinned and not first_drift:
+                first_drift = True; phase = "DRIFT"
+                note = f"VIEWPORT DRIFT: top moved off pinned {pinned} (pinned line evicted)"
+            if (not saturated) or phase in ("SATURATE", "DRIFT"):
+                print(f"{phase:>9} {time.perf_counter()-t0:>6.3f} {sby:>5} {cnt:>5} "
+                      f"{tr:>11} {bottom(s):>11} {pin:>4} {note}")
+            if (got == 0 and MARKER.encode() in pty.received_bytes) or eof:
+                break
+        print(f"          ... (drained {frames} frames; only pre-saturation + SATURATE + first DRIFT shown) ...")
+        status = pty.wait_till_child_exits(require_exit_code=0)   # natural reap, asserts exit 0
+        text = pty.received_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", "replace")
+        lines = [ln for ln in text.split("\n") if ln.strip()]
+        marker_count = sum(1 for ln in lines if ln.strip() == MARKER)
+        s_labels = [ln for ln in lines if ln.startswith("S")]
+        last_token = lines[-1].strip() if lines else "(none)"
+        print(f"[COMPLETE] child_exit_status={status} (require_exit_code=0 satisfied) [OBSERVED]")
+        print(f"[STREAM ] received_bytes={len(pty.received_bytes)} content_lines={len(lines)} "
+              f"S_lines={len(s_labels)} (expected {TOTAL}) marker_count={marker_count} (expected 1) [OBSERVED]")
+        print(f"[TAIL   ] last content token={last_token!r} == marker? {last_token == MARKER} "
+              f"(no partial tail after marker) [OBSERVED]")
+        assert marker_count == 1, f"marker appeared {marker_count} times"
+        assert len(s_labels) == TOTAL, f"received {len(s_labels)} S-lines, expected {TOTAL}"
+        assert last_token == MARKER, "marker is not the final content token"
+        print(f"\nSUMMARY: pre-saturation the view stayed PINNED to {pinned} (scrolled_by rose in "
+              f"lockstep with count); at count==ynum={ynum} scrolled_by was capped by MIN(...,count); "
+              f"once the pinned line was evicted the viewport DRIFTED. The real child then emitted its "
+              f"completion marker exactly once, the parent drained to EOF/EIO and reaped it with natural "
+              f"exit status 0, and all {TOTAL} emitted lines were received with no partial tail. [OBSERVED]")
+    finally:
+        # Failure-safe reap WITHOUT swallowing: only if not already naturally reaped
+        # (e.g. an assertion failed); exceptions propagate after this runs.
+        if not pty.child_waited_for:
+            try:
+                os.kill(pty.child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pty.child_pid, 0)
+            pty.child_waited_for = True
 
 if __name__ == '__main__':
     main()
 ```
 
-### 5.3 Complete output (run 1 of 2)
+### 5.3 Complete output (two runs, both complete and unedited)
 
-Produced by `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq4_concurrent.py`
-(run from the repository root against the canonical `.so`):
+Produced by `PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq4_scroll.py"` (run from the
+repository root against the canonical `.so`). The **completion invariants are
+deterministic** and reproduce on every run — `child_exit_status=0`,
+`received_bytes=3160027`, `content_lines=40001`, `S_lines=40000`, `marker_count=1`,
+and the marker as the final token (no partial tail) — as does the **pin -> cap ->
+drift** structure. What varies run-to-run is only **scheduling-dependent** detail: the
+exact absolute line the user was scrolled to when `scroll(500)` fired (the pinned
+label), the line the view drifts to, the precise list of `DURING` frames, and the
+exact number of frames drained (**725 in run 1, 720 in run 2**) — because a real child
+races the reader and the OS chunks the PTY bytes differently each time.
+
+**Run 1 of 2** (drained 725 frames):
 
 ```text
-child argv: python -c <bulk print, N=40000, 68-space pad>  ynum=2000 lines=24 [OBSERVED]
-[BEFORE] t=0.014s scrolled_by=0 count=1023 top=L00001023 bottom=L00001046 [OBSERVED]
-[SCROLL +500] scrolled_by=500 count=1023 top(pinned)=L00000523 bottom=L00000546 [OBSERVED]
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq4_scroll.py"
+child argv: python -c <prints N=40000 'S########' lines then marker 'COMPLETE_MARKER_815DF1E21', then exits 0>  ynum=2000 lines=24 [OBSERVED]
+[BEFORE] t=0.013s scrolled_by=0 count=1065 top=S00001065 bottom=S00001088 [OBSERVED]
+[SCROLL +500] scrolled_by=500 count=1065 top(pinned)=S00000565 bottom=S00000588 [OBSERVED]
 
     phase    t_s   sby count         top      bottom pin? note
-   DURING  0.015   572  1095   L00000523   L00000546  YES 
-   DURING  0.015   652  1175   L00000523   L00000546  YES 
-   DURING  0.015   754  1277   L00000523   L00000546  YES 
-   DURING  0.015   857  1380   L00000523   L00000546  YES 
-   DURING  0.015   909  1432   L00000523   L00000546  YES 
-   DURING  0.016   954  1477   L00000523   L00000546  YES 
-   DURING  0.016  1001  1524   L00000523   L00000546  YES 
-   DURING  0.016  1062  1585   L00000523   L00000546  YES 
-   DURING  0.016  1114  1637   L00000523   L00000546  YES 
-   DURING  0.016  1156  1679   L00000523   L00000546  YES 
-   DURING  0.016  1200  1723   L00000523   L00000546  YES 
-   DURING  0.016  1253  1776   L00000523   L00000546  YES 
-   DURING  0.017  1297  1820   L00000523   L00000546  YES 
-   DURING  0.017  1331  1854   L00000523   L00000546  YES 
-   DURING  0.017  1380  1903   L00000523   L00000546  YES 
-   DURING  0.017  1433  1956   L00000523   L00000546  YES 
-   DURING  0.017  1454  1977   L00000523   L00000546  YES 
- SATURATE  0.017  1493  2000   L00000523   L00000546  YES count==ynum=2000; scrolled_by capped by MIN(...,count)
-   DURING  0.018  1566  2000   L00000523   L00000546  YES 
-   DURING  0.018  1643  2000   L00000523   L00000546  YES 
-   DURING  0.018  1721  2000   L00000523   L00000546  YES 
-   DURING  0.018  1824  2000   L00000523   L00000546  YES 
-   DURING  0.019  1928  2000   L00000523   L00000546  YES 
-   DURING  0.019  1954  2000   L00000523   L00000546  YES 
-   DURING  0.019  1977  2000   L00000523   L00000546  YES 
-   DURING  0.019  2000  2000   L00000535   L00000558   no VIEWPORT DRIFT: top left L00000523 (pinned line evicted)
-   DURING  0.019  2000  2000   L00000579   L00000602   no 
-   DURING  0.019  2000  2000   L00000630   L00000653   no 
-   DURING  0.020  2000  2000   L00000734   L00000757   no 
+   DURING  0.013   552  1117   S00000565   S00000588  YES 
+   DURING  0.013   604  1169   S00000565   S00000588  YES 
+   DURING  0.014   656  1221   S00000565   S00000588  YES 
+   DURING  0.014   708  1273   S00000565   S00000588  YES 
+   DURING  0.014   759  1324   S00000565   S00000588  YES 
+   DURING  0.014   811  1376   S00000565   S00000588  YES 
+   DURING  0.014   915  1480   S00000565   S00000588  YES 
+   DURING  0.014  1019  1584   S00000565   S00000588  YES 
+   DURING  0.014  1122  1687   S00000565   S00000588  YES 
+   DURING  0.014  1176  1741   S00000565   S00000588  YES 
+   DURING  0.015  1279  1844   S00000565   S00000588  YES 
+   DURING  0.015  1331  1896   S00000565   S00000588  YES 
+ SATURATE  0.015  1435  2000   S00000565   S00000588  YES count==ynum=2000; scrolled_by now capped by MIN(...,count)
+    DRIFT  0.016  2000  2000   S00000575   S00000598   no VIEWPORT DRIFT: top moved off pinned S00000565 (pinned line evicted)
+          ... (drained 725 frames; only pre-saturation + SATURATE + first DRIFT shown) ...
+[COMPLETE] child_exit_status=0 (require_exit_code=0 satisfied) [OBSERVED]
+[STREAM ] received_bytes=3160027 content_lines=40001 S_lines=40000 (expected 40000) marker_count=1 (expected 1) [OBSERVED]
+[TAIL   ] last content token='COMPLETE_MARKER_815DF1E21' == marker? True (no partial tail after marker) [OBSERVED]
 
-SUMMARY: pre-saturation, scrolled_by rose in lockstep and top stayed pinned to L00000523 (pin=YES); after count saturated at ynum=2000, scrolled_by was capped at count and once the pinned line was evicted the viewport drifted (pin=no). [OBSERVED]
+SUMMARY: pre-saturation the view stayed PINNED to S00000565 (scrolled_by rose in lockstep with count); at count==ynum=2000 scrolled_by was capped by MIN(...,count); once the pinned line was evicted the viewport DRIFTED. The real child then emitted its completion marker exactly once, the parent drained to EOF/EIO and reaped it with natural exit status 0, and all 40000 emitted lines were received with no partial tail. [OBSERVED]
 ```
 
-Run 2 was structurally identical: the same lockstep-pin-then-drift progression,
-differing only in the absolute pinned-line label (run 1 pinned `L00000523`; run 2
-pinned `L00000599`) because the exact line reached before the manual `scroll(500)`
-depends on how many 8192-byte reads landed before the 1000-line fill threshold — a
-timing detail, not a behavioral difference. The complete run-2 output is at
-`/tmp/kitty_probe/sq4_run2.txt` and is reproduced below:
+**Run 2 of 2** (drained 720 frames — same invariants, different scheduling):
 
 ```text
-child argv: python -c <bulk print, N=40000, 68-space pad>  ynum=2000 lines=24 [OBSERVED]
-[BEFORE] t=0.013s scrolled_by=0 count=1099 top=L00001099 bottom=L00001122 [OBSERVED]
-[SCROLL +500] scrolled_by=500 count=1099 top(pinned)=L00000599 bottom=L00000622 [OBSERVED]
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq4_scroll.py"
+child argv: python -c <prints N=40000 'S########' lines then marker 'COMPLETE_MARKER_815DF1E21', then exits 0>  ynum=2000 lines=24 [OBSERVED]
+[BEFORE] t=0.013s scrolled_by=0 count=1012 top=S00001012 bottom=S00001035 [OBSERVED]
+[SCROLL +500] scrolled_by=500 count=1012 top(pinned)=S00000512 bottom=S00000535 [OBSERVED]
 
     phase    t_s   sby count         top      bottom pin? note
-   DURING  0.013   604  1203   L00000599   L00000622  YES 
-   DURING  0.013   656  1255   L00000599   L00000622  YES 
-   DURING  0.013   708  1307   L00000599   L00000622  YES 
-   DURING  0.014   760  1359   L00000599   L00000622  YES 
-   DURING  0.014   811  1410   L00000599   L00000622  YES 
-   DURING  0.014   915  1514   L00000599   L00000622  YES 
-   DURING  0.014  1019  1618   L00000599   L00000622  YES 
-   DURING  0.014  1123  1722   L00000599   L00000622  YES 
-   DURING  0.014  1174  1773   L00000599   L00000622  YES 
-   DURING  0.014  1226  1825   L00000599   L00000622  YES 
-   DURING  0.014  1278  1877   L00000599   L00000622  YES 
-   DURING  0.015  1382  1981   L00000599   L00000622  YES 
- SATURATE  0.015  1485  2000   L00000599   L00000622  YES count==ynum=2000; scrolled_by capped by MIN(...,count)
-   DURING  0.015  1537  2000   L00000599   L00000622  YES 
-   DURING  0.015  1589  2000   L00000599   L00000622  YES 
-   DURING  0.015  1641  2000   L00000599   L00000622  YES 
-   DURING  0.015  1693  2000   L00000599   L00000622  YES 
-   DURING  0.015  1745  2000   L00000599   L00000622  YES 
-   DURING  0.015  1796  2000   L00000599   L00000622  YES 
-   DURING  0.016  1900  2000   L00000599   L00000622  YES 
-   DURING  0.016  2000  2000   L00000603   L00000626   no VIEWPORT DRIFT: top left L00000599 (pinned line evicted)
-   DURING  0.016  2000  2000   L00000655   L00000678   no 
-   DURING  0.016  2000  2000   L00000707   L00000730   no 
-   DURING  0.016  2000  2000   L00000758   L00000781   no 
+   DURING  0.013   603  1115   S00000512   S00000535  YES 
+   DURING  0.013   707  1219   S00000512   S00000535  YES 
+   DURING  0.014   759  1271   S00000512   S00000535  YES 
+   DURING  0.014   811  1323   S00000512   S00000535  YES 
+   DURING  0.014   863  1375   S00000512   S00000535  YES 
+   DURING  0.014   914  1426   S00000512   S00000535  YES 
+   DURING  0.014  1018  1530   S00000512   S00000535  YES 
+   DURING  0.014  1122  1634   S00000512   S00000535  YES 
+   DURING  0.014  1226  1738   S00000512   S00000535  YES 
+   DURING  0.015  1329  1841   S00000512   S00000535  YES 
+   DURING  0.015  1381  1893   S00000512   S00000535  YES 
+   DURING  0.015  1485  1997   S00000512   S00000535  YES 
+ SATURATE  0.015  1588  2000   S00000512   S00000535  YES count==ynum=2000; scrolled_by now capped by MIN(...,count)
+    DRIFT  0.016  2000  2000   S00000515   S00000538   no VIEWPORT DRIFT: top moved off pinned S00000512 (pinned line evicted)
+          ... (drained 720 frames; only pre-saturation + SATURATE + first DRIFT shown) ...
+[COMPLETE] child_exit_status=0 (require_exit_code=0 satisfied) [OBSERVED]
+[STREAM ] received_bytes=3160027 content_lines=40001 S_lines=40000 (expected 40000) marker_count=1 (expected 1) [OBSERVED]
+[TAIL   ] last content token='COMPLETE_MARKER_815DF1E21' == marker? True (no partial tail after marker) [OBSERVED]
 
-SUMMARY: pre-saturation, scrolled_by rose in lockstep and top stayed pinned to L00000599 (pin=YES); after count saturated at ynum=2000, scrolled_by was capped at count and once the pinned line was evicted the viewport drifted (pin=no). [OBSERVED]
+SUMMARY: pre-saturation the view stayed PINNED to S00000512 (scrolled_by rose in lockstep with count); at count==ynum=2000 scrolled_by was capped by MIN(...,count); once the pinned line was evicted the viewport DRIFTED. The real child then emitted its completion marker exactly once, the parent drained to EOF/EIO and reaped it with natural exit status 0, and all 40000 emitted lines were received with no partial tail. [OBSERVED]
 ```
 
 ### 5.4 What this shows (answering SQ4)
 
 - **While the buffer is unsaturated, an active scrollback is pinned perfectly.**
-  From `[SCROLL +500]` onward every frame shows `top(pinned)=L00000523` with
-  `pin=YES`, while `scrolled_by` rises in lockstep with `count` (e.g.
-  `sby=572/count=1095` ... `sby=1454/count=1977`). The `MIN(scrolled_by + added,
-  count)` clamp is a no-op here because `scrolled_by + added <= count`. **[OBSERVED]**
+  From `[SCROLL +500]` onward every pre-saturation frame shows the same pinned top
+  row with `pin=YES` (run 1: `S00000565`; run 2: `S00000512`), while `scrolled_by`
+  rises in lockstep with `count`. The `MIN(scrolled_by + added, count)` clamp is a
+  no-op here because `scrolled_by + added <= count`. **[OBSERVED]**
 - **Saturation is the crossover.** The `SATURATE` frame is reached exactly at
   `count == ynum == 2000`; from that point `count` is frozen and `scrolled_by` is
   clamped at 2000. **[OBSERVED]**
-- **Once the pinned line is evicted, the viewport drifts.** A few frames after
-  saturation the top row jumps from `L00000523` to `L00000535`, then `L00000579`,
-  `L00000630`, `L00000734` (`pin=no`) — the pinned old line has been evicted from
-  the segmented store and the view can no longer hold it. This is precisely the
-  `MIN(..., count)` cap [kitty/screen.c:2716] refusing to grow past `ynum`.
-  **[OBSERVED]**
-- **The behavior is reproducible.** Both runs show the identical
-  unsaturated-pin -> saturate -> drift structure; only the absolute label differs
-  by startup timing. **[OBSERVED across 2 runs]**
+- **Once the pinned line is evicted, the viewport drifts.** The first `DRIFT` frame
+  shows the top row leaving the pinned label (run 1: `S00000565` -> `S00000575`;
+  run 2: `S00000512` -> `S00000515`) with `pin=no` — the pinned old line has been
+  evicted from the segmented store and the view can no longer hold it. This is
+  precisely the `MIN(..., count)` cap [kitty/screen.c:2716] refusing to grow past
+  `ynum`. **[OBSERVED]**
+- **The child ran to completion and was reaped cleanly.** Both runs end with
+  `child_exit_status=0` (asserted via `require_exit_code=0`), `received_bytes=3160027`,
+  all `40000` `S`-lines received, `marker_count=1`, and the marker as the final
+  content token — proving the full stream was consumed with no partial tail and the
+  child exited **naturally**, not by a forced kill. **[OBSERVED]**
+- **The behavior is reproducible; only scheduling detail differs.** Both runs show
+  the identical unsaturated-pin -> saturate -> drift structure and identical stream
+  invariants; only the absolute pinned/drift labels and the exact frame list/count
+  (725 vs 720) differ, by startup timing. **[OBSERVED across 2 runs]**
 
 ---
 
@@ -1349,12 +1501,17 @@ if __name__ == '__main__':
     main()
 ```
 
-### 6.3 Complete output (run 1 of 2)
+### 6.3 Complete output (two runs, both complete and unedited)
 
-Produced by `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq5_reflow.py`
-(run from the repository root against the canonical `.so`):
+Produced by `PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq5_reflow.py"` (run from the
+repository root against the canonical `.so`). Reflow here is a **fully in-process,
+deterministic** transformation (no child, no PTY, no wall-clock timing), so the two
+runs are **byte-identical**; both are shown complete and unedited.
+
+**Run 1 of 2:**
 
 ```text
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq5_reflow.py"
 initial: lines=24 cols=80 count=977 top_logical=0488: [OBSERVED]
 
 === resize -> width 80: count=977 top_logical=0488: [OBSERVED]  path=FAST memcpy (width unchanged, history.c:597-606) ===
@@ -1411,10 +1568,66 @@ INTERPRETATION [INFERRED, scenario-limited]: reflow redistributes logical lines
   specific to this fill pattern (500 x 150-char lines, lines=24, scrollback=8000).
 ```
 
-Run 2 was **byte-identical** (deterministic in-process reflow): the same
-`977 -> 1977 -> 3977 -> 995 -> 996` count progression, the same `+19` round-trip
-delta, and the same row dumps. The complete run-2 output at
-`/tmp/kitty_probe/sq5_run2.txt` matches this verbatim.
+**Run 2 of 2** (byte-identical to run 1 — same `977 -> 1977 -> 3977 -> 995 -> 996`
+count progression, same `+19` round-trip delta, same row dumps):
+
+```text
+$ PYTHONDONTWRITEBYTECODE=1 python3 "$scratch/sq5_reflow.py"
+initial: lines=24 cols=80 count=977 top_logical=0488: [OBSERVED]
+
+=== resize -> width 80: count=977 top_logical=0488: [OBSERVED]  path=FAST memcpy (width unchanged, history.c:597-606) ===
+    hist[   0] = '0488:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[   1] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[   2] = '0487:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 974] = '0001:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 975] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 976] = '0000:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+=== resize -> width 40: count=1977 top_logical=0494: [OBSERVED]  path=rewrap_inner (width changed, history.c:611 / rewrap.h:57) ===
+    hist[   0] = '0494:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[   1] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[   2] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[1974] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[1975] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[1976] = '0000:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+=== resize -> width 20: count=3977 top_logical=0497: [OBSERVED]  path=rewrap_inner (width changed, history.c:611 / rewrap.h:57) ===
+    hist[   0] = '0497:xxxxxxxxxxxxxxx'
+    hist[   1] = 'xxxxxxxxxx'
+    hist[   2] = 'xxxxxxxxxxxxxxxxxxxx'
+    hist[3974] = 'xxxxxxxxxxxxxxxxxxxx'
+    hist[3975] = 'xxxxxxxxxxxxxxxxxxxx'
+    hist[3976] = '0000:xxxxxxxxxxxxxxx'
+
+=== resize -> width 120: count=995 top_logical=0497: [OBSERVED]  path=rewrap_inner (width changed, history.c:611 / rewrap.h:57) ===
+    hist[   0] = '0497:xxxxxxxxxxxxxxx'
+    hist[   1] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[   2] = '0496:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 992] = '0001:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 993] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 994] = '0000:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+=== resize -> width 80: count=996 top_logical=0497: [OBSERVED]  path=rewrap_inner (width changed, history.c:611 / rewrap.h:57) ===
+    hist[   0] = '0497:xxxxxxxxxxxxxxx'
+    hist[   1] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[   2] = '0496:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 993] = '0001:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 994] = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    hist[ 995] = '0000:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+ROUND-TRIP width 80 -> 40 -> 20 -> 120 -> 80: history count 977 -> 996 delta=+19 [OBSERVED]
+OBSERVED facts of the non-idempotent round-trip:
+  - history row count changed by +19 (was 977, now 996)
+  - index-0 (most-recent) retained logical line moved (see top_logical above: 80-initial vs 80-final)
+INTERPRETATION [INFERRED, scenario-limited]: reflow redistributes logical lines
+  between the 24-row on-screen grid (linebuf) and the history buffer. Intermediate
+  narrow widths (40,20) pack fewer logical lines onto the 24 visible rows and split
+  each into more continuation rows (rewrap_inner, rewrap.h:57); widening to 120 then
+  80 does not restore the exact original screen<->history partition, so a different
+  number of rows remains in history and a different logical line sits at the top.
+  The counts and row dumps above are OBSERVED; this causal account is INFERRED and
+  specific to this fill pattern (500 x 150-char lines, lines=24, scrollback=8000).
+```
 
 ### 6.4 What this shows (answering SQ5)
 
@@ -1461,16 +1674,16 @@ ring's boundary behavior (SQ3) differ between disabled and enabled.
 
 | Claim | Status | Basis |
 |---|---|---|
-| Fresh buffer = exactly 1 segment | OBSERVED | §2.3 + [kitty/history.c:117-133] |
-| Max segments = `ceil(ynum/2048)`; carves at count 2049/4097/6145/8193 | OBSERVED | §2.3 |
+| Fresh buffer = 1 segment | SOURCE-DERIVED + runtime-correlated | `create_historybuf` sets `num_segments=0` then calls `add_segment` once [kitty/history.c:117-133]; segment count is **not** exposed to Python (§1.4), so this is derived from source and corroborated by `count`/`ynum` + the first RSS step |
+| Max segments = `ceil(ynum/2048)`; carves at count 2049/4097/6145/8193 | OBSERVED (count) + SOURCE-DERIVED (segment index) | `count` at each boundary is observed (§2.3); the segment index derives from `segment_for` (2048·n < ynum) [kitty/history.c:36-42] + the RSS step |
 | Per-segment `calloc` = 5,251,072 B @ xnum=80 | INFERRED | [kitty/history.c:17-28] arithmetic; CPUCell=12/GPUCell=20 static_asserts + LineAttrs=4 (enum-bitfield, `_Static_assert` probe) |
-| RSS grows gradually (~5 MB per 2048-line segment), not in one segment-sized step | OBSERVED | §2.4 per-segment climb (e.g. 31984→37012→…→52404 KB); derived first-segment RSS slope is nondeterministic (ranges 0–~2570 B/line, §2.3), converging on the [INFERRED] per-line cost 80×32=2560 B |
+| RSS grows gradually (~5.13 MB per 2048-line segment on this build), not in one segment-sized step | OBSERVED (nondeterministic) | §2.4 per-carve climb (e.g. `32100→37236→42364→47492→52620→57012 KB`); first-segment slope is a distribution (stable 2562.7 B/line here; 0–~2570 across environments, §2.3), bracketed by the [INFERRED] constants payload 80×32=2560 and whole-`calloc` 5,251,072/2048=2564 B |
 | Disabled tier drops evicted lines (3977 dropped) | OBSERVED | §3.3 |
 | Enabled tier costs exactly 33 B per evicted line (this fixed line) | OBSERVED | §3.3 |
 | Visible ring increment = evicted x bytes/line (payload) | OBSERVED | §3.3 (+33000/batch) |
 | Ring capacity grows in `MAX(1 MiB, needed)` steps | INFERRED | [kitty/history.c:89-102] (`as_bytes` reports payload, not capacity) |
 | Ring plateaus at `maximum_size`, then overwrites oldest | OBSERVED | §4.2 (1 MiB @ 1,048,576; 4 KiB @ 4096) + [3rdparty/ringbuf/ringbuf.c:231-234] |
-| No latency outlier beyond ~1.8x median at any boundary | OBSERVED (resolution-bounded) | §4.2 (median 0.632 ms, max/median 1.77x) |
+| No latency outlier beyond ~1.8x median at any boundary | OBSERVED (resolution-bounded) | §4.2 (median 0.633 ms, max/median 1.78x on run 1) |
 | No crash / no sanitizer error at 1M & 10M lines | OBSERVED | §4.3 |
 | Regression #3011 absent (fix is a baseline ancestor) | OBSERVED (git) + INFERRED (causal) | §4.3, `git merge-base` fb87fc32 |
 | Scroll pinned pre-saturation, drifts post-saturation | OBSERVED | §5.3 |
@@ -1490,11 +1703,32 @@ This investigation modified **no existing repository file** — no source, test,
 configuration, or build file was edited. The single repository change is the addition
 of this answer document, `blitzy/documentation/kitty_815df1e210e0.md`. All build
 artifacts (`kitty/fast_data_types.so`, `build/`, launchers) are gitignored and never
-appear in `git status`. The temporary observation scripts lived entirely in
-`/tmp/kitty_probe` (outside the repository tree) and were removed after the runs.
+appear in `git status`. The temporary observation scripts and any preserved supplemental binaries lived
+entirely inside a **private, owner-only** scratch directory created per session with
+`umask 077` and `scratch=$(mktemp -d /tmp/kitty-history.XXXXXX)` (§1.6), and were
+removed on **any** exit by a `trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM` handler —
+entirely outside the repository tree.
 Consequently, before committing the document `git status --porcelain` lists only the
 one new file, and after committing it the working tree is clean. The canonical `.so`
-was verified unchanged (sha256 `74ca07a6...`) after every swap to a supplemental build.
+was verified unchanged (sha256 `75d31e7a...`) after every swap to a supplemental build.
+
+### 8.4 Environment and out-of-scope notes (INFO, report-only)
+
+Two observations fall **outside** this document's scope and, under the read-only rule,
+are **reported, not fixed**:
+
+- **Full test-suite GLFW/Wayland gate (environment).** The complete `./test.py` suite
+  includes `test_glfw_modules`, which requires a GLFW/Wayland display module absent in
+  this headless container. That gate is unrelated to scrollback and to this
+  investigation; the `HistoryBuf` / `datatypes` / `screen` tests that exercise the code
+  paths studied here run and pass without it. **[OBSERVED, environment-only]**
+- **`scrollback_lines` at or above 2³² wraps (outside the documented range).** The
+  setting is converted through an unsigned 32-bit field in the finalizer
+  [kitty/options/utils.py:557-561] before `ynum = MAX(scrollback_lines, lines)`
+  [kitty/screen.c:130]. Observed on the canonical build: `scrollback_lines = 2**31`
+  gives `ynum = 2147483648`, but `scrollback_lines = 2**32` wraps to `0` and yields
+  `ynum = 24` (= `lines`). This is far outside the magnitudes this investigation
+  exercises (≤ 10,000) and is noted only for completeness. **[OBSERVED]**
 
 ## 9. References
 
