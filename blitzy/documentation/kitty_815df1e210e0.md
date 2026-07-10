@@ -2,7 +2,7 @@
 
 **Repository:** `kovidgoyal/kitty` · **task/source branch:** `kitty_815df1e210e0` · **working branch:** `blitzy-e6347bf9-6afb-4791-a2f8-1a5b0595f682` · **kitty 0.35.2**
 
-> **VCS-revision grounding (observed, corrected).** The build stamps the *current* checkout HEAD, because `get_vcs_rev()` runs `git rev-parse HEAD` [`setup.py`:L674-L690]. On this branch that HEAD is **`48e58f707990cb414b0f068f214e3a5019228a6f`** — verified embedded in the produced `kitty/launcher/kitten` via `strings kitty/launcher/kitten | grep -oE '48e58f707990cb414b0f068f214e3a5019228a6f|815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1' | sort | uniq -c`, which prints `4 48e58f707990cb414b0f068f214e3a5019228a6f` and zero occurrences of the other hex. The hex `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` is the **upstream base commit** encoded in the Docker image tag (the source branch is *named* `kitty_815df1e210e0` after its 12-char prefix); it is **not** what this build stamps. This correction is called out here because an earlier draft mis-attributed the stamped revision.
+> **VCS-revision grounding (build-time / HEAD-dependent value).** kitty's build stamps whatever `git rev-parse HEAD` returns *at build time*: `get_vcs_rev()` runs exactly that command [`setup.py`:L674-L690] and the Go launcher embeds the result through the linker flag `-X kitty.VCSRevision=<HEAD>` (observed in the build log; see §1). It is therefore a **build-time value tied to the checked-out `HEAD`, not a fixed constant**, and is classified as a *HEAD-dependent* field (explicitly **not** "stable") in §6.2. **Observer effect (important):** because this document is itself committed into the repository, the act of committing it advances `HEAD`, so any build produced *after* that commit stamps the *new* HEAD — no hash a self-describing committed document records can remain the value a later build reproduces. The concrete revision quoted in §§1 and 3.3 was the HEAD that was current when those observations were captured — **`48e58f707990cb414b0f068f214e3a5019228a6f`** — verified embedded in the then-produced `kitty/launcher/kitten` via `strings kitty/launcher/kitten | grep -oE '48e58f707990cb414b0f068f214e3a5019228a6f|815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1' | sort | uniq -c`, which printed `4 48e58f707990cb414b0f068f214e3a5019228a6f` and zero occurrences of the other hex. A disposable rebuild of the identical source tree at a later HEAD stamps that later HEAD instead (empirical demonstration in §1), confirming the value tracks HEAD rather than being pinned. The hex `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` is the **upstream base commit** encoded in the Docker image tag (the source branch is *named* `kitty_815df1e210e0` after its 12-char prefix); it is **not** what any of these builds stamp.
 
 This document answers four questions about how kitty configures its text‑shaping/layout
 engine and its GPU glyph atlas **during startup**. Every behavioral claim below is grounded in
@@ -147,9 +147,30 @@ acfe7448993bcb2239adc529d57284a33603abc4c1b9f0db8f5e939573e30cef  kitty/fast_dat
 4f32afab623cc60f73784131aa3ab1fd2f1ffbfaa52e3bfcc6ae5fa0eb0eb9dc  kitty/launcher/kitten
 ```
 
-The stamped VCS revision is the current HEAD (see the grounding note in the header): `strings
-kitty/launcher/kitten | grep -oE 48e58f707990cb414b0f068f214e3a5019228a6f` → **4 matches**;
-`815df1e210e0…` appears **0 times**.
+The stamped VCS revision equals `git rev-parse HEAD` **at build time** — a build-time / HEAD-dependent
+value (see the header grounding note and §6.2), not a fixed constant. At the HEAD current when these
+artifacts were built it was `48e58f707990…`: `strings kitty/launcher/kitten | grep -oE
+48e58f707990cb414b0f068f214e3a5019228a6f` → **4 matches**; `815df1e210e0…` appears **0 times**. The
+stamping mechanism is visible directly in the build log's Go link step, which threads the revision
+through the linker as `-X kitty.VCSRevision=<HEAD>`. To make the HEAD-tracking behavior concrete, a
+disposable rebuild of this same source tree was performed at a later HEAD **[OBSERVED — canonical,
+disposable rebuild]** (`exit=0`); its link step embedded that later HEAD, verified with the same
+probe:
+
+```
+$ git rev-parse HEAD                      # inside the disposable build copy
+1f88e431cac7bd0207002c166a218db3970c8ca8
+$ grep -oE '[-]X kitty.VCSRevision=[0-9a-f]+' build.log | sort -u
+-X kitty.VCSRevision=1f88e431cac7bd0207002c166a218db3970c8ca8
+$ strings kitty/launcher/kitten | grep -oE '48e58f707990cb414b0f068f214e3a5019228a6f|1f88e431cac7bd0207002c166a218db3970c8ca8' | sort | uniq -c
+      4 1f88e431cac7bd0207002c166a218db3970c8ca8
+```
+
+That is, at the later HEAD the launcher embeds `1f88e431cac7…` **4 times** and `48e58f70…`
+**0 times** — the exact inverse of the authoring-time capture above. This is the observer effect made
+concrete: committing *this* document advances HEAD, so the next canonical build stamps the next HEAD,
+which is why §6.2 classifies the VCS revision as a build-time / HEAD-dependent field rather than a
+stable one.
 
 **Version banner [OBSERVED — canonical]** (`exit=0`):
 
@@ -728,9 +749,12 @@ Important environment variables seen by the kitty process:
 
 Three decisive facts, each grounded in the dump above:
 
-1. **VCS‑stamped identity `kitty 0.35.2 (48e58f7079)`** — the first 10 chars of the built launcher's
-   stamped rev (§1), confirming this dump came from *this* build (not a copied/illustrative value; the
-   earlier draft's `815df1e210` was the upstream base tag, not what this build stamps).
+1. **VCS‑stamped identity `kitty 0.35.2 (48e58f7079)`** — the first 10 chars of the launcher's
+   build-time stamped rev, i.e. `git rev-parse HEAD` at the moment this build was produced (§1). As a
+   build-time / HEAD-dependent value (§6.2), it confirms this dump came from the build whose HEAD was
+   current at capture — here `48e58f707990…`; a rebuild after a later commit shows that later HEAD's
+   first 10 chars instead (see the disposable-rebuild evidence in §1). (The earlier draft's
+   `815df1e210` was the upstream base tag, not what any of these builds stamp.)
 2. **Live GL context**: `OpenGL: '4.5 (Core Profile) Mesa 25.2.8-…'` — the context in which the atlas
    (§5) is allocated.
 3. **Default configuration is proved two ways in the dump:** (i) **there is no `Loaded config files:`
@@ -1157,7 +1181,7 @@ explains every observed number:
 - **`kitty/fonts.c`:L44** — `static size_t max_texture_size = 1024, max_array_len = 1024;`. Used by
   `sprite_tracker_set_layout` [`kitty/fonts.c`:L277‑L282] for the page arithmetic and by
   `do_increment` [`kitty/fonts.c`:L243‑L256] for the layer‑overflow check.
-- **`kitty/shaders.c`:L44** — `static GLint max_texture_size = 0, max_array_texture_layers = 0;`,
+- **`kitty/shaders.c`:L32** — `static GLint max_texture_size = 0, max_array_texture_layers = 0;`,
   the `if (!max_texture_size)` guard inside `alloc_sprite_map` [`kitty/shaders.c`:L52].
 
 Both relevant calls live in the same font‑group‑creation function, in this order:
@@ -1365,13 +1389,21 @@ dedicated readiness log line.
 **User‑example phrases preserved verbatim:** *"ligatures, bidi, combining diacritics"* (§2),
 *"mixed Arabic (RTL) and English (LTR) text"* (§3), *"(overline/underline)"* (§4).
 
-### 6.2 Stability — stable vs volatile fields (CQ‑14)
+### 6.2 Stability — stable, build-time, and volatile fields (CQ‑14)
 
-Two classes of field are distinguished:
+Three classes of field are distinguished:
 
 - **Stable fields** — reproduce identically across every run: all shaping group tuples, the seven
   cell metrics, font families/paths, GL limits, the live `glTexStorage3D` dimensions, sprite‑upload
-  counts, SGR decoration values, config option values, and the VCS revision `48e58f7079`.
+  counts, SGR decoration values, and config option values.
+- **Build-time / HEAD-dependent fields** — stable across repeated runs *of one build*, but tied to
+  the checked-out `HEAD` at build time rather than to observed behavior: the VCS revision stamped into
+  the launcher (`get_vcs_rev()` runs `git rev-parse HEAD` [`setup.py`:L674-L690]) and the per-build
+  binary artifact `sha256`s that embed it (§1). These reproduce identically only for a *fixed* HEAD;
+  they change whenever `HEAD` advances — including when *this* document is committed (the observer
+  effect noted in the header) — so they are reported as build-time values illustrated by their
+  captured value, never as reproducible constants. The authoring-time capture was `48e58f7079` (HEAD
+  `48e58f707990…`); a disposable rebuild at a later HEAD stamped `1f88e431cac7…` instead (§1).
 - **Volatile fields** — vary run‑to‑run but carry **no semantic meaning**: the monotonic `[N.NNN]`
   debug timestamps, the ephemeral Xvfb display number (`xvfb-run -a` picks a free display), process
   PIDs, and the `mktemp` directory suffix. Where a full transcript containing volatile fields is
@@ -1412,13 +1444,19 @@ normalization applied before hashing volatile transcripts is:
 
 This was a **read‑only investigation**. Observation used only per‑invocation CLI flags
 (`--debug-config`, `--debug-font-fallback`, `--debug-rendering`) and the `LD_PRELOAD` shim; **no
-persistent setting was changed** and **no custom `kitty.conf`** was introduced. `git status` reports
-exactly one modified/added path — the deliverable itself:
+persistent setting was changed** and **no custom `kitty.conf`** was introduced. While the deliverable
+is being authored (i.e. before it is committed), `git status` reports exactly one changed path — the
+deliverable itself — and no source file whatsoever:
 
 ```
-$ git status --porcelain
+$ git status --porcelain        # working tree while the deliverable is still uncommitted
  M blitzy/documentation/kitty_815df1e210e0.md
 ```
+
+Once the deliverable is committed, `git status --porcelain` is **empty** (the working tree is clean);
+this transient ` M` line is exactly what a reviewer sees while the document is being edited. Either
+way the invariant that matters for the read-only guarantee holds: **no source file other than this
+one document ever appears in `git status`**.
 
 Build artifacts (`kitty/fast_data_types.so`, `kitty/launcher/kitt*`) are git‑ignored and were already
 present from the pre‑existing build; they do not affect repository status.
@@ -1443,8 +1481,9 @@ tree, the repository is left byte‑for‑byte unchanged apart from this documen
 
 ### 7.3 Gate criteria satisfied — prior‑gate reconciliation (PG‑1)
 
-The two required prior gates for HEAD `48e58f707990` — the *Runtime Evidence & Technical
-Documentation Gate* and the *Dedicated Security, Read‑Only Scope & Cleanup Gate* — are
+The two required prior gates — the *Runtime Evidence & Technical
+Documentation Gate* and the *Dedicated Security, Read‑Only Scope & Cleanup Gate*, both anchored at the
+authoring-time HEAD `48e58f707990` (a build-time / HEAD-dependent identifier; see §6.2) — are
 orchestration‑pipeline outputs; their **report files** are not artifacts this investigation can
 retroactively fabricate for a past HEAD. What this investigation **can** and **does** do is
 substantively satisfy both gates' criteria, verifiably from this document:
