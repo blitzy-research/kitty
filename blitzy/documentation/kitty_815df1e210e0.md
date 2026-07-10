@@ -1300,48 +1300,98 @@ constants:
 
 | Rendered by the child | `glTexSubImage3D` uploads | Δ vs empty | Interpretation |
 |---|---:|---:|---|
-| *(empty — no text, `sleep` only)* | 11 | — | prerender baseline (1 blank + 10 decoration sprites via `send_prerendered_sprites`) — **reproduces every session** |
+| *(empty — no text, `sleep` only)* | 11 | — | prerender baseline — **reproduces every session**. The count `11` is **[OBSERVED — canonical, live GL]** (the shim counts calls); its decomposition — **1 blank + 10 special sprites** (5 underline + 1 strikethrough + the missing‑glyph sprite at index `MISSING_GLYPH = NUM_UNDERLINE_STYLES + 2 = 7` + 3 cursor) — is **[INFERRED — code‑derived]** from `send_prerendered_sprites` [`kitty/fonts.c`:L1450‑L1472] and `prerender_function` [`kitty/fonts/render.py`:L364‑L395], **not** read off the shim (which observes GL calls, not glyph identity) |
 | `hi ` | 13 | +2 | `h`, `i` (`space` reuses the blank slot) |
 | `hi Z` | 14 | +3 | a plain ASCII glyph = **exactly +1** sprite (matches `render_group`'s `num_cells` upload loop [fonts.c:L739‑L744]) |
-| `😁` (U+1F601) | 18 *(session‑specific)* | +7 | emoji — served by a **fallback** face (count varies cross‑session; see note) |
-| `你` (U+4F60, CJK) | 19 *(session‑specific)* | +8 | CJK — served by a **fallback** face (count varies cross‑session; see note) |
-| `hi 😁` | 20 *(session‑specific)* | (Δ vs `hi ` = **+7**) | primary ASCII **and** fallback emoji in one render (count varies cross‑session; see note) |
+| `😁` (U+1F601) | 18 *(session‑specific)* | +7 | emoji — a **genuine fallback** to DejaVu Sans (`ps_name=DejaVuSans`, §3.2). Creates **real new atlas glyphs** — see the sprite‑identity probe below. Raw count varies cross‑session; see note |
+| `你` (U+4F60, CJK) | 19 *(session‑specific)* | +8 | CJK — a **failed** fallback: **no installed font contains the glyph** (§3.2; `get_fallback_font` → `ValueError`), so the fallback loader `load_fallback_font` returns `MISSING_FONT` [`kitty/fonts.c`:L501‑L512], reached via `font_for_cell` → `fallback_font` [`kitty/fonts.c`:L602], and the cell renders the **pre‑rendered `MISSING_GLYPH` notdef sprite** (index 7) [`kitty/fonts.c`:L1296‑L1297], creating **no new atlas glyph** (see the sprite‑identity probe below). The raw upload count is a **non‑attributable** GL observation — **not** a fallback‑glyph count; varies cross‑session |
+| `hi 😁` | 20 *(session‑specific)* | (Δ vs `hi ` = **+7**) | primary ASCII **and** the genuine emoji fallback in one render (raw count varies cross‑session; see note) |
 
 Every upload in the `hi 😁` render targeted **`zoff=0`** of the **same** texture, and only **one**
-`glTexStorage3D` occurred (no reallocation) — so the primary (English → DejaVu Sans Mono) and the
-fallback (emoji/CJK) glyphs demonstrably occupy **one shared atlas**. This structural conclusion —
-one allocation, and every upload at `zoff=0` with `w=9 h=18` — reproduced **identically in every
-session**. kitty's `wcswidth` reports the
-fallback glyphs as 2 cells each (`wcswidth(😁)=2`, `wcswidth(你)=2`, `wcswidth(Z)=1`), and
-`shape_string` shows the emoji mapping to glyph `0` (`.notdef`) in the **primary** group
-`(2, 1, 0, (0,))` **[OBSERVED — test‑API]** — i.e. only the live fallback face supplies a real glyph,
-which is why the extra uploads appear only in the live render.
+`glTexStorage3D` occurred (no reallocation) — so the primary (ASCII `h`,`i` → DejaVu Sans Mono) and
+the **genuine emoji fallback** (`😁` → DejaVu Sans) glyphs demonstrably occupy **one shared atlas**.
+This structural conclusion — one allocation, and every upload at `zoff=0` with `w=9 h=18` —
+reproduced **identically in every session**. **CJK is deliberately excluded from this shared‑atlas
+claim: it produces no fallback glyph at all** (it is a failed fallback rendered with the pre‑rendered
+notdef sprite — proven directly next), so the only genuine primary + fallback co‑residence
+demonstrated here is ASCII + emoji.
+
+**Sprite‑identity probe — which glyphs are actually new [OBSERVED — test‑API, stable ×2, fresh
+processes].** The live GL shim counts `glTexSubImage3D` calls but **cannot see glyph identity**. To
+attribute the uploads, the real render path was exercised through `render_string`/`test_render_line`
+[`kitty/fonts/render.py`:L435‑L452] inside a `setup_for_testing()` font group (default `monospace`),
+capturing, for each drawn string, the `(x,y,z)` sprite each cell resolves to (`line.sprite_at`) and
+the set of **new** sprite keys uploaded beyond the 11 prerendered ones. Each case was run in a
+**fresh process** (the resolver mutates font‑group state; repeated in‑process queries are unstable —
+the same test‑API quirk §3.2(b) documents) and was byte‑identical across two runs:
+
+```
+$ export PYTHONPATH=$PWD LANG=C.UTF-8 LC_ALL=C.UTF-8
+$ python3 sprite_identity.py ASCII-Z Z      # one fresh process per (label, text)
+$ python3 sprite_identity.py CJK-你 你
+$ python3 sprite_identity.py CJK-好 好
+$ python3 sprite_identity.py emoji-😁 😁
+[ASCII-Z] text='Z' prerendered_before=11 MISSING_GLYPH=7
+    cell sprite_at = [(11, 0, 0)]
+    NEW sprite keys = [(11, 0, 0)]  (count=1)
+[CJK-你] text='你' prerendered_before=11 MISSING_GLYPH=7
+    cell sprite_at = [(7, 0, 0), (7, 0, 0)]
+    NEW sprite keys = []  (count=0)
+[CJK-好] text='好' prerendered_before=11 MISSING_GLYPH=7
+    cell sprite_at = [(7, 0, 0), (7, 0, 0)]
+    NEW sprite keys = []  (count=0)
+[emoji-😁] text='😁' prerendered_before=11 MISSING_GLYPH=7
+    cell sprite_at = [(11, 0, 0), (12, 0, 0)]
+    NEW sprite keys = [(11, 0, 0), (12, 0, 0)]  (count=2)
+```
+
+Reading this against the source:
+
+- **ASCII `Z`** → a new sprite `(11,0,0)` (primary DejaVu Sans Mono) — one new glyph, consistent with
+  the plain‑ASCII `+1` rule.
+- **emoji `😁`** → **two new sprites `(11,0,0)`, `(12,0,0)`** — the genuine fallback face
+  (DejaVu Sans, §3.2) really does rasterize new glyphs into the shared atlas.
+- **CJK `你` / `好`** → **both cells resolve to sprite index `7` = `MISSING_GLYPH`** and **zero new
+  sprite keys are created.** This is the pre‑rendered notdef sprite selected by the render path's `case
+  MISSING_FONT` [`kitty/fonts.c`:L1296‑L1297] when the resolver chain `font_for_cell` → `fallback_font`
+  → `load_fallback_font` returns `MISSING_FONT` [`kitty/fonts.c`:L501‑L512] — exactly the "does not actually
+  contain glyphs" / `get_fallback_font` → `ValueError` result from §3.2. **CJK contributes no fallback
+  glyph to the atlas.**
+
+So the honest, observed attribution is: the shared atlas receives **primary glyphs and the one
+genuine fallback (emoji)**; **CJK adds nothing** — it reuses a sprite that was already uploaded at
+startup.
 
 **Cross‑session note [OBSERVED — canonical, live GL].** Re‑running the identical fixtures in
 independent launcher sessions (fresh `xvfb-run` + shim, same build) reproduces the **baseline
 `empty=11`** and the **plain‑ASCII rule** (`hi Z` = `empty`+3, i.e. **+1 sprite per ASCII glyph**)
-every time, but the **fallback/colored‑glyph totals vary between sessions**: across the authoring
-capture in the table above and independent reproductions in the same container, the `😁` total was
-observed at **13–18**, `你` at **11–19**, and `hi 😁` at **15–20**. One representative independent
-re‑run measured `empty=11, hi =13, hi Z=14, 😁=13, 你=11, hi 😁=15` — stable across three back‑to‑back
-rounds and **invariant to the child `sleep` duration** (identical at `sleep=1` and `sleep=8`), i.e.
-deterministic *within* a session. The cause is **draw‑loop upload batching**: how many discrete
-`glTexSubImage3D` calls the render loop emits for a first‑time wide/colored fallback glyph before the
-child exits is a GLFW/render‑loop timing artifact, **not** a source or configuration difference (the
-source tree is byte‑identical across these sessions). These per‑string counts are therefore
-classified **within‑session stable, cross‑session variable** in §6.2; only the baseline `empty=11` and
-the shared‑atlas *structure* are reproducible constants.
+every time, but the **non‑baseline `glTexSubImage3D` totals vary between sessions**: across the
+authoring capture in the table above and independent reproductions in the same container, the `😁`
+total was observed at **13–18**, `你` at **11–19**, and `hi 😁` at **15–20**. One representative
+independent re‑run measured `empty=11, hi =13, hi Z=14, 😁=13, 你=11, hi 😁=15` — stable across three
+back‑to‑back rounds and **invariant to the child `sleep` duration** (identical at `sleep=1` and
+`sleep=8`), i.e. deterministic *within* a session. The cause is **draw‑loop upload batching**: how
+many discrete `glTexSubImage3D` calls the render loop emits before the child exits is a
+GLFW/render‑loop timing artifact, **not** a source or configuration difference (the source tree is
+byte‑identical across these sessions). **These raw per‑string counts are non‑attributable at the GL
+layer** (the shim sees calls, not glyph identity); in particular the `你` count does **not** measure a
+CJK fallback glyph — the sprite‑identity probe above shows CJK creates **zero** new sprites and reuses
+the pre‑rendered notdef. They are therefore classified **within‑session stable, cross‑session
+variable** in §6.2; only the baseline `empty=11`, the plain‑ASCII `+1`‑per‑glyph rule, and the
+shared‑atlas *structure* are reproducible constants.
 
-**Honest note [OBSERVED, not fully isolated].** In the authoring capture the wide fallback glyph
-produced **more** sprite‑cell uploads (emoji +7, CJK +8) than its 2‑cell on‑screen width; in other
-sessions the surplus was smaller (see the cross‑session note). `render_group` uploads `num_cells`
-sprites per group [`kitty/fonts.c`:L739‑L744], so the surplus reflects first‑time fallback/colored‑
-glyph sprite‑cell uploads emitted by the draw loop. The GL‑interception shim observes GL calls only
-(not glyph identities), so the precise decomposition of those uploads cannot be attributed at the GL
-layer without modifying source (out of scope, read‑only), and — as the cross‑session note records —
-the exact surplus is **not** reproducible across sessions. The finding the question actually asks
-about — that fallback glyphs are rasterized and uploaded into the **shared** atlas — is directly
-observed and reproduces in every session.
+**Honest note [OBSERVED, not fully isolated].** The GL‑interception shim observes GL **calls only,
+not glyph identities**, so the raw per‑string upload counts above cannot be decomposed at the GL layer
+without modifying source (out of scope, read‑only). Glyph identity is instead established by the
+sprite‑identity probe above: the genuine emoji fallback rasterizes **new** sprites into the shared
+atlas (`(11,0,0)`, `(12,0,0)`); a plain ASCII glyph adds **one** (`render_group` uploads `num_cells`
+sprites per group [`kitty/fonts.c`:L739‑L744]); and **CJK adds none** — it resolves to the
+pre‑rendered `MISSING_GLYPH` notdef sprite. The exact number of raw `glTexSubImage3D` calls a
+first‑time wide/colored glyph provokes is **not** reproducible across sessions (see the cross‑session
+note). The finding the question actually asks about — that a **genuine fallback** glyph is rasterized
+and uploaded into the **shared** atlas (demonstrated with the emoji), while a **failed** fallback
+(CJK) contributes only the pre‑rendered notdef — is directly observed and reproduces in every
+session.
 
 ### 5.7 The "atlas ready" signal (CQ‑13)
 
@@ -1407,7 +1457,7 @@ dedicated readiness log line.
 | **atlas sizing** | §5.4 (live `glTexStorage3D` `1017×18×1`, `GL_TEXTURE_2D_ARRAY`, `GL_SRGB8_ALPHA8`) | OBSERVED — canonical (live GL) |
 | **atlas capacity** | §5.3, §5.5 (6328 slots/layer; layer cap `MIN(0xfff,2048)=2048`; total 12 959 744) | OBSERVED + code‑derived |
 | **primary font** | §5.6 (DejaVu Sans Mono ASCII glyphs → shared atlas, `zoff=0`) | OBSERVED — canonical (live GL) |
-| **fallback fonts** | §5.6 (emoji/CJK glyphs → same shared atlas texture, `zoff=0`) | OBSERVED — canonical (live GL) |
+| **fallback fonts** | §5.6 (genuine emoji fallback → DejaVu Sans → new glyphs in the same shared atlas texture, `zoff=0`; CJK is a *failed* fallback → pre‑rendered `MISSING_GLYPH` notdef, no new atlas glyph) | OBSERVED — canonical (live GL) + test‑API (sprite identity) |
 | **"atlas ready" logs** | §5.7 (no explicit log; readiness = first `glTexStorage3D` + 3 fatal gates; real `OS Window created` / GL 4.5) | OBSERVED + INFERRED |
 
 **User‑example phrases preserved verbatim:** *"ligatures, bidi, combining diacritics"* (§2),
@@ -1431,11 +1481,15 @@ Four classes of field are distinguished:
   `48e58f707990…`); a disposable rebuild at a later HEAD stamped `1f88e431cac7…` instead (§1).
 - **Session‑scoped fields (within‑session stable, cross‑session variable)** — deterministic across
   repeated runs of a *single* build (and invariant to the child `sleep` duration) but **not**
-  reproducible across independent launcher sessions: the per‑string `glTexSubImage3D` **upload counts**
-  for first‑time wide/colored fallback glyphs (§5.6). The baseline `empty=11` and the plain‑ASCII
-  `+1`‑per‑glyph increment *do* reproduce every session; only the fallback/colored‑glyph totals vary
+  reproducible across independent launcher sessions: the raw per‑string `glTexSubImage3D` **upload
+  counts** for non‑baseline strings (§5.6). The baseline `empty=11` and the plain‑ASCII
+  `+1`‑per‑glyph increment *do* reproduce every session; only the non‑baseline totals vary
   (observed `😁`=13–18, `你`=11–19, `hi 😁`=15–20) — a draw‑loop upload‑batching artifact, not a
   source or configuration difference (the source tree is byte‑identical across the sessions compared).
+  These raw counts are **non‑attributable at the GL layer** (the shim sees calls, not glyph identity);
+  glyph identity — including that CJK creates **no** new atlas glyph (it reuses the pre‑rendered
+  notdef) while the emoji fallback creates two — is established separately by the **[OBSERVED —
+  test‑API]** sprite‑identity probe in §5.6, which *is* stable across runs.
 - **Volatile fields** — vary run‑to‑run but carry **no semantic meaning**: the monotonic `[N.NNN]`
   debug timestamps, the ephemeral Xvfb display number (`xvfb-run -a` picks a free display), process
   PIDs, and the `mktemp` directory suffix. Where a full transcript containing volatile fields is
@@ -1501,7 +1555,8 @@ All temporary scripts, fixtures, logs, and the GL shim lived in **container‑lo
 not part of the bind‑mounted repository), each in a private `mktemp -d` directory (mode `700`):
 
 - **Evidence directory** `/tmp/kitty_obs.<rand>` — observation harnesses (`q1_shape.py`,
-  `q2_fb_one.py`, `q3_metrics.py`, `q3_sgr.py`, `winsize.py`, `q4_emoji_shape.py`), text fixtures
+  `q2_fb_one.py`, `q3_metrics.py`, `q3_sgr.py`, `winsize.py`, `q4_emoji_shape.py`,
+  `sprite_identity.py`), text fixtures
   (`fixture_q1.txt`, `fixture_q2.txt`, `fixture_q4.txt`), captured output logs, and the observe‑first
   chronology ledger `CHRONOLOGY.tsv`.
 - **Shim directory** `/tmp/kitty_glshim.<rand>` — `glshim.c` (sha256 `8a77dca7…`) / `glshim.so`
