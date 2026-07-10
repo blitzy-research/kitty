@@ -303,8 +303,8 @@ startup trace below is therefore the **X11** path.
 Command exactly as in [§1.3](#13-exact-headless-invocation). Both runs are pasted **verbatim** with
 their exit status. Across runs the **event order** and every **semantic value** (the GL version
 string, the four resolved font paths, the exit status) are **identical**; the absolute `[t]`
-monotonic timestamps vary by a few milliseconds run-to-run — the measured distribution over six
-unchanged runs is reported in [§8.3](#83-stability).
+monotonic timestamps vary by a few milliseconds run-to-run (and slow down arbitrarily under host
+load) — the measured distribution over repeated unchanged runs is reported in [§8.3](#83-stability).
 
 ```console
 $ xvfb-run -a -s "-screen 0 1920x1080x24" ./kitty/launcher/kitty \
@@ -1230,14 +1230,20 @@ Per the stability mandate, every magnitude/timing/ordering value was confirmed a
 unchanged runs**:
 
 - **Startup order** — the canonical launch ([§1.3](#13-exact-headless-invocation)) was repeated
-  **six** unchanged times (two are pasted in [§2.1](#21-the-captured-startup-log-complete-unedited-two-runs)).
+  across **many unchanged runs** (two are pasted verbatim in [§2.1](#21-the-captured-startup-log-complete-unedited-two-runs)).
   The **event order** (`GL` → `OS Window created` → `systemd` → `Child launched` → `Text fonts`) and
-  every **semantic value** (GL string, four font paths, exit status) were **identical** in all six
-  runs. The **absolute** monotonic timestamps are **not** identical — they vary by a few
-  milliseconds run-to-run. Observed per-event ranges over the six runs: `GL` 0.117–0.118 s;
-  `OS Window created` 0.136–0.139 s; `systemd` 0.145–0.148 s; `Child launched` 0.152–0.155 s;
-  `Text fonts` 0.152–0.155 s — a per-event spread of ≤ 0.003 s. Only the ordering and the semantic
-  values are load-bearing; the absolute timestamps are **[observed, volatile]**.
+  every **semantic value** (the GL string, the four font paths, the exit status) were **identical in
+  every run** — a dedicated **10-run** repetition recorded **zero** ordering violations of the
+  `GL ≤ OS Window ≤ systemd ≤ Child ≤ Text fonts` sequence. The **absolute** monotonic timestamps,
+  by contrast, are **[observed, volatile]** and are **not** load-bearing: most runs complete these
+  milestones within a tight few-millisecond band, but on this shared, software-rendered host
+  individual runs slow down **arbitrarily** under scheduler / host-load jitter, so the timestamps
+  have **no fixed upper bound** (one validation run reached `OS Window created` 0.162 s /
+  `Child launched` 0.178 s). Across the repeated runs the observed per-event envelope was
+  `GL` ≈ 0.115–0.121 s, `OS Window created` ≈ 0.134–0.162 s, `systemd` ≈ 0.143–0.171 s,
+  `Child launched` ≈ 0.149–0.178 s, `Text fonts` ≈ 0.150–0.178 s; the typical (non-outlier)
+  run-to-run spread is only a few milliseconds. Only the **ordering** and the **semantic values** are
+  reproducible invariants; the absolute magnitudes must **not** be read as fixed values.
 - **Cell metrics** — the supplemental probe was run **twice**, producing **byte-identical** output
   (9 × 18 px at DPI 96); see [§6.2](#62-step-2--cell-metrics-are-computed-at-the-detected-dpi).
 - **Window geometry** — the default (640 × 400) and cells (721 × 433) measurements each reproduced
