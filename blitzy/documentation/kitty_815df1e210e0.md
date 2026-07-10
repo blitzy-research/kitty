@@ -812,7 +812,7 @@ hex=1b5f47693d313b45494e56414c3a504e4720646174612073697a6520746f6f206c617267651b
 
 Eviction is enforced by `apply_storage_quota` (`kitty/graphics.c:L290-L296`): it first removes *unreferenced* images (`remove_images(self, trim_predicate, currently_added_image_internal_id)`, where `trim_predicate` = `!img->root_frame_data_loaded || !img->refs`, defined at L280‑L281 and invoked at L292), and if storage is still over the limit it sorts oldest‑first (`HASH_SORT(self->images, oldest_img_first)`) and deletes until it fits.
 
-Because `used_storage` is not exposed to Python, eviction was observed via `image_count` (= `HASH_COUNT`, `kitty/graphics.c:L2362`) and `disk_cache.total_size`, driven through kitty's own in‑tree harness. **This is a labeled supplement (S2):** `send_command`/`parse_bytes` feed the parser directly and bypass the PTY + `io_loop`, but they exercise the *identical* `graphics.c` storage code regardless of transport. (A single inline APC that would exceed the 1 MiB parser buffer is itself rejected as `VTE_APC escape code too long (1048574 bytes)` = `BUF_SZ − 2` — a direct manifestation of `BUF_SZ`, captured canonically in Section F.1b — so large images below use the file‑transfer medium `t='f'`.)
+Because `used_storage` is not exposed to Python, eviction was observed via `image_count` (= `HASH_COUNT`, `kitty/graphics.c:L2362`) and `disk_cache.total_size`, driven through kitty's own in‑tree harness. **This is a labeled supplement (S2):** `send_command`/`parse_bytes` feed the parser directly and bypass the PTY + `io_loop`, but they exercise the *identical* `graphics.c` storage code regardless of transport. (A single inline APC that would exceed the 1 MiB parser buffer is itself rejected as `VTE_APC escape code too long (1048574 bytes)` = `BUF_SZ − 2` — a direct manifestation of `BUF_SZ`, captured canonically in Section F.1b — so large images below use the temporary‑file transfer medium `t='t'`.)
 
 **`disk_cache.total_size` is a LOGICAL accounting figure, not proof of physical bytes on disk (Finding 11).** The value read from Python is `disk_cache_total_size` (`kitty/disk-cache.c:L666`), which returns the `total_size` counter. That counter is incremented **synchronously, inside the cache mutex, at the moment `add_to_disk_cache` is called** — `self->total_size += s->data_sz` (`kitty/disk-cache.c:L508`) — *before* the background writer thread has necessarily flushed the bytes to the on‑disk file (the writer is only woken at the end of the function). So `total_size` proves the logical size the cache has *accepted for storage*; the *physical* bytes are confirmed separately by `disk_cache_wait_for_write` (`kitty/disk-cache.c:L642`, Python `wait_for_write`, L704), `disk_cache_size_on_disk` (Python `size_on_disk`, L712), and `disk_cache_num_cached_in_ram` (L669, counts entries where `written_to_disk && data`). The two are distinguished directly below before eviction is exercised.
 
@@ -856,7 +856,7 @@ So the data genuinely leaves RAM and lands on disk: `total_size` records the log
 
 ```
 grman.storage_limit (DEFAULT) = 335544320 bytes (== 320*1024*1024 ? True)
-each image: s=4096 v=4096 f=24 t=f => data_sz=50331648 bytes (48.00 MiB); 7 images => 336 MiB > 320 MiB
+each image: s=4096 v=4096 f=24 t=t => data_sz=50331648 bytes (48.00 MiB); 7 images => 336 MiB > 320 MiB
 img_id  code   image_count  disk_cache.total_size(bytes,LOGICAL)  total(MiB)  <=320MiB?
      1  OK               1                              50331648      48.00  yes
      2  OK               2                             100663296      96.00  yes
@@ -1948,7 +1948,7 @@ sed '/^$/d' "$ERR" 2>/dev/null | head -10 || true
 echo "RUN_${RUN}_done"
 ```
 
-**`gfx_quota.py`** — the in‑tree harness (**labeled supplement S2**) for the logical/physical disk‑cache split (Finding 11) and the 5× animation‑frame quota (Finding 10). Uses only pure reads (`image_count`=`HASH_COUNT`, `disk_cache.total_size`, `size_on_disk`, `num_cached_in_ram`), the `t='f'` file medium for large images, and a distinct first byte per image to defeat de‑duplication. Run via `+runpy`, so it runs to completion and exits (inherently bounded):
+**`gfx_quota.py`** — the in‑tree harness (**labeled supplement S2**) for the logical/physical disk‑cache split (Finding 11) and the 5× animation‑frame quota (Finding 10). Uses only pure reads (`image_count`=`HASH_COUNT`, `disk_cache.total_size`, `size_on_disk`, `num_cached_in_ram`), direct/inline transmission (the default medium, no `t=` key; each 120 KB image fits in one escape code), and a distinct first byte per image to defeat de‑duplication. Run via `+runpy`, so it runs to completion and exits (inherently bounded):
 
 ```python
 #!/usr/bin/env python3
@@ -2057,7 +2057,7 @@ print("HARNESS_DONE")
 ```python
 #!/usr/bin/env python3
 # LABELED SUPPLEMENT (S2). LRU eviction under the storage quota (apply_storage_quota,
-# graphics.c:L290-L299). Same graphics.c code as the PTY path; direct parser feed so
+# graphics.c:L290-L296). Same graphics.c code as the PTY path; direct parser feed so
 # grman.storage_limit / image_count / disk_cache are reachable.
 import os, sys, tempfile
 repo = os.environ['KITTY_REPO']; sys.path.insert(0, repo)
@@ -2082,7 +2082,7 @@ print("grman.storage_limit (DEFAULT) = %d bytes (== 320*1024*1024 ? %s)" % (
     g.storage_limit, g.storage_limit == 320*1024*1024))
 W = H = 4096
 per = W*H*3
-print("each image: s=%d v=%d f=24 t=f => data_sz=%d bytes (%.2f MiB); 7 images => %.0f MiB > 320 MiB" % (
+print("each image: s=%d v=%d f=24 t=t => data_sz=%d bytes (%.2f MiB); 7 images => %.0f MiB > 320 MiB" % (
     W, H, per, per/1024/1024, 7*per/1024/1024))
 li = make_send_command(s)
 print("img_id  code   image_count  disk_cache.total_size(bytes,LOGICAL)  total(MiB)  <=320MiB?")
