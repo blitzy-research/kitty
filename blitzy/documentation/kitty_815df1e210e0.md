@@ -433,7 +433,7 @@ on the line about to be overwritten, then advances `start_of_data`
   [kitty/history.c:69-81] (guard `if (!pagerhist_sz) return NULL;`). With
   `self->pagerhist == NULL`, `pagerhist_push` returns immediately
   [kitty/history.c:258-261] — the evicted line is **dropped**, and
-  `pagerhist_as_bytes()` returns empty `b""` [kitty/history.c:459].
+  `pagerhist_as_bytes()` returns empty `b""` [kitty/history.c:460-483].
 - **Pager enabled.** `alloc_pagerhist(sz)` creates a ring whose **initial** capacity is
   `initial_pagerhist_ringbuf_sz(sz) = MIN(1 MiB, sz)` and whose **`maximum_size = sz`**
   [kitty/history.c:66-67, 79]. On each eviction, `pagerhist_push` serializes the line
@@ -506,8 +506,11 @@ def part_enabled():
     print(f"fresh: ring_bytes={len(s.historybuf.pagerhist_as_bytes())} [OBSERVED]")
     n = 1
     # First, fill exactly to saturation WITHOUT eviction, then cross into eviction.
-    # Grid holds 24 lines; history saturates at ynum=2000. Feed 2000+24 = 2024 to just reach cap.
-    n = feed(s, n, 2024)
+    # SQ2-A above shows history count = fed - 23 before saturation (e.g. fed 1000 -> count 977),
+    # because ~23 lines of the burst still occupy the live 24-row grid. history saturates at
+    # ynum=2000, so feed 2023 to just reach the cap (2023 - 23 = 2000) with ZERO eviction;
+    # feeding one more (2024) would push count to 2001 and evict exactly one line.
+    n = feed(s, n, 2023)
     cnt, hlac, ev, ring = snap(s)
     print(f"after fed={n-1}: count={cnt} hlac(local)={hlac} evicted={ev} ring_bytes={ring} "
           f"[OBSERVED] (ring still 0 while evicted==0)")
@@ -534,7 +537,7 @@ def part_enabled():
     print(f"RESULT: each batch's ring growth == (batch evictions) x (bytes/line) = PAYLOAD "
           f"volume of evicted lines (NOT a fixed 1MiB extend granularity). [OBSERVED]")
     print(f"  (internal ring capacity grows via pagerhist_extend MAX(1MiB,minsz), history.c:89-102,")
-    print(f"   but pagerhist_as_bytes() reports bytes_USED = payload, history.c:459) [INFERRED]\n")
+    print(f"   but pagerhist_as_bytes() reports bytes_USED = payload, history.c:460-483) [INFERRED]\n")
 
 if __name__ == '__main__':
     part_disabled()
@@ -559,22 +562,22 @@ RESULT: count capped at ynum=2000, ring stays 0 -> 3977 evicted lines DROPPED (n
 
 === SQ2-B: pager ENABLED (scrollback_pager_history_size=4194304 bytes = 4 MiB) ===
 fresh: ring_bytes=0 [OBSERVED]
-after fed=2024: count=2000 hlac(local)=2001 evicted=1 ring_bytes=33 [OBSERVED] (ring still 0 while evicted==0)
-FIRST eviction batch: fed=3024 count=2000 evicted=1001 ring_bytes=33033 [OBSERVED]
-  first-delta arithmetic: 33033 - 0 = +33033 bytes for 1001 evicted lines => 33.0000 bytes/evicted-line [OBSERVED]
+after fed=2023: count=2000 hlac(local)=2000 evicted=0 ring_bytes=0 [OBSERVED] (ring still 0 while evicted==0)
+FIRST eviction batch: fed=3023 count=2000 evicted=1000 ring_bytes=33000 [OBSERVED]
+  first-delta arithmetic: 33000 - 0 = +33000 bytes for 1000 evicted lines => 33.0000 bytes/evicted-line [OBSERVED]
    fed  count  evicted  ring_bytes     delta batch_ev   B/line
-  3024   2000     1001       33033         -        -   33.000
-  4024   2000     2001       66033    +33000     1000   33.000
-  5024   2000     3001       99033    +33000     1000   33.000
-  6024   2000     4001      132033    +33000     1000   33.000
-  7024   2000     5001      165033    +33000     1000   33.000
-  8024   2000     6001      198033    +33000     1000   33.000
-  9024   2000     7001      231033    +33000     1000   33.000
- 10024   2000     8001      264033    +33000     1000   33.000
- 11024   2000     9001      297033    +33000     1000   33.000
+  3023   2000     1000       33000         -        -   33.000
+  4023   2000     2000       66000    +33000     1000   33.000
+  5023   2000     3000       99000    +33000     1000   33.000
+  6023   2000     4000      132000    +33000     1000   33.000
+  7023   2000     5000      165000    +33000     1000   33.000
+  8023   2000     6000      198000    +33000     1000   33.000
+  9023   2000     7000      231000    +33000     1000   33.000
+ 10023   2000     8000      264000    +33000     1000   33.000
+ 11023   2000     9000      297000    +33000     1000   33.000
 RESULT: each batch's ring growth == (batch evictions) x (bytes/line) = PAYLOAD volume of evicted lines (NOT a fixed 1MiB extend granularity). [OBSERVED]
   (internal ring capacity grows via pagerhist_extend MAX(1MiB,minsz), history.c:89-102,
-   but pagerhist_as_bytes() reports bytes_USED = payload, history.c:459) [INFERRED]
+   but pagerhist_as_bytes() reports bytes_USED = payload, history.c:460-483) [INFERRED]
 
 ```
 
@@ -593,14 +596,14 @@ RESULT: each batch's ring growth == (batch evictions) x (bytes/line) = PAYLOAD v
   `"\x1b[m"` reset + 28 text bytes + `\r\n` (2) = 33 [kitty/history.c:258-274].
   **[OBSERVED]**
 - **The first non-zero ring reading is exact arithmetic on a fresh 0-byte ring.**
-  The first eviction batch produced `33033 - 0 = +33033` bytes for **1001** evicted
-  lines (`33033 / 1001 = 33.0000`). **[OBSERVED]**
+  The first eviction batch produced `33000 - 0 = +33000` bytes for **1000** evicted
+  lines (`33000 / 1000 = 33.0000`). **[OBSERVED]**
 - **Each subsequent batch grows the ring by `evictions x bytes/line` — payload
   volume, not an extend-granularity artifact.** Every 1000-line batch added
   `+33000` bytes (= `1000 x 33`) to `pagerhist_as_bytes()`. The internal ring
   **capacity** does grow in `MAX(1 MiB, needed)` steps via `pagerhist_extend`
   [kitty/history.c:89-102], but `pagerhist_as_bytes()` reports bytes **used**
-  (the payload) [kitty/history.c:459], so the visible increment equals the evicted
+  (the payload) [kitty/history.c:460-483], so the visible increment equals the evicted
   lines' serialized size, **not** a 1 MiB quantum. **[OBSERVED payload / INFERRED
   capacity mechanism]**
 - **The ring initial size and cap come straight from the option.** The tier starts
@@ -848,16 +851,78 @@ runtime. This build is **not** canonical; it is used only to let the sanitizer
 watch the ring boundary. Afterwards the canonical `.so` was restored and its
 sha256 re-verified (`74ca07a6…`), with `git status --porcelain` empty.
 
+The exact `sq3_sanitize.py` used (complete and self-contained — the same canonical
+code path as `sq3_fragility.py` above, but driven as a single 1,000,000-line burst
+sampled every 200,000 lines so the sanitizer watches `pagerhist_as_bytes()` cross the
+ring boundary while it is still growing and after it caps at 8 MiB):
+
+```python
+#!/usr/bin/env python3
+# SQ3 probe (part 3): NON-CANONICAL sanitizer cross-check of the large-burst pager
+# ring path. Identical code path to sq3_fragility.py (payload, screen geometry, and
+# 8 MiB pager ring), but driven as a single 1,000,000-line burst sampled every
+# 200,000 lines so the sanitizer can watch pagerhist_as_bytes() cross the ring
+# boundary while it is still GROWING (before the 8 MiB cap) and after it caps.
+# Run against the supplemental ASan+UBSan .so with LD_PRELOAD of the ASan runtime;
+# ASAN_OPTIONS=halt_on_error=1 / UBSAN_OPTIONS=halt_on_error=1 abort the process on
+# ANY sanitizer error, so reaching the final "NO SANITIZER ERROR" print IS the
+# evidence of a clean run. This build is NOT canonical (labelled [OBSERVED asan]);
+# the canonical .so is restored immediately afterwards.
+import sys, os, time
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.getcwd())
+from kitty_tests import BaseTest, parse_bytes
+
+class P(BaseTest):
+    def runTest(self):
+        pass
+
+CHUNK = 100000     # lines per parse_bytes call (same as sq3_fragility.py)
+PROGRESS = 200000  # sample the ring every 200k lines to catch the growth phase
+
+def chunk_bytes(start, count_lines):
+    # Canonical payload: the decimal line number + CRLF, fed through the real VT
+    # parser via parse_bytes (identical to sq3_fragility.py).
+    return b"".join((f"{n}\r\n").encode() for n in range(start, start + count_lines))
+
+def sanitize_burst(total, ring_bytes_size):
+    bt = P()
+    s = bt.create_screen(cols=80, lines=24, scrollback=2000,
+                         options={'scrollback_pager_history_size': ring_bytes_size})
+    n = 1
+    t0 = time.perf_counter()
+    done = 0
+    while done < total:
+        c = min(CHUNK, total - done)
+        parse_bytes(s, chunk_bytes(n, c))
+        n += c
+        done += c
+        if done % PROGRESS == 0:
+            hb = s.historybuf
+            ring = len(hb.pagerhist_as_bytes())   # read path exercised under ASan
+            print(f"  progress {done} count={hb.count} "
+                  f"evicted={s.history_line_added_count - hb.count} ring_bytes={ring} "
+                  f"elapsed={time.perf_counter()-t0:.2f}s [OBSERVED asan]")
+    hb = s.historybuf
+    ring = len(hb.pagerhist_as_bytes())
+    print(f"DONE {total} lines under ASAN+UBSAN: count={hb.count} "
+          f"evicted={s.history_line_added_count - hb.count} ring_bytes={ring} "
+          f"NO SANITIZER ERROR [OBSERVED asan]")
+
+if __name__ == '__main__':
+    sanitize_burst(1000000, 8388608)
+```
+
 ```console
 $ cp /tmp/kitty_probe/fast_data_types.sanitize.so kitty/fast_data_types.so
 $ LD_PRELOAD=/usr/lib/gcc/x86_64-linux-gnu/15/libasan.so \
   ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
   PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq3_sanitize.py
-  progress 200000 count=2000 evicted=197977 ring_bytes=2066642 elapsed=0.44s [OBSERVED asan]
-  progress 400000 count=2000 evicted=397977 ring_bytes=4266642 elapsed=0.87s [OBSERVED asan]
-  progress 600000 count=2000 evicted=597977 ring_bytes=6466642 elapsed=1.30s [OBSERVED asan]
-  progress 800000 count=2000 evicted=797977 ring_bytes=8388608 elapsed=1.73s [OBSERVED asan]
-  progress 1000000 count=2000 evicted=997977 ring_bytes=8388608 elapsed=2.17s [OBSERVED asan]
+  progress 200000 count=2000 evicted=197977 ring_bytes=2066642 elapsed=0.55s [OBSERVED asan]
+  progress 400000 count=2000 evicted=397977 ring_bytes=4266642 elapsed=0.98s [OBSERVED asan]
+  progress 600000 count=2000 evicted=597977 ring_bytes=6466642 elapsed=1.40s [OBSERVED asan]
+  progress 800000 count=2000 evicted=797977 ring_bytes=8388608 elapsed=1.83s [OBSERVED asan]
+  progress 1000000 count=2000 evicted=997977 ring_bytes=8388608 elapsed=2.27s [OBSERVED asan]
 DONE 1000000 lines under ASAN+UBSAN: count=2000 evicted=997977 ring_bytes=8388608 NO SANITIZER ERROR [OBSERVED asan]
 $ echo "SANITIZE_EXIT=$?"
 SANITIZE_EXIT=0
@@ -1174,7 +1239,7 @@ in §2 and "retention" (eviction into the pager ring) in §3.
 The probe fills history with 500 long, individually labelled logical lines
 (`NNNN:xxx...`, 150 chars each, which autowrap at 80 cols into two rows apiece),
 then drives the width through the sequence `80 -> 40 -> 20 -> 120 -> 80` via
-`Screen.resize`, capturing `count`, the topmost retained logical label, and a
+`Screen.resize`, capturing `count`, the index-0 (most-recent) retained logical label, and a
 row-level dump of the first/last three history rows at each step. The first resize
 (80 -> 80) deliberately exercises the **fast memcpy** branch; every subsequent width
 change exercises **rewrap_inner**.
@@ -1242,7 +1307,7 @@ def main():
           f"delta={c1 - c0:+d} [OBSERVED]")
     print("OBSERVED facts of the non-idempotent round-trip:")
     print(f"  - history row count changed by {c1 - c0:+d} (was {c0}, now {c1})")
-    print(f"  - topmost retained logical line moved (see top_logical above: 80-initial vs 80-final)")
+    print(f"  - index-0 (most-recent) retained logical line moved (see top_logical above: 80-initial vs 80-final)")
     print("INTERPRETATION [INFERRED, scenario-limited]: reflow redistributes logical lines")
     print("  between the 24-row on-screen grid (linebuf) and the history buffer. Intermediate")
     print("  narrow widths (40,20) pack fewer logical lines onto the 24 visible rows and split")
@@ -1307,7 +1372,7 @@ initial: lines=24 cols=80 count=977 top_logical=0488: [OBSERVED]
 ROUND-TRIP width 80 -> 40 -> 20 -> 120 -> 80: history count 977 -> 996 delta=+19 [OBSERVED]
 OBSERVED facts of the non-idempotent round-trip:
   - history row count changed by +19 (was 977, now 996)
-  - topmost retained logical line moved (see top_logical above: 80-initial vs 80-final)
+  - index-0 (most-recent) retained logical line moved (see top_logical above: 80-initial vs 80-final)
 INTERPRETATION [INFERRED, scenario-limited]: reflow redistributes logical lines
   between the 24-row on-screen grid (linebuf) and the history buffer. Intermediate
   narrow widths (40,20) pack fewer logical lines onto the 24 visible rows and split
@@ -1336,7 +1401,7 @@ delta, and the same row dumps. The complete run-2 output at
   row-level evidence of `rewrap_inner` re-packing. **[OBSERVED]**
 - **The round trip is non-idempotent by `+19` rows in this scenario.** Returning to
   width 80 yields `count=996`, not the original `977` — a `delta=+19` — and the
-  topmost retained logical line moved from `0488:` to `0497:`. **[OBSERVED]**
+  index-0 (most-recent) retained logical line moved from `0488:` to `0497:`. **[OBSERVED]**
 - **The cause is isolated to reflow's screen<->history partition, and is
   scenario-specific.** Intermediate narrow widths pack fewer logical lines onto the
   fixed 24-row grid and push more into history; widening does not restore the exact
@@ -1408,7 +1473,7 @@ was verified unchanged (sha256 `74ca07a6...`) after every swap to a supplemental
 **kitty source (baseline commit `815df1e21`), by `file:line`:**
 
 - Segmented store: `SEGMENT_SIZE = 2048` [kitty/history.c:15]; `add_segment` [kitty/history.c:17-28]; `segment_for` [kitty/history.c:36-42]; `create_historybuf` (one segment on construction) [kitty/history.c:117-133]; `historybuf_push` eviction [kitty/history.c:277-285]; read-only members `xnum`/`ynum`/`count` [kitty/history.c:556-558].
-- Pager ring: `initial_pagerhist_ringbuf_sz` [kitty/history.c:66-67]; `alloc_pagerhist` [kitty/history.c:69-81]; `pagerhist_extend` [kitty/history.c:89-102]; `pagerhist_write_bytes` [kitty/history.c:218-226]; `pagerhist_push` [kitty/history.c:258-274]; `pagerhist_as_bytes` [kitty/history.c:459].
+- Pager ring: `initial_pagerhist_ringbuf_sz` [kitty/history.c:66-67]; `alloc_pagerhist` [kitty/history.c:69-81]; `pagerhist_extend` [kitty/history.c:89-102]; `pagerhist_write_bytes` [kitty/history.c:218-226]; `pagerhist_push` [kitty/history.c:258-274]; `pagerhist_as_bytes` [kitty/history.c:460-483].
 - Ring FIFO: overflow / overwrite-oldest [3rdparty/ringbuf/ringbuf.c:231-234]; attribution (Drew Hess, 2011, public domain) [3rdparty/ringbuf/ringbuf.h:1-15].
 - Reflow: `historybuf_rewrap` [kitty/history.c:595]; fast memcpy path [kitty/history.c:597-606]; `rewrap_needed` [kitty/history.c:607-608]; `rewrap_inner` call [kitty/history.c:611]; engine [kitty/rewrap.h:57].
 - Screen / scroll: `alloc_historybuf(MAX(scrollback, lines), ...)` [kitty/screen.c:130]; `INDEX_UP` + `history_line_added_count++` [kitty/screen.c:1552-1566, 1559]; `screen_reset_dirty` zeroes the counter [kitty/screen.c:2597-2601]; `scrolled_by` cap [kitty/screen.c:2716, 2761]; `scrolled_by` read-only member [kitty/screen.c:4903]; `history_line_added_count` writable member [kitty/screen.c:4908]; `visual_line` [kitty/screen.c:4788]; `update_only_line_graphics_data` [kitty/screen.c:4867]; `scroll` arg spec `"ip"` [kitty/screen.c:4123].
