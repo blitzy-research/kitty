@@ -1813,7 +1813,7 @@ The C guards `no active window, ignoring` (`kitty/keys.c:L182`) and the post-dis
 ############ BOUNDARY 4: no-active-window guard (keys.c:L182) + same-dispatch drop race (keys.c:L236) ############
 active_window() (keys.c:L105-111) returns NULL when the active window slot's
   render_data.screen is NULL (a transient teardown state). L182: 'no active window,
-  ignoring'. After Python dispatch, L226 re-resolves w=window_for_window_id(id); L236
+  ignoring'. After Python dispatch, L224 re-resolves w=window_for_window_id(id); L236
   'if (!w) return;' DROPS the key if that window vanished DURING dispatch.
 
 === GENUINE ATTEMPT: 10 rounds of {create window, focus, hammer keys while closing it} ===
@@ -1847,12 +1847,12 @@ count of on_key_input lines in this window = 800
 
 ### 6.5 IME / preedit state [OBSERVED + INFERRED]
 
-`on_key_input` switches on `ev->ime_state` (`kitty/keys.c:L188-L216`); the debug line prints `state: %d`. A genuine environment check confirmed **no input method** is configured or running (no `XMODIFIERS`/`*_IM_MODULE`, no `ibus`/`fcitx` daemon or binary). Every real keystroke reports `state: 0` = `GLFW_IME_NONE` (`kitty/keys.c:L210`, the real-key path), and zero IME-path debug lines are produced. The `PREEDIT_CHANGED` (`kitty/keys.c:L194`) and `COMMIT_TEXT` (`kitty/keys.c:L202`, which calls `schedule_write_to_child`) branches require an active IM to emit GLFW IME events; this is labelled [INFERRED] **after** the documented environment check, since no IM is present or installable offline:
+`on_key_input` switches on `ev->ime_state` (`kitty/keys.c:L188-L216`); the debug line prints `state: %d`. A genuine environment check confirmed **no input method** is configured or running (no `XMODIFIERS`/`*_IM_MODULE`, no `ibus`/`fcitx` daemon or binary). Every real keystroke reports `state: 0` = `GLFW_IME_NONE` (`kitty/keys.c:L207`, the real-key path), and zero IME-path debug lines are produced. The `PREEDIT_CHANGED` (`kitty/keys.c:L195`) and `COMMIT_TEXT` (`kitty/keys.c:L202`, which calls `schedule_write_to_child`) branches require an active IM to emit GLFW IME events; this is labelled [INFERRED] **after** the documented environment check, since no IM is present or installable offline:
 
 ```text
 ############ BOUNDARY 5: IME / preedit state (M4) ############
 keys.c on_key_input switches on ev->ime_state: GLFW_IME_NONE(normal), PREEDIT_CHANGED
-  ('updated pre-edit text', L196), COMMIT_TEXT ('committed pre-edit text', L204->
+  ('updated pre-edit text', L198), COMMIT_TEXT ('committed pre-edit text', L202->
   schedule_write_to_child), WAYLAND_DONE_EVENT, default('invalid state'). The on_key_input
   debug line prints 'state: %d' = ev->ime_state (keys.c:L176).
 
@@ -1876,9 +1876,9 @@ committed pre-edit:  0
   (no XMODIFIERS/*_IM_MODULE, no ibus/fcitx daemon). Every real keystroke's on_key_input
   line reports state: 0 = GLFW_IME_NONE, and 0 IME-path debug lines (on_IME_input,
   'updated pre-edit text', 'committed pre-edit text') are produced by real input.
-[OBSERVED] The GLFW_IME_NONE case (keys.c:L210) is what real keys take: it calls
+[OBSERVED] The GLFW_IME_NONE case (keys.c:L207) is what real keys take: it calls
   update_ime_position then breaks to the normal dispatch path.
-[INFERRED] The preedit/commit paths (keys.c:L194 PREEDIT_CHANGED -> screen_update_overlay_text
+[INFERRED] The preedit/commit paths (keys.c:L195 PREEDIT_CHANGED -> screen_update_overlay_text
   + 'updated pre-edit text'; L202 COMMIT_TEXT -> schedule_write_to_child + 'committed
   pre-edit text') require an active input method (ibus/fcitx) to emit GLFW IME events.
   Absent an IM in this environment they cannot be exercised via XTEST; labeled INFERRED
@@ -2082,9 +2082,9 @@ not a single global lock.
 === M20 — write_to_child COALESCING & PARTIAL-WRITE RETENTION (source + measured) ===
 [OBSERVED-in-source] write_to_child (child-monitor.c:L1447-1473): while(written <
   write_buf_used) write(fd, write_buf+written, write_buf_used-written) [L1448] — writes as
-  much as possible per call; ret==0 -> break (L1459); EINTR -> continue (L1461);
-  EAGAIN/EWOULDBLOCK -> break (L1462); other errno -> perror + discard (L1464); leftover
-  retained via memmove (L1471-1473).
+  much as possible per call; ret==0 -> break (L1460); EINTR -> continue (L1462);
+  EAGAIN/EWOULDBLOCK -> break (L1463); other errno -> perror + discard (L1464); leftover
+  retained via memmove (L1471-1476).
 [OBSERVED-measured] A single 600-byte bulk enqueue produced exactly ONE write(10,...) = 600
   (see write_coalescing_M20.txt), not 600 one-byte writes. Per-keystroke typing yields
   1-byte writes only because each keystroke is enqueued separately. Thus bytes pending
@@ -2101,7 +2101,7 @@ not a single global lock.
 
 [OBSERVED-in-source] The enqueue path `schedule_write_to_child_generic` (`kitty/child-monitor.c:L323`) takes **two distinct locks**, not one: first `children_mutex` (`L334`, i.e. `pthread_mutex_lock(&children_lock)`, macro `L76`) to look up the target child in the `children[]` array, then the **per-screen** `screen_mutex(lock, write)` (`L338`, i.e. `&screen->write_buf_lock`, macro `L74`) to append into that window's `write_buf` (memcpy `L354`, `write_buf_used +=` `L355`) before waking the io-loop (`L363`). `write_to_child` (`kitty/child-monitor.c:L1443`) independently takes the same per-screen `write_buf_lock` (`L1446`) to flush on the io-thread.
 
-[OBSERVED-in-source] `write_to_child` (`kitty/child-monitor.c:L1447-L1473`) does **not** guarantee the whole buffer is written per `POLLOUT`: `while (written < write_buf_used)` issuing `write(fd, buf, remaining)` writes as much as possible, breaks on a zero return (`L1459`), continues on `EINTR` (`L1461`), **breaks on `EAGAIN`/`EWOULDBLOCK`** (`L1462`), discards on any other errno (`L1464`), and retains any leftover via `memmove` (`L1471-L1473`). [OBSERVED-measured] A single 600-byte bulk enqueue is therefore flushed as **one** `write(10, buf, 600)=600`, not 600 one-byte writes — bytes pending together coalesce; per-keystroke typing yields 1-byte writes only because each key is enqueued separately. The claim that “kitty deliberately never coalesces input” is false:
+[OBSERVED-in-source] `write_to_child` (`kitty/child-monitor.c:L1447-L1473`) does **not** guarantee the whole buffer is written per `POLLOUT`: `while (written < write_buf_used)` issuing `write(fd, buf, remaining)` writes as much as possible, breaks on a zero return (`L1460`), continues on `EINTR` (`L1462`), **breaks on `EAGAIN`/`EWOULDBLOCK`** (`L1463`), discards on any other errno (`L1464`), and retains any leftover via `memmove` (`L1471-L1476`). [OBSERVED-measured] A single 600-byte bulk enqueue is therefore flushed as **one** `write(10, buf, 600)=600`, not 600 one-byte writes — bytes pending together coalesce; per-keystroke typing yields 1-byte writes only because each key is enqueued separately. The claim that “kitty deliberately never coalesces input” is false:
 
 ```text
 ############ M20: write_to_child COALESCING (bulk enqueue -> few large write() calls) ############
