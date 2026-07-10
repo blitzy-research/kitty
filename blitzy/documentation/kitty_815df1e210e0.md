@@ -965,13 +965,15 @@ These are "quiet" because the *only* effects the user could notice are indirect 
 
 ### H.1 Build and run (default, canonical configuration)
 
-- **Repository revision.** All `file:line` citations reference the kitty **source baseline** commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`). This answer document was then committed *on top of* that baseline as commit `8fe5c7357` — so the baseline is the parent, **not** HEAD, once the document exists. The kitty C/Python source is byte‑for‑byte unchanged between the two commits (`git diff --stat 815df1e21 8fe5c7357 -- kitty/` is empty); the only change the document commit introduces is the document itself.
+- **Repository revision.** All `file:line` citations reference the kitty **source baseline** commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`). This answer document was added on top of that baseline (initial document commit `8fe5c7357`) and has since been refined by follow-up commits that touch **only** this document; the baseline therefore remains the parent of the document history, not `HEAD`, once the document exists. The kitty C/Python/Go **source** is byte-for-byte unchanged from the baseline through current `HEAD` -- `git diff --name-status 815df1e21 HEAD` lists only `blitzy/documentation/kitty_815df1e210e0.md`, and `git diff --stat 815df1e21 HEAD -- kitty/ 3rdparty/ kitty_tests/ docs/` is empty (full proof in Section H.5).
 - **Required setup pre‑step (this environment).** The prebuilt dependency bundle ships a Wayland `pkg-config` file that is incompatible with the pinned toolchain, so the supported X11‑only build requires disabling it **before** building (re‑apply if `dependencies/` is re‑downloaded):
 
 ```bash
 mv dependencies/linux-amd64/lib/pkgconfig/wayland-protocols.pc \
    dependencies/linux-amd64/lib/pkgconfig/wayland-protocols.pc.disabled
 ```
+
+- **Host build prerequisites.** kitty's C extension links a number of system libraries; on a Debian/Ubuntu host these are installed from the OS package manager **before** building. The authoritative, always-current list is `docs/build.rst` (its Dependencies section): `harfbuzz`, `libpng`, `zlib`, `liblcms2`, `libxxhash`, `openssl`, `freetype`/`fontconfig`, `simde`, and `pkg-config` (plus the X11/GL development headers for the X11 build). `./dev.sh build` then downloads the prebuilt Python/dependency bundle, but these host libraries must already be present.
 
 - **Build command (default, canonical).**
 
@@ -1014,18 +1016,30 @@ go        go1.22.12 linux/amd64
 python    3.14.6   (the bundled interpreter the launcher runs under)
 ```
 
-- **Run (headless), exact per‑condition commands.** The canonical PTY flow‑control code only runs inside a full kitty process with a real window, child, and PTY, so every run used a real launcher under a virtual display. Two equivalent display setups were used: `xvfb-run -a` (self‑allocating) for the read‑side driver, and a persistent `Xvfb :91` for the write‑side and graphics drivers. The exact per‑condition launch commands are the driver scripts in H.4; each reduces to:
+- **Locale / fonts (scope note).** The `LANG`/`LC_ALL=C.UTF-8` locale and CI font configuration that this environment sets up are prerequisites only for kitty's **full test suite** (`kitty +launch test.py`) to pass; they are **not** required by -- and do not affect -- the flow-control observations in this document, which push real graphics-protocol bytes through the PTY and depend on neither font rendering nor a specific locale. (Confirmed empirically: the canonical drivers in Section H.4 run to byte-identical results without that test-only setup.)
+
+- **Run (headless), exact per‑condition commands.** The canonical PTY flow‑control code only runs inside a full kitty process with a real window, child, and PTY, so every run used a real launcher under a virtual display. Two equivalent display setups were used: `xvfb-run -a` (self‑allocating) for the read‑side driver, and a persistent `Xvfb :91` for the write‑side and graphics drivers. The exact per‑condition launch commands are the driver scripts in H.4; with a one-time setup that creates the out-of-repo scratch directory (shown first in the block below), they reduce to:
 
 ```bash
+# --- One-time setup: run ONCE, from the repository root, before any driver below ---
+# The temporary observation scripts live OUTSIDE the repository, in an owner-only
+# scratch directory. Create it, publish its path, then write every script from
+# Section H.4 into "$OBS/<name>" (keeping the same filenames).
+export KITTY_REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"  # repo root (run from it)
+OBS="$(mktemp -d /tmp/kitty_obs.XXXXXX)"; chmod 0700 "$OBS"              # owner-only scratch, outside the repo
+printf '%s\n' "$OBS" > /tmp/kitty_obs_scratch_path.txt                   # every driver reads this to find $OBS
+export OBS                                                               # the S2 +runpy line below reads $OBS
+# Then write each Section H.4 script into "$OBS/" (same filename) and run:
+
 # read-side flood (canonical, /proc observation)
-bash obs_read_proc.sh run1 flood        # and: bash obs_read_proc.sh run1 burst:65536   (control)
+bash "$OBS/obs_read_proc.sh" run1 flood        # and: bash "$OBS/obs_read_proc.sh" run1 burst:65536   (control)
 
 # write-side 100 MiB cap (canonical drop-log)
-bash run_w1.sh run1                      # and run2
+bash "$OBS/run_w1.sh" run1                      # and run2
 
 # graphics APC cross-product / strict-PNG EFBIG (canonical PTY)
-bash run_apcx.sh run1                    # and run2
-bash run_efbig.sh run1                   # and run2
+bash "$OBS/run_apcx.sh" run1                    # and run2
+bash "$OBS/run_efbig.sh" run1                   # and run2
 
 # graphics quota eviction / frame quota (in-tree harness supplement, S2)
 KITTY_REPO=$PWD OBS=$OBS SCRIPT=$OBS/gfx_evict.py DISPLAY=:91 \
@@ -1080,7 +1094,7 @@ The complete raw run‑1 and run‑2 outputs for each experiment are embedded in
 
 ### H.4 Temporary scripts (complete text of every script that produced the output)
 
-Every temporary script is reproduced here **in full, with no ellipsis and no "identical in spirit" substitution** — the exact bytes that were run. All scripts lived **outside** the repository, under a per‑run scratch directory created with `mktemp -d` (mode `0700`, owner‑only; the instance for this run was `/tmp/kitty_obs.2ba7uE`, confirmed `drwx------`), and were removed afterward (Section H.5). Each driver reads that directory's path explicitly rather than hard‑coding a predictable name.
+Every temporary script is reproduced here **in full, with no ellipsis and no "identical in spirit" substitution** — the exact bytes that were run. All scripts lived **outside** the repository, under a per‑run scratch directory created with `mktemp -d` (mode `0700`, owner‑only; the instance for this run was `/tmp/kitty_obs.2ba7uE`, confirmed `drwx------`), and were removed afterward (Section H.5). Each driver discovers that directory by reading the fixed path‑file `/tmp/kitty_obs_scratch_path.txt` (created by the one‑time setup in Section H.1) and **guards** it: a missing or empty scratch path aborts the driver with a non‑zero exit and a clear `ERROR: OBS scratch not initialized` message instead of proceeding. The repository root is auto‑detected via `${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}` rather than hard‑coded, so every script is reproducible exactly as printed from any checkout.
 
 **Safety properties shared by every script (auditable below):**
 
@@ -1142,8 +1156,9 @@ open(os.path.join(OBS, "child.done"), "w").write(str(total))
 # while kitty runs normally (State R/S, never T) -> kitty's AUTOMATIC gate; NO SIGSTOP.
 set -u
 RUN="${1:-run1}"; RMODE="${2:-flood}"                 # RMODE: flood | burst:<bytes>
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 export OBS MODE="$RMODE" MAX_BYTES=$((400*1024*1024)) DEADLINE_S=12
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
@@ -1198,8 +1213,9 @@ echo "RUN_$RUN done"
 # gdb async-attach snapshots of parser occupancy + has-space + requested poll events.
 set -u
 RUN="${1:-run1}"
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 export OBS MODE=flood MAX_BYTES=$((400*1024*1024)) DEADLINE_S=20
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
@@ -1444,8 +1460,9 @@ open(os.path.join(OBS, "child.done"), "w").write(str(total))
 # kitty exit status, and full raw output. No SIGSTOP, no debug hooks - the default binary.
 set -u
 RUN="${1:-run1}"
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 ERR="$OBS/w1_${RUN}.err"; OUT="$OBS/w1_${RUN}.out"
@@ -1516,8 +1533,9 @@ echo "W1_$RUN done"
 # The flood still goes through a real PTY; only observability was added. Bounded + guarded.
 set -u
 RUN="${1:-run1}"
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 rm -f "$OBS/go" "$OBS/child.ready" "$OBS/child.done" "$OBS/child.pid" "$OBS/child_bytes"
@@ -1579,8 +1597,9 @@ printf "write_buf_used=%lu write_buf_sz=%lu req_events=%d child_fd=%d parser_rea
 # child fd (=9 on this build, confirmed by gdb in W2). The EAGAIN return is the concrete
 # evidence behind the `if (errno == EWOULDBLOCK || errno == EAGAIN) break;` at child-monitor.c:L1463.
 set -u
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 rm -f "$OBS/go" "$OBS/child.ready" "$OBS/child.done" "$OBS/child.pid" "$OBS/child_bytes" "$OBS/strace.out"
@@ -1622,8 +1641,9 @@ echo "W2d done"
 # small. We expect a few large successful writes (slave buffer fills) then `Wrote: -1 bytes: `
 # = the write() that returned -1 immediately before the EAGAIN break (child-monitor.c:L1463).
 set -u
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 rm -f "$OBS/go" "$OBS/child.ready" "$OBS/child.done" "$OBS/child.pid" "$OBS/child_bytes" "$OBS/w2c.err"
@@ -1661,8 +1681,9 @@ echo "W2c done"
 # floods ~1s (write_buf grows, retained because child does not read), then STOPS flooding
 # and reads its stdin, so kitty's queued bytes flush and write_buf_used falls back toward 0.
 set -u
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 rm -f "$OBS/go" "$OBS/child.ready" "$OBS/child.done" "$OBS/child.pid" "$OBS/child_bytes" "$OBS/drain.start" "$OBS/drain.done"
@@ -1798,8 +1819,9 @@ open(os.path.join(OBS, "apc_x.done"), "w").write("done")
 # under the persistent Xvfb :91, with apc_xprobe.py as its child. Bounded + exact-PID cleanup.
 set -u
 RUN="${1:-run1}"
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 RESULT="apc_x_${RUN}.result"
@@ -1915,8 +1937,9 @@ open(os.path.join(OBS, "efbig.done"), "w").write("done")
 #!/usr/bin/env bash
 set -u
 RUN="${1:-run1}"
-OBS="$(cat /tmp/kitty_obs_scratch_path.txt)"
-REPO=/tmp/blitzy/kitty/blitzy-b99e7b01-6d63-416c-b23d-5138b838d9e8_6c5c29
+OBS="$(cat /tmp/kitty_obs_scratch_path.txt 2>/dev/null)"
+[ -n "$OBS" ] && [ -d "$OBS" ] || { echo "ERROR: OBS scratch not initialized (run the H.4 one-time setup first)" >&2; exit 2; }
+REPO="${KITTY_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$REPO"; export PATH=/usr/local/go/bin:$PATH
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 RESULT="efbig_${RUN}.result"
@@ -2120,7 +2143,7 @@ print("HARNESS_DONE")
 
 The read‑only constraint is verified with Git, scoped precisely to **tracked/untracked Git‑visible** repository state (git‑ignored build products are explicitly excluded, since building kitty necessarily regenerates them).
 
-**Baseline‑to‑deliverable committed diff.** The only committed change from the source baseline `815df1e21` to the document commit `8fe5c7357` is the answer document itself — no source, test, manifest, or third‑party file:
+**Baseline-to-deliverable committed history.** The answer document was first added on top of the source baseline `815df1e21` in the initial document commit `8fe5c7357` (686 insertions, the document only) and has since been refined by follow-up commits that touch **only** this same file. The immutable initial-commit diff:
 
 ```
 $ git diff --stat 815df1e21 8fe5c7357
@@ -2128,12 +2151,15 @@ $ git diff --stat 815df1e21 8fe5c7357
  1 file changed, 686 insertions(+)
 ```
 
-(The document is longer than 686 lines in its final corrected form; that count is from the initial commit and grows with the corrections in this revision.)
+(The document is longer than 686 lines in its final corrected form; 686 is the initial-commit count and grows with each documentation-only revision, so the exact HEAD line count is not a fixed invariant and is deliberately not pinned here.)
 
-**kitty source unchanged.** Restricting the same diff to the source tree is empty:
+**kitty source unchanged -- proven against current `HEAD`, not just the initial commit.** The load-bearing read-only guarantee is that the kitty **source** is untouched across the *entire* document history, however many documentation-only commits accumulate. From the baseline to current `HEAD` the only Git-visible change is this one document, and restricting the diff to the source trees is empty -- both hold at `HEAD` regardless of how many times the document is revised:
 
 ```
-$ git diff --stat 815df1e21 8fe5c7357 -- kitty/ 3rdparty/ kitty_tests/ docs/
+$ git diff --name-status 815df1e21 HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
+
+$ git diff --stat 815df1e21 HEAD -- kitty/ 3rdparty/ kitty_tests/ docs/
 (no output)
 ```
 
