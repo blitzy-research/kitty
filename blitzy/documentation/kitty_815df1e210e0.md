@@ -1637,7 +1637,8 @@ echo "W2d done"
 ```bash
 #!/usr/bin/env bash
 # W2c (INSTRUMENTED supplement): surface the write() return value at each write_to_child call
-# via KITTY_PRINT_BYTES_SENT_TO_CHILD (child-monitor.c:L1451). A SHORT flood so stderr stays
+# via KITTY_PRINT_BYTES_SENT_TO_CHILD (child-monitor.c:L1449, the #ifdef guard; the fprintf that
+# prints the `Wrote:` line is the very next line, L1450). A SHORT flood so stderr stays
 # small. We expect a few large successful writes (slave buffer fills) then `Wrote: -1 bytes: `
 # = the write() that returned -1 immediately before the EAGAIN break (child-monitor.c:L1463).
 set -u
