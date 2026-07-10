@@ -41,7 +41,7 @@ command pours out an enormous amount of text very fast:
    multi-segment carving is only visible when scrollback exceeds 2048.
 3. **Allocation is lazy at the OS level.** A carved segment reserves
    `xnum*2048*sizeof(CPUCell) + xnum*2048*sizeof(GPUCell) + 2048*sizeof(LineAttrs)`
-   bytes in one `calloc` [kitty/history.c:17-28] — **5,244,928 bytes at `xnum=80`
+   bytes in one `calloc` [kitty/history.c:17-28] — **5,251,072 bytes at `xnum=80`
    [INFERRED]** — but resident memory climbs **gradually**, measured at exactly
    **2560 bytes per line** as pages are touched, not in discrete multi-megabyte jumps.
 4. **The pager tier is disabled by default** (`scrollback_pager_history_size = 0`
@@ -241,15 +241,19 @@ allocated **lazily**:
   [kitty/history.c:277-285].
 
 The per-segment `calloc` size is therefore fully determined by three compile-time
-struct sizes, each pinned by a `static_assert`:
-`sizeof(CPUCell) == 12` [kitty/data-types.h:228], `sizeof(GPUCell) == 20`
-[kitty/data-types.h:221], `sizeof(LineAttrs) == 1` [kitty/data-types.h:233-239].
+struct sizes. Two are pinned by a `static_assert` in the header:
+`sizeof(CPUCell) == 12` [kitty/data-types.h:228] and `sizeof(GPUCell) == 20`
+[kitty/data-types.h:221]. The third, `sizeof(LineAttrs) == 4`, is **not** asserted in
+the header; it follows from the union layout, where the `PromptKind prompt_kind : 2`
+enum bitfield forces a 4-byte (`int`) storage unit [kitty/data-types.h:230-239]
+(verified with a `_Static_assert(sizeof(LineAttrs) == 4)` probe against the real
+header — only `== 4` compiles, under both the canonical and debug flag sets).
 At `xnum = 80`:
 
 ```
-80*2048*12 + 80*2048*20 + 2048*1
-= 1,966,080 + 3,276,800 + 2,048
-= 5,244,928 bytes  (~5.002 MiB)      [INFERRED — history.c:17-28 + the static_asserts]
+80*2048*12 + 80*2048*20 + 2048*4
+= 1,966,080 + 3,276,800 + 8,192
+= 5,251,072 bytes  (~5.008 MiB)      [INFERRED — history.c:17-28 arithmetic; CPUCell/GPUCell static_asserts + LineAttrs=4 probe]
 ```
 
 **Two facts the code makes precise, that a naive reading gets wrong:**
@@ -339,10 +343,10 @@ def run_config(scrollback):
 
 if __name__ == '__main__':
     print("=== SQ1: segment allocation / carving (pager DISABLED) ===")
-    sz = 80*SEGMENT_SIZE*12 + 80*SEGMENT_SIZE*20 + SEGMENT_SIZE*1
+    sz = 80*SEGMENT_SIZE*12 + 80*SEGMENT_SIZE*20 + SEGMENT_SIZE*4
     print(f"Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert "
-          f"CPUCell=12@228 GPUCell=20@221 LineAttrs=1]:")
-    print(f"  xnum=80: 80*2048*12 + 80*2048*20 + 2048*1 = {sz} bytes (~{sz/1048576:.3f} MiB)")
+          f"CPUCell=12@228 GPUCell=20@221; LineAttrs=4 (enum bitfield @231-239, no static_assert)]:")
+    print(f"  xnum=80: 80*2048*12 + 80*2048*20 + 2048*4 = {sz} bytes (~{sz/1048576:.3f} MiB)")
     print()
     for sb in (2000, 5000, 10000):
         run_config(sb)
@@ -354,8 +358,8 @@ if __name__ == '__main__':
 ```console
 $ PYTHONDONTWRITEBYTECODE=1 python3 /tmp/kitty_probe/sq1_segments.py
 === SQ1: segment allocation / carving (pager DISABLED) ===
-Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell=12@228 GPUCell=20@221 LineAttrs=1]:
-  xnum=80: 80*2048*12 + 80*2048*20 + 2048*1 = 5244928 bytes (~5.002 MiB)
+Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell=12@228 GPUCell=20@221; LineAttrs=4 (enum bitfield @231-239, no static_assert)]:
+  xnum=80: 80*2048*12 + 80*2048*20 + 2048*4 = 5251072 bytes (~5.008 MiB)
 
 --- CONFIG scrollback=2000: ynum=2000 xnum=80 [OBSERVED] | max_segments=ceil(ynum/2048)=1 [INFERRED] ---
   FRESH: count=0 inferred_segments=1[INF] rss=32916KB [OBSERVED]
@@ -406,7 +410,7 @@ Per-segment calloc [INFERRED add_segment history.c:17-28 + static_assert CPUCell
   probe's self-computed `RSS SLOPE` inside the first segment was **2562.7 bytes/line**
   (scrollback=2000) and **2560.0 bytes/line** (5000 and 10000) — matching
   `80 cols × (sizeof(CPUCell)+sizeof(GPUCell)) = 80 × 32 = 2560` bytes, i.e. each line
-  only touches its own row of cells. The 5.24 MB per-segment `calloc` is therefore
+  only touches its own row of cells. The 5.25 MB per-segment `calloc` is therefore
   **not** paid as a visible 5 MB step; it materializes gradually as pages are first
   written (note how RSS rises by ~5 MB smoothly across each 2048-line span, e.g.
   32916→38184 KB for the first segment). **[OBSERVED]** This is the concrete, measured
@@ -1366,7 +1370,7 @@ ring's boundary behavior (SQ3) differ between disabled and enabled.
 |---|---|---|
 | Fresh buffer = exactly 1 segment | OBSERVED | §2.3 + [kitty/history.c:117-133] |
 | Max segments = `ceil(ynum/2048)`; carves at count 2049/4097/6145/8193 | OBSERVED | §2.3 |
-| Per-segment `calloc` = 5,244,928 B @ xnum=80 | INFERRED | [kitty/history.c:17-28] arithmetic (not directly measured) |
+| Per-segment `calloc` = 5,251,072 B @ xnum=80 | INFERRED | [kitty/history.c:17-28] arithmetic; CPUCell=12/GPUCell=20 static_asserts + LineAttrs=4 (enum-bitfield, `_Static_assert` probe) |
 | RSS grows gradually (~2560 B/line), not in segment-sized steps | OBSERVED | §2.3 RSS slope |
 | Disabled tier drops evicted lines (3977 dropped) | OBSERVED | §3.3 |
 | Enabled tier costs exactly 33 B per evicted line (this fixed line) | OBSERVED | §3.3 |
