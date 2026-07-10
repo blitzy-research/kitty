@@ -1291,33 +1291,57 @@ Sprite positions are tracked **per `Font`** (each `Font` has its own position ha
 `sprite_position_for(fg, font, …)` [`kitty/fonts.c`:L257‑L266], and every glyph is uploaded by
 `send_sprite_to_gpu` [`kitty/shaders.c`:L147‑L155] into the single texture created in §5.4. This was
 exercised **live** with a fixture that forces a fallback (ASCII from the primary DejaVu Sans Mono +
-an emoji that the primary lacks). Counting the shim's `glTexSubImage3D` uploads
-**[OBSERVED — canonical, live GL], stable ×2**:
+an emoji that the primary lacks). Counting the shim's `glTexSubImage3D` uploads in **one
+representative live session [OBSERVED — canonical, live GL]** produced the table below. Each total is
+**within‑session stable** (identical across repeated runs of a single build) but the non‑baseline
+per‑string counts are **cross‑session variable** (see the cross‑session note beneath the table), so
+the individual integers are reported as one session's illustration, **not** as reproducible
+constants:
 
 | Rendered by the child | `glTexSubImage3D` uploads | Δ vs empty | Interpretation |
 |---|---:|---:|---|
-| *(empty — `sleep 4` only)* | 11 | — | prerender baseline (1 blank + 10 decoration sprites via `send_prerendered_sprites`) |
+| *(empty — no text, `sleep` only)* | 11 | — | prerender baseline (1 blank + 10 decoration sprites via `send_prerendered_sprites`) — **reproduces every session** |
 | `hi ` | 13 | +2 | `h`, `i` (`space` reuses the blank slot) |
 | `hi Z` | 14 | +3 | a plain ASCII glyph = **exactly +1** sprite (matches `render_group`'s `num_cells` upload loop [fonts.c:L739‑L744]) |
-| `😁` (U+1F601) | 18 | +7 | emoji — served by a **fallback** face |
-| `你` (U+4F60, CJK) | 19 | +8 | CJK — served by a **fallback** face |
-| `hi 😁` | 20 | (Δ vs `hi ` = **+7**) | primary ASCII **and** fallback emoji in one render |
+| `😁` (U+1F601) | 18 *(session‑specific)* | +7 | emoji — served by a **fallback** face (count varies cross‑session; see note) |
+| `你` (U+4F60, CJK) | 19 *(session‑specific)* | +8 | CJK — served by a **fallback** face (count varies cross‑session; see note) |
+| `hi 😁` | 20 *(session‑specific)* | (Δ vs `hi ` = **+7**) | primary ASCII **and** fallback emoji in one render (count varies cross‑session; see note) |
 
-Every one of the 20 uploads in `hi 😁` targeted **`zoff=0`** of the **same** texture, and only **one**
+Every upload in the `hi 😁` render targeted **`zoff=0`** of the **same** texture, and only **one**
 `glTexStorage3D` occurred (no reallocation) — so the primary (English → DejaVu Sans Mono) and the
-fallback (emoji/CJK) glyphs demonstrably occupy **one shared atlas**. kitty's `wcswidth` reports the
+fallback (emoji/CJK) glyphs demonstrably occupy **one shared atlas**. This structural conclusion —
+one allocation, and every upload at `zoff=0` with `w=9 h=18` — reproduced **identically in every
+session**. kitty's `wcswidth` reports the
 fallback glyphs as 2 cells each (`wcswidth(😁)=2`, `wcswidth(你)=2`, `wcswidth(Z)=1`), and
 `shape_string` shows the emoji mapping to glyph `0` (`.notdef`) in the **primary** group
 `(2, 1, 0, (0,))` **[OBSERVED — test‑API]** — i.e. only the live fallback face supplies a real glyph,
 which is why the extra uploads appear only in the live render.
 
-**Honest note [OBSERVED, not fully isolated].** The wide fallback glyph produces **more** sprite‑cell
-uploads (emoji +7, CJK +8) than its 2‑cell on‑screen width. `render_group` uploads `num_cells`
-sprites per group [`kitty/fonts.c`:L739‑L744], so the excess reflects additional sprite‑cell uploads
-tied to first‑time fallback/colored‑glyph rendering. The GL‑interception shim observes GL calls only
-(not glyph identities), so the precise decomposition of those 7–8 uploads cannot be attributed at
-the GL layer without modifying source (out of scope, read‑only). The finding the question asks about
-— that fallback glyphs are rasterized and uploaded into the **shared** atlas — is directly observed.
+**Cross‑session note [OBSERVED — canonical, live GL].** Re‑running the identical fixtures in
+independent launcher sessions (fresh `xvfb-run` + shim, same build) reproduces the **baseline
+`empty=11`** and the **plain‑ASCII rule** (`hi Z` = `empty`+3, i.e. **+1 sprite per ASCII glyph**)
+every time, but the **fallback/colored‑glyph totals vary between sessions**: across the authoring
+capture in the table above and independent reproductions in the same container, the `😁` total was
+observed at **13–18**, `你` at **11–19**, and `hi 😁` at **15–20**. One representative independent
+re‑run measured `empty=11, hi =13, hi Z=14, 😁=13, 你=11, hi 😁=15` — stable across three back‑to‑back
+rounds and **invariant to the child `sleep` duration** (identical at `sleep=1` and `sleep=8`), i.e.
+deterministic *within* a session. The cause is **draw‑loop upload batching**: how many discrete
+`glTexSubImage3D` calls the render loop emits for a first‑time wide/colored fallback glyph before the
+child exits is a GLFW/render‑loop timing artifact, **not** a source or configuration difference (the
+source tree is byte‑identical across these sessions). These per‑string counts are therefore
+classified **within‑session stable, cross‑session variable** in §6.2; only the baseline `empty=11` and
+the shared‑atlas *structure* are reproducible constants.
+
+**Honest note [OBSERVED, not fully isolated].** In the authoring capture the wide fallback glyph
+produced **more** sprite‑cell uploads (emoji +7, CJK +8) than its 2‑cell on‑screen width; in other
+sessions the surplus was smaller (see the cross‑session note). `render_group` uploads `num_cells`
+sprites per group [`kitty/fonts.c`:L739‑L744], so the surplus reflects first‑time fallback/colored‑
+glyph sprite‑cell uploads emitted by the draw loop. The GL‑interception shim observes GL calls only
+(not glyph identities), so the precise decomposition of those uploads cannot be attributed at the GL
+layer without modifying source (out of scope, read‑only), and — as the cross‑session note records —
+the exact surplus is **not** reproducible across sessions. The finding the question actually asks
+about — that fallback glyphs are rasterized and uploaded into the **shared** atlas — is directly
+observed and reproduces in every session.
 
 ### 5.7 The "atlas ready" signal (CQ‑13)
 
@@ -1389,13 +1413,14 @@ dedicated readiness log line.
 **User‑example phrases preserved verbatim:** *"ligatures, bidi, combining diacritics"* (§2),
 *"mixed Arabic (RTL) and English (LTR) text"* (§3), *"(overline/underline)"* (§4).
 
-### 6.2 Stability — stable, build-time, and volatile fields (CQ‑14)
+### 6.2 Stability — stable, build-time, session‑scoped, and volatile fields (CQ‑14)
 
-Three classes of field are distinguished:
+Four classes of field are distinguished:
 
 - **Stable fields** — reproduce identically across every run: all shaping group tuples, the seven
-  cell metrics, font families/paths, GL limits, the live `glTexStorage3D` dimensions, sprite‑upload
-  counts, SGR decoration values, and config option values.
+  cell metrics, font families/paths, GL limits, the live `glTexStorage3D` dimensions (atlas page
+  layout, sizing, and the shared‑atlas structure — one allocation, every upload at `zoff=0` with
+  `w=9 h=18`), SGR decoration values, and config option values.
 - **Build-time / HEAD-dependent fields** — stable across repeated runs *of one build*, but tied to
   the checked-out `HEAD` at build time rather than to observed behavior: the VCS revision stamped into
   the launcher (`get_vcs_rev()` runs `git rev-parse HEAD` [`setup.py`:L674-L690]) and the per-build
@@ -1404,12 +1429,21 @@ Three classes of field are distinguished:
   effect noted in the header) — so they are reported as build-time values illustrated by their
   captured value, never as reproducible constants. The authoring-time capture was `48e58f7079` (HEAD
   `48e58f707990…`); a disposable rebuild at a later HEAD stamped `1f88e431cac7…` instead (§1).
+- **Session‑scoped fields (within‑session stable, cross‑session variable)** — deterministic across
+  repeated runs of a *single* build (and invariant to the child `sleep` duration) but **not**
+  reproducible across independent launcher sessions: the per‑string `glTexSubImage3D` **upload counts**
+  for first‑time wide/colored fallback glyphs (§5.6). The baseline `empty=11` and the plain‑ASCII
+  `+1`‑per‑glyph increment *do* reproduce every session; only the fallback/colored‑glyph totals vary
+  (observed `😁`=13–18, `你`=11–19, `hi 😁`=15–20) — a draw‑loop upload‑batching artifact, not a
+  source or configuration difference (the source tree is byte‑identical across the sessions compared).
 - **Volatile fields** — vary run‑to‑run but carry **no semantic meaning**: the monotonic `[N.NNN]`
   debug timestamps, the ephemeral Xvfb display number (`xvfb-run -a` picks a free display), process
   PIDs, and the `mktemp` directory suffix. Where a full transcript containing volatile fields is
   hashed for comparison, they are normalized first (below).
 
-Stability evidence — each value reproduced across the stated number of identical runs **[OBSERVED]**:
+Stability evidence — each value reproduced across the stated number of identical runs **[OBSERVED]**
+(the sole exception — the per‑string `glTexSubImage3D` upload counts — is recorded as session‑scoped:
+within‑session stable, cross‑session variable, per the class list above and §5.6):
 
 | Command / captured value | Runs | sha256 (raw unless noted) | Result |
 |---|---:|---|---|
@@ -1419,7 +1453,7 @@ Stability evidence — each value reproduced across the stated number of identic
 | SGR decoration probe (4/24/9/29/53/55) | 2 | `662e296b…` (raw) | byte‑identical |
 | live `glTexStorage3D` dims | 2 | line `…width=1017 height=18 depth=1` | identical |
 | `glGetIntegerv` GL limits | 3 | `16384` / `2048` | identical |
-| `glTexSubImage3D` upload counts | 2 | `11/13/14/18/19/20` | identical |
+| `glTexSubImage3D` upload counts | 3+ | baseline `empty=11`; plain‑ASCII `+1`/glyph (fallback totals vary) | within‑session stable; cross‑session variable (render‑batching non‑determinism) — see §5.6 |
 | `--debug-rendering` startup lines | 2 | line‑set identical after normalization | content stable, timestamps volatile |
 
 **Timestamp variation distribution** (`--debug-rendering`, the only volatile payload), run1 → run2:
