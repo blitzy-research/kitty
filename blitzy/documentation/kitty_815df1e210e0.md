@@ -599,7 +599,7 @@ consume_normal(PS *self) {
 }
 ```
 
-The `screen_draw_text(...)` call lands in `screen_draw_text()` at `kitty/screen.c:866` — the printable-text destination. When an ESC byte is hit, `consume_normal` sets state `ESC`, and the next dispatch enters `consume_esc()` (`kitty/vt-parser.c:261`), whose first-character switch selects the sub-state. Verbatim excerpt, `kitty/vt-parser.c:261`–`274` (an excerpt: the same `switch` continues past line 274 with the `IS_ESCAPED_CHAR` label at line 275, `ESC_RIS`/`ESC_IND`/… single-char escapes, and a `default`, ending at `kitty/vt-parser.c:288`):
+The `screen_draw_text(...)` call lands in `screen_draw_text()` at `kitty/screen.c:866` — the printable-text destination. When an ESC byte is hit, `consume_normal` sets state `ESC`, and the next dispatch enters `consume_esc()` (`kitty/vt-parser.c:261`), whose first-character switch selects the sub-state. Verbatim excerpt, `kitty/vt-parser.c:261`–`274` (an excerpt: the same `switch` continues past line 274 with the `IS_ESCAPED_CHAR` label at line 275, `ESC_RIS`/`ESC_IND`/… single-char escapes, and a `default`, ending at `kitty/vt-parser.c:298`):
 
 ```c
 consume_esc(PS *self) {
