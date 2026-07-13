@@ -21,6 +21,8 @@
 
 ### 1.3 Direct answer (TL;DR)
 
+> **CRITICAL caveat, stated first (observed).** On this exact version (`815df1e21`), feeding *any* width-2 base into a **one-column** line is **memory-unsafe**: the draw loop writes one cell past the single column (an out-of-bounds trailing-cell store). Every 1×1 value reported below and in Sections 4–6 is therefore a **nominal readout from a process that has already performed an out-of-bounds write** — the values are exactly what the engine emits, but the operation is undefined behavior on this build, not a safely-settled state. This is proven at runtime by a deterministic CPython debug-allocator abort (`EXIT_CODE=134`, trailing-pad bytes `0x66 f4 01 00` = `U+1F466`), an independent glibc `free(): invalid next size` abort, and an outright segfault (`EXIT_CODE=139`) under accumulation — full evidence and the source trace (`kitty/screen.c:L840-L841`, `L593-L595`) are in **§4.6**. The defect is specific to *width-2 base × one column*; wider grids and width-1 input are clean. Per the read-only rule this document does not fix the engine; it discloses the behavior. The nominal answers below stand as *what the terminal reports*, read with this caveat.
+
 **What the *visible* 1×1 cell keeps, and why it is not simple overwrite.** A width-2 emoji can never fit into a single column, so kitty's default autowrap mode (`DECAWM`, on by default — `kitty/screen.c:L33`) fires *before* each base emoji is placed. The autowrap does not silently discard the current line: it runs `continue_to_next_line → screen_linefeed → screen_index`, and because the cursor is already on the only (bottom) row, `screen_index` pushes the **current line into the scrollback history buffer** (`historybuf_add_line`, `kitty/screen.c:L1558`), clears the now-recycled visible row (`linebuf_clear_line`, `kitty/screen.c:L1565`), and only then writes the new base into the freshly cleared cell. Consequently, feeding the canonical family sequence `👨‍👩‍👧‍👦` into a 1×1 grid leaves the **visible cell** holding just the **final base emoji**, Boy `U+1F466` (`👦`) — but the earlier bases (`👨`, `👩`, `👧`), each still carrying its trailing ZWJ, are **retained in the scrollback history**, one per history line, not destroyed. Each ZWJ (`U+200D`) is a codepoint that kitty classifies as *combining/appendable* and attaches to whichever base currently occupies the cell, so a ZWJ never triggers a wrap of its own.
 
 **What the terminal thinks is present once it settles (OBJ-2).** The visible cell reports exactly **one** codepoint — `U+1F466` — because the family sequence ends on a base with no trailing ZWJ. (`str(line)` = `'👦'`, `len == 1`.) The scrollback history simultaneously holds `['👧\u200d', '👩\u200d', '👨\u200d', '']` (Section 4).
@@ -77,7 +79,7 @@ The exact clean-build command used here (the gitignored `build/` directory, `kit
 
 ```bash
 $ source /tmp/kitty-venv/bin/activate
-$ rm -rf build kitty/fast_data_types.so kitty/launcher/kitty \
+$ rm -f kitty/fast_data_types.so kitty/launcher/kitty && rm -rf ./build \
     && python3 setup.py build > /tmp/kitty_obs/build_canonical.log 2>&1; echo "EXIT_CODE=$?"
 ```
 
@@ -225,6 +227,8 @@ $ PYTHONPATH=. python3 -c "import kitty.fast_data_types as f; from kitty.fast_da
 import OK -> /tmp/blitzy/kitty/blitzy-8842e805-1a59-4efe-ad77-f5c3cfe88349_b1d24d/kitty/fast_data_types.so
 ```
 
+> **Path note (environment-specific).** The absolute prefix shown above (`/tmp/blitzy/kitty/blitzy-8842e805-1a59-4efe-ad77-f5c3cfe88349_b1d24d/`) is the ephemeral, machine-specific checkout location used by this sandbox; only the trailing `kitty/fast_data_types.so` is significant. On another machine the prefix will differ — reproduce from wherever the repository is checked out (all documented commands run from the repository root).
+
 ### 2.5 Reproducibility — two byte-identical runs
 
 The observation script (Section 10) was executed **twice** from the repository root; the two output files were then compared with `diff` and hashed with both MD5 and SHA-256:
@@ -244,7 +248,7 @@ d26db8c171e8deef9e0bcdebb7e6a40c8e4c6b7d31bd94e51160c729732b1101  /tmp/kitty_obs
 d26db8c171e8deef9e0bcdebb7e6a40c8e4c6b7d31bd94e51160c729732b1101  /tmp/kitty_obs/run2.txt
 ```
 
-The two runs are **byte-for-byte identical** (empty `diff`; identical MD5 `77a2325f…` and SHA-256 `d26db8c1…`), so every value reported in this document is stable across repeated identical runs. In addition, the script embeds **46 golden assertions** that compare each observed value against a hard-coded expected value and exit non-zero on any mismatch; both runs report `ASSERTIONS: 46 passed, 0 failed (of 46)` (full assertion block in Section 10).
+The two runs are **byte-for-byte identical** (empty `diff`; identical MD5 `77a2325f…` and SHA-256 `d26db8c1…`), so every value reported in this document is stable across repeated identical runs. In addition, the script embeds **46 golden assertions** that compare 46 selected observed values (the settled finals and key intermediates, not every printed line) against hard-coded expected values and exit non-zero on any mismatch; both runs report `ASSERTIONS: 46 passed, 0 failed (of 46)` (full assertion block in Section 10).
 
 ### 2.6 Repository integrity — the source tree is unchanged
 
@@ -358,7 +362,7 @@ kitty's own existing tests in `kitty_tests/screen.py` frequently call `s.draw(<s
 
 **Direct answer:** retention is governed by **two independent mechanisms**, and it is important not to conflate them:
 
-1. **Within a single line/cell**, capacity is fixed — one base codepoint plus **three** combining slots (`CPUCell.cc_idx[3]`). Any codepoint kitty classifies as *combining/appendable* (which includes ZWJ `U+200D`) is **appended** into the current base's slots rather than being given its own cell.
+1. **Within a single line/cell**, capacity is fixed — one base codepoint plus **three** combining slots (`CPUCell.cc_idx[3]`). Any codepoint kitty classifies as *combining/appendable* (which includes ZWJ `U+200D`) is normally **appended** into the current base's slots rather than being given its own cell. (Two narrow exceptions, which do **not** affect the ZWJ family, are documented later: an *unpaired* regional-indicator flag codepoint instead occupies its **own cell** as a base — §7.7 — and the variation selectors, though appended, change the base's width and therefore move the cursor — §7.5.)
 2. **Across lines**, a width-2 base emoji cannot fit into a single column, so before it is written kitty's default **autowrap** (`DECAWM`) scrolls the current visible line off the screen. On a one-row grid that scroll pushes the line into the **scrollback history buffer** and clears the visible row; the new base is then written into the cleared cell.
 
 So a ZWJ family stream into a **1×1** grid does **not** collapse by in-place overwrite. Each successive base triggers an autowrap that **preserves the prior line in scrollback history**, then occupies the freshly cleared visible cell. When the stream settles, the **visible** cell holds only the **final base** (Boy, `U+1F466`) while the earlier bases — `👨`, `👩`, `👧`, each still carrying the ZWJ that followed it — remain **in history**, one per line. The ZWJ never triggers a wrap of its own; it is appended to whichever base currently occupies the visible cell.
@@ -401,13 +405,13 @@ Three behaviors matter for OBJ-1:
 
 1. It targets the cell at `cpu_cells + x`.
 2. It **refuses to attach an appended codepoint to a null (empty) cell** — *unless* the previous cell is a **width-2 base** (`x > 0 && width == 2 && cpu_cells[x-1].ch`), in which case it retargets onto that wide base. This is exactly how a codepoint following the trailing (right) half of a wide emoji still "belongs" to the base to its left.
-3. It **fills the first empty `cc_idx` slot**; and once **all three** are full, the fourth (and any later) appended codepoint **overwrites the last slot** `cc_idx[arraysz(cc_idx)-1]` (i.e. `cc_idx[2]`). This is the overflow rule exercised with an explicit `A + 4 marks` sequence in **Section 7.5**.
+3. It **fills the first empty `cc_idx` slot**; and once **all three** are full, the fourth (and any later) appended codepoint **overwrites the last slot** `cc_idx[arraysz(cc_idx)-1]` (i.e. `cc_idx[2]`). This is the overflow rule exercised with an explicit `A + 4 marks` sequence in **Section 7.6**.
 
-> **Terminology (per Unicode).** kitty's "combining" class here is an *engine* classification of codepoints that get **appended** to a base rather than occupying their own cell. It is broader than the Unicode general category *Mark* (Mn/Mc/Me): it also includes ZWJ `U+200D` (general category **Cf**, *Format*), the variation selectors `U+FE0E`/`U+FE0F` (**Mn**), regional-indicator symbols (**So**), and emoji skin-tone modifiers `U+1F3FB–U+1F3FF` (**Sk**). Throughout this document, "appended codepoint" / "stored in a combining slot" refers to this engine class; where a codepoint's Unicode category matters it is named explicitly.
+> **Terminology (per Unicode).** kitty's "combining" class here is an *engine* classification of codepoints that are normally **appended** to a base rather than occupying their own cell (two engine exceptions are noted below and analysed in §7.5/§7.7: an *unpaired* regional-indicator flag codepoint occupies its **own cell** as a base, and the variation selectors, though appended, change the base's width and so move the cursor). It is broader than the Unicode general category *Mark* (Mn/Mc/Me): it also includes ZWJ `U+200D` (general category **Cf**, *Format*), the variation selectors `U+FE0E`/`U+FE0F` (**Mn**), regional-indicator symbols (**So**), and emoji skin-tone modifiers `U+1F3FB–U+1F3FF` (**Sk**). Throughout this document, "appended codepoint" / "stored in a combining slot" refers to this engine class; where a codepoint's Unicode category matters it is named explicitly.
 
 ### 4.3 Where a ZWJ is routed (not given its own cell)
 
-In the per-codepoint draw loop (inside `screen_draw_text`), a combining codepoint never occupies a fresh cell — `kitty/screen.c:L805-L812`:
+In the per-codepoint draw loop (inside `screen_draw_text`), a codepoint classified as combining is normally routed to the append path instead of occupying a fresh cell — `kitty/screen.c:L805-L812`:
 
 ```c
             if (is_ignored_char(ch)) continue;
@@ -422,8 +426,9 @@ In the per-codepoint draw loop (inside `screen_draw_text`), a combining codepoin
 
 - `is_ignored_char(ch)` (`kitty/unicode-data.c:L671`) is the gate that would *drop* a codepoint entirely; ZWJ is **not** in it (see Section 7).
 - `is_combining_char(ch)` (`kitty/unicode-data.c:L11`) is **true** for ZWJ `U+200D` (see Section 7), so ZWJ takes the combining branch and is handed to `draw_combining_char` — it is **appended**, never allocated a new cell.
+- **Exception visible in this same snippet — regional-indicator flags.** A flag codepoint (`is_flag_codepoint`, `U+1F1E6..U+1F1FF`) takes the `draw_second_flag_codepoint` branch, which `continue`s (appends) **only if it pairs** with a pending first flag; the **first/unpaired** flag returns `false` there and *falls through* to normal base placement, taking its **own cell** (observed in §7.7). So the append-without-a-new-cell behaviour holds for ZWJ and the variation selectors but **not** for the first regional indicator.
 
-`draw_combining_char` (`kitty/screen.c:L663-L710`) locates the "previous" cell — the cell at `cursor->x - 1` on the current row, or, when the cursor is at column 0, the **last column of the previous row** (`ypos = cursor->y - 1`, `xpos = columns - 1`) — and then calls `line_add_combining_char(cp, gp, ch, xpos)` to append the codepoint into that base's slots. (The complete function body, including the VS16/VS15 width-flip branches, is shown and analysed in **Section 7.2**; it is not excerpted here to avoid eliding any logic.) In the family stream each ZWJ arrives while the cursor is at `x=2` (just past a width-2 base occupying the single column), so `xpos = 1` — the position of the base's *trailing* half. `line_add_combining_char` finds that trailing half empty but sees that the cell to its left is a width-2 base, so it **retargets** the append onto the base itself (the `x > 0 && width == 2 && cpu_cells[x-1].ch` guard, §4.2). This is why the observed cell shows `['U+1F468', 'U+200D']` — the ZWJ landed in the Man base's first combining slot — with the cursor unchanged at `x=2`.
+`draw_combining_char` (`kitty/screen.c:L663-L710`) locates the "previous" cell — the cell at `cursor->x - 1` on the current row, or, when the cursor is at column 0, the **last column of the previous row** (`ypos = cursor->y - 1`, `xpos = columns - 1`) — and then calls `line_add_combining_char(cp, gp, ch, xpos)` to append the codepoint into that base's slots. (The complete function body, including the VS16/VS15 width-flip branches, is shown and analysed in **Section 7.5**; it is not excerpted here to avoid eliding any logic.) In the family stream each ZWJ arrives while the cursor is at `x=2` (just past a width-2 base occupying the single column), so `xpos = 1` — the position of the base's *trailing* half. `line_add_combining_char` finds that trailing half empty but sees that the cell to its left is a width-2 base, so it **retargets** the append onto the base itself (the `x > 0 && width == 2 && cpu_cells[x-1].ch` guard, §4.2). This is why the observed cell shows `['U+1F468', 'U+200D']` — the ZWJ landed in the Man base's first combining slot — with the cursor unchanged at `x=2`.
 
 ### 4.4 What actually happens to each width-2 base: autowrap into history (not in-place overwrite)
 
@@ -590,12 +595,126 @@ So the retention rule under the 1×1 constraint is: *the visible cell keeps the 
 
 > **Observed vs. inferred (this section).** The bracketed trace above — every `str(line0)`, `codepoints`, `cursor`, and `historybuf` value — is **observed** (captured byte-for-byte and re-checked by the golden assertions `fam_incr_visible`, `fam_incr_cursor`, `fam_incr_hist` in Section 10). The *explanation* tying each history growth to the autowrap→`screen_index`→`INDEX_UP`→`historybuf_add_line` chain (§4.4) is **inferred from the cited source**, and it is exactly consistent with the observed `historybuf.count` incrementing on each base and never on a ZWJ.
 
+### 4.6 CRITICAL (observed): on this version, placing a width-2 glyph in a one-column line writes out of bounds
+
+**Direct answer, stated up front.** Everything reported for the 1×1 case in §4.5, §5, and §6 is a **nominal readout taken from a process that has already performed an out-of-bounds write**. On this exact checkout (`815df1e21`), writing any **width-2 base** into a **one-column** line makes the draw loop touch the *trailing* half-cell at column index 1, which does not exist when the line has only one column (valid index 0). The nominal values (`'👦'`, `len=1`, cursor `x=2`, `CSI 6 n` → `b'\x1b[1;2R'`) are exactly what the engine emits, but they are produced **after** memory corruption has occurred, so the 1×1 width-2 path is **memory-unsafe / undefined behavior on this version**, not a safely-settled terminal state. This is a defect in the pre-existing engine; per the read-only rule this document does not modify kitty source — it discloses the behavior with evidence.
+
+**The write path, in source (read-only trace).** For a width-2 base the normal placement branch is `kitty/screen.c:L820-L843`:
+
+```c
+        if (UNLIKELY(self->columns < self->cursor->x + (unsigned int)char_width)) {   // L821: fires: 1 < 0+2
+            if (self->modes.mDECAWM) {
+                continue_to_next_line(self);          // autowrap: recycle the single row
+                init_text_loop_line(self, s);
+            } else { /* … */ }
+        }
+        /* … */
+        zero_cells(s, s->cp + self->cursor->x, s->gp + self->cursor->x);   // L835: cell[0]  (in bounds)
+        s->cp[self->cursor->x].ch = ch;                                    // L836: base -> cell[0]
+        self->cursor->x++;                                                 // L837: x -> 1
+        if (char_width == 2) {                                             // L838
+            s->gp[self->cursor->x-1].attrs.width = 2;                      // L839: gp[0].width = 2
+            zero_cells(s, s->cp + self->cursor->x, s->gp + self->cursor->x); // L840: cell[1]  <-- OUT OF BOUNDS
+            s->gp[self->cursor->x].attrs.width = 0;                        // L841: gp[1].width  <-- OUT OF BOUNDS
+            self->cursor->x++;                                             // L842: x -> 2
+        }
+```
+
+At L840 the cursor is already at `x=1`, so `zero_cells(...)` `memcpy`s a full 12-byte `CPUCell` (and a `GPUCell`) into `s->cp[1]` / `s->gp[1]` — one cell past the only valid column of a one-column line. `zero_cells` is `kitty/screen.c:L657-L660` (it copies whole cell structs). The VS16-widen sub-case reaches the same defect through a different route: in 1×1, `draw_combining_char`'s `if (xpos + 1 < self->columns)` at `kitty/screen.c:L684` is false, so it calls `move_widened_char` (`kitty/screen.c:L575-L596`), whose `memcpy(dest_cpu + 1, …)` / `memcpy(dest_gpu + 1, …)` / `dest_gpu[1].attrs.width = 0` (`kitty/screen.c:L593-L595`) write the same nonexistent trailing cell. The `Screen` constructor `new_screen_object` (`kitty/screen.c:L94`) accepts a one-column geometry with no width-2 guard, so nothing prevents the situation.
+
+**Diagnostic 1 — CPython debug allocator (deterministic; the definitive proof).** Running the *same* canonical observation script (§10.1) under CPython's debug allocator aborts the moment a 1×1 screen that received width-2 bases is freed:
+
+```bash
+$ source /tmp/kitty-venv/bin/activate
+$ PYTHONPATH=. PYTHONMALLOC=debug PYTHONFAULTHANDLER=1 python3 /tmp/kitty_obs/observe.py ; echo "EXIT_CODE=$?"
+```
+
+```text
+      codepoints    = ['U+1F466']  (len=1)
+      as_ansi()     = '👦'
+      cursor        = (x=2, y=0)
+      historybuf    = count=4  lines=['👧\u200d', '👩\u200d', '👨\u200d', '']
+
+==============================================================================
+PRIMARY (canonical single-stream): whole FAMILY at once -> 1x1, then CSI 6 n
+==============================================================================
+Debug memory block at address p=0x7f389cebb250: API 'm'
+    0 bytes originally requested
+    The 7 pad bytes at p-7 are FORBIDDENBYTE, as expected.
+    The 8 pad bytes at tail=0x7f389cebb250 are not all FORBIDDENBYTE (0xfd):
+        at tail+0: 0x66 *** OUCH
+        at tail+1: 0xf4 *** OUCH
+        at tail+2: 0x01 *** OUCH
+        at tail+3: 0x00 *** OUCH
+        at tail+4: 0x00 *** OUCH
+        at tail+5: 0x00 *** OUCH
+        at tail+6: 0x00 *** OUCH
+        at tail+7: 0x00 *** OUCH
+
+Enable tracemalloc to get the memory block allocation traceback
+
+Fatal Python error: _PyMem_DebugRawFree: bad trailing pad byte
+Python runtime state: initialized
+
+Current thread 0x00007f389f553140 (most recent call first):
+  File "/tmp/kitty_obs/observe.py", line 99 in <module>
+
+Extension modules: kitty.fast_data_types (total: 1)
+EXIT_CODE=134
+```
+
+The abort is a `SIGABRT` (`EXIT_CODE=134`) and is **deterministic** — reproduced on 3/3 runs. It fires at `observe.py` line 99, which is `s, c = new_screen(1, 1)` (the statement that rebinds `s` to a fresh screen and thereby **frees** the *previous* 1×1 screen — the one the incremental family trace just wrote width-2 bases into). The overwritten trailing-pad bytes are **`0x66 0xf4 0x01 0x00`**, which is little-endian for **`0x0001F466` = `U+1F466` (Boy)** — the *final* base written by the family sequence — proving the corruption originates from the width-2 write path, not from anywhere else. (The pointer address `p=0x…` varies per run under ASLR; the corrupting byte *value* is deterministic.)
+
+**Diagnostic 2 — glibc allocator consistency check (corroboration).** Under the system C allocator with its heap checker enabled, the same script aborts on an invalid free — an independent detector, again `EXIT_CODE=134`, reproduced 2/2:
+
+```bash
+$ PYTHONPATH=. PYTHONMALLOC=malloc MALLOC_CHECK_=3 python3 /tmp/kitty_obs/observe.py ; echo "EXIT_CODE=$?"
+```
+
+```text
+free(): invalid next size (fast)
+EXIT_CODE=134
+```
+
+**Diagnostic 3 — outright segfault under accumulation (default configuration).** A minimal script that repeatedly feeds the family stream into fresh 1×1 screens through the **canonical** parser and retains them (so the corrupted allocations pile up on the heap) crashes with a segmentation fault, reproduced 3/3:
+
+```python
+# /tmp/kitty_obs/accum_repro.py  (canonical entry point: parse_bytes -> real VT parser)
+keep = []
+for i in range(2000):
+    c = Callbacks(); s = Screen(c, 1, 1, 5, 10, 20, 0, c)
+    parse_bytes(s, '\U0001F468\u200d\U0001F469\u200d\U0001F467\u200d\U0001F466'.encode('utf-8'))
+    keep.append((s, c))
+print("completed 2000 family-into-1x1 iterations; len(keep)=", len(keep))
+```
+
+```bash
+$ PYTHONPATH=. PYTHONMALLOC=malloc python3 /tmp/kitty_obs/accum_repro.py ; echo "EXIT_CODE=$?"
+```
+
+```text
+EXIT_CODE=139
+```
+
+`EXIT_CODE=139` is `128 + SIGSEGV(11)` — the process dies before printing, i.e. the accumulated out-of-bounds writes eventually corrupt live heap metadata.
+
+**Contrast — the defect is specific to width-2 base × one column.** The same construction is clean (`EXIT_CODE=0`, an adjacent sentinel `bytearray` left intact) when either factor is removed — a width-**1** char in a 1×1 line, or a width-**2** char in a 5-column line — both fed through the canonical parser:
+
+```text
+ascii_1x1:  parse_bytes(Screen(1x1), b'A')                 -> completed; sentinel_intact=True   EXIT=0
+width2_5x1: parse_bytes(Screen(5x1), '👨'.encode('utf-8')) -> completed; sentinel_intact=True   EXIT=0
+```
+
+**Why the ordinary runs in §5, §6, and §10.2 still exit 0 and are byte-identical.** Under CPython's *default* `pymalloc`, small allocations are rounded up into fixed-size pool blocks that carry slack, so the out-of-bounds trailing-cell write usually lands in that unused slack and is **silent** — no crash, and the nominal cell/cursor/report values are produced and read back exactly as shown. That is precisely why every earlier section and the §10.2 transcript run cleanly. It does **not** make the operation safe: the write is still outside the intended object, and any heap layout that places live data (rather than slack) immediately after the one-column cell array — as the debug allocator, the glibc checker, and the accumulation test all arrange — turns the silent corruption into an abort or a crash.
+
+> **Observed vs. inferred (this section).** *Observed:* the debug-allocator abort with the `0x66 f4 01 00` (= `U+1F466`) trailing-pad corruption and `EXIT_CODE=134` (3/3 runs); the glibc `free(): invalid next size (fast)` abort, `EXIT_CODE=134` (2/2 runs); the accumulation segfault `EXIT_CODE=139` (3/3 runs); and the clean `EXIT_CODE=0` contrasts. *Inferred from the cited source (and corroborated by the observed corrupting byte value):* that the specific write at `kitty/screen.c:L840-L841` (and the `move_widened_char` path at `L593-L595`) is the out-of-bounds store — entailed by reading those lines together with the observation that the corrupting bytes equal the last-written base codepoint.
+
 
 ---
 
 ## Section 5 — Part 2: Settled cell content → OBJ-2
 
-**Direct answer:** once the family ZWJ stream settles into the 1×1 cell, the terminal believes exactly **one** codepoint is present: **`U+1F466`** (`👦`, Boy). Length is 1.
+**Direct answer:** once the family ZWJ stream settles into the 1×1 cell, the terminal believes exactly **one** codepoint is present: **`U+1F466`** (`👦`, Boy). Length is 1. *(This is the value the engine reports; on this version it is a nominal readout taken after the width-2-into-one-column out-of-bounds write documented in **§4.6** — read it with that memory-safety caveat.)*
 
 ### 5.1 How the settled content is read (canonical text accessors)
 
@@ -661,10 +780,11 @@ Complete, unedited output:
 
 The settled **visible** cell is `'👦'`, its codepoint list is `['U+1F466']`, `len == 1`, and `as_ansi()` agrees. This is exactly what OBJ-2 asks for: what the terminal believes is present in the (one and only) visible cell once everything settles.
 
-Two qualifications keep this answer precise and prevent it from being misread:
+Three qualifications keep this answer precise and prevent it from being misread:
 
+- **These are nominal values from a memory-unsafe path (on this version).** As detailed in **§4.6**, writing each width-2 base into the one-column line performs an out-of-bounds trailing-cell store; the `str(line0)`/`codepoints`/`cursor` values above are exactly what the engine produces, but they are read from a process that has already invoked undefined behavior. Under the default `pymalloc` allocator the corruption lands in pool slack and the run completes cleanly (which is why this output is byte-identical across runs), but the operation is not safe. The remaining qualifications describe the *nominal* result read with that caveat.
 - **"Settled cell content" means the *visible* cell, not the whole stream.** The three earlier width-2 bases (`👨`, `👩`, `👧`) were not discarded — they were scrolled into the history buffer by the autowrap mechanism of §4.4, and the `historybuf` snapshot above shows them verbatim (`['👧\u200d', '👩\u200d', '👨\u200d', '']`, most-recent first, each still carrying its trailing ZWJ `U+200D`). Only the *final* base survives in the on-screen cell. See §4.4–§4.5 for the mechanism and the incremental history growth.
-- **This is chunking-independent for this unchanged input.** The settled visible cell here (whole stream fed in one `parse_bytes` call) is identical to the end state of the incremental trace in §4.5 (the same bytes fed one codepoint at a time), including the identical four-entry history buffer. Feeding the *same* sequence as one chunk or as several produces the same result. This is not a claim of order-independence — reordering the codepoints would change grapheme membership and therefore the outcome; it is the narrower, observed fact that *how the identical byte sequence is split across parser calls* does not affect the settled state.
+- **This is chunking-independent for this unchanged input.** The settled visible cell here (whole stream fed in one `parse_bytes` call) is identical to the end state of the incremental trace in §4.5 (the same bytes fed one codepoint at a time), including the identical four-entry history buffer. Feeding the *same* sequence as one chunk or as several produces the same result. This is not a claim of order-independence — reordering the codepoints would change grapheme membership and therefore the outcome; it is the narrower, observed fact that *how the identical byte sequence is split across parser calls* does not affect the settled state. (This chunk-independence holds because the input is **well-formed** UTF-8, which every decoder handles identically; it does **not** extend to *ill-formed* input, whose handling is decoder- and chunk-dependent — see §7.9.)
 
 
 ---
@@ -741,7 +861,7 @@ Fed into a **20×1** grid, the very same byte stream is **not** collapsed: there
       CSI 6 n reply = b'\x1b[1;9R'
 ```
 
-Here `x=8 < columns=20`, so the `x >= self->columns` test is false and the bottom-row decrement branch does **not** run; the report is `y+1=1`, `x+1=9` → **`b'\x1b[1;9R'`**. Note also `historybuf count=0`: with 20 columns there was room for all four width-2 bases (8 columns total), so **nothing autowrapped into history** — the entire seven-codepoint cluster stayed in the visible line. Contrast is the point: the identical input yields **`b'\x1b[1;2R'`** with an empty settled cell region plus a *four-entry* history in 1×1 (collapsed), versus **`b'\x1b[1;9R'`** with a *zero-entry* history in 20×1 (whole cluster retained). The difference in the state report — and in the history buffer — is a direct readout of the difference in retention forced by geometry.
+Here `x=8 < columns=20`, so the `x >= self->columns` test is false and the bottom-row decrement branch does **not** run; the report is `y+1=1`, `x+1=9` → **`b'\x1b[1;9R'`**. Note also `historybuf count=0`: with 20 columns there was room for all four width-2 bases (8 columns total), so **nothing autowrapped into history** — the entire seven-codepoint cluster stayed in the visible line. Contrast is the point: the identical input yields **`b'\x1b[1;2R'`** with the single visible cell holding only the final base Boy `U+1F466` plus a *four-entry* history in 1×1 (collapsed), versus **`b'\x1b[1;9R'`** with a *zero-entry* history in 20×1 (whole cluster retained). The difference in the state report — and in the history buffer — is a direct readout of the difference in retention forced by geometry.
 
 ### 6.4 OBSERVED: related state reports on the settled 1×1 cell
 
@@ -782,7 +902,7 @@ None of DSR-5, DA, DA>, the size reports, DECRPM, or DECRQSS depend on the cell'
 
 ### 7.1 Normalization: ABSENT (on the parser → screen → line path)
 
-There is **no Unicode normalization pass** on the input path that this investigation exercises — the VT parser (`kitty/vt-parser.c`), the screen draw path (`kitty/screen.c`), and the line/cell storage (`kitty/line.c`, `kitty/data-types.h`). The UTF-8 bytes decoded by the parser are classified by width/combining-membership and stored as-is; no NFC/NFD/NFKC/NFKD transformation is applied before a codepoint is placed in a cell or appended to `cc_idx`. *(This statement is scoped to that path; it is not a claim that the string "normalize" appears nowhere in the entire multi-hundred-file repository.)*
+There is **no Unicode normalization pass** on the input path that this investigation exercises — the VT parser (`kitty/vt-parser.c`), the screen draw path (`kitty/screen.c`), and the line/cell storage (`kitty/line.c`, `kitty/data-types.h`). The UTF-8 bytes decoded by the parser are classified by width/combining-membership and stored as-is; no NFC/NFD/NFKC/NFKD transformation is applied before a codepoint is placed in a cell or appended to `cc_idx`. *(This statement is scoped to that path; it is not a claim that the string "normalize" appears nowhere in the entire multi-hundred-file repository.)* *(That is the decode→classify→store behavior for **valid** UTF-8, which is decoder-independent; how the byte decoder treats **ill-formed** UTF-8 is a separate, decoder- and chunk-dependent matter, disclosed in §7.9.)*
 
 **Source-search evidence (inferred-from-source, shown as commands + output).** Searching the four files on the path for any normalization vocabulary returns nothing:
 
@@ -836,10 +956,10 @@ The classification tables are **generated**, not hand-written. The generator is 
 These three facts (each grounded in code) are what route a ZWJ into a combining slot rather than dropping it or giving it a cell:
 
 - **`is_combining_char(0x200D)` is TRUE.** ZWJ falls inside `case 0x200b ... 0x200f:` at `kitty/unicode-data.c:L323`, which is a case within `is_combining_char` (`L11`). Hence ZWJ takes the combining branch of the draw loop (§4.3) and is appended, not allocated a new cell. *(Observed indirectly: after a ZWJ the cell length grows by one combining mark on the same base rather than producing a second cell — §4.5.)*
-- **`is_ignored_char(0x200D)` is FALSE.** `is_ignored_char` (`kitty/unicode-data.c:L671`, "Control characters and non-characters") does **not** contain the `0x200b..0x200f` range, so the draw-loop gate `if (is_ignored_char(ch)) continue;` (`screen.c:L805`) does **not** drop ZWJ. The identical-looking `case 0x200b ... 0x200f:` at `kitty/unicode-data.c:L753` belongs to a **different** function, `is_non_rendered_char` (`L723`), which is **not** the draw-loop gate. The distinction matters: it is why ZWJ genuinely reaches `draw_combining_char`. *(Observed indirectly via §4.5: the ZWJ demonstrably survives as a combining mark on the base — it is neither dropped nor given its own cell.)*
+- **`is_ignored_char(0x200D)` is FALSE.** `is_ignored_char` (`kitty/unicode-data.c:L671`, "Control characters and non-characters") does **not** contain the `0x200b..0x200f` range, so the draw-loop gate `if (is_ignored_char(ch)) continue;` (`kitty/screen.c:L805`) does **not** drop ZWJ. The identical-looking `case 0x200b ... 0x200f:` at `kitty/unicode-data.c:L753` belongs to a **different** function, `is_non_rendered_char` (`L723`), which is **not** the draw-loop gate. The distinction matters: it is why ZWJ genuinely reaches `draw_combining_char`. *(Observed indirectly via §4.5: the ZWJ demonstrably survives as a combining mark on the base — it is neither dropped nor given its own cell.)*
 - **VS15/VS16 are combining.** The variation selectors fall inside `case 0xfe00 ... 0xfe0f:` at `kitty/unicode-data.c:L407` (within `is_combining_char`), so they too are appended to the preceding base — which is what enables the width-flip logic in §7.5.
 
-> **Terminology precision (F15).** "Combining" in this document means *kitty's* `is_combining_char` membership, which is deliberately **broader** than the Unicode "Combining Mark" general categories (`Mn`/`Mc`/`Me`). The codepoints kitty routes into `cc_idx` here span several distinct Unicode general categories: ZWJ `U+200D` is `Cf` (Format); variation selectors `U+FE0E`/`U+FE0F` are `Mn` (Nonspacing Mark); regional-indicator symbols `U+1F1E6..U+1F1FF` are `So` (Other Symbol); and emoji skin-tone modifiers `U+1F3FB..U+1F3FF` are `Sk` (Modifier Symbol). kitty does not consult the Unicode general category on this path; it consults only `is_combining_char` (plus the flag-pair special case), so any codepoint that returns true there is *appended as a stored codepoint in a `cc_idx` slot*, regardless of its formal category. That is why calling every appended codepoint a "combining mark" would be imprecise — several of them are not `M*`-category marks at all.
+> **Terminology precision (F15).** "Combining" in this document means *kitty's* `is_combining_char` membership, which is deliberately **broader** than the Unicode "Combining Mark" general categories (`Mn`/`Mc`/`Me`). The codepoints kitty routes into `cc_idx` here span several distinct Unicode general categories: ZWJ `U+200D` is `Cf` (Format); variation selectors `U+FE0E`/`U+FE0F` are `Mn` (Nonspacing Mark); regional-indicator symbols `U+1F1E6..U+1F1FF` are `So` (Other Symbol); and emoji skin-tone modifiers `U+1F3FB..U+1F3FF` are `Sk` (Modifier Symbol). kitty does not consult the Unicode general category on this path; it consults only `is_combining_char` and the flag-pair special case. **Most** codepoints that return true there are *appended as a stored codepoint in a `cc_idx` slot*, regardless of formal category — but two engine exceptions matter: the **first** codepoint of a regional-indicator flag pair returns `false` from `draw_second_flag_codepoint` and instead occupies its **own cell** as a base (§7.7), and the variation selectors, though appended, additionally change the base's width and so move the cursor (§7.5). That is why calling every appended codepoint a "combining mark" would be imprecise — several of them are not `M*`-category marks at all.
 
 ### 7.5 Variation-selector width flips (and how they change the state report)
 
@@ -969,7 +1089,7 @@ To exercise the overflow branch of `line_add_combining_char` (§4.2), a base `A`
       cursor        = (x=1, y=0)
 ```
 
-The first three marks fill `cc_idx[0..2]` (the codepoint list grows 1 → 2 → 3 → 4). The **fourth** mark `U+0303` does not extend the list further — it **overwrites the last slot**, so `U+0302` (which had been in `cc_idx[2]`) is replaced while `U+0300` and `U+0301` remain. The retained set is `['U+0041','U+0300','U+0301','U+0303']`, exactly as `cell->cc_idx[arraysz(cell->cc_idx) - 1] = mark_for_codepoint(ch);` (`kitty/line.c:L466`) dictates. This is the same fixed-capacity retention rule as Part 1's `CPUCell.cc_idx[3]`, now visible on a single base rather than across autowrapped lines. *(The cursor stays at `x=1` throughout — appended codepoints never advance it, which is also why the overflow case emits no `CSI 6 n` change.)*
+The first three marks fill `cc_idx[0..2]` (the codepoint list grows 1 → 2 → 3 → 4). The **fourth** mark `U+0303` does not extend the list further — it **overwrites the last slot**, so `U+0302` (which had been in `cc_idx[2]`) is replaced while `U+0300` and `U+0301` remain. The retained set is `['U+0041','U+0300','U+0301','U+0303']`, exactly as `cell->cc_idx[arraysz(cell->cc_idx) - 1] = mark_for_codepoint(ch);` (`kitty/line.c:L466`) dictates. This is the same fixed-capacity retention rule as Part 1's `CPUCell.cc_idx[3]`, now visible on a single base rather than across autowrapped lines. *(The cursor stays at `x=1` throughout — these combining marks are appended without advancing it, which is why the overflow case emits no `CSI 6 n` change. That is the common case for appended codepoints; the variation selectors are the exception — though also appended, they change the base's width and so **do** move the cursor, §7.5.)*
 
 ### 7.7 Contrast conditions: flag pairs and skin-tone modifiers are retained even in 1×1
 
@@ -1065,13 +1185,193 @@ Not every "multi-codepoint" sequence collapses the way the ZWJ family does. Two 
       CSI 6 n reply = b'\x1b[1;3R'
 ```
 
-In both cases the 1×1 **visible** cell keeps **two** codepoints (`len=2`) — unlike the ZWJ family, where the visible cell keeps **one** (`len=1`). The distinction is entirely explained by classification, and it shows up in the history buffer too: the *second* codepoint here is **appended** to the first base (flag pair via `draw_second_flag_codepoint`; skin tone via the combining path), so it does **not** consume a new column and does **not** trigger another autowrap — the 1×1 history count stays at **1** (the single empty line left by the first width-2 base) rather than growing. In the family sequence, by contrast, each element after a ZWJ is a **new width-2 base**, so each one autowraps the previous base into history (§4.4) and the 1×1 history count grows to **4**. The `CSI 6 n` column (2 in 1×1, 3 in 5×1) echoes the *single* width-2 base's cursor advance under the geometry — the appended second codepoint adds nothing to the column because appended codepoints never move the cursor.
+In both cases the 1×1 **visible** cell keeps **two** codepoints (`len=2`) — unlike the ZWJ family, where the visible cell keeps **one** (`len=1`). The distinction is entirely explained by classification, and it shows up in the history buffer too: the *second* codepoint here is **appended** to the first base (flag pair via `draw_second_flag_codepoint`; skin tone via the combining path), so it does **not** consume a new column and does **not** trigger another autowrap — the 1×1 history count stays at **1** (the single empty line left by the first width-2 base) rather than growing. In the family sequence, by contrast, each element after a ZWJ is a **new width-2 base**, so each one autowraps the previous base into history (§4.4) and the 1×1 history count grows to **4**. The `CSI 6 n` column (2 in 1×1, 3 in 5×1) echoes the *single* width-2 base's cursor advance under the geometry — the appended second codepoint adds nothing to the column because these particular appended codepoints (the paired flag's second regional indicator; the skin-tone modifier) carry no width of their own. (The variation selectors are the exception among appended codepoints — they change the base's width and therefore **do** move the cursor, §7.5.)
 
 ### 7.8 Putting the three mechanisms together
 
 - **Normalization** never runs on this path (§7.1), so nothing recomposes or reorders the stream — the raw codepoints are what get classified.
 - **Grapheme breaking** is not a segmentation pass but the emergent result of per-codepoint width + combining decisions; under a 1×1 constraint this means "last base wins **in the visible cell**," with appended codepoints (ZWJ included) riding along on whatever base is current. The earlier bases are not destroyed — each new width-2 base triggers the pending-wrap path (§4.4) that scrolls the previous base into the **history buffer** before the new base is written into the cleared visible cell.
 - **State reporting** does not observe graphemes at all; `CSI 6 n` reports the **cursor column**, which is the only place the earlier handling leaves a visible trace — and only because width classification moved the cursor. When the cursor is one past the last column, `report_device_status` takes its bottom-row branch and **decrements the column by exactly one** (`x--`, §6.1) before emitting it 1-based — it does **not** clamp to the last real column, and it conveys nothing about which codepoints were kept in the cell or scrolled into history.
+
+### 7.9 A decoding boundary (observed): ill-formed UTF-8 is handled differently by the SIMD and scalar decoders, and is chunk-dependent
+
+Everything above — and the family-emoji answer in Parts 1–3 — concerns **well-formed** UTF-8. One boundary condition deserves its own disclosure because it sits *upstream* of the "decode → classify" story of §7.1 and because, unlike that story, it is **not** invariant: how the byte→codepoint decoder treats **ill-formed** UTF-8 depends on *which* decoder implementation is active and on *how the bytes are chunked* across parser calls. This does **not** change the well-formed family-emoji answer (that input decodes identically under every decoder); it is disclosed here for completeness and because it is a decoding-correctness / input-validation boundary the question's "normalization" facet touches.
+
+**Where the decoder is selected (source).** `consume_normal` feeds raw bytes to `utf8_decode_to_esc` and hands the decoded codepoints to `screen_draw_text` — `kitty/vt-parser.c:L229-L239`. `utf8_decode_to_esc` is an indirect call through the function pointer `utf8_decode_to_esc_impl`, which defaults to the **scalar** decoder — `kitty/simd-string.c:L69-L74`. At module init, `init_simd` picks the implementation from the CPU (with an optional `KITTY_SIMD` override): AVX2 → `utf8_decode_to_esc_256`, else SSE4.2 → `utf8_decode_to_esc_128`, else scalar — `kitty/simd-string.c:L224-L243`. On this host the default is **AVX2/256** (observed: the module attribute `has_avx2 = True`).
+
+- The **scalar** decoder runs the DFA-based `decode_utf8` (`kitty/charsets.c:L197`) which **rejects** overlong forms, surrogates, and above-range codepoints, emitting `U+FFFD` — `kitty/simd-string.c:L39-L66`.
+- The **SIMD** decoders validate only the *structural* shape of a sequence (that each start byte is followed by the right number of continuation bytes); a structurally well-formed but illegal sequence is decoded arithmetically and **accepted** with no range / overlong / surrogate check. The only escape hatch is `abort_with_invalid_utf8()`, which is reached on *structural* failure — `kitty/simd-string-impl.h:L573-L577`, `L630-L638`.
+- The SIMD entry point **falls back to the scalar finisher** whenever it is resumed mid-sequence: `if (d->state.cur != UTF8_ACCEPT) … scalar_decode_to_accept(…)` — `kitty/simd-string-impl.h:L538-L548`. This is exactly why **chunking changes the result**: bytes split one-per-parser-call are finished by the scalar path (and rejected), whereas a whole malformed run that lands inside a single SIMD chunk is accepted.
+
+**Observed — three ill-formed inputs, each framed with ASCII `X … Y`, driven through the canonical `parse_bytes` path.** Complete, unedited output; each table was byte-identical across two runs (§2.5 discipline).
+
+Scalar decoder (`KITTY_SIMD=0`) — **correct rejection** to `U+FFFD` in every case (both whole-buffer and split-per-byte):
+
+```text
+KITTY_SIMD env      : '0'
+has_avx2            : False
+has_sse4_2          : False
+active decoder      : scalar (utf8_decode_to_esc_scalar)
+================================================================
+  case: overlong C0 8A (should be rejected -> U+FFFD)
+    input bytes      : b'X\xc0\x8aY'
+    split-per-byte   : False
+    cursor.x         : 4
+    str(line0)       : 'X��Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+  case: surrogate ED A0 80 (U+D800, should be rejected)
+    input bytes      : b'X\xed\xa0\x80Y'
+    split-per-byte   : False
+    cursor.x         : 5
+    str(line0)       : 'X���Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+  case: above-max F4 90 80 80 (U+110000, should be rejected)
+    input bytes      : b'X\xf4\x90\x80\x80Y'
+    split-per-byte   : False
+    cursor.x         : 6
+    str(line0)       : 'X����Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+--- same three inputs, fed one byte per parse_bytes call ---
+  case: overlong C0 8A (split)
+    input bytes      : b'X\xc0\x8aY'
+    split-per-byte   : True
+    cursor.x         : 4
+    str(line0)       : 'X��Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+  case: surrogate ED A0 80 (split)
+    input bytes      : b'X\xed\xa0\x80Y'
+    split-per-byte   : True
+    cursor.x         : 5
+    str(line0)       : 'X���Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+  case: above-max F4 90 80 80 (split)
+    input bytes      : b'X\xf4\x90\x80\x80Y'
+    split-per-byte   : True
+    cursor.x         : 6
+    str(line0)       : 'X����Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+FFFD U+FFFD U+0059
+    str() SystemError: False
+```
+
+Default decoder on this host, **AVX2/256** (`KITTY_SIMD=256`; the SSE4.2/128 run produced a **byte-identical case body**, verified by `diff`) — **acceptance** when the malformed run is in one chunk, but **scalar-equivalent rejection** when the same bytes are fed one per `parse_bytes` call:
+
+```text
+KITTY_SIMD env      : '256'
+has_avx2            : True
+has_sse4_2          : False
+active decoder      : AVX2 / 256-bit (utf8_decode_to_esc_256)
+================================================================
+  case: overlong C0 8A (should be rejected -> U+FFFD)
+    input bytes      : b'X\xc0\x8aY'
+    split-per-byte   : False
+    cursor.x         : 2
+    str(line0)       : ' Y'
+    codepoints       : U+0020 U+0059
+    str() SystemError: False
+
+  case: surrogate ED A0 80 (U+D800, should be rejected)
+    input bytes      : b'X\xed\xa0\x80Y'
+    split-per-byte   : False
+    cursor.x         : 2
+    str(line0)       : 'XY'
+    codepoints       : U+0058 U+0059
+    str() SystemError: False
+
+  case: above-max F4 90 80 80 (U+110000, should be rejected)
+    input bytes      : b'X\xf4\x90\x80\x80Y'
+    split-per-byte   : False
+    cursor.x         : 3
+    str(line0)       : 'X\U00110000Y' <unrepresentable: SystemError: invalid maximum character passed to PyUnicode_New>
+    str() SystemError: True
+
+--- same three inputs, fed one byte per parse_bytes call ---
+  case: overlong C0 8A (split)
+    input bytes      : b'X\xc0\x8aY'
+    split-per-byte   : True
+    cursor.x         : 4
+    str(line0)       : 'X��Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+  case: surrogate ED A0 80 (split)
+    input bytes      : b'X\xed\xa0\x80Y'
+    split-per-byte   : True
+    cursor.x         : 5
+    str(line0)       : 'X���Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+FFFD U+0059
+    str() SystemError: False
+
+  case: above-max F4 90 80 80 (split)
+    input bytes      : b'X\xf4\x90\x80\x80Y'
+    split-per-byte   : True
+    cursor.x         : 6
+    str(line0)       : 'X����Y'
+    codepoints       : U+0058 U+FFFD U+FFFD U+FFFD U+FFFD U+0059
+    str() SystemError: False
+```
+
+Reading the three single-chunk rows against scalar:
+
+| ill-formed input | scalar (`KITTY_SIMD=0`) | SIMD single chunk (128 ≡ 256, the default) |
+|---|---|---|
+| overlong `C0 8A` (would-be `U+000A` LF) | `X··Y` → `U+0058 U+FFFD U+FFFD U+0059`, cursor.x=4 | **accepted and executed as a control**: decodes to `U+000A` (LF); settled line0 = `' Y'`, cursor.x=2 |
+| surrogate `ED A0 80` (would-be `U+D800`) | `X···Y` → three `U+FFFD`, cursor.x=5 | **silently dropped**: line0 = `'XY'`, cursor.x=2, no replacement emitted |
+| above-max `F4 90 80 80` (would-be `U+110000`) | `X····Y` → four `U+FFFD`, cursor.x=6 | **accepted**: cell holds an out-of-range scalar (detailed below) |
+
+(The `·` glyphs above stand in for the `U+FFFD` REPLACEMENT CHARACTERs that appear verbatim in the fenced output blocks.)
+
+**The overlong control case, shown as a scroll (observed).** Because the overlong `C0 8A` is accepted as `U+000A`, the parser then *acts on it as a line feed*. Feeding `X`, `C0 8A`, `Y` into a 3-row grid makes the control effect visible (stable across two runs):
+
+```text
+active decoder : AVX2/256 (has_avx2=True)
+input bytes    : b'X\xc0\x8aY'  (overlong 2-byte encoding of U+000A LF)
+cursor (x,y)   : (2, 1)
+row 0          : 'X'
+row 1          : ' Y'
+row 2          : ''
+```
+
+`X` lands on row 0; the accepted-overlong LF moves the cursor to row 1 (column preserved); `Y` lands at row 1, column 1. In the 1-row grid of the table above, that same LF scrolls `X` into history and leaves `' Y'` visible with `cursor.x = 2`. An overlong-encoded control byte thus **bypasses the rejection that the scalar path applies** and takes effect — the classic overlong-encoding hazard.
+
+**The above-max case in detail (the strongest signal).** Four bytes `F4 90 80 80` would encode `U+110000`, one past the Unicode maximum `U+10FFFF`. The scalar decoder rejects it; the SIMD decoder **stores it**. Reading the settled cell back through the canonical text accessors then produces a Python `str` that *reprs* as `'X\U00110000Y'` but is internally invalid: any per-character re-materialization (indexing or iteration) raises `SystemError: invalid maximum character passed to PyUnicode_New`. Complete output (default decoder), stable across two runs:
+
+```text
+KITTY_SIMD env : None
+active decoder : AVX2/256 (utf8_decode_to_esc_256)
+============================================================
+[canonical] after parse_bytes(b"X\xf4\x90\x80\x80Y"): cursor.x = 3
+[canonical] str(line0)       -> repr='X\U00110000Y'  len=3
+[canonical] line0.as_ansi()  -> repr='X\U00110000Y'  len=3
+[canonical] txt[1] index      -> SystemError: invalid maximum character passed to PyUnicode_New
+[canonical] iterate chars     -> SystemError: invalid maximum character passed to PyUnicode_New
+```
+
+For contrast, the scalar decoder yields a fully valid, serializable cell for the same bytes:
+
+```text
+KITTY_SIMD env : '0'
+active decoder : scalar (utf8_decode_to_esc_scalar)
+============================================================
+[canonical] after parse_bytes(b"X\xf4\x90\x80\x80Y"): cursor.x = 6
+[canonical] str(line0)       -> repr='X����Y'  len=6
+[canonical] line0.as_ansi()  -> repr='X����Y'  len=6
+[canonical] txt[1] indexed OK -> ord=0xFFFD
+[canonical] iterate chars     -> ['0x58', '0xfffd', '0xfffd', '0xfffd', '0xfffd', '0x59']
+```
+
+**Scope and relation to §7.1.** This boundary is a **decoding-layer** effect that occurs *before* the width/combining classification of §7.1–§7.7: it decides *which codepoints even exist* to be classified. The scope note in §7.1 ("the UTF-8 bytes decoded by the parser are … stored as-is") is about *valid* input; for *ill-formed* input the codepoints that reach the classifier are decoder- and chunk-dependent exactly as shown here. None of this alters Parts 1–3: the family ZWJ sequence is valid UTF-8 and decodes identically under scalar, 128, and 256.
+
+> **Observed vs. inferred (this subsection).** The per-mode tables, the cursor columns, the row-by-row overlong scroll, the `'X\U00110000Y'` serialization, and the `SystemError` on re-materialization are **observed** (captured byte-for-byte via the canonical `parse_bytes` path, each stable across two identical runs). The *reason* — SIMD structural-only validation plus the scalar-finisher fallback — is **inferred from the cited source** (`kitty/simd-string.c`, `kitty/simd-string-impl.h`, `kitty/charsets.c`) and is corroborated by the observed chunk-dependence (split-per-byte matches scalar exactly, in the tables above). That overlong / surrogate / above-max forms are *ill-formed* is **standards background** (the UTF-8 definition and Unicode's "maximal subpart" replacement guidance). *(A decoder-level cross-check that calls the 128/256 functions directly was deliberately avoided in the deliverable output because it bypasses the VT parser — a non-canonical path whose values "do not count" under the investigation rules; the observations above are all from the real parser.)*
 
 
 ---
@@ -1089,10 +1389,11 @@ Every behavioral claim in this document falls into exactly one of three evidenti
 - **Chunking-independence:** feeding the identical family byte sequence as one `parse_bytes` call (§5.2) versus one codepoint at a time (§4.5) produces the identical settled cell *and* the identical four-entry history buffer. (Observed for this unchanged input; this is *not* a claim of order-independence — see §5.2.)
 - The two source-search commands and their `grep-exit=1` results (§7.1, §7.2), and the `unicodedata` NFC/NFD/NFKC/NFKD output (§7.1) — these are observed *command outputs*.
 - The build result in this environment (canonical `python3 setup.py build` → exit 0, Wayland disabled, 85 objects, 4 links) and the successful import.
+- **The memory-safety diagnostics of §4.6:** the CPython debug-allocator abort with `bad trailing pad byte` corruption `0x66 f4 01 00` (= `U+1F466`) and `EXIT_CODE=134` (3/3 runs); the glibc `free(): invalid next size (fast)` abort with `EXIT_CODE=134` (2/2 runs); the accumulation segfault `EXIT_CODE=139` (3/3 runs); and the clean `EXIT_CODE=0` width-1-into-1×1 and width-2-into-5×1 contrasts. These are captured command outputs.
 
 **Category A′ — OBSERVED but VERSION-DEPENDENT:**
 
-- The Secondary-DA numbers `4000;35` in `b'\x1b[>1;4000;35c'` are compile-time version constants derived from the kitty version (`constants.py:L25` → `setup.py:L605-L606`, emitted at `setup.py:L730`); a different kitty version would report different numbers. The *shape* of the reply (`ESC [ > 1 ; … ; … c`) is stable.
+- The Secondary-DA numbers `4000;35` in `b'\x1b[>1;4000;35c'` are compile-time version constants derived from the kitty version (`kitty/constants.py:L25` → `setup.py:L605-L606`, emitted at `setup.py:L730`); a different kitty version would report different numbers. The *shape* of the reply (`ESC [ > 1 ; … ; … c`) is stable.
 
 **Category B — INFERRED from reading the source** (entailed by the observations plus the code, but not a distinct line in the output):
 
@@ -1100,6 +1401,7 @@ Every behavioral claim in this document falls into exactly one of three evidenti
 - That the VS16 widen in the **1×1** case takes the `move_widened_char` path rather than `cursor->x++` is inferred from `kitty/screen.c:L682-L688` together with the observed fact that the cursor stayed at `x=1` (had the `cursor->x++` branch run, `x` would have become 2).
 - The exact internal slot that each mark occupies (`cc_idx[0]`, `[1]`, `[2]`) is inferred from `line_add_combining_char` (`kitty/line.c:L456-L467`) plus the observed codepoint-list growth and the overflow overwrite; the public accessors expose the resulting *list*, not the raw slot indices.
 - "No Unicode normalization runs at runtime on this path" is a source-derived *generalization*: the observed `grep-exit=1` command output shows the vocabulary is absent from the four path files, and from that (plus reading those files) we conclude no normalization executes. The overflow codepoints alone are only *consistent* with this (§7.1), not proof of it.
+- That the **out-of-bounds store of §4.6 is specifically at `kitty/screen.c:L840-L841`** (and, for the VS16-widen sub-case, `move_widened_char` at `L593-L595`) is inferred from reading those lines — that a width-2 base advances the cursor to column index 1 and then writes/zeros `cell[1]` of a one-column line. It is corroborated by the observed fact that the corrupting trailing-pad bytes equal the last-written base codepoint (`U+1F466`). The *fact that corruption occurs* (the aborts and segfault) is directly observed; the *exact offending line* is the source-level explanation.
 
 **Category C — EXTERNAL-STANDARD BACKGROUND** (not observed here and not from kitty's source; drawn from the Unicode Standard and VT/xterm control-sequence specifications, used only to describe the observations in standards-correct language):
 
@@ -1118,10 +1420,11 @@ Every named item the question implies, addressed by name:
 
 | Item | Where addressed | Key observed evidence |
 |------|-----------------|-----------------------|
-| **Normalization** (interaction) | §7.1, §7.8 | ABSENT — raw codepoints preserved (overflow list unreordered) |
+| **Normalization** (interaction) | §7.1, §7.8 | ABSENT — proven by the scoped source search (`grep-exit=1`, §7.1); the unreordered overflow list is only *consistent with* this, not proof of it (§7.1) |
 | **Grapheme breaking** (interaction) | §7.2, §7.8 | NO UAX #29 state machine; width + combining membership |
 | **State reporting** (interaction) | §6, §7.8 | `CSI 6 n` → `b'\x1b[1;2R'` (1×1) |
 | **1×1 constraint** | §4, §5, §6.1–6.2 | settled visible cell `len=1`; cursor `x=2`; bottom-row `x--` decrement (not a clamp) → col 2 |
+| **1×1 width-2 memory safety** (observed) | §4.6, §1.3 | width-2 base in one column writes out of bounds: debug-allocator abort `EXIT=134` (pad `0x66 f4 01 00` = `U+1F466`), glibc `free(): invalid next size` `EXIT=134`, accumulation segfault `EXIT=139`; width-1 and 5×1 contrasts clean; source `kitty/screen.c:L840-L841`, `L593-L595` |
 | **Primary family ZWJ emoji** | §4.5, §5.2 | incremental trace; settled visible `'👦'` `['U+1F466']`; history retains Man/Woman/Girl+ZWJ |
 | **VS15 (narrow)** | §7.5 | width-2 base `U+1F610` genuinely narrowed (`x--` fires): 5×1 `x` 2→1 `b'\x1b[1;2R'`; 1×1 `b'\x1b[1;1R'` |
 | **VS16 (widen)** | §7.5 | base `U+2764`: 1×1 `b'\x1b[1;1R'` (move_widened_char, no advance); 5×1 `b'\x1b[1;3R'` (`x++`) |
@@ -1137,7 +1440,7 @@ Every named item the question implies, addressed by name:
 | **DECRQSS** | §6.4 | `b'\x1bP1$r1 q\x1b\\'` |
 | **Canonical entry point** | §3 | all input via `parse_bytes` → real VT parser |
 | **Reproducibility / stability** | §2.5 | 2/2 byte-identical runs (identical MD5) |
-| **Repository integrity / cleanup** | §2.5, §10 | build artifacts gitignored; temp script outside repo, removed; `git status` clean |
+| **Repository integrity / cleanup** | §2.6, §10 | build artifacts gitignored; temp script outside repo, removed; `git status` clean |
 
 
 ---
@@ -1146,7 +1449,7 @@ Every named item the question implies, addressed by name:
 
 ### 10.1 The observation script (verbatim)
 
-This script lived **outside** the repository tree at `/tmp/kitty_obs/observe.py` and was **removed** afterward (§8). It drives the **real VT parser** (the canonical entry point) via `kitty_tests.parse_bytes` (`kitty_tests/__init__.py:L30-L36`), and captures every control-sequence reply from `Callbacks.write` → `self.wtcbuf` (`kitty_tests/__init__.py:L50-L51`). Before constructing any `Screen` it initializes the global `Options` exactly as `kitty_tests.BaseTest.set_options` does (via `merge_result_dicts(defaults._asdict(), …)` then `set_options(...)`), so that `get_options()` succeeds (§3.3, finding F3). Every observed value is checked against a golden expected value; any mismatch raises `SystemExit(1)`. It was executed from the repository root as `source /tmp/kitty-venv/bin/activate && PYTHONPATH=. python3 /tmp/kitty_obs/observe.py`.
+This script lived **outside** the repository tree at `/tmp/kitty_obs/observe.py` and was **removed** afterward (§2.6). It drives the **real VT parser** (the canonical entry point) via `kitty_tests.parse_bytes` (`kitty_tests/__init__.py:L30-L36`), and captures every control-sequence reply from `Callbacks.write` → `self.wtcbuf` (`kitty_tests/__init__.py:L50-L51`). Before constructing any `Screen` it initializes the global `Options` exactly as `kitty_tests.BaseTest.set_options` does (via `merge_result_dicts(defaults._asdict(), …)` then `set_options(...)`), so that `get_options()` succeeds (§3.3, finding F3). Selected observed values (46 in total — the settled finals and key intermediates, not every printed line) are checked against golden expected values; any mismatch raises `SystemExit(1)`. Whole-output stability across runs is confirmed separately, by the byte-identical re-run and matching MD5/SHA-256 hashes (§2.5, §10.2). It was executed from the repository root as `source /tmp/kitty-venv/bin/activate && PYTHONPATH=. python3 /tmp/kitty_obs/observe.py`.
 
 ```python
 # TEMPORARY observation script (lives OUTSIDE the kitty repo tree at /tmp/kitty_obs).
@@ -1156,7 +1459,7 @@ This script lived **outside** the repository tree at `/tmp/kitty_obs/observe.py`
 #
 # It initializes the global Options exactly as kitty_tests.BaseTest.set_options does,
 # so the Screen runs under kitty's canonical default configuration (get_options() works).
-# Every observed value is checked against an expected "golden" value at the end; the
+# Selected observed values (46 assertions) are checked against expected "golden" values at the end; the
 # script exits non-zero if ANY assertion fails, so silent behavioral drift cannot pass.
 from kitty.fast_data_types import Screen, get_options, set_options
 from kitty.config import finalize_keys, finalize_mouse_mappings
@@ -1374,7 +1677,7 @@ rec('rep_decrpm', reports['DECRPM CSI ?25 $p'])
 rec('rep_decrqss', reports['DECRQSS DECSCUSR'])
 
 # ---------------------------------------------------------------------------
-# GOLDEN ASSERTIONS: every observed value is checked against its expected value.
+# GOLDEN ASSERTIONS: 46 selected observed values are checked against their expected values.
 # A byte-for-byte mismatch here fails loudly (SystemExit 1) rather than passing silently.
 hdr('GOLDEN ASSERTIONS (observed vs expected)')
 EXPECTED = {
