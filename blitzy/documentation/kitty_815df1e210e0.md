@@ -56,7 +56,7 @@ $ PATH=$PATH:/usr/local/go/bin CI=true python3 setup.py build --debug --ignore-c
 
 **Canonical path (no bypass).** The headless driver is kitty's own test harness: `create_screen(cols, lines, scrollback, ...)` [kitty_tests/__init__.py:237] builds a real `Screen`, and `parse_bytes(screen, data)` [kitty_tests/__init__.py:30] feeds raw bytes through the **real VT parser** — `parse_bytes` → `Screen.test_create_write_buffer` → `vt_parser_create_write_buffer` [kitty/vt-parser.c:1451] → `test_commit_write_buffer` → `vt_parser_commit_write` [kitty/vt-parser.c:1465] → `parse_worker` [kitty/vt-parser.c:1496] → the screen ops that scroll lines off the top via the `INDEX_UP` macro [kitty/screen.c:1552] → `historybuf_add_line` [kitty/history.c:287-291] → `historybuf_push` [kitty/history.c:276-285]. At no point is `HistoryBuf.push()` called directly; this is exactly the path taken by a child program's PTY output. The harness forces `scrollback_pager_history_size` to a non‑zero test value at [kitty_tests/__init__.py:224], so every headless run **explicitly overrides it back to `0`** to reproduce the true default [kitty/options/definition.py:406].
 
-**Q2 environment.** The GUI binary `./kitty/launcher/kitty` from the image renders to a host‑provided `Xvfb` display (`1280x800x24`), software GL (`LIBGL_ALWAYS_SOFTWARE=1`, Mesa 24.2.8 llvmpipe). kitty requires OpenGL ≥ 3.3 [kitty/data-types.h:19-21]. GUI rendering is proven by kitty's own startup log (`OS Window created`, `Child launched` under `--debug-rendering`), by the 32 Mesa `llvmpipe-*` GL worker threads, and by successful framebuffer read‑back (the scroll detector below). The mandated image itself has no `Xvfb`, so the display is supplied by the host and shared into the container via the X socket; the **kitty binary under test is the image's own** — see the exact commands in the [methodology appendix](#appendix-b--q2-gui-latency-harness).
+**Q2 environment.** The GUI binary `./kitty/launcher/kitty` from the image renders to a host‑provided `Xvfb` display (`1280x800x24`), software GL (`LIBGL_ALWAYS_SOFTWARE=1`, Mesa 24.2.8 llvmpipe). kitty requires OpenGL ≥ 3.3 [kitty/data-types.h:19-21]. GUI rendering is proven by kitty's own startup log (`OS Window created`, `Child launched` under `--debug-rendering`), by the 32 Mesa `llvmpipe-*` GL worker threads, and by successful framebuffer read‑back (the scroll detector below). The mandated image itself has no `Xvfb`, so the display is supplied by the host and shared into the container via the X socket; the **kitty binary under test is the image's own** — see the exact commands in the [methodology appendix](#appendix-b--q2-gui-latency-harness-verbatim).
 
 > **Note on the "PIL is unavailable" claim in the prior draft.** That claim was false and is retracted: Pillow with `ImageGrab` is present both on the host (12.3.0) and in the mandated image (11.3.0). Q2 does not depend on it — the latency detector reads the framebuffer directly through `libX11`'s `XGetImage`.
 
@@ -493,9 +493,24 @@ ALL ASSERTIONS PASSED
 
 ### kitty's own test suite (same shipped module)
 
-To confirm the imported module is healthy and the cell/attr sizes it was compiled with are the ones used above, kitty's scrollback‑relevant suites were run against the same shipped `.so`:
+To confirm the imported module is healthy and the cell/attr sizes it was compiled with are the ones used above, kitty's scrollback‑relevant suites were run against the same shipped `.so`. Because `./test.py --module` accepts exactly one module (any further positional arguments are treated as test‑name filters), the three suites are driven with a per‑module loop, preceded by an identity preamble that pins the commit, interpreter, compiler, and the exact `.so` the harness imports.
 
-**Command:** `LANG=C.UTF-8 CI=true ./test.py --module datatypes screen parser  (+ image/.so identity)`
+**Command** (copy‑paste runnable from the repo root inside the image):
+
+```bash
+echo "IMG_HEAD=$(cat .git/HEAD)"
+python3 --version
+gcc --version | head -1
+echo "--- fast_data_types.so identity (the module imported by the harness) ---"
+ls -l kitty/fast_data_types.so
+python3 -c "import kitty.fast_data_types as f; print('so path imported:', f.__file__)"
+for m in datatypes screen parser; do
+  echo "=== TEST: $m ==="
+  LANG=C.UTF-8 CI=true ./test.py --module "$m" 2>&1
+done
+```
+
+Complete, unedited output. (The only run‑to‑run variation is the sub‑second wall‑clock figure on each `Ran N tests in …s` line; the test set — 18 / 36 / 16 — and the `OK` results are identical across runs, confirmed over ≥ 2 runs.)
 
 ```text
 IMG_HEAD=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
@@ -505,30 +520,103 @@ gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
 -rwxr-xr-x 1 root 1001 1221264 Aug 28  2025 kitty/fast_data_types.so
 so path imported: /app/kitty/fast_data_types.so
 === TEST: datatypes ===
+Running under CI: True
+Using PATH in test environment: /app/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
+test_ansi_repr (kitty_tests.datatypes.TestDataTypes.test_ansi_repr) ... ok
+test_bracketed_paste_sanitizer (kitty_tests.datatypes.TestDataTypes.test_bracketed_paste_sanitizer) ... ok
+test_color_profile (kitty_tests.datatypes.TestDataTypes.test_color_profile) ... ok
+test_expand_ansi_c_escapes (kitty_tests.datatypes.TestDataTypes.test_expand_ansi_c_escapes) ... ok
+test_historybuf (kitty_tests.datatypes.TestDataTypes.test_historybuf) ... ok
+test_line (kitty_tests.datatypes.TestDataTypes.test_line) ... ok
+test_linebuf (kitty_tests.datatypes.TestDataTypes.test_linebuf) ... ok
+test_notify_identifier_sanitization (kitty_tests.datatypes.TestDataTypes.test_notify_identifier_sanitization) ... ok
+test_replace_c0_codes (kitty_tests.datatypes.TestDataTypes.test_replace_c0_codes) ... ok
+test_rewrap_narrower (kitty_tests.datatypes.TestDataTypes.test_rewrap_narrower) ... ok
+test_rewrap_simple (kitty_tests.datatypes.TestDataTypes.test_rewrap_simple) ... ok
+test_rewrap_wider (kitty_tests.datatypes.TestDataTypes.test_rewrap_wider) ... ok
+test_shlex_split (kitty_tests.datatypes.TestDataTypes.test_shlex_split) ... ok
+test_single_key (kitty_tests.datatypes.TestDataTypes.test_single_key) ... ok
+test_strip_csi (kitty_tests.datatypes.TestDataTypes.test_strip_csi) ... ok
 test_to_color (kitty_tests.datatypes.TestDataTypes.test_to_color) ... ok
 test_url_at (kitty_tests.datatypes.TestDataTypes.test_url_at) ... ok
 test_utils (kitty_tests.datatypes.TestDataTypes.test_utils) ... ok
 
 ----------------------------------------------------------------------
-Ran 18 tests in 0.010s
+Ran 18 tests in 0.017s
 
 OK
 === TEST: screen ===
+Running under CI: True
+Using PATH in test environment: /app/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
+test_backspace_wide_characters (kitty_tests.screen.TestScreen.test_backspace_wide_characters) ... ok
+test_bottom_margin (kitty_tests.screen.TestScreen.test_bottom_margin) ... ok
+test_char_manipulation (kitty_tests.screen.TestScreen.test_char_manipulation) ... ok
+test_color_stack (kitty_tests.screen.TestScreen.test_color_stack) ... ok
+test_cursor_after_resize (kitty_tests.screen.TestScreen.test_cursor_after_resize) ... ok
+test_cursor_hidden (kitty_tests.screen.TestScreen.test_cursor_hidden) ... ok
+test_cursor_movement (kitty_tests.screen.TestScreen.test_cursor_movement) ... ok
+test_detect_url (kitty_tests.screen.TestScreen.test_detect_url) ... ok
+test_dirty_lines (kitty_tests.screen.TestScreen.test_dirty_lines) ... ok
+test_draw_char (kitty_tests.screen.TestScreen.test_draw_char) ... ok
+test_draw_fast (kitty_tests.screen.TestScreen.test_draw_fast) ... ok
+test_emoji_skin_tone_modifiers (kitty_tests.screen.TestScreen.test_emoji_skin_tone_modifiers) ... ok
+test_erase_in_screen (kitty_tests.screen.TestScreen.test_erase_in_screen) ... ok
+test_hyperlinks (kitty_tests.screen.TestScreen.test_hyperlinks) ... ok
+test_key_encoding_flags_stack (kitty_tests.screen.TestScreen.test_key_encoding_flags_stack) ... ok
+test_margins (kitty_tests.screen.TestScreen.test_margins) ... ok
+test_osc_52 (kitty_tests.screen.TestScreen.test_osc_52) ... ok
+test_pagerhist (kitty_tests.screen.TestScreen.test_pagerhist) ... ok
+test_pointer_shapes (kitty_tests.screen.TestScreen.test_pointer_shapes) ... ok
+test_prompt_marking (kitty_tests.screen.TestScreen.test_prompt_marking) ... ok
+test_regional_indicators (kitty_tests.screen.TestScreen.test_regional_indicators) ... ok
+test_rep (kitty_tests.screen.TestScreen.test_rep) ... ok
+test_resize (kitty_tests.screen.TestScreen.test_resize) ... ok
+test_scrollback_fill_after_resize (kitty_tests.screen.TestScreen.test_scrollback_fill_after_resize) ... ok
+test_selection_as_text (kitty_tests.screen.TestScreen.test_selection_as_text) ... ok
+test_serialize (kitty_tests.screen.TestScreen.test_serialize) ... ok
+test_sgr (kitty_tests.screen.TestScreen.test_sgr) ... ok
+test_soft_hyphen (kitty_tests.screen.TestScreen.test_soft_hyphen) ... ok
+test_tab_stops (kitty_tests.screen.TestScreen.test_tab_stops) ... ok
+test_top_and_bottom_margin (kitty_tests.screen.TestScreen.test_top_and_bottom_margin) ... ok
+test_top_margin (kitty_tests.screen.TestScreen.test_top_margin) ... ok
+test_user_marking (kitty_tests.screen.TestScreen.test_user_marking) ... ok
+test_variation_selectors (kitty_tests.screen.TestScreen.test_variation_selectors) ... ok
 test_wrapping_serialization (kitty_tests.screen.TestScreen.test_wrapping_serialization) ... ok
 test_writing_with_cursor_on_trailer_of_wide_character (kitty_tests.screen.TestScreen.test_writing_with_cursor_on_trailer_of_wide_character) ... ok
 test_zwj (kitty_tests.screen.TestScreen.test_zwj) ... ok
 
 ----------------------------------------------------------------------
-Ran 36 tests in 0.090s
+Ran 36 tests in 0.101s
 
 OK
 === TEST: parser ===
+Running under CI: True
+Using PATH in test environment: /app/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Python: /usr/bin/python
+Intrinsics: has_avx2=True has_sse4_2=True
+test_base64 (kitty_tests.parser.TestParser.test_base64) ... ok
+test_charsets (kitty_tests.parser.TestParser.test_charsets) ... ok
+test_csi_code_rep (kitty_tests.parser.TestParser.test_csi_code_rep) ... ok
+test_csi_codes (kitty_tests.parser.TestParser.test_csi_codes) ... ok
+test_dcs_codes (kitty_tests.parser.TestParser.test_dcs_codes) ... ok
+test_deccara (kitty_tests.parser.TestParser.test_deccara) ... ok
+test_desktop_notify (kitty_tests.parser.TestParser.test_desktop_notify) ... ok
+test_esc_codes (kitty_tests.parser.TestParser.test_esc_codes) ... ok
+test_find_either_of_two_bytes (kitty_tests.parser.TestParser.test_find_either_of_two_bytes) ... ok
+test_graphics_command (kitty_tests.parser.TestParser.test_graphics_command) ... ok
+test_osc_codes (kitty_tests.parser.TestParser.test_osc_codes) ... ok
+test_oth_codes (kitty_tests.parser.TestParser.test_oth_codes) ... ok
+test_parser_threading (kitty_tests.parser.TestParser.test_parser_threading) ... ok
 test_simple_parsing (kitty_tests.parser.TestParser.test_simple_parsing) ... ok
 test_utf8_parsing (kitty_tests.parser.TestParser.test_utf8_parsing) ... ok
 test_utf8_simd_decode (kitty_tests.parser.TestParser.test_utf8_simd_decode) ... ok
 
 ----------------------------------------------------------------------
-Ran 16 tests in 0.055s
+Ran 16 tests in 0.063s
 
 OK
 ```
@@ -742,7 +830,7 @@ Per‑run medians (2 runs each) confirm run‑to‑run stability: c4_idle 8.39 /
 
 ### Throughput context — the `__benchmark__` kitten (NOT a latency measurement)
 
-kitty ships a hidden throughput benchmark, `kitten __benchmark__`. It is a **parser/PTY‑throughput** tool, not a latency or rendering tool: its own output states *"These results measure the time it takes the terminal to fully parse all the data sent to it"* and *"rendering is suppressed … to better benchmark parser performance"* [tools/cmd/benchmark/main.go:302-305,323]. It must run inside a real terminal (it sends data and waits for query responses); it hangs on a raw pty and also under `script`, but runs correctly as a **direct child of the image's kitty** (verified). Results were read from the rendered screen (screenshots archived).
+kitty ships a hidden throughput benchmark, `kitten __benchmark__`. It is a **parser/PTY‑throughput** tool, not a latency or rendering tool: its own output states *"These results measure the time it takes the terminal to fully parse all the data sent to it"* and *"rendering is suppressed … to better benchmark parser performance"* [tools/cmd/benchmark/main.go:301-305,323]. It must run inside a real terminal (it sends data and waits for query responses); it hangs on a raw pty and also under `script`, but runs correctly as a **direct child of the image's kitty** (verified). Results were read from the rendered screen (screenshots archived).
 
 **Argument‑order correctness.** kitty's CLI stops parsing options after the first positional argument: `Command.AllowOptionsAfterArgs` defaults to 0 — *"0 means no options after the first non-option arg"* [tools/cli/command.go] — enforced by `if self.AllowOptionsAfterArgs <= len(self.Args) { options_allowed = false }` [tools/cli/parse-args.go]. The `__benchmark__` command does not raise that limit [tools/cmd/benchmark/main.go:317-352], so any option placed **after** `ascii` is silently ignored. `--repetitions` defaults to `100` and `--with-scrollback` switches from the alt screen to the main screen (`Alternate_screen: !opts.WithScrollback`) [tools/cmd/benchmark/main.go:59,337-347]. The prior draft's command put `ascii` first, so its options were ignored — which the following two runs demonstrate directly:
 
