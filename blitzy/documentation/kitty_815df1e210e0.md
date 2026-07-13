@@ -68,6 +68,93 @@ fast_data_types OK: True
 
 OpenSSH is `9.6p1` — **≥ 8.4**, so the proactive (zero-round-trip) data-request path is the default here; this is important for Q7 and Q9. The `kitty.fast_data_types` C extension imports successfully, which is what makes the Python side (`kitty.shm`, the responder) usable at all.
 
+### Loopback `sshd` for connection-reuse observation **[Observed]**
+
+The Q5 connection-reuse observations (the `ssh -O check` probe and the chronological ControlMaster lifecycle) need a reachable SSH **server**. The pinned canonical image ships the OpenSSH **client only** — there is no `sshd` binary, no `/etc/ssh/sshd_config`, no host keys, and no `obsuser` account (only the base `ubuntu`, uid 1000). A loopback `sshd` is therefore installed and started as an explicitly documented **augmentation** of the base image; using a loopback `sshd` for these observations is sanctioned by the task scope. The clean starting state, verified in a fresh container:
+
+```text
+$ dpkg -l openssh-server 2>/dev/null | grep -q '^ii' && echo present || echo "sshd ABSENT (clean)"
+sshd ABSENT (clean)
+$ getent passwd obsuser >/dev/null && echo present || echo "obsuser ABSENT (clean)"
+obsuser ABSENT (clean)
+```
+
+The exact setup — run once, as root, inside the container — is:
+
+```bash
+# 1. install the server (the image has the client only); requires network
+apt-get update && apt-get install -y openssh-server
+# 2. generate host keys (ed25519 is the key referenced by the config below)
+ssh-keygen -A
+# 3. create the observation user (uid 1001) and UNLOCK its password field.
+#    useradd leaves the shadow field '!' (locked); with `UsePAM no` sshd denies
+#    a locked account even for public-key auth, so set it to '*' (valid-but-unusable).
+useradd -m -s /bin/bash obsuser
+usermod -p '*' obsuser
+# 4. give obsuser a key and authorize it for loopback login
+runuser -u obsuser -- ssh-keygen -t ed25519 -N '' -f /home/obsuser/.ssh/id_ed25519
+runuser -u obsuser -- sh -c 'cat /home/obsuser/.ssh/id_ed25519.pub >> /home/obsuser/.ssh/authorized_keys'
+runuser -u obsuser -- chmod 600 /home/obsuser/.ssh/authorized_keys
+# 5. a minimal, loopback-only, public-key-only sshd config
+cat > /tmp/obs_sshd_config <<'CONF'
+Port 22
+ListenAddress 127.0.0.1
+HostKey /etc/ssh/ssh_host_ed25519_key
+PubkeyAuthentication yes
+PasswordAuthentication no
+UsePAM no
+AllowUsers obsuser
+PidFile /tmp/obs_sshd.pid
+X11Forwarding no
+PrintMotd no
+AcceptEnv KITTY_PID KITTY_WINDOW_ID
+CONF
+# 6. start it
+mkdir -p /run/sshd
+/usr/sbin/sshd -f /tmp/obs_sshd_config
+```
+
+After this, `obsuser` can log in over loopback — the precondition for every Q5 reuse capture:
+
+```text
+$ runuser -u obsuser -- ssh -o BatchMode=yes -o StrictHostKeyChecking=no 127.0.0.1 'echo LOOPBACK_OK id=$(id -un)'
+LOOPBACK_OK id=obsuser
+```
+
+Running these exact commands in a *fresh* pinned container (from the clean state above) reproduces the Q5 six-step lifecycle banner-for-banner and exit-code-for-exit-code. The only value that differs between container instances is the `%C` connection hash, because `%C = SHA1(%l%h%p%r)` includes the local hostname `%l` (see Q5) — here the fresh container's hostname is `423ebc7c8e25`, so `%C` resolves to `ba1da0160774ba2f1a669ec5445965e6e1b26cc9` rather than the `kitty_obs` value `f2fc4d857993a5a6f6c64371a664cee177a20700`:
+
+```text
+### ControlPath template: /home/obsuser/.cache/kitty/run/kssh-lifecycle-%C
+
+### [1] absence check (no master yet): ssh -O check
+Control socket connect(/home/obsuser/.cache/kitty/run/kssh-lifecycle-ba1da0160774ba2f1a669ec5445965e6e1b26cc9): No such file or directory
+exit=255
+socket present? -> NONE
+
+### [2] create master: ssh -o ControlMaster=auto -o ControlPersist=yes -N -f
+exit=0
+socket present? -> /home/obsuser/.cache/kitty/run/kssh-lifecycle-ba1da0160774ba2f1a669ec5445965e6e1b26cc9
+
+### [3] master alive check: ssh -O check
+Master running (pid=1201)
+exit=0
+
+### [4] reuse (multiplexed session over the master): ssh <cmd>
+REUSED_ON_MASTER pid=1206
+SSH_CONNECTION=127.0.0.1 35312 127.0.0.1 22
+exit=0
+
+### [5] tear down master: ssh -O exit
+Exit request sent.
+exit=0
+socket present? -> NONE
+
+### [6] absence check after exit: ssh -O check
+Control socket connect(/home/obsuser/.cache/kitty/run/kssh-lifecycle-ba1da0160774ba2f1a669ec5445965e6e1b26cc9): No such file or directory
+exit=255
+```
+
+
 ### The canonical build ran (artifacts present, incremental build exits 0) **[Observed]**
 
 The image ships pre-built; re-running the canonical build command is incremental and exits 0. Output (`/obs/cap/01_build_artifacts.txt` and `/obs/cap/02_build_tail.txt`):
@@ -296,7 +383,7 @@ the kitten layers connection **sharing** and the bootstrap channel on top of it.
 Method: a PATH-first `ssh` shim (full source in Q7 and Q9) records the exact argv the kitten assembled, then exits `0` without connecting. `utils.FindExe("ssh")` [kittens/ssh/utils.go:23] (inside `var SSHExe` [kittens/ssh/utils.go:22]) resolves the shim because it is first on `PATH`. Default config, `kitten ssh 127.0.0.1`, `KITTY_PID=999999` (`/obs/cap/argv_default.log`):
 
 ```text
-=== OBS_SSH_ARGV_BEGIN pid=15530 ts=2026-07-13T18:26:49Z ===
+=== OBS_SSH_ARGV_BEGIN pid=23659 ts=2026-07-13T23:01:44Z ===
 argc=20
 argv[0]=-t
 argv[1]=-o
@@ -312,7 +399,7 @@ argv[10]=ServerAliveCountMax=5
 argv[11]=-o
 argv[12]=TCPKeepAlive=no
 argv[13]=--
-argv[14]=obsuser@127.0.0.1
+argv[14]=127.0.0.1
 argv[15]=exec
 argv[16]=sh
 argv[17]=-c
@@ -364,11 +451,11 @@ func connection_sharing_args(kitty_pid int) ([]string, error) {
 Same invocation with `--kitten share_connections=no` (`/obs/cap/argv_shareno.log`):
 
 ```text
-=== OBS_SSH_ARGV_BEGIN pid=15656 ts=2026-07-13T18:30:24Z ===
+=== OBS_SSH_ARGV_BEGIN pid=23705 ts=2026-07-13T23:02:08Z ===
 argc=8
 argv[0]=-t
 argv[1]=--
-argv[2]=obsuser@127.0.0.1
+argv[2]=127.0.0.1
 argv[3]=exec
 argv[4]=sh
 argv[5]=-c
@@ -930,7 +1017,7 @@ Exit 255 → `master_is_alive = false` → `need_to_request_data` remains `true`
 
 ### One chronological ControlMaster lifecycle, same socket, with exit codes (M-7) **[Observed]**
 
-To show fresh-creation, reuse, and teardown on a *single* `ControlPath`, the auditable helper `/obs/helpers/controlmaster_lifecycle.sh` drives the real `/usr/bin/ssh` against the real loopback `sshd` through one master socket (`%C` resolved via `ssh -G` to the hash `f2fc4d857993a5a6f6c64371a664cee177a20700`). Command: `runuser -u obsuser -- bash /obs/helpers/controlmaster_lifecycle.sh`:
+To show fresh-creation, reuse, and teardown on a *single* `ControlPath`, the auditable helper `/obs/helpers/controlmaster_lifecycle.sh` drives the real `/usr/bin/ssh` against a real loopback `sshd` through one master socket. (The pinned canonical image ships an SSH **client only** — no `sshd` — so the loopback server is installed and started as an explicitly documented augmentation; the exact setup commands are in the preamble subsection **"Loopback `sshd` for connection-reuse observation"**.) The socket's `ControlPath` embeds `%C`, which `ssh -G` resolves here to `f2fc4d857993a5a6f6c64371a664cee177a20700`. That digit string is **environment-specific, not byte-reproducible across environments**: `%C = SHA1(%l%h%p%r)` [ssh_config(5)], and its first component `%l` is the *local hostname* — in this container the container id `bd6e648ef19e` — so `SHA1('bd6e648ef19e' + '127.0.0.1' + '22' + 'obsuser')` yields exactly this hash, while any other host or container instance (with a different `%l`) yields a different one. Command: `runuser -u obsuser -- bash /obs/helpers/controlmaster_lifecycle.sh`:
 
 ```text
 (from /obs/cap/06_controlmaster_lifecycle.txt)
@@ -1011,7 +1098,7 @@ def cleanup_ssh_control_masters() -> None:
             os.remove(x)
 ```
 
-**Reasoning.** The design cleanly separates concerns: OpenSSH owns the actual socket create/reuse (`ControlMaster=auto`), so the kitten never has to race to create a master for the common case; the kitten only *reads* master state (`ssh -O check`) to make its one optimisation decision (skip the TTY round-trip) and, exceptionally, to guarantee a master exists before setting up a reverse port-forward for remote control. Because `%C` in the `ControlPath` is a hash over `(local user, remote host, port, remote user)`, distinct destinations get distinct sockets automatically, and the `kitty_pid` in the template scopes every socket to the owning kitty instance so `cleanup_ssh_control_masters()` can find and close exactly its own masters at quit.
+**Reasoning.** The design cleanly separates concerns: OpenSSH owns the actual socket create/reuse (`ControlMaster=auto`), so the kitten never has to race to create a master for the common case; the kitten only *reads* master state (`ssh -O check`) to make its one optimisation decision (skip the TTY round-trip) and, exceptionally, to guarantee a master exists before setting up a reverse port-forward for remote control. Because `%C` in the `ControlPath` is OpenSSH's SHA-1 hash of `%l%h%p%r` — i.e. `(local hostname, remote host, remote port, remote user)`, per the `ssh_config(5)` TOKENS table ("`%C` — Hash of `%l%h%p%r`"; "`%l` — the local hostname"; note the *local user* is `%u`, which is **not** part of `%C`) — distinct destinations get distinct sockets automatically, and the `kitty_pid` in the template scopes every socket to the owning kitty instance so `cleanup_ssh_control_masters()` can find and close exactly its own masters at quit.
 
 ---
 
