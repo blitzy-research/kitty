@@ -614,7 +614,7 @@ export LANG=C.UTF-8 LC_ALL=C.UTF-8
 cd "$WS/src"                                  # $WS = default build workspace (see (f))
 PYTHONPATH="$WS/src" python3 "$WS/pathA_probe.py"        # exit status: 0
 ```
-All output below is **verbatim** and was **byte‑identical across two runs** (`diff` of the two runs was empty).
+The output below is **verbatim**. The `stdout` block (the graphics‑protocol response bytes) was **byte‑identical across two runs** (`diff` of the two `stdout` captures was empty); the sole exception is the `stderr` `[PARSE ERROR]` line shown after it (section 7b), whose leading `[t]` **elapsed‑seconds stamp** varies between runs while the message text itself is identical (annotated below).
 
 **Complete, unedited output of `pathA_probe.py`:**
 ```
@@ -663,6 +663,7 @@ And the parser‑level error, captured on **stderr** during section 7b (verbatim
 ```
 [0.060] [PARSE ERROR] Malformed GraphicsCommand control block, no = after key, found: 0x7a instead
 ```
+Unlike the `stdout` block above, this `stderr` line is **not** byte‑identical across runs: only its **message text** is stable, while the leading `[t]` is kitty's own **elapsed‑seconds stamp** and therefore varies. The message is emitted by `REPORT_ERROR` (`kitty/parse-graphics-command.h:L158`) through the canonical routing macro `log_error(ERROR_PREFIX " " __VA_ARGS__)` (`kitty/vt-parser.c:L125`, with `ERROR_PREFIX = "[PARSE ERROR]"` at `kitty/data-types.h:L70`); the `[t]` prefix is prepended by `log_error` itself (`fprintf(stderr, "[%.3f] ", monotonic_t_to_s_double(monotonic()))`, `kitty/logging.c:L56`) — the same elapsed‑seconds stamp seen on the cap log in (b.4). Fresh two‑run reproduction: run 1 `[0.137]`, run 2 `[0.051]` (the `[0.060]` above is the value captured when this document's output was first recorded); the message text after the stamp was identical in both runs.
 
 **Reading the output.**
 - **(d.1) 320 MiB storage quota (OBSERVED, default config).** `grman.storage_limit = 335544320` = exactly `320 * 1024 * 1024` (`DEFAULT_STORAGE_LIMIT`, `kitty/graphics.c:L25`); the animation frame cache is `5×` that = `1677721600` (1600 MiB) (`kitty/graphics.c:L1570`).
