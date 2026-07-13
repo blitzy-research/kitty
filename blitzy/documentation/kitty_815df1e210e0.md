@@ -10,7 +10,7 @@
 
 This answer follows a **run‑then‑write** method: every behavioral claim below was produced by **executing kitty's real parser** and pasting its complete, unedited output; code‑only (not‑executed) statements are explicitly labeled **[inferred]**.
 
-**Canonical entry point.** The parser's public API is `search()` in `kitty/search_query_parser.py:L292-296`. This is *literally* the function kitty's match machinery imports and calls — `Boss.match_windows` does `from .search_query_parser import search` (`kitty/boss.py:L475`) and `Boss.match_tabs` does the same (`kitty/boss.py:L509`). Reproducing through `search()` — supplying a location tuple, a universal/candidate set, and a `get_matches` callback, with `allow_no_location=False` (the default) — is therefore a **faithful, canonical reproduction, not a bypass.**
+**Canonical entry point.** The parser's public API is `search()` in `kitty/search_query_parser.py:L292-296`. **[inferred from `kitty/boss.py`]** This is *literally* the function kitty's match machinery imports and calls — `Boss.match_windows` does `from .search_query_parser import search` (`kitty/boss.py:L475`) and `Boss.match_tabs` does the same (`kitty/boss.py:L509`). Reproducing through `search()` — supplying a location tuple, a universal/candidate set, and a `get_matches` callback, with `allow_no_location=False` (the default) — is therefore a **faithful, canonical reproduction, not a bypass.**
 
 **Environment (captured at *probe time* — i.e. before this answer document was authored or committed):**
 
@@ -266,7 +266,7 @@ python3 /tmp/sqp_edge.py "$REPO"
 
 ### Stability & reproducibility (two runs, observed)
 
-Both observation scripts were run **twice**, each run captured to a separate file, then compared with `diff` and `sha256sum`. The commands and their complete, unedited output:
+All three observation scripts were run **twice**, each run captured to a separate file, then compared with `diff` and `sha256sum`. The commands and their complete, unedited output:
 
 #### Command
 
@@ -276,6 +276,10 @@ python3 /tmp/sqp_probe.py "$REPO" > /tmp/probe_run1.out; echo "exit=$?"
 python3 /tmp/sqp_probe.py "$REPO" > /tmp/probe_run2.out; echo "exit=$?"
 diff /tmp/probe_run1.out /tmp/probe_run2.out && echo "byte-identical (diff exit=$?)"
 sha256sum /tmp/probe_run1.out /tmp/probe_run2.out
+python3 /tmp/sqp_fulltuple.py "$REPO" > /tmp/fulltuple_run1.out; echo "exit=$?"
+python3 /tmp/sqp_fulltuple.py "$REPO" > /tmp/fulltuple_run2.out; echo "exit=$?"
+diff /tmp/fulltuple_run1.out /tmp/fulltuple_run2.out && echo "byte-identical (diff exit=$?)"
+sha256sum /tmp/fulltuple_run1.out /tmp/fulltuple_run2.out
 python3 /tmp/sqp_edge.py "$REPO" > /tmp/edge_run1.out; echo "exit=$?"
 python3 /tmp/sqp_edge.py "$REPO" > /tmp/edge_run2.out; echo "exit=$?"
 diff /tmp/edge_run1.out /tmp/edge_run2.out && echo "byte-identical (diff exit=$?)"
@@ -293,11 +297,16 @@ byte-identical (diff exit=0)
 exit=0
 exit=0
 byte-identical (diff exit=0)
+42d536135faab4fba5a0556d56a629d74d9e8826d37cef3e99ff4095eee51215  /tmp/fulltuple_run1.out
+42d536135faab4fba5a0556d56a629d74d9e8826d37cef3e99ff4095eee51215  /tmp/fulltuple_run2.out
+exit=0
+exit=0
+byte-identical (diff exit=0)
 eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5  /tmp/edge_run1.out
 eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5  /tmp/edge_run2.out
 ```
 
-Both `sqp_probe.py` runs are byte-identical (full SHA-256 `8520dc094b221176b4bd14926b5953343c84d3eee71165704e57eb7f3220cead`) and both `sqp_edge.py` runs are byte-identical (`eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5`); every run exited `0`. **This determinism was observed directly at runtime** — there is no run-to-run variability, and the only "inconsistency" is the precedence effect itself.
+All three observation scripts' runs are byte-identical: `sqp_probe.py` (full SHA-256 `8520dc094b221176b4bd14926b5953343c84d3eee71165704e57eb7f3220cead`), `sqp_fulltuple.py` (`42d536135faab4fba5a0556d56a629d74d9e8826d37cef3e99ff4095eee51215`), and `sqp_edge.py` (`eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5`); every run exited `0`. **This determinism was observed directly at runtime** — there is no run-to-run variability, and the only "inconsistency" is the precedence effect itself.
 
 *Separately — a code-read note, and NOT the cause of the determinism observed above:* `build_tree` is decorated `@lru_cache(maxsize=64)` (`kitty/search_query_parser.py:L281`), so repeating an identical `(query, locations)` input returns the already-parsed AST object instead of re-parsing it. **[inferred]** this cache only memoizes the parse *result*; it does not change parse or evaluation semantics — the identical output above would hold even with the cache disabled, because the parser is a deterministic pure function of its input.
 
@@ -372,6 +381,8 @@ rm -f /tmp/sqp_probe.py /tmp/sqp_edge.py /tmp/sqp_fulltuple.py
 ls -1 /tmp/sqp_*.py 2>&1              # confirm no observation script remains
 git diff --name-status "$BASE"       # only difference vs the baseline commit
 git diff --name-status "$BASE" HEAD  # ... same, against the committed HEAD
+echo "STATUS_BEGIN"; git status --porcelain=v1; echo "STATUS_END"                        # clean working tree (empty between markers)
+echo "UNTRACKED_BEGIN"; git ls-files --others --exclude-standard; echo "UNTRACKED_END"   # no untracked files (empty between markers)
 ```
 
 #### Complete, unedited output
@@ -380,9 +391,13 @@ git diff --name-status "$BASE" HEAD  # ... same, against the committed HEAD
 ls: cannot access '/tmp/sqp_*.py': No such file or directory
 A	blitzy/documentation/kitty_815df1e210e0.md
 A	blitzy/documentation/kitty_815df1e210e0.md
+STATUS_BEGIN
+STATUS_END
+UNTRACKED_BEGIN
+UNTRACKED_END
 ```
 
-The `ls` line confirms **no `/tmp/sqp_*.py` observation script remains**, and both `git diff` forms show that the **only** change relative to the baseline commit is a single **added** file — this answer document. No existing repository file was modified, added, or deleted. After this document is committed, `git status --porcelain` reports a clean working tree (no other pending changes).
+The `ls` line confirms **no `/tmp/sqp_*.py` observation script remains**, and both `git diff` forms show that the **only** change relative to the baseline commit is a single **added** file — this answer document. No existing repository file was modified, added, or deleted. The empty block between `STATUS_BEGIN`/`STATUS_END` is the output of `git status --porcelain=v1` (a **clean working tree**, no other pending changes), and the empty block between `UNTRACKED_BEGIN`/`UNTRACKED_END` is `git ls-files --others --exclude-standard` (**no untracked files**); this reflects the delivered state, i.e. after this answer document is committed.
 
 `/tmp/sqp_probe.py` (conditions a–e + fix form + mixed variant):
 
