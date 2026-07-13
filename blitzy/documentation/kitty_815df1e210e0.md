@@ -12,7 +12,7 @@ This answer follows a **run‑then‑write** method: every behavioral claim belo
 
 **Canonical entry point.** The parser's public API is `search()` in `kitty/search_query_parser.py:L292-296`. This is *literally* the function kitty's match machinery imports and calls — `Boss.match_windows` does `from .search_query_parser import search` (`kitty/boss.py:L475`) and `Boss.match_tabs` does the same (`kitty/boss.py:L509`). Reproducing through `search()` — supplying a location tuple, a universal/candidate set, and a `get_matches` callback, with `allow_no_location=False` (the default) — is therefore a **faithful, canonical reproduction, not a bypass.**
 
-**Environment (observed):**
+**Environment (captured at *probe time* — i.e. before this answer document was authored or committed):**
 
 ```console
 $ git rev-parse --abbrev-ref HEAD
@@ -25,9 +25,9 @@ $ wc -c kitty/__init__.py
 0 kitty/__init__.py
 ```
 
-- **Source / commit.** The document name `kitty_815df1e210e0` derives from the source branch. The working tree here is checked out on the Blitzy branch shown above, but its `HEAD` commit is exactly `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (short `815df1e21`) — i.e. the tree *is* at the `kitty_815df1e210e0` commit, so every `file:line` citation matches this branch.
+- **Source / commit.** The document name `kitty_815df1e210e0` derives from the source branch. The commands above were captured **at probe time — before this answer document was authored or committed** — when `HEAD` was still the baseline commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (short `815df1e21`), i.e. the `kitty_815df1e210e0` commit, so every `file:line` citation matches this branch. The delivered artifact is a **new commit stacked on top of that baseline** that adds only this one file, so the *delivered* `HEAD` is no longer equal to `815df1e21`; the invariant that matters for provenance is that the change **relative to the baseline** is exactly one added file — shown in the Appendix under *"Final repository state (verified after cleanup)"* via `git diff --name-status 815df1e21`.
 - **Interpreter.** Behavior was reproduced on **CPython 3.13.7**. The repository declares `requires-python = ">=3.8"` (`pyproject.toml:L2`) and its CI runs the test matrix on Python 3.8 / 3.9 / 3.10 with a 3.11 docs job (`.github/workflows/ci.yml`, `pyver` at L26/L34/L30, docs `python-version` L85). The parse‑tree/precedence logic is **pure‑Python and version‑independent** across these — **[inferred]** from the fact that `kitty/__init__.py` is **0 bytes** (confirmed above), so `import kitty.search_query_parser` pulls in **no compiled modules**; it imports only the standard library plus `kitty.types` (`kitty/search_query_parser.py:L3-9`). No build step is required.
-- **Read‑only.** No existing repository file was modified. The only observation scripts (`/tmp/sqp_probe.py`, `/tmp/sqp_edge.py`) were created **outside** the repository and deleted after use; their source is reproduced in the Appendix so the results remain verifiable.
+- **Read‑only.** No existing repository file was modified — the only change to the repository is this single answer document. The observation scripts (`/tmp/sqp_probe.py`, `/tmp/sqp_edge.py`, `/tmp/sqp_fulltuple.py`) were created **outside** the repository (under `/tmp`) and deleted after use; their source is reproduced in the Appendix so the results remain verifiable. The post-cleanup filesystem check and the final `git` state — exactly one added file relative to the baseline — are shown in the Appendix under *"Final repository state (verified after cleanup)"*.
 
 **Model of the demo.** The probe uses a simulated window universe of `id → title`:
 
@@ -35,7 +35,7 @@ $ wc -c kitty/__init__.py
 {1: 'foo', 2: 'bar', 3: 'baz', 4: 'foobar', 5: 'qux'}
 ```
 
-with `LOCATIONS = ('id', 'title')` — a subset of the real 11‑field window tuple (`kitty/boss.py:L494`). Only `id`/`title` appear in the demo queries, and the `get_matches` callback faithfully mirrors kitty's real per‑field matchers: **`id` → exact string equality** (`kitty/window.py:L770`, `pat.pattern == str(self.id)`) and **`title` → regex search** (`kitty/window.py:L774`, `pat.search(...) is not None`). Using the full tuple yields identical results for these queries. This is the canonical `search()` contract, not a bypass.
+with `LOCATIONS = ('id', 'title')` — a subset of the real 11‑field window tuple (`kitty/boss.py:L494`). Only `id`/`title` appear in the demo queries. **[inferred — read from source]** the `get_matches` callback mirrors kitty's real per‑field matchers: **`id` → exact string equality** (`kitty/window.py:L770`, `pat.pattern == str(self.id)`) and **`title` → regex search** (`kitty/window.py:L774`, `pat.search(...) is not None`). That the result sets do **not** change when the real full 11-field tuple is used in place of the `('id','title')` subset is **not merely asserted — it is demonstrated at runtime** in Section 3 under *"Full-tuple equivalence (observed)"*. This is the canonical `search()` contract, not a bypass.
 
 ---
 
@@ -129,7 +129,7 @@ Each AST node is callable and operates on a candidate set:
 **[inferred from `kitty/boss.py`]** Both real callers invoke `search()` **without** passing `allow_no_location`, so it defaults to `False`:
 
 - **`Boss.match_windows`** (def `:L471`): imports `search` (`:L475`), defines a `get_matches` closure that calls `Window.matches_query` (`:L491`), and calls `search(match, ( 'id','title','pid','cwd','cmdline','num','env','var','recent','state','neighbor' ), set(self.window_id_map), get_matches)` (`:L493-495`).
-- **`Boss.match_tabs`** (def `:L505`): imports `search` (`:L509`), calls `Tab.matches_query` (`:L526`), and calls `search(match, ( 'id','index','title','window_id','window_title','pid','cwd','env','var','cmdline','recent','state' ), set(tim), get_matches)` (`:L529-531`); if no tab matches directly it falls back to the windows of matching windows (`:L535-539`).
+- **`Boss.match_tabs`** (def `:L505`): imports `search` (`:L509`), calls `Tab.matches_query` (`:L526`), and calls `search(match, ( 'id','index','title','window_id','window_title','pid','cwd','env','var','cmdline','recent','state' ), set(tim), get_matches)` (`:L529-531`); if no tab matches directly, it falls back to **the tabs that contain windows matched by the same expression** — i.e. `self.match_windows(match)` mapped through `self.tab_for_window(...)` (`:L535-539`).
 
 The per‑item matchers are `Window.matches_query` (`kitty/window.py:L784`, using `matches` at `:L761`, patterns compiled by `compile_match_query` at `:L213`) and `Tab.matches_query` (`kitty/tabs.py:L800`). The same match machinery is reached from several user‑facing surfaces — remote control `--match` / `--match-tab` (`kitty/rc/base.py`: `match_windows` `:L367` & `:L400`, `match_tabs` `:L377` & `:L404`), the `when_focus_on` key‑mapping condition (`kitty/keys.py:L123`, `:L125`, wrapper `:L223-224`), and tab/detach operations (`kitty/tabs.py:L995`, `kitty/rc/detach_tab.py:L38`, `kitty/rc/detach_window.py:L54`). So the precedence you hit applies everywhere kitty matches windows or tabs.
 
@@ -151,7 +151,7 @@ graph TD
 
 ## Section 3 — Runtime demonstration (the evidence)
 
-All output below is **complete and unedited**, captured through the canonical `search()` API. Each script was run **twice**; the two runs were **byte‑identical** (verified by `sha256sum` — probe `8520dc09…`, edge `eb92d57c…`), consistent with `build_tree` being deterministic and `@lru_cache`‑backed (`kitty/search_query_parser.py:L281`).
+All output below is **complete and unedited**, captured through the canonical `search()` API. Each script was run **twice** and the two runs were verified **byte-identical**; the exact commands, exit statuses, `diff` result, and full `sha256sum` digests are shown at the end of this section under *"Stability & reproducibility (two runs, observed)"*.
 
 ### Command (conditions a–e, plus the fix form and a mixed variant)
 
@@ -197,6 +197,56 @@ QUERY: 'title:foo or title:bar or title:baz'
 - **(d) all‑explicit `or` chain** — `title:foo or title:baz or title:qux` → `OR(TOK[title:foo], OR(TOK[title:baz], TOK[title:qux]))` → **`[1, 3, 4, 5]`** (every term's matches included). And the **fix form** for your case, `title:foo or title:bar or title:baz` → `OR(TOK[title:foo], OR(TOK[title:bar], TOK[title:baz]))` → **`[1, 2, 3, 4]`** — now window 2 (`bar`) *is* included, because every term is joined by an explicit `or`. This is the result you originally expected. *(The mixed variant `title:foo or title:baz title:qux` → `[1, 4]` reinforces (c): again the trailing space is an `AND`, dropping `baz` and `qux` unless something matches both.)*
 - **(e) parenthesized group** — `(title:foo or title:bar) and title:foobar` → `AND(OR(TOK[title:foo], TOK[title:bar]), TOK[title:foobar])` → **`[4]`**; and `(title:bar or title:baz) title:foobar` → `AND(OR(TOK[title:bar], TOK[title:baz]), TOK[title:foobar])` → **`[4]`**. Parentheses force the `OR` to be grouped first, overriding the default precedence — note the second example uses a bare space for the outer `AND` and still groups the `OR` correctly.
 
+### Full-tuple equivalence (observed)
+
+The demonstration above uses `LOCATIONS = ('id', 'title')`, a subset of the real 11-field window tuple. To prove the subset does not alter the results, the same eight queries were re-run through the canonical `search()` twice: once with the `('id','title')` subset and once with the **exact** full window tuple that `Boss.match_windows` supplies — `('id','title','pid','cwd','cmdline','num','env','var','recent','state','neighbor')` (`kitty/boss.py:L494`) — comparing the two result sets per query.
+
+#### Command
+
+```bash
+python3 /tmp/sqp_fulltuple.py "$REPO"
+```
+
+#### Complete, unedited output
+
+```text
+QUERY: 'title:foo or title:bar'
+  subset(id,title) : [1, 2, 4]
+  full 11-field    : [1, 2, 4]
+  identical        : True
+QUERY: 'title:foo title:bar'
+  subset(id,title) : [4]
+  full 11-field    : [4]
+  identical        : True
+QUERY: 'title:foo or title:bar title:baz'
+  subset(id,title) : [1, 4]
+  full 11-field    : [1, 4]
+  identical        : True
+QUERY: 'title:foo or title:baz or title:qux'
+  subset(id,title) : [1, 3, 4, 5]
+  full 11-field    : [1, 3, 4, 5]
+  identical        : True
+QUERY: 'title:foo or title:baz title:qux'
+  subset(id,title) : [1, 4]
+  full 11-field    : [1, 4]
+  identical        : True
+QUERY: '(title:foo or title:bar) and title:foobar'
+  subset(id,title) : [4]
+  full 11-field    : [4]
+  identical        : True
+QUERY: '(title:bar or title:baz) title:foobar'
+  subset(id,title) : [4]
+  full 11-field    : [4]
+  identical        : True
+QUERY: 'title:foo or title:bar or title:baz'
+  subset(id,title) : [1, 2, 3, 4]
+  full 11-field    : [1, 2, 3, 4]
+  identical        : True
+ALL_QUERIES_IDENTICAL: True
+```
+
+Every query reports `identical : True`, and the run ends with `ALL_QUERIES_IDENTICAL: True`. The `('id','title')` subset used in the demonstration is therefore faithful to the full window tuple — the equivalence is now **observed at runtime**, not merely asserted.
+
 ### (f) Bare‑word error path
 
 ### Command
@@ -214,7 +264,42 @@ python3 /tmp/sqp_edge.py "$REPO"
 
 - **(f) bare‑word error path** — On the real match path (`allow_no_location=False`), **every term needs a `field:` prefix**. A bare word raises `NoLocation` (a `ParseException`) with `No location specified before <word>`. This matters because the mental model "match at least one term" often includes *bare* words like `foo or bar` — but kitty rejects those outright (`base_token()` at `kitty/search_query_parser.py:L278`; message from `NoLocation.__init__` at `:L143`) rather than silently mishandling them.
 
-**Stability.** As noted above, both scripts produced **identical output across two runs** (matching SHA‑256 sums), tying to the `@lru_cache`‑backed determinism of `build_tree` (`:L281`). There is no run‑to‑run variability; the only "inconsistency" is the precedence effect itself.
+### Stability & reproducibility (two runs, observed)
+
+Both observation scripts were run **twice**, each run captured to a separate file, then compared with `diff` and `sha256sum`. The commands and their complete, unedited output:
+
+#### Command
+
+```bash
+REPO="$(git rev-parse --show-toplevel)"
+python3 /tmp/sqp_probe.py "$REPO" > /tmp/probe_run1.out; echo "exit=$?"
+python3 /tmp/sqp_probe.py "$REPO" > /tmp/probe_run2.out; echo "exit=$?"
+diff /tmp/probe_run1.out /tmp/probe_run2.out && echo "byte-identical (diff exit=$?)"
+sha256sum /tmp/probe_run1.out /tmp/probe_run2.out
+python3 /tmp/sqp_edge.py "$REPO" > /tmp/edge_run1.out; echo "exit=$?"
+python3 /tmp/sqp_edge.py "$REPO" > /tmp/edge_run2.out; echo "exit=$?"
+diff /tmp/edge_run1.out /tmp/edge_run2.out && echo "byte-identical (diff exit=$?)"
+sha256sum /tmp/edge_run1.out /tmp/edge_run2.out
+```
+
+#### Complete, unedited output
+
+```text
+exit=0
+exit=0
+byte-identical (diff exit=0)
+8520dc094b221176b4bd14926b5953343c84d3eee71165704e57eb7f3220cead  /tmp/probe_run1.out
+8520dc094b221176b4bd14926b5953343c84d3eee71165704e57eb7f3220cead  /tmp/probe_run2.out
+exit=0
+exit=0
+byte-identical (diff exit=0)
+eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5  /tmp/edge_run1.out
+eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5  /tmp/edge_run2.out
+```
+
+Both `sqp_probe.py` runs are byte-identical (full SHA-256 `8520dc094b221176b4bd14926b5953343c84d3eee71165704e57eb7f3220cead`) and both `sqp_edge.py` runs are byte-identical (`eb92d57c98b6504720886c60b58ed0fdf9d564d96dbd0e1e736fd9c92aedd6e5`); every run exited `0`. **This determinism was observed directly at runtime** — there is no run-to-run variability, and the only "inconsistency" is the precedence effect itself.
+
+*Separately — a code-read note, and NOT the cause of the determinism observed above:* `build_tree` is decorated `@lru_cache(maxsize=64)` (`kitty/search_query_parser.py:L281`), so repeating an identical `(query, locations)` input returns the already-parsed AST object instead of re-parsing it. **[inferred]** this cache only memoizes the parse *result*; it does not change parse or evaluation semantics — the identical output above would hold even with the cache disabled, because the parser is a deterministic pure function of its input.
 
 ---
 
@@ -244,7 +329,7 @@ Grounded in the Section 3 evidence, here is how to get "match at least one of th
 
 **The pitfall to avoid:** mixing `or` with spaces, e.g. `A or B C`. The space is **not** another `or` — it is a tighter‑binding **implicit `AND`**, so the query means `A OR (B AND C)`. If you meant "A or B or C", write all three with explicit `or`.
 
-**Documented baseline (for reference).** kitty's own test suite encodes the expected‑behavior baseline in `kitty_tests/search_query_parser.py:L10-30`: `id:1 or id:2` → `{1, 2}` (`:L25`), `id:1 and id:2` → `{}` (`:L26`), `not id:1` → the complement (`:L27`), `(id:1 or id:2) and id:1` → `{1}` (`:L28`), and bare `1` / `"id:1"` → `ParseException` (`:L29-30`). Note that **no existing test mixes an implicit space‑`AND` with an explicit `or`** — i.e. the exact combination you hit (`A or B C`) is untested, which is consistent with it being an easy‑to‑miss, undocumented interaction rather than a defect.
+**Documented baseline (for reference). [inferred — read from `kitty_tests/search_query_parser.py`, not executed here.]** kitty's own test suite encodes the expected‑behavior baseline in `kitty_tests/search_query_parser.py:L10-30`: `id:1 or id:2` → `{1, 2}` (`:L25`), `id:1 and id:2` → `{}` (`:L26`), `not id:1` → the complement (`:L27`), `(id:1 or id:2) and id:1` → `{1}` (`:L28`), and bare `1` / `"id:1"` → `ParseException` (`:L29-30`). Note that **no existing test mixes an implicit space‑`AND` with an explicit `or`** — i.e. the exact combination you hit (`A or B C`) is untested, which is consistent with it being an easy‑to‑miss, undocumented interaction rather than a defect.
 
 ---
 
@@ -252,7 +337,7 @@ Grounded in the Section 3 evidence, here is how to get "match at least one of th
 
 The behavior is correct, but the rule that **a space means implicit `AND`** appears to be **undocumented**, which is the most likely origin of the confusion:
 
-- **User‑facing syntax docs** — `docs/remote-control.rst` (`_search_syntax`, label at `:L327`; body `:L332-338`) describe match expressions of the form `field:query` (`:L335`) that can be "combined using Boolean operators" (`:L337`), and give examples at `:L340-343`:
+- **[inferred — read from `docs/remote-control.rst`, not executed] User-facing syntax docs** — `docs/remote-control.rst` (`_search_syntax`, label at `:L327`; body `:L332-338`) describe match expressions of the form `field:query` (`:L335`) that can be "combined using Boolean operators" (`:L337`), and give examples at `:L340-343`:
 
   ```text
   title:"My special window" or id:43
@@ -263,17 +348,41 @@ The behavior is correct, but the rule that **a space means implicit `AND`** appe
 
   **Every example uses an explicit operator or parentheses — none uses a bare space.** The implicit‑`AND` rule is never stated.
 
-- **Per‑field help strings** — `MATCH_WINDOW_OPTION` (`kitty/rc/base.py:L87`) and `MATCH_TAB_OPTION` (`kitty/rc/base.py:L131`) likewise reference "combined using Boolean operators" (`:L93` / `:L137`) but never mention that a space means `AND`. These strings are generated into `docs/generated/matching.rst` at build time by `docs/conf.py` (imports the options `:L594`, opens the file `:L595`, processes `MATCH_WINDOW_OPTION` `:L598` and `MATCH_TAB_OPTION` `:L602`).
+- **[inferred — read from `kitty/rc/base.py` and `docs/conf.py`, not executed] Per-field help strings** — `MATCH_WINDOW_OPTION` (`kitty/rc/base.py:L87`) and `MATCH_TAB_OPTION` (`kitty/rc/base.py:L131`) likewise reference "combined using Boolean operators" (`:L93` / `:L137`) but never mention that a space means `AND`. These strings are generated into `docs/generated/matching.rst` at build time by `docs/conf.py` (imports the options `:L594`, opens the file `:L595`, processes `MATCH_WINDOW_OPTION` `:L598` and `MATCH_TAB_OPTION` `:L602`).
 
 **Recommendation (a suggestion only — this task does NOT modify any of these files):** the syntax docs and/or the `MATCH_*_OPTION` help text could add one clarifying sentence, e.g. *"A bare space between two terms is an implicit `and` that binds more tightly than `or`; to OR several terms, put an explicit `or` between each."* That single sentence would prevent exactly the misunderstanding reported here.
 
-**Accuracy note (version drift).** kitty's current *online* documentation lists an additional `session` match field. That field is **not** present in this checked‑out branch's window location tuple (`kitty/boss.py:L494`, which is `id, title, pid, cwd, cmdline, num, env, var, recent, state, neighbor`). This document treats the **checked‑out code as authoritative**; the discrepancy is noted but does not affect the precedence conclusion.
+**Accuracy note (version drift). [inferred, external documentation — not from this checked-out branch.]** kitty's current *online* remote-control documentation lists an additional `session` match field for windows; there the window match fields are given as `id, title, pid, cwd, cmdline, num, env, var, state, neighbor, session and recent` (source: kitty official remote-control documentation, <https://sw.kovidgoyal.net/kitty/remote-control/>, accessed 2026-07-13). That `session` field is **not** present in this checked-out branch's window location tuple (`kitty/boss.py:L494`, which is `id, title, pid, cwd, cmdline, num, env, var, recent, state, neighbor`). This document treats the **checked-out code as authoritative**; the discrepancy is noted but does not affect the precedence conclusion.
 
 ---
 
 ## Appendix — Temporary observation scripts (created outside the repo, since deleted)
 
 These scripts were created under `/tmp` (outside the repository), run to produce the output in Section 3, and then deleted, leaving the repository unchanged. They are reproduced here so the results can be independently re‑verified. Run with `python3 /tmp/sqp_probe.py "$(git rev-parse --show-toplevel)"`.
+
+### Final repository state (verified after cleanup)
+
+After the observation scripts had been run, they were removed and the repository state was checked against the baseline commit `815df1e21` (the `kitty_815df1e210e0` commit). Commands and complete, unedited output:
+
+#### Command
+
+```bash
+BASE=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+rm -f /tmp/sqp_probe.py /tmp/sqp_edge.py /tmp/sqp_fulltuple.py
+ls -1 /tmp/sqp_*.py 2>&1              # confirm no observation script remains
+git diff --name-status "$BASE"       # only difference vs the baseline commit
+git diff --name-status "$BASE" HEAD  # ... same, against the committed HEAD
+```
+
+#### Complete, unedited output
+
+```text
+ls: cannot access '/tmp/sqp_*.py': No such file or directory
+A	blitzy/documentation/kitty_815df1e210e0.md
+A	blitzy/documentation/kitty_815df1e210e0.md
+```
+
+The `ls` line confirms **no `/tmp/sqp_*.py` observation script remains**, and both `git diff` forms show that the **only** change relative to the baseline commit is a single **added** file — this answer document. No existing repository file was modified, added, or deleted. After this document is committed, `git status --porcelain` reports a clean working tree (no other pending changes).
 
 `/tmp/sqp_probe.py` (conditions a–e + fix form + mixed variant):
 
@@ -359,4 +468,54 @@ for q in ['title:foo or bar', 'foo or bar']:
         print(f"{q!r}: OK -> {sorted(res)}")
     except ParseException as e:
         print(f"{q!r}: {type(e).__name__}(ParseException) -> {e.msg}")
+```
+
+`/tmp/sqp_fulltuple.py` (full 11-field tuple vs `(id,title)` subset — the Section 3 *Full-tuple equivalence* check):
+
+```python
+#!/usr/bin/env python3
+# Temporary observation script (OUTSIDE the repo). Re-runs the SAME queries
+# through the CANONICAL search() with (a) the (id,title) subset used in the
+# demo and (b) the REAL full 11-field window location tuple from
+# Boss.match_windows (kitty/boss.py:494), and compares the result sets.
+import sys, os, re
+REPO = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+sys.path.insert(0, REPO)
+from kitty.search_query_parser import search
+
+WINDOWS = {1: 'foo', 2: 'bar', 3: 'baz', 4: 'foobar', 5: 'qux'}
+SUBSET = ('id', 'title')
+FULL   = ('id', 'title', 'pid', 'cwd', 'cmdline', 'num', 'env', 'var', 'recent', 'state', 'neighbor')  # kitty/boss.py:494
+UNIVERSAL = set(WINDOWS)
+
+def get_matches(location, query, candidates):
+    out = set()
+    for wid in candidates:
+        if location == 'id' and query == str(wid):
+            out.add(wid)
+        elif location == 'title' and re.search(query, WINDOWS[wid]) is not None:
+            out.add(wid)
+    return out
+
+QUERIES = [
+    'title:foo or title:bar',
+    'title:foo title:bar',
+    'title:foo or title:bar title:baz',
+    'title:foo or title:baz or title:qux',
+    'title:foo or title:baz title:qux',
+    '(title:foo or title:bar) and title:foobar',
+    '(title:bar or title:baz) title:foobar',
+    'title:foo or title:bar or title:baz',
+]
+all_identical = True
+for q in QUERIES:
+    r_sub  = sorted(search(q, SUBSET, UNIVERSAL, get_matches))
+    r_full = sorted(search(q, FULL,   UNIVERSAL, get_matches))
+    same = (r_sub == r_full)
+    all_identical = all_identical and same
+    print(f"QUERY: {q!r}")
+    print(f"  subset(id,title) : {r_sub}")
+    print(f"  full 11-field    : {r_full}")
+    print(f"  identical        : {same}")
+print(f"ALL_QUERIES_IDENTICAL: {all_identical}")
 ```
