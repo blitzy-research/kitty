@@ -239,6 +239,7 @@ Keys are abbreviated on the wire to reduce overhead
 | id | `id` | safe_string (session id) |
 | file_id | `fid` | safe_string |
 | bypass | `pw` | see drift note below |
+| quiet | `q` | integer (0 = verbose / 1 = only errors / 2 = totally silent) |
 | mtime | `mod` | integer nanoseconds |
 | permissions | `prm` | integer (octal value in decimal) |
 | size | `sz` | integer |
@@ -334,7 +335,14 @@ payload; `Hash(2)`=`uint16 size` + checksum; `BlockRange(3)`=`uint64 start` + `u
 
 ### The match mechanism
 
-The sender detects matches by rolling the weak checksum byte-by-byte and, on a weak-hash hit,
+The sender's delta is produced by `Differ.CreateDelta(src, output)`
+[SOURCE-VERIFIED: tools/rsync/api.go:230] — invoked by the transfer kitten as
+`self.delta_loader = self.differ.CreateDelta(self.actual_file, self.deltabuf)`
+[SOURCE-VERIFIED: kittens/transfer/send.go:768] — which loads the previously received signature and
+delegates to the streaming `(*rsync).CreateDiff` [SOURCE-VERIFIED: tools/rsync/api.go:239]. The
+low-level convenience wrapper `(*rsync).CreateDelta` funnels through the same `CreateDiff` and
+collects the ops into a slice [SOURCE-VERIFIED: tools/rsync/algorithm.go:599-601]. That routine
+detects matches by rolling the weak checksum byte-by-byte and, on a weak-hash hit,
 confirming with the strong hash [SOURCE-VERIFIED: tools/rsync/algorithm.go]: `hash_lookup
 map[uint32][]BlockHash` is keyed by weak hash and built from the received signature
 [algorithm.go:366,617-623]; the window advances via `self.rc.add_one_byte(...)` [algorithm.go:543];
@@ -353,13 +361,20 @@ delta payload bytes: 1010 (vs full src 200777 bytes)
 op counts: {'OpBlock': 0, 'OpData': 2, 'OpHash': 1, 'OpBlockRange': 1}
 first ops: OpData(size=777) -> OpBlockRange(start=0,+446) -> OpData(size=191) -> OpHash(size=16)
 literal OpData bytes total: 968 (~= the 777 prepended novel bytes)
-blocks referenced (OpBlock + sum OpBlockRange spans): 447 of 400 basis blocks (200000/500)
+blocks referenced (OpBlock + sum OpBlockRange spans): 447 of 448 basis blocks (200000/447)
 ```
 
-Only the 777 prepended bytes (plus a 191-byte trailing remainder) were sent as literal `OpData`; the
-original blocks were referenced by their **original index** through a single `OpBlockRange[0..446]`,
-even though every one had shifted 777 bytes later in the file [OBSERVED]. The position-independent
-lookup that makes this possible is `self.hash_lookup[self.rc.val]`
+Here the basis file's block size is `round(sqrt(200000))` = **447** bytes
+[SOURCE-VERIFIED: kittens/transfer/algorithm.c:204] (distinct from the 500-byte block size of the
+250,000-byte example above, which is `round(sqrt(250000))` = 500), so the 200,000-byte basis divides
+into 447 full 447-byte blocks (447 × 447 = 199,809 bytes) plus a 191-byte partial trailing block —
+**448 basis blocks** in total, matching the 448 signature records the receiver emitted. Only the 777
+prepended bytes plus that 191-byte partial tail were sent as literal `OpData` (447 × 447 + 191 + 777 =
+200,777 = the full new-file size, confirmed by the reconstruction cross-check [OBSERVED]); the partial
+tail cannot be matched as a whole block because it is shorter than the 447-byte rolling window. The
+447 full original blocks were referenced by their **original index** through a single
+`OpBlockRange[0..446]`, even though every one had shifted 777 bytes later in the file [OBSERVED]. The
+position-independent lookup that makes this possible is `self.hash_lookup[self.rc.val]`
 [SOURCE-VERIFIED: tools/rsync/algorithm.go:532-567]; the C server's analogue is
 [SOURCE-VERIFIED: kittens/transfer/algorithm.c:719-747].
 
@@ -534,8 +549,16 @@ Both runs completed to a byte-identical copy of the source; the mechanism is sta
 
 ### No persistent sidecar, but a transient patch file (precise wording)
 
-There is no persistent resume-metadata sidecar — the signature is computed on the fly and held in
-memory. During an rsync **patch**, however, `PatchFile` creates a **transient** output file:
+There is no persistent resume-metadata sidecar — the signature is computed **on the fly**, block by
+block, by `PatchFile.next_signature_block` [SOURCE-VERIFIED: kitty/file_transmission.py:426] and
+streamed straight back to the sender by `FileTransmission.transmit_rsync_signature`
+[SOURCE-VERIFIED: kitty/file_transmission.py:1081]; the only in-memory retention is the transient
+backpressure buffer `ActiveReceive.signature_pending_chunks` (a `Deque[FileTransmissionCommand]`)
+[SOURCE-VERIFIED: kitty/file_transmission.py:599], into which a signature chunk is appended only when
+the child pipe is momentarily full [SOURCE-VERIFIED: kitty/file_transmission.py:1119,1121] and which
+is drained first on the next scheduled pass before more blocks are read
+[SOURCE-VERIFIED: kitty/file_transmission.py:1086-1088]. During an rsync **patch**, however,
+`PatchFile` creates a **transient** output file:
 `tempfile.NamedTemporaryFile(mode='wb', dir=os.path.dirname(realpath(path)), delete=False)`
 [SOURCE-VERIFIED: kitty/file_transmission.py:392], and on close it does
 `os.replace(self.dest_file.name, self.src_file.name)`
@@ -700,7 +723,7 @@ text file reduced to a 125-byte on-wire data payload by default and was 18,000 b
 | 3 | C then Python then Go constant propagation | Q3 one-definition | SOURCE (control-codes.h:233; data-types.c:596; go_code.py:575,597) |
 | 4 | `FileTransmissionCommand.Serialize()` + OSC prefix | Q1 initiation | SOURCE (ftc.go:163-222; send.go:384,647-648) |
 | 5 | Session id / file id correlation, action/status interleaving | Q1 ordering | OBSERVED |
-| 6 | All key abbreviations (ac/zip/ft/tt/id/fid/pw/mod/prm/sz/n/st/pr/d) | Q1 table | SOURCE (spec:558-576) |
+| 6 | All 15 key abbreviations (ac/zip/ft/tt/id/fid/pw/q/mod/prm/sz/n/st/pr/d) | Q1 table | SOURCE (spec:558-576) |
 | 7 | `pw` spec (safe_string) vs impl (base64) drift | Q1 drift note | SOURCE (spec:567; ftc.go:129; file_transmission.py:260) |
 | 8 | `safe_string` excludes `;` | Q1 abbreviations | SOURCE (spec:589-601) |
 | 9 | base64 RawStdEncoding, no padding | Q3 encoding | OBSERVED + SOURCE (ftc.go:178-189) |
