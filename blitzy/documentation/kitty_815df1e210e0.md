@@ -6,7 +6,7 @@ An investigative, runtime-observed answer, grounded in captured output and `file
 
 - **Investigated software:** `kitty` terminal emulator, repository `kovidgoyal/kitty`.
 - **Investigated (source) commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Every `file:line` citation in this document refers to the tree at that commit.
-- **This document lives** on branch `blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad`. The branch `HEAD` at authoring time was the commit that first added this file (`9fd0da15ff09436c0c3c40eb7dbdda3556358f34`, *"docs: add investigative answer for kitty child-exit-0 behavior"*); this HEAD is the **documentation** commit, **not** a commit of the investigated source. No source file under `kitty/`, `kittens/`, `tools/`, or `shell-integration/` was modified — the only change on this branch is the creation of this Markdown file.
+- **This document lives** on branch `blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad`. It was first added by a **documentation** commit (`9fd0da15ff09436c0c3c40eb7dbdda3556358f34`, *"docs: add investigative answer for kitty child-exit-0 behavior"*) and has since received documentation-only revisions (including a QA-driven correction to the duration-gate discussion); every commit on this branch touches only this Markdown file, never the investigated source, so the branch `HEAD` advances but is **not** load-bearing. The durable, HEAD-independent invariant is that the branch's source tree is **byte-identical to the investigated commit** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`: the sole delta versus that commit is the addition of this file — `git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD` reports exactly `A blitzy/documentation/kitty_815df1e210e0.md`. No file under `kitty/`, `kittens/`, `tools/`, `shell-integration/`, or `docs/` was modified.
 - **Methodology (per the SWE-AtlasQnA rules):** the relevant code paths were **built and run first**, real output was captured with temporary observation scripts, and only then was this answer written. Every behavioral claim is presented next to the exact command that produced it and the unedited output, and is labeled **[observed]**, **[source-derived]**, **[inferred]**, or **[non-canonical corroboration]**. All temporary scripts live outside the repository (under `/tmp/kwork`) and the repository is left byte-for-byte unchanged apart from this file.
 
 ### The nine questions
@@ -45,6 +45,8 @@ branch=blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad
 HEAD=9fd0da15ff09436c0c3c40eb7dbdda3556358f34
 investigated source commit target = 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 ```
+
+The `HEAD=` line above is the authoring-time snapshot (the first documentation commit) and advances with each documentation-only revision; it is **not** load-bearing. The load-bearing line is the one below it — the investigated source commit target `815df1e210e0…` — which is invariant and is verified independently in §7 via `git diff --name-status 815df1e210e0..HEAD`.
 
 `python3` is a shim pointing at Python 3.11.13 (kitty's runtime interpreter for this build); the system default is 3.13, but the project's highest explicitly-supported CI version is 3.11, so 3.11 is used.
 
@@ -512,7 +514,7 @@ kitty  (defaults: notify_on_cmd_finish=never)           2          2            
 Reading the matrix:
 - With shell integration **on** and notification **enabled**, the shell emits OSC 133 `C`/`D;0` and kitty fires exactly **one** notification.
 - With shell integration **disabled at the kitty level**, **no** OSC 133 markers are produced and **no** notification fires (negative control).
-- With shell integration **on** but `notify_on_cmd_finish` at its **default (`never`)**, the OSC 133 markers still arrive but **no** notification fires — proving the gate is the `when != 'never'` condition, not a duration threshold (see Nuance 2).
+- With shell integration **on** but `notify_on_cmd_finish` at its **default (`never`)**, the OSC 133 markers still arrive but **no** notification fires — isolating the `when != 'never'` condition (this case varies only `when`, so it says nothing about the separate `duration` term, which is examined under Q5 / Nuance 2 and shown there to be a functional kitty-uptime threshold).
 
 #### Code citation **[source-derived]**
 
@@ -642,11 +644,73 @@ $ cat /tmp/kwork/evidence/q5_recorded_state.txt
 NOTIFY_FIRED recorded_exit_status=[0] recorded_cmdline=[echo hello]
 ```
 
-### An apparent pre-existing behavior in the duration gate **[source-derived; documented, not changed]**
+### The duration gate is a kitty-uptime threshold (zeroed-before-subtract) **[observed + source-derived; documented, not changed]**
 
-The gate at line 1425 is `if last_cmd_output_duration >= duration and when != 'never':`. However, `last_cmd_output_duration` is computed at line 1417 as `end_time - self.last_cmd_output_start_time`, and `self.last_cmd_output_start_time` was **already set to `0.` at line 1411** — *before* the subtraction. Consequently `last_cmd_output_duration == end_time`, i.e. the raw `monotonic()` clock value (thousands of seconds since boot), which is effectively always `>= duration` (default `5.0`). The gate therefore reduces in practice to **`when != 'never'`**: the `duration` threshold has no practical effect.
+The gate at line 1425 is `if last_cmd_output_duration >= duration and when != 'never':`. `last_cmd_output_duration` is computed at line 1417 as `end_time - self.last_cmd_output_start_time`, where `end_time = monotonic()` (line 1416) — but `self.last_cmd_output_start_time` was **already reset to `0.` at line 1411**, *before* the subtraction. Consequently `last_cmd_output_duration == end_time == monotonic()`: the recorded "duration" is not the command's real runtime but kitty's clock reading at command-finish.
 
-This is corroborated empirically by the Q3b matrix: with `notify_on_cmd_finish` at its default (`never`) no notification fires, but with `when='always'` a notification fires immediately for `echo hello` (which has essentially zero real output duration) — the duration threshold never gates it out. This is reported as an **apparent pre-existing behavior/defect in the investigated source**; per scope, **no source change is made** — only documentation.
+The decisive detail is *which* `monotonic` this is. It is **kitty's own C clock**, imported from `.fast_data_types` (import block at `kitty/window.py:44`; the name `monotonic` at `kitty/window.py:75`) — **not** Python's `time.monotonic`. Per `kitty/monotonic.h:60-68`, `monotonic()` returns `monotonic_() - monotonic_start_time`, and `init_monotonic()` captures `monotonic_start_time` at kitty startup, so kitty's `monotonic()` is **seconds since kitty started**, beginning at ~`0`. This was measured directly through kitty's canonical `+runpy` entry point, stable across three runs:
+
+```
+$ for r in 1 2 3; do ./kitty/launcher/kitty +runpy 'from kitty.fast_data_types import monotonic as km
+from time import monotonic as pm
+import time
+print("kitty_monotonic_at_startup=%.6f  python_time_monotonic=%.6f" % (km(), pm()))
+time.sleep(2)
+print("kitty_monotonic_after_2s_sleep=%.6f  python_time_monotonic=%.6f" % (km(), pm()))'; done
+kitty_monotonic_at_startup=0.000717  python_time_monotonic=3008972.218154
+kitty_monotonic_after_2s_sleep=2.000825  python_time_monotonic=3008974.218268
+kitty_monotonic_at_startup=0.000631  python_time_monotonic=3008974.331554
+kitty_monotonic_after_2s_sleep=2.000744  python_time_monotonic=3008976.331672
+kitty_monotonic_at_startup=0.000779  python_time_monotonic=3008976.449320
+kitty_monotonic_after_2s_sleep=2.000888  python_time_monotonic=3008978.449434
+```
+
+kitty's `monotonic()` reads ~`0.0007 s` at startup and grows in real time to ~`2.0008 s` after a 2 s sleep; Python's `time.monotonic()` here reads ~`3,008,972 s`, a large since-boot-style counter that kitty does **not** consult on this path. (An earlier draft mislabeled kitty's value as a since-boot figure; that description belongs to Python's clock, not kitty's.)
+
+Because `last_cmd_output_duration == monotonic()` equals **kitty's uptime at the instant the command's OSC 133 `D` arrives**, the gate is a **functional** threshold, not a no-op: a completion notification fires only when `when != 'never'` **and** kitty has been running at least `duration` seconds. With the default `duration = 5.0`, a command that finishes within the first 5 s after kitty launches is **gated out**; one that finishes later fires. The threshold is real and observable — it simply keys off kitty's uptime rather than the command's own runtime, which is the apparent pre-existing defect (documented here, not changed).
+
+#### Empirical corroboration with a **non-zero** duration **[observed]**
+
+The gate must be probed with a non-zero `duration`; probing with `always 0` is circular, because every clock reading trivially satisfies `>= 0`. A real interactive `bash` was driven inside kitty with `-o "notify_on_cmd_finish always 5"` (the default duration), keystrokes synthesized via the X11 `XTEST` extension under `dbus-run-session`, `Notify` calls counted with `dbus-monitor` and OSC 133 markers with `--dump-bytes`, varying only **when** the `echo hello` command finishes relative to kitty start:
+
+```
+$ cat /tmp/kwork/evidence/dgate_matrix.txt
+===== notify_on_cmd_finish always 5 (NON-ZERO, = default duration) =====
+--- EARLY: command finishes <5s after kitty start -> expect gated (Notify=0) ---
+early_1        inject@1.5 s  OSC133_D0=2  Notify_total=0  Notify_echohello=0
+early_2        inject@1.5 s  OSC133_D0=2  Notify_total=0  Notify_echohello=0
+early_3        inject@1.5 s  OSC133_D0=2  Notify_total=0  Notify_echohello=0
+--- LATE: command finishes >5s after kitty start -> expect fires (Notify=1) ---
+late_1         inject@8   s  OSC133_D0=2  Notify_total=1  Notify_echohello=1
+late_2         inject@8   s  OSC133_D0=2  Notify_total=1  Notify_echohello=1
+late_3         inject@8   s  OSC133_D0=2  Notify_total=1  Notify_echohello=1
+===== CONTROL: always 100 + EARLY -> expect gated (Notify=0) =====
+dg100_early    inject@1.5 s  OSC133_D0=2  Notify_total=0  Notify_echohello=0
+===== CONTROL: always 0 + EARLY (deliverable's old circular method) -> Notify=1 =====
+a0_early       inject@1.5 s  OSC133_D0=2  Notify_total=1  Notify_echohello=1
+```
+
+The same `echo hello` under the same `always 5` config fires **0** notifications when it finishes early (×3) and **1** when it finishes late (×3); `always 100` gates an early command whose uptime has not yet crossed 100 s; and `always 0` (the circular method the original draft used) fires trivially. In every row the OSC 133 `D;0` sequence still arrives (count `2` — the initial-prompt marker plus the `echo hello` marker), so the transport is constant and the **notification decision is the sole differentiator**. The fired notification's body, captured byte-exact over D-Bus in a LATE run, is exactly the Q3b body:
+
+```
+$ sed -n '/member=Notify/,/Click to focus/p' /tmp/kwork/evidence/dbus_late_1.log
+method call time=1783974141.763309 sender=:1.8 -> destination=org.freedesktop.Notifications serial=3 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+   string "kitty"
+   uint32 0
+   string "/tmp/blitzy/kitty/blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad_2bb4d2/logo/kitty.png"
+   string "kitty"
+   string "Command echo hello finished with status: 0.
+Click to focus."
+```
+
+By contrast the EARLY capture contains **no** `Notify` method call at all:
+
+```
+$ grep -c "member=Notify" /tmp/kwork/evidence/dbus_early_1.log
+0
+```
+
+This is an **apparent pre-existing behavior** in the investigated source (the "duration" is really kitty's uptime, not the command's runtime); per scope, **no source change is made** — only documentation.
 
 ### Rationale
 
@@ -1081,9 +1145,9 @@ yes:         kitty_exit=0  wall=0.31s
 
 With the default (`no`), kitty lingers **4.31 s** — until the detached writer closes the PTY (EOF) — proving teardown is PTY-EOF-driven. With `close_on_child_death=yes`, kitty closes in **0.31 s** — immediately on the `SIGCHLD` reap via `mark_child_for_removal`. Both exit `0`. (For a child with no lingering writer, EOF coincides with exit, so the difference is invisible; the detached-writer case is what separates the two mechanisms.)
 
-### Nuance 2 — The completion notification is off by default, and the duration gate is effectively inert
+### Nuance 2 — The completion notification is off by default, and the duration term gates on kitty's uptime
 
-`notify_on_cmd_finish` defaults to `never` (`kitty/options/types.py:560` → `NotifyOnCmdFinish(when='never', duration=5.0, …)`; `kitty/options/definition.py:3190` → `opt('notify_on_cmd_finish', 'never', …)`), so **by default no completion notification is shown** even with shell integration active — confirmed by the Q3b matrix (`enabled_default`: OSC 133 received, `Notify=0`). Separately, as documented under Q5, the `duration` threshold is effectively inert because `last_cmd_output_start_time` is zeroed (`kitty/window.py:1411`) *before* the duration subtraction (`kitty/window.py:1417`), making `last_cmd_output_duration` equal to the raw monotonic clock and thus always `>= duration`. The gate therefore reduces to `when != 'never'`. This is an **apparent pre-existing behavior** in the investigated source and is documented, not changed.
+`notify_on_cmd_finish` defaults to `never` (`kitty/options/types.py:560` → `NotifyOnCmdFinish(when='never', duration=5.0, …)`; `kitty/options/definition.py:3190` → `opt('notify_on_cmd_finish', 'never', …)`), so **by default no completion notification is shown** even with shell integration active — confirmed by the Q3b matrix (`enabled_default`: OSC 133 received, `Notify=0`). Separately, as documented under Q5, the `duration` term does **not** measure the command's own runtime: `last_cmd_output_start_time` is zeroed (`kitty/window.py:1411`) *before* the subtraction (`kitty/window.py:1417`), so `last_cmd_output_duration == monotonic()` — and kitty's `monotonic()` (`kitty/monotonic.h:60-68`, imported at `kitty/window.py:44`/`:75`) is **seconds since kitty started**. The gate therefore fires only when `when != 'never'` **and** kitty has been running at least `duration` seconds; with the default `duration = 5.0` a command finishing <5 s after launch is gated out (observed: `always 5` EARLY → `Notify=0` ×3; LATE → `Notify=1` ×3; see Q5). This is an **apparent pre-existing behavior** in the investigated source (the term keys off kitty's uptime rather than the command's runtime) and is documented, not changed.
 
 ## Observed vs. inferred classification
 
@@ -1097,7 +1161,7 @@ Every claim in this document is one of: **runtime-observed** (captured from a li
 | `+hold` banner is `Press Enter or Esc to exit` (bold-green), stable ×2 | runtime-observed | `q3a_hold.txt` |
 | `--hold` flag shows an interactive shell (`KITTY_HOLD=1`), no banner | runtime-observed | `q3_hold_flag_env.txt` + screenshot |
 | Notification body `Command echo hello finished with status: 0.\nClick to focus.` | runtime-observed | `q3b_notify_body.txt` (D-Bus) |
-| Notification off by default; fires only when `when != never` | runtime-observed | Q3b matrix (`enabled_default` Notify=0) |
+| Notification off by default; fires only when `when != never` (and kitty uptime ≥ `duration`) | runtime-observed | Q3b matrix (`enabled_default` Notify=0); duration-gate matrix |
 | OSC 133 `D;0` bytes `\e]133;D;0\a` on the wire | runtime-observed | `q8_byte_exact.txt`, `q8_timeline.txt` |
 | Child output `hello`/`world` lands in the `Screen` grid | runtime-observed | `q9_screen_dump.txt` + `q9_grid.png` |
 | Child output is NOT on kitty's own stdout/stderr | runtime-observed | `q9_negative.txt` (0 bytes) |
@@ -1105,7 +1169,8 @@ Every claim in this document is one of: **runtime-observed** (captured from a li
 | `ChildMonitor` owns id/PID/PTY-fd/Screen | source-derived | `kitty/boss.py:370-374, 585-587`; `kitty/child-monitor.c:305-306` |
 | `handle_cmd_end()` builds the message | source-derived (+ observed body) | `kitty/window.py:1408-1451`; `q3b_notify_body.txt` |
 | `on_child_death(window_id)` carries no status; `mark_monitored_pids` no-op for primary child | source-derived | `kitty/boss.py:881`; `kitty/child-monitor.c:1397-1409` |
-| Duration gate reduces to `when != never` (zeroed-before-subtract) | source-derived (+ observed) | `kitty/window.py:1411,1417,1425`; Q3b matrix |
+| Duration gate is a functional kitty-uptime threshold (`when != never` **and** kitty uptime ≥ `duration`, due to zeroed-before-subtract) | runtime-observed (+ source-derived) | `kitty/window.py:1411,1416,1417,1425`; `kitty/monotonic.h:60-68`; `+runpy` monotonic + `always 5` EARLY/LATE matrix |
+| kitty's `monotonic()` is seconds since kitty started (≈0 at startup, +2 s after a 2 s sleep), not since boot | runtime-observed | `+runpy` measurement ×3; `kitty/monotonic.h:60-68` |
 | OSC 133 is a de-facto cross-vendor convention (FinalTerm origin, exit code optional) | corroborated | external references (iTerm2, VS Code, terminfo.dev) |
 
 ## Reproducibility (self-contained)
@@ -1305,18 +1370,84 @@ The whole matrix must be run under a session bus so notifications are deliverabl
 dbus-run-session -- bash "$WORK/si_matrix.sh"
 ```
 
+### 6b. Duration-gate threshold with a **non-zero** duration (Q5 / Nuance 2)
+
+`dgate.sh` reuses `xtype.py` (step 6) and probes the `duration` term with the default non-zero value (`always 5`), varying only **when** the `echo hello` command finishes relative to kitty start. It counts `Notify` D-Bus calls and OSC 133 `D;0` markers per case:
+
+```bash
+#!/bin/bash
+set -u
+cd "$KITTY_REPO"
+export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 TMPDIR=/tmp/kitty-clean
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+EV=/tmp/kwork/evidence
+PY=/opt/kitty-venv/bin/python
+
+# run_case LABEL INJECT_DELAY EXIT_DELAY KITTY_OPTS...
+run_case() {
+  local label="$1" idelay="$2" xdelay="$3"; shift 3
+  local dbuslog="$EV/dbus_${label}.log" dump="$EV/dump_${label}.bin"
+  : > "$dbuslog"
+  dbus-monitor "interface='org.freedesktop.Notifications',member='Notify'" >"$dbuslog" 2>/dev/null &
+  local dpid=$!
+  sleep 0.3
+  timeout 30 ./kitty/launcher/kitty --config NONE "$@" --dump-bytes "$dump" bash -i >/dev/null 2>&1 &
+  local kpid=$!
+  "$PY" /tmp/kwork/xtype.py "$idelay" $'echo hello\n'   # inject the test command
+  sleep 2.5                                             # allow D;0 + notification
+  "$PY" /tmp/kwork/xtype.py "$xdelay" $'exit\n'         # close the shell
+  wait $kpid 2>/dev/null
+  sleep 0.6; kill $dpid 2>/dev/null; wait $dpid 2>/dev/null
+  local dcount ncount nhello
+  dcount=$("$PY" - "$dump" <<'PYX'
+import sys
+d=open(sys.argv[1],'rb').read()
+print(d.count(b']133;D;0'))
+PYX
+)
+  ncount=$(grep -c "member=Notify" "$dbuslog" 2>/dev/null)
+  nhello=$(grep -c "echo hello finished with status" "$dbuslog" 2>/dev/null)
+  printf '%-14s inject@%-4ss  OSC133_D0=%s  Notify_total=%s  Notify_echohello=%s\n' \
+     "$label" "$idelay" "$dcount" "$ncount" "$nhello"
+}
+
+echo "===== notify_on_cmd_finish always 5 (NON-ZERO, = default duration) ====="
+echo "--- EARLY: command finishes <5s after kitty start -> expect gated (Notify=0) ---"
+run_case early_1 1.5 3.5 -o "notify_on_cmd_finish always 5"
+run_case early_2 1.5 3.5 -o "notify_on_cmd_finish always 5"
+run_case early_3 1.5 3.5 -o "notify_on_cmd_finish always 5"
+echo "--- LATE: command finishes >5s after kitty start -> expect fires (Notify=1) ---"
+run_case late_1 8 2 -o "notify_on_cmd_finish always 5"
+run_case late_2 8 2 -o "notify_on_cmd_finish always 5"
+run_case late_3 8 2 -o "notify_on_cmd_finish always 5"
+echo "===== CONTROL: always 100 + EARLY -> expect gated (Notify=0) ====="
+run_case dg100_early 1.5 3.5 -o "notify_on_cmd_finish always 100"
+echo "===== CONTROL: always 0 + EARLY (deliverable's old circular method) -> Notify=1 ====="
+run_case a0_early 1.5 3.5 -o "notify_on_cmd_finish always 0"
+```
+
+Run under a session bus so the `Notify` calls are visible to `dbus-monitor`:
+
+```bash
+dbus-run-session -- bash "$WORK/dgate.sh"
+```
+
+The captured result is the `dgate_matrix.txt` table shown under Q5 (EARLY `Notify=0` ×3, LATE `Notify=1` ×3, `always 100` EARLY `Notify=0`, `always 0` EARLY `Notify=1`).
+
 ### 7. Cleanup and repository-unchanged verification
 
 ```bash
 rm -rf /tmp/kwork          # remove ALL temporary artifacts (outside the repo)
-git status --porcelain     # only the answer document should appear
+git status --porcelain     # clean once the answer document is committed
+git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD   # sole delta vs investigated source
 ```
 
-Actual final status (the only change on the branch is this document):
+Once the answer document is committed, the working tree is clean and the only difference from the investigated source commit is this one file (this is the durable, HEAD-independent check; while the document is still being edited, `git status --porcelain` instead shows it as modified/untracked):
 
 ```
 $ git status --porcelain
- M blitzy/documentation/kitty_815df1e210e0.md
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 ## Coverage checklist
@@ -1354,6 +1485,7 @@ Every question and every named item is answered, and every implied condition was
 - [x] Shell integration enabled + `notify_on_cmd_finish always` — OSC 133 + one notification.
 - [x] Shell integration disabled (kitty level) — no OSC 133, no notification (negative control).
 - [x] Shell integration enabled + default `notify_on_cmd_finish=never` — OSC 133 present, no notification (gate control).
+- [x] Duration gate with non-zero `duration` (`always 5`) — EARLY finish `Notify=0` ×3, LATE finish `Notify=1` ×3; `always 100`+EARLY gated; `always 0`+EARLY fires (circular) — proves a functional kitty-uptime threshold.
 - [x] Nonzero child status controls — child exit 5 and 42 → kitty exit 0.
 - [x] Before/during/after markers — the OSC 133 `D→A→C→D` timeline.
 - [x] Kitty's own stdout/stderr negative check — 0 bytes / benign only.
