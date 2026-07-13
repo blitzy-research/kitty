@@ -6,12 +6,12 @@
 > - **SOURCE‑VERIFIED** — read directly from the code, or produced by a static command such as `grep`/`sed`; the `file:line` is cited, but that specific branch was not separately exercised end‑to‑end at runtime.
 > - **INFERRED** — derived from the protocol spec or from reading code, and *not* exercised here; called out explicitly wherever it appears.
 >
-> Nothing in the kitty source tree was modified to produce this document. All instrumentation used throwaway scripts created **outside** the repository under a `mktemp -d` working directory, launched kitty in the background with explicit PID capture (`$!`), waited on readiness, and cleaned up via an `EXIT` trap; every script was deleted afterward and `git status --porcelain` was confirmed empty (§4, §5.5, and the cleanup note at the end).
+> Nothing in the kitty source tree was modified to produce this document. All instrumentation used throwaway scripts created **outside** the repository under a `mktemp -d` working directory, launched kitty in the background with explicit PID capture (`$!`), waited on readiness, and cleaned up via an `EXIT` trap; every script was deleted afterward, and `git status --porcelain` was confirmed to show **only this deliverable document** — no C, Go, Python, config, or test file was touched (the full socket lifecycle absent → present → absent is in §4.4, logging cleanup in §5.5, and the final process/socket/temp/`git` checks in §11 at the end).
 >
 > **This document is explanatory only. It does not add a new RC command** — but §8 distills the exact pattern so you can add one later.
 
 - **Branch:** `blitzy-5272820a-f82d-4851-9076-f4ffb122d22c`.
-- **Code checkout:** the RC subsystem was read and run at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` ("Wire up applying of font config"), the branch's **base** commit. This document is added on top of that base as **documentation-only commit(s)**; the first was `7da6b37726335799f63f5ea0bca9185625382c21`, and the branch has since advanced with follow-up documentation edits (each touching **only this `.md`**). Because none of those commits change any C, Go, or Python file, the C/Go/Python **source is byte‑identical to `815df1e2`** — but `setup.py` stamps the binary with the current git `HEAD`, so the **authoring-time** build embedded `VCSRevision=7da6b37726335799f63f5ea0bca9185625382c21` (OBSERVED in the `--verbose` build line, §2).
+- **Code checkout:** the RC subsystem was read and run at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` ("Wire up applying of font config"), the branch's **base** commit. This document is added on top of that base as **documentation-only commit(s)**; the first was `7da6b37726335799f63f5ea0bca9185625382c21`, and the branch has since advanced with follow-up documentation edits (each touching **only this `.md`**). Because none of those commits change any C, Go, or Python file, the C/Go/Python **source is byte‑identical to `815df1e2`** — but `setup.py` stamps the binary with the current git `HEAD`, so the **authoring-time** build embedded `VCSRevision=7da6b37726335799f63f5ea0bca9185625382c21`. §2 now shows a *fresh* `--verbose` build that stamps the *current* `HEAD` (`3389e897…`) instead, demonstrating that the stamp simply tracks the checked-out commit.
 - **Build/version:** `kitty 0.35.2` (see §2).
 - **Transports exercised:** (1) configured UNIX socket, and (2) shell‑integration / RC‑over‑TTY. Both are demonstrated with before/after state.
 
@@ -38,7 +38,7 @@ Crucially, this is a decision on the **presence of the target string** (`tools/c
 
 **Q4 — Show the real socket path, the wire bytes, where Python parses/routes to `ls`, the returned JSON, and the logging behavior.**
 - **Real socket path:** `.../mykitty` (CLI, verbatim, no PID suffix) and `.../cfgkitty-40761` (config, PID‑suffixed) — full observed paths under a `mktemp -d` dir in §4.
-- **On the wire:** a symmetric DCS envelope `<ESC>P@kitty-cmd<JSON><ESC>\` (`<ESC>` = `0x1b`). The **real client** request is **58 bytes** carrying `"version":[0,26,0]` and `"payload":{}`; the response is 3655 bytes, beginning `1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 6f 6b` (`ESC P @kitty-cmd{"ok`) and ending `1b 5c` (`ESC \`). The **same 58‑byte frame** is what the client writes to the PTY in the socketless case — §5.2.
+- **On the wire:** a symmetric DCS envelope `<ESC>P@kitty-cmd<JSON><ESC>\` (`<ESC>` = `0x1b`). The frame the **real client** sends depends on **context**: an **external** client sends **58 bytes** (`"version":[0,26,0]`, `"payload":{}`, no `kitty_window_id`), whereas the canonical `kitten @ ls` run **inside a kitty window** sends **78 bytes** carrying `"kitty_window_id":1`. That same 78-byte in-window frame is written to a **socket** (via `connect()`) when a listener exists, and to the **PTY** (`/dev/tty`) in the socketless case — identical bytes, different carrier. The response uses the same envelope (**3491 bytes** in the §5.2 capture), beginning `1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 6f 6b` (`ESC P @kitty-cmd{"ok`) and ending `1b 5c` (`ESC \`) — see §5.2.
 - **Parse/route (OBSERVED):** `parse_cmd` (`kitty/remote_control.py:56`) → `handle_cmd` (`:213`) → `command_for_name('ls')` (`kitty/rc/base.py:449`) → `LS.response_from_kitty` (`kitty/rc/ls.py:48`) → `boss.list_os_windows` (`:57`) → `json.dumps(..., indent=2, sort_keys=True)` (`:76`), wrapped as `{'ok': True, 'data': <json-string>}` (`kitty/remote_control.py:258-260`) — §5.3.
 - **Returned JSON:** the full OS‑window/tab/window tree — §5.1.
 - **Logging:** **error‑only.** A successful `ls` logs **nothing**; a malformed command logs `Failed to parse JSON payload of remote command, ignoring it` (`kitty/remote_control.py:62`) — §5.5.
@@ -69,7 +69,7 @@ $ touch kitty/data-types.c && python3 setup.py ; echo "exit=$?"
 exit=0
 ```
 
-Run with `--verbose` it additionally prints compiler detection and the Go build of the `kitten` client. (Between `Detected:` and `Updating Go generated files...`, `--verbose` also echoes the two full gcc commands — one compile line for `data-types.c` and one link line spanning ~60 object files into `fast_data_types.so`; those two phases are exactly the `Compiling`/`Linking` steps shown complete above, so the mechanical gcc lines are not repeated here.) The Go build line is shown in full and embeds the git‑`HEAD` VCS revision:
+Run with `--verbose` it additionally prints, in order: compiler detection, the **two gcc commands** (one compile line for `data-types.c`, then one link line assembling ~60 object files into `fast_data_types.so`), and finally the Go build of the `kitten` client. The block below is a single **fresh** `--verbose` run captured now (forced by `touch`-ing one C source so the compile is re-triggered); it is shown complete, with **both** gcc commands verbatim and unelided. Because a fresh build stamps the **current** git `HEAD` (see the note after the block), the compile line's `-DKITTY_VCS_REV=` and the Go line's `VCSRevision=` both read the current HEAD `3389e897…`:
 
 ```console
 $ touch kitty/data-types.c && python3 setup.py --verbose
@@ -79,11 +79,14 @@ Copyright (C) 2023 Free Software Foundation, Inc.
 This is free software; see the source for copying conditions.  There is NO
 warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 Detected: CompilerType.gcc
+gcc -MMD -DNDEBUG -DKITTY_VCS_REV="3389e897468a3efb37c21ce1912e86b0f912ee61" -DWRAPPED_KITTENS="ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/python3.12 -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/python3.12 -Wall -O3 -shared -flto build/fast_data_types-kitty-charsets.c.o build/fast_data_types-kitty-child-monitor.c.o build/fast_data_types-kitty-child.c.o build/fast_data_types-kitty-cleanup.c.o build/fast_data_types-kitty-colors.c.o build/fast_data_types-kitty-crypto.c.o build/fast_data_types-kitty-cursor.c.o build/fast_data_types-kitty-data-types.c.o build/fast_data_types-kitty-desktop.c.o build/fast_data_types-kitty-disk-cache.c.o build/fast_data_types-kitty-fast-file-copy.c.o build/fast_data_types-kitty-font-names.c.o build/fast_data_types-kitty-fontconfig.c.o build/fast_data_types-kitty-fonts.c.o build/fast_data_types-kitty-freetype.c.o build/fast_data_types-kitty-freetype_render_ui_text.c.o build/fast_data_types-kitty-gl-wrapper.c.o build/fast_data_types-kitty-gl.c.o build/fast_data_types-kitty-glfw-wrapper.c.o build/fast_data_types-kitty-glfw.c.o build/fast_data_types-kitty-glyph-cache.c.o build/fast_data_types-kitty-graphics.c.o build/fast_data_types-kitty-history.c.o build/fast_data_types-kitty-hyperlink.c.o build/fast_data_types-kitty-key_encoding.c.o build/fast_data_types-kitty-keys.c.o build/fast_data_types-kitty-kittens.c.o build/fast_data_types-kitty-line-buf.c.o build/fast_data_types-kitty-line.c.o build/fast_data_types-kitty-logging.c.o build/fast_data_types-kitty-loop-utils.c.o build/fast_data_types-kitty-monotonic.c.o build/fast_data_types-kitty-mouse.c.o build/fast_data_types-kitty-png-reader.c.o build/fast_data_types-kitty-rowcolumn-diacritics.c.o build/fast_data_types-kitty-screen.c.o build/fast_data_types-kitty-shaders.c.o build/fast_data_types-kitty-shlex.c.o build/fast_data_types-kitty-simd-string-128.c.o build/fast_data_types-kitty-simd-string-256.c.o build/fast_data_types-kitty-simd-string.c.o build/fast_data_types-kitty-state.c.o build/fast_data_types-kitty-systemd.c.o build/fast_data_types-kitty-unicode-data.c.o build/fast_data_types-kitty-utmp.c.o build/fast_data_types-kitty-vt-parser.c.o build/fast_data_types-kitty-wcswidth.c.o build/fast_data_types-kitty-window_logo.c.o build/fast_data_types-kitty-vt-parser-dump.c.o build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon32-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse42-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-ssse3-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse41-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-generic-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx2-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx512-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon64-codec.c.o build/fast_data_types-3rdparty-base64-lib-tables-tables.c.o build/fast_data_types-3rdparty-base64-lib-codec_choose.c.o build/fast_data_types-3rdparty-base64-lib-lib.c.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.12 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -lharfbuzz -lGL -lpng16 -llcms2 -lcrypto -lrt -lz -o build/kitty/fast_data_types.so
 Updating Go generated files...
-/usr/local/go/bin/go build -v -ldflags '-X kitty.VCSRevision=7da6b37726335799f63f5ea0bca9185625382c21 -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-5272820a-f82d-4851-9076-f4ffb122d22c_31872f/tools/cmd
+kitty/tools/cmd
+/usr/local/go/bin/go build -v -ldflags '-X kitty.VCSRevision=3389e897468a3efb37c21ce1912e86b0f912ee61 -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-5272820a-f82d-4851-9076-f4ffb122d22c_31872f/tools/cmd
 ```
 
-(The `VCSRevision` value captured above (`7da6b377…`) is the **authoring-time** documentation commit — the *first* commit that added this document — because `setup.py` derives the stamp from `git rev-parse HEAD`. The branch has since advanced with follow-up documentation-only commits, so a fresh `python3 setup.py` build today stamps the *current* `HEAD` instead; the stamp reflects only the checked-out commit. The compiled C/Go/Python source is identical to `815df1e2` regardless — so the binary's behavior is unchanged — as explained in the header.)
+(The block above is a **fresh** capture, so `setup.py` stamps it with the **current** git `HEAD` — `3389e897468a3efb37c21ce1912e86b0f912ee61` — visible identically in the gcc compile line's `-DKITTY_VCS_REV="3389e897…"` and the Go line's `VCSRevision=3389e897…`. This is exactly the documented behavior: `setup.py` derives the stamp from `git rev-parse HEAD` (`setup.py:674-678`), emitting it both as the C compile-time define `-DKITTY_VCS_REV=` (`setup.py:726`) and the Go link-time flag `-X kitty.VCSRevision=` (`setup.py:1149-1151`) — which is why the two stamps in the block above are identical. So the value simply tracks whichever commit is checked out. The **initial** documentation commit — the first commit that added this file — was `7da6b37726335799f63f5ea0bca9185625382c21` (still recorded in the header and in the coverage ledger, §9). The branch has since advanced with follow-up **documentation-only** commits, which is why a build today reads `3389e897…`. None of those commits touches any C, Go, or Python file, so the compiled source is byte-identical to `815df1e2` and the binary's behavior is unchanged — as explained in the header.)
 
 The build produces the launcher at **`kitty/launcher/kitty`** and the client at **`kitty/launcher/kitten`** (build logic `setup.py:1230` `build_launcher`; `launcher_dir = 'kitty/launcher'` `setup.py:2099`). **OBSERVED:**
 
@@ -121,7 +124,7 @@ OpenGL core profile version string: 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.0
 OpenGL version string: 4.5 (Compatibility Profile) Mesa 25.2.8-0ubuntu0.24.04.2
 ```
 
-> **Note on startup log noise.** In this container kitty always prints one benign, non‑RC line at startup: `Failed to open systemd user bus with error: No medium found` (the leading bracketed timestamp is a monotonic uptime and varies per run — observed as `[0.162]`, `[0.175]`, `[0.277]`, etc.). It is a D‑Bus artifact of the headless container and is unrelated to remote control. It is called out here so the "empty log on success" claim in §5.5 is precise: that one line is present regardless of any RC activity.
+> **Note on startup log noise.** In this headless container kitty prints one benign, non-RC line at startup of the form `Failed to open systemd user bus with error: <errno text>` — a D-Bus artifact of the container, unrelated to remote control. Two aspects of this line are **run-specific** and were both OBSERVED live: (1) the **errno wording varies** across launches on the *same* image — most runs read `No medium found` (e.g. five consecutive fresh launches during §2's capture session all read it), while other runs read `No such file or directory` (the successful socketless-PTY run in §5.5); **do not treat either exact string as invariant.** (2) The leading bracketed timestamp is a **monotonic uptime** that varies per run (observed as `[0.162]`, `[0.167]`, `[0.172]`, `[0.190]`, `[0.272]`, etc.). Identify the line **structurally** by its `Failed to open systemd user bus with error:` prefix rather than by any fixed errno. It is called out here so the "empty log on success" claim in §5.5 is precise: this single non-RC line may be present regardless of RC activity, which is exactly why the success test counts only RC-relevant lines (`grep -c 'remote command'`), not total lines.
 
 ---
 
@@ -330,13 +333,55 @@ The empty `grep` output with `grep_exit=1` means **no listening socket named `ga
 > **A note on finding the live PID.** `pgrep -x kitty | head -1` is unreliable here: repeated launch/kill cycles leave `[kitty] <defunct>` zombies (reparented to PID 1) that share the process name. The authoritative owner of a socket is what `lsof -U`/`ss -xlp` report — e.g. pid `40579` for `.../mykitty` in §4.1, captured independently as the launch‑time `$!`. Every PID quoted in this document is the socket's `ss -xlp` owner, cross‑checked against the captured `$!`.
 
 
+### 4.4 The full socket lifecycle in motion — absent → present → absent (OBSERVED)
+
+§4.1–§4.3 explain *why* a socket may be missing; this closes the loop by showing the **complete lifecycle** of a socket that *is* created — **absent before** launch, **present during** the instance, and **absent again after** a graceful shutdown — so "I looked in `/tmp` and it wasn't there" is shown to be **timing**-dependent as well as naming-dependent. A throwaway `mktemp -d` directory holds the socket; kitty is backgrounded with its PID captured as `$!`; readiness is polled on the socket path; then the **exact** PID is killed and waited on. (The CLI `--listen-on` value is used **verbatim** — the socket is named `lifekitty` with **no** `-<PID>` suffix, exactly per §4.1.)
+
+```console
+$ W=$(mktemp -d) ; SOCK="$W/lifekitty"
+
+# [1] BEFORE launch — the socket does not exist yet
+$ ls -l "$SOCK" 2>&1
+ls: cannot access '/tmp/tmp.EfRjXTF9gC/lifekitty': No such file or directory
+$ ss -xl | grep lifekitty ; echo "grep_exit=$?"
+grep_exit=1
+
+# launch in the background, capture the PID, poll for readiness
+$ "$KITTY" -o allow_remote_control=yes --listen-on "unix:$SOCK" bash -c 'sleep 300' & KPID=$!
+$ echo "KPID=$KPID"
+KPID=4979
+$ for i in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
+
+# [2] DURING — the socket is present, owned by KPID, and RC works over it
+$ ls -l "$SOCK"
+srwxr-xr-x 1 root root 0 Jul 13 23:15 /tmp/tmp.EfRjXTF9gC/lifekitty
+$ ss -xlp | grep lifekitty
+u_str LISTEN 0      128    /tmp/tmp.EfRjXTF9gC/lifekitty 752193532            * 0    users:(("kitty",pid=4979,fd=6))
+$ "$KITTEN" @ --to "unix:$SOCK" ls >/dev/null 2>&1 && echo "RC_DURING=OK"
+RC_DURING=OK
+
+# graceful shutdown: kill the exact PID and wait for it
+$ kill "$KPID" ; wait "$KPID" ; echo "kitty_exit=$?"
+kitty_exit=0
+
+# [3] AFTER shutdown — the socket is gone again, and so is the process
+$ ls -l "$SOCK" 2>&1
+ls: cannot access '/tmp/tmp.EfRjXTF9gC/lifekitty': No such file or directory
+$ ss -xl | grep lifekitty ; echo "grep_exit=$?"
+grep_exit=1
+$ ps -p "$KPID" -o pid=,comm= ; echo "ps_exit=$?"
+ps_exit=1
+```
+
+The leading `s` in `srwxr-xr-x` marks a **socket** file; while the instance lives, `ss -xlp` reports the listener owned by `pid=4979` (the captured `$!`, fd 6). On `kill`/`wait` the instance exits **0**, and kitty's `atexit.register(remove_socket_file, s, socket_path)` handler — registered inside `listen_on()` at **`kitty/boss.py:181`** (`remove_socket_file` imported at `:149`) — deletes the file, so **both** the filesystem entry **and** the kernel listener vanish (`ls` → *No such file*, `ss` grep → exit 1) and the PID is dead (`ps -p` prints nothing, exit 1). This **absent-after** state is the half that §4/§5.1 previously left implicit; with §4.1's absent-before/present-during it forms the complete **absent → present → absent** lifecycle.
+
 ---
 
 ## 5. OBJ‑4 — End‑to‑end over the socket: wire bytes, parse/route, JSON, logging
 
 **Direct answer.** The request and response are a **symmetric DCS envelope** `<ESC>P@kitty-cmd<JSON><ESC>\` (`<ESC>` = byte `0x1b`), where the JSON envelope carries `cmd`, `version`, `no_response`, `kitty_window_id`, `payload` (`docs/rc_protocol.rst:8,14-20`). On the server the bytes are decoded by **`parse_cmd`** (`kitty/remote_control.py:56`), dispatched by **`handle_cmd`** (`:213`) → **`command_for_name('ls')`** (`kitty/rc/base.py:449`) → **`LS.response_from_kitty`** (`kitty/rc/ls.py:48`), which builds the tree with `boss.list_os_windows(...)` (`:57`) and returns `json.dumps(data, indent=2, sort_keys=True)` (`:76`); the result is wrapped as `{'ok': True, 'data': <json-string>}` (`kitty/remote_control.py:258-260`) and framed back in the same DCS envelope. **Logging is error‑only**: a successful call logs nothing; a malformed one emits one `log_error` line.
 
-**One consolidated instance for all of §5 (OBSERVED).** So that every value below — socket path, owning PID, wire bytes, JSON, and log lines — is mutually consistent, §5.1–§5.5 were all captured against a **single** instance launched by the harness. Its background PID was captured as `$!` = **42106**, and it listened on `unix:/tmp/kitty_obs_work/run.XgZliG/kitty.sock`; the socket was **absent before** and **present after**, owned by pid 42106:
+**One consolidated instance for all of §5 (OBSERVED).** So that every value below — socket path, owning PID, wire bytes, JSON, and log lines — is mutually consistent, §5.1–§5.5 were all captured against a **single** instance launched by the harness (the sole exception is §5.2's *raw wire bytes*: exposing the actual on-the-wire bytes requires instrumentation — a tee proxy for the socket and `strace` for the PTY — so §5.2 uses its own dedicated capture instances and proves equality against their own client output). Its background PID was captured as `$!` = **42106**, and it listened on `unix:/tmp/kitty_obs_work/run.XgZliG/kitty.sock`; the socket was **absent before** and **present after**, owned by pid 42106:
 
 ```console
 $ echo "before:"; ls -l "$WORK/kitty.sock" 2>&1
@@ -478,59 +523,123 @@ This matches the tree shape documented at `docs/remote-control.rst:84-120` and �
 
 > **Security note (non‑secret).** The `KITTY_PUBLIC_KEY` value above (prefix `1:`) is kitty's **public** X25519 key — it is exported into every child so clients can *encrypt to* kitty; it is ephemeral per‑instance and is **not** a credential. Only a *private* key would be sensitive; none appears in any captured output.
 
-### 5.2 The raw on‑the‑wire bytes (OBSERVED — captured from the *real* client)
+### 5.2 The raw on-the-wire bytes (OBSERVED — captured from the *real* client)
 
-The bytes below are **the exact bytes the real `kitten @ ls` client sent and received** — not a hand‑crafted `printf`. The in‑repo `socat` recipe (`docs/rc_protocol.rst:35-42`) documents how to *decode* an RC frame, but to capture the **canonical** client's own bytes the harness inserted a transparent `tee`‑style proxy in front of the socket: the real client dialed the proxy, which forwarded to kitty and copied each direction to `request.bin`/`response.bin`. The client exited 0, so these are a genuine round trip.
+The bytes below are **the exact bytes the real `kitten @ ls` client sent and received** — not a hand-crafted `printf`. They never touch a file on their own, so capturing them requires instrumentation: for the **socket** carrier the harness inserted a transparent `tee`-style proxy in front of a real kitty (the client dialed `unix:/tmp/groupA.k0A9BE/proxy.sock`, which forwarded to the real socket `unix:/tmp/groupA.k0A9BE/kitty.sock` and copied each direction to `request_ext.bin`/`response.bin`); for the **PTY** carrier it ran the real client under `strace`. Every client below exited 0, so these are genuine round trips. Crucially, the request frame depends on **context** — an *external* client versus one running *inside a kitty window* — so both are shown, over both carriers.
 
-> **Why this matters (finding on canonical evidence).** The real client sends the *remote‑control protocol* version `[0,26,0]` (from `var ProtocolVersion [3]int = [3]int{0, 26, 0}` at `tools/cmd/at/main.go:33`) and includes a `"payload":{}` object — **not** the release version `[0,35,2]`. A `printf` that hand‑types `[0,35,2]` also happens to work (it is still `<=` the instance version, so it passes the guard), but it is **non‑canonical**; the capture here is the actual client frame.
+> **Why the version is `[0,26,0]` (finding on canonical evidence).** The real client sends the *remote-control protocol* version `[0,26,0]` (from `var ProtocolVersion [3]int = [3]int{0, 26, 0}` at `tools/cmd/at/main.go:33`) and a `"payload":{}` object — **not** the release version `[0,35,2]`. A `printf` that hand-types `[0,35,2]` also happens to work (it is still `<=` the instance version, so it passes the guard), but it is **non-canonical**; every frame here is the actual client's bytes.
 
-**The request — 58 bytes, `<ESC>P@kitty-cmd{…}<ESC>\`:**
+**What decides the frame size: `KITTY_WINDOW_ID` (SOURCE-VERIFIED).** The client chooses what to send *before* it chooses a transport: `wid, err := strconv.Atoi(os.Getenv("KITTY_WINDOW_ID"))` … `if err == nil && wid > 0 { io_data.rc.KittyWindowId = uint(wid) }` (`tools/cmd/at/main.go:271-273`), and the field is emitted only when non-zero — ``KittyWindowId uint `json:"kitty_window_id,omitempty"` `` (`tools/utils/types.go:15`). So an **external** client (launched outside any kitty window, `KITTY_WINDOW_ID` unset) sends a **58-byte** frame with no `kitty_window_id`, whereas the canonical `kitten @ ls` run **inside a kitty window** (`KITTY_WINDOW_ID=1`) sends a **78-byte** frame carrying `"kitty_window_id":1`.
+
+**(a) External client — 58 bytes, no `kitty_window_id` (OBSERVED).** Captured client→server through the tee proxy with `KITTY_WINDOW_ID` unset:
 
 ```console
-$ wc -c < request.bin
+$ wc -c < request_ext.bin
 58
-$ od -c request.bin
-0000000 033   P   @   k   i   t   t   y   -   c   m   d   {   "   c   m
-0000020   d   "   :   "   l   s   "   ,   "   v   e   r   s   i   o   n
-0000040   "   :   [   0   ,   2   6   ,   0   ]   ,   "   p   a   y   l
-0000060   o   a   d   "   :   {   }   } 033   \
-0000072
-$ od -An -tx1 request.bin
+$ od -An -tx1 request_ext.bin
  1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 63 6d
  64 22 3a 22 6c 73 22 2c 22 76 65 72 73 69 6f 6e
  22 3a 5b 30 2c 32 36 2c 30 5d 2c 22 70 61 79 6c
  6f 61 64 22 3a 7b 7d 7d 1b 5c
+$ python3 -c 'import json;b=open("request_ext.bin","rb").read();print(json.loads(b[12:-2]))'
+{'cmd': 'ls', 'version': [0, 26, 0], 'payload': {}}
 ```
 
-Decoded, the JSON envelope is `{"cmd":"ls","version":[0,26,0],"payload":{}}`. `033` is octal for `0x1b` (ESC); the leading bytes `1b 50 40 6b 69 74 74 79 2d 63 6d 64` are `ESC P @kitty-cmd` and the trailing `1b 5c` are `ESC \` — exactly the constants the Go client uses at `tools/cmd/at/socket_io.go:82-83` (`cmd_escape_code_prefix = "\x1bP@kitty-cmd"`, `cmd_escape_code_suffix = "\x1b\\"`) and the Python client at `kitty/remote_control.py:308-310` (`encode_send`).
+Decoded: `{"cmd":"ls","version":[0,26,0],"payload":{}}`. The leading `1b 50 40 6b 69 74 74 79 2d 63 6d 64` is `ESC P @kitty-cmd` and the trailing `1b 5c` is `ESC \` — exactly the constants the Go client uses at `tools/cmd/at/socket_io.go:82-83` (`cmd_escape_code_prefix = "\x1bP@kitty-cmd"`, `cmd_escape_code_suffix = "\x1b\\"`) and the Python client at `kitty/remote_control.py:308-310` (`encode_send`).
 
-**The response — same envelope, 3655 bytes.** First 16 bytes and last 2 bytes prove the framing; the `od -c` head shows the envelope beginning `{"ok": true, "data": "[\n …` (note the `"` after `data:` and the escaped `\n` — `data` is itself a **JSON string**):
+**(b) In-window client — 78 bytes, `"kitty_window_id":1` (OBSERVED, the canonical case).** The `kitten @ ls` a user actually types is a child of a kitty window, so kitty has exported `KITTY_WINDOW_ID=1` into its environment and the client adds the field. The **same** 78-byte frame is emitted whether the carrier is a socket or the PTY — only the carrier differs.
+
+*(b1) In-window, listener present → env-selected socket.* The window's environment carries `KITTY_LISTEN_ON`, so the client dials that socket. Traced with `strace -f -xx -e trace=connect,write` (the `-xx` option renders every string as `\xNN`; the connect line is shown decoded):
+
+```console
+$ cat env_sock.txt
+KITTY_WINDOW_ID=[1]
+KITTY_LISTEN_ON=[unix:/tmp/groupA.k0A9BE/win.sock]
+$ grep -c 'connect(' strace_sock.out
+1
+$ python3 -c 'import re; l=[x for x in open("strace_sock.out") if "connect(" in x][0]; print(re.sub(r"\\x(..)",lambda m:chr(int(m.group(1),16)),l).rstrip())'
+1789  connect(3, {sa_family=AF_UNIX, sun_path="/tmp/groupA.k0A9BE/win.sock"}, 30) = 0
+$ wc -c < req_sock.bin        # the 78-byte frame, extracted from the trace's write() payloads
+78
+$ od -An -tx1 req_sock.bin
+ 1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 63 6d
+ 64 22 3a 22 6c 73 22 2c 22 76 65 72 73 69 6f 6e
+ 22 3a 5b 30 2c 32 36 2c 30 5d 2c 22 6b 69 74 74
+ 79 5f 77 69 6e 64 6f 77 5f 69 64 22 3a 31 2c 22
+ 70 61 79 6c 6f 61 64 22 3a 7b 7d 7d 1b 5c
+$ python3 -c 'import json;print(json.loads(open("req_sock.bin","rb").read()[12:-2]))'
+{'cmd': 'ls', 'version': [0, 26, 0], 'kitty_window_id': 1, 'payload': {}}
+```
+
+Decoded: `{"cmd":"ls","version":[0,26,0],"kitty_window_id":1,"payload":{}}` — 78 bytes, differing from the external frame only by the inserted `,"kitty_window_id":1` (20 bytes; 58 + 20 = 78).
+
+*(b2) In-window, no listener → true PTY (the "TTY magic").* Launching kitty **without** `--listen-on` leaves `KITTY_LISTEN_ON` empty, so there is no socket to dial; the client instead opens the controlling terminal and writes the DCS frame to it. Traced with `strace -f -xx -e trace=connect,openat,write`, it shows **zero `connect()`**, an `openat` of `/dev/tty`, and the identical 78-byte frame written to that fd (prefix 12 + body 64 + suffix 2), reconstructed from the `write()` payloads:
+
+```console
+$ cat env_pty.txt
+KITTY_WINDOW_ID=[1]
+KITTY_LISTEN_ON=[]
+$ grep -c 'connect(' strace_pty.out
+0
+$ python3 -c 'import re; dec=lambda l:re.sub(r"\\x(..)",lambda m:chr(int(m.group(1),16)),l); print("".join(dec(l) for l in open("strace_pty.out") if "openat(" in l and "/dev/tty" in dec(l)), end="")'
+1880  openat(AT_FDCWD, "/dev/tty", O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC) = 3
+$ python3 - <<'PY'
+import re, json
+dec = lambda s: bytes(int(h,16) for h in re.findall(r'\\x(..)', s))
+frame = b''
+for l in open('strace_pty.out'):
+    m = re.search(r'write\(3, "((?:\\x..)+)", \d+\)', l)
+    if m:
+        p = dec(m.group(1))
+        if p.startswith(b'\x1bP@kitty-cmd') or p.startswith(b'{"cmd"') or p == b'\x1b\\':
+            frame += p
+print('bytes:', len(frame))
+print('hex  :', frame.hex(' '))
+print('json :', json.loads(frame[12:-2]))
+PY
+bytes: 78
+hex  : 1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 63 6d 64 22 3a 22 6c 73 22 2c 22 76 65 72 73 69 6f 6e 22 3a 5b 30 2c 32 36 2c 30 5d 2c 22 6b 69 74 74 79 5f 77 69 6e 64 6f 77 5f 69 64 22 3a 31 2c 22 70 61 79 6c 6f 61 64 22 3a 7b 7d 7d 1b 5c
+json : {'cmd': 'ls', 'version': [0, 26, 0], 'kitty_window_id': 1, 'payload': {}}
+```
+
+The client opens `/dev/tty` (`O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC`, fd 3) and writes the byte-for-byte identical 78-byte frame there — exactly the path `tty_io.go:79-82` takes (`queue_escape_code` framing with the same `cmd_escape_code_prefix`/`cmd_escape_code_suffix` and writing to the tty). So whether the request rides a socket (`connect()` in b1) or the PTY (`/dev/tty` write here), the on-the-wire frame is identical; **only the carrier differs**.
+
+> **Correction over a naive capture.** Running the client under a bare `script` pseudo-terminal (with no real kitty parent) leaves `KITTY_WINDOW_ID` unset and therefore yields the **58-byte** external frame — which is *not* the frame the canonical in-window `kitten @ ls` emits. The 78-byte frames in (b1)/(b2) are the canonical in-window bytes, captured from a client that is a genuine child of a running kitty window.
+
+**The response — complete frame, 3491 bytes, every byte accounted for (OBSERVED).** The reply to the external round trip (`response.bin`, copied by the tee proxy) is the same DCS envelope. Rather than eliding the middle, the block below accounts for **all 3491 bytes** and re-derives the outer→inner structure deterministically, retaining the outer→inner equality check:
 
 ```console
 $ wc -c < response.bin
-3655
-$ head -c 16 response.bin | od -An -tx1
- 1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 6f 6b
-$ head -c 40 response.bin | od -c
-0000000 033   P   @   k   i   t   t   y   -   c   m   d   {   "   o   k
-0000020   "   :       t   r   u   e   ,       "   d   a   t   a   "   :
-0000040       "   [   \   n           {
-0000050
-$ tail -c 2 response.bin | od -An -tx1
+3491
+$ head -c 12 response.bin | od -An -tx1      # DCS prefix
+ 1b 50 40 6b 69 74 74 79 2d 63 6d 64
+$ tail -c 2  response.bin | od -An -tx1       # DCS suffix
  1b 5c
+$ python3 - <<'PY'
+import json
+b = open("response.bin","rb").read()
+assert b[:12] == b"\x1bP@kitty-cmd" and b[-2:] == b"\x1b\\"     # framing verified
+outer = json.loads(b[12:-2])                                   # strip 12B prefix + 2B suffix
+inner = json.loads(outer["data"])                              # data is itself a JSON string
+stdout_tree = json.loads(open("ext_out.json").read())          # this capture's own client stdout
+print("total_bytes    =", len(b))
+print("byte_accounting =", 12, "+", len(b)-14, "+", 2, "==", len(b), "->", 12+(len(b)-14)+2 == len(b))
+print("outer_keys     =", sorted(outer))
+print("outer_ok       =", outer["ok"])
+print("data_str_bytes =", len(outer["data"].encode()))
+print("inner_top      =", type(inner).__name__, "len", len(inner))
+print("inner==stdout  =", inner == stdout_tree)
+PY
+total_bytes    = 3491
+byte_accounting = 12 + 3477 + 2 == 3491 -> True
+outer_keys     = ['data', 'ok']
+outer_ok       = True
+data_str_bytes = 3132
+inner_top      = list len 1
+inner==stdout  = True
 ```
 
-`1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 6f 6b` = `ESC P @kitty-cmd{"ok` and `1b 5c` = `ESC \`. This response framing is produced by `encode_response_for_peer` (`kitty/remote_control.py:52-53`). The outer envelope is `{ok, data}` where `data` is a **string** — the wrapping that `handle_cmd` applies (`kitty/remote_control.py:258-260`) around the string `ls` produces via `json.dumps(...)` (`kitty/rc/ls.py:76`). Re‑parsing that inner `data` string (e.g. `jq '.data|fromjson'`, or strip the 12‑byte prefix + 2‑byte suffix with the `docs/rc_protocol.rst:35-42` `awk` recipe) yields the tree shown **complete in §5.1** for this same instance.
-
-**The socketless case writes the *same* frame to the PTY (OBSERVED — actual PTY bytes).** To confirm the earlier claim that the TTY transport carries the identical DCS frame, the harness ran the real client under a pseudo‑terminal (`script`) with `KITTY_LISTEN_ON` unset, and dumped exactly what the client wrote to the controlling PTY. The `@kitty-cmd` frame it emitted is **byte‑for‑byte identical** to the socket request above:
-
-```console
-$ python3 -c 'raw=open("ptycap.raw","rb").read(); i=raw.find(b"\x1bP@kitty-cmd"); j=raw.find(b"\x1b\\",i); f=raw[i:j+2]; print("len",len(f)); print(f.hex(" "))'
-len 58
-1b 50 40 6b 69 74 74 79 2d 63 6d 64 7b 22 63 6d 64 22 3a 22 6c 73 22 2c 22 76 65 72 73 69 6f 6e 22 3a 5b 30 2c 32 36 2c 30 5d 2c 22 70 61 79 6c 6f 61 64 22 3a 7b 7d 7d 1b 5c
-```
-
-That is the same 58‑byte `\033P@kitty-cmd{"cmd":"ls","version":[0,26,0],"payload":{}}\033\\`. So whether it travels over a socket or over the PTY, the on‑the‑wire request frame is identical; only the *carrier* differs. (Under a bare `script` PTY there is no kitty to answer, so the client writes its request frame and then exits without a response — which is why this block shows the request only; the socket capture above shows the full round trip.)
+Every one of the 3491 bytes is accounted for: a **12-byte** DCS prefix (`ESC P @kitty-cmd`) + a **3477-byte** outer JSON object + a **2-byte** DCS suffix (`ESC \`). The outer object is exactly `{"ok": true, "data": <3132-byte string>}` — the wrapping `handle_cmd` applies (`kitty/remote_control.py:258-260`) around the string that `LS.response_from_kitty` returns via `json.dumps(...)` (`kitty/rc/ls.py:76`); the response framing itself is produced by `encode_response_for_peer` (`kitty/remote_control.py:52-53`). Decoding the 3132-byte `data` string yields the OS-window list (a `list` of length 1, the same structure shown **complete in §5.1**), and it is **byte-for-byte equal to this capture's own client stdout** (`inner == stdout` above). *(Volatile note: the exact byte count tracks the child's environment block embedded in the `ls` tree; this frame is from the minimal `env -i` capture instance, so it is smaller than the §5.1 consolidated instance's response.)*
 
 ### 5.3 The Python parse/route chain — where `ls` gets handled (OBSERVED)
 
@@ -624,6 +733,20 @@ $ cat "$WORK/kitty.log"
 [1.177] Failed to parse JSON payload of remote command, ignoring it
 ```
 
+The **same "no log on success" holds over the PTY transport**, not just the socket. A successful socketless `kitten @ ls` (the §6.4 *Case 6b* run — delivered as a DCS frame over `/dev/tty`, with no socket) is handled by the very same kitty process, so the harness snapshotted **that process's own stderr immediately before and 0.6 s after** the call. It is **byte‑for‑byte unchanged** (identical size and SHA‑256), with **zero** RC lines:
+
+```console
+KITTEN_EXIT=0
+RESPONSE_JSON=VALID
+STDERR_BEFORE bytes=78 rc_lines=0 sha256=7b963e8abd1f5e2290dba41729f2e4ff8a7099b81a047343434a2b62f800a81a
+STDERR_AFTER  bytes=78 rc_lines=0 sha256=7b963e8abd1f5e2290dba41729f2e4ff8a7099b81a047343434a2b62f800a81a
+STDERR_UNCHANGED=yes
+# the entire (unchanged) server stderr — startup noise only, no RC line:
+[0.272] Failed to open systemd user bus with error: No such file or directory
+```
+
+So **both** transports agree: a successful `ls` logs nothing; only an error path logs. (Note this run's startup line reads `No such file or directory`, whereas other runs on the same image read `No medium found` — the errno wording is environment/timing‑dependent, discussed in §2 and §5.5's error note; it is *not* an RC line and does not change across the success call.)
+
 - **Success:** with the exit‑0 + valid‑JSON precondition satisfied, the RC‑relevant line count stayed `0 → 0` — **no log on success**.
 - **Error:** the malformed frame added **exactly one** RC line, `Failed to parse JSON payload of remote command, ignoring it` — `log_error(...)` at `kitty/remote_control.py:62` inside `parse_cmd`. The other line, `Failed to open systemd user bus …`, is the pre‑existing D‑Bus startup noise from §2; it is **not** an RC line, which is precisely why the RC‑relevant count went `0 → 1` (not `1 → 2`). Counting only RC‑relevant lines (`grep -c 'remote command'`) rather than total lines avoids conflating the two.
 - **Other `log_error` sites exist but were *not* triggered in these runs (SOURCE‑VERIFIED, not observed):** a structurally broken peer frame would log `Malformatted remote control message received from peer, ignoring` at `kitty/boss.py:792` (`peer_message_received`), and a command that raises while being parsed on the boss side would log `Failed to parse remote command with error: {e}` at `kitty/boss.py:605` (`_handle_remote_command`). `log_error` itself is defined at `kitty/utils.py:130`. They are listed for completeness and labeled SOURCE‑VERIFIED because they were read from the code, not reproduced here.
@@ -674,7 +797,7 @@ grep_exit=1
 
 The scripts only ever **read** the kitty‑set variables — e.g. `shell-integration/bash/kitty.bash:215` (`if [[ -z "$KITTY_PID" ]]; then`), `shell-integration/zsh/kitty-integration:249` (`if [[ -n "$KITTY_PID" ]]; then`), and `shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:29` (`test -n "$KITTY_SHELL_INTEGRATION" || return 0`). They use `KITTY_PID` only for local‑vs‑SSH detection; none of them creates the RC target.
 
-> **In‑window harness (Cases 4‑6, shared `WORK=/tmp/kitty_obs_work/run.4VK8TB`).** Each case launches a kitty whose window runs a throwaway inner script (`caseN_inner.sh`, created under `WORK`, deleted on exit) that (1) dumps the four env vars **as the window's child sees them**, (2) resolves `which kitten` to prove the real launcher is used, (3) runs the **bare** `kitten @ ls` (no `--to`) and records its exit code, (4) validates the returned JSON, (5) projects the window list to `id,is_self,cmdline`, and (6) prints the listening socket **scoped to this kitty's own PID** (`ss -x` filtered to the owner) so a stray socket from another instance cannot be mistaken for this one. Output is shown complete and unedited.
+> **In‑window harness (Cases 4‑6, shared `WORK=/tmp/kitty_obs_work/run.4VK8TB`).** Each case launches a kitty whose window runs a throwaway inner script (`caseN_inner.sh`, created under `WORK`, deleted on exit) that (1) dumps the four env vars **as the window's child sees them**, (2) resolves `which kitten` to prove the real launcher is used, (3) runs the **bare** `kitten @ ls` (no `--to`) and records its exit code, (4) validates the returned JSON, (5) projects the window list to `id,is_self,cmdline`, and (6) prints the listening socket **scoped to this kitty's own PID** (`ss -x` filtered to the owner) so a stray socket from another instance cannot be mistaken for this one. Output is shown complete and unedited, with **one deliberate, labeled exception**: the per-window `KITTY_PUBLIC_KEY` is projected to its `1:` version prefix plus byte-length (`1:...(len=42)`) instead of its full 40-char base85 body. That field is a **non-secret, ephemeral, per-instance** key — a *different* value on every launch, so its body carries no cross-case meaning — and one full specimen is shown verbatim in §5.1’s env block (`"1:a0J8LSF$PtKFfn)oo_Iq!cdVXfKy%#=5^0JR;uk%"`), with the non-secret security rationale in the note immediately after it. Projecting it keeps the three env dumps aligned without implying the differing key bodies are significant.
 
 ### 6.2 Case 4 — in‑window, socket configured → uses the same socket (OBSERVED)
 
@@ -745,6 +868,30 @@ u_str LISTEN 0      128    /tmp/kitty_obs_work/run.4VK8TB/nosikitty 728558053   
 
 `KITTY_SHELL_INTEGRATION` is now **empty** (`SI=[]`, shell integration genuinely off), yet `KITTY_PID` and `KITTY_LISTEN_ON` are **still set** (`child.py:244-249` exports them regardless of shell integration), and `kitten @ ls` still works (`KITTEN_EXIT=0`, `RESPONSE_JSON=VALID`) over the socket owned by pid `41580`. **Conclusion: shell integration is not what makes RC work** — the enabler is kitty's env export (`kitty/child.py:244-249`) plus the two RC transports.
 
+**Case 6b — the decisive combination: shell integration OFF *and* no socket → still works over the PTY (OBSERVED, closes R5).** Case 6 kept a socket; to prove shell integration is not the enabler *even for the socketless path*, launch with **both** `-o shell_integration=disabled` **and no `--listen-on`**, then run bare `kitten @ ls` in the window:
+
+```console
+--- env inside window (case6b: shell_integration=disabled, NO --listen-on) ---
+KITTY_PID=[2238]
+KITTY_WINDOW_ID=[1]
+KITTY_LISTEN_ON=[]
+KITTY_SHELL_INTEGRATION=[]
+KITTY_PUBLIC_KEY_present=[yes]
+--- listener scoped to THIS kitty pid 2238 ---
+(no listening socket owned by pid 2238)
+--- run REAL: kitten @ ls  (no --to) ---
+KITTEN_EXIT=0
+RESPONSE_JSON=VALID
+--- projected windows (id,is_self,cmdline) ---
+[{"id":1,"is_self":true,"cmdline":["bash","/tmp/groupB.NEb3Nt/inner_b.sh"]}]
+--- transport proof (strace -f -xx -e trace=connect,openat,write) ---
+connect() calls: 0
+2324  openat(AT_FDCWD, "/dev/tty", O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC) = 3
+reconstructed DCS frame: 78 bytes  {"cmd":"ls","version":[0,26,0],"kitty_window_id":1,"payload":{}}
+```
+
+Here shell integration is genuinely **off** (`KITTY_SHELL_INTEGRATION=[]`) **and** there is **no socket** (`KITTY_LISTEN_ON=[]`, and no listening socket owned by pid `2238`), yet `kitten @ ls` still succeeds (`KITTEN_EXIT=0`, `RESPONSE_JSON=VALID`, `is_self:true`). The strace proves it took the **true PTY** path: **zero `connect()`** calls, an `openat` of `/dev/tty` (fd 3), and the 78‑byte `@kitty-cmd` DCS frame written there — exactly `do_tty_io` (`tools/cmd/at/main.go:280`) → `tty_io.go:79-82`, parsed by `kitty/vt-parser.c:603` and routed via `kitty/window.py:1279`. `KITTY_PUBLIC_KEY` is still present because `kitty/child.py:244-249` exports it unconditionally. **This is the airtight disambiguation:** with shell integration disabled *and* no socket, the socketless TTY transport still delivers the command — so shell integration is not the enabler of *either* transport; kitty's env export plus the two transports are.
+
 > **Gotcha you may hit:** the correct value is `shell_integration=disabled`, **not** `shell_integration=no`. `no` is an invalid token that kitty ignores **while emitting a diagnostic** — `Invalid shell integration options: frozenset({'no'}), ignoring` via `log_error` at `kitty/options/utils.py:985` (OBSERVED at startup) — leaving shell integration *enabled*; the default is `enabled` (`kitty/options/definition.py:3141`).
 
 ### 6.5 Resolution of your either/or
@@ -790,7 +937,7 @@ It then computes `allowed_unconditionally` (`boss.py:623-628`): true when `allow
 
 ### 7.3 Encryption scheme (INFERRED‑from‑spec — NOT exercised)
 
-The plaintext `kitten @ ls` runs above are **not** encrypted: the real socket request and the real PTY frame captured in **§5.2** are cleartext DCS + JSON (`{"cmd":"ls","version":[0,26,0],"payload":{}}` with no `iv`/`tag`/`encrypted` fields). Encryption engages **only** when a `remote_control_password` is involved, and works as follows per the in‑repo spec (`docs/rc_protocol.rst:57-84`): the command is encrypted using the recipient's **public key** taken from `KITTY_PUBLIC_KEY` (protocol prefix `1:`, `:60-61` — the very variable whose consumers are traced in §6.1); key agreement is **X25519** ECDH (`:64`); a **time‑based nonce** is added and commands whose `timestamp` is **more than 5 minutes** from now are **rejected** (`:66-68`); the command is then sealed with **AES‑256‑GCM** (authenticated) (`:69`) and the fields (`iv`, `tag`, `pubkey`, `encrypted`) are base85‑encoded into the JSON envelope. Altering encryption/auth is **out of scope** (AAP §0.5.2).
+The plaintext `kitten @ ls` runs above are **not** encrypted: the real socket request and the real PTY frame captured in **§5.2** are cleartext DCS + JSON (e.g. the in-window PTY frame `{"cmd":"ls","version":[0,26,0],"kitty_window_id":1,"payload":{}}`, and the external socket request `{"cmd":"ls","version":[0,26,0],"payload":{}}` — both with no `iv`/`tag`/`encrypted` fields). Encryption engages **only** when a `remote_control_password` is involved, and works as follows per the in‑repo spec (`docs/rc_protocol.rst:57-84`): the command is encrypted using the recipient's **public key** taken from `KITTY_PUBLIC_KEY` (protocol prefix `1:`, `:60-61` — the very variable whose consumers are traced in §6.1); key agreement is **X25519** ECDH (`:64`); a **time‑based nonce** is added and commands whose `timestamp` is **more than 5 minutes** from now are **rejected** (`:66-68`); the command is then sealed with **AES‑256‑GCM** (authenticated) (`:69`) and the fields (`iv`, `tag`, `pubkey`, `encrypted`) are base85‑encoded into the JSON envelope. Altering encryption/auth is **out of scope** (AAP §0.5.2).
 
 ---
 
@@ -819,25 +966,25 @@ Every major claim is tagged **OBSERVED** (reproduced at runtime, with the produc
 
 | # | Claim | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Build is `python3 setup.py`; launcher at `kitty/launcher/kitty`; banner `kitty 0.35.2`; binary stamps `VCSRevision` of the checked-out git HEAD (authoring-time capture `7da6b377`; a fresh build stamps the current documentation commit) | OBSERVED | §2 `--verbose` build tail + `--version` |
+| 1 | Build is `python3 setup.py`; launcher at `kitty/launcher/kitty`; banner `kitty 0.35.2`; binary stamps `VCSRevision` of the checked-out git HEAD (authoring-time capture; §2 shows a fresh build stamping the current HEAD `3389e897`; the initial documentation commit was `7da6b377`) | OBSERVED | §2 `--verbose` build tail + `--version` |
 | 2 | Transport = socket **or** DCS‑over‑PTY, never a pipe | OBSERVED (both) | §4/§6 socket dial + §6.3 socketless TTY; `main.go:280` |
 | 3 | Target string present → `do_socket_io` (`net.Dial`) | OBSERVED | §4.1/§6.2 + `socket_io.go:177` |
-| 4 | Empty target string → `do_tty_io` (DCS to PTY), even with no socket for this instance | OBSERVED | §6.3 (no listener for pid 41484, still works) + `tty_io.go:79-82` |
+| 4 | Empty target string -> `do_tty_io` (DCS to PTY), even with no socket for this instance | OBSERVED | §6.3 (no listener for pid 41484) and §6.4 Case 6b (SI disabled AND no socket, still works); `tty_io.go:79-82` |
 | 5 | CLI `--listen-on` is **verbatim** unless it contains `{kitty_pid}` | OBSERVED | §4.1 `.../mykitty` (pid 40579) & `.../tplkitty-40680`; `main.py:329-331` |
 | 6 | Config‑file `listen_on` gets an automatic `-<PID>` suffix | OBSERVED | §4.1 `.../cfgkitty-40761` (pid 40761) + `main.py:329-330` |
 | 7 | `unix:@name` = abstract socket, no FS entry | OBSERVED | §4.2 `@obskitty` via `ss`/`lsof` + `utils.py:513-514` |
 | 8 | Default‑off: no socket unless `allow_remote_control` **and** `listen_on` set | OBSERVED | §4.3 grep_exit=1 + §6.3 empty `LISTEN_ON`; `boss.py:364-366`, `definition.py:2969,3000` |
-| 9 | Client request is a 58‑byte cleartext DCS `<ESC>P@kitty-cmd{…}<ESC>\`, version `[0,26,0]` | OBSERVED | §5.2 real‑client `od`/hex; `socket_io.go:82-83`, `main.go:33` |
+| 9 | Client request is a cleartext DCS `<ESC>P@kitty-cmd{…}<ESC>\`, version `[0,26,0]` — **58 B external** (no `kitty_window_id`) vs **78 B in-window** (`"kitty_window_id":1`) | OBSERVED | §5.2 real-client `od`/hex for both frames; `socket_io.go:82-83`, `main.go:33,271-273`, `types.go:15` |
 | 10 | Response is `{ok:true, data:<json-string>}` in the same DCS envelope | OBSERVED | §5.2 response bytes + §5.1; `remote_control.py:52-53,258-260`, `ls.py:76` |
-| 11 | The socketless PTY frame is **byte‑identical** to the socket request (58 B) | OBSERVED | §5.2 `ptycap.raw` vs `request.bin` |
+| 11 | The socketless PTY frame is **byte-identical** to the in-window socket request (both **78 B**, carrying `"kitty_window_id":1`) | OBSERVED | §5.2 (b2) PTY frame reconstructed from `/dev/tty` `write()`s in `strace_pty.out` vs (b1) `req_sock.bin` |
 | 12 | Parse/route: `parse_cmd → handle_cmd → command_for_name('ls') → LS.response_from_kitty`; both ingresses identical | OBSERVED | §5.3 shim firing order (socket + TTY) |
 | 13 | Real `ls` JSON tree structure | OBSERVED | §5.1 complete output (pid 42106 instance) |
-| 14 | Logging: empty on success (exit 0 + valid JSON asserted first), one `log_error` on malformed | OBSERVED | §5.5 line‑count + error line; `remote_control.py:62` |
+| 14 | Logging: empty on success over BOTH transports (socket AND PTY; exit 0 + valid JSON asserted first), one `log_error` on malformed | OBSERVED | §5.5 socket line-count + PTY stderr before==after (bytes/sha256) + error line; `remote_control.py:62` |
 | 15 | Go return leg: decode → `Ok`→print `Data`; `!Ok`→print `Error`, exit 1 | OBSERVED | §5.4 `ls` tree on stdout + `--match 'nonsense:1'`; `main.go:223,248,288,297` |
 | 16 | `KITTY_PID` and `KITTY_PUBLIC_KEY` exported **unconditionally** to every child | OBSERVED + SOURCE‑VERIFIED | §5.1/§6.2‑6.4 env dumps (populated in all cases); `child.py:244-245` |
 | 17 | `KITTY_LISTEN_ON` exported **conditionally** (only when listening; else popped) | OBSERVED + SOURCE‑VERIFIED | §6.3 `KITTY_LISTEN_ON=[]` while PID set; `child.py:246-249` |
 | 18 | Shell‑integration scripts do **not** set `KITTY_LISTEN_ON` (they only read env) | OBSERVED | §6.1 `grep` exit 1 |
-| 19 | `shell_integration=disabled` → RC still works (SI is not the enabler) | OBSERVED | §6.4 (`SI=[]`, exit 0) |
+| 19 | `shell_integration=disabled` -> RC still works — even with NO socket, over the PTY (SI is not the enabler of either transport) | OBSERVED | §6.4 Case 6 (socket) + Case 6b (`SI=[]`, `LISTEN_ON=[]`, 0 `connect()`, `/dev/tty`, exit 0) |
 | 20 | `KITTY_PUBLIC_KEY` is consumed **only** on the password/encryption path | SOURCE‑VERIFIED (not exercised) | `get_pubkey` `main.go:72-94`, `remote_control.py:516-524` |
 | 21 | `allow_remote_control` modes: `no`/`yes`/`password`/`socket-only`/`socket` & gating | SOURCE‑VERIFIED (`no`+`yes` OBSERVED) | `definition.py:2969-2999`; `boss.py:594-640` |
 | 22 | New command: Python server auto‑routes; Go client needs a generated file + rebuild | SOURCE‑VERIFIED | `base.py:451-453`; `cmd_ls_generated.go:1,148-149`, `go_code.py:667-671`, `setup.py:1102,1112` |
@@ -858,11 +1005,35 @@ Every major claim is tagged **OBSERVED** (reproduced at runtime, with the produc
    → **§1 (TL;DR #2) + §4.** Three compounding reasons, each shown live: config‑file paths get an automatic **`-<PID>` suffix** (`.../cfgkitty-40761`, §4.1); `unix:@…` **abstract** sockets have **no file** (`@obskitty`, §4.2); and by default there is **no socket at all** unless `allow_remote_control` + `listen_on` are both set (§4.3).
 
 3. **Shell integration "without configuration": same socket, or TTY magic through the pty? And where are those env vars used?**
-   → **§1 (TL;DR #3) + §6.** **Same socket when one is configured** (§6.2, `KITTY_LISTEN_ON`); **DCS‑over‑PTY when no socket exists** (§6.3). The env vars are **produced by `kitty/child.py:244-249`** and **consumed by `tools/cmd/at/main.go:371-372`**; the shell scripts only *read* them (grep exit 1, §6.1) — proven by `shell_integration=disabled` still working (§6.4).
+   → **§1 (TL;DR #3) + §6.** **Same socket when one is configured** (§6.2, `KITTY_LISTEN_ON`); **DCS‑over‑PTY when no socket exists** (§6.3). The env vars are **produced by `kitty/child.py:244-249`** and **consumed by `tools/cmd/at/main.go:371-372`**; the shell scripts only *read* them (grep exit 1, §6.1) — proven decisively in §6.4: `shell_integration=disabled` still works **with a socket (Case 6)** *and* **with no socket at all, over the PTY (Case 6b: `SI=[]`, `LISTEN_ON=[]`, 0 `connect()`, `/dev/tty`)**.
 
 4. **Show the real socket path, the on‑the‑wire messages, where Python parses/routes to `ls`, the returned JSON, and logging.**
-   → **§1 (TL;DR #4) + §4/§5.** Real socket path (`.../run.e6tI6X/mykitty` verbatim, §4.1; the §5 round trip used `.../run.XgZliG/kitty.sock`, pid 42106); raw + decoded DCS bytes (§5.2); parse/route chain `parse_cmd → handle_cmd → command_for_name('ls') → LS.response_from_kitty` (§5.3); complete `ls` JSON (§5.1); logging empty‑on‑success vs one `log_error` on malformed (§5.5); and the Go client's receive→decode→print return leg (§5.4).
+   → **§1 (TL;DR #4) + §4/§5.** Real socket path (`.../run.e6tI6X/mykitty` verbatim, §4.1; the §5 round trip used `.../run.XgZliG/kitty.sock`, pid 42106); raw + decoded DCS bytes for the external **and** in‑window frames (§5.2); parse/route chain `parse_cmd → handle_cmd → command_for_name('ls') → LS.response_from_kitty` (§5.3); complete `ls` JSON (§5.1); logging empty‑on‑success vs one `log_error` on malformed, verified over **both** the socket **and** the PTY transports (§5.5); and the Go client's receive→decode→print return leg (§5.4).
+
+## 11. Cleanup & final repository state (OBSERVED)
+
+Per the read-only mandate (AAP §0.5.2, §0.8), every instrumentation artifact was transient: all throwaway scripts and captures lived under `mktemp -d` working directories **outside** the repository, kitty instances were launched with explicit `$!` PID capture and stopped by killing that exact PID (the lifecycle is in §4.4), and each working directory was removed on exit. This is the end-of-document cleanup evidence promised in the header and cross-referenced from §2, §4.4, and §5.5.
+
+```console
+# the transient working directory is removed and confirmed gone …
+$ rm -rf "$W" ; ls -d "$W" 2>&1
+ls: cannot access '/tmp/tmp.EfRjXTF9gC': No such file or directory
+
+# … the instrumented kitty is already dead (its lifecycle PID no longer exists) …
+$ ps -p 4979 -o pid=,comm= ; echo "ps_exit=$?"
+ps_exit=1
+
+# … and the repository shows exactly ONE change — this deliverable — with NO source edits:
+$ git status --porcelain
+ M blitzy/documentation/kitty_815df1e210e0.md
+$ git status --porcelain -- . ':(exclude)blitzy/documentation' ; echo "src_query_exit=$?"
+src_query_exit=0
+$ git diff --quiet -- kitty/data-types.c && echo "data-types.c: UNCHANGED (byte-identical)"
+data-types.c: UNCHANGED (byte-identical)
+```
+
+The single porcelain line is the **deliverable document itself**; the source-excluding query (`:(exclude)blitzy/documentation`) prints **nothing** and exits 0, confirming that **no** C, Go, Python, config, or test file was modified — including `kitty/data-types.c`, which was `touch`-ed only to force the §2 verbose rebuild and is byte-identical (`git diff --quiet` succeeds). Once this document is committed, `git status --porcelain` is empty. The only artifact this investigation adds to the tree is `blitzy/documentation/kitty_815df1e210e0.md` — satisfying the constraint that the source repository is left byte-for-byte unchanged.
 
 ---
 
-*End of document. All runtime evidence above was captured on `kitty 0.35.2` (source tree at base VCS `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; the built binary stamps `VCSRevision` with the git HEAD checked out at build time (authoring-time capture `7da6b377`, the initial documentation commit; a fresh build stamps the current documentation commit) — see §2) inside the prepared container, under `Xvfb :99` with the Mesa `llvmpipe` software GL renderer. Volatile values (PIDs such as `40579`/`42106`/`42182` in §4‑§5 and `41386`/`41484`/`41580` in §6, socket inode numbers, timestamps, and the ephemeral public key) are reported exactly as observed and will differ on other runs.*
+*End of document. All runtime evidence above was captured on `kitty 0.35.2` (source tree at base VCS `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; the built binary stamps `VCSRevision` with the git HEAD checked out at build time (authoring-time capture; §2's fresh build stamps the current HEAD `3389e897`, and the initial documentation commit was `7da6b377`) — see §2) inside the prepared container, under `Xvfb :99` with the Mesa `llvmpipe` software GL renderer. Volatile values (PIDs such as `40579`/`42106`/`42182` in §4‑§5 and `41386`/`41484`/`41580` in §6, socket inode numbers, timestamps, and the ephemeral public key) are reported exactly as observed and will differ on other runs.*
