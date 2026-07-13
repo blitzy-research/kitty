@@ -4,14 +4,28 @@
 
 ## Methodology and provenance
 
-Every factual claim below was produced by **building kitty from source and running its real test suite first**, then writing this document from the captured output. The complete, unedited output of each command is embedded beside the claim it supports, together with the exact command that produced it. Statements that are **not** direct observations — i.e. conclusions derived by reading source code rather than watching runtime behaviour — are explicitly marked **(inferred)**. Source locations are given as `file:line` against the checkout described below.
+Every factual claim below was produced by **building kitty from source and running its real test suite first**, then writing this document from the captured output. Beside every behavioural claim is the **exact command that produced it** together with that command's output. Two honest scope notes on the phrase "complete output":
+
+1. The `setup.py build --verbose` log is **319 lines** of largely-repetitive per-file compiler invocations (the longest single line — the `fast_data_types` link command — reaches **3,626 characters**). Rather than paste all 319 lines, §1 embeds the build's **exit code, wall-clock duration, verbatim preamble, and self-contained `grep`/`nm`/`ls` commands whose own output is shown complete and unedited**. Every command that is *shown* has its full, verbatim output beside it; nothing inside a shown output block is paraphrased or elided.
+2. Where a value is stated "stable across two runs", **both runs were executed**. The second run's output is shown in full when it differs materially (e.g. the two full test runs, §2.1/§2.2), and stated as byte-identical (with the exact re-run command given, so it is reproducible) when it is (e.g. the loaded-module and import-chain observers, §4/§9).
+
+Statements that are **not** direct observations — conclusions derived by reading source rather than watching runtime behaviour — are explicitly marked **(inferred)**. Source locations are given as `file:line` against the checkout described below.
 
 - **Source commit under investigation:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (kitty). This is the code that was read for all `file:line` citations.
 - **Delivery branch (where this document is added):** `blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9`. This document is the *only* file added to the repository; no existing file is modified. The compiled `*.so` extensions are git-ignored generated build artifacts (`.gitignore:1` = `*.so`); any that were temporarily moved during the failure-cascade reproduction (§5) were restored byte-for-byte (verified by SHA-256 in the Appendix).
-- **Canonical build command:** `CC=gcc-13 python3 setup.py build --verbose`
-- **Canonical test command:** `CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./test.py` (single module: `./test.py --module <name>`)
+- **Canonical build command — exactly what kitty's CI runs (`.github/workflows/ci.py:104` = `{python} setup.py build --verbose`, with *no* `CC` override):** `python3 setup.py build --verbose`. On this container the host default compiler is `gcc` 15.2.0; the environment setup additionally recommends the `gcc-13` variant `CC=gcc-13 python3 setup.py build --verbose`. **Both build cleanly (exit 0)** — see §1.1–§1.3, which show each build's duration and the (differing) artifact sizes. The compiled artifacts used for every runtime observation in this document (§1.1 symbols, §1.3 sizes, §4 loading, §5 cascades, Appendix hashes) are from the `CC=gcc-13` build.
+- **Canonical test command:** `CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./test.py` (single module: `./test.py --module <name>`).
 
-All temporary observation scripts lived under `/tmp` (never inside the repository) and were removed after use; their full source is shown inline where used.
+**Shell setup assumed for every command block in this document.** The inherited container PATH does **not** include the Go toolchain (`/usr/local/go/bin`), and the C UTF-8 locale is required; unless a block shows a different environment inline, assume this setup is in effect:
+
+```console
+$ export PATH="/usr/local/go/bin:$PATH"    # kitten's `go build` and the Go test suite need `go` on PATH; otherwise it is "not found"
+$ export LANG=C.UTF-8 LC_ALL=C.UTF-8        # required, or two zsh shell-integration tests error on UTF-8 handling
+$ command -v go
+/usr/local/go/bin/go
+```
+
+All temporary observation scripts lived under `/tmp` (never inside the repository) and were removed after use; their **full, runnable source is shown inline** where used (no elided bodies).
 
 ### Direct answer (summary)
 
@@ -86,27 +100,70 @@ In the `dpkg-query` block above, the leading `dpkg-query: no packages found matc
 
 ## 1. Building kitty from source (canonical configuration)
 
-kitty is built by its multi-language orchestrator `setup.py` (it uses `sysconfig`, not distutils, so it builds cleanly on Python 3.13). The canonical build command — the one kitty's CI uses (`.github/workflows/ci.py:104`, `{python} setup.py build --verbose`) — was run after a clean:
+kitty is built by its multi-language orchestrator `setup.py` (it uses `sysconfig`, not distutils, so it builds cleanly on Python 3.13). The **canonical** build command is exactly the one kitty's own CI runs — `build_kitty()` at `.github/workflows/ci.py:102-104` sets `cmd = f'{python} setup.py build --verbose'`, i.e. **`python3 setup.py build --verbose` with no `CC` override**. On this container the host default compiler is `gcc` 15.2.0; the environment setup additionally recommends building with `CC=gcc-13` (gcc 13.4.0). **Both configurations build cleanly (exit code 0).** Each was run twice from a clean tree, timing the wall clock with the shell `time` builtin:
 
 ```console
-$ CC=gcc-13 python3 setup.py clean
 $ export TIMEFORMAT='BUILD_REAL_SECONDS=%R'
-$ { time CC=gcc-13 python3 setup.py build --verbose ; }
+
+# (a) canonical CI command — default compiler (gcc 15.2.0)
+$ python3 setup.py clean ;            { time python3 setup.py build --verbose ; } ; echo "exit=$?"   # run 1
+$ python3 setup.py clean ;            { time python3 setup.py build --verbose ; } ; echo "exit=$?"   # run 2
+
+# (b) container-recommended variant — CC=gcc-13 (gcc 13.4.0); this is the build left on disk
+$ CC=gcc-13 python3 setup.py clean ;  { time CC=gcc-13 python3 setup.py build --verbose ; } ; echo "exit=$?"   # run 1
+$ CC=gcc-13 python3 setup.py clean ;  { time CC=gcc-13 python3 setup.py build --verbose ; } ; echo "exit=$?"   # run 2
 ```
 
-The build completed successfully (exit code 0). Its wall-clock duration was captured with the shell `time` builtin and confirmed to be of the same order across the clean rebuild:
+All four builds reported `exit=0`. The captured `BUILD_REAL_SECONDS` values are stable to the same order across the two runs of each configuration:
 
 ```text
-BUILD_REAL_SECONDS=60.871
+# (a) default gcc 15.2.0
+BUILD_REAL_SECONDS=65.081      # run 1
+BUILD_REAL_SECONDS=64.060      # run 2
+# (b) CC=gcc-13
+BUILD_REAL_SECONDS=61.630      # run 1
+BUILD_REAL_SECONDS=61.590      # run 2
 ```
 
-The three extension link steps and the two launcher/Go build steps appear in the verbose build log at these lines (`build/…` object paths abbreviated):
+Both builds emit an identical **319-line** verbose log. Its verbatim preamble records two facts directly relevant to this investigation — the Wayland backend is **disabled** (no `wayland-protocols` on this host), and the detected compiler:
 
-- `build.log:98` — link `kitty/fast_data_types.so`
-- `build.log:99` — link `kitty/glfw-x11.so`
-- `build.log:100` — link `kittens/transfer/rsync.so`
-- `build.log:101` — link the C launcher `kitty/launcher/kitty`
-- `build.log:319` — `go build` of `kitty/launcher/kitten` (its ldflags embed `-X kitty.VCSRevision=<delivery-commit>`, i.e. the *destination* commit, not the source commit — see Appendix)
+```text
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+CC: ['gcc-13'] (13, 0)
+gcc-13 (Ubuntu 13.4.0-4ubuntu1) 13.4.0
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+Detected: CompilerType.gcc
+```
+
+(The default-compiler build's preamble is identical except for the three compiler-identity lines, which read `CC: ['gcc'] (15, 0)` / `gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0` / `Copyright (C) 2025 Free Software Foundation, Inc.`.) The line **`Disabling building of wayland backend`** is the *observed* reason `glfw-wayland.so` is never produced here — the root cause of the non-CI `test_glfw_modules` result in §2.4.
+
+Rather than reproduce all 319 largely-repetitive per-file compile lines, the three extension link steps and the two launcher/Go build steps are isolated with a self-contained `grep` over the build output. The command below is exactly reproducible and its output is complete:
+
+```console
+$ CC=gcc-13 python3 setup.py build --verbose 2>&1 \
+    | grep -oE '\-o (build/kitty/fast_data_types\.so|build/kitty/glfw-x11\.so|build/kittens/transfer/rsync\.so|kitty/launcher/kitty|kitty/launcher/kitten)'
+```
+
+```text
+-o build/kitty/fast_data_types.so
+-o build/kitty/glfw-x11.so
+-o build/kittens/transfer/rsync.so
+-o kitty/launcher/kitty
+-o kitty/launcher/kitten
+```
+
+The final step is the `go build` that produces `kitty/launcher/kitten`. Its `-ldflags` embed `-X kitty.VCSRevision=<delivery-commit>` — the *destination* delivery commit, not the source commit (see Appendix). Shown verbatim below, with only that 40-hex revision replaced by the placeholder `<delivery-commit>` because it is the hash of the commit that adds this document (which cannot embed its own hash):
+
+```text
+/usr/local/go/bin/go build -v -ldflags '-X kitty.VCSRevision=<delivery-commit> -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/tools/cmd
+```
 
 ### 1.1 Extension taxonomy — two Python extensions + one native library (observed)
 
@@ -118,20 +175,65 @@ $ for so in kitty/fast_data_types.so kittens/transfer/rsync.so kitty/glfw-x11.so
 ```
 
 ```text
-### command: for f in fast_data_types glfw-x11 rsync: nm -D | grep -E 'PyInit|utf_8_strndup'
 --- kitty/fast_data_types.so ---
 0000000000028c70 T PyInit_fast_data_types
 --- kittens/transfer/rsync.so ---
 0000000000008600 T PyInit_rsync
 --- kitty/glfw-x11.so ---
-(no PyInit -> NOT a Python extension module)
-    glfw-x11.so exported native symbol used by test_utf_8_strndup:
 0000000000021f60 T utf_8_strndup
 ```
 
+Interpreting the observed output: `fast_data_types.so` and `rsync.so` each print a `PyInit_*` line (`PyInit_fast_data_types` at `0x28c70`, `PyInit_rsync` at `0x8600`), confirming they are importable CPython extension modules. Under the `--- kitty/glfw-x11.so ---` header the command prints **only** the `utf_8_strndup` line (`0x21f60`) and **no** `PyInit_*` line — so `glfw-x11.so` is a native shared library, not a Python extension module; it is consumed through `ctypes` rather than `import` (see §4 and §5.3). The exact symbol addresses are compiler/link dependent (captured here from the on-disk `CC=gcc-13` build); the **presence/absence** of each symbol is not. **(inferred that the missing `PyInit_glfw_x11` means "not importable as a Python module" — the runtime confirmation of that inference is the actual `ModuleNotFoundError`-free `ctypes` load path exercised in §4.1 and the cascade in §5.3.)**
+
 ### 1.2 What actually gets compiled into each extension (source selection, observed)
 
-The repository globs are **not** the exact set of build inputs. Counting the object files on each link line in `build.log` (`grep -oE 'build/…\.o'`) versus the on-disk globs shows the difference:
+The repository globs are **not** the exact set of build inputs. Two self-contained, reproducible steps show the difference: first count the on-disk source globs, then count the object files (`.o` tokens) on each link line of a verbose build.
+
+**Step 1 — count the on-disk source globs:**
+
+```console
+$ for g in 'kitty/*.c' 'glfw/*.c' 'kittens/transfer/*.c'; do
+    printf '%-22s : %s\n' "$g" "$(ls $g | wc -l)"; done
+```
+
+```text
+kitty/*.c              : 49
+glfw/*.c               : 31
+kittens/transfer/*.c   : 1
+```
+
+**Step 2 — count the objects actually linked** (capture the verbose build once to a scratch log *outside* the repository, then count the `.o` tokens on each `-o <build-dir>/<name>.so` link line):
+
+```console
+$ CC=gcc-13 python3 setup.py build --verbose > /tmp/build.log 2>&1
+$ for so in kitty/fast_data_types.so kitty/glfw-x11.so kittens/transfer/rsync.so; do
+    n=$(grep -E "\-o build/$so( |\$)" /tmp/build.log | grep -oE '[^ ]+\.o( |$)' | wc -l)
+    echo "$so : $n objects linked"; done
+```
+
+```text
+kitty/fast_data_types.so : 62 objects linked
+kitty/glfw-x11.so : 20 objects linked
+kittens/transfer/rsync.so : 1 objects linked
+```
+
+**Step 3 — break down the 62 `fast_data_types` objects** by categorizing the link-line tokens:
+
+```console
+$ grep -E '\-o build/kitty/fast_data_types\.so( |$)' /tmp/build.log \
+    | tr ' ' '\n' | grep -E '\.o$' > /tmp/fdt_objs.txt
+$ echo "kitty-prefixed  : $(grep -cE 'fast_data_types-kitty-'          /tmp/fdt_objs.txt)"
+$ echo "3rdparty base64 : $(grep -cE 'fast_data_types-3rdparty-base64-'  /tmp/fdt_objs.txt)"
+$ echo "3rdparty ringbuf: $(grep -cE 'fast_data_types-3rdparty-ringbuf-' /tmp/fdt_objs.txt)"
+```
+
+```text
+kitty-prefixed  : 49
+3rdparty base64 : 12
+3rdparty ringbuf: 1
+```
+
+The glob counts (49 / 31 / 1) versus the linked-object counts (62 / 20 / 1), and the 49 = 48 real + 1 generated / 13 = 12 + 1 breakdown, are summarized below:
 
 | Extension | Repo glob | Glob count | Objects actually linked | Composition of the linked objects |
 |-----------|-----------|-----------:|------------------------:|-----------------------------------|
@@ -146,17 +248,31 @@ The source-selection logic lives in `setup.py`:
 - the rsync extension's sources are listed at `setup.py:986`. **(inferred, from reading `setup.py:986`)**
 - `build()` (`setup.py:1084`) drives the `fast_data_types` compile via `compile_c_extension(...'kitty/fast_data_types'...)` at `setup.py:1090-1093`. **(inferred, from reading `setup.py:1084-1093`)**
 
-### 1.3 Observed build artifacts
+### 1.3 Observed build artifacts (both compilers)
 
-The compiled artifacts on disk after the canonical build (`ls -l`):
+The three `*.so` extensions plus the two launcher binaries are the observable products of the build. Their **C-artifact sizes are compiler-dependent**, so both builds are shown. All runtime evidence in §§2, 4, 5 and the Appendix was captured against the **`CC=gcc-13` build left on disk**; the default-compiler (`gcc 15.2.0`) build is the one kitty's CI actually produces (`.github/workflows/ci.py:104` runs `{python} setup.py build --verbose` with no `CC` override).
+
+**Canonical CI build — default compiler `gcc (Ubuntu 15.2.0)` (`ls -l`):**
 
 ```text
--rwxr-xr-x 1 root root    55032 Jul 13 17:31 kittens/transfer/rsync.so
--rwxr-xr-x 1 root root  1213072 Jul 13 17:31 kitty/fast_data_types.so
--rwxr-xr-x 1 root root   357584 Jul 13 17:31 kitty/glfw-x11.so
--rwxr-xr-x 1 root root 15765764 Jul 13 17:32 kitty/launcher/kitten
--rwxr-xr-x 1 root root    36288 Jul 13 17:31 kitty/launcher/kitty
+-rwxr-xr-x 1 root root    42824 Jul 13 22:21 kittens/transfer/rsync.so
+-rwxr-xr-x 1 root root  1253792 Jul 13 22:21 kitty/fast_data_types.so
+-rwxr-xr-x 1 root root   373896 Jul 13 22:21 kitty/glfw-x11.so
+-rwxr-xr-x 1 root root 15765764 Jul 13 22:22 kitty/launcher/kitten
+-rwxr-xr-x 1 root root    40384 Jul 13 22:21 kitty/launcher/kitty
 ```
+
+**On-disk build used for all runtime observations — `CC=gcc-13` (`gcc-13 13.4.0`) (`ls -l`):**
+
+```text
+-rwxr-xr-x 1 root root    55032 Jul 13 22:23 kittens/transfer/rsync.so
+-rwxr-xr-x 1 root root  1213072 Jul 13 22:23 kitty/fast_data_types.so
+-rwxr-xr-x 1 root root   357584 Jul 13 22:23 kitty/glfw-x11.so
+-rwxr-xr-x 1 root root 15765764 Jul 13 22:24 kitty/launcher/kitten
+-rwxr-xr-x 1 root root    36288 Jul 13 22:23 kitty/launcher/kitty
+```
+
+The `kitten` launcher is **15,765,764 bytes in both builds** — it is produced by `go build` (§1), so its size does not depend on the C compiler. The three C artifacts and the C `kitty` launcher differ between the two toolchains: `fast_data_types.so` is 1,253,792 under gcc-15 vs 1,213,072 under gcc-13; `glfw-x11.so` 373,896 vs 357,584; and `rsync.so` 42,824 vs 55,032 (gcc-13's `rsync.so` is *larger*). Within each compiler, the sizes were byte-identical across the two paired runs captured in §1 (stable). The `nm -D` symbol addresses shown in §1.1 (e.g. `PyInit_fast_data_types` at `0x28c70`) correspond to this on-disk `CC=gcc-13` build.
 
 ### 1.4 The `libssl-dev` / CI dependency gap (observed, isolated reproduction)
 
@@ -167,11 +283,11 @@ $ sed -n '239p' setup.py
             raise SystemExit(f'The package {error(pkg)} was not found on your system')
 ```
 
-kitty's CI apt list (`.github/workflows/ci.py:85-88`) does **not** include `libssl-dev`, yet `setup.py` needs the `libcrypto.pc` it provides. To observe the resulting failure **without touching any system file**, the build was re-run with `PKG_CONFIG_LIBDIR` pointed at a private symlink farm (created with `mktemp -d`) that contained every `.pc` file **except** `libcrypto.pc`/`openssl.pc`/`libssl.pc`. The system `pkg-config` directory was never modified (its `libcrypto` modversion remained `3.5.3` afterward). The command and its complete tail:
+kitty's CI apt list (`.github/workflows/ci.py:85-88`) does **not** include `libssl-dev`, yet `setup.py` needs the `libcrypto.pc` it provides. To observe the resulting failure **without touching any system file**, the build was re-run with `PKG_CONFIG_LIBDIR` pointed at a private symlink farm (created with `mktemp -d`) that mirrored every `.pc` file from **all six** pkg-config search directories (112 files) **except** `libcrypto.pc`/`openssl.pc`/`libssl.pc`. The system `pkg-config` directory was never modified — its `libcrypto` modversion was `3.5.3` both before and after the reproduction. The gap surfaces inside `libcrypto_flags()`' `pkg_config()` call **before any C source is compiled**, so it is independent of the C compiler; it is shown here with the **default compiler** (no `CC` override), exactly as kitty's CI would encounter it. The command and its complete output:
 
 ```console
-$ ISO_DIR="$(mktemp -d)"     # private; populated with all *.pc except libcrypto/openssl/libssl
-$ PKG_CONFIG_LIBDIR="$ISO_DIR" CC=gcc-13 python3 setup.py build --verbose   # exit 1
+$ ISO_DIR="$(mktemp -d)"     # private farm: every *.pc from all 6 search dirs EXCEPT libcrypto/openssl/libssl
+$ PKG_CONFIG_LIBDIR="$ISO_DIR" python3 setup.py build --verbose   # default compiler (no CC), exit 1
 ```
 
 ```text
@@ -179,9 +295,9 @@ Package libcrypto was not found in the pkg-config search path.
 Perhaps you should add the directory containing `libcrypto.pc'
 to the PKG_CONFIG_PATH environment variable
 Package 'libcrypto', required by 'virtual:world', not found
-CC: ['gcc-13'] (13, 0)
-gcc-13 (Ubuntu 13.4.0-4ubuntu1) 13.4.0
-Copyright (C) 2023 Free Software Foundation, Inc.
+CC: ['gcc'] (15, 0)
+gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
 This is free software; see the source for copying conditions.  There is NO
 warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 Detected: CompilerType.gcc
@@ -1040,30 +1156,63 @@ Sections 4 and 9 show this captured live; section 5 shows what breaks at each le
 
 ## 4. Which extension modules actually get loaded during test execution
 
-This was observed by running the runner's **own** discovery routine, `find_all_tests()`, through the **real** launcher (`./kitty/launcher/kitty +launch <script>`), and inspecting which entries in `sys.modules` are backed by a `.so` file (matched by module `__spec__.origin`). The temporary script (created under a private `mktemp -d`, mode 0700, removed by an `EXIT`/`INT`/`TERM` trap afterward) was:
+This was observed by running the runner's **own** discovery routine, `find_all_tests()`, through the **real** launcher (`./kitty/launcher/kitty +launch <script>`), and inspecting which entries in `sys.modules` are backed by a `.so` file (matched by module `__spec__.origin`). The temporary script (created under `/tmp`, outside the repository, and removed after the investigation so the tracked tree is left untouched) was, in full:
 
 ```python
-# /tmp/…/observe_loading.py  (temporary; removed after the run)
+#!/usr/bin/env python3
+# observe_loading.py  (temporary observation script; lives under /tmp, never in the repo)
+# Purpose: observe which .so-backed modules are loaded (a) at bootstrap, just after
+# importing the test runner package, and (b) after the runner's own find_all_tests()
+# discovery has imported every test module. Run through the REAL launcher:
+#   ./kitty/launcher/kitty +launch <path>/observe_loading.py
 import sys, os
+
+
 def so_modules():
+    """Return {module_name: origin} for every entry in sys.modules backed by a .so file."""
     out = {}
     for name, mod in list(sys.modules.items()):
         origin = getattr(getattr(mod, '__spec__', None), 'origin', None) or getattr(mod, '__file__', None)
         if origin and origin.endswith('.so'):
             out[name] = origin
     return out
-import kitty_tests.main as ktmain            # BOOTSTRAP: runs kitty_tests/__init__.py
+
+
+def dump(title, mapping):
+    print(f"=== {title} ===")
+    print(f"count={len(mapping)}")
+    for name in sorted(mapping):
+        print(f"  {name} -> {mapping[name]}")
+    print()
+
+
+import kitty_tests.main as ktmain            # BOOTSTRAP: importing the package runs kitty_tests/__init__.py
 boot = so_modules()
 suite = ktmain.find_all_tests()             # DISCOVERY: main.py:57,64 import every test module
 post = so_modules()
-# … prints the two snapshots, the kitty-built vs stdlib split, the discovered case count,
-#   and whether glfw is imported as a python module / mapped in /proc/self/maps …
+
+dump("BOOTSTRAP .so-backed modules (after importing kitty_tests.main)", boot)
+dump("POST-DISCOVERY .so-backed modules (after find_all_tests())", post)
+
+kitty_built = {n: o for n, o in post.items() if n.split('.')[0] in ('kitty', 'kittens')}
+stdlib = {n: o for n, o in post.items() if n.split('.')[0] not in ('kitty', 'kittens')}
+dump(f"KITTY-BUILT extensions loaded (count={len(kitty_built)})", kitty_built)
+dump(f"stdlib / third-party .so loaded (count={len(stdlib)})", stdlib)
+
+print(f"=== discovered test cases: {suite.countTestCases()} ===")
+
+glfw_as_pymod = any(('glfw' in n.lower()) and o.endswith('.so') for n, o in post.items())
+print(f"=== 'kitty.glfw-x11' or glfw backend imported as a python module? {glfw_as_pymod} ===")
+
+with open('/proc/self/maps') as fh:
+    maps = fh.read()
+print(f"=== glfw-x11.so present in /proc/self/maps at discovery time? {'glfw-x11.so' in maps} ===")
 ```
 
 Complete unedited output (identical across two runs):
 
 ```console
-$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./kitty/launcher/kitty +launch /tmp/…/observe_loading.py
+$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./kitty/launcher/kitty +launch /tmp/kitty_fix_evidence/observe_loading.py
 ```
 
 ```text
@@ -1115,28 +1264,85 @@ count=7
 
 ### 4.1 `glfw-x11.so` is loaded **natively** (not imported) when the GLFW test runs
 
-The GLFW backend is not a Python extension (it has no `PyInit_*`; §1.1). The test `kitty_tests/glfw.py:test_utf_8_strndup` obtains its path from `kitty.constants.glfw_path` (defined `kitty/constants.py:191`, returns `os.path.join(extensions_dir, f'{prefix}glfw-{module}.so')` at `constants.py:193`) and loads it with `ctypes.CDLL` at `kitty_tests/glfw.py:50` (`lib = ctypes.CDLL(backend_utils)`), then calls the native `utf_8_strndup` symbol. This was observed with an `sys.addaudithook` on `ctypes.dlopen` plus `/proc/self/maps` snapshots, running the **real** `test_utf_8_strndup` through `unittest`. The temporary script and its complete output (identical across two runs):
+The GLFW backend is not a Python extension (it has no `PyInit_*`; §1.1). The test `kitty_tests/glfw.py:test_utf_8_strndup` obtains its path from `kitty.constants.glfw_path` (defined `kitty/constants.py:191`, returns `os.path.join(extensions_dir, f'{prefix}glfw-{module}.so')` at `constants.py:193`) and loads it with `ctypes.CDLL` at `kitty_tests/glfw.py:50` (`lib = ctypes.CDLL(backend_utils)`), then calls the native `utf_8_strndup` symbol. This was observed with an `sys.addaudithook` on `ctypes.dlopen` plus `/proc/self/maps` snapshots, running the **real** `test_utf_8_strndup` through `unittest`. The temporary script (created under `/tmp`, outside the repository, removed afterward) and its complete, unedited output follow. The output is byte-identical across two runs **except** the sub-second wall-clock figure on the `unittest` summary line — `Ran 1 test in 0.005s` (run 1) vs `Ran 1 test in 0.006s` (run 2) — which is expected to vary; every other line, including all state snapshots and the captured `dlopen` event, is stable. Run 1 is shown:
 
 ```python
-# /tmp/…/observe_native_glfw.py  (temporary; removed after the run)
+#!/usr/bin/env python3
+# observe_native_glfw.py  (temporary observation script; lives under /tmp, never in the repo)
+# Purpose: prove that kitty/glfw-x11.so is loaded NATIVELY via ctypes.dlopen (not imported as a
+# Python module) when the real kitty_tests/glfw.py:test_utf_8_strndup runs. We install an audit
+# hook on 'ctypes.dlopen', snapshot /proc/self/maps and sys.modules before and after, and run the
+# real test through unittest. Run through the REAL launcher:
+#   ./kitty/launcher/kitty +launch <path>/observe_native_glfw.py
 import sys, os, unittest, traceback
+
+REPO_MARKER = 'kitty_tests'                 # repo test frames contain this path component
+
+
 def glfw_mapped():
-    with open('/proc/self/maps') as f: return 'glfw-x11.so' in f.read()
-def glfw_so_backed_module():           # correct test: match on .so ORIGIN, not module NAME
+    """OS truth: is glfw-x11.so mapped into this process address space right now?"""
+    with open('/proc/self/maps') as f:
+        return 'glfw-x11.so' in f.read()
+
+
+def glfw_so_backed_module():
+    """Correct test: is any loaded module backed by a glfw .so ORIGIN (not just a name match)?"""
     for name, mod in list(sys.modules.items()):
-        origin = getattr(getattr(mod,'__spec__',None),'origin',None) or getattr(mod,'__file__',None)
-        if origin and origin.endswith('.so') and 'glfw' in os.path.basename(origin): return (name, origin)
+        origin = getattr(getattr(mod, '__spec__', None), 'origin', None) or getattr(mod, '__file__', None)
+        if origin and origin.endswith('.so') and 'glfw' in os.path.basename(origin):
+            return (name, origin)
     return None
+
+
+def glfw_name_only():
+    """sys.modules keys that merely CONTAIN 'glfw' as a substring (name-only, can mislead)."""
+    return [k for k in sys.modules if 'glfw' in k.lower()]
+
+
+def print_state():
+    print(f'glfw-x11.so as a .so-backed python module in sys.modules? {glfw_so_backed_module()}')
+    print(f'glfw-x11.so mapped in /proc/self/maps (OS truth)?         {glfw_mapped()}')
+    print(f'sys.modules keys merely containing "glfw" (name-only):    {glfw_name_only()}')
+
+
 dlopen_hits = []
+
+
 def _audit(ev, args):
-    if ev == 'ctypes.dlopen' and args and 'glfw' in str(args[0]): dlopen_hits.append((str(args[0]), traceback.extract_stack()))
+    if ev == 'ctypes.dlopen' and args and 'glfw' in str(args[0]):
+        dlopen_hits.append((str(args[0]), traceback.extract_stack()))
+
+
 sys.addaudithook(_audit)
-import kitty_tests.main                 # bootstrap
-# … print BEFORE state, run the real test_utf_8_strndup via unittest, print AFTER state + dlopen stack …
+
+import kitty_tests.main                      # bootstrap (runs kitty_tests/__init__.py)
+
+print("=== BEFORE running glfw.test_utf_8_strndup ===")
+print_state()
+print()
+
+# Run the REAL test method through unittest, output interleaved on stdout in order.
+from kitty_tests.glfw import TestGLFW
+suite = unittest.TestLoader().loadTestsFromName('test_utf_8_strndup', TestGLFW)
+result = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
+print()
+
+print("=== AFTER running glfw.test_utf_8_strndup ===")
+print(f'test outcome: wasSuccessful={result.wasSuccessful()} (failures={len(result.failures)}, errors={len(result.errors)})')
+print_state()
+print()
+
+print(f"=== native ctypes.dlopen(glfw) events captured: {len(dlopen_hits)} ===")
+for target, stack in dlopen_hits:
+    print(f"dlopen target: {target}")
+    print("call stack (repo frames):")
+    for fr in stack:
+        if REPO_MARKER in fr.filename:
+            print(f"  {fr.filename}:{fr.lineno} ({fr.name})  |  {fr.line}")
 ```
 
 ```console
-$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./kitty/launcher/kitty +launch /tmp/…/observe_native_glfw.py
+$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./kitty/launcher/kitty +launch /tmp/kitty_fix_evidence/observe_native_glfw.py
 ```
 
 ```text
@@ -1168,15 +1374,64 @@ call stack (repo frames):
 
 ## 5. How test failures cascade when the extension modules are unavailable
 
-Each compiled extension was moved out of its real import path **one at a time**, the **full** `./test.py` was re-run, the complete output and exit code captured, and the artifact restored. The reproduction used a safe harness: a private `mktemp -d` stash (mode 0700), an **unconditional** `trap … EXIT INT TERM` that always moves the `.so` back, and SHA-256 verification that each artifact was restored byte-for-byte (hashes in the Appendix). These `.so` are git-ignored generated artifacts (`.gitignore:1`), so moving and restoring them leaves the tracked tree unchanged.
+Each compiled extension was moved out of its real import path **one at a time**, the **full** `./test.py` was re-run, the complete output and exit code captured, and the artifact restored. The reproduction used a safe harness: a private `mktemp -d` stash (mode 0700), an **unconditional** `trap restore EXIT INT TERM` that always moves the `.so` back, and SHA-256 verification that each artifact was restored byte-for-byte (before/after hashes shown inline in each subsection below and summarized in the Appendix). These `.so` are git-ignored generated artifacts (`.gitignore:1`), so moving and restoring them leaves the tracked tree unchanged.
+
+The complete harness, `cascade_one.sh`, invoked once per extension as `bash cascade_one.sh <relative-.so-path>`, is reproduced here in full:
+
+```bash
+#!/usr/bin/env bash
+# cascade_one.sh <relative-.so-path>
+# Move ONE compiled extension out of its real import path, run the FULL ./test.py through the real
+# launcher, capture exit code + complete output, then restore the artifact byte-for-byte. An
+# unconditional trap restores the .so even if the run is interrupted. .so are git-ignored
+# (.gitignore:1 = *.so), so moving/restoring leaves the tracked tree unchanged.
+set -u
+export PATH="/usr/local/go/bin:$PATH"              # canonical prerequisite: Go on PATH (see Methodology)
+SO="$1"
+BASENAME="$(basename "$SO")"
+STASH="$(mktemp -d)"; chmod 700 "$STASH"           # private stash, mode 0700
+restore() {                                        # always move the .so back
+    if [ -f "$STASH/$BASENAME" ] && [ ! -e "$SO" ]; then mv "$STASH/$BASENAME" "$SO"; fi
+    rmdir "$STASH" 2>/dev/null || true
+}
+trap restore EXIT INT TERM
+
+sha_before="$(sha256sum "$SO" | awk '{print $1}')"; mode_before="$(stat -c '%a' "$SO")"
+echo "### CASCADE for $SO"
+echo "BEFORE : sha256=$sha_before mode=$mode_before present=$([ -e "$SO" ] && echo yes || echo no)"
+mv "$SO" "$STASH/$BASENAME"
+echo "MOVED  : present=$([ -e "$SO" ] && echo yes || echo no) stashed=$([ -e "$STASH/$BASENAME" ] && echo yes || echo no)"
+CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./test.py > "$STASH/out.txt" 2>&1
+rc=$?
+mv "$STASH/$BASENAME" "$SO"                         # explicit restore (trap is the safety net)
+sha_after="$(sha256sum "$SO" | awk '{print $1}')"; mode_after="$(stat -c '%a' "$SO")"
+echo "AFTER  : sha256=$sha_after mode=$mode_after present=$([ -e "$SO" ] && echo yes || echo no)"
+echo "EXIT   : ./test.py exit_code=$rc"
+[ "$sha_before" = "$sha_after" ] && echo "INTEGRITY: RESTORED BYTE-FOR-BYTE (sha256 match), mode preserved=$([ "$mode_before" = "$mode_after" ] && echo yes || echo no)" || echo "INTEGRITY: MISMATCH!"
+echo "===== BEGIN ./test.py OUTPUT (exit=$rc) ====="
+cat "$STASH/out.txt"
+echo "===== END ./test.py OUTPUT ====="
+```
+
+Each subsection below shows the invocation, the harness's restoration proof (SHA-256 and mode before/after, plus the `./test.py` exit code), then the captured `./test.py` output.
 
 ### 5.1 `kitty/fast_data_types.so` removed → entire run aborts at bootstrap → **CRITICAL (root)**
 
 With `fast_data_types.so` absent, the run dies **before any test is collected or run**, during the package-init import chain of §3/§9. The complete output is the traceback only — no test lines, no Go line:
 
 ```console
-$ mv kitty/fast_data_types.so <private-stash>/     # git-ignored artifact
-$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./test.py    # exit 1
+$ bash cascade_one.sh kitty/fast_data_types.so
+```
+
+Harness restoration proof — SHA-256-identical before and after, mode preserved, with the captured exit code:
+
+```text
+### CASCADE for kitty/fast_data_types.so
+BEFORE : sha256=a3f7ec88487e1ab7b9ecba83415c5abcaf4011b68ca87db326e6e45e8ba62c11 mode=755 present=yes
+MOVED  : present=no stashed=yes
+AFTER  : sha256=a3f7ec88487e1ab7b9ecba83415c5abcaf4011b68ca87db326e6e45e8ba62c11 mode=755 present=yes
+EXIT   : ./test.py exit_code=1
+INTEGRITY: RESTORED BYTE-FOR-BYTE (sha256 match), mode preserved=yes
 ```
 
 ```text
@@ -1229,20 +1484,30 @@ The terminal frame is `kitty/conf/utils.py:27` → `ModuleNotFoundError: No modu
 
 ### 5.2 `kittens/transfer/rsync.so` removed → Python suite aborts at discovery → **CRITICAL for the Python suite**
 
-With `rsync.so` absent, the environment/preamble prints, the Go tests are **launched** (the line `Go packages being tested: …` comes from `kitty_tests/main.py:277`, after `go_proc = run_go(...)` at `main.py:270`), and then discovery crashes:
+With `rsync.so` absent, the environment/preamble prints, the Go tests are **launched** (the line `Go packages being tested:` comes from `kitty_tests/main.py:277`, after `go_proc = run_go(...)` at `main.py:270`), and then discovery crashes:
 
 ```console
-$ mv kittens/transfer/rsync.so <private-stash>/    # git-ignored artifact
-$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./test.py    # exit 1
+$ bash cascade_one.sh kittens/transfer/rsync.so
+```
+
+Harness restoration proof — SHA-256-identical before and after, mode preserved, with the captured exit code:
+
+```text
+### CASCADE for kittens/transfer/rsync.so
+BEFORE : sha256=c0bf7b038558d5dfabd176602d7a05458459bc635ee8dd869e1125695dea35a8 mode=755 present=yes
+MOVED  : present=no stashed=yes
+AFTER  : sha256=c0bf7b038558d5dfabd176602d7a05458459bc635ee8dd869e1125695dea35a8 mode=755 present=yes
+EXIT   : ./test.py exit_code=1
+INTEGRITY: RESTORED BYTE-FOR-BYTE (sha256 match), mode preserved=yes
 ```
 
 ```text
 Running under CI: True
-Using PATH in test environment: /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty_tests/kitty/launcher:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/go/bin
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Python: /usr/bin/python
 Intrinsics: has_avx2=True has_sse4_2=True
 Go executable: /usr/local/go/bin/go
-Go packages being tested: kittens/hints tools/themes tools/tui tools/tui/loop tools/wcswidth tools/tui/shell_integration tools/utils/humanize tools/config tools/tui/readline tools/simdstring kittens/diff tools/cmd/at tools/utils/shlex kittens/ssh kittens/transfer tools/rsync tools/utils/style tools/utils tools/cli tools/utils/base85 tools/tui/subseq tools/tui/graphics tools/unicode_names tools/utils/shm tools/tui/sgr kittens/hyperlinked_grep
+Go packages being tested: tools/rsync tools/utils/base85 tools/wcswidth tools/tui/shell_integration kittens/hints tools/tui/graphics tools/utils/humanize tools/utils/style tools/tui/sgr tools/simdstring tools/unicode_names tools/themes tools/utils/shlex kittens/hyperlinked_grep tools/tui/subseq tools/tui tools/cmd/at tools/utils tools/config tools/cli tools/tui/readline tools/utils/shm kittens/diff kittens/transfer tools/tui/loop kittens/ssh
 Traceback (most recent call last):
   File "<frozen runpy>", line 198, in _run_module_as_main
   File "<frozen runpy>", line 88, in _run_code
@@ -1293,24 +1558,36 @@ ModuleNotFoundError: No module named 'kittens.transfer.rsync'
 
 The terminal frame is `kitty_tests/file_transmission.py:13` → `ModuleNotFoundError: No module named 'kittens.transfer.rsync'`, reached from `test.py:9` → `kitty_tests/main.py:338` (`main` → `run_tests()`) → `main.py:279` (`run_tests` → `run_python_tests`) → `main.py:211` (`run_python_tests` → `find_all_tests()`) → `main.py:64` (the direct `importlib.import_module`) → `file_transmission.py:13`.
 
-**Important nuance about the Go tests (observed):** the output proves the Go tests were **launched** (`Go packages being tested: …`) but it does **not** contain `All Go tests succeeded`. That completion line is printed by `print_go()` (`main.py:213`, which calls `go_proc.wait()` at `main.py:214`), and `print_go()` is invoked only later (`main.py:238`), **after** `find_all_tests()` at `main.py:211`. Since the crash happens at `main.py:211`, the Go result is **never waited on or reported** in this cascade. So the correct statement is: the Go tests *launch*, but their completion is **not reported** — not that they "succeed".
+**Important nuance about the Go tests (observed):** the output proves the Go tests were **launched** (`Go packages being tested:`) but it does **not** contain `All Go tests succeeded`. The following mechanism is **(inferred from the source structure at `main.py:211`-`238`)**: that completion line is printed by `print_go()` (`main.py:213`, which calls `go_proc.wait()` at `main.py:214`), and `print_go()` is invoked only later (`main.py:238`), **after** `find_all_tests()` at `main.py:211`. Since the crash happens at `main.py:211`, the Go result is **never waited on or reported** in this cascade. So the correct statement is: the Go tests *launch*, but their completion is **not reported** — not that they "succeed".
+
+**Observed run-to-run variance (not a result inconsistency):** the *order* of packages on the `Go packages being tested:` line is not stable across runs (it reflects Go's unordered package discovery) — compare this section's line with the one in §5.3; the *set* is invariably the same 26 packages, and the ordering affects neither which tests run nor the pass/fail outcome.
 
 ### 5.3 `kitty/glfw-x11.so` removed → **two** tests break (native-load ERROR + file-check FAIL) → **OPTIONAL for suite completion**
 
 Unlike the two Python extensions, removing the GLFW backend does **not** abort the run: because `glfw-x11.so` is not imported at discovery, the suite still collects and runs all **145** tests, and the Go tests still complete (`All Go tests succeeded`). But **two** tests break — not one — and the delta versus the baseline (`failures=4, errors=0` in §2) is exactly `+1 failure` and `+1 error`:
 
 ```console
-$ mv kitty/glfw-x11.so <private-stash>/            # git-ignored artifact
-$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./test.py    # exit 1
+$ bash cascade_one.sh kitty/glfw-x11.so
+```
+
+Harness restoration proof — SHA-256-identical before and after, mode preserved, with the captured exit code:
+
+```text
+### CASCADE for kitty/glfw-x11.so
+BEFORE : sha256=99db5778b34c5370637a2fce743fd6379ebb879f9fbee34bb38f67f0cbd83a56 mode=755 present=yes
+MOVED  : present=no stashed=yes
+AFTER  : sha256=99db5778b34c5370637a2fce743fd6379ebb879f9fbee34bb38f67f0cbd83a56 mode=755 present=yes
+EXIT   : ./test.py exit_code=1
+INTEGRITY: RESTORED BYTE-FOR-BYTE (sha256 match), mode preserved=yes
 ```
 
 ```text
 Running under CI: True
-Using PATH in test environment: /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty_tests/kitty/launcher:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/go/bin
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Python: /usr/bin/python
 Intrinsics: has_avx2=True has_sse4_2=True
 Go executable: /usr/local/go/bin/go
-Go packages being tested: tools/tui kittens/diff kittens/hints tools/cli tools/rsync tools/tui/loop tools/wcswidth kittens/transfer tools/themes tools/utils/humanize tools/tui/readline tools/cmd/at kittens/ssh tools/simdstring tools/utils/style tools/tui/graphics tools/utils tools/utils/shm tools/tui/subseq tools/tui/shell_integration tools/tui/sgr tools/unicode_names kittens/hyperlinked_grep tools/utils/shlex tools/config tools/utils/base85
+Go packages being tested: tools/unicode_names tools/tui/loop tools/simdstring tools/wcswidth kittens/ssh tools/tui/graphics kittens/hyperlinked_grep tools/utils/humanize kittens/hints tools/config kittens/diff tools/tui tools/themes tools/tui/shell_integration tools/utils/style kittens/transfer tools/cmd/at tools/tui/readline tools/utils/base85 tools/utils tools/tui/subseq tools/cli tools/utils/shlex tools/tui/sgr tools/utils/shm tools/rsync
 test_backspace_wide_characters (kitty_tests.screen.TestScreen.test_backspace_wide_characters) ... ok
 test_bottom_margin (kitty_tests.screen.TestScreen.test_bottom_margin) ... ok
 test_char_manipulation (kitty_tests.screen.TestScreen.test_char_manipulation) ... ok
@@ -1393,7 +1670,7 @@ test_fallback_font_not_last_resort (kitty_tests.fonts.Rendering.test_fallback_fo
 test_font_rendering (kitty_tests.fonts.Rendering.test_font_rendering) ... ok
 test_shaping (kitty_tests.fonts.Rendering.test_shaping) ... ok
 test_sprite_map (kitty_tests.fonts.Rendering.test_sprite_map) ... ok
-test_font_selection (kitty_tests.fonts.Selection.test_font_selection) ...
+test_font_selection (kitty_tests.fonts.Selection.test_font_selection) ... 
   test_font_selection (kitty_tests.fonts.Selection.test_font_selection) (spec='ubuntu mono') ... FAIL
   test_font_selection (kitty_tests.fonts.Selection.test_font_selection) (spec='family="ubuntu mono"') ... FAIL
 test_os_window_size_calculation (kitty_tests.glfw.TestGLFW.test_os_window_size_calculation) ... ok
@@ -1467,7 +1744,7 @@ Traceback (most recent call last):
     lib = ctypes.CDLL(backend_utils)
     backend_utils = '/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/glfw-x11.so'
     ctypes = <module 'ctypes' from '/usr/lib/python3.13/ctypes/__init__.py'>
-    glfw_path = <function glfw_path at 0x7b9985347600>
+    glfw_path = <function glfw_path at 0x787366ceb600>
     self = <kitty_tests.glfw.TestGLFW testMethod=test_utf_8_strndup>
   File "/usr/lib/python3.13/ctypes/__init__.py", line 390, in __init__
     self._handle = _dlopen(self._name, mode)
@@ -1477,7 +1754,7 @@ Traceback (most recent call last):
     handle = None
     mode = 0
     name = '/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/glfw-x11.so'
-    self = <CDLL '/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/glfw-x11.so', handle 0 at 0x7b998315fcb0>
+    self = <CDLL '/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/glfw-x11.so', handle 0 at 0x787364affcb0>
     use_errno = False
     use_last_error = False
     winmode = None
@@ -1494,37 +1771,37 @@ Traceback (most recent call last):
   File "/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/launcher/../../kitty_tests/file_transmission.py", line 443, in basic_transfer_tests
     multiple_files()
     ~~~~~~~~~~~~~~^^
-    d = <_io.BufferedWriter name='/tmp/tmpip7ihigb/dest'>
-    dest = '/tmp/tmpip7ihigb/dest'
-    multiple_files = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files at 0x7b998268ede0>
-    pty = <kitty_tests.file_transmission.TransferPTY object at 0x7b99832c5160>
-    s = <_io.BufferedWriter name='/tmp/tmpip7ihigb/src'>
+    d = <_io.BufferedWriter name='/tmp/tmpe5njcxbs/dest'>
+    dest = '/tmp/tmpe5njcxbs/dest'
+    multiple_files = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files at 0x78735ff6ede0>
+    pty = <kitty_tests.file_transmission.TransferPTY object at 0x787364c65160>
+    s = <_io.BufferedWriter name='/tmp/tmpe5njcxbs/src'>
     self = <kitty_tests.file_transmission.TestFileTransmission testMethod=test_transfer_receive>
-    single_file = <function TestFileTransmission.basic_transfer_tests.<locals>.single_file at 0x7b99832cd080>
-    src = '/tmp/tmpip7ihigb/src'
+    single_file = <function TestFileTransmission.basic_transfer_tests.<locals>.single_file at 0x787364c71080>
+    src = '/tmp/tmpe5njcxbs/src'
   File "/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/launcher/../../kitty_tests/file_transmission.py", line 432, in multiple_files
     self.assertEqual(expected, actual)
     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
     Entry = <class 'kitty_tests.file_transmission.Entry'>
-    actual = {'sub': Entry(relpath='sub', mtime=0, mode='0o40755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783964859056941457, mode='0o120777', nlink=1), 'empty': Entry(relpath='empty', mtime=0, mode='0o40755', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'sym': Entry(relpath='sym', mtime=1783964859056941457, mode='0o120777', nlink=1), 'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1)}
-    b = PosixPath('/tmp/tmpip7ihigb/msrc')
+    actual = {'sub': Entry(relpath='sub', mtime=0, mode='0o40755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783983422937923359, mode='0o120777', nlink=1), 'empty': Entry(relpath='empty', mtime=0, mode='0o40755', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'sym': Entry(relpath='sym', mtime=1783983422937923359, mode='0o120777', nlink=1), 'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1)}
+    b = PosixPath('/tmp/tmpe5njcxbs/msrc')
     cmd = ()
-    de = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.de at 0x7b998268ff60>
-    dest = '/tmp/tmpip7ihigb/mdest'
+    de = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.de at 0x78735ff6ff60>
+    dest = '/tmp/tmpe5njcxbs/mdest'
     dirnames = []
-    dirpath = '/tmp/tmpip7ihigb/mdest/msrc/empty'
-    entry = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.entry at 0x7b998268f2e0>
-    expected = {'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1), 'sub': Entry(relpath='sub', mtime=0, mode='0o42755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783964859056941457, mode='0o120777', nlink=1), 'sym': Entry(relpath='sym', mtime=1783964859056941457, mode='0o120777', nlink=1)}
-    f = <_io.BufferedWriter name='/tmp/tmpip7ihigb/msrc/sub/reg'>
+    dirpath = '/tmp/tmpe5njcxbs/mdest/msrc/empty'
+    entry = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.entry at 0x78735ff6f2e0>
+    expected = {'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1), 'sub': Entry(relpath='sub', mtime=0, mode='0o42755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783983422937923359, mode='0o120777', nlink=1), 'sym': Entry(relpath='sym', mtime=1783983422937923359, mode='0o120777', nlink=1)}
+    f = <_io.BufferedWriter name='/tmp/tmpe5njcxbs/msrc/sub/reg'>
     filenames = []
-    pty = <kitty_tests.file_transmission.TransferPTY object at 0x7b9983ddde50>
-    s = PosixPath('/tmp/tmpip7ihigb/msrc/sub')
-    se = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.se at 0x7b998268f380>
+    pty = <kitty_tests.file_transmission.TransferPTY object at 0x7873657b5e50>
+    s = PosixPath('/tmp/tmpe5njcxbs/msrc/sub')
+    se = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.se at 0x78735ff6f380>
     self = <kitty_tests.file_transmission.TestFileTransmission testMethod=test_transfer_receive>
-    src = '/tmp/tmpip7ihigb/msrc'
+    src = '/tmp/tmpe5njcxbs/msrc'
     x = 'reg'
 AssertionError: {'simple': Entry(relpath='simple', mtime=130[497 chars]k=1)} != {'sub': Entry(relpath='sub', mtime=0, mode='[497 chars]k=1)}
-  {'abssym': Entry(relpath='abssym', mtime=1783964859056941457, mode='0o120777', nlink=1),
+  {'abssym': Entry(relpath='abssym', mtime=1783983422937923359, mode='0o120777', nlink=1),
 -  'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2),
 ?                                                    ^
 
@@ -1540,7 +1817,7 @@ AssertionError: {'simple': Entry(relpath='simple', mtime=130[497 chars]k=1)} != 
 ?                                                ^
 
    'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1),
-   'sym': Entry(relpath='sym', mtime=1783964859056941457, mode='0o120777', nlink=1)}
+   'sym': Entry(relpath='sym', mtime=1783983422937923359, mode='0o120777', nlink=1)}
 
 ======================================================================
 FAIL: test_transfer_send (kitty_tests.file_transmission.TestFileTransmission.test_transfer_send)
@@ -1553,37 +1830,37 @@ Traceback (most recent call last):
   File "/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/launcher/../../kitty_tests/file_transmission.py", line 443, in basic_transfer_tests
     multiple_files()
     ~~~~~~~~~~~~~~^^
-    d = <_io.BufferedWriter name='/tmp/tmphfs5ac1l/dest'>
-    dest = '/tmp/tmphfs5ac1l/dest'
-    multiple_files = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files at 0x7b998269e480>
-    pty = <kitty_tests.file_transmission.TransferPTY object at 0x7b998264e7b0>
-    s = <_io.BufferedWriter name='/tmp/tmphfs5ac1l/src'>
+    d = <_io.BufferedWriter name='/tmp/tmpwk6wo7p2/dest'>
+    dest = '/tmp/tmpwk6wo7p2/dest'
+    multiple_files = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files at 0x78735ff86480>
+    pty = <kitty_tests.file_transmission.TransferPTY object at 0x78735ff2e7b0>
+    s = <_io.BufferedWriter name='/tmp/tmpwk6wo7p2/src'>
     self = <kitty_tests.file_transmission.TestFileTransmission testMethod=test_transfer_send>
-    single_file = <function TestFileTransmission.basic_transfer_tests.<locals>.single_file at 0x7b998269c360>
-    src = '/tmp/tmphfs5ac1l/src'
+    single_file = <function TestFileTransmission.basic_transfer_tests.<locals>.single_file at 0x78735ff84360>
+    src = '/tmp/tmpwk6wo7p2/src'
   File "/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/launcher/../../kitty_tests/file_transmission.py", line 432, in multiple_files
     self.assertEqual(expected, actual)
     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
     Entry = <class 'kitty_tests.file_transmission.Entry'>
-    actual = {'sub': Entry(relpath='sub', mtime=0, mode='0o40755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783964859528946542, mode='0o120777', nlink=1), 'empty': Entry(relpath='empty', mtime=0, mode='0o40755', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'sym': Entry(relpath='sym', mtime=1783964859528946542, mode='0o120777', nlink=1), 'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1)}
-    b = PosixPath('/tmp/tmphfs5ac1l/msrc')
+    actual = {'sub': Entry(relpath='sub', mtime=0, mode='0o40755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783983423357927873, mode='0o120777', nlink=1), 'empty': Entry(relpath='empty', mtime=0, mode='0o40755', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'sym': Entry(relpath='sym', mtime=1783983423357927873, mode='0o120777', nlink=1), 'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1)}
+    b = PosixPath('/tmp/tmpwk6wo7p2/msrc')
     cmd = ()
-    de = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.de at 0x7b998269f6a0>
-    dest = '/tmp/tmphfs5ac1l/mdest'
+    de = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.de at 0x78735ff876a0>
+    dest = '/tmp/tmpwk6wo7p2/mdest'
     dirnames = []
-    dirpath = '/tmp/tmphfs5ac1l/mdest/msrc/empty'
-    entry = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.entry at 0x7b998269eac0>
-    expected = {'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1), 'sub': Entry(relpath='sub', mtime=0, mode='0o42755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783964859528946542, mode='0o120777', nlink=1), 'sym': Entry(relpath='sym', mtime=1783964859528946542, mode='0o120777', nlink=1)}
-    f = <_io.BufferedWriter name='/tmp/tmphfs5ac1l/msrc/sub/reg'>
+    dirpath = '/tmp/tmpwk6wo7p2/mdest/msrc/empty'
+    entry = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.entry at 0x78735ff86ac0>
+    expected = {'simple': Entry(relpath='simple', mtime=1300000000, mode='0o100766', nlink=2), 'hardlink': Entry(relpath='hardlink', mtime=1300000000, mode='0o100766', nlink=2), 'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2), 'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1), 'sub': Entry(relpath='sub', mtime=0, mode='0o42755', nlink=2), 'abssym': Entry(relpath='abssym', mtime=1783983423357927873, mode='0o120777', nlink=1), 'sym': Entry(relpath='sym', mtime=1783983423357927873, mode='0o120777', nlink=1)}
+    f = <_io.BufferedWriter name='/tmp/tmpwk6wo7p2/msrc/sub/reg'>
     filenames = []
-    pty = <kitty_tests.file_transmission.TransferPTY object at 0x7b99829f0c00>
-    s = PosixPath('/tmp/tmphfs5ac1l/msrc/sub')
-    se = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.se at 0x7b998269eb60>
+    pty = <kitty_tests.file_transmission.TransferPTY object at 0x7873645b0c00>
+    s = PosixPath('/tmp/tmpwk6wo7p2/msrc/sub')
+    se = <function TestFileTransmission.basic_transfer_tests.<locals>.multiple_files.<locals>.se at 0x78735ff86b60>
     self = <kitty_tests.file_transmission.TestFileTransmission testMethod=test_transfer_send>
-    src = '/tmp/tmphfs5ac1l/msrc'
+    src = '/tmp/tmpwk6wo7p2/msrc'
     x = 'reg'
 AssertionError: {'simple': Entry(relpath='simple', mtime=130[497 chars]k=1)} != {'sub': Entry(relpath='sub', mtime=0, mode='[497 chars]k=1)}
-  {'abssym': Entry(relpath='abssym', mtime=1783964859528946542, mode='0o120777', nlink=1),
+  {'abssym': Entry(relpath='abssym', mtime=1783983423357927873, mode='0o120777', nlink=1),
 -  'empty': Entry(relpath='empty', mtime=0, mode='0o42755', nlink=2),
 ?                                                    ^
 
@@ -1599,7 +1876,7 @@ AssertionError: {'simple': Entry(relpath='simple', mtime=130[497 chars]k=1)} != 
 ?                                                ^
 
    'sub/reg': Entry(relpath='sub/reg', mtime=1171299999999, mode='0o100644', nlink=1),
-   'sym': Entry(relpath='sym', mtime=1783964859528946542, mode='0o120777', nlink=1)}
+   'sym': Entry(relpath='sym', mtime=1783983423357927873, mode='0o120777', nlink=1)}
 
 ======================================================================
 FAIL: test_glfw_modules (kitty_tests.check_build.TestBuild.test_glfw_modules)
@@ -1608,7 +1885,7 @@ Traceback (most recent call last):
   File "/tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty/launcher/../../kitty_tests/check_build.py", line 46, in test_glfw_modules
     self.assertTrue(os.path.isfile(path), f'{path} is not a file')
     ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    glfw_path = <function glfw_path at 0x7b9985347600>
+    glfw_path = <function glfw_path at 0x787366ceb600>
     is_macos = False
     linux_backends = ['x11']
     modules = ['x11']
@@ -1628,7 +1905,7 @@ Traceback (most recent call last):
     alternate = None
     expected = ('UbuntuMono-Regular', 'UbuntuMono-Bold', 'UbuntuMono-Italic', 'UbuntuMono-BoldItalic')
     family = 'ubuntu mono'
-    opts = <kitty.options.types.Options object at 0x7b99813560d0>
+    opts = <kitty.options.types.Options object at 0x78735ec8e0d0>
     self = <kitty_tests.fonts.Selection testMethod=test_font_selection>
     x = 'UbuntuMonoRoman-BoldItalic'
 AssertionError: Tuples differ: ('UbuntuMono-Regular', 'UbuntuMono-Bold', 'UbuntuMono[29 chars]lic') != ('UbuntuMonoRoman-Regular', 'UbuntuMonoRoman-Bold', '[55 chars]lic')
@@ -1665,7 +1942,7 @@ Traceback (most recent call last):
     alternate = None
     expected = ('UbuntuMono-Regular', 'UbuntuMono-Bold', 'UbuntuMono-Italic', 'UbuntuMono-BoldItalic')
     family = 'family="ubuntu mono"'
-    opts = <kitty.options.types.Options object at 0x7b99813560d0>
+    opts = <kitty.options.types.Options object at 0x78735ec8e0d0>
     self = <kitty_tests.fonts.Selection testMethod=test_font_selection>
     x = 'UbuntuMonoRoman-BoldItalic'
 AssertionError: Tuples differ: ('UbuntuMono-Regular', 'UbuntuMono-Bold', 'UbuntuMono[29 chars]lic') != ('UbuntuMonoRoman-Regular', 'UbuntuMonoRoman-Bold', '[55 chars]lic')
@@ -1692,10 +1969,10 @@ First differing element 0:
 
 
 ----------------------------------------------------------------------
-Ran 145 tests in 21.945s
+Ran 145 tests in 22.060s
 
 FAILED (failures=5, errors=1, skipped=4)
-All Go tests succeeded, ran in 22.0 seconds
+All Go tests succeeded, ran in 22.2 seconds
 [31mError[39m: Some tests failed!
 ```
 
@@ -1724,7 +2001,56 @@ Reading the observed output end-to-end, the dependency structure between build a
 
 ### 7.1 The 22 discovered test modules
 
-`find_all_tests()` (`kitty_tests/main.py:57`, excluding `main` and `gr`) discovers 22 modules under `kitty_tests/`: `check_build`, `clipboard`, `completion`, `crypto`, `datatypes`, `file_transmission`, `fonts`, `glfw`, `graphics`, `keys`, `layout`, `mouse`, `open_actions`, `options`, `parser`, `screen`, `search_query_parser`, `shell_integration`, `shm`, `ssh`, `tui`, `utmp`. Every one of them executes `from . import BaseTest`, which runs `kitty_tests/__init__.py` and therefore loads `fast_data_types` transitively.
+`find_all_tests()` (`kitty_tests/main.py:57`, `excludes=('main', 'gr')`) discovers 22 test modules under `kitty_tests/`: `check_build`, `clipboard`, `completion`, `crypto`, `datatypes`, `file_transmission`, `fonts`, `glfw`, `graphics`, `keys`, `layout`, `mouse`, `open_actions`, `options`, `parser`, `screen`, `search_query_parser`, `shell_integration`, `shm`, `ssh`, `tui`, `utmp`. Every one of them executes `from . import BaseTest` — **observed 22/22** by grepping each discovered module:
+
+```console
+$ for m in check_build clipboard completion crypto datatypes file_transmission fonts glfw \
+           graphics keys layout mouse open_actions options parser screen search_query_parser \
+           shell_integration shm ssh tui utmp; do
+      grep -qE '^from \. import .*BaseTest' "kitty_tests/$m.py" && echo "$m: yes"; done | wc -l
+```
+
+```text
+22
+```
+
+Executing `from . import BaseTest` runs `kitty_tests/__init__.py`, which is what loads `fast_data_types` transitively (import chain in §9). This was also confirmed dynamically through the **real** launcher with a temporary `observe_modules.py` that diffs `sys.modules` around `find_all_tests()` (byte-identical across two runs). It shows the discovery loop newly imports the 22 test modules — each exposing `BaseTest` — **plus** the package initializer `kitty_tests.__init__` itself (where `BaseTest` is *defined* and where `fast_data_types` is imported at `__init__.py:21-22`); the loop imports `__init__.py` because its name is not in `excludes`, but that module contributes no test cases. `main` and `gr` are **not** imported (both observed `False`), and **145** test cases are discovered:
+
+```console
+$ CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 ./kitty/launcher/kitty +launch /tmp/kitty_fix_evidence/observe_modules.py
+```
+
+```text
+=== test modules newly imported by find_all_tests(): 23 ===
+  kitty_tests.__init__  (exposes BaseTest? True)
+  kitty_tests.check_build  (exposes BaseTest? True)
+  kitty_tests.clipboard  (exposes BaseTest? True)
+  kitty_tests.completion  (exposes BaseTest? True)
+  kitty_tests.crypto  (exposes BaseTest? True)
+  kitty_tests.datatypes  (exposes BaseTest? True)
+  kitty_tests.file_transmission  (exposes BaseTest? True)
+  kitty_tests.fonts  (exposes BaseTest? True)
+  kitty_tests.glfw  (exposes BaseTest? True)
+  kitty_tests.graphics  (exposes BaseTest? True)
+  kitty_tests.keys  (exposes BaseTest? True)
+  kitty_tests.layout  (exposes BaseTest? True)
+  kitty_tests.mouse  (exposes BaseTest? True)
+  kitty_tests.open_actions  (exposes BaseTest? True)
+  kitty_tests.options  (exposes BaseTest? True)
+  kitty_tests.parser  (exposes BaseTest? True)
+  kitty_tests.screen  (exposes BaseTest? True)
+  kitty_tests.search_query_parser  (exposes BaseTest? True)
+  kitty_tests.shell_integration  (exposes BaseTest? True)
+  kitty_tests.shm  (exposes BaseTest? True)
+  kitty_tests.ssh  (exposes BaseTest? True)
+  kitty_tests.tui  (exposes BaseTest? True)
+  kitty_tests.utmp  (exposes BaseTest? True)
+=== every discovered module exposes BaseTest? True ===
+=== 'kitty_tests.main' discovered? False | 'kitty_tests.gr' discovered? False ===
+=== total test cases discovered: 145 ===
+```
+
+(The header count of 23 = the 22 test modules + the `kitty_tests.__init__` initializer; the 22 figure in the module list above excludes the initializer, which defines `BaseTest` rather than being a test module.)
 
 ### 7.2 Extension → test-category mapping (observed)
 
@@ -1746,31 +2072,76 @@ Reading the observed output end-to-end, the dependency structure between build a
 
 ## 9. The actual import chains established during the test run
 
-To capture the **real** chains (not a synthetic import), a non-invasive `sys.meta_path` finder recorded the repo-frame call stack at the **first** import of each target, then the **real** entry point `./test.py` was executed via `runpy.run_path(test_py, run_name='__main__')` so the frames include the genuine launcher preamble, `test.py:8`, and `find_all_tests()` at `main.py:64`. The finder returns `None` from `find_spec` (so the real import machinery still resolves everything). The temporary script:
+To capture the **real** chains (not a synthetic import), a non-invasive `sys.meta_path` finder recorded the repo-frame call stack at the **first** import of each target, then the **real** entry point `./test.py` was executed via `runpy.run_path(test_py, run_name='__main__')` so the frames include the genuine launcher preamble, `test.py:8`, and `find_all_tests()` at `main.py:64`. The finder returns `None` from `find_spec` (so the real import machinery still resolves everything). Because this observer is itself launched by `kitty +launch`, the launcher's own `__main__.py`/`entry_points.py` frames are already on the stack; the observer's own `/tmp` frame is filtered out (it is not under the repo root), which is why `entry_points.py:73`'s `runpy.run_path(...)` appears directly above `test.py:13`. The temporary script (created under `/tmp`, outside the repository, removed afterward) was, in full:
 
 ```python
-# /tmp/…/observe_importchain.py  (temporary; removed after the run)
+#!/usr/bin/env python3
+# observe_importchain.py  (temporary observation script; lives under /tmp, never in the repo)
+# Capture the REAL import chains by recording the repo-frame call stack at the FIRST import of
+# each target module, then execute the REAL entry point ./test.py via runpy so the frames include
+# the genuine launcher preamble (this observer was itself launched by kitty +launch, so the
+# launcher's __main__.py/entry_points.py frames are already on the stack). The finder returns None
+# from find_spec, so the real import machinery still resolves everything (non-invasive).
+# Run through the REAL launcher:
+#   CHAIN_TRACE_FILE=<path>/chain.txt ./kitty/launcher/kitty +launch <path>/observe_importchain.py
 import sys, os, runpy, traceback
 from importlib.abc import MetaPathFinder
-TARGETS = {'kitty.config','kitty.conf.utils','kitty.fast_data_types','kittens.transfer.rsync'}
-_seen = set(); _out = open(os.environ['CHAIN_TRACE_FILE'], 'w')
+
+TARGETS = {'kitty.config', 'kitty.conf.utils', 'kitty.fast_data_types', 'kittens.transfer.rsync'}
+REPO = os.getcwd()
+_seen = set()
+_out = open(os.environ['CHAIN_TRACE_FILE'], 'w')
+
+
+def emit(line=''):
+    _out.write(line + '\n')
+    _out.flush()
+
+
+def is_repo_frame(fr):
+    # Keep genuine repo source frames; drop this /tmp observer, the stdlib, and <frozen ...> frames.
+    if fr.filename.startswith('<'):
+        return False
+    return os.path.abspath(os.path.join(REPO, fr.filename)).startswith(REPO + os.sep)
+
+
 class StackTracer(MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
         if fullname in TARGETS and fullname not in _seen:
-            _seen.add(fullname); _out.write(f'>>> FIRST IMPORT OF: {fullname}\n')
-            for fr in traceback.extract_stack(): _out.write(f'    {fr.filename}:{fr.lineno} ({fr.name}) | {fr.line}\n')
-            _out.write('\n'); _out.flush()
-        return None                      # non-invasive: real finders resolve the import
+            _seen.add(fullname)
+            emit(f'>>> FIRST IMPORT OF: {fullname}')
+            for fr in traceback.extract_stack():
+                if is_repo_frame(fr):
+                    disp = fr.filename[len(REPO) + 1:] if fr.filename.startswith(REPO + os.sep) else fr.filename
+                    emit(f'    {disp}:{fr.lineno} ({fr.name})  |  {fr.line}')
+            if fullname == 'kitty.fast_data_types':
+                emit(f"    after this: 'kitty.fast_data_types' in sys.modules -> {'kitty.fast_data_types' in sys.modules}")
+                emit(f"    at this point: 'kittens.transfer.rsync' in sys.modules -> {'kittens.transfer.rsync' in sys.modules}")
+            emit()
+        return None                          # non-invasive: real finders resolve the import
+
+
 sys.meta_path.insert(0, StackTracer())
-sys.argv = [os.path.join(os.getcwd(),'test.py'), '--module', 'check_build']
-runpy.run_path(sys.argv[0], run_name='__main__')   # the REAL entry point
+test_py = os.path.join(REPO, 'test.py')
+sys.argv = [test_py, '--module', 'check_build']
+emit(f"========== EXECUTING REAL ENTRY POINT: runpy.run_path('{test_py}') argv={sys.argv} ==========")
+emit()
+try:
+    runpy.run_path(test_py, run_name='__main__')     # the REAL entry point
+    code = 0
+except SystemExit as e:
+    code = e.code if e.code is not None else 0
+    emit(f'(real entry point exited with SystemExit code={code})')
+emit()
+emit(f"FINAL: 'kittens.transfer.rsync' in sys.modules -> {'kittens.transfer.rsync' in sys.modules}")
+_out.close()
 ```
 
-Complete captured trace (identical across two runs; repo-path prefix shown as recorded):
+Complete, unedited captured trace written to `$CHAIN_TRACE_FILE` (byte-identical across two runs). Frame paths are shown repo-relative — the script strips the `$REPO/` prefix for readability — while the banner records the absolute `test.py` path exactly as `runpy.run_path` received it:
 
 ```console
-$ CHAIN_TRACE_FILE=/tmp/…/chain.txt CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-    ./kitty/launcher/kitty +launch /tmp/…/observe_importchain.py
+$ CHAIN_TRACE_FILE=/tmp/kitty_fix_evidence/chain.txt CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    ./kitty/launcher/kitty +launch /tmp/kitty_fix_evidence/observe_importchain.py
 ```
 
 ```text
@@ -1826,15 +2197,16 @@ $ CHAIN_TRACE_FILE=/tmp/…/chain.txt CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 \
 FINAL: 'kittens.transfer.rsync' in sys.modules -> True
 ```
 
-The launcher's own stdout for that run (the filtered `check_build` suite still triggers discovery of **all** modules at `main.py:211`, which is why `rsync` loads even under `--module check_build`):
+The same invocation's **combined stdout and stderr** (`2>&1`): the runner prints its environment banner — `Running under CI`, the test `PATH`, `Python`, and `Intrinsics` — to **stdout** via `env_for_python_tests()` (`kitty_tests/main.py:297-331`), while `unittest` writes the per-test results to **stderr**; the two are merged here so the whole run is visible in order. The filtered `check_build` suite still triggers discovery of **all** modules at `main.py:211`, which is why `rsync` loads even under `--module check_build`. This output is byte-identical across two runs **except** the sub-second `Ran 9 tests in 0.076s` timing (run 2: `0.078s`), which is expected to vary. Run 1:
 
 ```console
-(stdout of the same invocation)
+$ CHAIN_TRACE_FILE=/tmp/kitty_fix_evidence/chain.txt CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    ./kitty/launcher/kitty +launch /tmp/kitty_fix_evidence/observe_importchain.py 2>&1
 ```
 
 ```text
 Running under CI: True
-Using PATH in test environment: /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty_tests/kitty/launcher:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/go/bin
+Using PATH in test environment: /tmp/blitzy/kitty/blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9_cfa475/kitty_tests/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Python: /usr/bin/python
 Intrinsics: has_avx2=True has_sse4_2=True
 test_all_kitten_names (kitty_tests.check_build.TestBuild.test_all_kitten_names) ... ok
@@ -1848,7 +2220,7 @@ test_loading_extensions (kitty_tests.check_build.TestBuild.test_loading_extensio
 test_loading_shaders (kitty_tests.check_build.TestBuild.test_loading_shaders) ... ok
 
 ----------------------------------------------------------------------
-Ran 9 tests in 0.106s
+Ran 9 tests in 0.076s
 
 OK (skipped=1)
 ```
@@ -1858,7 +2230,7 @@ OK (skipped=1)
 - **`kitty.fast_data_types` (bootstrap chain):**
   `kitty/launcher/../../__main__.py:7` `main()` → `kitty/entry_points.py:192` → `:146` → `:73` `runpy.run_path(...)` → `test.py:13` `main()` → **`test.py:8`** `importlib.import_module('kitty_tests.main')` → **`kitty_tests/__init__.py:21`** `from kitty.config import ...` → `kitty/config.py:10` `from .conf.utils import ...` → **`kitty/conf/utils.py:27`** `from ..fast_data_types import Color`. This confirms the root import is triggered by the **package** initializer reached directly from `test.py:8`; the `kitty_tests/main.py` module body is not on this chain.
 - **`kittens.transfer.rsync` (discovery chain):**
-  … → `test.py:9` `getattr(m,'main')()` → `kitty_tests/main.py:338` `run_tests()` → `main.py:279` `run_python_tests(args, go_proc)` → **`main.py:211`** `tests = find_all_tests()` → **`main.py:64`** `importlib.import_module(...)` → **`kitty_tests/file_transmission.py:13`** `from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc`.
+  (launcher preamble as in the bootstrap chain above) → `test.py:9` `getattr(m,'main')()` → `kitty_tests/main.py:338` `run_tests()` → `main.py:279` `run_python_tests(args, go_proc)` → **`main.py:211`** `tests = find_all_tests()` → **`main.py:64`** `importlib.import_module(...)` → **`kitty_tests/file_transmission.py:13`** `from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc`.
 
 ### 9.2 The native GLFW chain (not an import)
 
@@ -1869,9 +2241,9 @@ OK (skipped=1)
 This QnA investigation is read-only with respect to tracked files: the **only** repository change is the addition/update of this document. The distinction between the two relevant commits is important:
 
 - **Source commit under investigation:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` — the kitty code that all `file:line` citations refer to.
-- **Destination delivery branch:** `blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9` — the branch this document is committed to. (The `go build` line at `build.log:319` embeds `-X kitty.VCSRevision=<this delivery commit>`, which is why the launcher's version string reflects the destination commit, not the source commit.)
+- **Destination delivery branch:** `blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9` — the branch this document is committed to. (The `go build` line shown verbatim in §1 — `/usr/local/go/bin/go build -v -ldflags '-X kitty.VCSRevision=<delivery-commit> -s -w' -o kitty/launcher/kitten` — embeds `-X kitty.VCSRevision=<this delivery commit>`, which is why the launcher's version string reflects the destination commit, not the source commit **(inferred from the `-ldflags` shown; not separately observed at runtime)**.)
 
-The three compiled `*.so` are git-ignored generated artifacts (`.gitignore:1` = `*.so`). The two that were temporarily moved during §5 were restored **byte-for-byte**; the SHA-256 values below match the post-build baseline. The captured working-tree state at delivery, the restored-artifact hashes, and the confirmation that all `/tmp` observation scratch was removed:
+The three compiled `*.so` are git-ignored generated artifacts (`.gitignore:1` = `*.so`). **All three** — `kitty/fast_data_types.so`, `kittens/transfer/rsync.so`, and `kitty/glfw-x11.so` — were temporarily moved during §5 (one at a time), each with its SHA-256 and mode verified before the move and again after restoration (see the per-cascade restoration-proof blocks in §5.1–§5.3), and all three were restored **byte-for-byte**; the SHA-256 values below match the post-build baseline. The captured working-tree state at delivery, the restored-artifact hashes, and the confirmation that all `/tmp` observation scratch was removed:
 
 ```console
 # Repository state at delivery (destination branch), captured with the commands shown.
@@ -1879,7 +2251,7 @@ The three compiled `*.so` are git-ignored generated artifacts (`.gitignore:1` = 
 $ git rev-parse --abbrev-ref HEAD          # destination delivery branch
 blitzy-25deee7b-18fb-49cf-b74b-43873fbe40c9
 
-$ git log -1 --format="%H  %s"             # source commit under investigation is 815df1e210e0…;
+$ git log -1 --format="%H  %s"             # source commit under investigation is 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1;
                                             # the delivery commit that adds this document is created on the branch above
 c732e9295e99e1d7091953f9317997b35b7bc5aa  docs: add kitty C-extension vs test-suite QnA investigation
 
@@ -1887,7 +2259,7 @@ $ git status --porcelain                    # only the answer document is added/
  M blitzy/documentation/kitty_815df1e210e0.md
 
 $ sha256sum kitty/fast_data_types.so kitty/glfw-x11.so kittens/transfer/rsync.so   # git-ignored artifacts, restored byte-for-byte (== post-build baseline)
-1dc3caa73dc80733b5d755ee37cf9261125f660ae551d5419c53549650f2d0ed  kitty/fast_data_types.so
+a3f7ec88487e1ab7b9ecba83415c5abcaf4011b68ca87db326e6e45e8ba62c11  kitty/fast_data_types.so
 99db5778b34c5370637a2fce743fd6379ebb879f9fbee34bb38f67f0cbd83a56  kitty/glfw-x11.so
 c0bf7b038558d5dfabd176602d7a05458459bc635ee8dd869e1125695dea35a8  kittens/transfer/rsync.so
 
@@ -1901,7 +2273,7 @@ no temporary observation scratch remains under /tmp
 
 | # | Sub-question | Where answered | Key observed evidence |
 |---|--------------|----------------|-----------------------|
-| 1 | Build kitty from source (canonical) | §1, §1.3 | `CC=gcc-13 python3 setup.py build --verbose`, exit 0, `BUILD_REAL_SECONDS=60.871`; 3 artifacts on disk |
+| 1 | Build kitty from source (canonical) | §1, §1.3 | canonical `python3 setup.py build --verbose` (gcc 15.2.0) + on-disk `CC=gcc-13` variant, both exit 0; gcc-13 `BUILD_REAL_SECONDS=61.630`/`61.590` (×2 runs); 3 artifacts on disk |
 | 2 | Execute the test suite via its real entry point | §2.1, §2.2 | `./test.py` → `Ran 145 tests`, `FAILED (failures=4, skipped=4)`, `All Go tests succeeded` (×2 runs) |
 | 3 | Trace the extension ↔ test-execution relationship | §3, §9 | root/discovery/native three-level gating; captured import trace |
 | 4 | Which extension modules actually get loaded | §4, §4.1 | bootstrap=1 kitty ext; post-discovery 9 `.so` (2 kitty + 7 stdlib); glfw loaded natively (maps `False`→`True`) |
