@@ -46,9 +46,9 @@ investigation and is kept as genuine, unedited build output rather than rewritte
 ## 1. Methodology and provenance (capture-first)
 
 The entire investigation is a single, self-contained, security-hardened orchestrator
-(`run_investigation_final.sh`, reproduced complete in **Appendix A**, sha256 `b37401b8e360b88e7e2ea95e64b4e7546e36fe1df93aad0540cc6881819c587d`). It was
+(`run_investigation_final.sh`, reproduced complete in **Appendix A**, sha256 `5a20d838a3994789e88f51abd99874c7afe084c17af1a658e4dbfd5b61a5d960`). It was
 executed once end-to-end; its complete console transcript is **Appendix C**
-(`transcript_final.log`, sha256 `0ea69f4c609909bef76eaa019e29c489f01713c204bfb230f0ea1b3a45a87a69`). The transcript is bracketed by wall-clock
+(`transcript_final.log`, sha256 `f3892516777b3459c621026ee1ec9e1d0a0a1a9e891666ed10e2fa784754e5d1`). The transcript is bracketed by wall-clock
 timestamps, which is the provenance that observation preceded this write-up:
 
 - first line: `================ CAPTURE STARTED 2026-07-13T17:34:44Z ================`
@@ -63,13 +63,18 @@ verdict as its final line. The capture matrix's final line is
 **Reproducibility (F3).** The orchestrator defines the repository root from git itself
 (`REPO="$(git rev-parse --show-toplevel)"`) and verifies it, so there is no undefined `$REPO`. Every
 observation script is embedded inside the orchestrator (Appendix A) — nothing depends on files that
-were later deleted. To reproduce: from a built checkout, run `bash run_investigation_final.sh`.
+were later deleted. Because the orchestrator is itself a temporary file that its own `trap cleanup EXIT`
+removes on exit, it does **not** remain at the repository root after the run; to reproduce, first save
+the complete Appendix A listing to `/tmp/run_investigation_final.sh`, then run
+`bash /tmp/run_investigation_final.sh` from a built checkout.
 
 **Security of the scratch workspace (F9).** The orchestrator never executes code from a predictable
 world-writable path. It sets `umask 077`, creates a private workspace with
 `WORK="$(mktemp -d "${TMPDIR:-/tmp}/blitzy_osc133.XXXXXXXX")"`, `chmod 700 "$WORK"`, verifies the
-workspace is owned by the current user with mode `700`, writes every file atomically
-(`cat > "$WORK/<name>.part"; mv -- "$WORK/<name>.part" "$WORK/<name>"`), quotes all paths, and removes the
+workspace is owned by the current user with mode `700`, writes each generated observation script
+atomically via a `.part` staging file (`cat > "$WORK/<name>.part"; mv -- "$WORK/<name>.part" "$WORK/<name>"`)
+and captures the per-script logs (`obs_*.py.log`, `headless.log`) by direct redirection within that same
+private workspace, quotes all paths, and removes the
 whole workspace on exit — including on failure — via `trap cleanup EXIT`. The source tree is only
 ever read.
 
@@ -81,8 +86,8 @@ ever read.
 | `out_production.txt` | 96 | `9532ef175448eaf6d484054b6097c84087af9fdd74047b886035e20b7d817b3e` | Q6/Q7 + D-without-C, both runs + verdict (§9-§10) |
 | `out_realbash.txt` | 15 | `0e751e346e99d5e4980efafbd3fbb4f852056fe8a8c4f27263d32552ab471155` | real-bash PTY `D;99` production signal (§9) |
 | `clean_build.log` | 135 | `ece1f29143d67ee86869e686cf847003b012cdbf64d044deeda76c068e7472e7` | from-clean build transcript (Appendix B) |
-| `run_investigation_final.sh` | 418 | `b37401b8e360b88e7e2ea95e64b4e7546e36fe1df93aad0540cc6881819c587d` | the orchestrator + all 3 scripts (Appendix A) |
-| `transcript_final.log` | 367 | `0ea69f4c609909bef76eaa019e29c489f01713c204bfb230f0ea1b3a45a87a69` | one timestamped end-to-end run (Appendix C) |
+| `run_investigation_final.sh` | 424 | `5a20d838a3994789e88f51abd99874c7afe084c17af1a658e4dbfd5b61a5d960` | the orchestrator + all 3 scripts (Appendix A) |
+| `transcript_final.log` | 369 | `f3892516777b3459c621026ee1ec9e1d0a0a1a9e891666ed10e2fa784754e5d1` | one timestamped end-to-end run (Appendix C) |
 
 ## 2. Environment and build
 
@@ -163,7 +168,7 @@ it). Nothing below alters kitty's behavior; all of it is read-only against the s
 | Real **bash 5.2.37** over a PTY emitting `\x1b]133;D;99`, parsed by kitty, recorded (§9) | **CANONICAL** | A demonstrably production-created signal: the bytes originate from a real child process, not from us. |
 | Calling the real `Window.handle_cmd_end(...)` / `cmd_output_marking(...)` methods (`kitty/window.py:L1408`, `:L1453`) | **CANONICAL method** | The exact production recording functions; the recorded integer, watcher payload, and notification body all come from them. |
 | Constructing the `Window` via `Window.__new__` (bypassing `__init__` -> `add_window`) | **NON-CANONICAL construction** | `add_window` needs a live GUI window/tab, infeasible headless (see §2). Construction path differs; the *method under test* is unchanged. |
-| Seeding `last_cmd_output_start_time` to a nonzero value before `handle_cmd_end` | **NON-CANONICAL state seed** | Satisfies the C-before-D precondition (`kitty/window.py:L1409-L1410`) so the record path runs. In production a preceding `C` mark sets it; §10 also shows the un-seeded early-return. |
+| `last_cmd_output_start_time` initialized to its production default `0.0` (`Window.__init__`, `kitty/window.py:L569`), then set nonzero by the **real** preceding `C`-marker callback `cmd_output_marking(is_start=True, ...)` (`kitty/window.py:L1456`) | **CANONICAL (C-driven)** | The C-before-D precondition (`kitty/window.py:L1409-L1410`) is satisfied by the genuinely parsed `C` mark, exactly as in production — the program does **not** hand-seed a nonzero value; §10 shows the un-seeded, C-absent early-return. |
 | Seeding `last_cmd_exit_status` to a sentinel before each case | **NON-CANONICAL state seed** | Lets us *prove* the field was overwritten (e.g. `-987654321 -> 99`), rather than reading a coincidental value. |
 | `notify_on_cmd_finish` override `when='always', duration=0.0` | **observation-only override** | The **default is `when='never'`** (`kitty/options/types.py:L560`; captured live below), so a desktop notification would not fire by default. We override only to *observe the body string*; the default is reported alongside. |
 | Intercepting `notify_with_command` to capture the notification body instead of showing a desktop toast | **NON-CANONICAL interception** | Captures the exact `Notification.body` the production code builds (`kitty/window.py:L1429`); restored afterward. |
@@ -767,7 +772,7 @@ flowchart TD
 
 ## Appendix A — the complete orchestrator (`run_investigation_final.sh`)
 
-sha256 `b37401b8e360b88e7e2ea95e64b4e7546e36fe1df93aad0540cc6881819c587d`. This single script contains all three observation programs (embedded via
+sha256 `5a20d838a3994789e88f51abd99874c7afe084c17af1a658e4dbfd5b61a5d960`. This single script contains all three observation programs (embedded via
 quoted heredocs) and the environment/build/headless/cleanup framing. It is reproduced in full below.
 
 ~~~bash
@@ -1342,7 +1347,7 @@ Updating Go generated files...
 
 ## Appendix C — the complete timestamped run transcript (`transcript_final.log`)
 
-sha256 `0ea69f4c609909bef76eaa019e29c489f01713c204bfb230f0ea1b3a45a87a69`. One end-to-end execution of Appendix A, bracketed by `CAPTURE STARTED` /
+sha256 `f3892516777b3459c621026ee1ec9e1d0a0a1a9e891666ed10e2fa784754e5d1`. One end-to-end execution of Appendix A, bracketed by `CAPTURE STARTED` /
 `CAPTURE FINISHED` timestamps. The cleanup block confirms the private work dir and every temp script
 are removed on exit and that the source tree shows only the answer document.
 
