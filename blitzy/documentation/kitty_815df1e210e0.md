@@ -1,721 +1,1267 @@
-# kitty keyboard-protocol stack ↔ alternate-screen behavior — a runtime-observed investigation
+# kitty's keyboard-protocol flag stack across the main/alternate screen buffers — a runtime-observed investigation
 
-> **Deliverable:** answers to a five-part question about how kitty's keyboard-protocol
-> *progressive-enhancement* flag stack behaves when the terminal toggles between its **main**
-> and **alternate** screen buffers, grounded in **byte-level runtime observation** of the
-> *compiled* terminal (not code-reading alone).
+> **Objective.** Answer, with real runtime-observed evidence, how kitty's keyboard-protocol
+> progressive-enhancement flag stack behaves when the terminal switches between its **main** and
+> **alternate** screen buffers. Every behavioral claim below is paired with the **complete, unedited**
+> output that demonstrates it and the exact command that produced it, captured from the **compiled**
+> terminal (not from code-reading alone).
 >
-> **Repository / commit under study:** `kovidgoyal/kitty` at
-> `HEAD = 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (git branch
-> `blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7`).
+> **Source under study.** `kovidgoyal/kitty` at the pinned commit
+> `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (subject *"Wire up applying of font config"*). That
+> commit is the logical source branch `kitty_815df1e210e0`, from which this document's file name
+> derives. The investigation and this deliverable are committed on the **destination** branch
+> `blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7`, whose HEAD is the documentation commit
+> `3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f` and whose **parent** is exactly the pinned source commit
+> above. In other words, the code exercised here is `HEAD~1` of the destination branch — the pinned
+> commit — built in its default configuration.
 >
-> **Method summary:** every behavioral claim below is paired with the **complete, unedited**
-> output that demonstrates it and the exact command that produced it. Flag state is read from
-> the **real per-buffer stack** after driving the **real VT parser**; key bytes are produced by
-> the **same C encoder the live path uses**. Values were confirmed **stable across two runs**.
-> Claims are explicitly labeled **[observed]** or **[inferred]**, and every fact is anchored to a
-> `file:line` reference naming the specific function/struct that performs the work.
+> **Canonical build image.**
+> `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
+> (from `ghcr.io/scaleapi/swe-atlas`).
+>
+> **Observed vs. inferred.** Two kinds of evidence appear below and are labelled at each use:
+> **[observed]** — values printed by the compiled code at runtime (the real VT parser, the real
+> per-buffer stack, and the real C key-encoder); and **[inferred]** — statements derived by reading
+> the source (with `file:line` anchors) where a runtime channel is unavailable in this headless
+> environment (notably the live GUI keypress path, which needs a display). No inferred value is
+> presented as if it were observed.
 
----
+## TL;DR — direct answers
 
-## TL;DR — direct answers to the five questions
+1. **Round trip (main → push → alt → push → back to main).** After pushing *disambiguate* (flag `1`)
+   on the main buffer, switching to the alternate buffer, pushing *report-all-keys* (flag `8`) there,
+   and switching back, the **active flags on the main buffer are `1` again** — the main-buffer stack
+   survives the round trip intact because switching buffers only re-points an active pointer; it never
+   copies flags between the two arrays. **[observed]**, see [§2](#2-obj-1--round-trip-stack-survival).
 
-1. **Round trip** (start main → push flags → toggle to alt → push different flags → toggle back
-   to main): the keyboard mode active at the end is **disambiguate (flags = 1)**; the main-buffer
-   stack **survives the round trip completely intact**. **[observed]** The escape sequence a key
-   press produces in each intermediate state is given in §OBJ-1 and §OBJ-4.
-2. **Stack exhaustion:** pushing past the 8-slot limit **silently evicts the oldest entry** (a
-   `memmove` down by one) with **no error raised**; exhausting one buffer's stack has **zero
-   effect** on the other's. **[observed]**
-3. **Pop-to-empty:** a pop that empties the stack **resets all flags to 0**. **[observed]**
-4. **Ctrl+Shift+a** sends **the identical bytes `\x1b[97;6u` in all four states** (main/no-flags,
-   main/disambiguate, alt/report-all, back-to-main). This is **expected, not a failure to
-   observe** — explained in §OBJ-4. **[observed]**
-5. **Independence** is *not* visible from the four identical Ctrl+Shift+a captures; it is proven
-   instead by (a) the differing **query-reply bytes** ending in `\x1b[?1u` and (b) **contrast
-   keys** (plain `a`, `Ctrl+a`) whose bytes *do* change with the flags. A ≥10-cycle rapid-switch
-   probe shows **no state leakage**. **[observed]**
-6. **Mode-dependent edge cases:** isolation **holds** under all three alternate-screen mode
-   numbers **47 / 1047 / 1049**; `DECCKM` interacts with the flags on cursor keys; the
-   first-push-from-empty seeds a hidden base-0 entry; and a **bare `CSI u`** is *restore cursor*
-   (SCORC), **not** a keyboard operation. **[observed]**
+2. **Exhaustion.** The stack holds **8 entries**. A push onto a full stack **silently evicts the
+   oldest entry** (no error). Exhausting one buffer's stack does **not** affect the other's.
+   **[observed]**, see [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation).
 
----
+3. **Pop-to-empty.** A pop that empties the stack **resets all flags to `0`**; over-popping does not
+   underflow or error. **[observed]**, see [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop).
 
-## 1. Environment, build, and the canonical observation method
+4. **Ctrl+Shift+a in the four requested states.** All four states emit the identical byte sequence
+   **`b'\x1b[97;6u'`** (`ESC [ 97 ; 6 u`): codepoint `97` = `a`, modifier field `6` = the Ctrl+Shift
+   bitmask `5` plus `1`. The *plain* and *Ctrl+a* keys, by contrast, differ per state and expose the
+   flag semantics. **[observed]**, see [§5](#5-obj-4--the-four-ctrlshifta-byte-captures-plus-contrast-and-flag-sensitivity).
 
-### 1.1 Build the C extension (prerequisite — done first)
+5. **Independence & leakage.** The differing per-state byte captures, plus a 10-cycle rapid-switching
+   probe, show the two buffers keep **independent** stacks with **no leakage**.
+   **[observed]**, see [§6](#6-obj-5--independence-proof-and-leakage-probe).
 
-The compiled extension `kitty/fast_data_types.so`, which implements the stacks, is **not** part
-of the source checkout and must be built before any observation. The canonical build action is
-`python3 setup.py build` (`setup.py` default `action='build'`), which applies
-`-pedantic-errors -Werror -Wall -Wextra` by default.
+6. **Mode-dependent edge cases.** Isolation holds across all three alternate-screen mode constants
+   `47`/`1047`/`1049`; `DECCKM` interacts with the flags for cursor keys; and a bare `CSI u` is
+   *restore-cursor* (SCORC), not a keyboard-stack operation.
+   **[observed]**, see [§7](#7-obj-6--mode-dependent-edge-cases-4710471049-decckm-and-scorc).
 
-```console
-$ CI=true python3 setup.py build
-# ... compiles 100+ object files, links kitty/fast_data_types.so ...
-# (the build ends by attempting the Go launcher; that step is irrelevant to the
-#  headless harness because fast_data_types.so is already linked at that point.)
+## 1. Environment, build, and the canonical observation path
 
-$ ls -l kitty/fast_data_types.so | awk '{print $5, $NF}'
-1253792 kitty/fast_data_types.so
+### 1.1 Provenance and toolchain
+
+The following was captured at the repository root on the destination branch. It records the exact
+commit under study (the pinned source commit, which is `HEAD~1` here), the toolchain versions, and
+the `pkg-config` state that governs which GLFW backend is built (see [§1.3](#13-wayland-auto-disable-and-why-it-is-irrelevant-here)).
+
+Command:
+
+```bash
+set -o pipefail
+{
+  echo "=== repo root (pwd) ==="; pwd
+  echo; echo "=== git provenance ==="
+  echo "destination/review branch: $(git rev-parse --abbrev-ref HEAD)"
+  echo "current HEAD (doc commit): $(git rev-parse HEAD)"
+  echo "current HEAD subject: $(git log -1 --format='%s' HEAD)"
+  echo "parent HEAD~1 (pinned source commit under study): $(git rev-parse HEAD~1)"
+  echo "parent subject: $(git log -1 --format='%s' HEAD~1)"
+  echo; echo "=== toolchain versions ==="
+  python3 --version; cc --version | head -1; go version; pkg-config --version
+  echo; echo "=== Wayland pkg-config probe (governs GLFW backend selection) ==="
+  pkg-config --exists wayland-protocols && echo "wayland-protocols: PRESENT" || echo "wayland-protocols: ABSENT (rc=$?)"
+  pkg-config --exists wayland-client && echo "wayland-client: PRESENT" || echo "wayland-client: ABSENT (rc=$?)"
+  echo; echo "=== built GLFW backend shared objects present in kitty/ ==="
+  ls -1 kitty/glfw-*.so 2>/dev/null || echo "(none yet)"
+} 2>&1 | tee /tmp/env.txt
+echo "EXIT=${PIPESTATUS[0]}"
 ```
 
-Environment actually used (all satisfy the pinned requirements):
+Output **[observed]**:
 
-```console
-$ python3 --version
-Python 3.13.7                     # pyproject requires-python ">=3.8"  (pyproject.toml:L2)
-$ cc --version | head -1
+```text
+=== repo root (pwd) ===
+/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464
+
+=== git provenance ===
+destination/review branch: blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7
+current HEAD (doc commit): 3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f
+current HEAD subject: docs: add runtime-observed investigation of kitty keyboard-protocol stack vs alternate-screen
+parent HEAD~1 (pinned source commit under study): 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+parent subject: Wire up applying of font config
+
+=== toolchain versions ===
+Python 3.13.7
 cc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
-$ go version | head -1
-go version go1.24.4 linux/amd64   # go.mod "go 1.22"  (go.mod:L3) — GUI/launcher only
+go version go1.24.4 linux/amd64
+1.8.1
+
+=== Wayland pkg-config probe (governs GLFW backend selection) ===
+wayland-protocols: ABSENT (rc=1)
+wayland-client: ABSENT (rc=1)
+
+=== built GLFW backend shared objects present in kitty/ ===
+kitty/glfw-x11.so
+EXIT=0
 ```
 
-Sanity check that the built `Screen` object exposes the stack API used throughout this report:
+The two facts that matter downstream: the code under study is the pinned commit
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (the parent of the documentation commit), and
+`wayland-protocols` is **absent** from `pkg-config`, so only the X11 GLFW backend (`kitty/glfw-x11.so`)
+is built.
 
-```console
-$ PYTHONPATH=$(pwd) python3 -c "import kitty.fast_data_types as f; from kitty_tests import Callbacks; \
-c=Callbacks(); s=f.Screen(c,5,5,5,10,20,0,c); \
-print('current_key_encoding_flags=%d has_toggle_alt_screen=%s cursor_key_mode=%s' % \
-(s.current_key_encoding_flags(), hasattr(s,'toggle_alt_screen'), s.cursor_key_mode))"
-current_key_encoding_flags=0 has_toggle_alt_screen=True cursor_key_mode=False
+### 1.2 Building the C extension (canonical, default configuration)
+
+kitty's behavior lives in a compiled C extension, `kitty/fast_data_types.so`, which is not present in
+a fresh checkout and must be built before anything can be observed. The canonical build command is the
+default `build` action of `setup.py` ([setup.py:L175]); it applies a strict warning/error set by
+default — `-Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes`
+together with `-std=c11 -pedantic-errors -Werror` ([setup.py:L491], [setup.py:L500]) — so a clean
+build is also a zero-warning guarantee.
+
+To produce a genuine, complete compile transcript, the git-ignored C object cache (`build/`) and the
+extension (`kitty/fast_data_types.so`) were removed first, forcing a full recompile. (`setup.py clean`
+was deliberately *not* used, because it also wipes the offline Go module cache.)
+
+Command (run at the repository root):
+
+```bash
+set -o pipefail
+rm -rf build kitty/fast_data_types.so          # remove ONLY git-ignored C build artifacts
+CI=true python3 setup.py build --verbose > /tmp/build.txt 2>&1
+echo "BUILD_EXIT=$?"
+echo "lines: $(wc -l < /tmp/build.txt)  bytes: $(wc -c < /tmp/build.txt)"
+echo "sha256: $(sha256sum /tmp/build.txt | cut -d' ' -f1)"
+grep -ni 'warning:\|error:' /tmp/build.txt || echo 'NONE (zero warnings/errors)'
 ```
 
-`fast_data_types.so` is git-ignored, so building leaves the working tree clean (`git status
---porcelain` is empty). **[observed]**
+The complete, unedited transcript follows. All 85 compile lines carry the identical strict
+warning/error flag set shown above; the preamble (lines 1–6) records the Wayland auto-disable, and the
+final lines link `fast_data_types.so`, `glfw-x11.so`, the `kitty` launcher, and the Go `kitten`
+launcher.
 
-### 1.2 The canonical, display-free observation path
+Output **[observed]**:
 
-All observations use the sanctioned headless harness, which drives kitty's **real** input
-machinery — the same code an application triggers by writing escape codes to the terminal:
-
-- **Create a screen** exactly as the test harness does
-  (`kitty_tests/__init__.py` `create_screen`, L237):
-  `c = Callbacks(); s = fast_data_types.Screen(c, 5, 5, 5, 10, 20, 0, c)`.
-- **Drive the real VT parser** with `parse_bytes(s, b'...')` (`kitty_tests/__init__.py:L30`),
-  which runs the actual `vt-parser.c` dispatch.
-- **Read the active flags from the real per-buffer stack** with
-  `s.current_key_encoding_flags()` — Python binding wrapper at `kitty/screen.c:L3951`, C
-  implementation `screen_current_key_encoding_flags` at `kitty/screen.c:L1204`.
-- **Capture child-bound bytes** from `Callbacks.write` → `c.wtcbuf`
-  (`kitty_tests/__init__.py:L50-51`); reset with `c.clear()` (L95). A query `CSI ? u` makes the
-  terminal write `CSI ? flags u` into `wtcbuf` (`screen_report_key_encoding_flags`,
-  `kitty/screen.c:L1212`).
-- **Switch buffers** with the canonical escape codes `b'\x1b[?1049h'` (enter alt / `smcup`) and
-  `b'\x1b[?1049l'` (return / `rmcup`), matching terminfo (`kitty/terminfo.py:L235` and `L207`).
-- **Encode a key press exactly as production does.** The live path is `on_key_input` →
-  `encode_glfw_key_event(ev, screen->modes.mDECCKM, screen_current_key_encoding_flags(screen),
-  …)` (`kitty/keys.c:L251`). We reproduce it **verbatim** with
-  `fast_data_types.encode_key_for_tty(key=…, shifted_key=…, mods=…, text=…, action=1,
-  key_encoding_flags=s.current_key_encoding_flags(), cursor_key_mode=s.cursor_key_mode)` — this
-  is exactly what `Window.encoded_key()` does in production
-  (`kitty/window.py:L1795-1800`).
-
-Runtime constants used below (read from the built module):
-
-```console
-$ PYTHONPATH=$(pwd) python3 -c "import kitty.fast_data_types as f; \
-print('SHIFT=%d ALT=%d CTRL=%d PRESS=%d FKEY_UP=%d' % \
-(f.GLFW_MOD_SHIFT, f.GLFW_MOD_ALT, f.GLFW_MOD_CONTROL, f.GLFW_PRESS, f.GLFW_FKEY_UP))"
-SHIFT=1 ALT=2 CTRL=4 PRESS=1 FKEY_UP=57352
+```text
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+CC: ['gcc'] (15, 0)
+gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+Detected: CompilerType.gcc
+gcc -MMD -DNDEBUG -DPRIMARY_VERSION=4000 -DSECONDARY_VERSION=35 -DXT_VERSION="0.35.2" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/screen.c -o build/fast_data_types-kitty-screen.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/unicode-data.c -o build/fast_data_types-kitty-unicode-data.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/x11_window.c -o build/glfw-x11-glfw-x11_window.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/glfw.c -o build/fast_data_types-kitty-glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/graphics.c -o build/fast_data_types-kitty-graphics.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/child-monitor.c -o build/fast_data_types-kitty-child-monitor.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/fonts.c -o build/fast_data_types-kitty-fonts.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/shaders.c -o build/fast_data_types-kitty-shaders.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/vt-parser.c -o build/fast_data_types-kitty-vt-parser.c.o
+gcc -MMD -DNDEBUG -DDUMP_COMMANDS -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/vt-parser.c -o build/fast_data_types-kitty-vt-parser-dump.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/state.c -o build/fast_data_types-kitty-state.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/input.c -o build/glfw-x11-glfw-input.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/mouse.c -o build/fast_data_types-kitty-mouse.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/xkb_glfw.c -o build/glfw-x11-glfw-xkb_glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/freetype.c -o build/fast_data_types-kitty-freetype.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/window.c -o build/glfw-x11-glfw-window.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/line.c -o build/fast_data_types-kitty-line.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/glfw-wrapper.c -o build/fast_data_types-kitty-glfw-wrapper.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -Ikitty -I/usr/include/python3.13 -c kittens/transfer/algorithm.c -o build/rsync-kittens-transfer-algorithm.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/x11_init.c -o build/glfw-x11-glfw-x11_init.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/freetype_render_ui_text.c -o build/fast_data_types-kitty-freetype_render_ui_text.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/egl_context.c -o build/glfw-x11-glfw-egl_context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/disk-cache.c -o build/fast_data_types-kitty-disk-cache.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/glx_context.c -o build/glfw-x11-glfw-glx_context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/line-buf.c -o build/fast_data_types-kitty-line-buf.c.o
+gcc -MMD -DNDEBUG -DKITTY_VCS_REV="3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f" -DWRAPPED_KITTENS="ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/colors.c -o build/fast_data_types-kitty-colors.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/history.c -o build/fast_data_types-kitty-history.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/keys.c -o build/fast_data_types-kitty-keys.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/x11_monitor.c -o build/glfw-x11-glfw-x11_monitor.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/fontconfig.c -o build/fast_data_types-kitty-fontconfig.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/context.c -o build/glfw-x11-glfw-context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/crypto.c -o build/fast_data_types-kitty-crypto.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/ibus_glfw.c -o build/glfw-x11-glfw-ibus_glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/key_encoding.c -o build/fast_data_types-kitty-key_encoding.c.o
+gcc -DWRAPPED_KITTENS=" ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input " -DFROM_SOURCE -DKITTY_LIB_PATH="../.." -DKITTY_CLI_BOOL_OPTIONS=" detach hold single-instance 1 wait-for-single-instance-window-close version v dump-commands debug-rendering debug-gl debug-input debug-keyboard debug-font-fallback execute e " -DKITTY_VERSION="0.35.2" -Wall -pedantic-errors -Werror -fpie -O3 -I/usr/include/python3.13 -c kitty/launcher/main.c -o build/kitty-launcher-main.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/monitor.c -o build/glfw-x11-glfw-monitor.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/font-names.c -o build/fast_data_types-kitty-font-names.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/backend_utils.c -o build/glfw-x11-glfw-backend_utils.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/charsets.c -o build/fast_data_types-kitty-charsets.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/linux_joystick.c -o build/glfw-x11-glfw-linux_joystick.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/init.c -o build/glfw-x11-glfw-init.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/dbus_glfw.c -o build/glfw-x11-glfw-dbus_glfw.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/gl.c -o build/fast_data_types-kitty-gl.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/vulkan.c -o build/glfw-x11-glfw-vulkan.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/osmesa_context.c -o build/glfw-x11-glfw-osmesa_context.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/cursor.c -o build/fast_data_types-kitty-cursor.c.o
+gcc -DWRAPPED_KITTENS=" ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input " -DFROM_SOURCE -DKITTY_LIB_PATH="../.." -DKITTY_CLI_BOOL_OPTIONS=" detach hold single-instance 1 wait-for-single-instance-window-close version v dump-commands debug-rendering debug-gl debug-input debug-keyboard debug-font-fallback execute e " -DKITTY_VERSION="0.35.2" -Wall -pedantic-errors -Werror -fpie -O3 -I/usr/include/python3.13 -c kitty/launcher/single-instance.c -o build/kitty-launcher-single-instance.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/desktop.c -o build/fast_data_types-kitty-desktop.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/loop-utils.c -o build/fast_data_types-kitty-loop-utils.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/ringbuf/ringbuf.c -o build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/simd-string.c -o build/fast_data_types-kitty-simd-string.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/systemd.c -o build/fast_data_types-kitty-systemd.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/shlex.c -o build/fast_data_types-kitty-shlex.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/child.c -o build/fast_data_types-kitty-child.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/kittens.c -o build/fast_data_types-kitty-kittens.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/codec_choose.c -o build/fast_data_types-3rdparty-base64-lib-codec_choose.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/png-reader.c -o build/fast_data_types-kitty-png-reader.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/linux_notify.c -o build/glfw-x11-glfw-linux_notify.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/rowcolumn-diacritics.c -o build/fast_data_types-kitty-rowcolumn-diacritics.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/hyperlink.c -o build/fast_data_types-kitty-hyperlink.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/wcswidth.c -o build/fast_data_types-kitty-wcswidth.c.o
+gcc -MMD -DNDEBUG -DHAS_COPY_FILE_RANGE -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/fast-file-copy.c -o build/fast_data_types-kitty-fast-file-copy.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/lib.c -o build/fast_data_types-3rdparty-base64-lib-lib.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/posix_thread.c -o build/glfw-x11-glfw-posix_thread.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/window_logo.c -o build/fast_data_types-kitty-window_logo.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/glyph-cache.c -o build/fast_data_types-kitty-glyph-cache.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/logging.c -o build/fast_data_types-kitty-logging.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/neon64/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-neon64-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/tables/tables.c -o build/fast_data_types-3rdparty-base64-lib-tables-tables.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/neon32/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-neon32-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -mavx -c 3rdparty/base64/lib/arch/avx/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-avx-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/ssse3/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-ssse3-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -msse4.2 -c 3rdparty/base64/lib/arch/sse42/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-sse42-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -msse4.1 -c 3rdparty/base64/lib/arch/sse41/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-sse41-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -mavx2 -c 3rdparty/base64/lib/arch/avx2/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-avx2-codec.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/utmp.c -o build/fast_data_types-kitty-utmp.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/avx512/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-avx512-codec.c.o
+gcc -MMD -DNDEBUG -DHAVE_AVX512=0 -DHAVE_AVX2=1 -DHAVE_NEON32=0 -DHAVE_NEON64=0 -DHAVE_SSSE3=0 -DHAVE_SSE41=1 -DHAVE_SSE42=1 -DHAVE_AVX=1 -DHAVE_SSE3=1 -I3rdparty/base64 -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c 3rdparty/base64/lib/arch/generic/codec.c -o build/fast_data_types-3rdparty-base64-lib-arch-generic-codec.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/cleanup.c -o build/fast_data_types-kitty-cleanup.c.o
+gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/monotonic.c -o build/glfw-x11-glfw-monotonic.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/monotonic.c -o build/fast_data_types-kitty-monotonic.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -fopenmp-simd -DSIMDE_ENABLE_OPENMP -msse4.2 -c kitty/simd-string-128.c -o build/fast_data_types-kitty-simd-string-128.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -fopenmp-simd -DSIMDE_ENABLE_OPENMP -mavx2 -mno-vzeroupper -c kitty/simd-string-256.c -o build/fast_data_types-kitty-simd-string-256.c.o
+gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/gl-wrapper.c -o build/fast_data_types-kitty-gl-wrapper.c.o
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -Wall -O3 -shared -flto build/fast_data_types-kitty-charsets.c.o build/fast_data_types-kitty-child-monitor.c.o build/fast_data_types-kitty-child.c.o build/fast_data_types-kitty-cleanup.c.o build/fast_data_types-kitty-colors.c.o build/fast_data_types-kitty-crypto.c.o build/fast_data_types-kitty-cursor.c.o build/fast_data_types-kitty-data-types.c.o build/fast_data_types-kitty-desktop.c.o build/fast_data_types-kitty-disk-cache.c.o build/fast_data_types-kitty-fast-file-copy.c.o build/fast_data_types-kitty-font-names.c.o build/fast_data_types-kitty-fontconfig.c.o build/fast_data_types-kitty-fonts.c.o build/fast_data_types-kitty-freetype.c.o build/fast_data_types-kitty-freetype_render_ui_text.c.o build/fast_data_types-kitty-gl-wrapper.c.o build/fast_data_types-kitty-gl.c.o build/fast_data_types-kitty-glfw-wrapper.c.o build/fast_data_types-kitty-glfw.c.o build/fast_data_types-kitty-glyph-cache.c.o build/fast_data_types-kitty-graphics.c.o build/fast_data_types-kitty-history.c.o build/fast_data_types-kitty-hyperlink.c.o build/fast_data_types-kitty-key_encoding.c.o build/fast_data_types-kitty-keys.c.o build/fast_data_types-kitty-kittens.c.o build/fast_data_types-kitty-line-buf.c.o build/fast_data_types-kitty-line.c.o build/fast_data_types-kitty-logging.c.o build/fast_data_types-kitty-loop-utils.c.o build/fast_data_types-kitty-monotonic.c.o build/fast_data_types-kitty-mouse.c.o build/fast_data_types-kitty-png-reader.c.o build/fast_data_types-kitty-rowcolumn-diacritics.c.o build/fast_data_types-kitty-screen.c.o build/fast_data_types-kitty-shaders.c.o build/fast_data_types-kitty-shlex.c.o build/fast_data_types-kitty-simd-string-128.c.o build/fast_data_types-kitty-simd-string-256.c.o build/fast_data_types-kitty-simd-string.c.o build/fast_data_types-kitty-state.c.o build/fast_data_types-kitty-systemd.c.o build/fast_data_types-kitty-unicode-data.c.o build/fast_data_types-kitty-utmp.c.o build/fast_data_types-kitty-vt-parser.c.o build/fast_data_types-kitty-wcswidth.c.o build/fast_data_types-kitty-window_logo.c.o build/fast_data_types-kitty-vt-parser-dump.c.o build/fast_data_types-3rdparty-ringbuf-ringbuf.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon32-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse42-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-ssse3-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-sse41-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-generic-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx2-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx512-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-avx-codec.c.o build/fast_data_types-3rdparty-base64-lib-arch-neon64-codec.c.o build/fast_data_types-3rdparty-base64-lib-tables-tables.c.o build/fast_data_types-3rdparty-base64-lib-codec_choose.c.o build/fast_data_types-3rdparty-base64-lib-lib.c.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -lharfbuzz -lGL -lpng16 -llcms2 -llcms2_fast_float -llcms2_threaded -pthread -lm -lcrypto -lrt -lz -o build/kitty/fast_data_types.so
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -Wall -O3 -shared -flto build/glfw-x11-glfw-context.c.o build/glfw-x11-glfw-init.c.o build/glfw-x11-glfw-input.c.o build/glfw-x11-glfw-monitor.c.o build/glfw-x11-glfw-vulkan.c.o build/glfw-x11-glfw-monotonic.c.o build/glfw-x11-glfw-window.c.o build/glfw-x11-glfw-x11_init.c.o build/glfw-x11-glfw-x11_monitor.c.o build/glfw-x11-glfw-x11_window.c.o build/glfw-x11-glfw-xkb_glfw.c.o build/glfw-x11-glfw-dbus_glfw.c.o build/glfw-x11-glfw-ibus_glfw.c.o build/glfw-x11-glfw-posix_thread.c.o build/glfw-x11-glfw-glx_context.c.o build/glfw-x11-glfw-egl_context.c.o build/glfw-x11-glfw-osmesa_context.c.o build/glfw-x11-glfw-backend_utils.c.o build/glfw-x11-glfw-linux_joystick.c.o build/glfw-x11-glfw-linux_notify.c.o -pthread -lm -lrt -ldl -lX11 -lXrandr -lXinerama -lXcursor -lxkbcommon -lxkbcommon-x11 -lxkbcommon -lX11-xcb -lX11 -lxcb -ldbus-1 -o build/kitty/glfw-x11.so
+gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -Ikitty -I/usr/include/python3.13 -Wall -O3 -shared -flto build/rsync-kittens-transfer-algorithm.c.o -lxxhash -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -o build/kittens/transfer/rsync.so
+gcc build/kitty-launcher-main.o build/kitty-launcher-single-instance.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -o kitty/launcher/kitty
+Updating Go generated files...
+kitty/tools/cmd
+/usr/bin/go build -v -ldflags '-X kitty.VCSRevision=3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464/tools/cmd
 ```
 
-### 1.3 Escape-code grammar driven into the parser
+Build summary **[observed]**: `BUILD_EXIT=0`; transcript = 104 lines / 58964 bytes;
+`sha256 = 841d09404c5d0e29f39ee985401d19cc49ad7a22e2fe1f36b9d75c235bc7ca11`; the `grep` for
+`warning:`/`error:` returned **NONE (zero warnings/errors)**. Re-running the command above and
+comparing against this `sha256` verifies the transcript byte-for-byte.
 
-The `CSI u` family is dispatched by the **leading (start) modifier** in
-`kitty/vt-parser.c:L1217-1240`:
+Post-build verification **[observed]**:
 
-| Operation | Bytes | Dispatches to (`vt-parser.c`) |
-|---|---|---|
-| set flags | `CSI = flags ; how u` (`\x1b[=Fn;Hu`) | `screen_set_key_encoding_flags` (L1228-1230) |
-| query | `CSI ? u` (`\x1b[?u`) | `screen_report_key_encoding_flags` (L1223-1226) |
-| push | `CSI > flags u` (`\x1b[>Fu`) | `screen_push_key_encoding_flags` (L1232-1234) |
-| pop | `CSI < number u` (`\x1b[<Nu`) | `screen_pop_key_encoding_flags` (L1236-1238) |
-| **bare `CSI u`** | `\x1b[u` | **`screen_restore_cursor` (SCORC), *not* a keyboard op** (L1218-1220) |
-
-### 1.4 Canonicity labeling (per the binding rules)
-
-- **CANONICAL (used for every stateful claim):** flag state obtained via the real parser
-  (`parse_bytes`) → the real per-buffer stack → `s.current_key_encoding_flags()`. Encoding is
-  produced by `encode_glfw_key_event` (`kitty/key_encoding.c:L414`), the *same* C function the
-  live path calls; feeding stack-confirmed flags into `encode_key_for_tty` reproduces
-  `Window.encoded_key()` (`kitty/window.py:L1795-1800`) exactly. This is the **canonical
-  headless reproduction**.
-- **NON-CANONICAL (used only as a byte cross-check, always labeled):** `encode_key_for_tty` /
-  `pyencode_key_for_tty` (`kitty/keys.c:L311`, encode call at L319) accept an **explicit**
-  `key_encoding_flags` argument, so they **cannot by themselves prove stack state**. They are
-  used below only in the flag-4 sensitivity block, *after* the stack flags are confirmed from the
-  real stack, and are labeled non-canonical there.
-- **LIVE GUI PATH — could not be exercised (stated honestly):** `kitty --debug-keyboard` (which
-  prints `sent encoded key to child:` + raw bytes, `kitty/keys.c:L261`) and
-  `kitten show-key -m kitty` (`kittens/show_key/main.py:L12-15`) require a GLFW display and a
-  physical key press. The launcher is built, but there is no display in this container:
-
-```console
-$ echo "DISPLAY='${DISPLAY:-<unset>}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-<unset>}'"
-DISPLAY='<unset>' WAYLAND_DISPLAY='<unset>'
-$ ls -l kitty/launcher/kitty | awk '{print $1, $5, $NF}'
--rwxr-xr-x 40384 kitty/launcher/kitty
-$ timeout 20 ./kitty/launcher/kitty --debug-keyboard -e true 2>&1 | head -2
-[0.060] [glfw error 65544]: X11: The DISPLAY environment variable is missing
-GLFW initialization failed
+```text
+$ ls -l kitty/fast_data_types.so
+-rwxr-xr-x 1 root root 1253792 kitty/fast_data_types.so
+$ PYTHONPATH="$(pwd)" python3 -c "import kitty.fast_data_types as f; from kitty_tests import Callbacks; c=Callbacks(); s=f.Screen(c,5,40,5,10,20,0,c); print('import OK; flags =', s.current_key_encoding_flags(), '; toggle_alt_screen present =', hasattr(s,'toggle_alt_screen'))"
+import OK; flags = 0 ; toggle_alt_screen present = True
+$ git status --porcelain
+(empty — all build outputs are git-ignored, so the working tree stays clean)
 ```
 
-  The blocker here is the **missing display**, not a missing Go toolchain (Go is present and the
-  launcher linked). The headless harness drives the **identical** C parser → stack → encoder that
-  the live path uses, so it faithfully reproduces the live behavior; the raw `\x1b[…` byte
-  strings captured from `wtcbuf`/`encode_key_for_tty` are exactly what would be sent to the child.
-  **[observed]**
+### 1.3 Wayland auto-disable and why it is irrelevant here
 
----
+The build transcript opens with:
 
-## OBJ-1 — Round-trip active mode and main-stack survival
-
-**Question:** starting on the main buffer, push keyboard flags, toggle to the alternate screen,
-push *different* flags, then toggle back to the main buffer — which mode is active at the end,
-does the main stack survive, and what does a key press produce in each intermediate state?
-
-**Answer [observed]:** the mode active at the end is **disambiguate (flags = 1)**, and the
-main-buffer stack **survives the round trip intact**. The alternate buffer's flag-8 does **not**
-leak back to the main buffer.
-
-**Structural basis [observed in source].** kitty stores **two fixed 8-byte arrays plus one active
-pointer** (`kitty/screen.h:L128`):
-
-```c
-uint8_t main_key_encoding_flags[8], alt_key_encoding_flags[8], *key_encoding_flags;
+```text
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
 ```
 
-The buffer toggle, `screen_toggle_screen_buffer` (`kitty/screen.c:L1068`), only **re-points** the
-active pointer; it performs **no copy** between the two arrays:
+`wayland-protocols` is not installed in this image (the `pkg-config` probe in [§1.1](#11-provenance-and-toolchain)
+reports it **ABSENT**), so `setup.py` follows its default behavior and **disables the Wayland GLFW
+backend**, building only the X11 backend `kitty/glfw-x11.so`. This is a property of the *default*
+configuration as a normal user would build it in this environment — nothing was forced or overridden.
 
-```c
-self->key_encoding_flags = self->alt_key_encoding_flags;   // to alt  (screen.c:L1079)
-self->key_encoding_flags = self->main_key_encoding_flags;  // to main (screen.c:L1086)
+This has **no bearing on the investigation**. The keyboard-protocol stack and the key encoder live
+entirely in `kitty/fast_data_types.so`; the GLFW backends (`glfw-x11.so`, and the absent
+`glfw-wayland.so`) are the windowing/display layer. The headless observation path used below
+([§1.4](#14-the-canonical-observation-path-headless-and-the-observedinferred-boundary)) imports only
+`fast_data_types.so` and never opens a window, so whether the Wayland backend is present or absent
+cannot change any byte reported here.
+
+### 1.4 The canonical observation path (headless) and the observed/inferred boundary
+
+An application controls kitty's keyboard protocol by **writing escape codes**, which kitty's VT parser
+parses and dispatches into the screen's per-buffer stack routines. The sanctioned headless harness in
+`kitty_tests/__init__.py` drives *that same real parser*:
+
+- `parse_bytes(screen, data)` ([kitty_tests/__init__.py:L30]) feeds bytes through the real VT parser
+  (`test_create_write_buffer` / `test_commit_write_buffer` / `test_parse_written_data`), exactly as
+  bytes arriving from an application would be parsed.
+- `Callbacks.write` accumulates everything kitty writes **to the child** into `wtcbuf`
+  ([kitty_tests/__init__.py:L51]); `Callbacks.clear()` resets it ([kitty_tests/__init__.py:L95]). This
+  captures the real child-bound bytes (e.g. the reply to a flags *query*).
+- `create_screen` ([kitty_tests/__init__.py:L237]) builds the `Screen` with
+  `Screen(callbacks, lines, cols, scrollback, cell_width, cell_height, 0, test_child)`; the scripts
+  below use that exact construction.
+
+Two distinct channels of evidence, with an explicit boundary between what is observed and what is
+inferred:
+
+- **Flag state — fully canonical & [observed].** The active flags are read from the real per-buffer
+  stack via `Screen.current_key_encoding_flags()` (C: `screen_current_key_encoding_flags`,
+  [kitty/screen.c:L1204]), and the *query reply* is the real child-bound write produced by
+  `screen_report_key_encoding_flags` ([kitty/screen.c:L1212-L1215], which formats `?%uu`). Both are
+  produced by the compiled code at runtime.
+- **Key bytes — real encoder, [observed] output; live-GUI equivalence [inferred].** The bytes a key
+  press produces are computed by the C function `encode_glfw_key_event`
+  ([kitty/key_encoding.c:L414]). On the live path this is called from `on_key_input`
+  with the *active stack flags*:
+  `encode_glfw_key_event(ev, screen->modes.mDECCKM, screen_current_key_encoding_flags(screen), encoded_key)`
+  ([kitty/keys.c:L251]). Headlessly there is no GLFW key event object, so the scripts invoke the very
+  same encoder through its Python export, `encode_key_for_tty`, **passing the flags they just read
+  from the real stack**. The returned string is converted with `.encode('ascii')` — exactly as the
+  live GUI does in `Window.encoded_key`, which calls
+  `encode_key_for_tty(..., key_encoding_flags=self.screen.current_key_encoding_flags(), cursor_key_mode=self.screen.cursor_key_mode).encode('ascii')` ([kitty/window.py:L1795-L1801]).
+  The encoder output printed below is therefore **[observed]**; the claim that a *live* Ctrl+Shift+a
+  keypress in a GUI window would write these identical bytes to the child is **[inferred]** from
+  [kitty/keys.c:L251] and [kitty/window.py:L1795-L1801] (this headless environment has no display, so
+  a live keypress→child capture via `kitty --debug-keyboard` [kitty/keys.c:L260-L269] or
+  `kitten show-key -m kitty` [kittens/show_key/main.py:L12-L15] was not performed).
+
+Because the *encoder* is the production function and the *flags fed to it are read from the real
+stack immediately before each call*, every encoder capture below is a **stack-confirmed,
+production-equivalent cross-check** — not a value conjured from an arbitrary flags argument. The one
+exception is the deliberately labelled *encoder-characterization* block in
+[§5.3](#53-flag-sensitivity-explicit-non-canonical-encoder-characterization), which feeds **explicit
+flag literals** (not stack-derived) purely to isolate the effect of one flag bit; it proves encoder
+behavior, not stack state, and is marked **non-canonical** accordingly.
+
+### 1.5 The `CSI u` escape-code grammar (and the SCORC confusion)
+
+All stack operations share the final byte `u` and are disambiguated by the **leading** modifier byte.
+The dispatch is in the VT parser ([kitty/vt-parser.c:L1217-L1240]):
+
+| Escape code | Meaning | Dispatch |
+|-------------|---------|----------|
+| `CSI u` (no modifier, no params) | **Restore cursor (SCORC)** — *not* a keyboard op | `screen_restore_cursor` [kitty/vt-parser.c:L1218-L1221] |
+| `CSI ? u` | Query current flags (writes reply to child) | `screen_report_key_encoding_flags` [kitty/vt-parser.c:L1223-L1226] |
+| `CSI = flags ; mode u` | Set flags (mode 1=set, 2=or, 3=and-not) | `screen_set_key_encoding_flags` [kitty/vt-parser.c:L1228-L1230], [kitty/screen.c:L1220] |
+| `CSI > flags u` | Push flags onto the active stack | `screen_push_key_encoding_flags` [kitty/vt-parser.c:L1232-L1234], [kitty/screen.c:L1234] |
+| `CSI < number u` | Pop `number` entries from the active stack | `screen_pop_key_encoding_flags` [kitty/vt-parser.c:L1236-L1238], [kitty/screen.c:L1248] |
+
+The first row is a well-known confusion source: a bare `CSI u` with no modifier is the ancient
+*restore cursor* operation, entirely unrelated to the keyboard protocol. This is demonstrated at
+runtime in [§7.3](#73-scorc-a-bare-csi-u-restores-the-cursor-not-the-keyboard-stack).
+
+## 2. (OBJ-1) Round-trip stack survival
+
+**Question.** Starting on the main buffer, push keyboard flags, toggle to the alternate screen, push
+different flags, then toggle back to the main buffer: which mode is active at the end, does the
+main-buffer stack survive intact, and what does a flags *query* return in each intermediate state?
+
+**Mechanism (source).** kitty stores **two** 8-slot flag arrays plus one active pointer —
+`uint8_t main_key_encoding_flags[8], alt_key_encoding_flags[8], *key_encoding_flags;`
+([kitty/screen.h:L128]). Switching buffers calls `screen_toggle_screen_buffer`, which only **re-points**
+that active pointer — to the alternate array on entry ([kitty/screen.c:L1079]) and back to the main
+array on exit ([kitty/screen.c:L1086]) — and never copies bytes between the two arrays. So the
+main-buffer stack is expected to be exactly as it was left.
+
+The script below is fully self-contained and safe: it creates a private temp dir with `mktemp -d`
+under `umask 077`, writes its observation program there, runs only that program, and removes the dir
+via a `trap` on exit.
+
+Script (reproducible):
+
+```bash
+#!/usr/bin/env bash
+# OBJ-1 + OBJ-5(query-byte independence): main -> push flags -> alt -> push flags -> back to main.
+# Flag state is read CANONICALLY from the real per-buffer stack after driving the REAL VT parser.
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
+
+def new_screen():
+    c = Callbacks()
+    return f.Screen(c, 5, 40, 5, 10, 20, 0, c), c
+
+def active(s):                 # canonical: low-7-bits of highest occupied slot of the ACTIVE stack
+    return s.current_key_encoding_flags()
+
+def query_to_child(s, c):      # canonical: real parser emits flags report; capture child-bound bytes
+    c.clear(); parse_bytes(s, b'\x1b[?u'); return bytes(c.wtcbuf)
+
+s, c = new_screen()
+print("step 0  start on MAIN, nothing pushed        active=%d  query->child=%r" % (active(s), query_to_child(s, c)))
+parse_bytes(s, b'\x1b[>1u')    # CSI > 1 u  == push 'disambiguate' (flag 1) onto the active(main) stack
+print("step 1  MAIN push disambiguate (CSI >1u)     active=%d  query->child=%r" % (active(s), query_to_child(s, c)))
+parse_bytes(s, b'\x1b[?1049h') # DECSET 1049 == switch to ALTERNATE screen (re-points active stack ptr)
+print("step 2  toggle to ALT (CSI ?1049h)           active=%d  query->child=%r" % (active(s), query_to_child(s, c)))
+parse_bytes(s, b'\x1b[>8u')    # CSI > 8 u  == push 'report all keys' (flag 8) onto the active(alt) stack
+print("step 3  ALT push report-all-keys (CSI >8u)   active=%d  query->child=%r" % (active(s), query_to_child(s, c)))
+parse_bytes(s, b'\x1b[?1049l') # DECRST 1049 == switch back to MAIN screen (re-points active stack ptr)
+print("step 4  toggle back to MAIN (CSI ?1049l)     active=%d  query->child=%r" % (active(s), query_to_child(s, c)))
+print("RESULT  final active keyboard-encoding flags on MAIN = %d" % active(s))
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-All stack routines (`current`/`report`/`set`/`push`/`pop`) act **only through
-`self->key_encoding_flags`**, so switching buffers switches which array they operate on while the
-other array keeps its contents untouched. That is the mechanism that makes the main stack survive.
+Output **[observed]**:
 
-**Runtime evidence.** Script `/tmp/blitzy_obs/obj1_roundtrip.py` drives the real parser and reads
-the real stack + query bytes at each step:
-
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj1_roundtrip.py
-start (main), active = 0 ; query->child = b'\x1b[?0u'
-main: push disambiguate(1); active = 1 ; query->child = b'\x1b[?1u'
-toggle to ALT (CSI ?1049h); active = 0 ; query->child = b'\x1b[?0u'
-alt: push report-all(8); active = 8 ; query->child = b'\x1b[?8u'
-toggle back to MAIN (CSI ?1049l); active = 1 ; query->child = b'\x1b[?1u'
-RESULT: final active flags on main = 1
+```text
+step 0  start on MAIN, nothing pushed        active=0  query->child=b'\x1b[?0u'
+step 1  MAIN push disambiguate (CSI >1u)     active=1  query->child=b'\x1b[?1u'
+step 2  toggle to ALT (CSI ?1049h)           active=0  query->child=b'\x1b[?0u'
+step 3  ALT push report-all-keys (CSI >8u)   active=8  query->child=b'\x1b[?8u'
+step 4  toggle back to MAIN (CSI ?1049l)     active=1  query->child=b'\x1b[?1u'
+RESULT  final active keyboard-encoding flags on MAIN = 1
+EXIT=0
 ```
 
-Reading the intermediate states directly answers "what escape sequence does the terminal report
-in each state" (the query reply `CSI ? flags u`):
+**Interpretation.** The active flags trace `0 → 1` (main push) `→ 0` (fresh alt) `→ 8` (alt push)
+`→ 1` (back on main). The final active keyboard-encoding mode on the main buffer is **`1`
+(disambiguate)** — the main-buffer stack **survived the round trip intact**, because the toggle only
+re-pointed the active pointer ([kitty/screen.c:L1079], [kitty/screen.c:L1086]) and the alternate
+buffer's push (flag `8`) landed in the *separate* `alt_key_encoding_flags` array. The `query->child`
+bytes are the real replies written to the child by `screen_report_key_encoding_flags`
+([kitty/screen.c:L1212-L1215]); they read `b'\x1b[?1u'`, `b'\x1b[?0u'`, `b'\x1b[?8u'`, `b'\x1b[?1u'`
+respectively — a direct, child-visible confirmation of the same trace. **[observed]**
 
-| Step | Active buffer | Escape driven | Active flags | Query reply to child |
-|---|---|---|---|---|
-| start | main | — | `0` | `\x1b[?0u` |
-| push disambiguate | main | `\x1b[>1u` | `1` | `\x1b[?1u` |
-| enter alt | alt | `\x1b[?1049h` | `0` (alt is fresh) | `\x1b[?0u` |
-| push report-all | alt | `\x1b[>8u` | `8` | `\x1b[?8u` |
-| return to main | main | `\x1b[?1049l` | **`1`** | **`\x1b[?1u`** |
+## 3. (OBJ-2) Stack exhaustion on both buffers, and cross-buffer isolation
 
-The final reply is `\x1b[?1u`, **not** `\x1b[?8u` — the alt buffer's flag-8 stayed on the alt
-array, and the main array still holds the disambiguate value pushed before the excursion. The
-individual key bytes for each state are in §OBJ-4.
+**Question.** What happens when pushes exceed the stack limit — silent drop, error, or otherwise — and
+does exhausting one buffer's stack affect the other's?
 
----
+**Mechanism (source).** Each array is 8 slots ([kitty/screen.h:L128]); a slot's high bit `0x80` marks
+it *occupied* and the current flags are the low 7 bits (`& 0x7f`) of the **highest** occupied slot
+(`screen_current_key_encoding_flags`, [kitty/screen.c:L1204-L1206]). `screen_push_key_encoding_flags`
+([kitty/screen.c:L1234]) writes the new value at the next slot; **when the top slot is already the
+last one (index 7), it `memmove`s the whole array down by one, silently discarding the oldest entry**
+([kitty/screen.c:L1241]) — no error is raised. All of this acts through the *active* pointer, so it
+targets whichever buffer is current.
 
-## OBJ-2 — Stack-exhaustion semantics and cross-buffer isolation
+The script exercises exhaustion on **both** buffers (push values `1..12` — four more than capacity —
+then pop 12 times), and then a dedicated isolation check.
 
-**Question:** what happens when pushes exceed the stack limit (silent drop, error, or
-otherwise), and does exhausting one buffer's stack affect the other's?
+Script (reproducible):
 
-**Answer [observed]:** pushing onto a full 8-slot stack **silently evicts the oldest entry**;
-**no error** is raised. Only the **most-recent 8** entries survive. Exhausting one buffer's stack
-has **no effect** on the other buffer.
+```bash
+#!/usr/bin/env bash
+# OBJ-2: 8-slot stack exhaustion (oldest silently evicted, no error) on BOTH buffers, plus isolation.
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
 
-**Slot encoding [observed in source].** Each slot uses its **high bit `0x80` as an "occupied"
-marker**; the current flags are the low 7 bits (`& 0x7f`) of the **highest occupied** slot
-(`screen_current_key_encoding_flags`, `kitty/screen.c:L1204-1208`):
+def new_screen():
+    c = Callbacks()
+    return f.Screen(c, 5, 40, 5, 10, 20, 0, c), c
 
-```c
-for (unsigned i = arraysz(self->main_key_encoding_flags); i-- > 0; ) {
-    if (self->key_encoding_flags[i] & 0x80) return self->key_encoding_flags[i] & 0x7f;
-}
-return 0;
+def active(s):
+    return s.current_key_encoding_flags()
+
+def exhaust(label, s):
+    pushed = []
+    for v in range(1, 13):                 # push flag values 1..12 (12 > 8-slot capacity)
+        parse_bytes(s, b'\x1b[>%du' % v)   # CSI > v u  == push value v onto active stack
+        pushed.append(active(s))
+    popped = []
+    for _ in range(12):                    # pop 12 times (more than were retained)
+        parse_bytes(s, b'\x1b[<1u')        # CSI < 1 u  == pop one entry from active stack
+        popped.append(active(s))
+    print("%s active-after-each-push (v=1..12): %s" % (label, pushed))
+    print("%s active-after-each-pop  (12 pops): %s" % (label, popped))
+
+# --- exhaustion on the MAIN buffer ---
+s, c = new_screen()
+exhaust("MAIN", s)
+
+# --- exhaustion on the ALT buffer (toggle first, so the ACTIVE stack is the alt array) ---
+s, c = new_screen()
+parse_bytes(s, b'\x1b[?1049h')             # switch to ALT; active stack ptr -> alt array
+print("ALT  entered alternate screen; active=%d" % active(s))
+exhaust("ALT ", s)
+
+# --- cross-buffer isolation: exhausting one buffer must not disturb the other ---
+s, c = new_screen()
+parse_bytes(s, b'\x1b[>1u')                # MAIN: push 1
+print("ISO  MAIN after push1                 active=%d" % active(s))
+parse_bytes(s, b'\x1b[?1049h')             # -> ALT (independent, empty)
+print("ISO  entered ALT                      active=%d" % active(s))
+for v in range(1, 13):
+    parse_bytes(s, b'\x1b[>%du' % v)       # ALT: push 1..12 (exhaust the alt stack)
+print("ISO  ALT after pushing 1..12          active=%d" % active(s))
+parse_bytes(s, b'\x1b[?1049l')             # -> back to MAIN
+print("ISO  back on MAIN (unchanged?)        active=%d" % active(s))
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-**Silent eviction [observed in source].** In `screen_push_key_encoding_flags`
-(`kitty/screen.c:L1234`), when the top occupied index is the last slot, the array is `memmove`d
-down by one — dropping the oldest entry — with **no error path** (`kitty/screen.c:L1241`):
+Output **[observed]**:
 
-```c
-if (current_idx == sz - 1) memmove(self->key_encoding_flags, self->key_encoding_flags + 1,
-                                   (sz - 1) * sizeof(self->main_key_encoding_flags[0]));
-else self->key_encoding_flags[current_idx++] |= 0x80;
-self->key_encoding_flags[current_idx] = 0x80 | q;
+```text
+MAIN active-after-each-push (v=1..12): [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+MAIN active-after-each-pop  (12 pops): [11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0, 0]
+ALT  entered alternate screen; active=0
+ALT  active-after-each-push (v=1..12): [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+ALT  active-after-each-pop  (12 pops): [11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0, 0]
+ISO  MAIN after push1                 active=1
+ISO  entered ALT                      active=0
+ISO  ALT after pushing 1..12          active=12
+ISO  back on MAIN (unchanged?)        active=1
+EXIT=0
 ```
 
-**Runtime evidence.** Script `/tmp/blitzy_obs/obj2_exhaustion.py` pushes 1..12 onto an 8-slot
-stack, then pops 12 times, and separately proves alt↔main isolation:
+**Interpretation.**
 
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj2_exhaustion.py
-MAIN: push 1..12, active-after-each-push: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-      active-after-each-pop:               [11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0, 0]
-  -> only the most-recent 8 survive; oldest silently evicted; NO error raised.
-ALT isolation: main push>1 active=1; enter alt active=0; alt push 1..12 active=12; return main active=1 (unaffected)
+- *Exhaustion is silent and identical on both buffers.* On the MAIN buffer the pushes `1..12` make the
+  active value climb `1..12`, and the 12 pops read back `[11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0, 0]`. The
+  ALT buffer, exercised the same way after `CSI ?1049h`, produces the **identical** push and pop
+  sequences. Only the most-recent **8** values (`5..12`) were retained; the older values (`1..4`, and
+  the base-0 seed discussed in [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop))
+  were evicted by the `memmove` at [kitty/screen.c:L1241], and **no error was raised** at any point
+  (the program ran to `EXIT=0`).
+
+- *Why the first pop reads `11`, not `12`.* This is ordinary LIFO behavior, **not** an artifact of the
+  base-0 seeding: `screen_pop_key_encoding_flags` clears the highest occupied slot
+  ([kitty/screen.c:L1248-L1252]), so the first pop removes the just-pushed top value `12`, revealing
+  the next entry `11`. Popping continues to reveal `10, 9, 8, 7, 6, 5`; the eighth pop clears the last
+  occupied slot, at which point `screen_current_key_encoding_flags` finds no occupied slot and returns
+  `0` — that drain-to-`0` (not the first pop) is where the reset/seed behavior shows up.
+
+- *Isolation holds.* In the `ISO` block, the main buffer is left holding `1`; entering the alternate
+  buffer shows a fresh `0`; pushing `1..12` on the alternate buffer drives its active value to `12`;
+  and returning to the main buffer shows **`1` again**, wholly unaffected by the alternate buffer's
+  exhaustion. Exhausting one buffer's stack therefore does not touch the other's, exactly as the two
+  separate arrays ([kitty/screen.h:L128]) predict.
+
+## 4. (OBJ-3) Pop-to-empty reset, first-push-from-empty, and over-pop
+
+**Question.** Does a pop that empties the stack reset all flags, as the specification mandates?
+
+**Mechanism (source).** The specification requires that *"if a pop request is received that empties the
+stack, all flags are reset"* ([docs/keyboard-protocol.rst:L301-L302]).
+`screen_pop_key_encoding_flags` implements this by clearing (setting to `0`) each occupied slot it
+pops ([kitty/screen.c:L1248-L1252]); once every slot is clear, `screen_current_key_encoding_flags`
+finds nothing occupied and returns `0` ([kitty/screen.c:L1204-L1206]). Separately, the very first push
+onto an **empty** stack seeds a base entry: in `screen_push_key_encoding_flags`
+([kitty/screen.c:L1234-L1243]) the scan for the highest occupied slot leaves `current_idx = 0` when
+none is occupied, so the `else` branch marks slot 0 occupied *with value 0* and advances, and the
+pushed value is written at slot 1. That base-0 seed is why a stack that is pushed once and then popped
+once returns to `0` rather than underflowing.
+
+Script (reproducible):
+
+```bash
+#!/usr/bin/env bash
+# OBJ-3: a pop that empties the stack resets all flags; first-push-from-empty seeds a base-0 entry;
+#         over-popping does not underflow/error (stays at 0).
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
+
+def new_screen():
+    c = Callbacks()
+    return f.Screen(c, 5, 40, 5, 10, 20, 0, c), c
+
+def active(s):
+    return s.current_key_encoding_flags()
+
+# (A) first-push-from-empty, then pop back to empty
+s, c = new_screen()
+print("A0 empty stack                 active=%d" % active(s))
+parse_bytes(s, b'\x1b[>5u')            # push flag value 5 onto the empty stack
+print("A1 after push(5)               active=%d" % active(s))
+parse_bytes(s, b'\x1b[<1u')            # pop once
+print("A2 after 1 pop                 active=%d" % active(s))
+parse_bytes(s, b'\x1b[<1u')            # pop again (already empty)
+print("A3 after 2 pops                active=%d" % active(s))
+
+# (B) over-pop after several pushes: push 1,2,4 then pop 6 times
+s, c = new_screen()
+for v in (1, 2, 4):
+    parse_bytes(s, b'\x1b[>%du' % v)
+print("B0 after push 1,2,4            active=%d" % active(s))
+seq = []
+for _ in range(6):
+    parse_bytes(s, b'\x1b[<1u')
+    seq.append(active(s))
+print("B1 active-after-each-of-6-pops %s" % seq)
+
+# (C) pop-to-empty via SET then explicit reset semantics: set flags=7, then pop to empty
+s, c = new_screen()
+parse_bytes(s, b'\x1b[=7;1u')          # CSI = 7 ; 1 u  == SET flags to 7 (mode 1 = set all bits in value)
+print("C0 after set flags=7 (CSI =7;1u) active=%d" % active(s))
+parse_bytes(s, b'\x1b[<3u')            # pop 3 (more than present) -> empties -> reset
+print("C1 after pop 3 (CSI <3u)         active=%d" % active(s))
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-Interpretation **[observed]**:
+Output **[observed]**:
 
-- After 12 pushes the top-of-stack is 12 (each push updates the visible value), but only 8 slots
-  exist. Popping reveals the survivors: `11, 10, 9, 8, 7, 6, 5`, then `0` — i.e. values **5..12**
-  are retained and values **1..4** were silently evicted. (The first pop shows `11` rather than
-  the pushed `12` because of the first-push-from-empty base-0 seeding described in §OBJ-3; the
-  point is that exactly the most-recent eight entries survive, with no error.)
-- **Isolation:** with the main buffer at flags `1`, entering alt shows `0` (a fresh alt array),
-  pushing 1..12 there drives the alt to `12`, and returning to main shows **`1`** — the main
-  value is completely **unaffected** by the alt-side exhaustion. Exhausting one buffer's stack
-  cannot disturb the other because every push/pop acts solely through the active pointer.
-
----
-
-## OBJ-3 — Pop-to-empty reset
-
-**Question:** does a pop request that empties the stack reset all flags?
-
-**Answer [observed]:** **yes** — emptying the stack resets the active flags to `0`.
-
-**Basis [observed in source].** `screen_pop_key_encoding_flags` (`kitty/screen.c:L1248`) walks
-the array top-down and, for each occupied slot it pops, **clears the slot to `0`**
-(`kitty/screen.c:L1250`):
-
-```c
-for (unsigned i = arraysz(self->main_key_encoding_flags); num && i-- > 0; ) {
-    if (self->key_encoding_flags[i] & 0x80) { num--; self->key_encoding_flags[i] = 0; }
-}
+```text
+A0 empty stack                 active=0
+A1 after push(5)               active=5
+A2 after 1 pop                 active=0
+A3 after 2 pops                active=0
+B0 after push 1,2,4            active=4
+B1 active-after-each-of-6-pops [2, 1, 0, 0, 0, 0]
+C0 after set flags=7 (CSI =7;1u) active=7
+C1 after pop 3 (CSI <3u)         active=0
+EXIT=0
 ```
 
-Once every slot is cleared, `screen_current_key_encoding_flags` finds no occupied slot and
-returns `0` — i.e. all flags reset. This matches the specification: the spec states that a pop
-which empties the stack resets all flags (`docs/keyboard-protocol.rst:L301`).
+**Interpretation.**
 
-**Runtime evidence + the first-push-from-empty quirk.** Script `/tmp/blitzy_obs/obj3_popempty.py`:
+- *(A) first-push-from-empty + pop-to-empty.* The empty stack reads `0`; after `CSI >5u` the active
+  value is `5`; a single pop returns to **`0`** (revealing the seeded base-0 entry), and a second pop
+  stays `0`. This is the pop-to-empty reset mandated by [docs/keyboard-protocol.rst:L301-L302].
 
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj3_popempty.py
-empty active = 0
-after push(5): active = 5
-after 1 pop : active = 0   <- first-push-from-empty seeded a hidden base-0 entry beneath
-after 2 pop : active = 0
-over-pop test: push 1,2,4 -> active=4; pops -> 2,1,0,0,0,0  (resets to 0, no underflow error)
+- *(B) over-pop does not underflow.* After pushing `1, 2, 4` the active value is `4`; six successive
+  pops read `[2, 1, 0, 0, 0, 0]` — the third pop reveals the seeded base-0, and every pop past empty
+  simply stays at `0`. No underflow, no error (`EXIT=0`).
+
+- *(C) set-then-drain also resets.* `CSI =7;1u` sets the current flags to `7` in place
+  (`screen_set_key_encoding_flags`, mode 1 = set, [kitty/screen.c:L1220-L1229]); popping past the
+  bottom (`CSI <3u`) empties the stack and the active value resets to **`0`**.
+
+## 5. (OBJ-4) The four Ctrl+Shift+a byte captures, plus contrast and flag sensitivity
+
+**Question (user's verbatim example).** Press **Ctrl+Shift+a** — (a) on the main buffer with no flags
+pushed; (b) after pushing disambiguate mode; (c) after switching to the alternate buffer and pushing
+report-all-keys mode; (d) back on the main buffer. Show the actual bytes sent to the child for each.
+
+Per [§1.4](#14-the-canonical-observation-path-headless-and-the-observedinferred-boundary): the active
+flags in each state are read **canonically** from the real per-buffer stack, and the bytes are then
+produced by the production encoder `encode_glfw_key_event` ([kitty/key_encoding.c:L414]) via its Python
+export `encode_key_for_tty`, fed those exact stack flags and converted with `.encode('ascii')` just as
+`Window.encoded_key` does on the live path ([kitty/window.py:L1795-L1801]).
+
+### 5.1 The four requested states
+
+Script (reproducible):
+
+```bash
+#!/usr/bin/env bash
+# OBJ-4: exact bytes for Ctrl+Shift+a in the four requested states.
+# Flag state is CANONICAL (real parser -> real stack). The bytes are produced by the SAME C encoder
+# the live path uses (encode_glfw_key_event, key_encoding.c:L414), invoked here via its Python export
+# encode_key_for_tty with the flags READ FROM THE REAL STACK immediately before each call, and
+# converted with .encode('ascii') exactly as kitty/window.py:L1801 does on the live path.
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
+
+SHIFT, CTRL = f.GLFW_MOD_SHIFT, f.GLFW_MOD_CONTROL     # 1 and 4
+print("GLFW_MOD_SHIFT=%d GLFW_MOD_CONTROL=%d  -> Ctrl+Shift bitmask=%d" % (SHIFT, CTRL, SHIFT | CTRL))
+
+def new_screen():
+    c = Callbacks()
+    return f.Screen(c, 5, 40, 5, 10, 20, 0, c), c
+
+def active(s):
+    return s.current_key_encoding_flags()
+
+def query(s, c):
+    c.clear(); parse_bytes(s, b'\x1b[?u'); return bytes(c.wtcbuf)
+
+def ctrl_shift_a(stack_flags):
+    # key 'a' = codepoint 97; Shift's shifted form 'A' = 65; no text; mods = Shift|Ctrl.
+    out = f.encode_key_for_tty(97, shifted_key=65, mods=SHIFT | CTRL, key_encoding_flags=stack_flags)
+    return out.encode('ascii')            # mirrors Window.encoded_key() .encode('ascii') at window.py:L1801
+
+s, c = new_screen()
+fl = active(s)
+print("(a) MAIN / no flags pushed      stack active=%d  query->child=%r  Ctrl+Shift+a -> encoder(flags=%d)=%r" % (fl, query(s,c), fl, ctrl_shift_a(fl)))
+parse_bytes(s, b'\x1b[>1u')
+fl = active(s)
+print("(b) MAIN / pushed disambiguate  stack active=%d  query->child=%r  Ctrl+Shift+a -> encoder(flags=%d)=%r" % (fl, query(s,c), fl, ctrl_shift_a(fl)))
+parse_bytes(s, b'\x1b[?1049h'); parse_bytes(s, b'\x1b[>8u')
+fl = active(s)
+print("(c) ALT  / pushed report-all    stack active=%d  query->child=%r  Ctrl+Shift+a -> encoder(flags=%d)=%r" % (fl, query(s,c), fl, ctrl_shift_a(fl)))
+parse_bytes(s, b'\x1b[?1049l')
+fl = active(s)
+print("(d) MAIN / back after round trip stack active=%d  query->child=%r  Ctrl+Shift+a -> encoder(flags=%d)=%r" % (fl, query(s,c), fl, ctrl_shift_a(fl)))
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-Interpretation **[observed]**:
+Output **[observed]**:
 
-- **First-push-from-empty quirk:** pushing `5` onto a completely empty stack makes the active
-  value `5`, but a **single** pop returns to `0` (not to some prior non-zero value). Pushing onto
-  an empty stack effectively seeds a hidden **base-0** entry beneath the first pushed value, so
-  the first pop lands on that base-0 entry. This is reported as **observed** behavior (it is a
-  consequence of how `push` marks the previously-current slot occupied before writing the new
-  top; on an empty array the previously-current slot holds `0`).
-- **Over-pop is safe:** after pushing `1,2,4` (active `4`), repeated pops yield `2, 1, 0, 0, 0,
-  0` — the stack drains to `0` and **stays** at `0` with no underflow error, exactly as the pop
-  loop's bounded `i-- > 0` guard guarantees.
-
-
----
-
-## OBJ-4 — The four Ctrl+Shift+a byte captures
-
-**Question (user's verbatim example):** press **Ctrl+Shift+a** — (a) on the main buffer with no
-flags pushed; (b) after pushing disambiguate mode; (c) after switching to the alternate buffer
-and pushing report-all-keys mode; (d) back on the main buffer. Show the **actual bytes sent to
-the child** for each state.
-
-> ### ⭐ Headline finding — the four captures are IDENTICAL, and that is correct
->
-> **All four states emit exactly `\x1b[97;6u`.** This is **not** a bug and **not** a failure to
-> observe. It is the correct, expected result, and it is explained below. Because the four are
-> identical, the four captures **alone do not visually demonstrate stack independence** —
-> independence is proven separately in §OBJ-5 via the query bytes and contrast keys.
-
-**Runtime evidence.** Script `/tmp/blitzy_obs/obj4_ctrlshifta.py` builds a realistic GLFW event
-for Ctrl+Shift+a (`key=97 ('a')`, `shifted_key=65 ('A')`, `text=''`, `mods=SHIFT|CTRL=5`),
-manipulates the stack through the real parser, and encodes exactly as `Window.encoded_key()`:
-
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj4_ctrlshifta.py
-Ctrl+Shift bitmask = SHIFT|CTRL = 5 ; expect emitted modifier = 6
-(a) main / no flags pushed            active=0  query->child=b'\x1b[?0u'  Ctrl+Shift+a bytes=b'\x1b[97;6u'
-(b) main / after push disambiguate(1) active=1  query->child=b'\x1b[?1u'  Ctrl+Shift+a bytes=b'\x1b[97;6u'
-(c) alt  / after push report-all(8)   active=8  query->child=b'\x1b[?8u'  Ctrl+Shift+a bytes=b'\x1b[97;6u'
-(d) main / back after round trip      active=1  query->child=b'\x1b[?1u'  Ctrl+Shift+a bytes=b'\x1b[97;6u'
+```text
+GLFW_MOD_SHIFT=1 GLFW_MOD_CONTROL=4  -> Ctrl+Shift bitmask=5
+(a) MAIN / no flags pushed      stack active=0  query->child=b'\x1b[?0u'  Ctrl+Shift+a -> encoder(flags=0)=b'\x1b[97;6u'
+(b) MAIN / pushed disambiguate  stack active=1  query->child=b'\x1b[?1u'  Ctrl+Shift+a -> encoder(flags=1)=b'\x1b[97;6u'
+(c) ALT  / pushed report-all    stack active=8  query->child=b'\x1b[?8u'  Ctrl+Shift+a -> encoder(flags=8)=b'\x1b[97;6u'
+(d) MAIN / back after round trip stack active=1  query->child=b'\x1b[?1u'  Ctrl+Shift+a -> encoder(flags=1)=b'\x1b[97;6u'
+EXIT=0
 ```
 
-| State | Buffer / flags | Active flags | Ctrl+Shift+a bytes |
-|---|---|---|---|
-| (a) | main, none pushed | `0` | `\x1b[97;6u` |
-| (b) | main, disambiguate | `1` | `\x1b[97;6u` |
-| (c) | alt, report-all | `8` | `\x1b[97;6u` |
-| (d) | main, after round trip | `1` | `\x1b[97;6u` |
+**Interpretation.** In all four states, Ctrl+Shift+a emits the identical byte sequence
+**`b'\x1b[97;6u'`** = `ESC [ 97 ; 6 u`. The emitted bytes are themselves the confirmation of the
+encoding: the `97` field is the key's Unicode codepoint (`ord('a') == 97`), and the `6` field is the
+modifier, computed by the encoder as `1 + bitmask` where the Ctrl+Shift bitmask is
+`GLFW_MOD_SHIFT(1) | GLFW_MOD_CONTROL(4) = 5` (the script's first line prints
+`Ctrl+Shift bitmask=5`, which is setup, not the result). Each line also shows the exact stack flag that
+was read and handed to the encoder — `encoder(flags=0)`, `encoder(flags=1)`, `encoder(flags=8)`,
+`encoder(flags=1)` — so the byte value is tied to a canonically-observed stack state, and the
+`query->child` column independently corroborates that state from the child's point of view.
 
-**Decoding the bytes [observed]:** `\x1b[97;6u` = `CSI 97 ; 6 u`. The `97` is the Unicode code
-point of `a`. The `6` is the modifier value `1 + bitmask`, where the bitmask is
-`shift(1) | ctrl(4) = 5`, so `5 + 1 = 6`. Both the codepoint (`97`) and the modifier (`6`) were
-confirmed at runtime by the script's first line (`bitmask = 5 ; expect emitted modifier = 6`).
+The reason the bytes are identical across the four states is that Ctrl+Shift+a is an *otherwise
+ambiguous* modified key: it is emitted as a `CSI ... u` sequence under legacy mode (flags `0`),
+disambiguate (`1`), and report-all-keys (`8`) alike. The flags *do* change behavior for other keys —
+which is what the contrast in [§5.2](#52-contrast-keys-canonical-stack-flags) shows. The live-GUI
+equivalence of these bytes is **[inferred]** from [kitty/keys.c:L251] and [kitty/window.py:L1795-L1801],
+as explained in [§1.4](#14-the-canonical-observation-path-headless-and-the-observedinferred-boundary).
 
-**Why all four are identical [inferred from source, corroborated by the contrast keys in
-§OBJ-5].** A **Ctrl+Shift+letter** combination has **no legacy encoding**, so the key is emitted
-in the disambiguated `CSI u` form **in every state, including legacy mode (flags 0)**:
+### 5.2 Contrast keys (canonical stack flags)
 
-1. `encode_printable_ascii_key_legacy` (`kitty/key_encoding.c:L292`) is the function that would
-   produce a legacy byte. For `mods == (CTRL|SHIFT)` on a letter it runs out of branches: the
-   shift-swap at L297-303 is skipped (its guard `(!(mods & CTRL) || key < 'a' || key > 'z')` is
-   false for a Ctrl-held letter), the `== SHIFT`, `== ALT`, `== CTRL`, and `== (CTRL|ALT)`
-   branches don't match `CTRL|SHIFT`, and the space-only branch doesn't apply — so it hits
-   **`return 0`** at `kitty/key_encoding.c:L317`.
-2. In `encode_key` (`kitty/key_encoding.c:L366`), the legacy attempt is made only when
-   `!disambiguate && !report_text` (L379-382): `int ret = encode_printable_ascii_key_legacy(...);
-   if (ret > 0) return ret;` — but `ret == 0` here, so it **falls through**.
-3. The function then reaches **`return serialize(&ed, output, 'u')`** at
-   `kitty/key_encoding.c:L396`, emitting the `CSI u` form `\x1b[97;6u`.
+While Ctrl+Shift+a is invariant, the *plain* `a` key and the *Ctrl+a* key expose the flag semantics.
+The script below encodes both across the same four states, again reading the flags canonically from the
+real stack before each encode. It also includes, as a clearly separate Part 2, a **non-canonical**
+encoder-characterization block (see [§5.3](#53-flag-sensitivity-explicit-non-canonical-encoder-characterization)).
 
-Because the modified key is **already in `CSI u` form in every state**, the disambiguate (1) and
-report-all (8) flags have nothing left to change for this particular key — hence the four
-identical captures. This is exactly why the user's chosen example, while a perfectly natural
-thing to try, cannot by itself reveal the per-buffer stack; §OBJ-5 supplies keys that do.
+Script (reproducible):
 
-**Independent authoritative corroboration.** The protocol's own design deliberately encodes
-Ctrl+Shift+a as `CSI 97 ; 6` (report the *actual* key `a` = 97, with modifier 6), not as
-`CSI 65 ; 5` (the shifted form `A`). This is discussed by the protocol author in the original RFC
-(kitty issue #3248) and matches the observed `\x1b[97;6u` byte-for-byte.
+```bash
+#!/usr/bin/env bash
+# OBJ-4 (contrast + flag sensitivity):
+#  Part 1 = CANONICAL stack flags: plain 'a' and Ctrl+a across the four states (shows disambiguate vs
+#           report-all-keys behaviour on printable/ctrl keys).
+#  Part 2 = NON-CANONICAL encoder characterization: Ctrl+Shift+a with EXPLICIT flag literals 0/1/4/8/5
+#           to isolate bit-4 (report_alternate_key). These flags are literals, not read from a stack,
+#           so they are a pure encoder cross-check, NOT proof of stack state.
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
+SHIFT, CTRL = f.GLFW_MOD_SHIFT, f.GLFW_MOD_CONTROL
 
-**Encoder-is-behaving cross-check (NON-CANONICAL — explicit flags bypass the stack).** To confirm
-the encoder *does* respond to flags for this key when a flag actually applies to it, the
-flag-4 (report-alternate-key) case is exercised with explicit flags. This is **non-canonical**
-because `encode_key_for_tty` is given an explicit `key_encoding_flags` argument and therefore
-does not prove any stack state; it is shown only to demonstrate the encoder is live and that
-`shifted_key=65` is handled:
+def new_screen():
+    c = Callbacks()
+    return f.Screen(c, 5, 40, 5, 10, 20, 0, c), c
+def active(s):
+    return s.current_key_encoding_flags()
+def enc(key, mods, flags, shifted_key=0):
+    return f.encode_key_for_tty(key, shifted_key=shifted_key, mods=mods, key_encoding_flags=flags).encode('ascii')
 
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj4_contrast.py
-... (contrast-key output shown in §OBJ-5) ...
---- flag-4 sensitivity (NON-CANONICAL: explicit key_encoding_flags bypass the stack) ---
-flags 0                        Ctrl+Shift+a=b'\x1b[97;6u'
-flags 1                        Ctrl+Shift+a=b'\x1b[97;6u'
-flags 4 (report_alternate_key) Ctrl+Shift+a=b'\x1b[97:65;6u'
-flags 8                        Ctrl+Shift+a=b'\x1b[97;6u'
-flags 5 (1|4)                  Ctrl+Shift+a=b'\x1b[97:65;6u'
+print("== Part 1: CANONICAL stack flags — plain 'a' (mods=0) and Ctrl+a (mods=CTRL) ==")
+s, c = new_screen()
+def row(tag):
+    fl = active(s)
+    print("%s stack active=%d  plain-a=%r  Ctrl+a=%r" % (tag, fl, enc(97, 0, fl), enc(97, CTRL, fl)))
+row("(a) MAIN/no-flags   ")
+parse_bytes(s, b'\x1b[>1u');                       row("(b) MAIN/disambig(1)")
+parse_bytes(s, b'\x1b[?1049h'); parse_bytes(s, b'\x1b[>8u'); row("(c) ALT /report-all(8)")
+parse_bytes(s, b'\x1b[?1049l');                    row("(d) MAIN/return(1)  ")
+
+print()
+print("== Part 2: NON-CANONICAL encoder characterization — Ctrl+Shift+a with EXPLICIT flag literals ==")
+for fl in (0, 1, 4, 8, 5):
+    print("explicit flags=%-2d  Ctrl+Shift+a=%r" % (fl, enc(97, SHIFT | CTRL, fl, shifted_key=65)))
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-With **flag 4** set, the emitted bytes become `\x1b[97:65;6u` — the encoder appends the shifted
-key `65 ('A')` as a `:`-separated sub-parameter of the key field (`report_alternate_key`,
-`kitty/key_encoding.c:L421`). This proves the encoder is genuinely reading the flags; it is just
-that neither flag `1` nor flag `8` changes an already-`CSI u`-form key, which is why states
-(a)–(d) coincide.
+Output **[observed]**:
 
----
+```text
+== Part 1: CANONICAL stack flags — plain 'a' (mods=0) and Ctrl+a (mods=CTRL) ==
+(a) MAIN/no-flags    stack active=0  plain-a=b'a'  Ctrl+a=b'\x01'
+(b) MAIN/disambig(1) stack active=1  plain-a=b'a'  Ctrl+a=b'\x1b[97;5u'
+(c) ALT /report-all(8) stack active=8  plain-a=b'\x1b[97u'  Ctrl+a=b'\x1b[97;5u'
+(d) MAIN/return(1)   stack active=1  plain-a=b'a'  Ctrl+a=b'\x1b[97;5u'
 
-## OBJ-5 — Independence proof and leakage assessment
-
-**Question:** do the captured byte sequences prove that the two buffers maintain independent
-stacks, and is there any state leakage during rapid buffer switching while the keyboard mode is
-manipulated?
-
-**Answer [observed]:** the two buffers **do** maintain independent stacks. The four *identical*
-Ctrl+Shift+a captures **do not** demonstrate this by themselves; independence is proven by two
-things that **do** differ across the states, and a rapid-switch probe shows **no leakage**.
-
-### Proof 1 — the query-reply bytes differ and return to `1`
-
-From §OBJ-1/§OBJ-4 the query reply the terminal writes to the child at each state is:
-
-```
-\x1b[?0u   →   \x1b[?1u   →   \x1b[?8u   →   \x1b[?1u
- (a)main       (b)main        (c)alt         (d)main
+== Part 2: NON-CANONICAL encoder characterization — Ctrl+Shift+a with EXPLICIT flag literals ==
+explicit flags=0   Ctrl+Shift+a=b'\x1b[97;6u'
+explicit flags=1   Ctrl+Shift+a=b'\x1b[97;6u'
+explicit flags=4   Ctrl+Shift+a=b'\x1b[97:65;6u'
+explicit flags=8   Ctrl+Shift+a=b'\x1b[97;6u'
+explicit flags=5   Ctrl+Shift+a=b'\x1b[97:65;6u'
+EXIT=0
 ```
 
-The alt buffer reports `\x1b[?8u` while the main buffer, on return, reports `\x1b[?1u` — **not**
-`\x1b[?8u`. If the stacks were shared, the flag-8 pushed on the alt buffer would still be active
-after returning to main. It is not. **[observed]**
+**Interpretation of Part 1 (canonical).** The contrast confirms the flag semantics against the
+authoritative flag table ([docs/keyboard-protocol.rst:L275-L283]) and the encoder's bit decode
+([kitty/key_encoding.c:L419-L423]):
 
-### Proof 2 — contrast keys whose bytes change with the flags
+- With **no flags** (state a, active `0`): plain `a` sends the literal byte `b'a'`; Ctrl+a sends the
+  legacy control byte `b'\x01'`.
+- With **disambiguate** (states b/d, active `1`, `.disambiguate = flags & 1`
+  [kitty/key_encoding.c:L419]): plain printable `a` *still* sends `b'a'` (only ambiguous keys change),
+  but Ctrl+a now disambiguates to `b'\x1b[97;5u'` (modifier `5` = Ctrl bitmask `4` + `1`).
+- With **report-all-keys** (state c, active `8`, `.report_text = flags & 8`
+  [kitty/key_encoding.c:L422]): *every* key becomes a `CSI ... u` sequence, so even plain `a` reports
+  as `b'\x1b[97u'`; Ctrl+a remains `b'\x1b[97;5u'`.
 
-Plain `a` and `Ctrl+a` **are** sensitive to the flags, so their bytes track the active stack.
-Script `/tmp/blitzy_obs/obj4_contrast.py` captures them across the same four states:
+This is the crux of the independence proof in [§6](#6-obj-5--independence-proof-and-leakage-probe):
+the plain-`a` byte differs by buffer state (`b'a'` on the main buffer vs `b'\x1b[97u'` on the
+alternate buffer), which can only happen if the two buffers carry different active flags.
 
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj4_contrast.py
-(a) active=0  plain-a=b'a'         Ctrl+a=b'\x01'
-(b) active=1  plain-a=b'a'         Ctrl+a=b'\x1b[97;5u'
-(c) active=8  plain-a=b'\x1b[97u'  Ctrl+a=b'\x1b[97;5u'
-(d) active=1  plain-a=b'a'         Ctrl+a=b'\x1b[97;5u'
---- flag-4 sensitivity (NON-CANONICAL: explicit key_encoding_flags bypass the stack) ---
-flags 0                        Ctrl+Shift+a=b'\x1b[97;6u'
-flags 1                        Ctrl+Shift+a=b'\x1b[97;6u'
-flags 4 (report_alternate_key) Ctrl+Shift+a=b'\x1b[97:65;6u'
-flags 8                        Ctrl+Shift+a=b'\x1b[97;6u'
-flags 5 (1|4)                  Ctrl+Shift+a=b'\x1b[97:65;6u'
+### 5.3 Flag sensitivity: explicit (non-canonical) encoder characterization
+
+Part 2 of the output above feeds the encoder **explicit flag literals** `0, 1, 4, 8, 5` rather than
+values read from a stack. This is a pure characterization of the encoder and is labelled
+**non-canonical** because the flags are not proven to be any buffer's real stack state — it isolates
+the effect of one bit:
+
+- flags `0`, `1`, `8` → `b'\x1b[97;6u'` (no alternate key reported);
+- flags `4` (`.report_alternate_key = flags & 4`, [kitty/key_encoding.c:L421]) → `b'\x1b[97:65;6u'`,
+  which adds the shifted key `65` (`ord('A')`) after a colon;
+- flags `5` (= `1 | 4`) → `b'\x1b[97:65;6u'` as well.
+
+So bit 4 is what would add the shifted-key sub-field; it is *not* set in any of the four canonical
+states (whose stack flags were `0`, `1`, `8`, `1`), which is the deeper reason all four canonical
+captures were the plain `b'\x1b[97;6u'`.
+
+## 6. (OBJ-5) Independence proof and leakage probe
+
+**Question.** Do the captured byte sequences prove the two buffers maintain independent stacks, and is
+there any state leakage during rapid buffer switching while the keyboard mode is manipulated?
+
+**Proof from the captures already shown.** Independence is established two ways:
+
+1. *Query replies* (canonical, child-visible): in [§2](#2-obj-1--round-trip-stack-survival) the flags
+   query returns `b'\x1b[?1u'` on the main buffer but `b'\x1b[?8u'` on the alternate buffer at the same
+   point in the round trip, and returns to `b'\x1b[?1u'` on the main buffer afterward.
+2. *Key bytes* (contrast, [§5.2](#52-contrast-keys-canonical-stack-flags)): the plain-`a` byte is
+   `b'a'` on the main buffer (flags `1`) but `b'\x1b[97u'` on the alternate buffer (flags `8`). A
+   single shared stack could not yield two different bytes for the same key at the same moment.
+
+**Leakage probe.** The script drives 10 rapid main↔alt round trips while the two stacks hold distinct
+values (main `1`, alt `8`) and checks the active value on each side every cycle.
+
+Script (reproducible):
+
+```bash
+#!/usr/bin/env bash
+# OBJ-5: rapid main<->alt switching while both stacks hold distinct flags; probe for any leakage.
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
+
+c = Callbacks()
+s = f.Screen(c, 5, 40, 5, 10, 20, 0, c)
+
+def active(s):
+    return s.current_key_encoding_flags()
+
+parse_bytes(s, b'\x1b[>1u')                 # MAIN stack: push disambiguate (1)
+parse_bytes(s, b'\x1b[?1049h')              # -> ALT
+parse_bytes(s, b'\x1b[>8u')                 # ALT stack: push report-all (8)
+parse_bytes(s, b'\x1b[?1049l')              # -> back to MAIN
+print("setup: MAIN=1, ALT=8;  MAIN active now=%d" % active(s))
+
+leaked = False
+for i in range(1, 11):                      # 10 rapid round-trip cycles
+    parse_bytes(s, b'\x1b[?1049h'); a = active(s)   # into ALT
+    parse_bytes(s, b'\x1b[?1049l'); m = active(s)   # back to MAIN
+    ok = (a == 8 and m == 1)
+    leaked = leaked or not ok
+    print("cycle %2d: ALT active=%d  MAIN active=%d  %s" % (i, a, m, "OK" if ok else "LEAK!"))
+print("RESULT: leakage detected = %s (MAIN stayed 1 and ALT stayed 8 across all cycles = no leak)" % leaked)
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-| State | Active flags | plain `a` | `Ctrl+a` |
-|---|---|---|---|
-| (a) main, none | `0` | `a` | `\x01` |
-| (b) main, disambiguate | `1` | `a` | `\x1b[97;5u` |
-| (c) alt, report-all | `8` | **`\x1b[97u`** | `\x1b[97;5u` |
-| (d) main, back | `1` | **`a`** | `\x1b[97;5u` |
+Output **[observed]**:
 
-Two independent signals prove the main stack survived and the alt state did not leak
-**[observed]**:
-
-- **Plain `a`** becomes `\x1b[97u` **only in state (c)** (the alt buffer, flag 8 = report all
-  keys as escape codes). Returning to main in state (d) reverts to the literal byte `a` — the
-  flag-8 effect vanished with the buffer switch, so it never leaked to main. (In legacy mode and
-  under disambiguate-only, a plain printable key is still sent as its literal UTF-8 byte; only
-  report-all-keys promotes it to `CSI u`.)
-- **`Ctrl+a`** is `\x01` in the **legacy** state (a) but `\x1b[97;5u` under disambiguate. State
-  **(d) equals state (b)** (`\x1b[97;5u`), **not** state (a) (`\x01`) — proving the main buffer
-  came back to flags `1`, i.e. the disambiguate value pushed before the alt excursion was still
-  there. The modifier `5 = 4(ctrl) + 1` confirms the Ctrl-only bitmask.
-
-### Leakage probe — rapid buffer switching
-
-Script `/tmp/blitzy_obs/obj6_modes.py` performs 10 rapid main↔alt cycles while the main stack
-holds `1` and the alt stack holds `8`, reading the active flags on each side every cycle:
-
-```console
---- rapid switching leakage probe (10 cycles) ---
-cycles (main,alt) = [(1, 8), (1, 8), (1, 8), (1, 8), (1, 8), (1, 8), (1, 8), (1, 8), (1, 8), (1, 8)]
-NO LEAK (main always 1, alt always 8)
+```text
+setup: MAIN=1, ALT=8;  MAIN active now=1
+cycle  1: ALT active=8  MAIN active=1  OK
+cycle  2: ALT active=8  MAIN active=1  OK
+cycle  3: ALT active=8  MAIN active=1  OK
+cycle  4: ALT active=8  MAIN active=1  OK
+cycle  5: ALT active=8  MAIN active=1  OK
+cycle  6: ALT active=8  MAIN active=1  OK
+cycle  7: ALT active=8  MAIN active=1  OK
+cycle  8: ALT active=8  MAIN active=1  OK
+cycle  9: ALT active=8  MAIN active=1  OK
+cycle 10: ALT active=8  MAIN active=1  OK
+RESULT: leakage detected = False (MAIN stayed 1 and ALT stayed 8 across all cycles = no leak)
+EXIT=0
 ```
 
-Across all 10 cycles the main buffer always reads `1` and the alt buffer always reads `8` — **no
-state leakage** in either direction. **[observed]**
+**Interpretation.** Across all 10 cycles the alternate buffer always reads `8` and the main buffer
+always reads `1`; `leakage detected = False`. No value bled from one buffer's stack into the other's,
+consistent with the two physically separate arrays ([kitty/screen.h:L128]) and the pointer-only toggle
+([kitty/screen.c:L1079], [kitty/screen.c:L1086]). **[observed]**
 
+## 7. (OBJ-6) Mode-dependent edge cases: 47/1047/1049, DECCKM, and SCORC
 
----
+**Question.** Enumerate and exercise the terminal-mode variants under which stack isolation might
+behave unexpectedly: the three alternate-screen mode constants `47`/`1047`/`1049`, the cursor-key mode
+`DECCKM`, and the first-push-from-empty behavior (covered in [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop)).
 
-## OBJ-6 — Mode-dependent edge cases
+**Mechanism (source).** The three constants are `TOGGLE_ALT_SCREEN_1` (47), `TOGGLE_ALT_SCREEN_2`
+(1047), and `ALTERNATE_SCREEN` (1049) ([kitty/modes.h:L75-L77]). All three are dispatched to
+`screen_toggle_screen_buffer` ([kitty/screen.c:L1165-L1169]); only `1049` additionally saves the
+cursor and clears the alternate screen (its two boolean arguments are true only for
+`mode == ALTERNATE_SCREEN`). Crucially, **all three go through the same toggle**, which re-points the
+keyboard-flag pointer ([kitty/screen.c:L1079], [kitty/screen.c:L1086]), so isolation is expected to
+hold for all three. (`terminfo`'s `rmcup` is `\E[?1049l`, [kitty/terminfo.py:L207].) `DECCKM` is read
+by the encoder as its `cursor_key_mode` argument on the live path ([kitty/keys.c:L251]).
 
-**Question:** enumerate and exercise the terminal-mode variants under which stack isolation might
-behave unexpectedly — the three alternate-screen mode numbers `47` / `1047` / `1049`, the
-cursor-key mode `DECCKM`, and the first-push-from-empty behavior.
+Script (reproducible):
 
-### 6.1 All three alternate-screen mode numbers isolate identically
+```bash
+#!/usr/bin/env bash
+# OBJ-6: (A) isolation across the 3 alt-screen mode constants 47/1047/1049;
+#         (B) DECCKM x flags cross-product for the Up arrow;
+#         (C) SCORC confusion: bare CSI u = restore-cursor, NOT a keyboard-stack op.
+set -o pipefail
+umask 077
+repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/obs.py" <<'PYEOF'
+import kitty.fast_data_types as f
+from kitty_tests import parse_bytes, Callbacks
 
-The three alternate-screen constants are defined in `kitty/modes.h` (values shown are shifted
-left by 5, kitty's internal private-mode packing; the **wire mode numbers** are 47 / 1047 /
-1049):
+def new_screen():
+    c = Callbacks()
+    return f.Screen(c, 5, 40, 5, 10, 20, 0, c), c
+def active(s):
+    return s.current_key_encoding_flags()
 
-```c
-#define TOGGLE_ALT_SCREEN_1 (47   << 5)   // modes.h:L75
-#define TOGGLE_ALT_SCREEN_2 (1047 << 5)   // modes.h:L76
-#define ALTERNATE_SCREEN    (1049 << 5)   // modes.h:L77
+print("== Part A: stack isolation across alternate-screen mode constants 47 / 1047 / 1049 ==")
+for mode in (47, 1047, 1049):
+    s, c = new_screen()
+    parse_bytes(s, b'\x1b[>1u')                       # MAIN push disambiguate (1)
+    m0 = active(s)
+    parse_bytes(s, b'\x1b[?%dh' % mode)               # enter ALT via this mode
+    a0 = active(s)
+    parse_bytes(s, b'\x1b[>8u')                       # ALT push report-all (8)
+    a1 = active(s)
+    parse_bytes(s, b'\x1b[?%dl' % mode)               # leave ALT via same mode
+    m1 = active(s)
+    print("mode %-4d: MAIN=%d  enter-ALT=%d  ALT-after-push=%d  back-MAIN=%d  isolation %s"
+          % (mode, m0, a0, a1, m1, "HOLDS" if (m0 == 1 and a1 == 8 and m1 == 1) else "BROKEN"))
+
+print()
+print("== Part B: DECCKM x flags cross-product for the Up arrow (GLFW_FKEY_UP=%d) ==" % f.GLFW_FKEY_UP)
+print("(DECCKM set canonically via CSI ?1h / ?1l and read back from screen.cursor_key_mode;")
+print(" flags set canonically via the stack; Up encoded by the real encoder with both real inputs)")
+for fl_target in (0, 1, 8):
+    for deckm_on in (False, True):
+        s, c = new_screen()
+        parse_bytes(s, b'\x1b[?1h' if deckm_on else b'\x1b[?1l')   # DECCKM set/reset
+        ckm = s.cursor_key_mode
+        if fl_target:
+            parse_bytes(s, b'\x1b[>%du' % fl_target)               # push target flags
+        fl = active(s)
+        up = f.encode_key_for_tty(f.GLFW_FKEY_UP, mods=0, key_encoding_flags=fl, cursor_key_mode=ckm).encode('ascii')
+        print("DECCKM %-3s (cursor_key_mode=%d)  flags=%d  Up-> %r" % ("on" if deckm_on else "off", ckm, fl, up))
+
+print()
+print("== Part C: SCORC confusion — bare CSI u restores the cursor, leaving the keyboard stack alone ==")
+s, c = new_screen()
+parse_bytes(s, b'\x1b[>1u')                            # push disambiguate so we can watch it survive
+parse_bytes(s, b'\x1b[3;10H')                          # move cursor to row3 col10 (1-based)
+parse_bytes(s, b'\x1b[s')                              # SCOSC: save cursor (CSI s)
+saved = (s.cursor.x, s.cursor.y)
+parse_bytes(s, b'\x1b[1;1H')                           # move cursor to home
+moved = (s.cursor.x, s.cursor.y)
+c.clear()
+parse_bytes(s, b'\x1b[u')                              # bare CSI u == SCORC (restore cursor)
+restored = (s.cursor.x, s.cursor.y)
+print("cursor saved(x,y)=%s  after-move(x,y)=%s  after 'CSI u'(x,y)=%s" % (saved, moved, restored))
+print("bytes written to child by 'CSI u' = %r (empty => NOT a query; it is restore-cursor)" % bytes(c.wtcbuf))
+print("keyboard flags after 'CSI u' = %d (unchanged; SCORC does not touch the stack)" % active(s))
+c.clear()
+parse_bytes(s, b'\x1b[?u')                              # contrast: CSI ? u IS the flags query
+print("for contrast, 'CSI ? u' writes to child = %r (this is the keyboard-flags query)" % bytes(c.wtcbuf))
+PYEOF
+PYTHONPATH="$repo" python3 "$tmp/obs.py"
+rc=$?
+echo "EXIT=$rc"
+exit $rc
 ```
 
-In the mode dispatch (`kitty/screen.c:L1165-1169`), all three call the **same**
-`screen_toggle_screen_buffer`, and therefore all three re-point the keyboard-flag pointer the
-same way. Only **`1049`** additionally *saves the cursor* and *clears the alternate screen* — the
-`save_cursor`/`clear_alt_screen` arguments are `mode == ALTERNATE_SCREEN` on both positions
-(`kitty/screen.c:L1168`):
+Output **[observed]**:
 
-```c
-if (val && self->linebuf == self->main_linebuf)
-    screen_toggle_screen_buffer(self, mode == ALTERNATE_SCREEN, mode == ALTERNATE_SCREEN);
+```text
+== Part A: stack isolation across alternate-screen mode constants 47 / 1047 / 1049 ==
+mode 47  : MAIN=1  enter-ALT=0  ALT-after-push=8  back-MAIN=1  isolation HOLDS
+mode 1047: MAIN=1  enter-ALT=0  ALT-after-push=8  back-MAIN=1  isolation HOLDS
+mode 1049: MAIN=1  enter-ALT=0  ALT-after-push=8  back-MAIN=1  isolation HOLDS
+
+== Part B: DECCKM x flags cross-product for the Up arrow (GLFW_FKEY_UP=57352) ==
+(DECCKM set canonically via CSI ?1h / ?1l and read back from screen.cursor_key_mode;
+ flags set canonically via the stack; Up encoded by the real encoder with both real inputs)
+DECCKM off (cursor_key_mode=0)  flags=0  Up-> b'\x1b[A'
+DECCKM on  (cursor_key_mode=1)  flags=0  Up-> b'\x1bOA'
+DECCKM off (cursor_key_mode=0)  flags=1  Up-> b'\x1b[A'
+DECCKM on  (cursor_key_mode=1)  flags=1  Up-> b'\x1b[A'
+DECCKM off (cursor_key_mode=0)  flags=8  Up-> b'\x1b[A'
+DECCKM on  (cursor_key_mode=1)  flags=8  Up-> b'\x1bOA'
+
+== Part C: SCORC confusion — bare CSI u restores the cursor, leaving the keyboard stack alone ==
+cursor saved(x,y)=(9, 2)  after-move(x,y)=(0, 0)  after 'CSI u'(x,y)=(9, 2)
+bytes written to child by 'CSI u' = b'' (empty => NOT a query; it is restore-cursor)
+keyboard flags after 'CSI u' = 1 (unchanged; SCORC does not touch the stack)
+for contrast, 'CSI ? u' writes to child = b'\x1b[?1u' (this is the keyboard-flags query)
+EXIT=0
 ```
 
-Because the keyboard-flag pointer is re-pointed by the toggle regardless of those cursor/clear
-side effects, **isolation should hold for all three**. Confirmed at runtime:
+### 7.1 Isolation holds across 47 / 1047 / 1049
 
-```console
-$ PYTHONPATH=$(pwd) python3 /tmp/blitzy_obs/obj6_modes.py
-mode 47  : alt active=8  main-after-return=1  (isolation HOLDS)
-mode 1047: alt active=8  main-after-return=1  (isolation HOLDS)
-mode 1049: alt active=8  main-after-return=1  (isolation HOLDS)
-```
+For every one of the three constants the trace is identical: main `1`, fresh alt `0`, alt after push
+`8`, back to main `1` — printed as `isolation HOLDS` on all three rows. The differing side effects of
+`1049` (cursor save + alt-screen clear) do not affect the keyboard stacks, because isolation comes from
+the shared pointer re-point ([kitty/screen.c:L1079], [kitty/screen.c:L1086]) that all three constants
+trigger. **[observed]**
 
-For each of `47`, `1047`, `1049`: push `1` on main, enter alt via `\x1b[?<mode>h`, push `8` on
-alt (reads `8`), return via `\x1b[?<mode>l`, and main reads back **`1`**. Isolation **holds
-across all three**. **[observed]**
+### 7.2 DECCKM × flags cross-product for the Up arrow
 
-### 6.2 `DECCKM` × flags on the UP arrow
+`DECCKM` is set canonically via `CSI ?1h`/`CSI ?1l` and read back from `screen.cursor_key_mode`; the
+flags are set canonically on the stack; the Up arrow (`GLFW_FKEY_UP = 57352`) is then encoded by the
+real encoder with both real inputs. The observed cross-product:
 
-`DECCKM` (cursor-key mode, `kitty/modes.h:L27`) is passed to the encoder as
-`screen->modes.mDECCKM` on the live path (`kitty/keys.c:L251`). It changes how **cursor keys**
-are encoded in legacy mode: the application-cursor-keys **SS3** form `\x1bOA` vs. the normal
-**CSI** form `\x1b[A`. The stack flags interact with it. Cross-product on the UP arrow:
+| flags | DECCKM off | DECCKM on |
+|-------|------------|-----------|
+| `0` (legacy) | `b'\x1b[A'` | `b'\x1bOA'` |
+| `1` (disambiguate) | `b'\x1b[A'` | `b'\x1b[A'` |
+| `8` (report-all-keys) | `b'\x1b[A'` | `b'\x1bOA'` |
 
-```console
---- DECCKM x flags on the UP arrow ---
-flags 0 : DECCKM off cursor_key_mode=False UP->b'\x1b[A' | DECCKM on cursor_key_mode=True UP->b'\x1bOA'
-flags 1 : DECCKM off cursor_key_mode=False UP->b'\x1b[A' | DECCKM on cursor_key_mode=True UP->b'\x1b[A'
-flags 8 : DECCKM off cursor_key_mode=False UP->b'\x1b[A' | DECCKM on cursor_key_mode=True UP->b'\x1bOA'
-```
+With legacy or report-all-keys flags, `DECCKM on` switches the Up arrow from the CSI form `b'\x1b[A'`
+to the SS3 form `b'\x1bOA'`, the classic application-cursor-keys behavior. With **disambiguate** flags
+(`1`), the kitty encoder emits `b'\x1b[A'` regardless of `DECCKM` — the progressive-enhancement mode
+takes precedence over the legacy cursor-key toggle for this key. **[observed]**
 
-Interpretation **[observed]**, grounded in `encode_function_key` (`kitty/key_encoding.c:L147`):
+### 7.3 SCORC: a bare `CSI u` restores the cursor, not the keyboard stack
 
-- `legacy_mode = !report_all_event_types && !disambiguate` (`kitty/key_encoding.c:L152`).
-- The SS3 form is emitted only when `cursor_key_mode && legacy_mode && !mods`
-  (`kitty/key_encoding.c:L154`).
-- **flags 0** (legacy): DECCKM off → `\x1b[A`; DECCKM on → `\x1bOA` (SS3, because `legacy_mode`
-  is true).
-- **flags 1** (disambiguate): `disambiguate` makes `legacy_mode` **false**, so the SS3 branch is
-  never taken — the arrow stays `\x1b[A` **even with DECCKM on**. The disambiguate flag therefore
-  **overrides** DECCKM's SS3 form for the arrow key.
-- **flags 8** (report-all-keys): this flag sets the C variable `report_text`, **not**
-  `report_all_event_types`, so `legacy_mode` remains **true** — DECCKM's SS3 form `\x1bOA`
-  **still appears** with DECCKM on. (This is a direct consequence of the doc-vs-code naming skew
-  documented below.)
+Part C sets the cursor to row 3 / col 10, saves it with `CSI s`, moves it home, then issues a bare
+`CSI u`. The output shows the cursor position `saved=(9, 2)` (0-based x/y for col 10, row 3),
+`after-move=(0, 0)`, and `after 'CSI u'=(9, 2)` — i.e. the cursor was **restored**. The bare `CSI u`
+wrote `b''` to the child (it is *not* a query) and left the keyboard flags unchanged at `1`. For
+contrast, `CSI ? u` wrote `b'\x1b[?1u'` — the keyboard-flags query. This confirms the grammar caveat
+from [§1.5](#15-the-csi-u-escape-code-grammar-and-the-scorc-confusion): a modifier-less `CSI u` is
+SCORC ([kitty/vt-parser.c:L1218-L1221]), unrelated to the keyboard stack. **[observed]**
 
-### 6.3 First-push-from-empty
+## 8. How the mechanism works (source grounding)
 
-Covered in §OBJ-3: pushing onto an empty stack seeds a hidden base-0 entry beneath the first
-pushed value, so the first pop lands on flags `0`. **[observed]**
+The behaviors above all reduce to one structural fact and a handful of routines:
 
-### 6.4 The `CSI u` vs. SCORC confusion
+- **Storage — two arrays, one pointer** ([kitty/screen.h:L128]):
+  `uint8_t main_key_encoding_flags[8], alt_key_encoding_flags[8], *key_encoding_flags;`. The two
+  8-slot arrays are the per-buffer stacks; `key_encoding_flags` is the active pointer.
+- **Buffer toggle — pointer re-point only** (`screen_toggle_screen_buffer`): on entering the alternate
+  screen the pointer is set to the alt array ([kitty/screen.c:L1079]); on leaving, back to the main
+  array ([kitty/screen.c:L1086]). No bytes are copied between arrays — the source of independence.
+- **Current flags** (`screen_current_key_encoding_flags`, [kitty/screen.c:L1204-L1206]): the low 7 bits
+  of the highest slot whose `0x80` "occupied" bit is set.
+- **Push with silent eviction** (`screen_push_key_encoding_flags`, [kitty/screen.c:L1234-L1243]):
+  writes `0x80 | (val & 0x7f)` at the next slot; if the top slot is index 7, `memmove`s the array down
+  one and drops the oldest entry ([kitty/screen.c:L1241]).
+- **Pop with reset** (`screen_pop_key_encoding_flags`, [kitty/screen.c:L1248-L1252]): clears the popped
+  occupied slots to `0`; when all are clear the current value is `0`.
+- **Encoder** (`encode_glfw_key_event`, [kitty/key_encoding.c:L414]) reads the flag bits
+  ([kitty/key_encoding.c:L419-L423]) and the cursor-key mode to produce the emitted bytes; the live
+  path calls it with the active stack flags ([kitty/keys.c:L251]).
 
-A **bare `CSI u`** (no leading modifier, no parameters) is **restore cursor (SCORC)**, dispatched
-to `screen_restore_cursor` (`kitty/vt-parser.c:L1218-1220`), **not** any keyboard operation.
-Confirmed — the active flags are unchanged and nothing is written back to the child:
-
-```console
---- SCORC: bare CSI u is restore-cursor, NOT a keyboard op ---
-active before bare CSI u = 1 ; after = 1 ; child bytes from bare CSI u = b'' (empty => no keyboard reply)
-```
-
-Only the *modified* forms (`CSI ? u`, `CSI = … u`, `CSI > … u`, `CSI < … u`) touch the keyboard
-stack. This is a well-known source of confusion for protocol implementers. **[observed]**
-
-### 6.5 terminfo mapping (context)
-
-kitty's terminfo defines `smcup = \E[?1049h` (`kitty/terminfo.py:L235`) and
-`rmcup = \E[?1049l` (`kitty/terminfo.py:L207`) — the escape codes an application (via
-`tput`/curses) uses to enter/leave the alternate screen. These are the `1049` variant, the only
-one that also saves the cursor and clears the alt screen. **[observed in source]**
-
----
-
-## Doc-vs-code naming reconciliation (mandatory)
-
-There is a **naming skew** between the specification and the C source that will mislead a reader
-who greps the code by spec name. State it explicitly:
-
-| Flag value | Specification name (`docs/keyboard-protocol.rst:L278-282`) | C struct field (`kitty/key_encoding.c:L419-423`) |
-|---|---|---|
-| `1` (`0b1`) | Disambiguate escape codes | `disambiguate` (L419) |
-| `2` (`0b10`) | Report event types | `report_all_event_types` (L420) |
-| `4` (`0b100`) | Report alternate keys | `report_alternate_key` (L421) |
-| `8` (`0b1000`) | **Report all keys as escape codes** | **`report_text`** (L422) |
-| `16` (`0b10000`) | **Report associated text** | **`embed_text`** (L423) |
-
-```c
-.disambiguate           = key_encoding_flags & 1,    // key_encoding.c:L419
-.report_all_event_types = key_encoding_flags & 2,    // key_encoding.c:L420
-.report_alternate_key   = key_encoding_flags & 4,    // key_encoding.c:L421
-.report_text            = key_encoding_flags & 8,    // key_encoding.c:L422  <-- spec "report all keys"
-.embed_text             = key_encoding_flags & 16    // key_encoding.c:L423  <-- spec "report associated text"
-```
-
-**The trap:** the token **`report_text`** denotes the spec's *"report associated text"* (flag
-**16**) but in the C code the field named `report_text` is flag **8** ("report all keys as escape
-codes"). The user's **"report-all-keys mode" is flag 8** (C field `report_text`). This skew is
-precisely why flag 8 does **not** disable the SS3 cursor-key form in §6.2: flag 8 sets
-`report_text`, whereas the `legacy_mode` computation keys off `report_all_event_types` (flag 2)
-and `disambiguate` (flag 1). **[observed in source]**
-
----
-
-## The mechanism, illustrated
+The round trip that motivated OBJ-1 is exactly this pointer dance:
 
 ```mermaid
 graph TD
-    A["main buffer active<br/>active ptr = main_key_encoding_flags<br/>main:[base0]  alt:[base0]"]
-      --> B["push disambiguate (CSI &gt;1u)<br/>main:[base0, 1]  active = 1"]
-    B --> C["toggle to alt (CSI ?1049h)<br/>active ptr = alt_key_encoding_flags<br/>active = 0 (alt fresh)"]
-    C --> D["push report-all (CSI &gt;8u)<br/>alt:[base0, 8]  active = 8"]
-    D --> E["toggle back to main (CSI ?1049l)<br/>active ptr = main_key_encoding_flags"]
-    E --> F["active = 1 again<br/>main:[base0, 1] untouched — survived intact"]
-    D -. "no copy between arrays<br/>(screen.c:L1079/L1086 only re-point the pointer)" .-> F
+    A["Main buffer active<br/>active ptr = main_key_encoding_flags"] --> B["Push disambiguate (1) on main<br/>main array: base-0, then 1"]
+    B --> C["Toggle to alt (CSI ?1049h)<br/>active ptr = alt_key_encoding_flags"]
+    C --> D["Push report-all-keys (8) on alt<br/>alt array: base-0, then 8"]
+    D --> E["Toggle back to main (CSI ?1049l)<br/>active ptr = main_key_encoding_flags"]
+    E --> F["Active flags = 1 again<br/>main array untouched, survived intact"]
+    D -. no copy between arrays .-> F
 ```
 
-The two 8-byte arrays `main_key_encoding_flags` / `alt_key_encoding_flags` and the single active
-pointer `key_encoding_flags` (`kitty/screen.h:L128`) are the whole story: the toggle swaps only
-the pointer, so each buffer's stack is structurally independent.
+## 9. Specification cross-check and the doc-vs-code naming skew
 
----
+**Stack semantics match the specification.** The authoritative specification in the repository states
+that terminals *"must maintain separate stacks for the main and alternate screens"*, that *"if a pop
+request is received that empties the stack, all flags are reset"*, and that *"if a push request is
+received and the stack is full, the oldest entry from the stack must be evicted"*
+([docs/keyboard-protocol.rst:L300-L303]). Every one of these was observed above: separate stacks
+([§2](#2-obj-1--round-trip-stack-survival), [§6](#6-obj-5--independence-proof-and-leakage-probe)),
+pop-to-empty reset ([§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop)), and
+oldest-entry eviction ([§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation)).
 
-## Web-spec validation
+**Stack depth is kitty's implementation choice, not a spec minimum.** The specification does not
+mandate a minimum depth; it only says terminals *"should limit the size of the stack as appropriate,
+to prevent Denial-of-Service attacks"* ([docs/keyboard-protocol.rst:L299-L300]). The depth of **8**
+reported throughout this document is the size of kitty's own fixed arrays as observed in the source —
+`main_key_encoding_flags[8]` / `alt_key_encoding_flags[8]` ([kitty/screen.h:L128]) — and confirmed at
+runtime by the exhaustion test retaining exactly 8 values
+([§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation)). It is not attributed to
+any external "minimum depth" requirement.
 
-The observed runtime semantics were validated against the authoritative external specification at
-`https://sw.kovidgoyal.net/kitty/keyboard-protocol/` (mirrored in-repo at
-`docs/keyboard-protocol.rst`) and the original design RFC (kitty issue #3248). Each observation
-is corroborated:
+**Doc-vs-code naming skew (stated so the reader is not misled).** The user's "disambiguate mode" is
+flag value `1`, decoded by the encoder as `.disambiguate = flags & 1` ([kitty/key_encoding.c:L419]).
+The user's "report-all-keys mode" is the specification's flag `0b1000` (value `8`), *"report all keys
+as escape codes"* ([docs/keyboard-protocol.rst:L275-L283]); internally, however, the C source names
+that bit's field `report_text` (`.report_text = flags & 8`, [kitty/key_encoding.c:L422]), and it names
+the next bit `0b10000` (value `16`) `embed_text` (`.embed_text = flags & 16`,
+[kitty/key_encoding.c:L423]). In other words the spec label "report all keys as escape codes" and the
+C field name `report_text` denote the *same* bit (value `8`); the code's `report_text`/`embed_text`
+names do not line up verbatim with the specification's prose, which can mislead a reader comparing the
+two side by side.
 
-| Observed behavior | Spec / reference corroboration |
-|---|---|
-| Independent main/alt stacks (§OBJ-1, §OBJ-5) | Spec: terminals must maintain separate, independent keyboard-mode stacks for the main and alternate screens, so an alt-screen editor can change the mode without affecting the main screen (`docs/keyboard-protocol.rst:L300-306`). |
-| Pop-to-empty resets all flags (§OBJ-3) | Spec: a pop that empties the stack resets all flags (`docs/keyboard-protocol.rst:L301`). |
-| Push-full evicts oldest, no error (§OBJ-2) | Spec: on a full stack the oldest entry must be evicted (`docs/keyboard-protocol.rst:L302-303`). |
-| Stack depth 8 (§OBJ-2) | Community reference: terminals should support a stack depth of at least 8 — matches the 8-slot arrays (`kitty/screen.h:L128`). |
-| Modifier `6` = `1 + (shift\|ctrl)` (§OBJ-4) | Spec/references: the modifier value is `1 + bitmask`; Ctrl+Shift = `1 + 4 + 1 = 6`. |
-| Ctrl+Shift+a → `CSI 97;6u` (codepoint, not shifted form) (§OBJ-4) | RFC #3248: the author explicitly chose `CSI 97 ; 6` over `CSI 65 ; 5` (report the actual key, not its shifted form). |
-| Plain `a` stays literal under flags 0/1, becomes `CSI u` under flag 8 (§OBJ-5) | Spec/references: disambiguate keeps plain printable keys as literal UTF-8; "report all keys" (flag 8) promotes every key, including plain text, to `CSI u`. |
-| Flag 4 appends the alternate/shifted key (§OBJ-4) | Spec: "report alternate keys" (0b100) reports alternate key values in addition to the main value. |
-| Flag 16 = "Report associated text" (C `embed_text`) | Spec: 0b10000 embeds the text in the escape code — the naming-skew reconciliation above. |
+## 10. Coverage pass
 
-No conflicts were found between the observed behavior and the specification.
+Every distinct part of the question and every named item, with the section that answers it from
+observed evidence:
 
----
+| Question part / named item | Section | Observed result |
+|----------------------------|---------|-----------------|
+| Round trip: which mode active at end | [§2](#2-obj-1--round-trip-stack-survival) | main active = `1` (disambiguate) |
+| Round trip: does main stack survive intact | [§2](#2-obj-1--round-trip-stack-survival) | yes, intact |
+| Round trip: escape produced in each intermediate state | [§2](#2-obj-1--round-trip-stack-survival) | query bytes `?0u`,`?1u`,`?0u`,`?8u`,`?1u` |
+| Exhaustion: silent drop / error / otherwise | [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | silent eviction of oldest, no error |
+| Exhaustion: does one buffer affect the other | [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | no; isolated |
+| Exhaustion exercised on the alternate buffer too | [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | identical push/pop sequences |
+| Pop-to-empty resets all flags | [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop) | resets to `0` |
+| First-push-from-empty behavior | [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop) | seeds base-0 entry |
+| Over-pop behavior | [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop) | stays `0`, no underflow |
+| Ctrl+Shift+a (a) main / no flags | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `0`) |
+| Ctrl+Shift+a (b) main / disambiguate | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `1`) |
+| Ctrl+Shift+a (c) alt / report-all-keys | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `8`) |
+| Ctrl+Shift+a (d) back on main | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `1`) |
+| Contrast keys (plain `a`, Ctrl+a) | [§5.2](#52-contrast-keys-canonical-stack-flags) | differ per state |
+| Flag sensitivity (bit 4) | [§5.3](#53-flag-sensitivity-explicit-non-canonical-encoder-characterization) | `b'\x1b[97:65;6u'` for flags 4/5 |
+| Independence proof | [§6](#6-obj-5--independence-proof-and-leakage-probe) | query + key bytes differ by buffer |
+| Leakage during rapid switching | [§6](#6-obj-5--independence-proof-and-leakage-probe) | none across 10 cycles |
+| Mode constant `47` | [§7.1](#71-isolation-holds-across-47--1047--1049) | isolation holds |
+| Mode constant `1047` | [§7.1](#71-isolation-holds-across-47--1047--1049) | isolation holds |
+| Mode constant `1049` | [§7.1](#71-isolation-holds-across-47--1047--1049) | isolation holds |
+| `DECCKM` cursor-key mode | [§7.2](#72-decckm--flags-cross-product-for-the-up-arrow) | full flags×DECCKM matrix |
+| Bare `CSI u` = SCORC caveat | [§7.3](#73-scorc-a-bare-csi-u-restores-the-cursor-not-the-keyboard-stack) | restores cursor, not a keyboard op |
+| Doc-vs-code naming skew | [§9](#9-specification-cross-check-and-the-doc-vs-code-naming-skew) | flag 8 = `report_text` |
 
-## Coverage pass — every part of the question, with observed evidence
+## 11. Reproducibility: two-run stability
 
-| Question part / named item | Answered in | Observed result |
-|---|---|---|
-| (1) Round-trip active mode | §OBJ-1 | disambiguate, **flags = 1** |
-| (1) Main-stack survival | §OBJ-1 | survives intact (query ends `\x1b[?1u`) |
-| (1) Escape sequence at each intermediate state | §OBJ-1, §OBJ-4 | table of query bytes + per-state key bytes |
-| (2) Exhaustion — silent drop / error / otherwise | §OBJ-2 | silent oldest-eviction, **no error** |
-| (2) Which entry drops | §OBJ-2 | the **oldest**; most-recent 8 survive |
-| (2) Cross-buffer effect of exhaustion | §OBJ-2 | **none** — other buffer unaffected |
-| (3) Pop-to-empty reset | §OBJ-3 | flags reset to **0** |
-| (4) Ctrl+Shift+a state (a) main/no-flags | §OBJ-4 | `\x1b[97;6u` |
-| (4) Ctrl+Shift+a state (b) main/disambiguate | §OBJ-4 | `\x1b[97;6u` |
-| (4) Ctrl+Shift+a state (c) alt/report-all | §OBJ-4 | `\x1b[97;6u` |
-| (4) Ctrl+Shift+a state (d) back-to-main | §OBJ-4 | `\x1b[97;6u` (identical — explained) |
-| (5) Do the captures prove independence? | §OBJ-4, §OBJ-5 | not by themselves; proven via query bytes + contrast keys |
-| (5) Leakage during rapid switching | §OBJ-5 | **no leak** over 10 cycles |
-| (6) mode `47` | §OBJ-6.1 | isolation holds |
-| (6) mode `1047` | §OBJ-6.1 | isolation holds |
-| (6) mode `1049` | §OBJ-6.1 | isolation holds (also saves cursor/clears) |
-| (6) `DECCKM` | §OBJ-6.2 | SS3 vs CSI cross-product on UP arrow |
-| (6) first-push-from-empty | §OBJ-3, §OBJ-6.3 | seeds hidden base-0 entry |
-| (6) rapid switching | §OBJ-5 | no leak |
-| (6) `CSI u` vs SCORC confusion | §OBJ-6.4 | bare `CSI u` = restore cursor, no keyboard effect |
-| doc-vs-code naming skew | naming section | flag 8 = spec "report all keys" = C `report_text` |
+The seven observation scripts from [§2](#2-obj-1--round-trip-stack-survival)–[§7](#7-obj-6--mode-dependent-edge-cases-4710471049-decckm-and-scorc)
+are deterministic. To confirm the reported values are stable, the full set was run **twice**
+unchanged, each run's concatenated output hashed, and the two runs compared byte-for-byte.
 
-### Reproducibility, canonicity, and stability notes
+Command (reproducible; `$R` is the directory holding the seven scripts shown above):
 
-- **Stability [observed]:** the full observation suite was run **twice** and the output was
-  **byte-identical** across runs; final main-buffer active flags = `1` in both runs.
-- **Canonical path:** flag state is read from the real per-buffer stack after driving the real VT
-  parser (`parse_bytes` → `screen_*_key_encoding_flags`); key bytes come from the same
-  `encode_glfw_key_event` (`kitty/key_encoding.c:L414`) the live path uses, invoked exactly as
-  `Window.encoded_key()` (`kitty/window.py:L1795-1800`).
-- **Non-canonical usages** are limited to the flag-4 sensitivity block (explicit
-  `key_encoding_flags` passed to `encode_key_for_tty`), and are labeled as such — they are a byte
-  cross-check, not a proof of stack state.
-- **Live GUI path** (`kitty --debug-keyboard`, `kitten show-key -m kitty`) could **not** be run:
-  no display is present (`GLFW initialization failed`, X11 `DISPLAY` missing). The headless
-  harness drives the identical C parser/stack/encoder, so the captured `\x1b[…` bytes are exactly
-  what the live path would send to the child.
+```bash
+set -o pipefail
+SCRIPTS="obj1_roundtrip obj2_exhaustion obj3_pop_reset obj4_ctrlshifta obj4b_contrast obj5_leakage obj6_modes"
+run_all() { for s in $SCRIPTS; do bash "$R/$s.sh"; done; }
+run_all > run1.txt 2>&1; echo "run1 rc=$?"
+run_all > run2.txt 2>&1; echo "run2 rc=$?"
+echo "run1 sha256: $(sha256sum run1.txt | cut -d' ' -f1)"
+echo "run2 sha256: $(sha256sum run2.txt | cut -d' ' -f1)"
+cmp -s run1.txt run2.txt && echo "cmp: IDENTICAL (byte-for-byte)" || { echo "cmp: DIFFER"; cmp run1.txt run2.txt; }
+echo "run1 final-main: $(grep 'flags on MAIN' run1.txt)"
+echo "run2 final-main: $(grep 'flags on MAIN' run2.txt)"
+```
 
-**Byte-accuracy discipline:** every `\x1b[…`/`\x01`/`a` byte string quoted in this document was
-copied directly from the scripts' captured output (from `Callbacks.wtcbuf` for query/SCORC
-replies, and from `encode_key_for_tty` for key bytes), not re-typed or re-serialized.
+Output **[observed]**:
 
+```text
+run1 rc=0
+run2 rc=0
+run1 sha256: 0c87b9bef253086742e37abdb5e69e6fc30be5570ca9692b071b5de150a594db
+run2 sha256: 0c87b9bef253086742e37abdb5e69e6fc30be5570ca9692b071b5de150a594db
+cmp: IDENTICAL (byte-for-byte)
+run1 final-main: RESULT  final active keyboard-encoding flags on MAIN = 1
+run2 final-main: RESULT  final active keyboard-encoding flags on MAIN = 1
+```
+
+Both runs produce the identical sha256
+`0c87b9bef253086742e37abdb5e69e6fc30be5570ca9692b071b5de150a594db` and `cmp` confirms them
+byte-for-byte identical; the round-trip result (main active flags = `1`) is stable across both runs.
+**[observed]**
+
+## 12. Cleanup and final repository state
+
+This investigation is read-only with respect to the source tree; the sole repository change is this
+document. The cleanup discipline was built into every observation:
+
+- Each script created its program inside a private `mktemp -d` directory under `umask 077` and removed
+  that directory via a `trap '... EXIT'` on exit — so no observation script was ever left behind, and
+  none was ever written inside the repository working tree.
+- The build artifacts (`kitty/fast_data_types.so`, `kitty/glfw-x11.so`, `build/`, the launchers) are
+  all git-ignored, so rebuilding them leaves the tracked tree untouched.
+
+Cleanup and final-state verification:
+
+```bash
+set -o pipefail
+rm -rf /tmp/kbd_evidence                 # remove the out-of-tree capture directory
+ls -d /tmp/kbdobs.* 2>/dev/null || echo "no private mktemp dirs remain (trap-removed)"
+find . -path ./.git -prune -o \( -name 'blitzy_adhoc_test_*' -o -name 'kbdobs.*' \) -print
+echo "--- git working-tree state ---"
+git status --porcelain
+git diff --name-status
+```
+
+Output **[observed]**:
+
+```text
+no private mktemp dirs remain (trap-removed)
+--- git working-tree state ---
+ M blitzy/documentation/kitty_815df1e210e0.md
+M	blitzy/documentation/kitty_815df1e210e0.md
+```
+
+The `find` prints nothing (no temporary script exists anywhere in the repository), and
+`git status --porcelain` lists exactly one changed file — the deliverable. The net repository change
+is this single Markdown document; everything else (temporary scripts, capture files, build outputs)
+is either out-of-tree or git-ignored.
