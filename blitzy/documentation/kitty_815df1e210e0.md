@@ -191,10 +191,12 @@ terminal cell size, so the pseudo‑terminal must have a **real**, non‑zero wi
 (rows, cols, and *pixel* width/height) or `loop.update_screen_size`
 (`tools/tui/loop/run.go`) divides by zero.
 
-Two small, deterministic, **temporary** Python tools (removed at the end) implement this.
-They only supply the terminal and the quit key; the program under the PTY is always the
-real `kitten diff` CLI. Both are listed here in full so every rendered screen below is
-reproducible.
+A few small, deterministic, **temporary** Python tools (removed at the end) implement this.
+The two PTY harnesses (`pty_run.py` and `pty_run_stderr.py`) only supply the terminal and
+the quit key; the program under the PTY is always the real `kitten diff` CLI. All of these
+tools — the two harnesses, the grid renderer (`screen_render.py`), and the two byte‑level
+scanners (`scan_colors.py`, `scan_graphics.py`) — are listed here in full so every rendered
+screen below is reproducible.
 
 **`pty_run.py`** — opens a PTY with a 40×120 char / 1440×800 px winsize, `exec`s the
 command, waits, sends `ESC[113u`, and writes the raw byte stream:
@@ -204,7 +206,10 @@ import os, sys, pty, termios, fcntl, struct, select, time, signal
 def main():
     wait_s = float(sys.argv[1]); out_path = sys.argv[2]
     assert sys.argv[3] == "--"; cmd = sys.argv[4:]
-    rows, cols, xpix, ypix = 40, 120, 1440, 800
+    rows, cols, xpix, ypix = 40, 120, 1440, 800   # default winsize
+    ws = os.environ.get("PTY_WINSIZE")             # optional <rows>x<cols>x<xpix>x<ypix> override
+    if ws:
+        rows, cols, xpix, ypix = (int(v) for v in ws.split("x"))
     pid, fd = pty.fork()
     if pid == 0:                                   # child: pty.fork() already did setsid +
         winsize = struct.pack("HHHH", rows, cols, xpix, ypix)  # made slave the controlling tty
@@ -246,6 +251,89 @@ def main():
     open(out_path, "wb").write(bytes(buf))
     ec = os.WEXITSTATUS(status) if (status is not None and os.WIFEXITED(status)) else -1
     sys.stderr.write("raw_bytes=%d child_exit=%d\n" % (len(buf), ec))
+main()
+```
+
+**`pty_run_stderr.py`** — a variant of `pty_run.py` used only for Q4. It keeps the child's
+**stderr on a separate pipe** (instead of letting it merge into the PTY) so a Go panic or
+`-race` report can be captured cleanly, apart from the rendered screen, and it writes the
+`raw_bytes` / `child_exit` status line to a `.info` **sidecar** file (consumed below by
+`cat …info`) rather than to its own stderr:
+
+```python
+import os, sys, pty, termios, fcntl, struct, select, time, signal
+def main():
+    wait_s = float(sys.argv[1]); out_raw = sys.argv[2]; out_err = sys.argv[3]
+    assert sys.argv[4] == "--"; cmd = sys.argv[5:]
+    rows, cols, xpix, ypix = 40, 120, 1440, 800
+    ws = os.environ.get("PTY_WINSIZE")
+    if ws:
+        rows, cols, xpix, ypix = (int(v) for v in ws.split("x"))
+    mfd, sfd = pty.openpty()                        # master/slave PTY for stdin+stdout
+    er, ew = os.pipe()                              # separate pipe for the child's stderr
+    pid = os.fork()
+    if pid == 0:                                    # child
+        os.setsid()
+        fcntl.ioctl(sfd, termios.TIOCSCTTY, 0)      # make the PTY slave the controlling tty
+        os.dup2(sfd, 0); os.dup2(sfd, 1); os.dup2(ew, 2)   # stdin/stdout->PTY, stderr->pipe
+        for f in (mfd, sfd, er, ew):
+            try: os.close(f)
+            except OSError: pass
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, xpix, ypix))
+        env = dict(os.environ); env["TERM"] = "xterm-256color"
+        os.execvpe(cmd[0], cmd, env); os._exit(127)
+    os.close(sfd); os.close(ew)
+    fcntl.ioctl(mfd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, xpix, ypix))
+    buf = bytearray(); errbuf = bytearray()
+    deadline = time.time() + wait_s; sent_quit = False; status = None
+    quit_seq = b"\x1b[113u"; fds = [mfd, er]
+    def drain(fd, sink):
+        try: d = os.read(fd, 65536)
+        except OSError: d = b""
+        if d: sink.extend(d)
+        return d
+    while True:
+        timeout = deadline - time.time()
+        if timeout <= 0:
+            if not sent_quit:
+                try: os.write(mfd, quit_seq)
+                except Exception: pass
+                sent_quit = True; deadline = time.time() + 0.8; continue
+            break
+        r, _, _ = select.select(fds, [], [], max(0.02, min(timeout, 0.2)))
+        if mfd in r: drain(mfd, buf)
+        if er in r: drain(er, errbuf)
+    try: os.write(mfd, quit_seq)
+    except Exception: pass
+    for _ in range(200):                            # keep draining while the child finishes
+        r, _, _ = select.select(fds, [], [], 0.02)
+        got = False
+        if mfd in r: got = bool(drain(mfd, buf)) or got
+        if er in r:  got = bool(drain(er, errbuf)) or got
+        try:
+            wpid, st = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid: status = st; break
+        except ChildProcessError: break
+        if not got: time.sleep(0.01)
+    if status is None:
+        try: os.kill(pid, signal.SIGKILL)
+        except Exception: pass
+        try: _, status = os.waitpid(pid, 0)
+        except Exception: status = 0
+    while True:                                     # final flush of the stderr pipe (EOF)
+        r, _, _ = select.select([er], [], [], 0.1)
+        if er in r:
+            if not drain(er, errbuf): break
+        else: break
+    for f in (mfd, er):
+        try: os.close(f)
+        except Exception: pass
+    open(out_raw, "wb").write(bytes(buf))
+    open(out_err, "wb").write(bytes(errbuf))
+    ec = os.WEXITSTATUS(status) if (status is not None and os.WIFEXITED(status)) else -1
+    info = "raw_bytes=%d child_exit=%d" % (len(buf), ec)
+    info_path = (out_raw[:-4] if out_raw.endswith(".raw") else out_raw) + ".info"
+    open(info_path, "w").write(info + "\n")          # sidecar consumed by `cat …info`
 main()
 ```
 
@@ -327,6 +415,45 @@ deliberately drops. `scan_colors.py` extracts 24‑bit `SGR` colors (`ESC[38:2:R
 the kitty **Graphics Protocol** APC commands and classifies them by action
 (query/transmit/put/delete/animate) for the image evidence (Q5); its full source is listed
 in Q5.
+
+`scan_colors.py` is listed here in full (`scan_graphics.py` appears with the Q5 image
+evidence):
+
+```python
+#!/usr/bin/env python3
+# Extract the distinct 24-bit (truecolor) SGR colors from a raw terminal byte stream,
+# separating foreground (SGR parameter 38) from background (SGR parameter 48). Each
+# truecolor is introduced by 38/48 followed by a "2" selector and an R,G,B triple.
+# kitty/Chroma emit either the colon subparameter form (ESC[38:2:R:G:Bm) or the
+# semicolon form (ESC[38;2;R;G;Bm), and several colors may be combined in a single
+# ESC[...m; this scanner handles all of them by flattening ':'/';' to one token stream
+# and walking it with a small state machine.
+#
+# Usage: scan_colors.py <raw_path>
+import sys, re
+def scan(raw):
+    fg, bg = set(), set()
+    for m in re.finditer(rb"\x1b\[([0-9;:]*)m", raw):        # every SGR (...m) sequence
+        toks = [int(t) for t in re.split(rb"[;:]", m.group(1)) if t != b""]
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t in (38, 48) and i + 1 < len(toks):
+                if toks[i+1] == 2 and i + 4 < len(toks):     # truecolor: 2,R,G,B
+                    r, g, b = toks[i+2], toks[i+3], toks[i+4]
+                    (fg if t == 38 else bg).add("#%02x%02x%02x" % (r, g, b))
+                    i += 5; continue
+                if toks[i+1] == 5:                            # 256-color: 5,n -> not 24-bit
+                    i += 3; continue
+            i += 1
+    return sorted(fg), sorted(bg)
+if __name__ == "__main__":
+    fg, bg = scan(open(sys.argv[1], "rb").read())
+    print("distinct 24-bit fg colors: %d" % len(fg))
+    print("fg: %s" % fg)
+    print("distinct 24-bit bg colors: %d" % len(bg))
+    print("bg: %s" % bg)
+```
 
 The invocation pattern for a screen capture is therefore:
 
@@ -745,7 +872,18 @@ under "Why it stays efficient".)*
 **do not persist across invocations**. Four separate `kitten diff` runs are therefore four
 independent **cold** processes — they **cannot demonstrate an in‑process cache hit**; what they
 *do* demonstrate is that the output is **deterministic** and that nothing leaks between
-processes. Diffing the same 4999‑line pair four times:
+processes. The 4999‑line pair is generated deterministically — identical base text on both
+sides, three single‑word edits on the right (`quick`→`QUICK` at line 100, `brown`→`BROWN` at
+2500, `lazy`→`LAZY` at 4000):
+
+```
+$ mkdir -p /tmp/kd
+$ seq 1 4999 | awk '{printf "line %04d: the quick brown fox jumps over the lazy dog\n", $1}' > /tmp/kd/big1L.txt
+$ cp /tmp/kd/big1L.txt /tmp/kd/big1R.txt
+$ sed -i '100s/quick/QUICK/; 2500s/brown/BROWN/; 4000s/lazy/LAZY/' /tmp/kd/big1R.txt
+```
+
+Diffing the same 4999‑line pair four times:
 
 ```
 $ for r in 1 2 3 4; do
@@ -753,15 +891,15 @@ $ for r in 1 2 3 4; do
     echo "  -> run $r md5=$(md5sum /tmp/big_$r.raw | cut -d' ' -f1)"
   done
 raw_bytes=13088 child_exit=0
-  -> run 1 md5=81c7dc0e8e75f65aa7ddc6a96cafd62a
+  -> run 1 md5=88db670a14de5b00cc843378046dbc13
 raw_bytes=13088 child_exit=0
-  -> run 2 md5=81c7dc0e8e75f65aa7ddc6a96cafd62a
+  -> run 2 md5=88db670a14de5b00cc843378046dbc13
 raw_bytes=13088 child_exit=0
-  -> run 3 md5=81c7dc0e8e75f65aa7ddc6a96cafd62a
+  -> run 3 md5=88db670a14de5b00cc843378046dbc13
 raw_bytes=13088 child_exit=0
-  -> run 4 md5=81c7dc0e8e75f65aa7ddc6a96cafd62a
+  -> run 4 md5=88db670a14de5b00cc843378046dbc13
 $ md5sum /tmp/big_[1234].raw | cut -d' ' -f1 | sort -u
-81c7dc0e8e75f65aa7ddc6a96cafd62a
+88db670a14de5b00cc843378046dbc13
 ```
 
 All four captures are **byte‑identical** (a single MD5), with a stable `raw_bytes=13088` and
@@ -920,25 +1058,40 @@ A 3‑file‑per‑side corpus (6 highlight paths, far below `NumCPU()` = 128) c
 crash in **every one of 8 runs** — but "no crash observed" is *not* the same as "safe" (the
 `-race` report below proves the race is present regardless). Each run is stderr‑separated so a
 Go fatal trace, if any, would land in a dedicated file; `crash_sigs` counts
-`fatal error`/`concurrent map`/`DATA RACE` hits in that file:
+`fatal error`/`concurrent map`/`DATA RACE` hits in that file. The 3‑file‑per‑side corpus
+(`smL`/`smR`) is generated first — each file is a short, highlightable Python function whose
+one string literal differs left↔right (`hello N` → `HELLO N`), giving exactly three changed
+hunks:
+
+```
+$ mkdir -p /tmp/kd/smL /tmp/kd/smR
+$ for n in 1 2 3; do
+    printf 'def f%d(x):\n    s = "hello %d"\n    return s\n' "$n" "$n" > /tmp/kd/smL/f$n.py
+    printf 'def f%d(x):\n    s = "HELLO %d"\n    return s\n' "$n" "$n" > /tmp/kd/smR/f$n.py
+  done
+```
+
+Each run is stderr‑separated; its `raw_bytes`/`child_exit` are read back from the `.info`
+sidecar (`cat …info`) and `crash_sigs` is the grep over the separated trace file:
 
 ```
 $ for r in $(seq 1 8); do
     python3 /tmp/pty_run_stderr.py 1.5 /tmp/sm_$r.raw /tmp/sm_$r.err -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/smL /tmp/kd/smR
-    printf "run %d: crash_sigs=%d\n" "$r" "$(grep -a -c 'fatal error\|concurrent map\|DATA RACE' /tmp/sm_$r.err)"
+    printf "run %d: %s  crash_sigs=%d\n" "$r" "$(cat /tmp/sm_$r.info)" "$(grep -a -c 'fatal error\|concurrent map\|DATA RACE' /tmp/sm_$r.err)"
   done
-run 1: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 2: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 3: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 4: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 5: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 6: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 7: raw_bytes=13002 child_exit=0  crash_sigs=0
-run 8: raw_bytes=13002 child_exit=0  crash_sigs=0
+run 1: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 2: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 3: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 4: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 5: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 6: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 7: raw_bytes=11790 child_exit=0  crash_sigs=0
+run 8: raw_bytes=11790 child_exit=0  crash_sigs=0
 ```
 
-(The two `pty_run_stderr.py` output fields per run — `raw_bytes` and `child_exit` — come
-from the harness on stderr; `crash_sigs=0` is the grep over the separated trace file.)
+(The two `pty_run_stderr.py` status fields per run — `raw_bytes` and `child_exit` — are read
+from the `.info` sidecar via `cat /tmp/sm_$r.info`; `crash_sigs=0` is the grep over the
+separated `.err` trace file.)
 
 The race is **not strictly scale‑gated**, though — it is only *rare* at small scale, not
 absent. Continuing to re‑run this same 3‑file input, a crash was eventually observed **once in
@@ -947,6 +1100,16 @@ input can crash; large corpora merely make it near‑certain. This is the concre
 scale is safe" is a false assurance.
 
 ### Observed — at scale it crashes (the real "stepping on itself")
+
+The 300‑file‑per‑side corpus (`bigL`/`bigR`) uses the same per‑file pattern, at `seq 1 300`:
+
+```
+$ mkdir -p /tmp/kd/bigL /tmp/kd/bigR
+$ for n in $(seq 1 300); do
+    printf 'def f%d(x):\n    s = "hello %d"\n    return s\n' "$n" "$n" > /tmp/kd/bigL/f$n.py
+    printf 'def f%d(x):\n    s = "HELLO %d"\n    return s\n' "$n" "$n" > /tmp/kd/bigR/f$n.py
+  done
+```
 
 A 300‑file‑per‑side corpus (600 highlight paths, well above `NumCPU()` = 128 so all 128
 worker goroutines run) crashes on the large majority of runs. Because it is a race, the exact
@@ -1011,6 +1174,17 @@ corpora emits `WARNING: DATA RACE` reports. Two distinct races are observed, mat
 fatal‑error forms above. The 16‑byte heap addresses and the numeric goroutine ids differ from
 run to run (they are runtime‑assigned), but the **source lines are stable across runs**; both
 reports below were reproduced on repeated runs.
+
+The 40‑file‑per‑side corpus (`medL`/`medR`) is generated with the same per‑file pattern as the
+3‑file corpus above, at `seq 1 40`:
+
+```
+$ mkdir -p /tmp/kd/medL /tmp/kd/medR
+$ for n in $(seq 1 40); do
+    printf 'def f%d(x):\n    s = "hello %d"\n    return s\n' "$n" "$n" > /tmp/kd/medL/f$n.py
+    printf 'def f%d(x):\n    s = "HELLO %d"\n    return s\n' "$n" "$n" > /tmp/kd/medR/f$n.py
+  done
+```
 
 **(1) write/write** — two highlight workers assign the same map at once. Captured against the
 40‑file corpus (which trips the race fastest), verbatim and complete:
@@ -1178,7 +1352,9 @@ $ python3 -c 'd=open("/tmp/kd/L/data.bin","rb").read(); print(" ".join("%02x"%b 
 ff fe 00 01 02 ff ff 80
 UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
 
-$ /app/kitty/launcher/kitten diff /tmp/kd/L/data.bin /tmp/kd/R/data.bin
+$ python3 /tmp/pty_run.py 1.5 /tmp/bin.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/L/data.bin /tmp/kd/R/data.bin
+raw_bytes=2664 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/bin.raw 40 120
    /tmp/kd/L/data.bin                                          /tmp/kd/R/data.bin
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    Binary file: 18 B                                           Binary file: 29 B
@@ -1188,19 +1364,55 @@ $ /app/kitty/launcher/kitten diff /tmp/kd/L/data.bin /tmp/kd/R/data.bin
 
 `pic.png` is a valid PNG (signature `89 50 4e 47 0d 0a 1a 0a`, MIME `image/png`), sized
 16×16 on the left and 24×24 on the right, and the directory also contains a `readme.txt`
-text change:
+text change. The PNG fixtures are produced by a tiny, self‑contained PNG writer (no
+external image libraries) — a 16×16 solid‑red image on the left and a 24×24 solid‑blue
+image on the right — plus a one‑line `readme.txt` that differs between the two sides:
 
 ```
-$ /app/kitty/launcher/kitten diff /tmp/kd/imgL /tmp/kd/imgR
+$ mkdir -p /tmp/kd/imgL /tmp/kd/imgR
+$ cat > /tmp/make_img.py <<'PY'
+import zlib, struct, sys
+def png(w, h, rgb):
+    def chunk(typ, data):
+        return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", zlib.crc32(typ+data) & 0xffffffff)
+    sig  = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw  = b"".join(b"\x00" + bytes(rgb)*w for _ in range(h))
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png(16, 16, (200, 30, 40)))
+open(sys.argv[2], "wb").write(png(24, 24, (30, 120, 200)))
+PY
+$ python3 /tmp/make_img.py /tmp/kd/imgL/pic.png /tmp/kd/imgR/pic.png
+$ printf 'left readme\n'  > /tmp/kd/imgL/readme.txt   # 12 B
+$ printf 'right readme\n' > /tmp/kd/imgR/readme.txt   # 13 B
+$ for f in /tmp/kd/imgL/pic.png /tmp/kd/imgR/pic.png; do printf '%-24s %s B\n' "$f" "$(stat -c %s "$f")"; done
+/tmp/kd/imgL/pic.png     79 B
+/tmp/kd/imgR/pic.png     88 B
+```
+
+Rendered side‑by‑side through the PTY harness (the PNG on the image path, the text file
+diffed normally in the same view):
+
+```
+$ python3 /tmp/pty_run.py 2.0 /tmp/img.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/imgL /tmp/kd/imgR
+raw_bytes=12719 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/img.raw 40 120
    pic.png
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    Dimensions: 16x16 Size: 79 B                                Dimensions: 24x24 Size: 88 B
+
+
 
    readme.txt
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    @@ -1,1 +1,1 @@
 1  left readme                                              1  right readme
 ```
+
+The three blank rows between the size line and `readme.txt` are the **reserved
+image‑placement region** — the rows into which a real kitty terminal would paint the
+transmitted pixels; the plain‑PTY harness leaves them empty (see the capture‑limitation
+note below).
 
 The PNG routes to the **image** path (shows `Dimensions:`/`Size:`), while `readme.txt`
 diffs normally in the same view — confirming text and images coexist. That the image is
@@ -1447,7 +1659,7 @@ highlight race) at a longer wait:
 
 ```
 $ python3 /tmp/pty_run.py 1.5 /tmp/aftsm.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/smL /tmp/kd/smR
-raw_bytes=13002 child_exit=0
+raw_bytes=11790 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/aftsm.raw 40 120 | sed -n '1,5p'
    f1.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1478,25 +1690,27 @@ $ for w in 0.02 0.05 0.10 0.30 0.60 1.50; do \
 
 RUN 1:
 wait=0.02  raw_bytes=355    placeholder=1 diff_hunk=0
-wait=0.05  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=0.10  raw_bytes=16340  placeholder=0 diff_hunk=3
-wait=0.30  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=0.60  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=1.50  raw_bytes=13002  placeholder=0 diff_hunk=3
+wait=0.05  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.10  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.30  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.60  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=1.50  raw_bytes=11790  placeholder=0 diff_hunk=3
 
 RUN 2:
 wait=0.02  raw_bytes=355    placeholder=1 diff_hunk=0
-wait=0.05  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=0.10  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=0.30  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=1.50  raw_bytes=13002  placeholder=0 diff_hunk=3
+wait=0.05  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.10  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.30  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.60  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=1.50  raw_bytes=11790  placeholder=0 diff_hunk=3
 
 RUN 3:
 wait=0.02  raw_bytes=355    placeholder=1 diff_hunk=0
-wait=0.05  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=0.10  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=0.30  raw_bytes=13002  placeholder=0 diff_hunk=3
-wait=1.50  raw_bytes=13002  placeholder=0 diff_hunk=3
+wait=0.05  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.10  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.30  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=0.60  raw_bytes=11790  placeholder=0 diff_hunk=3
+wait=1.50  raw_bytes=11790  placeholder=0 diff_hunk=3
 ```
 
 Reading this honestly:
@@ -1504,16 +1718,22 @@ Reading this honestly:
 - **Before (`0.02 s`, stable all 3 runs):** `raw_bytes=355`, one placeholder line, zero hunks —
   only the `initialize`→`draw_screen` placeholder paint has occurred (`ui.go:L139`,
   `ui.go:L350`).
-- **After (`≥0.05 s`, stable all 3 runs):** `raw_bytes=13002`, zero placeholder, three `@@`
+- **After (`≥0.05 s`, stable all 3 runs):** `raw_bytes=11790`, zero placeholder, three `@@`
   hunks — `COLLECTION` and `DIFF` have both completed and the full side‑by‑side diff is
   rendered.
-- **Intermediate (observed once, RUN 1 `0.10 s`):** `raw_bytes=16340` — *larger* than the
-  settled `13002`. This is a transient extra frame: a `HIGHLIGHT`/`IMAGE`‑triggered
-  `rerender_diff` (`ui.go:L271`/`L273`) repaint captured mid‑stream before it settled back to
-  the stable `13002`. It is **timing‑sensitive** — it appeared in only 1 of 3 runs — because
-  for a 3‑file corpus the diff and highlight stages complete almost together, so the
-  progressive‑repaint window is very short. This transient is the concurrent‑fan‑out repaint
-  made visible; the `-race` witness below proves the same overlap deterministically.
+- **Intermediate (sporadic, load‑dependent — *not* present in the three runs above):**
+  occasionally a frame **larger** than the settled `11790` is captured. Extending the sweep to
+  25 runs caught it **7 times**, at no fixed wait (seen at `0.10`, `0.30`, `0.60` and `1.50 s`),
+  and its size **varied every time** — the distinct values observed were `13294`, `13894`,
+  `14779`, `15375`, `16156`, `16646` and `16807` bytes, each still `placeholder=0` with the full
+  `diff_hunk=3`. So it is not a *different* diff but an **extra repaint of the same diff**: a
+  `HIGHLIGHT`/`IMAGE`‑triggered `rerender_diff` (`ui.go:L271`/`L273`) captured mid‑stream before
+  the byte stream settled back to `11790`. It is **timing‑sensitive** — for a 3‑file corpus the
+  `DIFF` and `HIGHLIGHT` stages finish almost together, so the progressive‑repaint window is
+  very short and whether a capture lands inside it depends on scheduling/load (a fresh 60‑try
+  loop at `0.60 s` caught none; the 25‑run sweep caught seven). This transient is the concurrent
+  fan‑out repaint made visible; the `-race` witness below proves the same overlap
+  deterministically.
 
 ### Observed — the pipeline wiring, proven by the runtime stack
 
@@ -1538,7 +1758,7 @@ stages after `COLLECTION` are concurrent, not sequential. These are the function
 
 ### Why (causal explanation, `main.go` + `ui.go`)
 
-- **Synchronous startup (`main.go`).** `main` (`main.go:L107`) checks there are exactly two
+- **Synchronous startup (`main.go`).** `main` (`main.go:L102`) checks there are exactly two
   operands (`main.go:L108-110`), runs `set_diff_command(conf.Diff_cmd)` (`main.go:L111`, see
   Q7), builds the seven caches with `init_caches()` (`main.go:L114`, see Q3), and
   `create_formatters()` (`main.go:L115`). It resolves each operand with `get_remote_file`
@@ -1837,10 +2057,12 @@ path that every successful grid above exercised.
 ### `/dev/null` as an operand
 
 ```
-$ /app/kitty/launcher/kitten diff /dev/null /tmp/kd/L/changed.txt
-   /dev/null                                              /tmp/kd/L/changed.txt
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Binary file: 0 B                                       Binary file: 23 B
+$ python3 /tmp/pty_run.py 1.5 /tmp/devnull.raw -- /app/kitty/launcher/kitten diff --config NONE /dev/null /tmp/kd/L/changed.txt
+raw_bytes=2658 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/devnull.raw 40 120
+   /dev/null                                                   /tmp/kd/L/changed.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Binary file: 0 B                                            Binary file: 23 B
 ```
 
 `/dev/null` is classified as **not text** because `is_path_text` detects it with
