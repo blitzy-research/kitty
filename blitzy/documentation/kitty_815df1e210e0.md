@@ -171,7 +171,7 @@ PYTHONPATH=$PWD python3 harness.py                  # run the read-only harness 
 
 **Question.** What unfolds inside `HistoryBuf` as it fills, "stretches," and begins carving out new segments while a torrent of text arrives?
 
-**Answer (prose).** Tier 1 is segmented: each segment holds `SEGMENT_SIZE = 2048` lines `[kitty/history.c:15]`. `num_segments` **starts at 1** because `create_historybuf` `[kitty/history.c:117]` calls `add_segment` once (Observed: `initial ... num_segments: 1`). A new segment is carved **lazily** by `segment_for` → `add_segment` `[kitty/history.c:18-40]` when a push needs a line beyond the current segments' coverage — Observed exactly at the FIRST push past each 2048 multiple (push #2049 → 2 segments, push #4097 → 3 segments). `add_segment` `[kitty/history.c:18-29]` does a `realloc` of the segments array and then a **single `calloc` block per segment** sized `2048 * (xnum*sizeof(GPUCell) + xnum*sizeof(CPUCell) + sizeof(LineAttrs))`. The cell sizes `sizeof(GPUCell)==20` and `sizeof(CPUCell)==12` (32 bytes/cell) are enforced by `static_assert` `[kitty/data-types.h:221,228]`; `sizeof(LineAttrs)==1` **follows from the `union LineAttrs` definition** `[kitty/data-types.h:231-239]`, whose storage is a single `uint8_t val` (there is no `static_assert` on `LineAttrs`). For `xnum=80` the per-segment size therefore works out to `2048*(80*32+1) = 5,244,928` bytes (5.002 MiB) — **Inferred**, a calculation from those struct sizes and `SEGMENT_SIZE`, not a direct allocation measurement; it is corroborated at runtime by the RSS step at each carve (R5 carve milestones, Observed). The segment count is likewise corroborated by the derived `ceil(6000/2048)=3` (Inferred). Structurally, each carve performs a `realloc` of the segments array plus one multi-MiB `calloc`; no elapsed time was measured in this harness, so this is described as an allocation boundary, not as a perceived pause.
+**Answer (prose).** Tier 1 is segmented: each segment holds `SEGMENT_SIZE = 2048` lines `[kitty/history.c:15]`. `num_segments` **starts at 1** because `create_historybuf` `[kitty/history.c:117]` calls `add_segment` once (Observed: `initial ... num_segments: 1`). A new segment is carved **lazily** by `segment_for` → `add_segment` `[kitty/history.c:18-40]` when a push needs a line beyond the current segments' coverage — Observed exactly at the FIRST push past each 2048 multiple (push #2049 → 2 segments, push #4097 → 3 segments). `add_segment` `[kitty/history.c:18-29]` does a `realloc` of the segments array and then a **single `calloc` block per segment** sized `2048 * (xnum*sizeof(GPUCell) + xnum*sizeof(CPUCell) + sizeof(LineAttrs))`. The cell sizes `sizeof(GPUCell)==20` and `sizeof(CPUCell)==12` (32 bytes/cell) are enforced by `static_assert` `[kitty/data-types.h:221,228]`; `sizeof(LineAttrs)==4` **follows from the `union LineAttrs` definition** `[kitty/data-types.h:230-239]`: its embedded anonymous struct ends in the bit-field `PromptKind prompt_kind : 2`, and `PromptKind` is a plain `enum` whose underlying type is `int` (4 bytes). Because the extension is built **without** `-fshort-enums` (the default; the extension `cflags` at `[setup.py:499-503]` contain no such flag), that `enum` bit-field forces a **4-byte allocation unit** for the anonymous struct — and hence for the whole union — so the `uint8_t val` member does *not* shrink it to 1 byte. (There is no `static_assert` on `LineAttrs`, so this size is not compiler-checked, which is why a "1-byte union" assumption is easy to make but wrong here.) For `xnum=80` the per-segment size therefore works out to `2048*(80*32+4) = 5,251,072` bytes (5.008 MiB) — **Observed**: measured directly at runtime from the live segment's glibc allocation chunk and pinned to the `LineAttrs=4` request by same-process calibration (see the R1 output below), and independently corroborated by compiling the real `kitty/data-types.h`, which reports `sizeof(LineAttrs)==4`. Process RSS is far too coarse to distinguish the two candidate sizes (5,251,072 vs the mistaken 5,244,928 differ by only 6,144 bytes per segment), so RSS is *not* used to corroborate this figure. The segment count is likewise corroborated by the derived `ceil(6000/2048)=3` (Inferred). Structurally, each carve performs a `realloc` of the segments array plus one multi-MiB `calloc`; no elapsed time was measured in this harness, so this is described as an allocation boundary, not as a perceived pause.
 
 **Command.**
 
@@ -180,21 +180,35 @@ python3 setup.py build --ignore-compiler-warnings
 PYTHONPATH=$PWD python3 harness.py
 ```
 
-**Complete, unedited output (RUN1; RUN2 identical for every structural value and exact byte string — only the heap address `segments_ptr` differs, see Stability):**
+**Complete, unedited output (both runs shown; every structural value and the `LineAttrs=4` calibration result are identical — only the inert `segments_ptr` and the raw glibc chunk *word* differ, the latter because the allocator may back a block this large by `mmap` or by the main arena; see Stability):**
 
 ```
 ===== R1 SEGMENT CARVING [RUN1] =====
-initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 400636704, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
-per-segment calloc = 2048*(80*32+1) = 5244928 bytes (5.002 MiB)
+initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 333714320, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
+per-segment calloc request = 2048*(80*32+4) = 5251072 bytes (5.008 MiB)  [sizeof(LineAttrs)=4]
 CARVE push#2049 count=2049 num_segments 1->2
 CARVE push#4097 count=4097 num_segments 2->3
-final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 400500352, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
+final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 333714320, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
 derived ceil(6000/2048)=3 == num_segments(3) -> True
+MEASURED live segment glibc chunk = 5255168 B ; internal regions: cpu=1966080=80*2048*12  gpu=3276800=80*2048*20
+  calibrate LineAttrs=1: malloc(5244928) -> chunk 5246976 != live segment
+  calibrate LineAttrs=4: malloc(5251072) -> chunk 5255168 == live segment (MATCH)
+
+===== R1 SEGMENT CARVING [RUN2] =====
+initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 334495904, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
+per-segment calloc request = 2048*(80*32+4) = 5251072 bytes (5.008 MiB)  [sizeof(LineAttrs)=4]
+CARVE push#2049 count=2049 num_segments 1->2
+CARVE push#4097 count=4097 num_segments 2->3
+final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 334495904, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
+derived ceil(6000/2048)=3 == num_segments(3) -> True
+MEASURED live segment glibc chunk = 5251088 B ; internal regions: cpu=1966080=80*2048*12  gpu=3276800=80*2048*20
+  calibrate LineAttrs=1: malloc(5244928) -> chunk 5244944 != live segment
+  calibrate LineAttrs=4: malloc(5251072) -> chunk 5251088 == live segment (MATCH)
 ```
 
-**Observed vs Inferred.** **Observed:** `num_segments` growth (1→2→3) and the carve push indices (#2049, #4097), read from the live struct; corroborated by `gdb` (attaching to the live PID and reading `num_segments` at the struct offset returned `$1 = 3`, matching the `ctypes` read — see section (a)). **Inferred (derived, not directly measured):** the per-segment byte size `5,244,928` (a calculation from the `static_assert` cell sizes plus `SEGMENT_SIZE`) and the `ceil(6000/2048)=3` segment-count check. `segments_ptr` is an inert heap address — non-deterministic, not a reported magnitude.
+**Observed vs Inferred.** **Observed:** `num_segments` growth (1→2→3) and the carve push indices (#2049, #4097), read from the live struct; corroborated by `gdb` (attaching to the live PID and reading `num_segments` at the struct offset returned `$1 = 3`, matching the `ctypes` read — see section (a)). Also **Observed:** the per-segment allocation of `5,251,072` bytes — measured directly at runtime from the live segment's glibc allocation chunk and pinned to the `LineAttrs=4` request by same-process calibration (a `malloc(5,251,072)` reproduces the live segment's chunk in the same process, while `malloc(5,244,928)` does not — shown for both runs above), and independently corroborated by compiling the real header (`sizeof(LineAttrs)==4`). The internal region sizes read from the live pointers (`cpu = 1,966,080 = 80·2048·12`, `gpu = 3,276,800 = 80·2048·20`) independently confirm `sizeof(CPUCell)==12` and `sizeof(GPUCell)==20`. **Inferred (derived, not directly measured):** only the `ceil(6000/2048)=3` segment-count check. `segments_ptr` is an inert heap address — non-deterministic, not a reported magnitude; the raw glibc chunk *word* is likewise allocator-dependent (`5,255,168` via `mmap` in RUN1, `5,251,088` via the main arena in RUN2), which is exactly why the conclusion rests on same-process calibration rather than the bare number.
 
-**Stability.** RUN1 == RUN2 for every structural value (`num_segments`, carve indices `#2049`/`#4097`, final `count=6000`) and for the derived per-segment byte size. Only `segments_ptr` (a heap address) varies between runs.
+**Stability.** RUN1 == RUN2 for every structural value (`num_segments`, carve indices `#2049`/`#4097`, final `count=6000`), for the measured per-segment `calloc` request (`5,251,072` bytes), and for the calibration verdict (`LineAttrs=4`). The inert `segments_ptr` heap address varies between runs, and the raw glibc chunk *word* also shifts with the allocator path (`5,255,168` via `mmap` in RUN1 vs `5,251,088` via the main arena in RUN2) — but in every run same-process calibration matches that exact chunk to the `5,251,072` request and never to `5,244,928`, so the reported per-segment size is stable.
 
 ---
 
@@ -318,7 +332,7 @@ SATURATION: scrolled_by= 100  count= 100  ynum= 100
 
 **Question.** How do the underlying memory structures evolve as pressure builds — allocation (segment `calloc` plus ring-buffer growth), wrapping (circular indexing plus line reflow), and retention (the `ynum` cap on Tier 1, the `maximum_size` cap on Tier 2, and eviction/overwrite)?
 
-**Answer (prose).** With `HistoryBuf(200000, 80)` (Tier 2 disabled), pushing 205,000 lines pins `count` at `ynum = 200000` — the Tier-1 **retention cap** (`historybuf_push` `[kitty/history.c:276-286]` overwrites in place once full, evicting the oldest each push). `num_segments` reaches `98 == ceil(200000 / 2048)`. Total Tier-1 allocation is a derived `98 * 5,244,928 = 514,002,944` bytes (490.2 MiB) — a calculation from the observed `num_segments` and the per-segment `calloc` size, not a direct measurement (see Observed vs Inferred) — which the measured process RSS delta tracks closely (measured ~479–488 MiB across the two runs; this RSS figure is the only non-deterministic value, reported as approximate, and its run-to-run variance is attributed to lazy `calloc` page commitment). `tracemalloc` shows only ~5–9 KB of Python-object delta because the large `calloc` blocks are C allocations invisible to `tracemalloc`. **Wrapping/retention:** circular indexing `index_of` `[kitty/history.c:152-158]` maps logical→physical with `(start_of_data + idx) % ynum` (reverse-indexed, line 0 = newest); the Tier-1 retention cap is `ynum`, and the Tier-2 retention cap is `maximum_size` with FIFO overwrite (from R2/R3).
+**Answer (prose).** With `HistoryBuf(200000, 80)` (Tier 2 disabled), pushing 205,000 lines pins `count` at `ynum = 200000` — the Tier-1 **retention cap** (`historybuf_push` `[kitty/history.c:276-286]` overwrites in place once full, evicting the oldest each push). `num_segments` reaches `98 == ceil(200000 / 2048)`. Total Tier-1 allocation is `98 * 5,251,072 = 514,605,056` bytes (490.77 MiB) — the observed `num_segments` times the per-segment `calloc` size measured at runtime in R1 (see Observed vs Inferred) — which the measured process RSS delta tracks to the same order of magnitude (~489–490 MiB across the two runs). RSS is expected to sit at or just below the allocated total because pages are committed lazily, and at this granularity it cannot pin the exact byte figure; it is the only non-deterministic value here, reported as approximate, and its run-to-run variance is attributed to lazy `calloc` page commitment. `tracemalloc` shows only ~5–6 KB of Python-object delta because the large `calloc` blocks are C allocations invisible to `tracemalloc`. **Wrapping/retention:** circular indexing `index_of` `[kitty/history.c:152-158]` maps logical→physical with `(start_of_data + idx) % ynum` (reverse-indexed, line 0 = newest); the Tier-1 retention cap is `ynum`, and the Tier-2 retention cap is `maximum_size` with FIFO overwrite (from R2/R3).
 
 **Command.**
 
@@ -332,26 +346,26 @@ PYTHONPATH=$PWD python3 harness.py
 ```
 ===== R5 ALLOCATION/RETENTION [RUN1] =====
 HistoryBuf(200000,80) pagerhist_ptr=0 (0=Tier2 disabled)
-per-segment calloc = 5244928 B (5.002 MiB)
+per-segment calloc = 5251072 B (5.008 MiB)
 pushed 205000 -> count=200000 RETENTION count==ynum? True num_segments=98
 ceil(200000/2048)=98 == num_segments? True
-total seg alloc = 98*5244928 = 514002944 B (490.2 MiB)
-RSS delta = 490336 KB (~478.8 MiB) ; tracemalloc py-delta = 5254 B (C calloc untracked)
-carve milestones {count:(num_segments,rss_KB)} = {1: (1, 64), 2048: (1, 64), 2049: (2, 64), 4096: (2, 64), 4097: (3, 2624), 200000: (98, 490336)}
+total seg alloc = 98*5251072 = 514605056 B (490.77 MiB)
+RSS delta = 501316 KB (~489.6 MiB) ; tracemalloc py-delta = 6455 B (C calloc untracked)
+carve milestones {count:(num_segments,rss_KB)} = {1: (1, 144), 2048: (1, 5264), 2049: (2, 5276), 4096: (2, 10400), 4097: (3, 10412), 200000: (98, 501316)}
 
 ===== R5 ALLOCATION/RETENTION [RUN2] =====
 HistoryBuf(200000,80) pagerhist_ptr=0 (0=Tier2 disabled)
-per-segment calloc = 5244928 B (5.002 MiB)
+per-segment calloc = 5251072 B (5.008 MiB)
 pushed 205000 -> count=200000 RETENTION count==ynum? True num_segments=98
 ceil(200000/2048)=98 == num_segments? True
-total seg alloc = 98*5244928 = 514002944 B (490.2 MiB)
-RSS delta = 499608 KB (~487.9 MiB) ; tracemalloc py-delta = 9478 B (C calloc untracked)
-carve milestones {count:(num_segments,rss_KB)} = {1: (1, 628), 2048: (1, 3940), 2049: (2, 4088), 4096: (2, 9072), 4097: (3, 9216), 200000: (98, 499608)}
+total seg alloc = 98*5251072 = 514605056 B (490.77 MiB)
+RSS delta = 500792 KB (~489.1 MiB) ; tracemalloc py-delta = 4967 B (C calloc untracked)
+carve milestones {count:(num_segments,rss_KB)} = {1: (1, 132), 2048: (1, 5128), 2049: (2, 5272), 4096: (2, 10256), 4097: (3, 10400), 200000: (98, 500792)}
 ```
 
-**Observed vs Inferred.** **Observed:** the `count == ynum` retention cap (pinned at 200000) and `num_segments == 98` — both read from the live struct; the measured RSS delta (490336 KB / ~478.8 MiB in RUN1, 499608 KB / ~487.9 MiB in RUN2); the measured `tracemalloc` py-delta (5254 B / 9478 B, confirming the large C `calloc` blocks are untracked by `tracemalloc`); and the carve milestones. **Inferred (derived, not directly measured):** (i) the total Tier-1 allocation `98 * 5,244,928 = 514,002,944` bytes (490.2 MiB) — a calculation from the observed `num_segments` times the per-segment `calloc` size (itself derived from the cell/attrs struct sizes, see R1), not a directly measured quantity; and (ii) the *cause* of the RSS run-to-run variance (lazy `calloc` page commitment), which explains why RSS is non-deterministic while the structural values are not. The structural values (`count`, `num_segments`, total seg alloc) are IDENTICAL across both runs; only the measured RSS (490336 vs 499608 KB → ~479–488 MiB), the `tracemalloc` py-delta (5254 vs 9478 B), and the per-milestone RSS columns differ run-to-run — reproduced, NOT engineered away.
+**Observed vs Inferred.** **Observed:** the `count == ynum` retention cap (pinned at 200000) and `num_segments == 98` — both read from the live struct; the per-segment `calloc` size (`5,251,072` bytes, measured at runtime in R1 and reused here); the measured RSS delta (501316 KB / ~489.6 MiB in RUN1, 500792 KB / ~489.1 MiB in RUN2); the measured `tracemalloc` py-delta (6455 B / 4967 B, confirming the large C `calloc` blocks are untracked by `tracemalloc`); and the carve milestones. **Inferred (derived, not directly measured):** (i) the total Tier-1 allocation `98 * 5,251,072 = 514,605,056` bytes (490.77 MiB) — the observed `num_segments` times the R1-measured per-segment `calloc` size; the multiplication is a calculation, but its per-segment input is a measured quantity (see R1), not an assumption; and (ii) the *cause* of the RSS run-to-run variance (lazy `calloc` page commitment), which explains why RSS is non-deterministic while the structural values are not. The structural values (`count`, `num_segments`, per-segment size, total seg alloc) are IDENTICAL across both runs; only the measured RSS (501316 vs 500792 KB → ~489–490 MiB), the `tracemalloc` py-delta (6455 vs 4967 B), and the per-milestone RSS columns differ run-to-run — reproduced, NOT engineered away.
 
-**Stability.** Structural values (`count = 200000`, `num_segments = 98`, total seg alloc = 514,002,944 B) are identical RUN1 == RUN2 at a scale of 205,000 pushes into `ynum = 200000`. The measured RSS delta is approximate and non-deterministic (490336 KB / ~478.8 MiB vs 499608 KB / ~487.9 MiB, i.e. ~479–488 MiB), with the cause stated (lazy `calloc` page commitment); the `tracemalloc` py-delta (5254 vs 9478 B) and the per-milestone RSS columns likewise vary. The variance is reproduced across the two identical runs, not smoothed away.
+**Stability.** Structural values (`count = 200000`, `num_segments = 98`, per-segment = 5,251,072 B, total seg alloc = 514,605,056 B) are identical RUN1 == RUN2 at a scale of 205,000 pushes into `ynum = 200000`. The measured RSS delta is approximate and non-deterministic (501316 KB / ~489.6 MiB vs 500792 KB / ~489.1 MiB, i.e. ~489–490 MiB), with the cause stated (lazy `calloc` page commitment); the `tracemalloc` py-delta (6455 vs 4967 B) and the per-milestone RSS columns likewise vary. The variance is reproduced across the two identical runs, not smoothed away.
 
 ---
 
@@ -361,7 +375,7 @@ carve milestones {count:(num_segments,rss_KB)} = {1: (1, 628), 2048: (1, 3940), 
 
 **Smoothness versus hesitation (R1/R3).** No elapsed time was measured in this investigation, so the boundaries below are described structurally — by the work each performs — not as timed pauses. In steady state, pushing a line within an existing segment and evicting/overwriting once Tier 1 is full are in-place operations that allocate nothing. The structural discontinuities — points where the work-per-push changes — are:
 
-- **The segment carve (R1)** — a `realloc` of the segments array plus one multi-MiB `calloc` (a derived `5,244,928` bytes for `xnum=80`; see R1) at each 2048-line crossing (`add_segment` `[kitty/history.c:18-29]`). Observed at pushes #2049 and #4097; the relative size or duration of this allocation versus others was not measured or ranked.
+- **The segment carve (R1)** — a `realloc` of the segments array plus one multi-MiB `calloc` (a runtime-measured `5,251,072` bytes for `xnum=80`; see R1) at each 2048-line crossing (`add_segment` `[kitty/history.c:18-29]`). Observed at pushes #2049 and #4097; the relative size or duration of this allocation versus others was not measured or ranked.
 - **Tier-1 saturation onset (R2/R4)** — the exact push where `count == ynum` flips behavior from "grow" to "evict"; from that push onward every write does eviction work (and, if Tier 2 is enabled, serialization + ring write).
 - **The 1 MB ring-growth steps (R3a)** — Tier 2 grows in ≥1 MB chunks (`pagerhist_extend` `[kitty/history.c:89-101]`) at pushes #5126/#10241/#15356/#20471; each step allocates a new ring and copies the used bytes across.
 - **The FIFO overwrite ceiling (R3b)** — once the ring hits `maximum_size`, growth stops and the oldest bytes are overwritten in place by `ringbuf_memcpy_into` `[3rdparty/ringbuf/ringbuf.h:140-154]`; this performs no allocation but silently discards the oldest archived bytes.
@@ -398,7 +412,7 @@ Every `file:line` below was confirmed accurate at commit `815df1e210e0a9ab4622f5
 | `HistoryBufSegment {gpu_cells, cpu_cells, line_attrs}` | `kitty/data-types.h:262-266` | Segment struct |
 | `PagerHistoryBuf {ringbuf, maximum_size, rewrap_needed}` | `kitty/data-types.h:268-272` | Tier-2 struct |
 | `HistoryBuf {…xnum, ynum, num_segments; segments; pagerhist; line; start_of_data, count}` | `kitty/data-types.h:283-290` | Tier-1 struct |
-| `static_assert` GPUCell==20 `[:221]` / CPUCell==12 `[:228]`; `union LineAttrs` (`uint8_t val`, no assert) `[:231-239]` | `kitty/data-types.h:215-239` | Per-cell byte sizes (GPU+CPU = 32 B/cell); LineAttrs is 1 B by union definition |
+| `static_assert` GPUCell==20 `[:221]` / CPUCell==12 `[:228]`; `union LineAttrs` with `PromptKind prompt_kind : 2` enum bit-field, no assert `[:230-239]` | `kitty/data-types.h:215-239` | Per-cell byte sizes (GPU+CPU = 32 B/cell); LineAttrs is **4 B** (the `enum` bit-field forces a 4-byte allocation unit; no `-fshort-enums`), runtime-measured |
 | `alloc_historybuf(MAX(scrollback, lines), …)` | `kitty/screen.c:130` | `ynum = MAX(scrollback, lines)` |
 | `INDEX_UP` macro (`history_line_added_count++` at `:1559`) | `kitty/screen.c:1552-1567` | Canonical ingest path |
 | `screen_reset_dirty` (resets `history_line_added_count`) | `kitty/screen.c:2598-2601` | Post-render reset |
