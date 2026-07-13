@@ -1,219 +1,316 @@
-# How `kitty` handles a child that prints a few lines and exits 0
+# How kitty handles a child that prints a few lines and exits with status 0
 
-## 1. Title & scope
+An investigative, runtime-observed answer, grounded in captured output and `file:line` source citations.
 
-This document answers, with **runtime‑observed evidence** and **cited `file:line` source references**, how the
-[`kitty`](https://github.com/kovidgoyal/kitty) terminal emulator behaves from the moment a launched child
-program is running, through it printing a few lines to standard output, to it exiting with status `0` and the
-window being torn down.
+## Scope and provenance
 
-| Item | Value |
-|------|-------|
-| Repository | `kovidgoyal/kitty` |
-| Commit (HEAD) | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` |
-| Branch | `kitty_815df1e210e0` (working branch `blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad`) |
-| Built version | `kitty 0.35.2 created by Kovid Goyal` |
-| Intended container | `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (from `ghcr.io/scaleapi/swe-atlas`) |
+- **Investigated software:** `kitty` terminal emulator, repository `kovidgoyal/kitty`.
+- **Investigated (source) commit:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Every `file:line` citation in this document refers to the tree at that commit.
+- **This document lives** on branch `blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad`. The branch `HEAD` at authoring time was the commit that first added this file (`9fd0da15ff09436c0c3c40eb7dbdda3556358f34`, *"docs: add investigative answer for kitty child-exit-0 behavior"*); this HEAD is the **documentation** commit, **not** a commit of the investigated source. No source file under `kitty/`, `kittens/`, `tools/`, or `shell-integration/` was modified — the only change on this branch is the creation of this Markdown file.
+- **Methodology (per the SWE-AtlasQnA rules):** the relevant code paths were **built and run first**, real output was captured with temporary observation scripts, and only then was this answer written. Every behavioral claim is presented next to the exact command that produced it and the unedited output, and is labeled **[observed]**, **[source-derived]**, **[inferred]**, or **[non-canonical corroboration]**. All temporary scripts live outside the repository (under `/tmp/kwork`) and the repository is left byte-for-byte unchanged apart from this file.
 
-The nine questions answered below, in order, are: (1) end‑to‑end flow; (2) kitty's own exit code; (3) the full
-completion message(s); (4) the child‑tracking component; (5) the message‑generating function; (6) the OS signal;
-(7) the status‑retrieval system call; (8) the exit‑status transport; and (9) where the child's printed output
-actually appears.
+### The nine questions
 
-> **Methodology (binding rule: run first, then write).** Every value below was produced by building kitty in its
-> default configuration and exercising its real entry points inside the environment described in §2, capturing the
-> raw output *before* writing this document. Values that could not be observed at runtime are explicitly labelled
-> **inferred** and grounded in a `file:line`. Where a debug facility (kitty's own `--dump-bytes`) was used, it is
-> labelled as such and used only to corroborate a value already observed through a canonical path.
+1. End-to-end flow from "child is running" through "child exits 0, having printed a few lines to stdout".
+2. Kitty's own process exit code when the child exits with status 0.
+3. The full, exact text of any completion message shown to the user.
+4. Which component tracks the child across its lifetime.
+5. The single function that turns the child's exit status into the user-facing message.
+6. The OS signal kitty listens for to learn a child terminated.
+7. The system call kitty uses to retrieve the child's exit status.
+8. How the exit status travels from the shell to the message-generating function (protocol / escape sequence).
+9. Where the child's printed output actually appears.
 
----
+## Environment and canonical build
 
-## 2. Environment & build
+### Honest environment disclosure (finding of provenance)
 
-### 2.1 Canonical build
+The project's setup instructions name a private image, `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0...` from `ghcr.io/scaleapi/swe-atlas`. That image is **private and could not be pulled** in this sandbox (no registry credentials). However, **this sandbox host is itself the coding-agent environment** — it contains the same toolchain (Python 3.11, Go 1.22, a C toolchain, and all of kitty's build dependencies) — so the canonical build and all runs below were performed **natively on this host**. This deviation from "run inside the named container" is disclosed explicitly here; it does not affect any observed value, because the build and runs use kitty's real, default entry points.
 
-The canonical build is `make`, whose `all:` target runs `python3 setup.py`:
+### Build host and toolchain **[observed]**
 
 ```
-$ sed -n '12,13p' Makefile
-all:
-	python3 setup.py $(VVAL)
-```
-
-In this environment kitty was built (per the provisioned toolchain) with `setup.py build`, producing the launcher
-`kitty/launcher/kitty`, the companion `kitty/launcher/kitten`, and the C extension `kitty/fast_data_types.so`
-(all git‑ignored build artefacts). The exact toolchain present:
-
-```
-$ /usr/local/bin/python3.11 --version ; /usr/local/go/bin/go version ; /bin/bash --version | head -1 ; gcc --version | head -1
-Python 3.11.13
+$ cat /tmp/kwork/evidence/build_provenance.txt
+### uname / OS
+Linux reverse-code-generator-04182660-cdbt8 6.6.122+ #1 SMP Thu Apr  2 09:59:00 UTC 2026 x86_64 GNU/Linux
+PRETTY_NAME="Ubuntu 25.10"
+NAME="Ubuntu"
+### interpreter + toolchain
+python3 -> /usr/local/bin/python3.11 = Python 3.11.13
 go version go1.22.12 linux/amd64
-GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
 gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
+### git provenance
+branch=blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad
+HEAD=9fd0da15ff09436c0c3c40eb7dbdda3556358f34
+investigated source commit target = 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 ```
 
-Supported‑version anchors: `pyproject.toml` line 2 `requires-python = ">=3.8"` (CI‑tested version 3.11);
-`go.mod` line 3 `go 1.22`.
+`python3` is a shim pointing at Python 3.11.13 (kitty's runtime interpreter for this build); the system default is 3.13, but the project's highest explicitly-supported CI version is 3.11, so 3.11 is used.
 
-### 2.2 Headless display
+### Canonical default build: `make` **[observed]**
 
-kitty is a GPU terminal, so a virtual display and a software GL backend were used to obtain a real on‑screen
-window:
+Kitty's canonical build is `make`, whose `all:` target invokes `python3 setup.py` (default, no `--debug`). A full clean rebuild:
 
 ```
-$ Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
-$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
+$ PATH=/usr/local/go/bin:$PATH GOPATH=/root/go CI=true make clean
+$ ( set -o pipefail; time make > /tmp/kwork/evidence/make_full.log 2>&1; echo "MAKE_EXIT=${PIPESTATUS[0]}" ) 2> /tmp/kwork/evidence/make_full.time
+
+$ head -16 /tmp/kwork/evidence/make_full.log
+python3 setup.py
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+[1/85] Compiling kitty/screen.c ...
+[2/85] Compiling kitty/unicode-data.c ...
+[3/85] Compiling [x11] glfw/x11_window.c ...
+[4/85] Compiling kitty/glfw.c ...
+[5/85] Compiling kitty/graphics.c ...
+[6/85] Compiling kitty/child-monitor.c ...
+[7/85] Compiling kitty/fonts.c ...
+[8/85] Compiling kitty/shaders.c ...
+
+$ cat /tmp/kwork/evidence/make_full.time
+real	1m10.263s
+user	2m31.647s
+sys	0m23.974s
 ```
 
-All GUI runs below use `DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1`.
+The build exits **0** (`MAKE_EXIT=0`), compiles 85 native units and links the Go `kitten` tools, and produces the launcher and C extension:
 
-### 2.3 Canonical invocation and configuration
+- `kitty/launcher/kitty` and `kitty/launcher/kitten`
+- `kitty/fast_data_types.so`
 
-There is no user config at `~/.config/kitty/kitty.conf`, so `--config NONE` is equivalent to the shipped defaults;
-it is passed explicitly to make the "default configuration" claim unambiguous. The canonical reproduction command
-used throughout is:
+The build auto-disables the Wayland backend because `wayland-protocols` dev headers are absent, and builds **x11-only**. This is a supported default reaction and does **not** affect the child-exit investigation (the process/PTY/signal/parser paths are backend-independent). The resulting version string is:
+
+```
+$ ./kitty/launcher/kitty --version
+kitty 0.35.2 created by Kovid Goyal
+```
+
+### How runs were performed (headless GUI) **[observed]**
+
+Because kitty is a GPU terminal, runs use a headless X server plus software GL:
+
+```
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp     # started once; PID captured; torn down via trap
+export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
+```
+
+The canonical reproduction command used throughout is:
 
 ```
 ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0'
 ```
 
-All reported values come from this canonical path unless a line is explicitly labelled **configured (non‑default)**
-or **inferred**.
+`--config NONE` guarantees **default** configuration (no user `kitty.conf` is read), so every observed value reflects what a normal user sees with defaults.
 
----
+### Safe temporary-file handling **[observed]**
 
-## 3. Executive summary
+All observation artifacts live under a dedicated directory created with `mktemp -d` semantics (mode `700`), background servers have their PIDs captured and are stopped via shell `trap`, pipelines use `set -o pipefail`, and each capture checks its exit status. The full, self-contained harnesses are reproduced verbatim in the **Reproducibility** section; nothing is written inside the repository.
 
-When kitty launches a child on a pseudo‑terminal (PTY) and the child prints a few lines and exits `0`, kitty's
-`ChildMonitor` reads the child's bytes from the PTY master, feeds them through the VT parser into the on‑screen
-`Screen` grid (that is where the output appears), learns of the child's death via a **`SIGCHLD`** delivered through
-a **signalfd**, reaps the child with **`waitpid(-1,&status,WNOHANG)`** (the `wait4` syscall on Linux), and tears the
-window down; by default the window closes. kitty's *own* process then exits `0`. A user‑visible "finished" message
-is **not** shown in the default configuration; it appears only when either `--hold`/the `hold` kitten shows its
-banner, or shell integration plus a non‑default `notify_on_cmd_finish` fires a desktop notification whose body
-carries the exit status. The exit status reaches that notification not via the OS signal but via the **OSC 133
-`D;<code>`** semantic‑prompt escape sequence emitted by the integrated shell.
+## Executive summary
 
-One‑line answers:
+When kitty launches a child that prints a few lines and exits 0:
 
-1. **End‑to‑end flow** — `Child.fork()` spawns the program on a PTY; the child writes the PTY slave; `ChildMonitor` reads the PTY master (`read_bytes`), parses to the `Screen`, renders the grid; on exit the OS raises `SIGCHLD` (signalfd) → `reap_children` `waitpid` reaps status 0 → `on_child_death(window_id)` tears the window down; by default the window closes.
-2. **kitty's own exit code** — `0` (observed stable across 5 runs), independent of the child's status.
-3. **Completion message** — two *separate* messages: the `--hold`/`hold`‑kitten green banner `Press Enter or Esc to exit` (no status), and the shell‑integration notification body `Command echo hello finished with status: 0.\nClick to focus.` (carries the status; non‑default).
-4. **Child‑tracking component** — the `ChildMonitor` (C core `kitty/child-monitor.c` + Boss registration in `kitty/boss.py`).
-5. **Message‑generating function** — `Window.handle_cmd_end()` (`kitty/window.py:1408`).
-6. **Signal** — `SIGCHLD` (numeric 17), delivered via a signalfd.
-7. **System call** — `waitpid(-1,&status,WNOHANG)` (`kitty/child-monitor.c:1418`), i.e. the `wait4` syscall on Linux.
-8. **Status transport** — the OSC 133 `D;<exit_code>` (FinalTerm/iTerm2) escape sequence emitted by the integrated shell; parsed at `kitty/vt-parser.c:536` → `kitty/screen.c:2350-2352` → `handle_cmd_end`.
-9. **Output location** — kitty's on‑screen terminal grid (the `Screen` buffer, GPU‑rendered), **not** kitty's own stdout/stderr.
+- The child runs on the **slave side of a pseudo-terminal (PTY)**; kitty's `ChildMonitor` owns the **master** side, the child PID, and the window's `Screen`.
+- The child's printed bytes are read from the PTY master, fed to kitty's VT parser, written into the `Screen` line buffer, and rendered into kitty's **on-screen terminal grid** by the GPU renderer — they appear **in the kitty window**, not on kitty's own stdout/stderr.
+- The child's termination is delivered to kitty as the OS signal **`SIGCHLD`** (observed as `signalfd` siginfo `ssi_signo=17`, `ssi_code=1`=`CLD_EXITED`), and kitty reaps the zombie with **`wait4(-1, &status, WNOHANG)`** (the `waitpid` family).
+- **Kitty's own process exits with code `0`** — independently of the child's status (a child exiting 5 or 42 still yields kitty exit 0).
+- **Two different "completion" behaviors** must be distinguished:
+  - The direct-reap path (`SIGCHLD` → `wait4`) carries **no** exit status into the window callback `on_child_death(window_id)` (it receives only a window id). By **default** the window simply **closes/tears down**; there is **no persistent completion message** in the default case.
+  - A **completion message** appears only via **shell integration**: the integrated shell emits an **OSC 133 `D;<status>`** escape sequence, which kitty decodes and — when `notify_on_cmd_finish` is enabled — turns into the notification body **`Command <cmd> finished with status: 0.\nClick to focus.`** via `Window.handle_cmd_end()`.
+  - The `--hold` **flag** holds the window open with an **interactive shell** (env `KITTY_HOLD=1`), showing **no banner**; the separate `kitty +hold` / hold-kitten entry point shows the green banner **`Press Enter or Esc to exit`**.
+- **Default window teardown** for a child with no lingering PTY writer is driven by **PTY end-of-file (EIO/EOF)**, not by the `SIGCHLD` reap: with `close_on_child_death` at its default (`no`), kitty removes the window when `read()` on the PTY master returns EOF/EIO; with `close_on_child_death=yes`, the reap immediately removes the window.
 
----
+### One-line answers
 
-## Q1 — End‑to‑end flow (child running → prints stdout → exits 0 → teardown)
+1. **End-to-end flow:** `Child.fork()` spawns the program on a PTY slave → child prints to stdout → `ChildMonitor` reads the PTY master (`read_bytes`) → VT parser → `Screen` buffer → GPU render into kitty's grid; on exit, `SIGCHLD` → `wait4` reaps, and the window tears down (default) via PTY EOF. **[observed + source-derived]**
+2. **Kitty's own exit code:** `0`, stable across 5 runs and independent of the child's status. **[observed]**
+3. **Full completion message:** default direct launch shows **none**; shell-integration notification body is exactly `Command echo hello finished with status: 0.\nClick to focus.`; `kitty +hold` shows `Press Enter or Esc to exit`. **[observed]**
+4. **Child-tracking component:** the **`ChildMonitor`** (C core `kitty/child-monitor.c`; created and populated from `kitty/boss.py`), which owns each child's PID, PTY master fd, and `Screen`. **[source-derived]**
+5. **Message-generating function:** **`Window.handle_cmd_end()`** [`kitty/window.py:1408`], which builds the `Command … finished with status: …` body. **[observed + source-derived]**
+6. **Termination signal:** **`SIGCHLD`** (signal 17), observed via `signalfd` siginfo. **[observed]**
+7. **Status-retrieval system call:** **`wait4(-1, &status, WNOHANG)`** — the `waitpid` family — in `reap_children()`. **[observed + source-derived]**
+8. **Status transport:** the **shell-reported command status** travels via the **OSC 133 `D;<code>`** escape sequence emitted by the integrated shell → `vt-parser.c` (OSC 133 dispatch) → `screen.c` `shell_prompt_marking()` (case `D`) → `Window.handle_cmd_end()`. **[observed + source-derived]**
+9. **Output location:** the child's stdout appears in **kitty's on-screen terminal grid** (the kitty window), read from the PTY master; it does **not** appear on kitty's own stdout/stderr. **[observed]**
 
-**Command**
+## Q1 — End-to-end flow (running → prints → exits 0)
+
+### Command **[observed]**
 
 ```
 $ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
-$ strace -f -e trace=signalfd4,rt_sigprocmask,wait4,read -e signal=all -o /tmp/kitty_sig.strace \
+$ strace -f -e trace=signalfd4,rt_sigprocmask,wait4,read -e signal=all -e read=all \
+    -o /tmp/kwork/evidence/kitty.strace \
     ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0'
+$ echo "kitty_exit=$?"
+kitty_exit=0
 ```
 
-**Raw output** (the exact death‑sequence window from the child‑monitor I/O thread, TID `93767`; the child `sh`
-is PID `93768`):
+### Raw output — the contiguous death window from the strace **[observed]**
 
 ```
-93767 read(8, "hello\r\nworld\r\n", 1048576) = 14
-93768 +++ exited with 0 +++
-93767 read(8, 0x57cc861ae50e, 1048562)  = -1 EIO (Input/output error)
-93767 read(7, "\21\0\0\0\0\0\0\0\1\0\0\0Hn\1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096) = 128
-93767 read(7, 0x799ff35143a0, 4096)     = -1 EAGAIN (Resource temporarily unavailable)
-93767 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 93768
-93767 wait4(-1, 0x799fc4f87e50, WNOHANG, NULL) = -1 ECHILD (No child processes)
+$ cat /tmp/kwork/evidence/q6q7_window.txt
+146320 read(8, "hello\r\nworld\r\n", 1048576) = 14
+146321 +++ exited with 0 +++
+146320 read(8, 0x585866c7c78e, 1048562) = -1 EIO (Input/output error)
+146320 read(7, "\21\0\0\0\0\0\0\0\1\0\0\0\221;\2\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096) = 128
+146320 read(7, 0x7c8262b143a0, 4096)    = -1 EAGAIN (Resource temporarily unavailable)
+146320 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 146321
+146320 wait4(-1, 0x7c82346c2e50, WNOHANG, NULL) = -1 ECHILD (No child processes)
 ```
 
-The window then closes and the kitty process returns exit `0` (see Q2). fd `8` is the PTY master; fd `7` is the
-signalfd (see Q6).
+Here TID `146320` is kitty's monitor thread, `146321` is the child. Reading top to bottom: the monitor reads the child's `hello\r\nworld\r\n` (14 bytes) from PTY master fd 8; the child exits 0; the next PTY read returns `EIO` (the PTY-EOF condition after the last writer closed); a `signalfd` read on fd 7 delivers the `SIGCHLD` siginfo; and `wait4` reaps the child (returning pid `146321` with `WIFEXITED && WEXITSTATUS==0`), then a second `wait4` returns `ECHILD`.
 
-**Code citation** — the pipeline is anchored in the following verbatim lines.
+### The spawn and wiring **[source-derived]**
 
-Spawn — `kitty/child.py:276,281,329-330,333,337-338`:
+The child is created by `Child.fork()`, which opens a PTY and calls the native `spawn`:
 
-```
+`kitty/child.py:276-283` (contiguous):
+
+```python
     def fork(self) -> Optional[int]:
+        if self.forked:
+            return None
+        opts = fast_data_types.get_options()
+        self.forked = True
         master, slave = openpty()
+        stdin, self.stdin = self.stdin, None
+        ready_read_fd, ready_write_fd = os.pipe()
+```
+
+`kitty/child.py:327-340` (contiguous) — the native `spawn` is called and the resulting PID and PTY **master** fd are stored on the `Child`:
+
+```python
+        self.final_exe = final_exe = which(argv[0]) or argv[0]
+        self.final_argv0 = argv[0]
         if self.hold:
             argv = cmdline_for_hold(argv)
+            final_exe = argv[0]
+        env = tuple(f'{k}={v}' for k, v in self.final_env.items())
         pid = fast_data_types.spawn(
+            final_exe, cwd, tuple(argv), env, master, slave, stdin_read_fd, stdin_write_fd,
+            ready_read_fd, ready_write_fd, tuple(handled_signals), kitten_exe(), opts.forward_stdio)
+        os.close(slave)
         self.pid = pid
         self.child_fd = master
+        if stdin is not None:
+            os.close(stdin_read_fd)
 ```
 
-PTY‑master read — `kitty/child-monitor.c:1337,1345,1354,1355`:
+Inside the native `spawn`, the child's stdin/stdout/stderr are redirected to the PTY **slave** — so everything the child prints goes down the PTY, `kitty/child.c:136-146` (contiguous):
 
+```c
+            }
+            // Redirect stdin/stdout/stderr to the pty
+            if (safe_dup2(slave, STDOUT_FILENO) == -1) exit_on_err("dup2() failed for fd number 1");
+            if (safe_dup2(slave, STDERR_FILENO) == -1) exit_on_err("dup2() failed for fd number 2");
+            if (stdin_read_fd > -1) {
+                if (safe_dup2(stdin_read_fd, STDIN_FILENO) == -1) exit_on_err("dup2() failed for fd number 0");
+                safe_close(stdin_read_fd, __FILE__, __LINE__);
+                safe_close(stdin_write_fd, __FILE__, __LINE__);
+            } else {
+                if (safe_dup2(slave, STDIN_FILENO) == -1) exit_on_err("dup2() failed for fd number 0");
+            }
 ```
+
+### Reading output and detecting death **[source-derived]**
+
+The monitor reads the PTY master into the VT parser's write buffer. `kitty/child-monitor.c:1336-1356` (contiguous):
+
+```c
+static bool
 read_bytes(int fd, Screen *screen) {
+    ssize_t len;
+    size_t available_buffer_space;
+
+    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
+    if (!available_buffer_space) return true;
+
+    while(true) {
         len = read(fd, buf, available_buffer_space);
+        if (len < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno != EIO) perror("Call to read() from child fd failed");
+            vt_parser_commit_write(screen->vt_parser, 0);
+            return false;
+        }
+        break;
+    }
     vt_parser_commit_write(screen->vt_parser, len);
     return len != 0;
+}
 ```
 
-I/O‑loop death dispatch — `kitty/child-monitor.c:1519,1526,1535`:
+Two distinct death-detection outcomes live in this one function: an `EIO` read (PTY EOF, last writer gone) commits 0 bytes and **returns `false`** (lines 1346-1350), and a clean zero-length read also **returns `false`** via `len != 0` (line 1355). Either way, `read_bytes` returning `false` signals the child is gone.
 
-```
+The monitor's I/O loop consumes both the signal path and the PTY path. `kitty/child-monitor.c:1516-1537` (contiguous):
+
+```c
+            if (children_fds[1].revents && POLLIN) {
+                SignalSet ss = {0};
+                data_received = true;
                 read_signals(children_fds[1].fd, handle_signal, &ss);
+                if (ss.kill_signal || ss.reload_config) {
+                    children_mutex(lock);
+                    if (ss.kill_signal) kill_signal_received = true;
+                    if (ss.reload_config) reload_config_signal_received = true;
+                    children_mutex(unlock);
+                }
                 if (ss.child_died) reap_children(self, OPT(close_on_child_death));
+            }
+            for (i = 0; i < self->count; i++) {
+                if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
+                    data_received = true;
+                    has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);
+                    if (!has_more) {
+                        // child is dead
+                        children_mutex(lock);
                         children[i].needs_removal = true;
+                        children_mutex(unlock);
+                    }
 ```
 
-Direct‑child window teardown callback — `kitty/boss.py:881`:
+Note `reap_children(self, OPT(close_on_child_death))` at line 1526: by **default** `close_on_child_death` is `no`, so the reap does **not** by itself remove the window; window removal happens because `read_bytes` returned `false` and set `children[i].needs_removal = true` at line 1535 (the PTY-EOF path). This is the causal basis for the default-teardown nuance discussed later.
+
+### Parsing, buffering, and rendering **[source-derived]**
+
+`read_bytes` only commits raw bytes into the VT parser's write buffer. The actual parsing into the `Screen` happens in `do_parse()` [`kitty/child-monitor.c:438`], invoked from the parse pass [`kitty/child-monitor.c:521,530`]; the filled `Screen` cells are then uploaded to the GPU in `prepare_to_render_os_window()` [`kitty/child-monitor.c:705`] via `send_cell_data_to_gpu()` [`kitty/child-monitor.c:714`] and drawn. The net effect: child stdout → PTY master → VT parser → `Screen` grid → GPU render into the kitty window (answered concretely in Q9).
+
+### Rationale
+
+The flow is a producer/consumer split across a PTY: `Child.fork()` wires the child's stdio to the PTY slave and hands the master + PID to the `ChildMonitor`; the monitor thread multiplexes a `signalfd` (for `SIGCHLD`) and the PTY master (for output and EOF). Output is transformed byte-stream → parsed grid → pixels; termination is delivered as a signal and finalized by reaping. Whether a persistent message appears depends entirely on the two secondary mechanisms (hold, shell integration) covered in Q3/Q5/Q8.
+
+## Q2 — Kitty's own exit code when the child exits 0
+
+### Command and raw output **[observed]**
 
 ```
-    def on_child_death(self, window_id: int) -> None:
-```
-
-**Rationale.** `Child.fork()` opens a PTY and calls `fast_data_types.spawn(...)`, storing `self.pid` and
-`self.child_fd = master` — kitty keeps only the master end. The child writes its stdout to the PTY *slave*; kitty's
-`ChildMonitor` thread reads those bytes from the master via `read_bytes()`' `read(fd, …)` and commits them to the
-VT parser (`vt_parser_commit_write`), which fills the `Screen` grid (Q9). When the child exits, the kernel raises
-`SIGCHLD`; the monitor loop drains it (`read_signals` → `handle_signal`, Q6) and calls
-`reap_children(self, OPT(close_on_child_death))` which `waitpid`‑reaps the zombie (Q7). Independently, the PTY hits
-end‑of‑file so `read()` returns `0`/`EIO` and `read_bytes()` returns `false`, marking the child
-`needs_removal = true`. Either way the window is torn down through `on_child_death(window_id)` and, in the default
-configuration, the window closes (see Nuance #1, §11). The raw trace shows all of this in order: the PTY read of
-`"hello\r\nworld\r\n"`, the child's `exited with 0`, the signalfd read, and the `wait4` reap returning the child PID
-with `WEXITSTATUS == 0`.
-
----
-
-## Q2 — kitty's OWN exit code when the child exits 0
-
-**Command** (run five times for stability, then two corroborating non‑zero‑child runs):
-
-```
-$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
-$ for i in 1 2 3 4 5; do
-    ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0' >/dev/null 2>&1
-    echo "run $i: kitty_exit=$?"
-  done
-$ ./kitty/launcher/kitty --config NONE sh -c 'echo hi; exit 5'  >/dev/null 2>&1; echo "child exit 5 -> kitty_exit=$?"
-$ ./kitty/launcher/kitty --config NONE sh -c 'echo hi; exit 42' >/dev/null 2>&1; echo "child exit 42 -> kitty_exit=$?"
-```
-
-**Raw output**
-
-```
+$ cat /tmp/kwork/evidence/q2_exit.txt
 run 1: kitty_exit=0
 run 2: kitty_exit=0
 run 3: kitty_exit=0
 run 4: kitty_exit=0
 run 5: kitty_exit=0
-child exit 5 -> kitty_exit=0
+child exit 5  -> kitty_exit=0
 child exit 42 -> kitty_exit=0
 ```
 
-**Code citation** — `kitty/main.py:524-531` (verbatim, 8 lines):
+Each `run N` executed `./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0'; echo "kitty_exit=$?"`. The last two lines re-ran with `exit 5` and `exit 42` respectively.
 
-```
+### Kitty's own exit code is `0` and is **stable** and **independent of the child's status**
+
+Across 5 identical runs the value is `0` every time (distribution `{0: 5}`), satisfying the ≥2-run stability requirement. Crucially, a child exiting `5` or `42` **still** yields kitty exit `0`: kitty does not propagate the child's status as its own.
+
+### Code citation **[source-derived]**
+
+`kitty/main.py:524-531` (contiguous) — kitty's own process exit is governed by `main()`: a normal return exits `0`, and only an internal, unhandled exception raises `SystemExit(1)`:
+
+```python
 def main() -> None:
     try:
         _main()
@@ -224,54 +321,96 @@ def main() -> None:
         raise SystemExit(1)
 ```
 
-**Rationale.** kitty's own process exit code is **`0`**, stable across all five runs (distribution `{0: 5}`). It is
-distinct from — though here numerically equal to — the child `sh`'s status: when the child instead exits `5` or
-`42`, kitty *still* exits `0`. That is because kitty does not propagate the child's status as its own; `main()`
-returns normally after a clean shutdown, so the process exits `0`, and only an *internal* kitty exception would
-turn into `raise SystemExit(1)`. The number in `$?` is therefore kitty's own clean‑shutdown status, not the child's.
+### Rationale
 
----
+`main()` returns normally after the GUI event loop ends (all windows closed), so the process exit code is `0`. The child's exit status lives in a completely different place — it is reaped by the monitor thread's `wait4` and, for the message path, transported by OSC 133 — but it never becomes kitty's own return code. Hence the observed independence: kitty exits `0` regardless of whether the child exited `0`, `5`, or `42`.
 
-## Q3 — Full completion message(s)
+## Q3 — The full completion message
 
-There are **two different** user‑facing "completion" messages. They are reported separately and must not be
-conflated (see Distinction A, §10).
+There is **no single "program completed" message in the default direct-launch case** — by default the window just closes (see Nuance 1). A persistent completion message appears only via **two distinct, unrelated mechanisms**: the **hold** entry point (a fixed banner) and **shell integration** (a status-bearing notification). Both are reported here, verbatim.
 
-### Q3a — the `--hold` / `hold`‑kitten green banner
+### Q3a — The `kitty +hold` / hold-kitten banner
 
-**Command** (capture the raw bytes the banner code writes, off a PTY, from the real `__hold_till_enter__` kitten —
-the code path that actually renders the banner in this commit):
+**Terminology (important):** two different things are colloquially called "hold":
 
-```
-$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
-# a small PTY harness exec'd:  kitten __hold_till_enter__ sh -c 'echo hello; echo world; exit 0'
-# and recorded the master bytes to /tmp/hold_banner_raw.bin
-$ python3 -c "print(repr(open('/tmp/hold_banner_raw.bin','rb').read()))"
-```
+- The **`--hold` flag** to `kitty` (e.g. `kitty --hold sh -c '…'`) keeps the window open by running the command **inside an interactive shell** (`kitten run-shell … --env=KITTY_HOLD=1`); it shows **no banner**.
+- The **`kitty +hold` / `kitten __hold_till_enter__`** entry point shows the green banner **`Press Enter or Esc to exit`**.
 
-**Raw output** (full capture, then the banner segment isolated):
+#### Command and raw output — the `+hold` banner **[observed]**
+
+Captured through a PTY (the banner is written to the terminal, so a PTY is required to see it):
 
 ```
+$ cat /tmp/kwork/evidence/q3a_hold.txt
+### kitty +hold  (public entry) run #1 — full capture (Python repr):
 b'hello\r\nworld\r\n\x1b[?s\x1b[*x\x1b[4l\x1b[?1l\x1b[?5l\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?8h\x1b[?7h\x1b[?25h\x1b[>29u\x1b[?25l\r\n\x1b[1;32mPress Enter or Esc to exit\x1b[m'
-```
 
-Banner segment (Python `repr`, then `cat -v`):
-
-```
-\x1b[1;32mPress Enter or Esc to exit\x1b[m
+### banner segment isolated (run #1), Python repr then cat -v:
+b'\x1b[1;32mPress Enter or Esc to exit\x1b[m'
 ^[[1;32mPress Enter or Esc to exit^[[m
+
+### kitty +hold run #2 banner segment (stability check), cat -v:
+^[[1;32mPress Enter or Esc to exit^[[m
+
+### kitten __hold_till_enter__ (NONCANONICAL corroboration) banner segment, cat -v:
+^[[1;32mPress Enter or Esc to exit^[[m
+
+### byte-identical banner across the two +hold runs?
+run1==run2 banner: True | banner bytes: b'\x1b[1;32mPress Enter or Esc to exit\x1b[m'
 ```
 
-**Code citation** — `tools/tui/hold.go:16,26` (verbatim):
+The **exact** message text is `Press Enter or Esc to exit`, wrapped in SGR `\x1b[1;32m` (bold, green) and reset `\x1b[m`. It is **byte-identical across two runs** (stability requirement met). The hidden `kitten __hold_till_enter__` helper produces the same bytes and is shown only as **[non-canonical corroboration]** — the canonical value comes from the public `kitty +hold` entry point.
+
+#### Command and raw output — the `--hold` flag shows **no** banner **[observed]**
 
 ```
+$ cat /tmp/kwork/evidence/q3_hold_flag_env.txt
+### any process on the host whose environ contains KITTY_HOLD=1 (the run-shell hold child) ###
+pid=148814 cmdline=[/bin/bash --posix ]
+    KITTY_SHELL_INTEGRATION=enabled
+    KITTY_HOLD=1
+### the actual interactive shell descendants (kitten run-shell) ###
+```
+
+A screenshot of the `kitty --hold` window (saved to `/tmp/kwork/evidence/q3_hold_flag.png` and inspected during the investigation) shows the two output lines `hello` and `world` in white monospace on black, and **no green `Press Enter or Esc to exit` banner anywhere** — confirming that the `--hold` flag holds via an interactive shell, not via the banner path.
+
+#### Code citations **[source-derived]**
+
+The banner literal, `tools/tui/hold.go:16-42` (contiguous; banner at line 26):
+
+```go
 func HoldTillEnter(start_with_newline bool) {
+	lp, err := loop.New(loop.NoAlternateScreen, loop.NoRestoreColors, loop.NoMouseTracking)
+	if err != nil {
+		return
+	}
+	lp.OnInitialize = func() (string, error) {
+		lp.SetCursorVisible(false)
+		if start_with_newline {
+			lp.QueueWriteString("\r\n")
+		}
 		lp.QueueWriteString("\x1b[1;32mPress Enter or Esc to exit\x1b[m")
+		return "", nil
+	}
+	lp.OnFinalize = func() string {
+		lp.SetCursorVisible(true)
+		return ""
+	}
+
+	lp.OnKeyEvent = func(event *loop.KeyEvent) error {
+		if event.MatchesPressOrRepeat("enter") || event.MatchesPressOrRepeat("kp_enter") || event.MatchesPressOrRepeat("esc") || event.MatchesPressOrRepeat("ctrl+c") || event.MatchesPressOrRepeat("ctrl+d") {
+			event.Handled = true
+			lp.Quit(0)
+		}
+		return nil
+	}
+	lp.Run()
+}
 ```
 
-Dispatch to that banner — `tools/cmd/tool/main.go:87-93` (verbatim):
+The `+hold` dispatch, `tools/cmd/tool/main.go:87-93` (contiguous):
 
-```
+```go
 	// __hold_till_enter__
 	root.AddSubCommand(&cli.Command{
 		Name:            "__hold_till_enter__",
@@ -281,44 +420,56 @@ Dispatch to that banner — `tools/cmd/tool/main.go:87-93` (verbatim):
 			tui.ExecAndHoldTillEnter(args)
 ```
 
-**Rationale.** The banner text is exactly `Press Enter or Esc to exit`, wrapped in SGR `1;32` (bold + green,
-`\x1b[1;32m`) and reset (`\x1b[m`). It is emitted by `HoldTillEnter()` in the Go `hold` kitten, reached via the
-hidden `__hold_till_enter__` subcommand → `tui.ExecAndHoldTillEnter()`. **This banner contains no exit status.**
+The standalone Python hold entry, `kitty/utils.py:1031-1035` (contiguous):
 
-> **Correction to the naive `--hold` hypothesis (observed).** In this commit the plain `--hold` *flag* does **not**
-> print this banner. `Child.fork()` rewrites the argv through `cmdline_for_hold()`
-> (`kitty/child.py:329-330`; `kitty/utils.py:1192,1202` — it returns
-> `[kitten_exe(), 'run-shell', …, '--env=KITTY_HOLD=1'] + list(cmd)`), which holds the window open by launching an
-> **interactive shell** with `KITTY_HOLD=1` in its environment, not by printing the banner. The green banner is
-> produced only by the `hold` kitten path (`kitty/entry_points.py:27-29` and `kitty/utils.py:1031-1034`
-> `subprocess.Popen([kitten_exe(), '__hold_till_enter__'])`), which is what the capture above exercised. This was
-> confirmed at runtime: `kitty --hold …`'s child is an interactive `bash` carrying `KITTY_HOLD=1`, and its screen
-> shows only `hello`/`world` with **no** green banner, whereas the `__hold_till_enter__` kitten shows the bold‑green
-> banner.
+```python
+def hold_till_enter() -> None:
+    import subprocess
 
-### Q3b — the shell‑integration desktop notification
-
-This notification does **not** fire in the default configuration (Nuance #2, §11: `notify_on_cmd_finish` default is
-`never`). To observe its body it must be enabled — a real option, not a mock — so this is a
-**configured (non‑default) but canonical** observation. It was captured on a real D‑Bus session by eavesdropping on
-the `org.freedesktop.Notifications` interface while kitty's default `notify` action ran.
-
-**Command**
-
-```
-# /tmp/dbus_notify_test.sh, run inside a fresh D-Bus session:
-#   dbus-monitor "interface='org.freedesktop.Notifications'" > /tmp/dbus_notify.log 2>&1 &
-#   DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 \
-#     ./kitty/launcher/kitty --config NONE -o "notify_on_cmd_finish always 0" sh -c "sh /tmp/child_osc.sh"
-# /tmp/child_osc.sh emits the real OSC 133 bytes a shell would send:
-#   printf '\033]133;C;cmdline=echo\\ hello\007'; echo hello; echo world; printf '\033]133;D;0\007'; sleep 2; exit 0
-$ dbus-run-session -- /tmp/dbus_notify_test.sh
+    from .constants import kitten_exe
+    subprocess.Popen([kitten_exe(), '__hold_till_enter__']).wait()
 ```
 
-**Raw output** (the captured `org.freedesktop.Notifications.Notify` method call; identical across two runs):
+The `+hold` argv dispatch, `kitty/entry_points.py:27-30` (contiguous):
+
+```python
+def hold(args: List[str]) -> None:
+    from kitty.constants import kitten_exe
+    args = ['kitten', '__hold_till_enter__'] + args[1:]
+    os.execvp(kitten_exe(), args)
+```
+
+The `--hold` **flag** path (interactive shell, `KITTY_HOLD=1`, **no** banner), `kitty/utils.py:1192-1202` (contiguous):
+
+```python
+def cmdline_for_hold(cmd: Sequence[str] = (), opts: Optional['Options'] = None) -> List[str]:
+    if opts is None:
+        with suppress(RuntimeError):
+            opts = get_options()
+    if opts is None:
+        from .options.types import defaults
+        opts = defaults
+    ksi = ' '.join(opts.shell_integration)
+    import shlex
+    shell = shlex.join(resolved_shell(opts))
+    return [kitten_exe(), 'run-shell', f'--shell={shell}', f'--shell-integration={ksi}', '--env=KITTY_HOLD=1'] + list(cmd)
+```
+
+#### Rationale
+
+The `+hold` banner is a fixed string with no exit status — it exists to let the user read the output before the window disappears. The `--hold` flag is a different feature: `Child.fork()` rewrites the command line via `cmdline_for_hold()` (see Q1) so the program runs under an interactive shell that stays alive, which is why its window shows a live shell (and `KITTY_HOLD=1`) rather than a banner.
+
+### Q3b — The shell-integration completion notification
+
+When shell integration is active, the shell reports each command's status via OSC 133 `D;<status>` (see Q8). Kitty turns that into a desktop notification whose **body** is the status-bearing message.
+
+#### Command and raw output — the exact notification body **[observed]**
+
+A **real interactive `bash` running inside kitty** was driven by synthesizing real keystrokes with the X11 `XTEST` extension (the canonical user-input path), under `dbus-run-session` so the notification is delivered over D-Bus, with `notify_on_cmd_finish` set to fire:
 
 ```
-method call time=1783962369.836648 sender=:1.2 -> destination=org.freedesktop.Notifications serial=3 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
+$ cat /tmp/kwork/evidence/q3b_notify_body.txt
+method call time=1783966736.493997 sender=:1.2 -> destination=org.freedesktop.Notifications serial=3 path=/org/freedesktop/Notifications; interface=org.freedesktop.Notifications; member=Notify
    string "kitty"
    uint32 0
    string "/tmp/blitzy/kitty/blitzy-4da995f7-9d87-4535-892b-6e7ceff8c1ad_2bb4d2/logo/kitty.png"
@@ -338,46 +489,55 @@ Click to focus."
    int32 -1
 ```
 
-Byte‑exact body (via `cat -A`, where `$` marks end‑of‑line, revealing the embedded newline):
+The **exact body text** (the fifth argument to `Notify`) is:
 
 ```
-   string "Command echo hello finished with status: 0.$
-Click to focus."$
+Command echo hello finished with status: 0.
+Click to focus.
 ```
 
-**Code citation** — `kitty/window.py:1429` (verbatim):
+i.e. `Command echo hello finished with status: 0.\nClick to focus.` with a literal newline between the two sentences. Stability note (per finding on run-to-run identity): across repeated runs the **body is byte-identical**, but the D-Bus envelope fields (`sender`, `serial`, `time=`) legitimately vary and are therefore not claimed to be stable.
+
+#### Command and raw output — the enable/disable matrix **[observed]**
+
+The same XTEST-driven real-bash-through-kitty run was captured three ways; `--dump-bytes` records the OSC 133 markers kitty's parser actually received, and `dbus-monitor` counts `Notify` calls:
 
 ```
+condition                                          OSC133 C   OSC133 D;0   Notify calls
+kitty -o "notify_on_cmd_finish always 0"  (int on)      2          2            1
+kitty -o "shell_integration disabled" (+notify)         0          0            0
+kitty  (defaults: notify_on_cmd_finish=never)           2          2            0
+```
+
+Reading the matrix:
+- With shell integration **on** and notification **enabled**, the shell emits OSC 133 `C`/`D;0` and kitty fires exactly **one** notification.
+- With shell integration **disabled at the kitty level**, **no** OSC 133 markers are produced and **no** notification fires (negative control).
+- With shell integration **on** but `notify_on_cmd_finish` at its **default (`never`)**, the OSC 133 markers still arrive but **no** notification fires — proving the gate is the `when != 'never'` condition, not a duration threshold (see Nuance 2).
+
+#### Code citation **[source-derived]**
+
+The body string is built in `Window.handle_cmd_end()` (full method quoted under Q5). The single line that formats the message, `kitty/window.py:1428-1429` (contiguous):
+
+```python
+            s = self.last_cmd_cmdline.replace('\\\n', ' ')
             cmd.body = f'Command {s} finished with status: {exit_status}.\nClick to focus.'
 ```
 
-**Rationale.** The notification body is exactly `Command echo hello finished with status: 0.\nClick to focus.`
-(a literal newline between `0.` and `Click to focus.`). It is built by `handle_cmd_end()` (Q5) from the exit
-status decoded out of the OSC 133 `D;0` sequence (Q8); `echo hello` is the `%q`‑decoded command line. **This message
-does include the exit status (`0`).** In the default configuration it is not emitted at all (§11, Nuance #2).
+#### Rationale
 
----
+For `echo hello`, `self.last_cmd_cmdline` is `echo hello` and `exit_status` is `'0'`, so the f-string yields `Command echo hello finished with status: 0.\nClick to focus.` — exactly the observed D-Bus body. The message only appears when `notify_on_cmd_finish != 'never'`, which is why the default configuration shows nothing.
 
+## Q4 — The component that tracks the child
 
-## Q4 — Child‑tracking component
+### Answer: the `ChildMonitor` **[source-derived]**
 
-**Command** (identify the component that owns each child's PID, PTY FD and Screen — the registration observed in the
-running process, corroborated by the strace showing that same thread polling fd 7/8 and reaping):
+The child is tracked across its lifetime by the **`ChildMonitor`** — a C object (implemented in `kitty/child-monitor.c`) created and driven from Python (`kitty/boss.py`). It owns, per child: the **window id**, the **PID**, the **PTY master file descriptor**, and the window's **`Screen`**. It runs the monitor thread that polls the PTY master and the `signalfd`, reads output, handles `SIGCHLD`, reaps the child, and notifies Python when the child dies.
 
-```
-$ grep -nE "self.child_monitor = ChildMonitor\(|self.child_monitor.add_child\(" kitty/boss.py
-```
+### Code citations **[source-derived]**
 
-**Raw output**
+The `Boss` creates the single `ChildMonitor` and wires its death callback, `kitty/boss.py:370-374` (contiguous):
 
-```
-370:        self.child_monitor = ChildMonitor(
-587:        self.child_monitor.add_child(window.id, window.child.pid, window.child.child_fd, window.screen)
-```
-
-**Code citation** — `kitty/boss.py:370-374` (verbatim):
-
-```
+```python
         self.child_monitor = ChildMonitor(
             self.on_child_death,
             DumpCommands(args) if args.dump_commands or args.dump_bytes else None,
@@ -385,504 +545,815 @@ $ grep -nE "self.child_monitor = ChildMonitor\(|self.child_monitor.add_child\(" 
         )
 ```
 
-and `kitty/boss.py:585-587` (verbatim):
+Each new child is registered with its PID, PTY master fd, and `Screen`, `kitty/boss.py:585-587` (contiguous):
 
-```
+```python
     def add_child(self, window: Window) -> None:
         assert window.child.pid is not None and window.child.child_fd is not None
         self.child_monitor.add_child(window.id, window.child.pid, window.child.child_fd, window.screen)
 ```
 
-**Rationale.** The component that tracks the child across its lifetime is the **`ChildMonitor`** — its C core is
-`kitty/child-monitor.c`, and it is created once by the `Boss` (`kitty/boss.py:370`) with `self.on_child_death` as
-its death callback. Each child is registered via `add_child(window.id, window.child.pid, window.child.child_fd,
-window.screen)`, so the `ChildMonitor` owns, per child, the **window id**, the **PID**, the **PTY master FD**
-(`child_fd`) and the **`Screen`**. It is the `ChildMonitor` thread that (as the Q1/Q6/Q7 strace shows) polls the
-child's FD, reads its output, drains its `SIGCHLD` from the signalfd, and `waitpid`‑reaps it — i.e. it tracks the
-child from spawn to death.
+The C side records exactly those fields, `kitty/child-monitor.c:305-306` (contiguous):
 
----
-
-## Q5 — Message‑generating function
-
-**Command** (show the function and its entry point; the runtime firing of it is captured in Q3b and below):
-
-```
-$ grep -nE "def handle_cmd_end|def cmd_output_marking|self.handle_cmd_end\(cmdline\)" kitty/window.py
+```c
+add_child(ChildMonitor *self, PyObject *args) {
+#define add_child_doc "add_child(id, pid, fd, screen) -> Add a child."
 ```
 
-**Raw output**
+### Rationale
 
-```
-1408:    def handle_cmd_end(self, exit_status: str = '') -> None:
-1453:    def cmd_output_marking(self, is_start: Optional[bool], cmdline: str = '') -> None:
-1461:            self.handle_cmd_end(cmdline)
-```
+`add_child(id, pid, fd, screen)` binds together everything needed to track the child: the `id` maps back to the `Window`, the `pid` is what `wait4` reaps (Q7), the `fd` is the PTY master read in `read_bytes` (Q1/Q9), and the `screen` is where parsed output lands. The monitor thread owns these for the child's whole life, which is why the `ChildMonitor` is *the* tracking component. On death it invokes `on_child_death(window_id)` — note it passes **only the window id, not an exit status** (see Distinction B / Q7).
 
-Runtime confirmation that `handle_cmd_end` actually runs and receives status `0` — a `command`‑action probe wrote
-its `%s` (exit status) and `%c` (command line) to a file when the OSC 133 `D;0` arrived:
+## Q5 — The function that turns the exit status into the message
 
-```
-$ ./kitty/launcher/kitty --config NONE \
-    -o "notify_on_cmd_finish always 0 command /tmp/notify_capture.sh %s %c" \
-    sh -c 'printf "\033]133;C;cmdline=echo\\ hello\007"; echo hello; echo world; printf "\033]133;D;0\007"; sleep 2; exit 0'
-$ cat /tmp/notify_capture.txt
-NOTIFY_FIRED exit_status=[0] cmdline=[echo hello]
-```
+### Answer: `Window.handle_cmd_end()` **[observed + source-derived]**
 
-**Code citation** — `kitty/window.py:1408,1413` (verbatim):
+The single function that converts the **shell-reported command status** into the user-facing message is **`Window.handle_cmd_end()`** at `kitty/window.py:1408`. It is reached from `cmd_output_marking()` when the OSC 133 `D` sub-command is decoded (Q8), and it builds the `Command … finished with status: …` notification body.
 
-```
+### Code citation — full method, `kitty/window.py:1408-1451` (contiguous) **[source-derived]**
+
+```python
     def handle_cmd_end(self, exit_status: str = '') -> None:
+        if self.last_cmd_output_start_time == 0.:
+            return
+        self.last_cmd_output_start_time = 0.
+        try:
             self.last_cmd_exit_status = int(exit_status)
+        except Exception:
+            self.last_cmd_exit_status = 0
+        end_time = monotonic()
+        last_cmd_output_duration = end_time - self.last_cmd_output_start_time
+
+        self.call_watchers(self.watchers.on_cmd_startstop, {
+            "is_start": False, "time": end_time, 'cmdline': self.last_cmd_cmdline, 'exit_status': self.last_cmd_exit_status})
+
+        opts = get_options()
+        when, duration, action, notify_cmdline = opts.notify_on_cmd_finish
+
+        if last_cmd_output_duration >= duration and when != 'never':
+            cmd = NotificationCommand()
+            cmd.title = 'kitty'
+            s = self.last_cmd_cmdline.replace('\\\n', ' ')
+            cmd.body = f'Command {s} finished with status: {exit_status}.\nClick to focus.'
+            cmd.actions = 'focus'
+            cmd.only_when = OnlyWhen(when)
+            if action == 'notify':
+                notify_with_command(cmd, self.id)
+            elif action == 'bell':
+                class Bell(NotifyImplementation):
+                    def __init__(self, window_id: int):
+                        self.window_id = window_id
+                    def __call__(self, title: str, body: str, identifier: str, urgency: Urgency = Urgency.Normal) -> None:
+                        w = get_boss().window_id_map.get(self.window_id)
+                        if w:
+                            w.screen.bell()
+                notify_with_command(cmd, self.id, notify_implementation=Bell(self.id))
+            elif action == 'command':
+                class Run(NotifyImplementation):
+                    def __init__(self, last_cmd_cmdline: str):
+                        self.last_cmd_cmdline = last_cmd_cmdline
+                    def __call__(self, title: str, body: str, identifier: str, urgency: Urgency = Urgency.Normal) -> None:
+                        open_cmd([x.replace('%c', self.last_cmd_cmdline).replace('%s', exit_status) for x in notify_cmdline])
+                notify_with_command(cmd, self.id, notify_implementation=Run(self.last_cmd_cmdline))
+            else:
+                raise ValueError(f'Unknown action in option `notify_on_cmd_finish`: {action}')
 ```
 
-and its entry point `kitty/window.py:1453,1461` (verbatim `else` branch):
+It is invoked from `cmd_output_marking()`, `kitty/window.py:1453-1461` (contiguous):
 
-```
+```python
     def cmd_output_marking(self, is_start: Optional[bool], cmdline: str = '') -> None:
+        if is_start:
+            start_time = monotonic()
+            self.last_cmd_output_start_time = start_time
+            cmdline = decode_cmdline(cmdline) if cmdline else ''
+            self.last_cmd_cmdline = cmdline
+            self.call_watchers(self.watchers.on_cmd_startstop, {"is_start": True, "time": start_time, 'cmdline': cmdline, 'exit_status': 0})
+        else:
             self.handle_cmd_end(cmdline)
 ```
 
-**Rationale.** The single function that turns the child's exit status into the user‑facing message is
-**`Window.handle_cmd_end()`** (`kitty/window.py:1408`). It is entered from `Window.cmd_output_marking()`: when
-`is_start` is falsy — the OSC 133 `D` case — the `else` branch calls `self.handle_cmd_end(cmdline)`, where the
-passed string *is* the exit status. `handle_cmd_end` parses it (`self.last_cmd_exit_status = int(exit_status)`) and,
-subject to `notify_on_cmd_finish`, builds `cmd.body` (Q3b) and dispatches the notification. The runtime probe shows
-it firing with `exit_status=[0]` for a command that exited 0, decoded from the real `D;0` sequence.
+### Observed recorded state **[observed]**
 
----
-
-## Q6 — Signal kitty listens for to learn a child terminated
-
-**Command**
+Driving a real command through kitty with `notify_on_cmd_finish` action `command` (which echoes the recorded values) shows `handle_cmd_end` recorded the status and cmdline:
 
 ```
-$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
-$ strace -f -e trace=signalfd4,rt_sigprocmask,wait4,read -e signal=all -o /tmp/kitty_sig.strace \
-    ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0'
-$ grep -nE "signalfd4\(|rt_sigprocmask\(SIG_BLOCK, \[HUP" /tmp/kitty_sig.strace | head -2
+$ cat /tmp/kwork/evidence/q5_recorded_state.txt
+NOTIFY_FIRED recorded_exit_status=[0] recorded_cmdline=[echo hello]
 ```
 
-**Raw output** — the signal set‑up (SIGCHLD, shown by strace as `CHLD`, is blocked and routed to a signalfd), and
-the signalfd read that delivers it, decoded:
+### An apparent pre-existing behavior in the duration gate **[source-derived; documented, not changed]**
+
+The gate at line 1425 is `if last_cmd_output_duration >= duration and when != 'never':`. However, `last_cmd_output_duration` is computed at line 1417 as `end_time - self.last_cmd_output_start_time`, and `self.last_cmd_output_start_time` was **already set to `0.` at line 1411** — *before* the subtraction. Consequently `last_cmd_output_duration == end_time`, i.e. the raw `monotonic()` clock value (thousands of seconds since boot), which is effectively always `>= duration` (default `5.0`). The gate therefore reduces in practice to **`when != 'never'`**: the `duration` threshold has no practical effect.
+
+This is corroborated empirically by the Q3b matrix: with `notify_on_cmd_finish` at its default (`never`) no notification fires, but with `when='always'` a notification fires immediately for `echo hello` (which has essentially zero real output duration) — the duration threshold never gates it out. This is reported as an **apparent pre-existing behavior/defect in the investigated source**; per scope, **no source change is made** — only documentation.
+
+### Rationale
+
+`handle_cmd_end(exit_status)` is the sole place where the shell-reported status string becomes the message: it stores `last_cmd_exit_status`, and, when the gate passes, formats `cmd.body` (line 1429) with the command line and the status. `cmd_output_marking(is_start=False, cmdline=…)` is its only caller in the OSC 133 `D` path, forwarding the decoded status string.
+
+
+## Q6 — The OS signal kitty listens for
+
+### Answer: `SIGCHLD` (signal 17) **[observed]**
+
+Kitty learns a child terminated via **`SIGCHLD`**, delivered through a **`signalfd`** (Linux) rather than an async signal handler. This was observed directly.
+
+### Raw output — signalfd setup and the SIGCHLD siginfo **[observed]**
+
+During startup, kitty blocks its handled signals and creates a `signalfd` whose mask includes `CHLD`:
 
 ```
-974:93701 signalfd4(-1, [HUP INT USR1 USR2 TERM CHLD], 8, SFD_CLOEXEC|SFD_NONBLOCK) = 7
-249:93701 rt_sigprocmask(SIG_BLOCK, [HUP INT USR1 USR2 TERM CHLD], NULL, 8) = 0
+$ grep -m1 'rt_sigprocmask(SIG_BLOCK, \[' /tmp/kwork/evidence/kitty.strace | grep CHLD
+146254 rt_sigprocmask(SIG_BLOCK, [HUP INT USR1 USR2 TERM CHLD], NULL, 8) = 0
+$ grep -m1 'signalfd4' /tmp/kwork/evidence/kitty.strace
+146254 signalfd4(-1, [HUP INT USR1 USR2 TERM CHLD], 8, SFD_CLOEXEC|SFD_NONBLOCK) = 7
 ```
 
-```
-# the 128-byte read on the signalfd (fd 7) right before the reap
-# (the trailing "..." is strace's own default buffer truncation, not an elision by us;
-#  the meaningful signalfd_siginfo fields are within the leading bytes shown):
-93767 read(7, "\21\0\0\0\0\0\0\0\1\0\0\0Hn\1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096) = 128
+When the child exits, the monitor thread reads one `struct signalfd_siginfo` (128 bytes) from fd 7. The `strace -e read=all` payload:
 
-# decoding the first 16 bytes of struct signalfd_siginfo, i.e. struct.unpack('<IiiI', first16bytes):
-#   \21\0\0\0 = 0x11 = 17 (ssi_signo) | \0\0\0\0 (ssi_errno) | \1\0\0\0 = 1 (ssi_code) | Hn\1\0 = 0x00016e48 = 93768 (ssi_pid)
+```
+247153:146320 read(7, "\21\0\0\0\0\0\0\0\1\0\0\0\221;\2\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096) = 128
+ | 00000  11 00 00 00 00 00 00 00  01 00 00 00 91 3b 02 00  .............;.. |
+ | 00010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................ |
+ | 00020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................ |
+```
+
+Decoding those exact bytes (the first four fields of `struct signalfd_siginfo`, little-endian `<IiiI`) with a reproducible script:
+
+```
+$ cat /tmp/kwork/decode_siginfo.py
+import struct
+# First 16 bytes of the struct signalfd_siginfo read from kitty's signal fd (fd 7),
+# captured verbatim by: strace -e read=all ... (the "read(7, ...) = 128" payload).
+first16 = bytes([0x11,0,0,0, 0,0,0,0, 1,0,0,0, 0x91,0x3b,0x02,0])
+signo, errno_, code, pid = struct.unpack('<IiiI', first16)
+names={17:'SIGCHLD'}; codes={1:'CLD_EXITED'}
+print(f"ssi_signo = {signo}  -> {names.get(signo,'?')}")
+print(f"ssi_errno = {errno_}")
+print(f"ssi_code  = {code}   -> {codes.get(code,'?')}")
+print(f"ssi_pid   = {pid}   (the child process that exited)")
+
+$ python3.11 /tmp/kwork/decode_siginfo.py
 ssi_signo = 17  -> SIGCHLD
 ssi_errno = 0
-ssi_code  = 1   (CLD_EXITED == 1)
-ssi_pid   = 93768    (the child process that exited)
+ssi_code  = 1   -> CLD_EXITED
+ssi_pid   = 146321   (the child process that exited)
 ```
 
-**Code citation** — the handled‑signal set including `SIGCHLD`, the block, and the handler.
-`kitty/child-monitor.c:121` (verbatim):
+`ssi_signo=17` is `SIGCHLD`; `ssi_code=1` is `CLD_EXITED`; `ssi_pid=146321` is exactly the child PID that `+++ exited with 0 +++` in Q1. (The `signalfd`/`sigprocmask` calls run on the setup thread TID `146254`; the siginfo read and reap run on the monitor thread TID `146320`.)
 
-```
+### Code citations **[source-derived]**
+
+`SIGCHLD` is in kitty's handled-signal set, `kitty/child-monitor.c:121`:
+
+```c
 #define KITTY_HANDLED_SIGNALS SIGINT, SIGHUP, SIGTERM, SIGCHLD, SIGUSR1, SIGUSR2, 0
 ```
 
-`kitty/child-monitor.c:136` (verbatim):
+The signals are blocked and a `signalfd` is created, `kitty/loop-utils.c:34-44` (contiguous):
 
-```
-    sigprocmask(SIG_BLOCK, &signals, NULL);
-```
-
-`kitty/loop-utils.c:42` (verbatim — the signalfd is created for those signals):
-
-```
+```c
+static bool
+init_signal_handlers(LoopData *ld) {
+    ld->signal_read_fd = -1;
+    sigemptyset(&ld->signals);
+    for (size_t i = 0; i < ld->num_handled_signals; i++) sigaddset(&ld->signals, ld->handled_signals[i]);
+#ifdef HAS_SIGNAL_FD
+    if (ld->num_handled_signals) {
+        if (sigprocmask(SIG_BLOCK, &ld->signals, NULL) == -1) return false;
         ld->signal_read_fd = signalfd(-1, &ld->signals, SFD_NONBLOCK | SFD_CLOEXEC);
+        if (ld->signal_read_fd == -1) return false;
+    }
 ```
 
-`kitty/child-monitor.c:1362,1370-1372` (verbatim — the handler that records the death):
+The siginfo is read and dispatched, `kitty/loop-utils.c:131-159` (contiguous):
 
+```c
+read_signals(int fd, handle_signal_func callback, void *data) {
+#ifdef HAS_SIGNAL_FD
+    static struct signalfd_siginfo fdsi[32];
+    siginfo_t si;
+    while (true) {
+        ssize_t s = read(fd, &fdsi, sizeof(fdsi));
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN) break;
+            log_error("Call to read() from read_signals() failed with error: %s", strerror(errno));
+            break;
+        }
+        if (s == 0) break;
+        size_t num_signals = s / sizeof(struct signalfd_siginfo);
+        if (num_signals == 0 || num_signals * sizeof(struct signalfd_siginfo) != (size_t)s) {
+            log_error("Incomplete signal read from signalfd");
+            break;
+        }
+        for (size_t i = 0; i < num_signals; i++) {
+            si.si_signo = fdsi[i].ssi_signo;
+            si.si_code = fdsi[i].ssi_code;
+            si.si_pid = fdsi[i].ssi_pid;
+            si.si_uid = fdsi[i].ssi_uid;
+            si.si_addr = (void*)(uintptr_t)fdsi[i].ssi_addr;
+            si.si_status = fdsi[i].ssi_status;
+            si.si_value.sival_int = fdsi[i].ssi_int;
+            if (!callback(&si, data)) break;
+        }
+    }
 ```
+
+The callback flags a child death on `SIGCHLD`, `kitty/child-monitor.c:1361-1383` (contiguous):
+
+```c
+static bool
 handle_signal(const siginfo_t *siginfo, void *data) {
+    SignalSet *ss = data;
+    switch(siginfo->si_signo) {
+        case SIGINT:
+        case SIGTERM:
+        case SIGHUP:
+            ss->kill_signal = true;
+            break;
         case SIGCHLD:
             ss->child_died = true;
             break;
+        case SIGUSR1:
+            ss->reload_config = true;
+            break;
+        case SIGUSR2:
+            log_error("Received SIGUSR2: %d\n", siginfo->si_value.sival_int);
+            break;
+        default:
+            break;
+    }
+    return true;
+}
 ```
 
-**Rationale.** The OS‑level signal kitty relies on to learn that a child terminated is **`SIGCHLD`** (numeric `17`).
-Because kitty blocks its handled signals process‑wide (`sigprocmask(SIG_BLOCK, …)`) and consumes them through a
-**signalfd** (`signalfd(-1, &ld->signals, …)`), there is no asynchronous `--- SIGCHLD ---` handler invocation in the
-trace; instead the signal arrives as a `struct signalfd_siginfo` from a `read()` on the signalfd (fd `7`). Decoding
-that record proves it is `SIGCHLD` (`ssi_signo == 17`), a normal child exit (`ssi_code == CLD_EXITED`), for the exact
-child that just exited (`ssi_pid == 93768`). The monitor loop drains it with `read_signals(...)` which invokes
-`handle_signal(...)`, whose `case SIGCHLD` sets `ss->child_died = true`, triggering the reap in Q7.
+### Rationale
 
----
+Kitty converts asynchronous signal delivery into a synchronous, pollable fd: it blocks `SIGCHLD` (among others) process-wide and drains a `signalfd` inside its monitor loop. When a `SIGCHLD` siginfo arrives, `handle_signal` sets `ss->child_died = true`, which triggers the reap in Q7. The observed `ssi_signo=17`/`CLD_EXITED` for the exact child PID confirms `SIGCHLD` is the signal kitty listens for.
 
+## Q7 — The system call to retrieve the child's exit status
 
-## Q7 — System call used to retrieve the child's exit status
+### Answer: `wait4(-1, &status, WNOHANG)` — the `waitpid` family **[observed + source-derived]**
 
-**Command** (same strace as Q6)
+Kitty reaps the child with **`waitpid(-1, &status, WNOHANG)`**, which the C library implements via the **`wait4`** syscall (as strace shows). It is called in a loop until no more children are reapable.
 
-```
-$ grep -nE "wait4\(-1" /tmp/kitty_sig.strace | head -2
-```
+### Raw output — the reap **[observed]**
 
-**Raw output**
+From the Q1 death window:
 
 ```
-1008:93767 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 93768
-1009:93767 wait4(-1, 0x799fc4f87e50, WNOHANG, NULL) = -1 ECHILD (No child processes)
+146320 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 146321
+146320 wait4(-1, 0x7c82346c2e50, WNOHANG, NULL) = -1 ECHILD (No child processes)
 ```
 
-**Code citation** — `kitty/child-monitor.c:1413,1418,1422,1423` (verbatim):
+The first `wait4` reaps child `146321` with `WIFEXITED && WEXITSTATUS==0`; the second returns `ECHILD` (nothing left to reap), ending the loop.
 
-```
+### Code citations **[source-derived]**
+
+The reap loop, `kitty/child-monitor.c:1412-1426` (contiguous):
+
+```c
+static void
 reap_children(ChildMonitor *self, bool enable_close_on_child_death) {
+    int status;
+    pid_t pid;
+    (void)self;
+    while(true) {
         pid = waitpid(-1, &status, WNOHANG);
+        if (pid == -1) {
+            if (errno != EINTR) break;
+        } else if (pid > 0) {
             if (enable_close_on_child_death) mark_child_for_removal(self, pid);
             mark_monitored_pids(pid, status);
+        } else break;
+    }
+}
 ```
 
-**Rationale.** kitty retrieves the child's exit status with **`waitpid(-1, &status, WNOHANG)`** in
-`reap_children()` (`kitty/child-monitor.c:1418`). On Linux/glibc `waitpid` is implemented on top of the `wait4`
-syscall, which is exactly what strace shows: `wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL)`
-returning the child PID `93768`, with the status word decoding to a normal exit of value `0`. The `-1` (any child)
-and `WNOHANG` (non‑blocking) arguments match the source verbatim; the immediately following `wait4` returns
-`ECHILD` because there are no further children to reap. The reaped raw status is recorded via
-`mark_monitored_pids(pid, status)` — but note (Distinction B, §10) that the *window* death callback
-`on_child_death(window_id)` receives only the window id, **not** this status.
+Two important facts about what happens to the reaped `status`:
 
----
+1. `mark_child_for_removal(self, pid)` runs **only if `enable_close_on_child_death`** is true — i.e. only when `close_on_child_death=yes`. With the **default** (`no`), the reap does **not** remove the window (window teardown then comes from the PTY-EOF path — see Nuance 1).
+2. `mark_monitored_pids(pid, status)` records the status **only for PIDs explicitly registered in the `monitored_pids[]` array** — it is a **no-op for the primary window child**, which is not in that array. `kitty/child-monitor.c:1397-1409` (contiguous):
 
-## Q8 — Status transport (how the shell‑reported exit code travels)
-
-**Command** — capture the byte‑exact OSC 133 the *real* bash shell‑integration script emits, in an interactive
-shell, with integration ENABLED vs DISABLED; then corroborate what kitty's own parser receives end‑to‑end with
-kitty's `--dump-bytes` recorder (labelled as kitty's debug facility; it records the *real* bytes received):
-
-```
-# (1) real shell-integration emission, captured off a PTY running: bash --rcfile shell-integration/bash/kitty.bash -i
-$ cat -v /tmp/osc_enabled.bin  | grep -o '\^\[]133;[ACD][^^]*\^G'
-# (2) integration disabled: bash --norc -i
-$ python3 -c "print(repr(open('/tmp/osc_disabled.bin','rb').read()))"
-# (3) end-to-end, kitty's own recorder of received bytes:
-$ ./kitty/launcher/kitty --config NONE --dump-bytes /tmp/kdump.bin sh -c 'sh /tmp/child_osc.sh'
-$ cat -v /tmp/kdump.bin
+```c
+static void
+mark_monitored_pids(pid_t pid, int status) {
+    children_mutex(lock);
+    for (ssize_t i = monitored_pids_count - 1; i >= 0; i--) {
+        if (pid == monitored_pids[i]) {
+            if (reaped_pids_count < arraysz(reaped_pids)) {
+                reaped_pids[reaped_pids_count].status = status;
+                reaped_pids[reaped_pids_count++].pid = pid;
+            }
+            remove_i_from_array(monitored_pids, (size_t)i, monitored_pids_count);
+        }
+    }
+    children_mutex(unlock);
+}
 ```
 
-**Raw output**
+Consequently, the direct-child death callback into Python carries **no exit status** — it receives only a window id, `kitty/boss.py:881`:
 
-(1) ENABLED — the shell emits the full semantic‑prompt cycle; `^[` is ESC, `^G` is BEL (so `^[]133;D;0^G` is
-`ESC ] 1 3 3 ; D ; 0 BEL`):
+```python
+    def on_child_death(self, window_id: int) -> None:
+```
+
+The status-bearing callback `on_monitored_pid_death(self, pid, exit_status)` [`kitty/boss.py:2725`] exists **only** for explicitly monitored background PIDs, not for the primary child.
+
+### Rationale
+
+`wait4`/`waitpid` is how kitty retrieves the child's raw wait-status and clears the zombie. But that status is used for reaping bookkeeping (and, for explicitly monitored PIDs, `on_monitored_pid_death`); it is **not** propagated as an exit status into the terminal window's message path. That is the technical reason the user-facing "finished with status" message comes from the **shell-integration** transport (Q8), not from the `wait4` reap. This is Distinction B.
+
+## Q8 — How the exit status travels from the shell to the message
+
+### Answer: the OSC 133 `D;<code>` escape sequence **[observed + source-derived]**
+
+The **shell-reported command status** travels from the integrated shell to kitty as the **OSC 133 `D;<code>`** ("command finished") escape sequence, in-band on the PTY. Kitty's VT parser routes OSC code 133 to `shell_prompt_marking()`, whose `D` case extracts the status string and calls back into Python, ending at `Window.handle_cmd_end()` (Q5).
+
+### Raw output — the byte-exact sequence and the on-wire timeline **[observed]**
+
+Byte-exact `D;0` as kitty's parser received it (real bash in kitty, XTEST-driven):
 
 ```
+$ cat /tmp/kwork/evidence/q8_byte_exact.txt
+repr: b'\x1b]133;D;0\x07\x1b'
+hex : 1b 5d 31 33 33 3b 44 3b 30 07 1b
+cat -v form: ^[]133;D;0^G
+```
+
+i.e. `ESC ] 1 3 3 ; D ; 0 BEL`. The ordered markers around the `echo hello` command:
+
+```
+$ cat /tmp/kwork/evidence/q8_timeline.txt
+# ordered OSC 133 markers kitty's parser received (echo hello command), cat -v:
 ^[]133;D;0^G
 ^[]133;A^G
 ^[]133;C;cmdline=echo\ hello^G
 ^[]133;D;0^G
 ^[]133;A^G
-^[]133;C;cmdline=echo\ world^G
-^[]133;D;0^G
-^[]133;A^G
 ^[]133;C;cmdline=exit^G
 ```
 
-(2) DISABLED — no OSC 133 sequences at all:
+Reading it: a `D;0` closes the previous prompt, `A` starts a new prompt, `C;cmdline=echo\ hello` marks command-output start, then `D;0` reports the command finished with status `0`. With shell integration **disabled at the kitty level**, **zero** `133` markers appear on the wire (the negative control from Q3b: `dump_disabled_notify.bin` has `C=0, D;0=0`).
 
-```
-b'PROMPT> echo hello\r\nhello\r\nPROMPT> echo world\r\nworld\r\nPROMPT> exit\r\nexit\r\n'
-```
+### Code citations **[source-derived]**
 
-(3) end‑to‑end — kitty received exactly the `C` and `D;0` markers around the output:
+The integrated shells emit the sequence. bash, `shell-integration/bash/kitty.bash:208` and `:239`:
 
-```
-^[]133;C;cmdline=echo\ hello^Ghello^M
-world^M
-^[]133;D;0^G
-```
-
-**Code citation** — the VT parser routes OSC code 133 to `shell_prompt_marking`. `kitty/vt-parser.c:536,544`
-(verbatim):
-
-```
-        case 133:
-                shell_prompt_marking(self->screen, (char*)buf + i);
-```
-
-`shell_prompt_marking`'s `D` case extracts the status — `kitty/screen.c:2350-2352` (verbatim):
-
-```
-            case 'D': {
-                const char *exit_status = buf[1] == ';' ? buf + 2 : "";
-                CALLBACK("cmd_output_marking", "Os", Py_None, exit_status);
-```
-
-The shell emitters (all three integrated shells) — `shell-integration/bash/kitty.bash:239` and `:208` (verbatim):
-
-```
-        _ksi_prompt[ps1]+="\[\e]133;D;\$?\a\e]133;A\a\]"
+```bash
                 builtin printf "\e]133;C;cmdline=%q\a" "$last_cmd"
 ```
-
-`shell-integration/zsh/kitty-integration:145` and `:149` (verbatim):
-
+```bash
+        _ksi_prompt[ps1]+="\[\e]133;D;\$?\a\e]133;A\a\]"
 ```
+
+zsh, `shell-integration/zsh/kitty-integration:145` (with status) and `:149` (no status):
+
+```zsh
                     builtin print -nu $_ksi_fd '\e]133;D;'$cmd_status'\a'
+```
+```zsh
                     builtin print -nu $_ksi_fd '\e]133;D\a'
 ```
 
-`shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:96` (verbatim):
+fish, `shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish:96`:
 
-```
+```fish
                 echo -en "\e]133;D;$status\a"
 ```
 
-**Rationale.** The shell‑reported exit code travels via the **OSC 133 `D;<exit_code>` semantic‑prompt (FinalTerm)
-escape sequence**, not via any OS signal. The integrated shell exercised here is **bash** (the container's default,
-`GNU bash 5.2.37`); its integration appends `\e]133;D;$?\a` to `PS1` (line 239) and emits
-`\e]133;C;cmdline=%q\a` from the command‑start hook (line 208). The runtime capture shows the real byte sequence
-`ESC ]133;D;0 BEL` emitted after each command that exited 0, preceded by the `C` (command‑output start) and `A`
-(prompt start) markers; with integration disabled, none of these appear. kitty's VT parser dispatches OSC code
-`133` (`kitty/vt-parser.c:536`) to `shell_prompt_marking()`, whose `case 'D'` slices the exit status out of the
-sequence (`buf + 2`) and hands it to the `cmd_output_marking` callback (`kitty/screen.c:2352`), which lands in
-`Window.cmd_output_marking()` → `handle_cmd_end(exit_status)` (Q5). The `--dump-bytes` recorder confirms kitty's
-parser really received `ESC ]133;D;0 BEL` end‑to‑end.
+The VT parser routes OSC code 133 to `shell_prompt_marking()`, `kitty/vt-parser.c:536-546` (contiguous; the `#ifdef DUMP_COMMANDS` reporting block is shown in place so the quote is not spliced):
 
-**Cross‑vendor context.** OSC 133 (`A` = prompt start, `B` = prompt/command boundary, `C` = command‑output start,
-`D[;ExitCode]` = command finished) is the FinalTerm/iTerm2 "semantic prompt" protocol, also implemented by iTerm2,
-WezTerm, VS Code's terminal and Ghostty; on `D`, `0` denotes success and any non‑zero denotes an error. kitty's
-`133;D;<status>` handling therefore conforms to an industry‑standard mechanism rather than a proprietary one.
-
----
-
-## Q9 — Where the child's printed output actually appears
-
-**Command** (redirect kitty's *own* stdout/stderr to files, so any child text leaking to them would be visible;
-the child still prints `hello`/`world`):
-
-```
-$ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
-$ ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0' \
-    >/tmp/q9_stdout.txt 2>/tmp/q9_stderr.txt
-$ echo "kitty_exit=$?"
-$ echo "own stdout bytes:"; wc -c < /tmp/q9_stdout.txt; cat /tmp/q9_stdout.txt
-$ echo "own stderr bytes:"; wc -c < /tmp/q9_stderr.txt; cat /tmp/q9_stderr.txt
-$ echo "child lines in kitty's own stdout/stderr:"; grep -c -E "hello|world" /tmp/q9_stdout.txt /tmp/q9_stderr.txt
+```c
+        case 133:
+#ifdef DUMP_COMMANDS
+            START_DISPATCH
+            REPORT_OSC2(shell_prompt_marking, code, mv);
+            END_DISPATCH_WITHOUT_BREAK
+#endif
+            if (limit > i) {
+                buf[limit] = 0; // safe to do as we have 8 extra bytes after PARSER_BUF_SZ
+                shell_prompt_marking(self->screen, (char*)buf + i);
+            }
+            break;
 ```
 
-**Raw output**
+`shell_prompt_marking()` handles `A`/`C`/`D`; the `D` case extracts the exit status and calls back into Python, `kitty/screen.c:2327-2356` (contiguous):
+
+```c
+void
+shell_prompt_marking(Screen *self, char *buf) {
+    if (self->cursor->y < self->lines) {
+        char ch = buf[0];
+        switch (ch) {
+            case 'A': {
+                PromptKind pk = PROMPT_START;
+                self->prompt_settings.redraws_prompts_at_all = 1;
+                self->prompt_settings.uses_special_keys_for_cursor_movement = 0;
+                parse_prompt_mark(self, buf+1, &pk);
+                self->linebuf->line_attrs[self->cursor->y].prompt_kind = pk;
+                if (pk == PROMPT_START) CALLBACK("cmd_output_marking", "O", Py_False);
+            } break;
+            case 'C': {
+                self->linebuf->line_attrs[self->cursor->y].prompt_kind = OUTPUT_START;
+                const char *cmdline = "";
+                if (strstr(buf + 1, ";cmdline") == buf + 1) {
+                    cmdline = buf + 2;
+                }
+                RAII_PyObject(c, PyUnicode_DecodeUTF8(cmdline, strlen(cmdline), "replace"));
+                if (c) { CALLBACK("cmd_output_marking", "OO", Py_True, c); }
+                else PyErr_Print();
+            } break;
+            case 'D': {
+                const char *exit_status = buf[1] == ';' ? buf + 2 : "";
+                CALLBACK("cmd_output_marking", "Os", Py_None, exit_status);
+            } break;
+        }
+    }
+}
+```
+
+The `D` case (lines 2350-2352) computes `exit_status` from the bytes after `D;` and invokes the Python callback `cmd_output_marking(None, exit_status)`, which forwards to `handle_cmd_end(exit_status)` (Q5). For `D;0`, `exit_status` is `"0"`.
+
+### The protocol is a de-facto cross-vendor convention **[source-derived, corroborated by external references]**
+
+OSC 133 is not a formally standardized escape sequence; it is a **de-facto cross-vendor convention** originating with FinalTerm and popularized by iTerm2. Its sequences <cite index="3-1">mark up a shell's output with semantic information about where the prompt begins</cite>, where the command begins, and where output begins and ends. The command-finished marker is defined by VS Code's documentation as <cite index="6-7">Based on FinalTerm's `OSC 133 ; D [; <ExitCode>] ST`</cite>, with the exit code optional. When present, terminals <cite index="9-2">treat 0 as "success" and anything else as an error.</cite> The markers are <cite index="7-3">now adopted by iTerm2, VS Code, Ghostty, and others</cite>, and kitty is explicitly among the implementers. Its non-standard status is explicit: <cite index="8-20">The OSC command numbers 133 and 1337 are not registered with any standards body.</cite>
+
+### Rationale
+
+Unlike the direct-child path (Q6/Q7), where the OS carries only a raw wait-status with no escape sequence, the shell-integration path is what carries a human-meaningful **command** status: the shell appends `\e]133;D;$?\a` (bash), `\e]133;D;$cmd_status\a` (zsh), or `\e]133;D;$status\a` (fish) after each command; kitty parses it (`vt-parser.c` → `screen.c`) and delivers the status string to `handle_cmd_end()`. This is why questions 5–8 concern the OSC 133 transport, while 6–7 concern the OS `SIGCHLD`/`wait4` mechanism.
+
+## Q9 — Where the child's printed output appears
+
+### Answer: in kitty's on-screen terminal grid (the kitty window) **[observed]**
+
+The child's stdout is read from the **PTY master**, parsed, written into the window's `Screen` grid, and rendered on screen. It does **not** appear on kitty's own stdout/stderr.
+
+### Raw output — the child's bytes reach kitty via the PTY master **[observed]**
+
+From the Q1 strace (monitor thread reading the PTY master fd 8):
 
 ```
+146320 read(8, "hello\r\nworld\r\n", 1048576) = 14
+```
+
+### Raw output — the bytes land in the `Screen` grid **[observed]**
+
+Feeding `hello\r\nworld\r\n` through kitty's **real** VT parser and `Screen` (via `kitty.fast_data_types.Screen` and the test harness `parse_bytes`, run under `kitty +launch`) fills the grid exactly:
+
+```
+$ cat /tmp/kwork/evidence/q9_screen_dump.txt
+grid line 0: 'hello'
+grid line 1: 'world'
+grid line 2: ''
+```
+
+A screenshot of the live kitty window (saved to `/tmp/kwork/evidence/q9_grid.png` and inspected during the investigation) shows two lines of light-gray monospace text on a black background — `hello` on the first line and `world` on the second — left-aligned at the top of the terminal grid, confirming the rendered result.
+
+### Raw output — the child's text is NOT on kitty's own stdout/stderr **[observed]**
+
+```
+$ cat /tmp/kwork/evidence/q9_negative.txt
 kitty_exit=0
-own stdout bytes:
+--- kitty own stdout: byte count ---
 0
-own stderr bytes:
-71
-[0.157] Failed to open systemd user bus with error: Connection refused
-grep child lines in kitty's own stdout/stderr:
-/tmp/q9_stdout.txt:0
-/tmp/q9_stderr.txt:0
+--- kitty own stdout: contents ---
+--- kitty own stderr: contents ---
+[0.195] Failed to open systemd user bus with error: Connection refused
+--- count of child lines (hello|world) in kitty own stdout+stderr ---
+/tmp/kwork/q9_own_stdout.txt:0
+/tmp/kwork/q9_own_stderr.txt:0
 ```
 
-Positive side — the strace from Q1/Q6 shows the child's bytes being read by kitty from the PTY master (fd `8`) and
-committed to the parser (which fills the `Screen` grid); a rendered screenshot taken during investigation showed the
-two lines `hello` and `world` in the terminal grid:
+Kitty's own stdout is **empty (0 bytes)**; its stderr contains only a benign, unrelated systemd-bus warning; and grepping both for `hello`/`world` yields **0** matches. The child's output is thus confined to the terminal grid.
+
+### Code citation **[source-derived]**
+
+The PTY master read is `read_bytes()` [`kitty/child-monitor.c:1345`] (full function quoted under Q1), which commits the bytes into the VT parser write buffer; `do_parse()` [`kitty/child-monitor.c:438`] then feeds the parser into the `Screen`, and `prepare_to_render_os_window()`/`send_cell_data_to_gpu()` [`kitty/child-monitor.c:705,714`] upload the grid cells to the GPU for drawing.
+
+### Rationale
+
+`echo hello; echo world` writes to the child's stdout, which is the PTY **slave** (wired by `dup2` in `spawn`, Q1). Kitty reads the **master** end, so the bytes enter kitty's parser and become grid cells rather than propagating to kitty's own standard streams. The empty own-stdout, the `Screen` dump, and the screenshot together confirm the output lands in the kitty window's terminal grid.
+
+
+## Two distinctions that resolve the question
+
+### Distinction A — There are two different "completion" messages
+
+The prompt's question 3 ("the full message shown indicating the program completed") only has a well-defined answer once two unrelated messages are separated:
+
+| Message | When it appears | Exact text | Carries status? |
+|---|---|---|---|
+| `+hold` / hold-kitten banner | `kitty +hold …` (or `kitten __hold_till_enter__`) | `Press Enter or Esc to exit` (SGR bold-green) | No |
+| Shell-integration notification | interactive shell with integration on **and** `notify_on_cmd_finish != never` | `Command <cmd> finished with status: <n>.\nClick to focus.` | Yes (`<n>`) |
+
+Note also that the **`--hold` flag** (not `+hold`) is a third, distinct thing: it holds the window open by running the command under an **interactive shell** (`KITTY_HOLD=1`), and shows **neither** message — just a live shell. In the **default** direct-launch case (`kitty sh -c '… exit 0'`), **no** persistent completion message is shown at all; the window simply closes.
+
+### Distinction B — There are two different exit-status transports
+
+| Transport | Mechanism | What it carries | Reaches the message? |
+|---|---|---|---|
+| OS process reaping | `SIGCHLD` → `wait4(-1,&status,WNOHANG)` | raw wait-status of the **direct child** | **No** — `on_child_death(window_id)` gets only a window id |
+| Shell integration | OSC 133 `D;<code>` escape sequence on the PTY | the **shell-reported command status** | **Yes** — decoded to `handle_cmd_end(exit_status)` |
+
+Questions 6 and 7 concern the **OS** transport (`SIGCHLD`/`wait4`); questions 5 and 8 concern the **shell-integration** transport (OSC 133). They are independent: the OS mechanism reaps the child but does not deliver a status to the window's message path, which is exactly why the status-bearing notification is produced by the shell-integration path and phrased as a **shell-reported command status**, not the child's OS wait-status.
+
+## Two nuances
+
+### Nuance 1 — Default window teardown is driven by PTY EOF, not by the `SIGCHLD` reap
+
+With `close_on_child_death` at its **default** value `no` (`kitty/options/types.py:500` → `close_on_child_death: bool = False`; `kitty/options/definition.py:2920` → `opt('close_on_child_death', 'no', …)`), the `SIGCHLD` reap does **not** remove the window (it passes `enable_close_on_child_death=false` into `reap_children`, so `mark_child_for_removal` is skipped — Q7). Instead, the window is removed because `read_bytes` on the PTY master returns `false` at EOF/EIO and sets `children[i].needs_removal = true` (Q1). This was proven with a **discriminating** experiment where the foreground command exits immediately but a detached writer keeps the PTY open:
 
 ```
-93767 read(8, "hello\r\nworld\r\n", 1048576) = 14
+$ cat /tmp/kwork/evidence/q1_close_alternate.txt
+### DISCRIMINATING close_on_child_death test ###
+# child: 'echo hi; setsid -f sleep 4; exit 0'  -> foreground sh exits 0 immediately,
+# but a detached 'sleep 4' keeps the PTY slave open (verified: PTY master EOF at ~4s).
+
+--- DEFAULT close_on_child_death=no : window LINGERS until PTY EOF (~4s) ---
+default(no): kitty_exit=0  wall=4.31s
+
+--- close_on_child_death=yes : window closes IMMEDIATELY when foreground sh exits ---
+yes:         kitty_exit=0  wall=0.31s
 ```
 
-**Code citation** — the PTY‑master read that feeds the grid, `kitty/child-monitor.c:1345,1354` (verbatim):
+With the default (`no`), kitty lingers **4.31 s** — until the detached writer closes the PTY (EOF) — proving teardown is PTY-EOF-driven. With `close_on_child_death=yes`, kitty closes in **0.31 s** — immediately on the `SIGCHLD` reap via `mark_child_for_removal`. Both exit `0`. (For a child with no lingering writer, EOF coincides with exit, so the difference is invisible; the detached-writer case is what separates the two mechanisms.)
 
-```
-        len = read(fd, buf, available_buffer_space);
-    vt_parser_commit_write(screen->vt_parser, len);
-```
+### Nuance 2 — The completion notification is off by default, and the duration gate is effectively inert
 
-**Rationale.** The child's printed output appears in **kitty's on‑screen terminal grid** — the `Screen` buffer,
-GPU‑rendered — and **not** on kitty's own stdout/stderr. The redirection proves the negative side: kitty's own
-stdout is `0` bytes and its own stderr contains only a benign, unrelated systemd‑bus warning; neither contains
-`hello` or `world` (`grep -c` returns `0` for both). The positive side is the PTY‑master `read(8, "hello\r\nworld\r\n",
-…) = 14` in the trace, immediately followed by `vt_parser_commit_write(...)` which writes the bytes into the
-`Screen`, where they are rendered as the two visible grid lines. The child writes the PTY *slave*; kitty reads the
-PTY *master*; the text lives in kitty's grid.
+`notify_on_cmd_finish` defaults to `never` (`kitty/options/types.py:560` → `NotifyOnCmdFinish(when='never', duration=5.0, …)`; `kitty/options/definition.py:3190` → `opt('notify_on_cmd_finish', 'never', …)`), so **by default no completion notification is shown** even with shell integration active — confirmed by the Q3b matrix (`enabled_default`: OSC 133 received, `Notify=0`). Separately, as documented under Q5, the `duration` threshold is effectively inert because `last_cmd_output_start_time` is zeroed (`kitty/window.py:1411`) *before* the duration subtraction (`kitty/window.py:1417`), making `last_cmd_output_duration` equal to the raw monotonic clock and thus always `>= duration`. The gate therefore reduces to `when != 'never'`. This is an **apparent pre-existing behavior** in the investigated source and is documented, not changed.
 
----
+## Observed vs. inferred classification
 
+Every claim in this document is one of: **runtime-observed** (captured from a live run), **source-derived** (read directly from cited source, and consistent with observed behavior), or **corroborated** (external references confirming an in-repo fact). No claim is purely speculative; nothing required an unverifiable inference.
 
-## 10. Two critical distinctions
-
-### Distinction A — two different "completion" messages
-
-| | `--hold` / `hold`‑kitten banner | shell‑integration notification |
+| Claim | Classification | Evidence |
 |---|---|---|
-| Text | `Press Enter or Esc to exit` (bold green, `\x1b[1;32m…\x1b[m`) | `Command echo hello finished with status: 0.\nClick to focus.` |
-| Contains exit status? | **No** | **Yes** (`0`) |
-| Produced by | `HoldTillEnter()` — `tools/tui/hold.go:26` | `Window.handle_cmd_end()` — `kitty/window.py:1429` |
-| Trigger | the `hold` kitten / `__hold_till_enter__` (the plain `--hold` flag holds via an interactive shell, see Q3a) | shell emits OSC 133 `D;<code>`; requires `notify_on_cmd_finish != never` |
+| Kitty's own exit code is `0`, stable, child-status-independent | runtime-observed | `q2_exit.txt` (5 runs + child exit 5/42) |
+| The child exits and delivers `SIGCHLD` (signal 17, `CLD_EXITED`) | runtime-observed | strace `signalfd4`, `read(7)=128`, decode script |
+| Kitty reaps with `wait4(-1,&status,WNOHANG)` | runtime-observed | strace `wait4(…) = 146321` |
+| `+hold` banner is `Press Enter or Esc to exit` (bold-green), stable ×2 | runtime-observed | `q3a_hold.txt` |
+| `--hold` flag shows an interactive shell (`KITTY_HOLD=1`), no banner | runtime-observed | `q3_hold_flag_env.txt` + screenshot |
+| Notification body `Command echo hello finished with status: 0.\nClick to focus.` | runtime-observed | `q3b_notify_body.txt` (D-Bus) |
+| Notification off by default; fires only when `when != never` | runtime-observed | Q3b matrix (`enabled_default` Notify=0) |
+| OSC 133 `D;0` bytes `\e]133;D;0\a` on the wire | runtime-observed | `q8_byte_exact.txt`, `q8_timeline.txt` |
+| Child output `hello`/`world` lands in the `Screen` grid | runtime-observed | `q9_screen_dump.txt` + `q9_grid.png` |
+| Child output is NOT on kitty's own stdout/stderr | runtime-observed | `q9_negative.txt` (0 bytes) |
+| Default teardown is PTY-EOF (lingers with detached writer); `=yes` reaps immediately | runtime-observed | `q1_close_alternate.txt` (4.31 s vs 0.31 s) |
+| `ChildMonitor` owns id/PID/PTY-fd/Screen | source-derived | `kitty/boss.py:370-374, 585-587`; `kitty/child-monitor.c:305-306` |
+| `handle_cmd_end()` builds the message | source-derived (+ observed body) | `kitty/window.py:1408-1451`; `q3b_notify_body.txt` |
+| `on_child_death(window_id)` carries no status; `mark_monitored_pids` no-op for primary child | source-derived | `kitty/boss.py:881`; `kitty/child-monitor.c:1397-1409` |
+| Duration gate reduces to `when != never` (zeroed-before-subtract) | source-derived (+ observed) | `kitty/window.py:1411,1417,1425`; Q3b matrix |
+| OSC 133 is a de-facto cross-vendor convention (FinalTerm origin, exit code optional) | corroborated | external references (iTerm2, VS Code, terminfo.dev) |
 
-Conflating these would misstate Q3 and Q5. The banner is a Go‑kitten TUI string with no status; the notification is
-a Python‑built desktop message that embeds the status.
+## Reproducibility (self-contained)
 
-### Distinction B — two different exit‑status transports
+All commands were run from the repository root on the host described in *Environment and build*. Every temporary artifact lives under `/tmp/kwork` (outside the repo). The scripts below are complete — no elisions.
 
-- A **directly launched** child's termination is delivered by the OS as **`SIGCHLD`** (via the signalfd) and reaped
-  by **`waitpid`/`wait4`** (`kitty/child-monitor.c:1418`). The direct‑reap *window* callback
-  `on_child_death(window_id)` (`kitty/boss.py:881`) carries **no exit status** — which is precisely why the
-  "finished with status" message cannot come from the direct reap.
-- A **shell‑reported** command's exit code travels via the **OSC 133 `D;<code>`** escape sequence
-  (`kitty/screen.c:2350-2352`).
-- Q6–Q7 concern the former (OS/signal transport); Q8 concerns the latter (escape‑sequence transport). The separate
-  callback `on_monitored_pid_death(self, pid, exit_status)` (`kitty/boss.py:2725`) *does* carry a status, but it is
-  for *monitored background pids*, not the primary window child — do not confuse it with `on_child_death`.
+### 0. Safe environment setup (headless X, captured PID, cleanup trap)
 
----
-
-## 11. Two default‑configuration nuances
-
-### Nuance #1 — `close_on_child_death` default is `no`, yet the window still closes
-
-Defaults — `kitty/options/types.py:500` and `kitty/options/definition.py:2920` (verbatim):
-
-```
-    close_on_child_death: bool = False
-```
-
-```
-opt('close_on_child_death', 'no',
+```bash
+set -o pipefail
+export KITTY_REPO="$PWD"                       # repository root
+export WORK=/tmp/kwork; mkdir -p "$WORK/evidence"; chmod 700 "$WORK"
+# headless X for the GPU terminal:
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+XVFB_PID=$!
+trap 'kill "$XVFB_PID" 2>/dev/null' EXIT       # tear down Xvfb on shell exit
+export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
 ```
 
-**Observed.** With the default (`no`) *and* with `-o close_on_child_death=yes`, the simple foreground child causes
-the window to close and kitty to exit `0`:
+### 1. Canonical default build
 
-```
-$ ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0' >/dev/null 2>&1; echo "default: $?"
-default: 0
-$ ./kitty/launcher/kitty --config NONE -o close_on_child_death=yes sh -c 'echo hello; echo world; exit 0' >/dev/null 2>&1; echo "yes: $?"
-yes: 0
-```
-
-For a simple child with no lingering PTY writers, the default (`no`) close happens via the **PTY‑EOF path**: the
-child dies → the PTY slave closes → `read()` returns `0`/`EIO` → `read_bytes()` returns `false`
-(`kitty/child-monitor.c:1355`) → the child is marked `needs_removal = true` (`kitty/child-monitor.c:1535`). The
-`SIGCHLD`‑reap dispatch at `kitty/child-monitor.c:1526` always runs, but by default it passes
-`OPT(close_on_child_death) == false`, so `mark_child_for_removal` (`:1422`) is *not* the mechanism that removes the
-window in the default config; setting `close_on_child_death=yes` is the alternate immediate‑removal path.
-
-### Nuance #2 — `notify_on_cmd_finish` default is `never`
-
-Defaults — `kitty/options/types.py:560` and `kitty/options/definition.py:3190` (verbatim):
-
-```
-    notify_on_cmd_finish: NotifyOnCmdFinish = NotifyOnCmdFinish(when='never', duration=5.0, action='notify', cmdline=())
+```bash
+mkdir -p "$WORK/bin"; ln -sf /usr/local/bin/python3.11 "$WORK/bin/python3"
+export PATH="$WORK/bin:/usr/local/go/bin:$PATH" GOPATH=/root/go CI=true
+make clean
+( set -o pipefail; make > "$WORK/evidence/make_full.log" 2>&1; echo "MAKE_EXIT=${PIPESTATUS[0]}" )
+./kitty/launcher/kitty --version    # -> kitty 0.35.2 created by Kovid Goyal
 ```
 
-```
-opt('notify_on_cmd_finish', 'never', option_type='notify_on_cmd_finish', long_text='''
-```
+### 2. Kitty's own exit code (Q2)
 
-**Observed.** In the default configuration, no desktop notification is emitted — on the same D‑Bus session used for
-Q3b, running the same OSC‑133‑emitting child *without* the `notify_on_cmd_finish` override produced **zero**
-`org.freedesktop.Notifications.Notify` method calls:
-
-```
-==== Notify method calls in DEFAULT config (expect NONE) ====
-NONE — no org.freedesktop.Notifications.Notify method call was emitted.
+```bash
+for i in 1 2 3 4 5; do
+  ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0' >/dev/null 2>&1
+  echo "run $i: kitty_exit=$?"
+done
 ```
 
-The gate is `kitty/window.py:1425` (verbatim):
+### 3. Signal + reap trace (Q6/Q7) and the reproducible siginfo decode
 
-```
-        if last_cmd_output_duration >= duration and when != 'never':
-```
-
-`handle_cmd_end()` still runs on every command end (updating `last_cmd_exit_status`), but the body is only built and
-sent when `when != 'never'` (and the output lasted at least `duration`). The Q3b observation therefore sets
-`notify_on_cmd_finish always 0` — a real, canonical option value, labelled configured (non‑default).
-
----
-
-## 12. Observed vs inferred
-
-| # | Reported value | Observed / Inferred | How |
-|---|----------------|---------------------|-----|
-| Q1 | full spawn→read→reap→teardown ordering | **Observed** | strace death‑sequence excerpt + code |
-| Q2 | kitty own exit code `0` (stable ×5; `0` even when child exits 5/42) | **Observed** | 5+2 runs of `$?` |
-| Q3a | banner bytes `\x1b[1;32mPress Enter or Esc to exit\x1b[m` | **Observed** | PTY capture of `__hold_till_enter__` (158 bytes) |
-| Q3a | plain `--hold` flag holds via interactive shell, not the banner | **Observed** | child is `bash` with `KITTY_HOLD=1`; screen shows no banner |
-| Q3b | notification body `Command echo hello finished with status: 0.\nClick to focus.` | **Observed** | D‑Bus `Notify` capture (×2 identical), configured `notify_on_cmd_finish always 0` |
-| Q4 | `ChildMonitor` owns window id/PID/child_fd/Screen | **Observed** | `add_child(...)` registration + strace of the monitor thread |
-| Q5 | `Window.handle_cmd_end()` builds the message | **Observed** | `command`‑action probe: `exit_status=[0] cmdline=[echo hello]` |
-| Q6 | `SIGCHLD` (17), via signalfd; `ssi_code=CLD_EXITED`, `ssi_pid=child` | **Observed** | `signalfd4([… CHLD …])`, decoded signalfd read |
-| Q7 | `waitpid(-1,&status,WNOHANG)` = child, status 0 (`wait4` syscall) | **Observed** | strace `wait4(-1, [{… WEXITSTATUS(s)==0}], WNOHANG, NULL) = <pid>` |
-| Q8 | OSC 133 `D;0` transport (bytes `ESC ]133;D;0 BEL`) | **Observed** | real bash‑integration PTY capture + kitty `--dump-bytes` |
-| Q9 | output in on‑screen grid, not kitty's own stdout/stderr | **Observed** | own stdout 0 B / stderr benign; PTY read of `"hello\r\nworld\r\n"` |
-
-No reported value in this document is inferred‑only; every answer is backed by captured runtime output plus a
-`file:line` citation. (The on‑screen rendering in Q9 was additionally confirmed visually via a screenshot during
-investigation; the byte‑level PTY/strace evidence is the primary, self‑contained proof retained here.)
-
----
-
-## 13. Reproducibility
-
-All commands, in order, with the environment `export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1` where a GUI window is
-needed:
-
-```
-# Q2 / Q1 / Q9 primary path
-./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0'; echo $?
-./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0' >/tmp/q9_stdout.txt 2>/tmp/q9_stderr.txt
-
-# Q1 / Q6 / Q7 — signals and reap
-strace -f -e trace=signalfd4,rt_sigprocmask,wait4,read -e signal=all -o /tmp/kitty_sig.strace \
-  ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0'
-
-# Q3a — hold banner (via the hold kitten)
-#   (PTY harness exec'ing:  kitten __hold_till_enter__ sh -c 'echo hello; echo world; exit 0')
-
-# Q3b / Q5 — notification body (configured, non-default) on a D-Bus session
-dbus-run-session -- bash -c 'dbus-monitor "interface=org.freedesktop.Notifications" >/tmp/dbus_notify.log 2>&1 & \
-  DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 ./kitty/launcher/kitty --config NONE \
-  -o "notify_on_cmd_finish always 0" sh -c "sh /tmp/child_osc.sh"'
-
-# Q8 — OSC 133 wire capture (real bash integration enabled vs disabled) + kitty --dump-bytes corroboration
-#   (PTY harness exec'ing:  bash --rcfile shell-integration/bash/kitty.bash -i   vs   bash --norc -i)
-./kitty/launcher/kitty --config NONE --dump-bytes /tmp/kdump.bin sh -c 'sh /tmp/child_osc.sh'
-
-# Q1 nuance — close_on_child_death
-./kitty/launcher/kitty --config NONE -o close_on_child_death=yes sh -c 'echo hello; echo world; exit 0'; echo $?
+```bash
+strace -f -e trace=signalfd4,rt_sigprocmask,wait4,read -e signal=all -e read=all \
+  -o "$WORK/evidence/kitty.strace" \
+  ./kitty/launcher/kitty --config NONE sh -c 'echo hello; echo world; exit 0' >/dev/null 2>&1
 ```
 
-**Stability.** kitty's own exit code (Q2) was `0` on all five consecutive runs — distribution `{0: 5}` — and
-remained `0` when the child exited non‑zero. The notification body (Q3b) was byte‑identical across two runs. No
-run‑to‑run variance was observed for any reported value.
+`decode_siginfo.py` (decodes the exact `read(7)` payload from the trace):
 
-**Repository left unchanged.** This investigation modified no source file. Temporary observation scripts and
-captures were written under `/tmp` (outside the repository) and removed afterward; the only file added to the
-repository is this document, `blitzy/documentation/kitty_815df1e210e0.md`.
+```python
+import struct
+first16 = bytes([0x11,0,0,0, 0,0,0,0, 1,0,0,0, 0x91,0x3b,0x02,0])
+signo, errno_, code, pid = struct.unpack('<IiiI', first16)
+names={17:'SIGCHLD'}; codes={1:'CLD_EXITED'}
+print(f"ssi_signo = {signo}  -> {names.get(signo,'?')}")
+print(f"ssi_errno = {errno_}")
+print(f"ssi_code  = {code}   -> {codes.get(code,'?')}")
+print(f"ssi_pid   = {pid}   (the child process that exited)")
+```
 
----
+### 4. On-screen grid proof (Q9) via kitty's real `Screen`
 
-## 14. Coverage checklist
+`screen_dump.py`:
 
-- [x] **Q1 — end‑to‑end flow**: spawn (`child.py:276+`) → PTY‑master read (`child-monitor.c:1345`) → parse/Screen → `SIGCHLD` (signalfd) → `waitpid` reap (`child-monitor.c:1418`) → `on_child_death` teardown (`boss.py:881`); default close.
-- [x] **Q2 — kitty's own exit code**: `0`, stable ×5, independent of child status (`main.py:524-531`).
-- [x] **Q3a — `--hold` banner (named item: banner bytes)**: `\x1b[1;32mPress Enter or Esc to exit\x1b[m` (`hold.go:26`); no status; plain `--hold` flag holds via interactive shell.
-- [x] **Q3b — notification body (named item)**: `Command echo hello finished with status: 0.\nClick to focus.` (`window.py:1429`); non‑default.
-- [x] **Q4 — child‑tracking component (named item: ChildMonitor)**: `ChildMonitor` (`boss.py:370,587`; `child-monitor.c`).
-- [x] **Q5 — message‑generating function (named item: `handle_cmd_end`)**: `Window.handle_cmd_end()` (`window.py:1408`, body `:1429`).
-- [x] **Q6 — signal (named item: `SIGCHLD`)**: `SIGCHLD` (17) via signalfd (`child-monitor.c:121,136,1370`; `loop-utils.c:42`).
-- [x] **Q7 — system call (named item: `waitpid`/`wait4`)**: `waitpid(-1,&status,WNOHANG)` (`child-monitor.c:1418`).
-- [x] **Q8 — status transport (named item: OSC 133 `D;<code>`)**: `vt-parser.c:536` → `screen.c:2350-2352`; emitters `bash:239`, `zsh:145`, `fish:96`.
-- [x] **Q9 — output location (named item: on‑screen grid)**: on‑screen `Screen` grid, not kitty's own stdout/stderr (`child-monitor.c:1345,1354`).
-- [x] **Distinction A** (two message paths) and **Distinction B** (two transports) stated explicitly.
-- [x] **Nuance #1** (default close via PTY‑EOF; `close_on_child_death=yes` alternate) and **Nuance #2** (`notify_on_cmd_finish` default `never`) addressed with observed contrasts.
-- [x] Every question has **Command → Raw output → `file:line` citation (verbatim) → Rationale**.
+```python
+from kitty.fast_data_types import Screen
+from kitty_tests import Callbacks, parse_bytes
+cb = Callbacks()
+screen = Screen(cb, 5, 20, 100, 10, 20, 0, cb)   # 5 rows x 20 cols
+parse_bytes(screen, b"hello\r\nworld\r\n")         # exactly what the child wrote to the PTY slave
+for i in range(3):
+    print(f"grid line {i}: {str(screen.line(i))!r}")
+```
 
+```bash
+./kitty/launcher/kitty +launch "$WORK/screen_dump.py"   # -> grid line 0: 'hello' / 1: 'world'
+```
+
+### 5. `+hold` banner (Q3a) via a PTY
+
+`pty_capture.py` (captures a program's terminal output through a PTY):
+
+```python
+import os, pty, sys, select, time
+argv = sys.argv[2:]
+outpath = sys.argv[1]
+pid, mfd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+buf = bytearray()
+deadline = time.time() + 12
+sent_enter = False
+while True:
+    r,_,_ = select.select([mfd], [], [], 0.3)
+    if mfd in r:
+        try:
+            d = os.read(mfd, 65536)
+        except OSError:
+            break
+        if not d: break
+        buf += d
+    if not sent_enter and (b'Press Enter' in buf or time.time() > deadline-8):
+        time.sleep(0.3); os.write(mfd, b'\r'); sent_enter = True
+    if time.time() > deadline: break
+    try:
+        wpid,_ = os.waitpid(pid, os.WNOHANG)
+        if wpid==pid:
+            time.sleep(0.2)
+            while True:
+                rr,_,_=select.select([mfd],[],[],0.3)
+                if mfd in rr:
+                    try: d=os.read(mfd,65536)
+                    except OSError: break
+                    if not d: break
+                    buf+=d
+                else: break
+            break
+    except ChildProcessError:
+        break
+open(outpath,'wb').write(bytes(buf))
+```
+
+```bash
+python3.11 "$WORK/pty_capture.py" "$WORK/evidence/hold1.bin" \
+  ./kitty/launcher/kitty +hold sh -c 'echo hello; echo world; exit 0'
+```
+
+### 6. Real shell integration → notification (Q3b/Q5/Q8) driven by synthetic keystrokes
+
+`xtype.py` (injects real keystrokes via the X11 XTEST extension — the canonical user-input path):
+
+```python
+import ctypes, ctypes.util, sys, time
+X11 = ctypes.CDLL("libX11.so.6")
+XTST = ctypes.CDLL("libXtst.so.6")
+X11.XOpenDisplay.restype = ctypes.c_void_p
+X11.XKeysymToKeycode.restype = ctypes.c_uint
+X11.XStringToKeysym.restype = ctypes.c_ulong
+dpy = X11.XOpenDisplay(None)
+if not dpy: sys.exit("no display")
+def keysym(s): return X11.XStringToKeysym(s.encode())
+SHIFT_KC = X11.XKeysymToKeycode(ctypes.c_void_p(dpy), ctypes.c_ulong(keysym("Shift_L")))
+def tapsym(ks, shift=False):
+    kc = X11.XKeysymToKeycode(ctypes.c_void_p(dpy), ctypes.c_ulong(ks))
+    if kc == 0: return
+    if shift: XTST.XTestFakeKeyEvent(ctypes.c_void_p(dpy), ctypes.c_uint(SHIFT_KC), 1, ctypes.c_ulong(0))
+    XTST.XTestFakeKeyEvent(ctypes.c_void_p(dpy), ctypes.c_uint(kc), 1, ctypes.c_ulong(0))
+    XTST.XTestFakeKeyEvent(ctypes.c_void_p(dpy), ctypes.c_uint(kc), 0, ctypes.c_ulong(0))
+    if shift: XTST.XTestFakeKeyEvent(ctypes.c_void_p(dpy), ctypes.c_uint(SHIFT_KC), 0, ctypes.c_ulong(0))
+    X11.XFlush(ctypes.c_void_p(dpy))
+    time.sleep(0.02)
+SPECIAL={' ':'space','\n':'Return','\t':'Tab','-':'minus','.':'period',';':'semicolon','/':'slash','_':('minus',True)}
+def typ(s):
+    for ch in s:
+        if ch in SPECIAL:
+            v=SPECIAL[ch]
+            if isinstance(v,tuple): tapsym(keysym(v[0]),shift=v[1])
+            else: tapsym(keysym(v))
+        elif ch.isupper():
+            tapsym(keysym(ch), shift=True)
+        else:
+            tapsym(keysym(ch))
+if __name__=="__main__":
+    time.sleep(float(sys.argv[1]))
+    typ(sys.argv[2])
+```
+
+`si_matrix.sh` (runs the enabled/disabled/default matrix; each case counts OSC 133 markers via `--dump-bytes` and `Notify` calls via `dbus-monitor`):
+
+```bash
+#!/bin/bash
+set -u
+cd "$KITTY_REPO"
+export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
+EV=/tmp/kwork/evidence
+run_case() {  # $1=label $2..=extra kitty opts
+  local label="$1"; shift
+  local dbuslog="$EV/dbus_${label}.log" dump="$EV/dump_${label}.bin"
+  dbus-monitor "interface='org.freedesktop.Notifications',member='Notify'" >"$dbuslog" 2>/dev/null &
+  local dpid=$!
+  timeout 30 ./kitty/launcher/kitty --config NONE "$@" --dump-bytes "$dump" bash -i >/dev/null 2>&1 &
+  local kpid=$!
+  /opt/kitty-venv/bin/python /tmp/kwork/xtype.py 4 "echo hello"$'\n'
+  sleep 2
+  /opt/kitty-venv/bin/python /tmp/kwork/xtype.py 0 "exit"$'\n'
+  wait $kpid 2>/dev/null
+  sleep 1; kill $dpid 2>/dev/null
+  echo "[$label] kitty done"
+}
+run_case enabled_notify -o "notify_on_cmd_finish always 0"
+run_case disabled_notify -o "shell_integration disabled" -o "notify_on_cmd_finish always 0"
+run_case enabled_default
+```
+
+The whole matrix must be run under a session bus so notifications are deliverable:
+
+```bash
+dbus-run-session -- bash "$WORK/si_matrix.sh"
+```
+
+### 7. Cleanup and repository-unchanged verification
+
+```bash
+rm -rf /tmp/kwork          # remove ALL temporary artifacts (outside the repo)
+git status --porcelain     # only the answer document should appear
+```
+
+Actual final status (the only change on the branch is this document):
+
+```
+$ git status --porcelain
+ M blitzy/documentation/kitty_815df1e210e0.md
+```
+
+## Coverage checklist
+
+Every question and every named item is answered, and every implied condition was exercised.
+
+### Questions
+
+- [x] Q1 end-to-end flow — spawn → PTY → read → parse → Screen → GPU render; exit → `SIGCHLD` → reap → teardown.
+- [x] Q2 kitty's own exit code — `0`, stable ×5, child-status-independent.
+- [x] Q3 full completion message — none by default; `+hold` banner `Press Enter or Esc to exit`; shell notification `Command … finished with status: 0.\nClick to focus.`
+- [x] Q4 tracking component — `ChildMonitor`.
+- [x] Q5 message-generating function — `Window.handle_cmd_end()`.
+- [x] Q6 signal — `SIGCHLD` (17), via `signalfd`.
+- [x] Q7 system call — `wait4(-1,&status,WNOHANG)` (`waitpid` family).
+- [x] Q8 status transport — OSC 133 `D;<code>` → `vt-parser.c` → `screen.c` → `handle_cmd_end()`.
+- [x] Q9 output location — kitty's on-screen terminal grid (not kitty's own stdout/stderr).
+
+### Named items
+
+- [x] `SIGCHLD` (Q6) — observed via `signalfd` siginfo decode.
+- [x] `waitpid`/`wait4` (Q7) — observed in strace.
+- [x] shell integration / OSC escape codes (Q8) — real OSC 133 `D;0` captured and traced through the parser.
+- [x] `ChildMonitor` (Q4) — cited and its `add_child(id,pid,fd,screen)` registration shown.
+- [x] `handle_cmd_end()` (Q5) — full method quoted; observed message body.
+- [x] terminal window vs. elsewhere (Q9) — grid dump + screenshot + empty own-stdout.
+
+### Conditions exercised
+
+- [x] Default direct launch (`kitty sh -c '… exit 0'`) — window closes, no message.
+- [x] `close_on_child_death=yes` — immediate close (discriminating 0.31 s vs 4.31 s).
+- [x] `kitty +hold` — green banner, ×2 byte-identical (stability).
+- [x] `kitten __hold_till_enter__` — same banner (non-canonical corroboration).
+- [x] `kitty --hold` flag — interactive shell, `KITTY_HOLD=1`, no banner.
+- [x] Shell integration enabled + `notify_on_cmd_finish always` — OSC 133 + one notification.
+- [x] Shell integration disabled (kitty level) — no OSC 133, no notification (negative control).
+- [x] Shell integration enabled + default `notify_on_cmd_finish=never` — OSC 133 present, no notification (gate control).
+- [x] Nonzero child status controls — child exit 5 and 42 → kitty exit 0.
+- [x] Before/during/after markers — the OSC 133 `D→A→C→D` timeline.
+- [x] Kitty's own stdout/stderr negative check — 0 bytes / benign only.
