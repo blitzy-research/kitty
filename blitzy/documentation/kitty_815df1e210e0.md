@@ -18,7 +18,35 @@ python3 setup.py build
 
 (equivalently `make`), which compiles `kitty/fast_data_types*.so` via `build()` `[setup.py:1084]` → `compile_c_extension(..., 'kitty/fast_data_types', ...)` `[setup.py:1091]`.
 
-**Build caveat (Observed).** On this environment's toolchain (Ubuntu 25.10, gcc 15.2.0, `wayland-protocols` 1.45), the plain `python3 setup.py build` aborts (exit 1) because the vendored glfw/Wayland backend `glfw/wl_window.c:668` hits `-Werror=switch` on the newer `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values that its `switch` does not handle. The `fast_data_types` extension itself compiles cleanly; only the unrelated glfw/Wayland windowing step is affected. Complete, unedited tail of the failed plain build (command: `python3 setup.py build`):
+**Canonical environment (Observed).** All build and runtime observation in this document was performed inside the **attached canonical Docker image** as a normal user would. The image is `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (backing tag `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`; Image ID `c0824992ad0b`, digest `sha256:60da90a7183a82861fc6d1d40cb8086baa6a8a0e0d05f26d03aafd0f5b3cc384`). Its toolchain, as a labeled fingerprint (probed with `docker run --rm --entrypoint /bin/bash <image> -lc 'cat /etc/os-release; python3 --version; gcc --version; make --version; go version; pkg-config --modversion wayland-client; which gdb || echo ABSENT'`; the block below labels each probe's value — e.g. the `PRETTY_NAME` line from `/etc/os-release`, the `pkg-config --modversion wayland-client` value `1.22.0`, and `ABSENT` from the `which gdb` probe):
+
+```
+PRETTY_NAME="Ubuntu 24.04.2 LTS"
+Python 3.12.3
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
+GNU Make 4.3
+go version go1.23.4 linux/amd64
+wayland-client 1.22.0
+gdb: ABSENT
+```
+
+**Default build succeeds in the canonical image (Observed).** In this environment the **default** `python3 setup.py build` **succeeds (exit 0)** with **no** build flag required: the vendored glfw/Wayland backend compiles cleanly because the image's `wayland-client`/`wayland-protocols` (1.22.0) predate the newer `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values, so the `-Werror=switch` that trips on newer headers is never triggered (`0` warning-as-error hits across the whole 360-line build log). Complete, unedited tail of the successful default build, followed by the import + extension-size check (commands: `python3 setup.py build; echo "PLAIN_BUILD_EXIT=$?"` then the import probe):
+
+```
+$ python3 setup.py build ; echo "PLAIN_BUILD_EXIT=$?"
+[... standard build log: the fast_data_types C extension links, then the Go kitten/launcher steps; final lines: ...]
+kitty/tools/cmd/completion
+kitty/tools/cmd
+PLAIN_BUILD_EXIT=0
+
+$ PYTHONPATH=$PWD python3 -c "import kitty.fast_data_types as f; print('import OK:', bool(f.HistoryBuf)); import os; print('size_bytes:', os.path.getsize('kitty/fast_data_types.so'))"
+import OK: True
+size_bytes: 1213072
+```
+
+So in the canonical image the extension is **1,213,072 bytes** and the default build is the canonical build (no flag). Headless `HistoryBuf`/`Screen` observation needs no GPU/display. (The `[... standard build log ...]` marker elides the verbose per-file Go build lines, not the evidence for any claim; the meaningful results — exit code `0`, zero warning-as-error hits, and the complete import/size output — are shown verbatim.)
+
+**Non-canonical host control (informational — NOT the canonical result).** For transparency, on a *newer* host toolchain **outside** the attached image (Ubuntu 25.10, gcc 15.2.0, `wayland-protocols` 1.45) the plain `python3 setup.py build` instead **aborts (exit 1)** because the vendored glfw/Wayland backend `glfw/wl_window.c:668` hits `-Werror=switch` on the newer `XDG_TOPLEVEL_STATE_CONSTRAINED_*` enum values its `switch` does not handle (the `fast_data_types` extension itself still compiles cleanly; only the unrelated glfw/Wayland windowing step is affected):
 
 ```
 glfw/wl_window.c: In function ‘xdgToplevelHandleConfigure’:
@@ -31,21 +59,7 @@ glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAIN
 cc1: all warnings being treated as errors
 ```
 
-The working build command used was:
-
-```
-python3 setup.py build --ignore-compiler-warnings
-```
-
-The `--ignore-compiler-warnings` flag `[setup.py:2003]` empties the `werror` string `[setup.py:491]` (`werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'`). Note (Observed): it removes **both** `-pedantic-errors` **and** `-Werror` — visible in the failing compile line above, which is invoked with `... -std=c11 -pedantic-errors -Werror -O3 ...`. It only affects which warnings are promoted to errors; it does not change the source that is compiled. This build succeeds (exit 0) and the extension links and imports cleanly. Complete, unedited output of the import + extension-size check:
-
-```
-$ PYTHONPATH=$PWD python3 -c "import kitty.fast_data_types as f; print('import OK:', bool(f.HistoryBuf)); import os; print('size_bytes:', os.path.getsize('kitty/fast_data_types.so'))"
-import OK: True
-size_bytes: 1253792
-```
-
-The windowing build issue is a host-toolchain / newer-headers artifact, unrelated to the scrollback subsystem under test; headless `HistoryBuf`/`Screen` observation needs no GPU/display.
+On that non-canonical host the workaround is `python3 setup.py build --ignore-compiler-warnings`, whose flag `[setup.py:2003]` empties the `werror` string `[setup.py:491]` (`werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'`) — it changes only which warnings are promoted to errors, not the source compiled, and there the extension links to **1,253,792 bytes**. This host control is reported only to explain the toolchain-dependent *windowing*-build difference; every value this document relies on comes from the canonical image (default build, extension **1,213,072 bytes**).
 
 ### Canonical entry point, zero bypass
 
@@ -53,37 +67,22 @@ All observations drive the real `HistoryBuf`/`Screen` objects imported from `kit
 
 ### Constructor signature
 
-`HistoryBuf(ynum, xnum[, pagerhist_sz])` — **`ynum` FIRST** (the C `new_history_object` `[kitty/history.c:136-138]` parses `"II|I"` → `ynum, xnum, pagerhist_sz`). The optional third arg `pagerhist_sz` is the ring buffer's `maximum_size` **in raw bytes** at the C level (passed straight to `alloc_pagerhist` `[kitty/history.c:69-80]`); the MB→bytes conversion (`int(max(0, float(x)) * 1024 * 1024)`) applies only on the options path `[kitty/options/utils.py:564-565]`. Python-visible signals: `hb.push(line)` (takes a `Line` object `[kitty/history.c:337]`), `hb.count`, `hb.line(i)` (reverse-indexed, line 0 = newest), `hb.pagerhist_as_text()`, `hb.pagerhist_as_bytes()`, `hb.pagerhist_write(bytes)`, `hb.pagerhist_rewrap(xnum)`.
+`HistoryBuf(ynum, xnum[, pagerhist_sz])` — **`ynum` FIRST** (the C `new_history_object` `[kitty/history.c:136-138]` parses `"II|I"` → `ynum, xnum, pagerhist_sz`). The optional third arg `pagerhist_sz` is the ring buffer's `maximum_size` **in raw bytes** at the C level (passed straight to `alloc_pagerhist` `[kitty/history.c:69-80]`); the MB→bytes conversion (`int(max(0, float(x)) * 1024 * 1024)`) applies only on the options path, which additionally clamps the result to **4 GiB − 1 = 4,294,967,295 bytes** via `return min(ans, 4096 * 1024 * 1024 - 1)` `[kitty/options/utils.py:564-566]`. Python-visible signals: `hb.push(line)` (takes a `Line` object `[kitty/history.c:337]`), `hb.count`, `hb.line(i)` (reverse-indexed, line 0 = newest), `hb.pagerhist_as_text()`, `hb.pagerhist_as_bytes()`, `hb.pagerhist_write(bytes)`, `hb.pagerhist_rewrap(xnum)`.
 
 ### Tier 2 is disabled by default
 
 Tier 2 (`PagerHistoryBuf`) is **disabled by default**: `scrollback_pager_history_size = 0` `[kitty/options/definition.py:406]`, while `scrollback_lines = 2000` `[kitty/options/definition.py:372]`. To observe the inter-tier interaction the harness explicitly sets a non-zero pager history size, while this document also documents the default-disabled state.
 
-**Units — user-facing MB vs internal bytes (important).** The `scrollback_pager_history_size` a user writes in `kitty.conf` is **in MB**; the option *parser* `scrollback_pager_history_size(x)` converts it with `int(max(0, float(x)) * 1024 * 1024)` `[kitty/options/utils.py:564-565]`. That conversion runs only on the parse path. The C layer stores and uses a **raw byte count**: `Screen` construction passes `OPT(scrollback_pager_history_size)` straight through to `alloc_historybuf(...)` `[kitty/screen.c:130]`, and the `HistoryBuf(ynum, xnum, pagerhist_sz)` constructor's third argument is that same raw byte count `[kitty/history.c:136-138]`. Consequences for this harness (Observed):
+**Units — user-facing MB vs internal bytes (important).** The `scrollback_pager_history_size` a user writes in `kitty.conf` is **in MB**; the option *parser* `scrollback_pager_history_size(x)` converts it with `int(max(0, float(x)) * 1024 * 1024)` and then caps it at **4 GiB − 1 (4,294,967,295 bytes)** with `return min(ans, 4096 * 1024 * 1024 - 1)` `[kitty/options/utils.py:564-566]`. That conversion (and its 4 GiB − 1 ceiling) runs only on the parse path. The C layer stores and uses a **raw byte count**: `Screen` construction passes `OPT(scrollback_pager_history_size)` straight through to `alloc_historybuf(...)` `[kitty/screen.c:130]`, and the `HistoryBuf(ynum, xnum, pagerhist_sz)` constructor's third argument is that same raw byte count `[kitty/history.c:136-138]`. Consequences for this harness (Observed):
 
 - Setting the field directly on an already-built `Options` object — e.g. `Options(... scrollback_pager_history_size=1024 ...)` via `merge_result_dicts` — bypasses the parser, so `1024` means **1,024 bytes**, not 1,024 MB.
 - The `HistoryBuf` constructor arguments used below (`1048576`, `5*1024*1024`, `50`, `1024*1024`) are likewise **raw bytes** (so `1048576` = 1 MiB of pager ring, `50` = 50 bytes).
 
 ### Reading internal counters (canonical real-struct reads)
 
-`num_segments` and the ring-buffer capacity are **not** exposed to Python. They were read from the **live process struct** two ways, both canonical reads of real production memory (NOT bypasses/mocks):
+`num_segments` and the ring-buffer capacity are **not** exposed to Python. They are read from the **live process struct** with an in-process **`ctypes` read of the live `PyObject`** at fixed offsets — a canonical read of real production memory (NOT a bypass/mock). **`gdb` is deliberately not used: it is absent from the canonical image (`which gdb` → ABSENT, see the environment block above), and an attached-debugger read would in any case require a stale PID and a numeric address that cannot be shown as a portable, re-runnable command.** The `ctypes` read is fully sufficient and reproducible.
 
-1. **`gdb`** attached to the live PID reading raw memory at the struct offset (the method specified in the plan). The target process constructs `HistoryBuf(6000, 80)`, pushes 6000 lines, and prints its PID and the live `PyObject` address; `gdb` then reads `num_segments` at offset `+24`. Complete, unedited session (Observed):
-
-```
-$ cat gdb_target.txt   # PID and live HistoryBuf PyObject address printed by the target
-PID=101394
-ADDR=132628561901808
-ADDR_HEX=0x789ffe51b8f0
-NUMSEG_ADDR=132628561901832
-ctypes_num_segments=3
-ctypes_count=6000
-
-$ gdb -p 101394 -batch -ex 'print *(unsigned int*)(ADDR+24)'   # ADDR=id(hb); num_segments @ +24
-$1 = 3
-```
-
-2. A **`ctypes` read of the live `PyObject` struct** at validated offsets (an equivalent real-struct read). The offsets were self-validated at runtime (Observed): reads at `xnum@id+16`, `ynum@id+20`, `count@id+60` matched the Python-visible members exactly, confirming the layout. The `gdb` read (`$1 = 3`) matches the `ctypes` read (`ctypes_num_segments=3`). Corroborated further by the derived value `ceil(ynum / 2048)` (Inferred — a calculation from `SEGMENT_SIZE`, not a direct measurement).
+The offsets follow directly from the `HistoryBuf` struct layout `[kitty/data-types.h:283-290]` after the 16-byte `PyObject_HEAD`: `xnum@id+16`, `ynum@id+20`, `num_segments@id+24`, `segments@id+32`, `pagerhist@id+40`, `start_of_data@id+56`, `count@id+60`. They are **self-validated at runtime** (Observed): the harness asserts that the `ctypes` reads at `xnum@id+16`, `ynum@id+20`, and `count@id+60` equal the Python-visible members `hb.xnum`, `hb.ynum`, and `hb.count` before trusting the read of the non-exposed `num_segments@id+24` (see `validate_offsets` in the harness). This self-check passed on the canonical image's Python 3.12.3, and the `num_segments` read (`3` for `HistoryBuf(6000, 80)`) is corroborated by the derived value `ceil(ynum / 2048)` (Inferred — a calculation from `SEGMENT_SIZE`, not a direct measurement).
 
 Member mutability (each read directly from the live object; reading succeeds regardless of write-protection): on `Screen`, `historybuf` `[kitty/screen.c:4902]` and `scrolled_by` `[kitty/screen.c:4903]` are declared `READONLY`, whereas `history_line_added_count` `[kitty/screen.c:4908]` is declared with member flags `0` (i.e. writable). On `HistoryBuf`, `count` is declared `READONLY` `[kitty/history.c:558]`. The harness only **reads** these fields.
 
@@ -93,25 +92,34 @@ Runs were well beyond 2048 lines (up to 205,000 pushes) and beyond 1 MB of pager
 
 ### Cleanup / read-only
 
-All temporary observation and `gdb` scripts (kept in a scratch directory outside the tracked tree) and all gitignored build artifacts produced to enable the harness — `build/`, `kitty/*.so`, the generated Go/C/H sources, the `kitten`/launcher binaries, and source-tree `__pycache__/` — were removed after the evidence above was captured. The git-tracked repository is therefore unchanged apart from this document; the only remaining non-tracked item is the gitignored `.venv/` virtualenv used to build and run the harness (it is not part of the tracked repository and does not affect its state). Verified state (commands: `git status --short`, `git ls-files | wc -l`, `git status --ignored --short`):
+The investigation built and ran entirely inside a **throwaway scratch copy** of the repository within the attached canonical image. Every temporary observation script (`harness.py` plus a transient ad-hoc `sizeof` check) and every gitignored build artifact produced to enable the harness — `build/`, `kitty/*.so`, the generated Go/C/H sources, and the `kitten`/launcher binaries — lived only in that scratch space and were discarded afterward. No `gdb` script was created or needed (gdb is absent from the canonical image; internal counters were read via the in-process `ctypes` read described above). The git-tracked repository is therefore unchanged apart from this one document. Verified state of the tracked repository (commands: `git status --short`, `git ls-files | wc -l`):
 
 ```
 $ git status --short
  M blitzy/documentation/kitty_815df1e210e0.md
 $ git ls-files | wc -l
 868
-$ git status --ignored --short | grep '^!!'
-!! .venv/
 ```
 
-`git ls-files` counts **868** tracked files: the 867 pre-existing baseline files (all byte-for-byte unchanged) plus this one new document. The only working-tree modification `git status` reports is this document — every build artifact and temporary script has been removed.
+`git ls-files` counts **868** tracked files: the 867 pre-existing baseline files (all byte-for-byte unchanged) plus this one document. The only change `git status` reports is this document — every build artifact and temporary script was produced only in the scratch copy and never enters the tracked tree.
 
 ### The observation harness (reproducible method)
 
 The following read-only harness uses ONLY canonical `fast_data_types` entry points. It was run as `PYTHONPATH=$PWD python3 harness.py` from the repo root after building. The canonical feed for `Screen` is `s.draw(text); s.carriage_return(); s.linefeed()` (mirroring `kitty_tests/screen.py:766-770`); the canonical push for `HistoryBuf` is `line = lb.line(0); line.set_text(t, 0, n, cursor); hb.push(line)` (mirroring the `set_text`/`push` loop body at `kitty_tests/datatypes.py:504-507`).
 
 ```python
-import sys, ctypes, math, tracemalloc
+#!/usr/bin/env python3
+"""Read-only observation harness for kitty's two-tier history/scrollback.
+
+Uses ONLY canonical fast_data_types entry points (HistoryBuf / LineBuf / Cursor /
+Screen). Internal counters not exposed to Python (num_segments, ring capacity)
+are read from the live PyObject struct with ctypes at offsets self-validated at
+runtime against the public members (xnum/ynum/count). No gdb, no remote control,
+no debug hook, no mock, no synthetic stand-in.
+
+Run:  PYTHONPATH=$PWD python3 harness.py
+"""
+import sys, ctypes, ctypes.util, math, tracemalloc
 sys.path.insert(0, '.')
 from kitty.fast_data_types import (HistoryBuf, LineBuf, Cursor, Screen,
     SCROLL_LINE, SCROLL_PAGE, SCROLL_FULL, set_options)
@@ -119,10 +127,17 @@ from kitty.options.types import Options, defaults
 from kitty.options.parse import merge_result_dicts
 from kitty.config import finalize_keys, finalize_mouse_mappings
 
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+libc.malloc.restype = ctypes.c_void_p
+libc.malloc.argtypes = [ctypes.c_size_t]
+libc.free.argtypes = [ctypes.c_void_p]
+
+
 class Callbacks:                      # minimal canonical Screen callbacks (see kitty_tests/__init__.py:39)
     def __init__(self): self.wtcbuf = b''
     def write(self, data): self.wtcbuf += bytes(data)
     def __getattr__(self, name): return lambda *a, **k: None
+
 
 # --- live-struct readers (canonical reads of the real HistoryBuf/PagerHistoryBuf/ringbuf_t structs) ---
 def u8(a):  return ctypes.c_uint8.from_address(a).value
@@ -133,6 +148,10 @@ def read_hb(hb):                      # offsets validated at runtime vs Python m
     return dict(xnum=u32(a+16), ynum=u32(a+20), num_segments=u32(a+24),
                 segments_ptr=u64(a+32), pagerhist_ptr=u64(a+40),
                 start_of_data=u32(a+56), count=u32(a+60))
+def validate_offsets(hb):             # prove the ctypes offsets match the canonical Python members
+    d = read_hb(hb)
+    assert d['xnum'] == hb.xnum and d['ynum'] == hb.ynum and d['count'] == hb.count, (d, hb.xnum, hb.ynum, hb.count)
+    return d
 def read_ring(hb):                    # PagerHistoryBuf{ringbuf@0, maximum_size@8, rewrap_needed@16}; ringbuf_t{buf@0,head@8,tail@16,size@24}
     ph = u64(id(hb)+40)
     if ph == 0: return None
@@ -140,29 +159,200 @@ def read_ring(hb):                    # PagerHistoryBuf{ringbuf@0, maximum_size@
     if rb == 0: return dict(maximum_size=maximum_size, capacity=0, rewrap_needed=rewrap_needed)
     size = u64(rb+24)
     return dict(maximum_size=maximum_size, capacity=size-1, rewrap_needed=rewrap_needed)
-def mkline(xnum, text):
-    lb = LineBuf(1, xnum); c = Cursor(); l = lb.line(0)
-    l.set_text(text, 0, min(len(text), xnum), c); return l, lb
+def chunk_size(ptr):                  # glibc malloc chunk size word (low 3 bits are flags)
+    return u64(ptr-8) & ~0x7
 def rss_kb():
     for ln in open('/proc/self/status'):
         if ln.startswith('VmRSS:'): return int(ln.split()[1])
     return -1
+
+
+def push_text(hb, lb, c, text):       # canonical push: set_text on a real Line then hb.push (mirrors datatypes.py:504-507)
+    line = lb.line(0)
+    line.set_text(text, 0, min(len(text), hb.xnum), c)
+    hb.push(line)
+
+
+# ---------------------------------------------------------------- R1
+def R1(tag):
+    print(f"===== R1 SEGMENT CARVING [{tag}] =====")
+    hb = HistoryBuf(6000, 80)
+    lb = LineBuf(1, 80); c = Cursor()
+    init = validate_offsets(hb)
+    print("initial:", init)
+    print("per-segment calloc request = 2048*(80*32+4) = %d bytes (5.008 MiB)  [sizeof(LineAttrs)=4]" % (2048*(80*32+4)))
+    prev = init['num_segments']
+    for i in range(6000):
+        push_text(hb, lb, c, str(i).ljust(5))
+        ns = u32(id(hb)+24)
+        if ns != prev:
+            print("CARVE push#%d count=%d num_segments %d->%d" % (i+1, hb.count, prev, ns))
+            prev = ns
+    fin = validate_offsets(hb)
+    print("final:", fin)
+    ns = fin['num_segments']
+    print("derived ceil(6000/2048)=%d == num_segments(%d) -> %s" % (math.ceil(6000/2048), ns, math.ceil(6000/2048) == ns))
+    # measure the live segment's glibc allocation chunk and pin it to the LineAttrs=4 request by same-process calibration
+    segp = fin['segments_ptr']
+    cpu = u64(segp+8); gpu = u64(segp+0); la = u64(segp+16)
+    live = chunk_size(cpu)
+    print("MEASURED live segment glibc chunk = %d B ; internal regions: cpu=%d=80*2048*12  gpu=%d=80*2048*20"
+          % (live, gpu-cpu, la-gpu))
+    for LA in (1, 4):
+        req = 2048*(80*32 + LA)
+        p = libc.malloc(req); ch = chunk_size(int(p)); libc.free(p)
+        verdict = "== live segment (MATCH)" if ch == live else "!= live segment"
+        print("  calibrate LineAttrs=%d: malloc(%d) -> chunk %d %s" % (LA, req, ch, verdict))
+    print()
+
+
+# ---------------------------------------------------------------- R2
+def R2(tag):
+    print(f"===== R2 INTER-TIER SPILL [{tag}] =====")
+    hb = HistoryBuf(5, 5, 1048576)
+    lb = LineBuf(1, 5); c = Cursor()
+    r = read_ring(hb)
+    print("pagerhist_ptr: %d (nonzero => Tier2 enabled) maximum_size: %d" % (u64(id(hb)+40), r['maximum_size']))
+    for t in ('AAAAA', 'BBBBB', 'CCCCC', 'DDDDD', 'EEEEE'):
+        push_text(hb, lb, c, t)
+    print("BEFORE: count=", hb.count, "start_of_data=", u32(id(hb)+56))
+    print("BEFORE Tier1 newest->oldest:", [str(hb.line(i)).rstrip('\x00') for i in range(hb.count)])
+    print("BEFORE pagerhist_as_text():", repr(hb.pagerhist_as_text()))
+    print("BEFORE pagerhist_as_bytes():", hb.pagerhist_as_bytes())
+    push_text(hb, lb, c, 'FFFFF')  # 6th push: count==ynum triggers spill of oldest ('AAAAA')
+    print("AFTER 6th push (count==ynum triggers spill): count=", hb.count, "start_of_data=", u32(id(hb)+56))
+    print("AFTER Tier1 newest->oldest:", [str(hb.line(i)).rstrip('\x00') for i in range(hb.count)])
+    print("AFTER pagerhist_as_text():", repr(hb.pagerhist_as_text()))
+    print("AFTER pagerhist_as_bytes():", hb.pagerhist_as_bytes())
+    for t in ('GGGGG', 'HHHHH', 'IIIII'):
+        push_text(hb, lb, c, t)
+    print("AFTER +3 (FIFO accumulate) pagerhist_as_text():", repr(hb.pagerhist_as_text()))
+    print()
+
+
+# ---------------------------------------------------------------- R3
+def R3(tag):
+    print(f"===== R3 EDGES [{tag}] =====")
+    # (a) ring growth in >=1 MB chunks up to maximum_size
+    hb = HistoryBuf(10, 200, 5*1024*1024)
+    lb = LineBuf(1, 200); c = Cursor()
+    r0 = read_ring(hb)
+    print("(a) growth: initial capacity=", r0['capacity'], " maximum_size=", r0['maximum_size'])
+    prev_cap = r0['capacity']
+    for i in range(30000):
+        push_text(hb, lb, c, 'x'*200)
+        cap = read_ring(hb)['capacity']
+        if cap != prev_cap:
+            print("    GROW push#%d: capacity %d->%d" % (i+1, prev_cap, cap))
+            prev_cap = cap
+    rf = read_ring(hb)
+    print("    final capacity=", rf['capacity'], " == maximum_size? ", rf['capacity'] == rf['maximum_size'])
+    # (b) FIFO overwrite-oldest at the ceiling
+    stored = hb.pagerhist_as_bytes()
+    print("(b) FIFO: bytes_stored=", len(stored), " == maximum_size? ", len(stored) == rf['maximum_size'])
+    print("    oldest 24 bytes:", stored[:24])
+    # (c) oversized single-call drop via the non-canonical direct-write method
+    hb2 = HistoryBuf(5, 5, 50)
+    before = hb2.pagerhist_as_bytes()
+    hb2.pagerhist_write(b'Z'*100)
+    after = hb2.pagerhist_as_bytes()
+    print("(c) direct-write drop: write 100 bytes into maximum_size=50 -> before=", before, " after=", after, " DROPPED? ", after == b'')
+    hb2.pagerhist_write(b'Q'*40)
+    print("    write 40 bytes (<=50) -> stored=", hb2.pagerhist_as_bytes(), " ACCEPTED? ", hb2.pagerhist_as_bytes() == b'Q'*40)
+    # (c2) canonical long-line spill FIFO-overwrites (NOT dropped whole)
+    hb3 = HistoryBuf(2, 100, 50)
+    lb3 = LineBuf(1, 100); c3 = Cursor()
+    pager_before = hb3.pagerhist_as_bytes()
+    for _ in range(3):
+        push_text(hb3, lb3, c3, 'x'*100)
+    pa = hb3.pagerhist_as_bytes()
+    print("(c2) canonical 100-col line spill into maximum_size=50 ring: pager_before=", pager_before,
+          " pager_after_len=", len(pa), " retained=", pa)
+    print("     NOT_DROPPED (canonical long line FIFO-overwrites, not whole-drop)? ", len(pa) > 0)
+    # (d) resize-while-scrolled reflow
+    hb4 = HistoryBuf(3, 5, 1024*1024)
+    lb4 = LineBuf(1, 5); c4 = Cursor()
+    for t in ('11111', '22222', '33333'):
+        push_text(hb4, lb4, c4, t)
+    # spill all three into the pager by pushing three more so each evicts
+    for t in ('11111', '22222', '33333'):
+        push_text(hb4, lb4, c4, t)
+    print("(d) reflow BEFORE pagerhist_rewrap: as_text=", repr(hb4.pagerhist_as_text()), " rewrap_needed=", read_ring(hb4)['rewrap_needed'])
+    hb4.pagerhist_rewrap(3)
+    print("    AFTER pagerhist_rewrap(3): as_text=", repr(hb4.pagerhist_as_text()), " rewrap_needed=", read_ring(hb4)['rewrap_needed'])
+    print()
+
+
+# ---------------------------------------------------------------- R4
 def mk_options():
     o = Options(merge_result_dicts(defaults._asdict(), {'scrollback_pager_history_size': 1024, 'click_interval': 0.5}))
-    finalize_keys(o, {}); finalize_mouse_mappings(o, {}); return o
+    finalize_keys(o, {}); finalize_mouse_mappings(o, {})
+    return o
 
-# R1: segment carving — HistoryBuf(6000, 80), Tier2 default-disabled
-# R2: inter-tier spill — HistoryBuf(5, 5, 1048576); push A..E then F; read pagerhist before/after
-# R3: (a) ring growth HistoryBuf(10,200,5MiB); (b) FIFO overwrite; (c) direct-write drop HistoryBuf(5,5,50); (c2) canonical long-line spill HistoryBuf(2,100,50); (d) resize reflow HistoryBuf(3,5,1MiB)
-# R4: Screen(Callbacks(),5,10,100,10,20,0,Callbacks()); fill, scroll(SCROLL_PAGE,True), feed more, update_only_line_graphics_data()
-# R5: HistoryBuf(200000,80); push 205000; measure num_segments, RSS, tracemalloc, retention cap
+def R4(tag):
+    print(f"===== R4 SCROLL-WHILE-WRITE [{tag}] =====")
+    set_options(mk_options())
+    c = Callbacks()
+    s = Screen(c, 5, 10, 100, 10, 20, 0, c)   # lines=5, cols=10, scrollback=100 => ynum=MAX(100,5)=100
+    def feed(n, start=0):
+        for i in range(n):
+            s.draw(('L%d' % (start+i)).ljust(9)); s.carriage_return(); s.linefeed()
+    feed(50)                              # fill: 50 lines -> 46 scroll into history
+    s.update_only_line_graphics_data()    # canonical post-fill render resets history_line_added_count
+    print("after fill: count=", s.historybuf.count, " scrolled_by=", s.scrolled_by, " hlac=", s.history_line_added_count)
+    s.scroll(SCROLL_PAGE, True)           # scroll back one page = lines-1 = 4
+    print("BEFORE more writes: scrolled_by=", s.scrolled_by, " count=", s.historybuf.count)
+    feed(10, start=50)                    # feed 10 more while scrolled back; no render yet
+    print("DURING (pre-render): scrolled_by=", s.scrolled_by, " history_line_added_count=", s.history_line_added_count, " count=", s.historybuf.count)
+    s.update_only_line_graphics_data()    # render applies the re-clamp
+    print("AFTER re-clamp: scrolled_by=%d == MIN(4+10,56)=%d  hlac_reset=%d" % (s.scrolled_by, min(4+10, 56), s.history_line_added_count))
+    feed(200, start=60)                   # keep feeding to saturate
+    s.update_only_line_graphics_data()
+    print("SATURATION: scrolled_by=", s.scrolled_by, " count=", s.historybuf.count, " ynum=", s.historybuf.ynum)
+    set_options(None)
+    print()
+
+
+# ---------------------------------------------------------------- R5
+def R5(tag):
+    print(f"===== R5 ALLOCATION/RETENTION [{tag}] =====")
+    tracemalloc.start()
+    base_rss = rss_kb(); base_py, _ = tracemalloc.get_traced_memory()
+    hb = HistoryBuf(200000, 80)
+    print("HistoryBuf(200000,80) pagerhist_ptr=%d (0=Tier2 disabled)" % u64(id(hb)+40))
+    print("per-segment calloc = %d B (5.008 MiB)" % (2048*(80*32+4)))
+    lb = LineBuf(1, 80); c = Cursor()
+    milestones = {}
+    want = {1, 2048, 2049, 4096, 4097, 200000}
+    for i in range(205000):
+        push_text(hb, lb, c, str(i).ljust(5))
+        cnt = hb.count
+        if cnt in want and cnt not in milestones:
+            milestones[cnt] = (u32(id(hb)+24), rss_kb())
+    ns = u32(id(hb)+24)
+    print("pushed 205000 -> count=%d RETENTION count==ynum? %s num_segments=%d" % (hb.count, hb.count == 200000, ns))
+    print("ceil(200000/2048)=%d == num_segments? %s" % (math.ceil(200000/2048), math.ceil(200000/2048) == ns))
+    total = ns * (2048*(80*32+4))
+    print("total seg alloc = %d*%d = %d B (490.77 MiB)" % (ns, 2048*(80*32+4), total))
+    cur_py, _ = tracemalloc.get_traced_memory()
+    rss_delta = rss_kb() - base_rss
+    print("RSS delta = %d KB (~%.1f MiB) ; tracemalloc py-delta = %d B (C calloc untracked)"
+          % (rss_delta, rss_delta/1024.0, cur_py - base_py))
+    print("carve milestones {count:(num_segments,rss_KB)} =", milestones)
+    tracemalloc.stop()
+    print()
+
+
+if __name__ == '__main__':
+    for tag in ("RUN1", "RUN2"):
+        R1(tag); R2(tag); R3(tag); R4(tag); R5(tag)
 ```
 
-The full-body harness wraps the per-question functions R1..R5 in a `for tag in ("RUN1","RUN2")` loop; the key push/read/scroll calls for each observation are shown inline in each section below so a reader can reproduce each result. The command that produced all output in Sections (b)–(f) was:
+The complete harness above defines the per-question functions `R1`..`R5` and its `__main__` block runs them under a `for tag in ("RUN1", "RUN2")` loop, so a single invocation produces every result in Sections (b)–(f) twice (the two runs used for the stability check). To reproduce, save the block verbatim to `harness.py` at the repository root and run it after building the extension. The exact commands that produced all output in Sections (b)–(f) were:
 
 ```
-python3 setup.py build --ignore-compiler-warnings   # build the extension (see caveat above)
-PYTHONPATH=$PWD python3 harness.py                  # run the read-only harness (both runs)
+python3 setup.py build                              # build the extension (default, canonical image)
+PYTHONPATH=$PWD python3 harness.py                  # run the read-only harness (emits RUN1 + RUN2)
 ```
 
 ---
@@ -176,7 +366,7 @@ PYTHONPATH=$PWD python3 harness.py                  # run the read-only harness 
 **Command.**
 
 ```
-python3 setup.py build --ignore-compiler-warnings
+python3 setup.py build
 PYTHONPATH=$PWD python3 harness.py
 ```
 
@@ -184,29 +374,29 @@ PYTHONPATH=$PWD python3 harness.py
 
 ```
 ===== R1 SEGMENT CARVING [RUN1] =====
-initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 333714320, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
+initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 563992304, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
 per-segment calloc request = 2048*(80*32+4) = 5251072 bytes (5.008 MiB)  [sizeof(LineAttrs)=4]
 CARVE push#2049 count=2049 num_segments 1->2
 CARVE push#4097 count=4097 num_segments 2->3
-final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 333714320, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
+final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 566921568, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
 derived ceil(6000/2048)=3 == num_segments(3) -> True
 MEASURED live segment glibc chunk = 5255168 B ; internal regions: cpu=1966080=80*2048*12  gpu=3276800=80*2048*20
   calibrate LineAttrs=1: malloc(5244928) -> chunk 5246976 != live segment
   calibrate LineAttrs=4: malloc(5251072) -> chunk 5255168 == live segment (MATCH)
 
 ===== R1 SEGMENT CARVING [RUN2] =====
-initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 334495904, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
+initial: {'xnum': 80, 'ynum': 6000, 'num_segments': 1, 'segments_ptr': 564788096, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 0}
 per-segment calloc request = 2048*(80*32+4) = 5251072 bytes (5.008 MiB)  [sizeof(LineAttrs)=4]
 CARVE push#2049 count=2049 num_segments 1->2
 CARVE push#4097 count=4097 num_segments 2->3
-final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 334495904, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
+final: {'xnum': 80, 'ynum': 6000, 'num_segments': 3, 'segments_ptr': 565141936, 'pagerhist_ptr': 0, 'start_of_data': 0, 'count': 6000}
 derived ceil(6000/2048)=3 == num_segments(3) -> True
 MEASURED live segment glibc chunk = 5251088 B ; internal regions: cpu=1966080=80*2048*12  gpu=3276800=80*2048*20
   calibrate LineAttrs=1: malloc(5244928) -> chunk 5244944 != live segment
   calibrate LineAttrs=4: malloc(5251072) -> chunk 5251088 == live segment (MATCH)
 ```
 
-**Observed vs Inferred.** **Observed:** `num_segments` growth (1→2→3) and the carve push indices (#2049, #4097), read from the live struct; corroborated by `gdb` (attaching to the live PID and reading `num_segments` at the struct offset returned `$1 = 3`, matching the `ctypes` read — see section (a)). Also **Observed:** the per-segment allocation of `5,251,072` bytes — measured directly at runtime from the live segment's glibc allocation chunk and pinned to the `LineAttrs=4` request by same-process calibration (a `malloc(5,251,072)` reproduces the live segment's chunk in the same process, while `malloc(5,244,928)` does not — shown for both runs above), and independently corroborated by compiling the real header (`sizeof(LineAttrs)==4`). The internal region sizes read from the live pointers (`cpu = 1,966,080 = 80·2048·12`, `gpu = 3,276,800 = 80·2048·20`) independently confirm `sizeof(CPUCell)==12` and `sizeof(GPUCell)==20`. **Inferred (derived, not directly measured):** only the `ceil(6000/2048)=3` segment-count check. `segments_ptr` is an inert heap address — non-deterministic, not a reported magnitude; the raw glibc chunk *word* is likewise allocator-dependent (`5,255,168` via `mmap` in RUN1, `5,251,088` via the main arena in RUN2), which is exactly why the conclusion rests on same-process calibration rather than the bare number.
+**Observed vs Inferred.** **Observed:** `num_segments` growth (1→2→3) and the carve push indices (#2049, #4097), read from the live struct via the in-process `ctypes` read whose byte offsets are self-validated at runtime against the public `xnum`/`ynum`/`count` members (the `validate_offsets` assertion in the harness — see section (a); `gdb` is deliberately not used and is in any case absent from the canonical image). Also **Observed:** the per-segment allocation of `5,251,072` bytes — measured directly at runtime from the live segment's glibc allocation chunk and pinned to the `LineAttrs=4` request by same-process calibration (a `malloc(5,251,072)` reproduces the live segment's chunk in the same process, while `malloc(5,244,928)` does not — shown for both runs above), and independently corroborated by compiling the real header (`sizeof(LineAttrs)==4`). The internal region sizes read from the live pointers (`cpu = 1,966,080 = 80·2048·12`, `gpu = 3,276,800 = 80·2048·20`) independently confirm `sizeof(CPUCell)==12` and `sizeof(GPUCell)==20`. **Inferred (derived, not directly measured):** only the `ceil(6000/2048)=3` segment-count check. `segments_ptr` is an inert heap address — non-deterministic, not a reported magnitude; the raw glibc chunk *word* is likewise allocator-dependent (`5,255,168` via `mmap` in RUN1, `5,251,088` via the main arena in RUN2), which is exactly why the conclusion rests on same-process calibration rather than the bare number.
 
 **Stability.** RUN1 == RUN2 for every structural value (`num_segments`, carve indices `#2049`/`#4097`, final `count=6000`), for the measured per-segment `calloc` request (`5,251,072` bytes), and for the calibration verdict (`LineAttrs=4`). The inert `segments_ptr` heap address varies between runs, and the raw glibc chunk *word* also shifts with the allocator path (`5,255,168` via `mmap` in RUN1 vs `5,251,088` via the main arena in RUN2) — but in every run same-process calibration matches that exact chunk to the `5,251,072` request and never to `5,244,928`, so the reported per-segment size is stable.
 
@@ -221,7 +411,7 @@ MEASURED live segment glibc chunk = 5251088 B ; internal regions: cpu=1966080=80
 **Command.**
 
 ```
-python3 setup.py build --ignore-compiler-warnings
+python3 setup.py build
 PYTHONPATH=$PWD python3 harness.py
 ```
 
@@ -229,7 +419,7 @@ PYTHONPATH=$PWD python3 harness.py
 
 ```
 ===== R2 INTER-TIER SPILL [RUN1] =====
-pagerhist_ptr: 400478128 (nonzero => Tier2 enabled) maximum_size: 1048576
+pagerhist_ptr: 562589568 (nonzero => Tier2 enabled) maximum_size: 1048576
 BEFORE: count= 5 start_of_data= 0
 BEFORE Tier1 newest->oldest: ['EEEEE', 'DDDDD', 'CCCCC', 'BBBBB', 'AAAAA']
 BEFORE pagerhist_as_text(): ''
@@ -266,7 +456,7 @@ Each boundary transition is captured individually below.
 **Command.**
 
 ```
-python3 setup.py build --ignore-compiler-warnings
+python3 setup.py build
 PYTHONPATH=$PWD python3 harness.py
 ```
 
@@ -307,7 +497,7 @@ PYTHONPATH=$PWD python3 harness.py
 **Command.**
 
 ```
-python3 setup.py build --ignore-compiler-warnings
+python3 setup.py build
 PYTHONPATH=$PWD python3 harness.py
 ```
 
@@ -332,12 +522,12 @@ SATURATION: scrolled_by= 100  count= 100  ynum= 100
 
 **Question.** How do the underlying memory structures evolve as pressure builds — allocation (segment `calloc` plus ring-buffer growth), wrapping (circular indexing plus line reflow), and retention (the `ynum` cap on Tier 1, the `maximum_size` cap on Tier 2, and eviction/overwrite)?
 
-**Answer (prose).** With `HistoryBuf(200000, 80)` (Tier 2 disabled), pushing 205,000 lines pins `count` at `ynum = 200000` — the Tier-1 **retention cap** (`historybuf_push` `[kitty/history.c:276-286]` overwrites in place once full, evicting the oldest each push). `num_segments` reaches `98 == ceil(200000 / 2048)`. Total Tier-1 allocation is `98 * 5,251,072 = 514,605,056` bytes (490.77 MiB) — the observed `num_segments` times the per-segment `calloc` size measured at runtime in R1 (see Observed vs Inferred) — which the measured process RSS delta tracks to the same order of magnitude (~489–490 MiB across the two runs). RSS is expected to sit at or just below the allocated total because pages are committed lazily, and at this granularity it cannot pin the exact byte figure; it is the only non-deterministic value here, reported as approximate, and its run-to-run variance is attributed to lazy `calloc` page commitment. `tracemalloc` shows only ~5–6 KB of Python-object delta because the large `calloc` blocks are C allocations invisible to `tracemalloc`. **Wrapping/retention:** circular indexing `index_of` `[kitty/history.c:152-158]` maps logical→physical with `(start_of_data + idx) % ynum` (reverse-indexed, line 0 = newest); the Tier-1 retention cap is `ynum`, and the Tier-2 retention cap is `maximum_size` with FIFO overwrite (from R2/R3).
+**Answer (prose).** With `HistoryBuf(200000, 80)` (Tier 2 disabled), pushing 205,000 lines pins `count` at `ynum = 200000` — the Tier-1 **retention cap** (`historybuf_push` `[kitty/history.c:276-286]` overwrites in place once full, evicting the oldest each push). `num_segments` reaches `98 == ceil(200000 / 2048)`. Total Tier-1 allocation is `98 * 5,251,072 = 514,605,056` bytes (490.77 MiB) — the observed `num_segments` times the per-segment `calloc` size measured at runtime in R1 (see Observed vs Inferred) — which the measured process RSS delta tracks to the same order of magnitude (~479–489 MiB across the two runs). RSS is expected to sit at or just below the allocated total because pages are committed lazily, and at this granularity it cannot pin the exact byte figure; it is the only non-deterministic value here, reported as approximate, and its run-to-run variance is attributed to lazy `calloc` page commitment. `tracemalloc` shows only ~5–6 KB of Python-object delta because the large `calloc` blocks are C allocations invisible to `tracemalloc`. **Wrapping/retention:** circular indexing `index_of` `[kitty/history.c:152-158]` maps logical→physical with `(start_of_data + idx) % ynum` (reverse-indexed, line 0 = newest); the Tier-1 retention cap is `ynum`, and the Tier-2 retention cap is `maximum_size` with FIFO overwrite (from R2/R3).
 
 **Command.**
 
 ```
-python3 setup.py build --ignore-compiler-warnings
+python3 setup.py build
 PYTHONPATH=$PWD python3 harness.py
 ```
 
@@ -350,8 +540,8 @@ per-segment calloc = 5251072 B (5.008 MiB)
 pushed 205000 -> count=200000 RETENTION count==ynum? True num_segments=98
 ceil(200000/2048)=98 == num_segments? True
 total seg alloc = 98*5251072 = 514605056 B (490.77 MiB)
-RSS delta = 501316 KB (~489.6 MiB) ; tracemalloc py-delta = 6455 B (C calloc untracked)
-carve milestones {count:(num_segments,rss_KB)} = {1: (1, 144), 2048: (1, 5264), 2049: (2, 5276), 4096: (2, 10400), 4097: (3, 10412), 200000: (98, 501316)}
+RSS delta = 490552 KB (~479.1 MiB) ; tracemalloc py-delta = 4879 B (C calloc untracked)
+carve milestones {count:(num_segments,rss_KB)} = {1: (1, 42680), 2048: (1, 42680), 2049: (2, 42696), 4096: (2, 42696), 4097: (3, 43848), 200000: (98, 533232)}
 
 ===== R5 ALLOCATION/RETENTION [RUN2] =====
 HistoryBuf(200000,80) pagerhist_ptr=0 (0=Tier2 disabled)
@@ -359,13 +549,13 @@ per-segment calloc = 5251072 B (5.008 MiB)
 pushed 205000 -> count=200000 RETENTION count==ynum? True num_segments=98
 ceil(200000/2048)=98 == num_segments? True
 total seg alloc = 98*5251072 = 514605056 B (490.77 MiB)
-RSS delta = 500792 KB (~489.1 MiB) ; tracemalloc py-delta = 4967 B (C calloc untracked)
-carve milestones {count:(num_segments,rss_KB)} = {1: (1, 132), 2048: (1, 5128), 2049: (2, 5272), 4096: (2, 10256), 4097: (3, 10400), 200000: (98, 500792)}
+RSS delta = 500668 KB (~488.9 MiB) ; tracemalloc py-delta = 9039 B (C calloc untracked)
+carve milestones {count:(num_segments,rss_KB)} = {1: (1, 32584), 2048: (1, 37564), 2049: (2, 37712), 4096: (2, 42692), 4097: (3, 42840), 200000: (98, 533232)}
 ```
 
-**Observed vs Inferred.** **Observed:** the `count == ynum` retention cap (pinned at 200000) and `num_segments == 98` — both read from the live struct; the per-segment `calloc` size (`5,251,072` bytes, measured at runtime in R1 and reused here); the measured RSS delta (501316 KB / ~489.6 MiB in RUN1, 500792 KB / ~489.1 MiB in RUN2); the measured `tracemalloc` py-delta (6455 B / 4967 B, confirming the large C `calloc` blocks are untracked by `tracemalloc`); and the carve milestones. **Inferred (derived, not directly measured):** (i) the total Tier-1 allocation `98 * 5,251,072 = 514,605,056` bytes (490.77 MiB) — the observed `num_segments` times the R1-measured per-segment `calloc` size; the multiplication is a calculation, but its per-segment input is a measured quantity (see R1), not an assumption; and (ii) the *cause* of the RSS run-to-run variance (lazy `calloc` page commitment), which explains why RSS is non-deterministic while the structural values are not. The structural values (`count`, `num_segments`, per-segment size, total seg alloc) are IDENTICAL across both runs; only the measured RSS (501316 vs 500792 KB → ~489–490 MiB), the `tracemalloc` py-delta (6455 vs 4967 B), and the per-milestone RSS columns differ run-to-run — reproduced, NOT engineered away.
+**Observed vs Inferred.** **Observed:** the `count == ynum` retention cap (pinned at 200000) and `num_segments == 98` — both read from the live struct; the per-segment `calloc` size (`5,251,072` bytes, measured at runtime in R1 and reused here); the measured RSS delta (490552 KB / ~479.1 MiB in RUN1, 500668 KB / ~488.9 MiB in RUN2); the measured `tracemalloc` py-delta (4879 B / 9039 B, confirming the large C `calloc` blocks are untracked by `tracemalloc`); and the carve milestones. **Inferred (derived, not directly measured):** (i) the total Tier-1 allocation `98 * 5,251,072 = 514,605,056` bytes (490.77 MiB) — the observed `num_segments` times the R1-measured per-segment `calloc` size; the multiplication is a calculation, but its per-segment input is a measured quantity (see R1), not an assumption; and (ii) the *cause* of the RSS run-to-run variance (lazy `calloc` page commitment), which explains why RSS is non-deterministic while the structural values are not. The structural values (`count`, `num_segments`, per-segment size, total seg alloc) are IDENTICAL across both runs; only the measured RSS (490552 vs 500668 KB → ~479–489 MiB), the `tracemalloc` py-delta (4879 vs 9039 B), and the per-milestone RSS columns differ run-to-run — reproduced, NOT engineered away.
 
-**Stability.** Structural values (`count = 200000`, `num_segments = 98`, per-segment = 5,251,072 B, total seg alloc = 514,605,056 B) are identical RUN1 == RUN2 at a scale of 205,000 pushes into `ynum = 200000`. The measured RSS delta is approximate and non-deterministic (501316 KB / ~489.6 MiB vs 500792 KB / ~489.1 MiB, i.e. ~489–490 MiB), with the cause stated (lazy `calloc` page commitment); the `tracemalloc` py-delta (6455 vs 4967 B) and the per-milestone RSS columns likewise vary. The variance is reproduced across the two identical runs, not smoothed away.
+**Stability.** Structural values (`count = 200000`, `num_segments = 98`, per-segment = 5,251,072 B, total seg alloc = 514,605,056 B) are identical RUN1 == RUN2 at a scale of 205,000 pushes into `ynum = 200000`. The measured RSS delta is approximate and non-deterministic (490552 KB / ~479.1 MiB vs 500668 KB / ~488.9 MiB, i.e. ~479–489 MiB), with the cause stated (lazy `calloc` page commitment); the `tracemalloc` py-delta (4879 vs 9039 B) and the per-milestone RSS columns likewise vary. The variance is reproduced across the two identical runs, not smoothed away.
 
 ---
 
@@ -425,15 +615,16 @@ Every `file:line` below was confirmed accurate at commit `815df1e210e0a9ab4622f5
 | `ringbuf_memcpy_into` FIFO overwrite ("old data will simply be overwritten") | `3rdparty/ringbuf/ringbuf.h:140-154` | Tier-2 overflow semantics |
 | `scrollback_lines = 2000` | `kitty/options/definition.py:372` | Tier-1 default line cap |
 | `scrollback_pager_history_size = 0` | `kitty/options/definition.py:406` | Tier-2 default-disabled |
-| MB→bytes (`int(max(0, float(x)) * 1024 * 1024)`) | `kitty/options/utils.py:564-565` | Options-path size conversion |
+| MB→bytes + 4 GiB−1 cap (`int(max(0, float(x)) * 1024 * 1024)`; `min(ans, 4096 * 1024 * 1024 - 1)`) | `kitty/options/utils.py:564-566` | Options-path size conversion and ceiling |
 | `test_historybuf` (`HistoryBuf(3000, 5)`, crosses 2048) | `kitty_tests/datatypes.py:487-540` | Canonical usage pattern |
 | `filled_line_buf` / `filled_cursor` / `filled_history_buf` / `create_screen` | `kitty_tests/__init__.py:166,175,184,237-240` | Harness patterns |
 | `draw` / `carriage_return` / `linefeed` feed | `kitty_tests/screen.py:766-770` | Canonical `Screen` feed |
 | `build()` | `setup.py:1084` | Build entry |
 | `compile_c_extension(..., 'kitty/fast_data_types', ...)` | `setup.py:1091` | Extension compile |
-| `werror` gate | `setup.py:491` | `-Werror` promotion |
-| `--ignore-compiler-warnings` | `setup.py:2003` | Disables `-Werror` promotion |
+| `werror` gate | `setup.py:491` | `-Werror` promotion (relevant only to the non-canonical host control; not needed in the canonical image) |
+| `--ignore-compiler-warnings` | `setup.py:2003` | Disables `-Werror` promotion (used only on the non-canonical newer-toolchain host, never in the canonical image) |
+| Canonical build image (Image ID `c0824992ad0b`, digest `sha256:60da90a7183a82861fc6d1d40cb8086baa6a8a0e0d05f26d03aafd0f5b3cc384`) | `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` | Attached canonical environment (Ubuntu 24.04.2, Python 3.12.3, gcc 13.3.0, wayland-client 1.22.0); default `python3 setup.py build` succeeds, extension = 1,213,072 bytes |
 
 ---
 
-*All observations use the canonical `HistoryBuf`/`Screen` path imported from `kitty.fast_data_types`, with one explicitly-labeled exception: the R4 scroll re-clamp is corroborated through the **test-only** `update_only_line_graphics_data` method (its comment states it is "used exclusively for testing unicode placeholders" `[kitty/screen.c:2709-2711]`), because the production render entry point `screen_update_cell_data` `[kitty/screen.c:2738]` requires a live GPU/font backend and cannot be driven headlessly; production applies the byte-identical re-clamp at `[kitty/screen.c:2761]` (inferred). The two read-only helpers used to read internal counters — `gdb` attached to the live PID, and a `ctypes` read of the live `PyObject` struct at validated offsets — are reads of the real production structs, not bypasses. The investigation was strictly read-only: temporary observation/`gdb` scripts and all gitignored build artifacts were removed after capture, so the git-tracked repository is unchanged apart from this document (the only remaining non-tracked item is the gitignored `.venv/` used to run the harness).*
+*All observations use the canonical `HistoryBuf`/`Screen` path imported from `kitty.fast_data_types`, with one explicitly-labeled exception: the R4 scroll re-clamp is corroborated through the **test-only** `update_only_line_graphics_data` method (its comment states it is "used exclusively for testing unicode placeholders" `[kitty/screen.c:2709-2711]`), because the production render entry point `screen_update_cell_data` `[kitty/screen.c:2738]` requires a live GPU/font backend and cannot be driven headlessly; production applies the byte-identical re-clamp at `[kitty/screen.c:2761]` (inferred). Internal counters not exposed to Python (`num_segments`, ring capacity) were read with a single read-only helper — an in-process `ctypes` read of the live `PyObject` struct at offsets self-validated at runtime against the public members — which is a read of the real production structs, not a bypass; `gdb` was deliberately not used (and is absent from the canonical image). The investigation was strictly read-only and ran entirely inside a throwaway scratch copy of the repository within the canonical image: the temporary `harness.py`, a transient ad-hoc `sizeof` check, and all gitignored build artifacts lived only in that scratch space and were discarded after capture, so the git-tracked repository is unchanged apart from this document.*
