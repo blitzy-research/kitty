@@ -92,16 +92,16 @@ kitty 0.35.2 created by Kovid Goyal
 $ ./kitty/launcher/kitty +runpy 'from kitty.fast_data_types import KITTY_VCS_REV as r; print(r)'
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 
-########## STEP 7: provenance — delivery HEAD vs built source rev (F15) ##########
-$ git rev-parse HEAD
-1518d468870df035ab0594ec74a73c5bad4bcfc3
-$ git log -1 --format='%h %s'
-1518d4688 docs: add investigate-by-running Q&A on kitty terminal-interaction pipeline
-$ git log -1 --format='parent=%p'
-parent=815df1e21
+########## STEP 7: provenance — built source rev (immutable) vs the single added file (F15) ##########
+$ git rev-parse 815df1e210e0
+815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+$ git log -1 --format='%h %s' 815df1e210e0
+815df1e21 Wire up applying of font config
+$ git diff --name-status 815df1e210e0..HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
-**Provenance note (resolves the "which commit?" ambiguity):** the git working tree's `HEAD` is `1518d4688`, whose *only* change over its parent is the addition of this documentation file — its parent is `815df1e21…`. The kitty **C extension** was compiled from that parent, so the binary's compiled-in `KITTY_VCS_REV` reads `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Both facts are shown above; they are consistent, not contradictory. All runtime evidence in this document comes from the binary stamped `815df1e210e0…`.
+**Provenance note (resolves the "which commit?" ambiguity, and why it is anchored on the built rev):** the kitty **C extension** was compiled from the base commit `815df1e210e0…` (`Wire up applying of font config`), so the binary's compiled-in `KITTY_VCS_REV` reads `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (identical to the value shown in STEP 6). The *only* change introduced over that base commit — cumulatively, across **every** commit up to the current `HEAD` — is the addition of this single documentation file, which is exactly what `git diff --name-status 815df1e210e0..HEAD` reports above (`A  blitzy/documentation/kitty_815df1e210e0.md`). This provenance is deliberately anchored on the **immutable built-source rev** rather than the working tree's mutable `HEAD` hash: a document cannot contain the hash of the very commit that adds it (that hash does not exist until *after* the file's bytes are frozen and committed), and any later doc-only revision advances `HEAD` again — so an embedded `HEAD` hash is inherently self-referential and goes stale as soon as the answer is revised. The two facts that *do* reproduce verbatim no matter how many doc-only commits are layered on are the ones this document relies on, both shown above: (a) the binary is stamped `815df1e210e0…`, and (b) the entire base→`HEAD` delta is the addition of this one file. All runtime evidence in this document comes from the binary stamped `815df1e210e0…`.
 
 **Security posture of the observation harness (resolves F16):** the container provides only the `root` account, which is disclosed here rather than hidden. To avoid predictable, world-accessible artifacts the harness (a) sets `umask 077`, (b) places every file, log, and unix socket inside a `mktemp -d` directory `chmod`ed to `0700` (shown above as `drwx------`), (c) captures each spawned kitty PID via `$!` and reaps exactly that PID in an `EXIT`/`INT`/`TERM` trap (never `pkill`), and (d) scopes remote control to a single unix socket created inside that `0700` directory. The complete harness source is reproduced verbatim in the Appendix so every experiment is auditable and reproducible.
 
@@ -138,10 +138,16 @@ A child process (a shell, or any program) does not write "to kitty" directly —
 ```
 $ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands sh -c 'printf "CHILD_TTY=%s\r\n" "$(tty)"; if [ -t 1 ]; then printf "STDOUT_ISATTY=yes\r\n"; else printf "STDOUT_ISATTY=no\r\n"; fi; sleep 0.2'
 draw CHILD_TTY=/dev/pts/0
+screen_carriage_return
+screen_carriage_return
+screen_linefeed
 draw STDOUT_ISATTY=yes
+screen_carriage_return
+screen_carriage_return
+screen_linefeed
 ```
 
-(The two `draw` lines are the parser events for the text the child printed; the child's stdout is the PTY slave `/dev/pts/0`.)
+(This is the **complete, unfiltered** stdout of the command — all eight `--dump-commands` events. The two `draw` lines are the parser events for the text the child printed; the child's stdout is the PTY slave `/dev/pts/0`. Each `printf "…\r\n"` the child wrote arrives at the parser as `\r\r\n`: the PTY's output line discipline has `ONLCR` set, so the child's `\n` is translated to `\r\n`, and combined with the `\r` the child already emitted this yields `\r\r\n` — parsed here as two `screen_carriage_return` events followed by one `screen_linefeed`. The command writes one diagnostic line to *stderr* — `[…] Failed to open systemd user bus with error: Connection refused` — which is the benign headless-container diagnostic that also appears in the `--debug-rendering` capture in §5.4 and is not part of this stdout block.)
 
 The **master** fd is where the surge first enters kitty's C core. On the `io_thread`, `read_bytes` reads it:
 
@@ -246,7 +252,7 @@ What this proves, precisely:
 - **kitty keeps processing input while paused.** `draw DRAWN-WHILE-PAUSED` appears in the trace **between** `screen_set_mode 2026 1` and `screen_reset_mode 2026 1` — the parser consumed the byte stream and mutated the (off-screen) screen state *during* the hold. This is the whole point of synchronized output: the *display* is frozen, the *processing* is not.
 - **The begin/end were genuinely sent.** The `od -c` shows the literal `033 [ ? 2 0 2 6 h` and `033 [ ? 2 0 2 6 l` (`033` = `ESC`), so the pause and resume were real emitted control sequences, not an artifact of the trace.
 
-**[INFERRED] — what the headless capture cannot show directly, with source:** that the *pixels the user sees* were held to the pre-pause frame and then replaced atomically is not captured here, because under Mesa `llvmpipe` there is no real scan-out to sample. The mechanism is in `screen_pause_rendering` (`kitty/screen.c:2506`): on begin it arms `expires_at` and **snapshots** the visible state — every visible line is copied into `paused_rendering.linebuf` (`kitty/screen.c:2529-2538`), along with the cursor (`:2527`), colors (`:2528`), and selections — so the renderer can keep drawing the *old* frame; on end it clears `expires_at` and sets `is_dirty = true` (`kitty/screen.c:2513`) to force the GPU to update to the now-current state (the atomic flush). The **observed proxy** for "held then flushed" is the combination above: the pause flag toggled `2→1→2` and processing demonstrably continued during the hold.
+**[INFERRED] — what the headless capture cannot show directly, with source:** that the *pixels the user sees* were held to the pre-pause frame and then replaced atomically is not captured here, because under Mesa `llvmpipe` there is no real scan-out to sample. The mechanism is in `screen_pause_rendering` (`kitty/screen.c:2506`): on begin it arms `expires_at` and **snapshots** the visible state — every visible line is copied into `paused_rendering.linebuf` (`kitty/screen.c:2529-2538`), along with the cursor (`:2527`), colors (`:2528`), and selections — so the renderer can keep drawing the *old* frame; on end it clears `expires_at` and sets `is_dirty = true` (`kitty/screen.c:2511`) to force the GPU to update to the now-current state (the atomic flush). The **observed proxy** for "held then flushed" is the combination above: the pause flag toggled `2→1→2` and processing demonstrably continued during the hold.
 
 ### 2.4 Resume without an "end" — the safety timeout
 
@@ -409,8 +415,8 @@ Within the I/O thread, a single `poll()` watches a fixed-order array of file des
 
 ```c
 if (children_fds[0].revents && POLLIN) drain_fd(children_fds[0].fd); // wakeup      child-monitor.c:1515
-if (children_fds[1].revents && POLLIN) { … read_signals(…); … }      // signals     child-monitor.c:1517
-for (i = 0; i < self->count; i++) {                                  // child PTYs  child-monitor.c:1529
+if (children_fds[1].revents && POLLIN) { … read_signals(…); … }      // signals     child-monitor.c:1516
+for (i = 0; i < self->count; i++) {                                  // child PTYs  child-monitor.c:1528
     if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP))
         has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);   // child-monitor.c:1531
     …
@@ -549,7 +555,7 @@ if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 
 }
 ```
 
-`new_input_at` is stamped when bytes are committed (`if (self->new_input_at == 0) self->new_input_at = monotonic();`, `kitty/vt-parser.c:1470`) and reset to 0 after a consume (`kitty/vt-parser.c:1436`). Because it is re-stamped for **each fresh arrival**, every isolated query must wait `input_delay` before it is parsed — which is exactly why the 50 ms idle gap makes no difference. The I/O-thread's wakeup coalescing (`kitty/child-monitor.c:1562-1569`, including the "wake immediately if idle longer than `input_delay`" branch at `:1565`) is a *second*, complementary throttle on the same knob governing *when the main loop is woken*; the ping-pong proxy makes the parser gate the visible term. Either way, the trade-off is the one documented in `docs/performance.rst`: a few milliseconds of artificial delay batches work and cuts CPU wakeups, at the cost of a little display latency.
+`new_input_at` is stamped when bytes are committed (`if (self->new_input_at == 0) self->new_input_at = monotonic();`, `kitty/vt-parser.c:1469`) and reset to 0 after a consume (`kitty/vt-parser.c:1436`). Because it is re-stamped for **each fresh arrival**, every isolated query must wait `input_delay` before it is parsed — which is exactly why the 50 ms idle gap makes no difference. The I/O-thread's wakeup coalescing (`kitty/child-monitor.c:1562-1569`, including the "wake immediately if idle longer than `input_delay`" branch at `:1565`) is a *second*, complementary throttle on the same knob governing *when the main loop is woken*; the ping-pong proxy makes the parser gate the visible term. Either way, the trade-off is the one documented in `docs/performance.rst`: a few milliseconds of artificial delay batches work and cuts CPU wakeups, at the cost of a little display latency.
 
 
 ---
