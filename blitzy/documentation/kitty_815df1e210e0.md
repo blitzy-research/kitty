@@ -6,7 +6,7 @@
 
 **Methodology (run‑first).** Every behavioral claim below is backed by output captured from the **real** compiled C extension `kitty.fast_data_types`, driven through the **canonical** entry points `Screen.resize`, `LineBuf.rewrap`, `HistoryBuf.rewrap`, and `HistoryBuf.pagerhist_rewrap` — the same interface kitty's own test‑suite uses (`kitty_tests/screen.py`, `kitty_tests/datatypes.py`). The six observation drivers were built and executed **before** this answer was written; each is reproduced verbatim in the [appendix](#9-buildrun-commands-appendix) and each embedded output block below is the complete, unedited stdout of the named command. Every factual claim about the code carries a `file:line` reference pinned to commit `815df1e210e0`. Statements derived only from reading the code (not directly observed) are explicitly labeled **(inferred)**.
 
-**Environment actually used (stated exactly, not the value in the task brief).** Python **3.13.7** `(main, Mar  3 2026, 12:19:54) [GCC 15.2.0]`; gcc **15.2.0**; Go **1.24.4** on `PATH`; Linux. `pyproject.toml` declares `requires-python = ">=3.8"`. The C extension `kitty/fast_data_types.so` (1,253,792 bytes) was built with the two **non‑default** build options documented in [§9](#9-buildrun-commands-appendix); those options do not alter the rewrap object code (see §9 for why). The rewrap translation units `screen.c`, `line-buf.c`, `history.c` compiled cleanly.
+**Environment actually used (stated exactly, in the mandatory build environment).** Python **3.12.3** `[GCC 13.3.0]`; gcc **13.3.0**; Go **1.23.4** on `PATH`; Linux — all provided by the mandatory Docker image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` (working dir `/app`, kitty at commit `815df1e210e0`). `pyproject.toml` declares `requires-python = ">=3.8"`. The C extension `kitty/fast_data_types.so` (1,213,072 bytes) was built with the two **non‑default** build options documented in [§9](#9-buildrun-commands-appendix); those options do not alter the rewrap object code (see §9 for why). The rewrap translation units `screen.c`, `line-buf.c`, `history.c` compiled cleanly.
 
 ---
 
@@ -170,6 +170,104 @@ STABILITY across the 2 runs (identical inputs)
 ```
 
 Scenario A shows a single `resize(5,1)` growing `historybuf.count` 0→6 to `'3\n3\n3\n3\n3\n2'` **and** rewrapping the visible buffer — both buffers transform in one call. Scenario B cross‑checks the visible result `'88\n88\n99\n99\n9'` against kitty's own `test_resize` expectation `[kitty_tests/screen.py:L293-L294]`, and the scrollback grows 5→20 rows, proving the driver exercises the canonical path. Scenario C confirms the cursor follows its content row (the `'|'`‑bearing row) across a widen. All three scenarios are byte‑identical across the two runs (`stable=True`).
+
+**Observed confirmation of the secondary resize branches (steps 4-9) — complete, unedited output of `python3 blitzy_adhoc_test_q5_secondary.py`** (full source in [§9](#9-buildrun-commands-appendix)). The primary `q5` driver above shows the two rewrap passes and cursor tracking; this second driver grounds the remaining branches named in the data flow, each driven through the canonical `Screen.resize`: **margins reset** and **tabstops rebuilt** (step 7 `[screen.c:L406, L408-L414]`), the **main vs. alt overflow target** (steps 5-6 `[screen.c:L384, L394]`), the **optional enlarge pull-back** shown BOTH at its `False` default AND overridden to `True` (step 8 `[screen.c:L428-L438]`), and **prompt preservation** plus the **`OUTPUT_START` blank-line dummy-char** edge (steps 4 & 9 `[screen.c:L303, L353-L361, L439-L461]`). The whole script is run **three** times on identical input and its stdout is byte-identical across all three runs (sha256 `66a2e247351388c999c837075db02afd6745f895f418b2c206eec69f6c1db1e4`, 84 lines).
+
+```text
+
+#################### RUN 1/3 ####################
+Q5_A_MARGINS_TABSTOPS_RESET_ON_RESIZE
+  BEFORE geometry=(6, 12) margins=(1, 4) custom_tab_x=3
+  AFTER  geometry=(8, 16) margins=(0, 7) default_tab_x=8
+  CHECKS margins_reset=True tabstops_reset=True geometry_set=True
+Q5_B_MAIN_OVERFLOW_INTO_REAL_HISTORY
+  BEFORE visible='55555\n66666\n77777\n88888\n99999' history_count=5
+  AFTER  visible='88\n88\n99\n99\n9' history_count=21
+  CHECKS overflowed=True
+Q5_C_ALT_HAS_NO_HISTORY_TARGET
+  BEFORE alt=True history_count=0
+  AFTER  alt=True history_count=0
+  CHECKS history_still_zero=True
+Q5_D_OPTIONAL_HISTORY_POPBACK  (scrollback_fill_enlarged_window)
+  FILL False (DEFAULT) BEFORE history_count=3 AFTER history_count=3 history_decreased=False
+  FILL True  (OVERRIDE) BEFORE history_count=3 AFTER history_count=0 history_decreased=True
+Q5_E_PROMPT_COPY_AND_OUTPUT_START_DUMMY
+  PROMPT before=['$ hell', 'o worl', 'd', '', '']
+  PROMPT after =['$ hell', 'o worl', 'd', '', '']
+  CHECKS prompt_physical_rows_preserved=True
+  DUMMY before cursor_x=0 output_start_line_blank=True
+  DUMMY after  cursor_x=0 output_start_line_blank=True
+  DUMMY last_cmd_output_after_resize='ok\n' (marker still delimits output)
+  CHECKS marker_preserved_no_dummy=True
+
+#################### RUN 2/3 ####################
+Q5_A_MARGINS_TABSTOPS_RESET_ON_RESIZE
+  BEFORE geometry=(6, 12) margins=(1, 4) custom_tab_x=3
+  AFTER  geometry=(8, 16) margins=(0, 7) default_tab_x=8
+  CHECKS margins_reset=True tabstops_reset=True geometry_set=True
+Q5_B_MAIN_OVERFLOW_INTO_REAL_HISTORY
+  BEFORE visible='55555\n66666\n77777\n88888\n99999' history_count=5
+  AFTER  visible='88\n88\n99\n99\n9' history_count=21
+  CHECKS overflowed=True
+Q5_C_ALT_HAS_NO_HISTORY_TARGET
+  BEFORE alt=True history_count=0
+  AFTER  alt=True history_count=0
+  CHECKS history_still_zero=True
+Q5_D_OPTIONAL_HISTORY_POPBACK  (scrollback_fill_enlarged_window)
+  FILL False (DEFAULT) BEFORE history_count=3 AFTER history_count=3 history_decreased=False
+  FILL True  (OVERRIDE) BEFORE history_count=3 AFTER history_count=0 history_decreased=True
+Q5_E_PROMPT_COPY_AND_OUTPUT_START_DUMMY
+  PROMPT before=['$ hell', 'o worl', 'd', '', '']
+  PROMPT after =['$ hell', 'o worl', 'd', '', '']
+  CHECKS prompt_physical_rows_preserved=True
+  DUMMY before cursor_x=0 output_start_line_blank=True
+  DUMMY after  cursor_x=0 output_start_line_blank=True
+  DUMMY last_cmd_output_after_resize='ok\n' (marker still delimits output)
+  CHECKS marker_preserved_no_dummy=True
+
+#################### RUN 3/3 ####################
+Q5_A_MARGINS_TABSTOPS_RESET_ON_RESIZE
+  BEFORE geometry=(6, 12) margins=(1, 4) custom_tab_x=3
+  AFTER  geometry=(8, 16) margins=(0, 7) default_tab_x=8
+  CHECKS margins_reset=True tabstops_reset=True geometry_set=True
+Q5_B_MAIN_OVERFLOW_INTO_REAL_HISTORY
+  BEFORE visible='55555\n66666\n77777\n88888\n99999' history_count=5
+  AFTER  visible='88\n88\n99\n99\n9' history_count=21
+  CHECKS overflowed=True
+Q5_C_ALT_HAS_NO_HISTORY_TARGET
+  BEFORE alt=True history_count=0
+  AFTER  alt=True history_count=0
+  CHECKS history_still_zero=True
+Q5_D_OPTIONAL_HISTORY_POPBACK  (scrollback_fill_enlarged_window)
+  FILL False (DEFAULT) BEFORE history_count=3 AFTER history_count=3 history_decreased=False
+  FILL True  (OVERRIDE) BEFORE history_count=3 AFTER history_count=0 history_decreased=True
+Q5_E_PROMPT_COPY_AND_OUTPUT_START_DUMMY
+  PROMPT before=['$ hell', 'o worl', 'd', '', '']
+  PROMPT after =['$ hell', 'o worl', 'd', '', '']
+  CHECKS prompt_physical_rows_preserved=True
+  DUMMY before cursor_x=0 output_start_line_blank=True
+  DUMMY after  cursor_x=0 output_start_line_blank=True
+  DUMMY last_cmd_output_after_resize='ok\n' (marker still delimits output)
+  CHECKS marker_preserved_no_dummy=True
+
+============================================================
+STABILITY / DISTRIBUTION across the 3 identical runs
+============================================================
+  scenario A -> stable=True
+  scenario B -> stable=True
+  scenario C -> stable=True
+  scenario D -> stable=True
+  scenario E -> stable=True
+```
+
+**Reading the secondary branches (each value is read directly from the output above):**
+
+- **Step 7 — margins & tabstops reset (scenario A).** After `set_margins(2,5)` the stored margins are `(1,4)` and a custom tab stop lands the cursor at `x=3`; after `resize(8,16)` the margins are reset to `(0, lines-1) = (0,7)` and the tab stop reverts to the 8-column default (`default_tab_x=8`) — `margins_reset=True tabstops_reset=True`. This grounds `screen.c:L406` (margins) and `L408-L414` (tabstops).
+- **Steps 5-6 — overflow target, main vs. alt (scenarios B, C).** On the **main** screen, narrowing spills the top rows into real scrollback (`history_count 5 → 21`); on the **alt** screen the identical narrow keeps `history_count = 0` (overflow discarded because `realloc_lb(alt, hb=NULL)` `[screen.c:L394]`).
+- **Step 8 — optional pull-back, default OFF (scenario D).** With `scrollback_fill_enlarged_window` at its **`False` default**, enlarging does **not** pull lines back (`history_count 3 → 3`, `history_decreased=False`); with the option **overridden to `True`**, the same enlarge pulls whole lines back (`3 → 0`, `history_decreased=True`). This is the direct runtime confirmation of the default-off claim made in [§6](#6-linebuf--historybuf-interaction-during-resize-q3).
+- **Steps 4 & 9 — prompt preserved, dummy-char edge (scenario E).** A soft-wrapped shell prompt's physical rows `['$ hell', 'o worl', 'd', '', '']` are **identical** before and after `resize(5,10)` (`prompt_physical_rows_preserved=True`) — the prompt is copied aside `[screen.c:L303]` and written back without reflow `[L444-L461]`. Separately, a blank `OUTPUT_START` line under the cursor at `x=0` keeps `cursor_x=0` and stays blank across `resize(5,8)`, and the output-start marker still delimits the following command output (`last_cmd_output_after_resize='ok\n'`), confirming the temporary dummy char `[screen.c:L353-L361, L439-L443]` was inserted then removed cleanly (`marker_preserved_no_dummy=True`).
+
+All five scenarios report `stable=True` across the three runs.
 
 ---
 
@@ -535,7 +633,7 @@ Reading this: the cursor sits at the end of the long soft‑wrapped line (on the
 **Direct answer.** The two buffers exchange whole rows **bidirectionally**, but only during the *visible* pass and the *enlarge* fill‑back — never as a coordinated single rewrap:
 
 - **Visible → history (overflow), during the visible pass.** When the destination visible buffer fills, `next_dest_line()` scrolls the destination and, **if a real `historybuf` was supplied**, pushes the scrolled‑off top row into scrollback via `historybuf_add_line` `[kitty/rewrap.h:L24-L37 (add at L32); kitty/history.c:L287]`. Because the history pass passes `historybuf=NULL` `[kitty/history.c:L611]`, only the *visible* pass overflows into history `[kitty/line-buf.c:L617]`.
-- **History → visible (pull‑back), on enlarge — OFF BY DEFAULT.** After the passes, if the window grew **and** `OPT(scrollback_fill_enlarged_window)` is set, `screen_resize` pops whole lines back from scrollback via `historybuf_pop_line()` `[kitty/screen.c:L428-L438 (pop at L432); kitty/history.c:L294]`. **This option's default is `no` / `False`** — `opt('scrollback_fill_enlarged_window', 'no', …)` `[kitty/options/definition.py:L420]`, materialised as `scrollback_fill_enlarged_window: bool = False` `[kitty/options/types.py:L570]`. The observation below therefore **overrides** it to `True` to exercise the path; a normal default build does **not** pull lines back on enlarge.
+- **History → visible (pull‑back), on enlarge — OFF BY DEFAULT.** After the passes, if the window grew **and** `OPT(scrollback_fill_enlarged_window)` is set, `screen_resize` pops whole lines back from scrollback via `historybuf_pop_line()` `[kitty/screen.c:L428-L438 (pop at L432); kitty/history.c:L294]`. **This option's default is `no` / `False`** — `opt('scrollback_fill_enlarged_window', 'no', …)` `[kitty/options/definition.py:L420]`, materialised as `scrollback_fill_enlarged_window: bool = False` `[kitty/options/types.py:L570]`. The observation below therefore **overrides** it to `True` to exercise the path; a normal default build does **not** pull lines back on enlarge. *(This default-off behavior is demonstrated at runtime in [§2](#2-resize-entry-point--the-complete-data-flow-q5), scenario D: `history_count 3→3` at the default vs. `3→0` when overridden.)*
 - **Pager history is a third, independent structure.** The compressed raw‑ANSI ring buffer (`PagerHistoryBuf`) is rewrapped by its own pass, `pagerhist_rewrap()` `[kitty/history.c:L530]` → `pagerhist_rewrap_to()` `[kitty/history.c:L392]`, triggered lazily (`historybuf_rewrap` only sets `pagerhist->rewrap_needed = true` when `xnum` changes `[kitty/history.c:L607-L608]`). It is distinct from `historybuf_rewrap`.
 
 **Observed — complete, unedited output of `python3 blitzy_adhoc_test_q3.py`** (full source in [§9](#9-buildrun-commands-appendix)). It exercises overflow **into** history (narrow), pull‑back **from** history (widen, with the option overridden and the default disclosed), the **alt‑screen** case (no scrollback), and the separate **pager‑history** pass; each family is run twice.
@@ -621,6 +719,15 @@ STABILITY across the 2 runs (identical inputs)
 - **WIDEN → pull‑back from history (option overridden).** With `scrollback_fill_enlarged_window=True` (overriding the `False` default), growing the window drops `historybuf.count` and re‑introduces history rows at the top via `historybuf_pop_line`, and the cursor row moves to stay with its content. This mirrors `test_scrollback_fill_after_resize` `[kitty_tests/screen.py:L343]`.
 - **ALT‑SCREEN.** Resizing while the alternate screen is active keeps `historybuf.count == 0`, because the alt pass is `realloc_lb(alt, hb=NULL)` `[kitty/screen.c:L394]` — the alt screen has no scrollback.
 - **Pager history is separate.** `pagerhist_rewrap(2)` rewraps the raw‑ANSI ring to width 2, producing exactly kitty's `test_pagerhist` expectation `[kitty_tests/screen.py:L733]`. This pass operates on compressed bytes, independent of the `HistoryBuf` cell grid.
+
+**Edge observation on the pager path (input robustness, not a reflow defect; source left unchanged per the read-only scope of this task).** The `pagerhist_rewrap` binding is not hardened against a **negative** width: a valid width rewraps cleanly, but `pagerhist_rewrap(-1)` surfaces a `SystemError` (“returned a result with an exception set”) rather than a converted `ValueError`/`OverflowError`, because a negative Python `int` is accepted where an `unsigned` width is expected `[kitty/history.c:L530]`. This is a pager-path input-validation edge, **not** a rewrap/reflow-correctness issue: the canonical `Screen.resize` → `historybuf_rewrap` path only ever derives the width from the (non-negative) column count, so it never reaches this state. It is recorded here for completeness and is **not** fixed, since the kitty source repository is strictly read-only for this investigation. Observed, byte-identical across two runs:
+
+```text
+baseline pagerhist_rewrap(2):
+  OK -> '\x1b[mso\rft\rbr\rea\rk\nne\rxt\r c\rat'
+edge pagerhist_rewrap(-1):
+  SystemError: <method 'pagerhist_rewrap' of 'fast_data_types.HistoryBuf' objects> returned a result with an exception set
+```
 
 ---
 
@@ -996,9 +1103,10 @@ DISTRIBUTION across 3 identical runs per scenario
 
 **Environment (stated exactly).**
 
-- Python **3.13.7** `(main, Mar  3 2026, 12:19:54) [GCC 15.2.0]`; `pyproject.toml` declares `requires-python = ">=3.8"`. (The task brief stated 3.12.3; the container in fact runs 3.13.7 — the value above is from **this** build.)
-- gcc **15.2.0**; Go **1.24.4** on `PATH` (`/usr/bin/go`).
-- Built artifact: `kitty/fast_data_types.so`, 1,253,792 bytes.
+- Mandatory Docker image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` (working directory `/app`; kitty checked out at commit `815df1e210e0`, clean tree).
+- Python **3.12.3** `[GCC 13.3.0]`; `pyproject.toml` declares `requires-python = ">=3.8"`.
+- gcc **13.3.0** (`Ubuntu 13.3.0-6ubuntu2~24.04`); Go **1.23.4** `linux/amd64` on `PATH`.
+- Built artifact: `kitty/fast_data_types.so`, 1,213,072 bytes.
 
 **Build (two steps). Complete, unedited output of step 2 is shown; note the NON‑DEFAULT flags.**
 
@@ -1015,25 +1123,144 @@ $ CI=true python3 setup.py build --skip-code-generation --ignore-compiler-warnin
 ```
 
 ```text
-[1/4] Compiling kitty/screen.c ...
-[2/4] Compiling kitty/line-buf.c ...
-[3/4] Compiling kitty/data-types.c ...
-[4/4] Compiling kitty/history.c ...
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[4/122] Compiling [x11] glfw/x11_window.c ...
+[5/122] Compiling kitty/glfw.c ...
+[6/122] Compiling kitty/graphics.c ...
+[7/122] Compiling kitty/child-monitor.c ...
+[8/122] Compiling kitty/fonts.c ...
+[9/122] Compiling kitty/shaders.c ...
+[10/122] Compiling kitty/vt-parser.c ...
+[11/122] Compiling kitty/vt-parser.c ...
+[12/122] Compiling kitty/state.c ...
+[13/122] Compiling [x11] glfw/input.c ...
+[14/122] Compiling [wayland] glfw/input.c ...
+[15/122] Compiling kitty/mouse.c ...
+[16/122] Compiling [x11] glfw/xkb_glfw.c ...
+[17/122] Compiling [wayland] glfw/xkb_glfw.c ...
+[18/122] Compiling kitty/freetype.c ...
+[19/122] Compiling [wayland] glfw/wl_client_side_decorations.c ...
+[20/122] Compiling [x11] glfw/window.c ...
+[21/122] Compiling [wayland] glfw/window.c ...
+[22/122] Compiling kitty/line.c ...
+[23/122] Compiling kitty/glfw-wrapper.c ...
+[24/122] Compiling kittens/transfer/algorithm.c ...
+[25/122] Compiling [wayland] glfw/wl_init.c ...
+[26/122] Compiling [x11] glfw/x11_init.c ...
+[27/122] Compiling kitty/freetype_render_ui_text.c ...
+[28/122] Compiling [x11] glfw/egl_context.c ...
+[29/122] Compiling [wayland] glfw/egl_context.c ...
+[30/122] Compiling kitty/disk-cache.c ...
+[31/122] Compiling [x11] glfw/glx_context.c ...
+[32/122] Compiling kitty/line-buf.c ...
+[33/122] Compiling kitty/data-types.c ...
+[34/122] Compiling kitty/colors.c ...
+[35/122] Compiling kitty/history.c ...
+[36/122] Compiling kitty/keys.c ...
+[37/122] Compiling [x11] glfw/x11_monitor.c ...
+[38/122] Compiling kitty/fontconfig.c ...
+[39/122] Compiling [x11] glfw/context.c ...
+[40/122] Compiling [wayland] glfw/context.c ...
+[41/122] Compiling kitty/crypto.c ...
+[42/122] Compiling [x11] glfw/ibus_glfw.c ...
+[43/122] Compiling [wayland] glfw/ibus_glfw.c ...
+[44/122] Compiling kitty/key_encoding.c ...
+[45/122] Compiling kitty/launcher/main.c ...
+[46/122] Compiling [x11] glfw/monitor.c ...
+[47/122] Compiling [wayland] glfw/monitor.c ...
+[48/122] Compiling kitty/font-names.c ...
+[49/122] Compiling [x11] glfw/backend_utils.c ...
+[50/122] Compiling [wayland] glfw/backend_utils.c ...
+[51/122] Compiling kitty/charsets.c ...
+[52/122] Compiling [x11] glfw/linux_joystick.c ...
+[53/122] Compiling [wayland] glfw/linux_joystick.c ...
+[54/122] Compiling [x11] glfw/init.c ...
+[55/122] Compiling [wayland] glfw/init.c ...
+[56/122] Compiling [x11] glfw/dbus_glfw.c ...
+[57/122] Compiling [wayland] glfw/dbus_glfw.c ...
+[58/122] Compiling kitty/gl.c ...
+[59/122] Compiling [x11] glfw/vulkan.c ...
+[60/122] Compiling [wayland] glfw/vulkan.c ...
+[61/122] Compiling [x11] glfw/osmesa_context.c ...
+[62/122] Compiling [wayland] glfw/osmesa_context.c ...
+[63/122] Compiling kitty/cursor.c ...
+[64/122] Compiling kitty/launcher/single-instance.c ...
+[65/122] Compiling kitty/desktop.c ...
+[66/122] Compiling kitty/loop-utils.c ...
+[67/122] Compiling 3rdparty/ringbuf/ringbuf.c ...
+[68/122] Compiling kitty/simd-string.c ...
+[69/122] Compiling kitty/systemd.c ...
+[70/122] Compiling kitty/shlex.c ...
+[71/122] Compiling [wayland] glfw/wayland-tablet-unstable-v2-client-protocol.c ...
+[72/122] Compiling kitty/child.c ...
+[73/122] Compiling [wayland] glfw/linux_desktop_settings.c ...
+[74/122] Compiling [wayland] glfw/wl_text_input.c ...
+[75/122] Compiling [wayland] glfw/wl_monitor.c ...
+[76/122] Compiling kitty/kittens.c ...
+[77/122] Compiling 3rdparty/base64/lib/codec_choose.c ...
+[78/122] Compiling kitty/png-reader.c ...
+[79/122] Compiling [wayland] glfw/wayland-xdg-shell-client-protocol.c ...
+[80/122] Compiling [x11] glfw/linux_notify.c ...
+[81/122] Compiling [wayland] glfw/linux_notify.c ...
+[82/122] Compiling kitty/rowcolumn-diacritics.c ...
+[83/122] Compiling kitty/hyperlink.c ...
+[84/122] Compiling [wayland] glfw/wayland-primary-selection-unstable-v1-client-protocol.c ...
+[85/122] Compiling kitty/wcswidth.c ...
+[86/122] Compiling [wayland] glfw/wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[87/122] Compiling kitty/fast-file-copy.c ...
+[88/122] Compiling [wayland] glfw/wayland-text-input-unstable-v3-client-protocol.c ...
+[89/122] Compiling [wayland] glfw/wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
+[90/122] Compiling 3rdparty/base64/lib/lib.c ...
+[91/122] Compiling [x11] glfw/posix_thread.c ...
+[92/122] Compiling [wayland] glfw/posix_thread.c ...
+[93/122] Compiling kitty/window_logo.c ...
+[94/122] Compiling [wayland] glfw/wayland-xdg-activation-v1-client-protocol.c ...
+[95/122] Compiling [wayland] glfw/wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+[96/122] Compiling [wayland] glfw/wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[97/122] Compiling [wayland] glfw/wayland-cursor-shape-v1-client-protocol.c ...
+[98/122] Compiling [wayland] glfw/wayland-fractional-scale-v1-client-protocol.c ...
+[99/122] Compiling kitty/glyph-cache.c ...
+[100/122] Compiling [wayland] glfw/wayland-viewporter-client-protocol.c ...
+[101/122] Compiling kitty/logging.c ...
+[102/122] Compiling 3rdparty/base64/lib/arch/neon64/codec.c ...
+[103/122] Compiling [wayland] glfw/wayland-single-pixel-buffer-v1-client-protocol.c ...
+[104/122] Compiling 3rdparty/base64/lib/tables/tables.c ...
+[105/122] Compiling [wayland] glfw/wl_cursors.c ...
+[106/122] Compiling 3rdparty/base64/lib/arch/neon32/codec.c ...
+[107/122] Compiling [wayland] glfw/wayland-kwin-blur-v1-client-protocol.c ...
+[108/122] Compiling 3rdparty/base64/lib/arch/avx/codec.c ...
+[109/122] Compiling 3rdparty/base64/lib/arch/ssse3/codec.c ...
+[110/122] Compiling 3rdparty/base64/lib/arch/sse42/codec.c ...
+[111/122] Compiling 3rdparty/base64/lib/arch/sse41/codec.c ...
+[112/122] Compiling 3rdparty/base64/lib/arch/avx2/codec.c ...
+[113/122] Compiling kitty/utmp.c ...
+[114/122] Compiling 3rdparty/base64/lib/arch/avx512/codec.c ...
+[115/122] Compiling 3rdparty/base64/lib/arch/generic/codec.c ...
+[116/122] Compiling kitty/cleanup.c ...
+[117/122] Compiling [x11] glfw/monotonic.c ...
+[118/122] Compiling [wayland] glfw/monotonic.c ...
+[119/122] Compiling kitty/monotonic.c ...
+[120/122] Compiling kitty/simd-string-128.c ...
+[121/122] Compiling kitty/simd-string-256.c ...
+[122/122] Compiling kitty/gl-wrapper.c ...
  done
-[1/1] Linking kitty/fast_data_types ...
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
  done
 Skipping generation of Go files due to command line option
-kittens/ssh/main.go:15:2: package kitty is not in std (/usr/lib/go-1.24/src/kitty)
-tools/tui/shell_integration/data.go:19:12: pattern data_generated.bin: no matching files found
-tools/unicode_names/query.go:20:12: pattern data_generated.bin: no matching files found
-EXIT=1
+EXIT=0
 ```
 
-**Reading the build output honestly (this is a non‑default build, and why it is still the right object code):**
+**Reading the build output (why this is the right object code):**
 
-- The command **exits 1**, but the non‑zero exit comes from the **final Go/`kitten` step**, which runs **after** `kitty/fast_data_types.so` is already compiled and linked (the four rewrap translation units report `[1/4]…[4/4] … done` and `[1/1] Linking kitty/fast_data_types … done` **before** the Go errors). The three trailing errors (`package kitty is not in std`, two `data_generated.bin: no matching files found`) are Go‑toolchain/codegen issues irrelevant to the C rewrap extension.
-- `--skip-code-generation` prints `Skipping generation of Go files due to command line option` and avoids generating Go sources; it does **not** change any C object. `--ignore-compiler-warnings` relaxes kitty's default `-Werror` (needed only because gcc 15 emits unrelated warnings in the GLFW/Wayland code); the rewrap TUs compile with **no** warnings either way.
-- Consequently these non‑default options do **not** alter the rewrap object code: `screen.c`, `line-buf.c`, and `history.c` compile to the same bytes a default build would produce for them, so every runtime observation in this document reflects default rewrap behavior. The rebuilt `.so` imports correctly (below).
+- The command **exits 0**. All 122 translation units compile (`[1/122]…[122/122] … done`) and all five artifacts link (`[1/5]…[5/5] … done`), including `[1/5] Linking kitty/fast_data_types` — the rewrap extension itself. The four rewrap translation units appear at `[1/122] kitty/screen.c`, `[32/122] kitty/line-buf.c`, `[33/122] kitty/data-types.c`, and `[35/122] kitty/history.c`, and all compile with no warnings.
+- `--skip-code-generation` prints `Skipping generation of Go files due to command line option` and avoids generating/compiling the Go `kitten` sources; it does **not** change any C object. `--ignore-compiler-warnings` relaxes kitty's default `-Werror` (a portability guard across toolchains); the rewrap TUs compile cleanly with or without it.
+- Consequently these non-default options do **not** alter the rewrap object code: `screen.c`, `line-buf.c`, and `history.c` compile to the same bytes a default build would produce for them, so every runtime observation in this document reflects default rewrap behavior. The rebuilt `.so` (1,213,072 bytes) imports correctly (below).
 
 **Canonical import validation. Complete, unedited output of the exact command:**
 
@@ -1045,7 +1272,19 @@ $ python3 -c "import kitty.fast_data_types as f; print(f.Screen, f.LineBuf, f.Hi
 <class 'fast_data_types.Screen'> <class 'fast_data_types.LineBuf'> <class 'fast_data_types.HistoryBuf'>
 ```
 
-**Observation scripts (all temporary, removed after capture; each run with `python3 <script>`).** Each is modelled on kitty's own tests — `create_screen` `[kitty_tests/__init__.py:L237]`, `create_lbuf` `[kitty_tests/datatypes.py:L29-L36]`, the `rewrap` helper `[kitty_tests/datatypes.py:L332-L334]`, and the harness `parse_bytes` `[kitty_tests/__init__.py]` — so the objects under test are the real `fast_data_types` classes. The full source of each is embedded below so every result above is independently reproducible.
+**Toolchain versions (observed). Complete, unedited output of the exact command:**
+
+```
+$ python3 --version; gcc --version | head -1; go version
+```
+
+```text
+Python 3.12.3
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
+go version go1.23.4 linux/amd64
+```
+
+**Observation scripts (all temporary, removed after capture — cleanup proven in the repository-integrity block at the end of this section; each run with `python3 <script>`).** Each is modelled on kitty's own tests — `create_screen` `[kitty_tests/__init__.py:L237]`, `create_lbuf` `[kitty_tests/datatypes.py:L29-L36]`, the `rewrap` helper `[kitty_tests/datatypes.py:L332-L334]`, and the harness `parse_bytes` `[kitty_tests/__init__.py]` — so the objects under test are the real `fast_data_types` classes. The full source of each is embedded below so every result above is independently reproducible.
 
 | Script | Question(s) | Canonical entry points driven |
 |--------|-------------|-------------------------------|
@@ -1054,6 +1293,7 @@ $ python3 -c "import kitty.fast_data_types as f; print(f.Screen, f.LineBuf, f.Hi
 | `blitzy_adhoc_test_q3.py` | Q3 | `Screen.resize`, `HistoryBuf.pagerhist_rewrap` |
 | `blitzy_adhoc_test_q4.py` | Q4, Q2 | `HistoryBuf.rewrap`, `LineBuf.rewrap`, `Screen.resize` |
 | `blitzy_adhoc_test_q5.py` | Q5, Q1b | `Screen.resize` |
+| `blitzy_adhoc_test_q5_secondary.py` | Q5, Q3 | `Screen.resize` (margins, tabstops, alt-screen, enlarge pull-back, prompt, `OUTPUT_START`) |
 | `blitzy_adhoc_test_q6.py` | Q6 | `Screen.draw`/`Screen.resize`, `parse_bytes` (CUU/LF/DECSC/DECRC) |
 
 <details>
@@ -1937,7 +2177,207 @@ for name, _ in scenarios:
 ```
 </details>
 
-**Repository integrity.** The source repository is treated as strictly read‑only: no existing file is modified or deleted. The six temporary observation scripts above were created only to capture the output in §2–§8 and are removed after capture; all build artifacts (`kitty/fast_data_types.so`, `build/`, `kitty/*_generated.h`, `__pycache__/`) are gitignored. The only net addition to the working tree is this document, `blitzy/documentation/kitty_815df1e210e0.md`.
+<details>
+<summary><code>blitzy_adhoc_test_q5_secondary.py</code> — Q5/Q3 secondary resize branches (margins, tabstops, alt-screen, enlarge pull-back, prompt, <code>OUTPUT_START</code>)</summary>
+
+```python
+#!/usr/bin/env python3
+# Temporary observation script (blitzy_adhoc_test_q5_secondary.py) — deleted after capture.
+# Q5/Q3 SECONDARY branches of screen_resize() that the primary q5/q3 drivers assert
+# but do not yet show at runtime. Every branch is driven through the CANONICAL
+# Screen.resize entry point (and the real VT parser via parse_bytes for OSC-133
+# prompt marks). Modelled on kitty_tests/screen.py (mark_prompt/mark_output at
+# L1059-L1063, set_margins/tab usage) and kitty_tests/__init__.py.
+#   A) MARGINS + TABSTOPS reset on resize        [screen.c:L405-L414]
+#   B) MAIN visible overflow spills to REAL history (narrow)         [screen.c:L384]
+#   C) ALT screen has NO history target (overflow discarded)         [screen.c:L394]
+#   D) OPTIONAL enlarge pull-back: DEFAULT-OFF vs OVERRIDDEN-ON
+#      scrollback_fill_enlarged_window  [screen.c:L428-L438; default False]
+#   E) PROMPT preservation (copied aside, restored WITHOUT reflow)   [screen.c:L303,L444-L461]
+#      + OUTPUT_START blank-line dummy-char edge (inserted then removed) [screen.c:L353-L361,L439-L443]
+# Every scenario is run 3x on identical input; a stability/distribution summary follows.
+from kitty.fast_data_types import Screen, set_options
+from kitty_tests import Callbacks, parse_bytes
+from kitty.options.types import Options, defaults
+from kitty.options.parse import merge_result_dicts
+
+
+def make_screen(cols=5, lines=5, scrollback=5, **overrides):
+    base = {'scrollback_pager_history_size': 1024, 'click_interval': 0.5}
+    base.update(overrides)
+    set_options(Options(merge_result_dicts(defaults._asdict(), base)))
+    cb = Callbacks()
+    return Screen(cb, lines, cols, scrollback, 10, 20, 0, cb)
+
+
+def tab_land_from_0(s):
+    # Move to home (row1,col1 => x=0,y=0) via the real VT parser, emit one HT,
+    # and report the landing column. Non-destructive probe of the tab stops.
+    parse_bytes(s, b'\x1b[1;1H')
+    s.tab()
+    return s.cursor.x
+
+
+def scenario_A_margins_tabstops():
+    print('Q5_A_MARGINS_TABSTOPS_RESET_ON_RESIZE')
+    s = make_screen(cols=12, lines=6)
+    s.draw('abcdefghijklmnopqrstuvwx')          # 24 chars -> soft-wraps to 2 rows at width 12
+    s.set_margins(2, 5)                          # 1-based DECSTBM -> stored margin_top=1, margin_bottom=4
+    m_before = (s.margin_top, s.margin_bottom)
+    s.clear_tab_stop(3)                          # TBC 3: clear ALL tab stops
+    parse_bytes(s, b'\x1b[1;4H')                 # cursor to col 4 (1-based) = x=3
+    s.set_tab_stop()                             # custom tab stop at x=3
+    custom_tab_x = tab_land_from_0(s)
+    geom_before = (s.lines, s.columns)
+    print('  BEFORE geometry=%r margins=%r custom_tab_x=%d' % (geom_before, m_before, custom_tab_x))
+    s.resize(8, 16)                              # enlarge both dims
+    m_after = (s.margin_top, s.margin_bottom)
+    default_tab_x = tab_land_from_0(s)
+    geom_after = (s.lines, s.columns)
+    print('  AFTER  geometry=%r margins=%r default_tab_x=%d' % (geom_after, m_after, default_tab_x))
+    margins_reset = (m_after == (0, s.lines - 1))
+    tabstops_reset = (custom_tab_x == 3 and default_tab_x == 8)
+    print('  CHECKS margins_reset=%s tabstops_reset=%s geometry_set=%s'
+          % (margins_reset, tabstops_reset, geom_after == (8, 16)))
+    return (m_before, m_after, custom_tab_x, default_tab_x, margins_reset, tabstops_reset)
+
+
+def scenario_B_main_overflow():
+    print('Q5_B_MAIN_OVERFLOW_INTO_REAL_HISTORY')
+    s = make_screen(cols=5, lines=5, scrollback=40)
+    s.draw(''.join(str(i) * s.columns for i in range(s.lines * 2)))  # 10 rows: top 5 -> history
+    hist_before, cnt_before = str(s.historybuf), s.historybuf.count
+    vis_before = str(s.linebuf)
+    print('  BEFORE visible=%r history_count=%d' % (vis_before, cnt_before))
+    s.resize(5, 2)                                # narrow cols 5->2 -> visible overflow into history
+    cnt_after = s.historybuf.count
+    print('  AFTER  visible=%r history_count=%d' % (str(s.linebuf), cnt_after))
+    print('  CHECKS overflowed=%s' % (cnt_after > cnt_before))
+    return (cnt_before, cnt_after)
+
+
+def scenario_C_alt_no_history():
+    print('Q5_C_ALT_HAS_NO_HISTORY_TARGET')
+    s = make_screen(cols=5, lines=5, scrollback=40)
+    s.toggle_alt_screen()
+    s.draw('ABCDEFGHIJKLMNOPQRST')               # 20 chars on the alt screen
+    print('  BEFORE alt=%s history_count=%d' % (s.is_using_alternate_linebuf(), s.historybuf.count))
+    s.resize(5, 2)                                # narrow -> overflow would occur, but alt has no history
+    print('  AFTER  alt=%s history_count=%d' % (s.is_using_alternate_linebuf(), s.historybuf.count))
+    print('  CHECKS history_still_zero=%s' % (s.historybuf.count == 0))
+    return (s.historybuf.count,)
+
+
+def _fill_for_popback(**overrides):
+    s = make_screen(cols=5, lines=6, scrollback=40, **overrides)
+    for line in map(str, range(8)):               # 8 rows -> 6 visible + 2 in history
+        s.draw(line); s.linefeed(); s.carriage_return()
+    return s
+
+
+def scenario_D_optional_popback():
+    print('Q5_D_OPTIONAL_HISTORY_POPBACK  (scrollback_fill_enlarged_window)')
+    # DEFAULT (False): enlarging must NOT pull lines back from history
+    s = _fill_for_popback()                        # default: option is False
+    hc_before = s.historybuf.count
+    s.resize(9, 5)                                 # grow rows 6->9
+    hc_after = s.historybuf.count
+    print('  FILL False (DEFAULT) BEFORE history_count=%d AFTER history_count=%d history_decreased=%s'
+          % (hc_before, hc_after, hc_after < hc_before))
+    # OVERRIDDEN (True): enlarging pulls whole lines back from history
+    s2 = _fill_for_popback(scrollback_fill_enlarged_window=True)
+    hc2_before = s2.historybuf.count
+    s2.resize(9, 5)
+    hc2_after = s2.historybuf.count
+    print('  FILL True  (OVERRIDE) BEFORE history_count=%d AFTER history_count=%d history_decreased=%s'
+          % (hc2_before, hc2_after, hc2_after < hc2_before))
+    return (hc_before, hc_after, hc2_before, hc2_after)
+
+
+def scenario_E_prompt_and_dummy():
+    print('Q5_E_PROMPT_COPY_AND_OUTPUT_START_DUMMY')
+    # PROMPT preservation: OSC-133;A marks a prompt; the shell prompt is copied
+    # aside and restored WITHOUT reflow, so its physical rows survive a width change.
+    s = make_screen(cols=6, lines=5)
+    parse_bytes(s, b'\x1b]133;A\x1b\\')            # PROMPT_START + enable prompt redraw
+    s.draw('$ hello world')                       # 13-char prompt soft-wraps at width 6
+    rows_before = [str(s.line(i)) for i in range(s.lines)]
+    print('  PROMPT before=%r' % rows_before)
+    s.resize(5, 10)                               # change geometry (narrower rows, wider cols)
+    rows_after = [str(s.line(i)) for i in range(s.lines)]
+    print('  PROMPT after =%r' % rows_after)
+    prompt_preserved = (rows_before[:3] == rows_after[:3])
+    print('  CHECKS prompt_physical_rows_preserved=%s' % prompt_preserved)
+    # OUTPUT_START blank-line dummy-char edge: a BLANK output-start line under the
+    # cursor at x=0 triggers a temporary '<' dummy char during reflow that is then
+    # removed (cursor.x restored to 0), so the blank marker line is preserved.
+    s2 = make_screen(cols=5, lines=5)
+    parse_bytes(s2, b'\x1b]133;A\x1b\\'); s2.draw('$ p'); s2.carriage_return(); s2.index()
+    parse_bytes(s2, b'\x1b]133;C\x1b\\')          # OUTPUT_START on a blank line; cursor at x=0
+    cx_before, blank_before = s2.cursor.x, (str(s2.line(s2.cursor.y)) == '')
+    print('  DUMMY before cursor_x=%d output_start_line_blank=%s' % (cx_before, blank_before))
+    s2.resize(5, 8)                               # widen -> dummy inserted then removed internally
+    cx_after, blank_after = s2.cursor.x, (str(s2.line(s2.cursor.y)) == '')
+    print('  DUMMY after  cursor_x=%d output_start_line_blank=%s' % (cx_after, blank_after))
+    # Prove the OUTPUT_START marker itself survived the resize (not just the blank
+    # line): draw output text on the preserved output-start line and retrieve it via
+    # cmd_output(0), which can only find it if the marker delimiter is still in place.
+    s2.draw('ok'); s2.carriage_return(); s2.index()
+    acc = []
+    s2.cmd_output(0, acc.append, False)
+    last_output = ''.join(acc)
+    print('  DUMMY last_cmd_output_after_resize=%r (marker still delimits output)' % last_output)
+    marker_ok = (cx_after == 0 and blank_after and last_output == 'ok\n')
+    print('  CHECKS marker_preserved_no_dummy=%s' % marker_ok)
+    return (tuple(rows_before[:3]), tuple(rows_after[:3]), cx_before, cx_after, blank_after, last_output)
+
+
+SCENARIOS = [
+    ('A', scenario_A_margins_tabstops),
+    ('B', scenario_B_main_overflow),
+    ('C', scenario_C_alt_no_history),
+    ('D', scenario_D_optional_popback),
+    ('E', scenario_E_prompt_and_dummy),
+]
+
+collected = {k: [] for k, _ in SCENARIOS}
+for run_no in (1, 2, 3):
+    print('\n#################### RUN %d/3 ####################' % run_no)
+    for key, fn in SCENARIOS:
+        collected[key].append(fn())
+
+print('\n' + '=' * 60)
+print('STABILITY / DISTRIBUTION across the 3 identical runs')
+print('=' * 60)
+for key, _ in SCENARIOS:
+    vals = collected[key]
+    print('  scenario %s -> stable=%s' % (key, len(set(map(repr, vals))) == 1))
+```
+</details>
+
+**Repository integrity.** The source repository is treated as strictly read‑only: no existing file is modified or deleted. The seven temporary observation scripts above were created only to capture the output in §2–§8 and are removed after capture; all build artifacts (`kitty/fast_data_types.so`, `build/`, `kitty/*_generated.h`, `__pycache__/`) are gitignored. The only net addition to the working tree is this document, `blitzy/documentation/kitty_815df1e210e0.md`.
+
+**Proof — cleanup and read-only-source verification (complete, unedited output).** Captured in the source checkout (`/app`) of the mandatory Docker image. The only working-tree entries are the seven temporary scripts (`??` = untracked); **no tracked source file is modified** (`git diff --stat` prints nothing), and all build artifacts are gitignored. Removing the scripts leaves `git status --porcelain` **empty** — i.e. the kitty source tree is byte-for-byte unchanged by the investigation:
+
+```text
+$ git status --porcelain
+?? blitzy_adhoc_test_q1a.py
+?? blitzy_adhoc_test_q1b.py
+?? blitzy_adhoc_test_q3.py
+?? blitzy_adhoc_test_q4.py
+?? blitzy_adhoc_test_q5.py
+?? blitzy_adhoc_test_q5_secondary.py
+?? blitzy_adhoc_test_q6.py
+
+$ git diff --stat
+
+$ rm -f blitzy_adhoc_test_*.py    # remove the temporary observation scripts
+
+$ git status --porcelain ; echo "exit=$?"
+exit=0
+```
+
+The single net artifact of this task is therefore the destination-repo document `blitzy/documentation/kitty_815df1e210e0.md` alone.
 
 ---
 
@@ -1949,7 +2389,7 @@ A final decomposition confirming every distinct thing the question names is answ
 |------------------------------|-------------|------------------------------|-------------------|
 | **Q1a** line continuations maintained | §4 | two bits: `next_char_was_wrapped` `[data-types.h:L206]`, `is_continued` `[data-types.h:L233]`; read `is_src_line_continued` `[rewrap.h:L40-L41]`; write `next_dest_line` `[rewrap.h:L24-L37]` | `q1a` before/after `is_continued` vectors `[F,T]`, `[F,F,T]`, `[F,T,T,T]` match kitty tests |
 | — source‑mutation side effect | §4, §7 | clear `next_char_was_wrapped=false` `[rewrap.h:L72]` | `q1a`/`q4` `[SOURCE AFTER]`: True→False |
-| **Q1b** cursor row preserved; column ±1 | §5, §8‑D | `TrackCursor` `[rewrap.h:L50-L53]`; remap `[rewrap.h:L84-L89]`, `+ (t->x>0)` `[rewrap.h:L87]`; threaded `[line-buf.c:L616-L619]`; clamp `[screen.c:L419-L423]` | `q1b` cursor follows `'|'` row; `q6‑D` `H→I` +1 shift, general |
+| **Q1b** cursor row preserved; column ±1 | §5, §8‑D | `TrackCursor` `[rewrap.h:L50-L53]`; remap `[rewrap.h:L84-L89]`, `+ (t->x>0)` `[rewrap.h:L87]`; threaded `[line-buf.c:L616-L619]`; clamp `[screen.c:L419-L423]` | `q1b` cursor follows `'\|'` row; `q6‑D` `H→I` +1 shift, general |
 | — DECSC/DECRC saved cursor | §5, §8‑D | saved cursor is `tcarr[1]`, seeded `[screen.c:L364]` | `q1b` restore; `q6‑D` +1 (general, controls 3/3) |
 | **Q2** code trace w/ functions & structs | §3 | `rewrap_inner` `[rewrap.h:L56]`; specializations `[line-buf.c:L583; history.c:L582-L592]`; bindings `[line-buf.c:L625; history.c:L617]` | full unedited source quoted; specialization table |
 | **Q3** LineBuf⇄HistoryBuf interaction | §6 | overflow `historybuf_add_line` `[rewrap.h:L32; history.c:L287]`; pull‑back `historybuf_pop_line` `[screen.c:L432; history.c:L294]`; pager `pagerhist_rewrap` `[history.c:L530]` | `q3`: count 0→6 (`'3\n3\n3\n3\n3\n2'`); pull‑back; alt count 0; pager output |
@@ -1969,8 +2409,8 @@ A final decomposition confirming every distinct thing the question names is answ
 | `kitty/cursor.c` (`Cursor` object) | §1,§5 | `cursor_copy_to` `[cursor.c:L247]`, `cursor_copy` `[cursor.c:L321]`; clamped after resize `[screen.c:L419-L423]` | `q1b`/`q5` cursor `(x,y)` before/after |
 | narrow vs. widen (both) | §4,§5,§6,§8 | — | `q1a`/`q1b`/`q3`/`q6` cover both |
 | scrollback fill on enlarge (default OFF) | §6 | `scrollback_fill_enlarged_window` default `no`/`False` `[definition.py:L420; types.py:L570]`; path `[screen.c:L428-L438]` | `q3` pull‑back with option overridden |
-| build flags (non‑default) | §9 | `--skip-code-generation`, `--ignore-compiler-warnings` | full build output captured (exit 1 on Go step) |
+| build flags (non‑default) | §9 | `--skip-code-generation`, `--ignore-compiler-warnings` | full build output captured (exit 0; 122 compiles, 5 links) |
 | how tests run (harness) | §9 | `create_screen` `[kitty_tests/__init__.py:L237]`; `parse_bytes` `[kitty_tests/__init__.py]`; `create_lbuf` `[datatypes.py:L29-L36]` | drivers modelled on these; cross‑checks pass |
-| Python version | §1,§9 | **3.13.7** (`requires-python >=3.8`) | `sys.version` printed |
+| Python version | §1,§9 | **3.12.3** (`requires-python >=3.8`) | `python3 --version` output in §9 |
 
 **Observed vs. inferred discipline.** Every behavioral outcome above is backed by the pasted, unedited runtime output. The explicitly **inferred** (code‑derived, not directly observed) statements are: (a) §7's causal explanation of *why* the history pass leaves its final row unmarked; (b) §7's notes on ring indexing and pager‑history divergence; (c) §8's generalization that the two‑pass boundary loss holds for *any* straddling logical line — observed in three configurations (A/B/C) and generalized via the §7 mechanism; and (d) §8‑D's characterization of the cursor `+1` shift, where classifying it as a "bug" is explicitly declined as beyond the observation. All are labeled inline. Every other claim is either a `file:line` citation to the source at commit `815df1e210e0` or a value read from the embedded output.
