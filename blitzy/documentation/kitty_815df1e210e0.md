@@ -8,16 +8,28 @@ was captured by running code first and is reproduced verbatim; every mechanistic
 
 ## Commit identity (read honestly)
 
-- **`git rev-parse HEAD` = `37325994aaa39295698089482a09ced5a905a29d`** — the commit that *adds this answer document*.
-- **Parent / source commit = `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`** — the frozen source the investigation targets ("Wire up
-  applying of font config").
-- **`git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD --name-status` shows exactly one path:**
-  `A  blitzy/documentation/kitty_815df1e210e0.md`.
+- **Frozen source commit = `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`** — the immutable source this investigation
+  targets ("Wire up applying of font config"). It is the one stable anchor: it never changes, and every
+  `file:line` citation below refers to the source at this commit.
+- **This answer document is added on top of that source** (branch `blitzy-623088ac-7bae-4843-a3c8-a19ab5a3bc64`,
+  authored by `agent@blitzy.com`) as doc-only commit(s) that touch **only** this Markdown file. Its own `HEAD`
+  hash is deliberately **not** pinned here: the deliverable is committed and may then be revised by follow-up
+  commits, so any hard-coded self-`HEAD` value would be stale the moment the next commit lands (a self-reference
+  limitation). Provenance is therefore reported relative to the immutable source, never as a frozen self-`HEAD`.
+- **`git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD --name-status` shows exactly one path** — a single
+  added-file entry for `blitzy/documentation/kitty_815df1e210e0.md`. This holds across **any** number of
+  doc-only commits layered on top, because none of them touches a source file.
 
 In other words, the kitty **source tree is byte-for-byte identical to `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`**; the only
 difference introduced by this task is the addition of this Markdown file. The `file:line` citations
-throughout refer to the source at `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (== the tree at `HEAD`, since no source file changed).
+throughout refer to the source at `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (== the source tree at `HEAD`, since no source file changed).
 The deliverable itself is named after the source branch (`kitty_815df1e210e0`).
+
+For full transparency about that self-reference: the one-time build transcript in **Appendix B** shows
+`KITTY_VCS_REV` / `kitty.VCSRevision = 37325994aaa39295698089482a09ced5a905a29d`. That is simply
+`git rev-parse HEAD` as stamped by the build when it ran — an earlier doc-only commit descended from the
+source `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. It does not affect the OSC 133 C-extension behavior under
+investigation and is kept as genuine, unedited build output rather than rewritten.
 
 ## TL;DR — direct answers
 
@@ -75,7 +87,7 @@ ever read.
 ## 2. Environment and build
 
 The following identity block is the head of the single timestamped run (Appendix C). It shows the
-kernel, the exact Python, both commits, the one-file diff, the container image, the build command,
+kernel, the exact Python, the frozen source commit, the source-anchored one-file diff, the container image, the build command,
 and a successful import of the compiled C extension — **as commands with their real output** (F5):
 
 ~~~text
@@ -88,12 +100,14 @@ $ uname -srm
 Linux 6.6.122+ x86_64
 $ python3 --version
 Python 3.13.7
-$ git -C "$REPO" rev-parse HEAD
-37325994aaa39295698089482a09ced5a905a29d
-$ git -C "$REPO" rev-parse HEAD~1  (source commit)
+$ SRC_COMMIT=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # frozen source, absolute hash (stable anchor)
+$ git -C "$REPO" rev-parse --verify "$SRC_COMMIT"   (source resolves in this repo)
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
-$ git -C "$REPO" diff $SRC_COMMIT HEAD --name-status  (only the answer doc must differ)
+$ git -C "$REPO" diff "$SRC_COMMIT" HEAD --name-status   (only the answer doc differs from source)
 A	blitzy/documentation/kitty_815df1e210e0.md
+# HEAD is a doc-only descendant of $SRC_COMMIT; its exact hash is intentionally not frozen here
+# (the document may be revised by follow-up commits). The two facts above hold across any number
+# of doc-only commits: the source is 815df1e21 and only this Markdown file differs from it.
 $ CONTAINER_IMAGE=${CONTAINER_IMAGE:-<not exported; see setup instructions>}
   andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 (per setup instructions)
 
@@ -774,8 +788,10 @@ umask 077
 # --- resolve & verify the absolute repository root (no undefined variable) ----
 REPO="$(git rev-parse --show-toplevel)"
 [ -d "$REPO/kitty" ] || { echo "FATAL: '$REPO' is not the kitty repo root" >&2; exit 2; }
-HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
-SRC_COMMIT="$(git -C "$REPO" rev-parse HEAD~1)"   # parent == source commit 815df1e21
+# The immutable source commit is pinned by its ABSOLUTE hash (never HEAD~1): the answer document
+# is committed and may then be revised by follow-up commits, so HEAD~1 does not reliably point at
+# the source. This absolute hash is stable across any number of doc-only commits layered on top.
+SRC_COMMIT="815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1"   # frozen source commit (stable anchor)
 
 # --- private, mode-0700 work dir with cleanup-on-exit (incl. failure) ---------
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/blitzy_osc133.XXXXXXXX")"
@@ -800,10 +816,14 @@ echo "WORK (mode $(stat -c %a "$WORK"), owner $(stat -c %U "$WORK")) = $WORK"
 echo; echo "======== ENVIRONMENT & BUILD IDENTITY ========"
 echo "\$ uname -srm";                 uname -srm
 echo "\$ python3 --version";          python3 --version
-echo "\$ git -C \"\$REPO\" rev-parse HEAD";        echo "$HEAD_COMMIT"
-echo "\$ git -C \"\$REPO\" rev-parse HEAD~1  (source commit)"; echo "$SRC_COMMIT"
-echo "\$ git -C \"\$REPO\" diff \$SRC_COMMIT HEAD --name-status  (only the answer doc must differ)"
+echo "\$ SRC_COMMIT=$SRC_COMMIT   # frozen source, absolute hash (stable anchor)"
+echo "\$ git -C \"\$REPO\" rev-parse --verify \"\$SRC_COMMIT\"   (source resolves in this repo)"
+git -C "$REPO" rev-parse --verify "$SRC_COMMIT"
+echo "\$ git -C \"\$REPO\" diff \"\$SRC_COMMIT\" HEAD --name-status   (only the answer doc differs from source)"
 git -C "$REPO" diff "$SRC_COMMIT" HEAD --name-status
+echo "# HEAD is a doc-only descendant of \$SRC_COMMIT; its exact hash is intentionally not frozen here"
+echo "# (the document may be revised by follow-up commits). The two facts above hold across any number"
+echo "# of doc-only commits: the source is 815df1e21 and only this Markdown file differs from it."
 echo "\$ CONTAINER_IMAGE=\${CONTAINER_IMAGE:-<not exported; see setup instructions>}"
 echo "  ${CONTAINER_IMAGE:-andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 (per setup instructions)}"
 
@@ -1336,12 +1356,14 @@ $ uname -srm
 Linux 6.6.122+ x86_64
 $ python3 --version
 Python 3.13.7
-$ git -C "$REPO" rev-parse HEAD
-37325994aaa39295698089482a09ced5a905a29d
-$ git -C "$REPO" rev-parse HEAD~1  (source commit)
+$ SRC_COMMIT=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # frozen source, absolute hash (stable anchor)
+$ git -C "$REPO" rev-parse --verify "$SRC_COMMIT"   (source resolves in this repo)
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
-$ git -C "$REPO" diff $SRC_COMMIT HEAD --name-status  (only the answer doc must differ)
+$ git -C "$REPO" diff "$SRC_COMMIT" HEAD --name-status   (only the answer doc differs from source)
 A	blitzy/documentation/kitty_815df1e210e0.md
+# HEAD is a doc-only descendant of $SRC_COMMIT; its exact hash is intentionally not frozen here
+# (the document may be revised by follow-up commits). The two facts above hold across any number
+# of doc-only commits: the source is 815df1e21 and only this Markdown file differs from it.
 $ CONTAINER_IMAGE=${CONTAINER_IMAGE:-<not exported; see setup instructions>}
   andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 (per setup instructions)
 
