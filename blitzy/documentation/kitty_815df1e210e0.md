@@ -800,9 +800,17 @@ The read and the parse are **separate threads**, decoupled by a shared buffer un
 
 * **Reader thread:** `read_bytes()` runs on `KittyChildMon` (tid 12904, proven above), created by
   `pthread_create(&self->io_thread, NULL, io_loop, self)` (`kitty/child-monitor.c:291`).
-* **Parser thread:** `consume_input()` runs on kitty's **main** thread. `child-monitor.c` creates
-  exactly two threads — the I/O thread just named, and a `talk_thread` for remote control — and
-  `vt-parser.c` contains **no** `pthread_create`, so the parser always runs on its caller's thread.
+* **Parser thread:** `consume_input()` runs on kitty's **main** thread. Grepping the source
+  (`grep -n pthread_create kitty/child-monitor.c`) shows four `pthread_create` sites, **none of which
+  hosts the parser**: the I/O thread just named (`io_loop`, started unconditionally by `start()`,
+  `kitty/child-monitor.c:291`); a `talk_thread` for remote control, started **only** when remote
+  control is configured — the `start()` gate `self->talk_fd > -1 || self->listen_fd > -1`
+  (`kitty/child-monitor.c:285`) guards the create at `:286`, and the same `self->talk_thread` is
+  lazily created on the peer-injection path at `:256` — which under the observed `--config NONE`
+  launch (no `--listen-on`) never fires; and a transient, **detached** per-write helper
+  (`thread_write`, created at `kitty/child-monitor.c:1002` by `cm_thread_write` and immediately
+  `pthread_detach`'d at `:1004`), spawned only on demand. `vt-parser.c` contains **no**
+  `pthread_create`, so the parser always runs on its caller's thread.
   The production parse driver is the main event loop: `main_loop()` (`kitty/child-monitor.c:1259`) →
   `run_main_loop(process_global_state, …)` (`:1262`) → `process_global_state()` (`:1224`) →
   `parse_input()` (`:451`, whose own comment reads "Parse all available input that was read in the
