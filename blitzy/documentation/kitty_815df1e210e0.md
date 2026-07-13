@@ -18,7 +18,7 @@ All measurements were taken **inside the mandated Docker image** `ghcr.io/scalea
 | # | Question | Headline result (measured, canonical, ≥2 runs) | Where |
 |---|----------|-----------------------------------------------|-------|
 | Q1 | Memory under massive output | RSS grows **≈ 5.13 MB per 2,048 lines** of scrollback (one `HistoryBuf` segment). Default (`scrollback_lines=2000`) tops out at **≈ 47 MB** (one segment). Feeding 500,000 lines into a 300,000‑line buffer reaches **≈ 794 MB** (147 segments) then **stops growing**. An "infinite" buffer fed 200,000 lines reaches **≈ 543 MB** (98 segments) and keeps climbing. Python‑level `tracemalloc` stays ≈ 12 MB throughout — the growth is **C `calloc`, invisible to Python allocation tracing**. | [Q1](#q1--memory-consumption-under-massive-output) |
-| Q2 | Responsiveness / latency | The terminal **stays responsive**. Scroll‑to‑render latency (real `ctrl+shift+home` injected, real framebuffer change detected): **idle ≈ 7 ms**; **during continuous output ≈ 14.8 ms median (default), ≈ 10.4 ms median (low‑latency‑tuned)**, worst case ≈ 16 ms — far below the ~100 ms human‑perceptible threshold. The during‑output distribution is **bimodal** (≈ 6.5 ms when the scroll lands in an output gap, ≈ 15 ms when it coincides with a repaint tick): the observable sign that a scroll **shares the main thread's throttled repaint cadence** with output rendering. | [Q2](#q2--responsiveness-and-latency-during-concurrent-activity) |
+| Q2 | Responsiveness / latency | The terminal **stays responsive**: 180/180 injected `ctrl+shift+home` scrolls rendered (0 missed), worst case **19.31 ms** — far below the ~100 ms human‑perceptible threshold. Scroll‑to‑render latency is **idle ≈ 7 ms (stable)**; under continuous output it becomes **bimodal** (≈ 7 ms when the scroll lands in an output gap, ≈ 13–16 ms when it coincides with a throttled repaint tick), so the during‑output *median* is run‑to‑run **unstable** (per‑run 9.13–12.46 ms) and is reported as a distribution, not a point value. Low‑latency tuning **tightens the tail (p90 16.30→14.13 ms, max 19.31→18.58 ms), not the median** — the observable sign that a scroll **shares the main thread's throttled repaint cadence** with output rendering. | [Q2](#q2--responsiveness-and-latency-during-concurrent-activity) |
 | Q3 | Buffer growth boundaries | New storage is allocated **one `SEGMENT_SIZE = 2048`‑row block at a time, on demand**, the instant a line is written into a not‑yet‑allocated block — observed externally as a **+5,132 kB `VmSize` step exactly as history `count` crosses 2048 → 2049**. The first segment is reserved **upfront** at `Screen` creation. Growth **plateaus** once `count == ynum` (capacity), after which the oldest line is overwritten circularly. A negative `scrollback_lines` maps to `2**32‑1`, so growth is effectively **unbounded** until `add_segment`'s `fatal("Out of memory")`. | [Q3](#q3--buffer-growth-boundaries) |
 
 **Key correction over a naïve reading of the source:** `sizeof(LineAttrs)` is **4 bytes, not 1** — the `LineAttrs` union contains a `PromptKind prompt_kind : 2` bit‑field and `PromptKind` is an `int`‑backed enum, so the union is 4‑byte‑aligned/sized. The correct 80‑column segment backing size is therefore **5,251,072 bytes** (not 5,244,928), and the measured resident/virtual step is one 4,096‑byte page above that (`5,255,168 B`). This is confirmed below by the compiled size, the external memory step, and the kitty test suite.
@@ -662,171 +662,231 @@ Because the scroll only sets `scrolled_by`/`dirty_scroll` and the actual redraw 
 
 ### What was measured
 
-Using the **image's own kitty binary** on a host `Xvfb`, a large scrollback was filled whose oldest 40 lines are a distinctive `#` banner (Appendix B). A real `ctrl+shift+home` was injected via the X11 **XTEST** extension (`libXtst`), and the framebuffer top strip was polled via `XGetImage` (~0.3 ms/grab) until it matched the banner. **Latency = t(banner rendered) − t(key injected)**, `time.perf_counter()`. Two conditions × two configs, **two identical runs × 15 trials = 30 trials per cell**; all distribution statistics computed programmatically from the raw per‑trial CSV (below):
+Using the **image's own kitty binary** on a host `Xvfb`, a large scrollback was filled whose oldest 40 lines are a distinctive `#` banner (Appendix B). A real `ctrl+shift+home` was injected via the X11 **XTEST** extension (`libXtst`), and the framebuffer top strip was polled via `XGetImage` (~0.3 ms/grab) until it matched the banner. **Latency = t(banner rendered) − t(key injected)**, `time.perf_counter()`. Two conditions × two configs; the **idle** cells were sampled over **two runs × 15 trials (n=30)** and the **during** cells over **four runs × 15 trials (n=60)** — deliberately more runs while output streams, because (as the data below show) the during‑output latency proves *run‑to‑run unstable*, so a larger sample is needed to characterise its distribution rather than a single point estimate. All distribution statistics are computed programmatically from the raw per‑trial CSV (below):
 
 - **idle** — history filled, then the child is quiescent (this is both the *before‑burst* and *after‑burst* steady state: no output is being produced while latency is sampled).
 - **during** — the child streams output continuously while scrolls are injected (true concurrent activity).
 
 ### Latency results (raw per‑trial data)
 
-Raw CSV rows are `label,trial,latency_ms,detector_gap,frames_polled`; the two blocks per file are the two independent runs.
+Raw CSV rows are `label,trial,latency_ms,detector_gap,frames_polled`; each block (delimited by the trial index restarting at 1) is one independent, freshly‑launched run — two runs for the idle cells, four for the during cells.
 
-**Command:** `q2_run.sh c4 idle measure 15   (2 runs)`
-
-```text
-c4_idle,1,8.5649,619219,23
-c4_idle,2,9.3907,619219,29
-c4_idle,3,8.1852,619219,23
-c4_idle,4,8.5124,619219,30
-c4_idle,5,8.9032,619219,21
-c4_idle,6,8.7707,619219,23
-c4_idle,7,8.3890,619219,21
-c4_idle,8,6.6858,619219,22
-c4_idle,9,8.5789,619219,22
-c4_idle,10,6.9886,619219,24
-c4_idle,11,7.4038,619219,20
-c4_idle,12,6.7522,619219,23
-c4_idle,13,8.0734,619219,19
-c4_idle,14,6.6643,619219,22
-c4_idle,15,8.6481,619219,22
-c4_idle,1,9.5665,619219,28
-c4_idle,2,6.7922,619219,19
-c4_idle,3,6.5531,619219,19
-c4_idle,4,6.6888,619219,22
-c4_idle,5,7.1204,619219,20
-c4_idle,6,7.0192,619219,22
-c4_idle,7,7.0204,619219,19
-c4_idle,8,6.7113,619219,20
-c4_idle,9,6.9045,619219,20
-c4_idle,10,6.9498,619219,20
-c4_idle,11,7.0787,619219,20
-c4_idle,12,6.5371,619219,18
-c4_idle,13,6.5297,619219,20
-c4_idle,14,7.0619,619219,21
-c4_idle,15,7.3295,619219,15
-```
-
-**Command:** `q2_run.sh c4 during measure 15 (2 runs)`
+**Command:** `q2_run.sh c4 idle measure 15   (2 runs, n=30)`
 
 ```text
-c4_during,1,15.9467,766410,49
-c4_during,2,8.3376,767645,26
-c4_during,3,15.1592,758535,48
-c4_during,4,7.7929,762117,22
-c4_during,5,15.9451,759852,51
-c4_during,6,6.7237,757376,21
-c4_during,7,14.9130,749178,47
-c4_during,8,15.7939,770568,49
-c4_during,9,14.8926,754640,41
-c4_during,10,6.5267,758535,22
-c4_during,11,6.6087,774077,20
-c4_during,12,7.3978,775680,23
-c4_during,13,14.9994,768608,47
-c4_during,14,15.5601,765984,36
-c4_during,15,13.2942,784150,44
-c4_during,1,12.0486,757988,36
-c4_during,2,14.7134,766051,43
-c4_during,3,14.9831,765613,47
-c4_during,4,14.5945,754133,45
-c4_during,5,14.9396,763348,50
-c4_during,6,14.8889,757162,33
-c4_during,7,6.6020,754538,20
-c4_during,8,6.2339,760612,12
-c4_during,9,6.6710,765314,21
-c4_during,10,14.7736,756504,45
-c4_during,11,16.1275,768889,51
-c4_during,12,15.0315,756060,46
-c4_during,13,15.2258,772542,51
-c4_during,14,15.2004,774077,51
-c4_during,15,6.4942,788084,23
+c4_idle,1,8.0316,619219,22
+c4_idle,2,8.2412,619219,20
+c4_idle,3,7.7326,619219,21
+c4_idle,4,7.9079,619219,16
+c4_idle,5,7.3927,619219,17
+c4_idle,6,6.9992,619219,21
+c4_idle,7,6.9529,619219,22
+c4_idle,8,6.9526,619219,23
+c4_idle,9,7.0808,619219,22
+c4_idle,10,7.1343,619219,23
+c4_idle,11,7.1358,619219,22
+c4_idle,12,9.3619,619219,30
+c4_idle,13,6.9334,619219,21
+c4_idle,14,8.6116,619219,22
+c4_idle,15,6.9416,619219,16
+c4_idle,1,7.2764,619219,15
+c4_idle,2,7.0111,619219,19
+c4_idle,3,6.8853,619219,20
+c4_idle,4,6.6832,619219,18
+c4_idle,5,8.0027,619219,20
+c4_idle,6,7.5137,619219,16
+c4_idle,7,7.3998,619219,25
+c4_idle,8,7.0440,619219,20
+c4_idle,9,6.5981,619219,20
+c4_idle,10,7.0787,619219,20
+c4_idle,11,8.0061,619219,21
+c4_idle,12,6.8090,619219,18
+c4_idle,13,7.4374,619219,19
+c4_idle,14,7.2735,619219,16
+c4_idle,15,6.5447,619219,22
 ```
 
-**Command:** `q2_run.sh c5 idle measure 15   (2 runs)`
+**Command:** `q2_run.sh c4 during measure 15 (4 runs, n=60)`
 
 ```text
-c5_idle,1,6.8943,619219,16
-c5_idle,2,7.6473,619219,20
-c5_idle,3,7.3104,619219,20
-c5_idle,4,9.1760,619219,26
-c5_idle,5,6.9688,619219,21
-c5_idle,6,6.6820,619219,21
-c5_idle,7,7.1880,619219,16
-c5_idle,8,6.4372,619219,21
-c5_idle,9,7.3941,619219,21
-c5_idle,10,7.4663,619219,20
-c5_idle,11,7.3099,619219,19
-c5_idle,12,7.0483,619219,23
-c5_idle,13,9.2398,619219,31
-c5_idle,14,6.7807,619219,20
-c5_idle,15,6.6852,619219,20
-c5_idle,1,6.5498,619219,19
-c5_idle,2,6.6829,619219,19
-c5_idle,3,6.9774,619219,24
-c5_idle,4,8.7398,619219,21
-c5_idle,5,7.2588,619219,20
-c5_idle,6,10.0929,619219,21
-c5_idle,7,9.3932,619219,25
-c5_idle,8,6.5711,619219,20
-c5_idle,9,6.6073,619219,20
-c5_idle,10,6.8368,619219,20
-c5_idle,11,6.5261,619219,22
-c5_idle,12,7.2561,619219,23
-c5_idle,13,6.6071,619219,18
-c5_idle,14,6.9953,619219,19
-c5_idle,15,9.7782,619219,19
+c4_during,1,15.0821,754492,35
+c4_during,2,15.1447,768303,44
+c4_during,3,7.2664,762117,15
+c4_during,4,18.9248,764448,48
+c4_during,5,12.2683,757988,38
+c4_during,6,7.9510,762331,21
+c4_during,7,8.8749,766284,26
+c4_during,8,13.6503,772171,31
+c4_during,9,13.7471,759342,38
+c4_during,10,16.4752,760138,53
+c4_during,11,6.7090,761673,14
+c4_during,12,6.7488,765326,19
+c4_during,13,9.4251,765984,21
+c4_during,14,15.5992,777359,29
+c4_during,15,7.3124,777730,21
+c4_during,1,7.2012,759852,21
+c4_during,2,16.0244,762943,50
+c4_during,3,15.1586,767286,40
+c4_during,4,6.6254,754133,21
+c4_during,5,6.8704,768303,18
+c4_during,6,10.0280,756718,24
+c4_during,7,13.9750,753066,38
+c4_during,8,9.5313,768237,24
+c4_during,9,9.1283,754640,22
+c4_during,10,19.3132,758535,48
+c4_during,11,7.3836,756971,16
+c4_during,12,8.8526,774436,26
+c4_during,13,7.0736,765326,21
+c4_during,14,7.1636,765984,18
+c4_during,15,16.2712,781526,53
+c4_during,1,7.1853,752628,23
+c4_during,2,9.1776,774861,28
+c4_during,3,16.0674,764955,45
+c4_during,4,16.1835,766051,38
+c4_during,5,15.9629,762690,36
+c4_during,6,9.6557,763934,25
+c4_during,7,16.9240,757162,46
+c4_during,8,14.9600,761817,48
+c4_during,9,8.4533,762624,19
+c4_during,10,16.0214,753666,40
+c4_during,11,7.6042,762331,24
+c4_during,12,7.3039,751358,22
+c4_during,13,9.7152,771298,29
+c4_during,14,16.0274,774077,43
+c4_during,15,7.5230,777730,23
+c4_during,1,16.2990,764546,33
+c4_during,2,15.0374,768889,50
+c4_during,3,9.5935,772171,23
+c4_during,4,10.5048,757629,31
+c4_during,5,7.4457,761096,21
+c4_during,6,9.8465,765972,27
+c4_during,7,7.8868,764420,26
+c4_during,8,13.5005,762176,27
+c4_during,9,7.4791,765906,23
+c4_during,10,11.8428,751802,28
+c4_during,11,15.2865,767645,46
+c4_during,12,8.0285,754640,23
+c4_during,13,7.2018,759194,23
+c4_during,14,16.3036,777718,41
+c4_during,15,16.3042,765326,46
 ```
 
-**Command:** `q2_run.sh c5 during measure 15 (2 runs)`
+**Command:** `q2_run.sh c5 idle measure 15   (2 runs, n=30)`
 
 ```text
-c5_during,1,11.6489,757330,36
-c5_during,2,12.1661,780474,35
-c5_during,3,12.9261,768237,39
-c5_during,4,9.6130,746508,30
-c5_during,5,6.9683,764819,22
-c5_during,6,9.8563,755298,30
-c5_during,7,6.6702,759852,22
-c5_during,8,6.8488,782708,21
-c5_during,9,6.9229,756204,23
-c5_during,10,12.1174,759081,38
-c5_during,11,11.5978,759194,38
-c5_during,12,11.6716,757078,36
-c5_during,13,11.1310,748520,40
-c5_during,14,12.8171,782619,42
-c5_during,15,12.3613,780868,39
-c5_during,1,10.2929,765032,24
-c5_during,2,12.6279,773617,39
-c5_during,3,8.4271,764955,24
-c5_during,4,9.0622,770002,26
-c5_during,5,12.5460,765972,39
-c5_during,6,8.3714,750936,26
-c5_during,7,12.1153,754538,37
-c5_during,8,6.3141,762476,19
-c5_during,9,10.4470,758313,34
-c5_during,10,11.4785,768908,38
-c5_during,11,10.5150,768889,27
-c5_during,12,8.6339,760365,26
-c5_during,13,9.1488,762188,28
-c5_during,14,9.0663,774735,24
-c5_during,15,8.5837,769931,27
+c5_idle,1,7.0713,619219,20
+c5_idle,2,6.9131,619219,21
+c5_idle,3,8.0755,619219,21
+c5_idle,4,9.3803,619219,21
+c5_idle,5,7.0726,619219,20
+c5_idle,6,7.0063,619219,20
+c5_idle,7,7.9168,619219,16
+c5_idle,8,7.2150,619219,17
+c5_idle,9,7.1398,619219,25
+c5_idle,10,7.0013,619219,17
+c5_idle,11,8.0417,619219,21
+c5_idle,12,11.0225,619219,30
+c5_idle,13,7.1576,619219,17
+c5_idle,14,7.4551,619219,26
+c5_idle,15,8.9155,619219,24
+c5_idle,1,7.4226,619219,20
+c5_idle,2,7.8854,619219,21
+c5_idle,3,8.1166,619219,18
+c5_idle,4,9.4108,619219,24
+c5_idle,5,6.7015,619219,19
+c5_idle,6,11.2313,619219,25
+c5_idle,7,7.6389,619219,16
+c5_idle,8,6.7426,619219,20
+c5_idle,9,7.2715,619219,21
+c5_idle,10,8.7465,619219,17
+c5_idle,11,7.0509,619219,20
+c5_idle,12,6.6956,619219,20
+c5_idle,13,6.7148,619219,21
+c5_idle,14,6.7411,619219,21
+c5_idle,15,8.4198,619219,18
 ```
 
-Distribution statistics computed programmatically from the raw rows above (`n=30` per cell):
+**Command:** `q2_run.sh c5 during measure 15 (4 runs, n=60)`
+
+```text
+c5_during,1,12.4353,764546,38
+c5_during,2,13.3421,770360,39
+c5_during,3,12.6614,761817,39
+c5_during,4,9.7377,757629,24
+c5_during,5,12.5577,761096,38
+c5_during,6,7.5631,765613,19
+c5_during,7,8.4162,764420,25
+c5_during,8,6.7874,771286,20
+c5_during,9,14.2050,759680,39
+c5_during,10,10.8710,753366,29
+c5_during,11,11.0141,771286,31
+c5_during,12,11.3839,756504,35
+c5_during,13,7.2871,758835,24
+c5_during,14,11.3972,786840,31
+c5_during,15,11.2818,774436,35
+c5_during,1,10.3087,755318,29
+c5_during,2,9.3923,764187,28
+c5_during,3,9.3380,770927,29
+c5_during,4,10.2997,756971,23
+c5_during,5,13.0542,765091,42
+c5_during,6,11.2920,763282,32
+c5_during,7,10.4233,749178,27
+c5_during,8,6.8618,765972,22
+c5_during,9,7.2138,775028,21
+c5_during,10,11.7872,763720,28
+c5_during,11,9.6782,765314,31
+c5_during,12,9.7819,752922,21
+c5_during,13,9.1224,753880,20
+c5_during,14,12.8598,769734,31
+c5_during,15,11.8800,774077,31
+c5_during,1,13.9467,765166,36
+c5_during,2,13.3659,767645,42
+c5_during,3,9.4424,774374,27
+c5_during,4,14.1310,762117,39
+c5_during,5,10.1811,759852,29
+c5_during,6,15.8022,757376,41
+c5_during,7,12.4576,751042,35
+c5_during,8,16.8260,768542,42
+c5_during,9,12.8878,757975,27
+c5_during,10,10.1066,758535,34
+c5_during,11,8.5549,774077,22
+c5_during,12,8.3417,759565,25
+c5_during,13,13.2585,768608,32
+c5_during,14,12.4421,762120,33
+c5_during,15,7.2024,781526,23
+c5_during,1,9.6993,753794,28
+c5_during,2,10.3849,779194,31
+c5_during,3,18.5774,777359,47
+c5_during,4,10.3647,764807,22
+c5_during,5,11.8934,762690,29
+c5_during,6,7.1882,749460,25
+c5_during,7,14.1417,754538,37
+c5_during,8,15.3677,760612,41
+c5_during,9,11.1501,764955,32
+c5_during,10,9.6857,768908,27
+c5_during,11,12.4101,769322,36
+c5_during,12,9.4645,756060,22
+c5_during,13,11.8706,762188,35
+c5_during,14,9.9146,777359,30
+c5_during,15,8.5575,765626,25
+```
+
+Distribution statistics computed programmatically from the raw rows above (idle = 2 runs × 15 = `n=30`; during = 4 runs × 15 = `n=60`; p90 by linear interpolation):
 
 | Condition | config (input_delay / repaint_delay / sync) | n | min | **median** | mean | p90 | max |
 |-----------|---------------------------------------------|---|-----|-----------|------|-----|-----|
-| idle   | **C4** default 3 / 10 / yes | 30 | 6.53 | **7.07**  | 7.55  | 8.77  | 9.57  |
-| during | **C4** default 3 / 10 / yes | 30 | 6.23 | **14.83** | 12.28 | 15.79 | 16.13 |
-| idle   | **C5** tuned 0 / 2 / no      | 30 | 6.44 | **7.02**  | 7.44  | 9.24  | 10.09 |
-| during | **C5** tuned 0 / 2 / no      | 30 | 6.31 | **10.37** | 10.10 | 12.55 | 12.93 |
+| idle   | **C4** default 3 / 10 / yes | 30 | 6.54 | **7.14**  | 7.37  | 8.05  | 9.36  |
+| during | **C4** default 3 / 10 / yes | 60 | 6.63 | **9.78**  | 11.45 | 16.30 | 19.31 |
+| idle   | **C5** tuned 0 / 2 / no      | 30 | 6.70 | **7.35**  | 7.81  | 9.38  | 11.23 |
+| during | **C5** tuned 0 / 2 / no      | 60 | 6.79 | **10.94** | 11.06 | 14.13 | 18.58 |
 
-Per‑run medians (2 runs each) confirm run‑to‑run stability: c4_idle 8.39 / 6.95; c4_during 14.89 / 14.77; c5_idle 7.19 / 6.98; c5_during 11.60 / 9.15 ms.
+**Per‑run medians show the during‑output median is _not_ stable across runs**, whereas the idle median is: c4_idle 7.14 / 7.08; **c4_during 12.27 / 9.13 / 9.72 / 10.50**; c5_idle 7.21 / 7.42; **c5_during 11.28 / 10.30 / 12.46 / 10.38 ms**. The during‑output medians land in — and swing across — the sparse 9–12 ms gap that separates the two latency modes (characterised in the answer below), so a single during‑output median is not a stable summary and is not reported as one; the idle median, by contrast, is stable to ≈ 0.1 ms.
 
 ### Q2 answer
 
-- **Does it stay responsive? Yes.** Across all 120 trials every injected scroll produced a detected banner render; the worst single latency was **16.13 ms**, far below the ~100 ms threshold at which lag becomes perceptible. The terminal never stalled, dropped a scroll, or failed to catch up while output streamed.
-- **What is the latency/lag?** Idle scroll‑to‑render is **≈ 7 ms** regardless of config (the ≈ 6.3 ms floor is XTEST delivery + GL draw + buffer swap + detector poll). Under continuous output it rises to **≈ 14.8 ms median at the default settings (C4)** and **≈ 10.4 ms median with the low‑latency tuning (C5)** — the *before/after* quiescent state is the idle row; the *during* state is the elevated row; once output stops, latency returns to the idle distribution.
-- **Signs of prioritizing one operation over another? Yes — and it is visible in the distribution.** The during‑output latencies are **bimodal**: a cluster near the idle floor (≈ 6.5 ms, when the injected scroll happens to arrive in a gap between output bursts) and a cluster near ≈ 15 ms (when it arrives just after a repaint has been scheduled and must wait for the next tick). This is the direct signature of the scroll repaint **sharing the single main‑thread render loop** with output rendering, throttled by `repaint_delay`. The C4→C5 comparison confirms the cause: dropping `repaint_delay` from 10 ms to 2 ms cuts the during‑output **median by ~30 %** (14.83 → 10.37 ms) and the **max from 16.1 → 12.9 ms**, while idle is unchanged (nothing to contend with). The I/O thread (`KittyChildMon`) keeps draining the PTY the whole time, so output is never blocked by the user's scroll either — the two simply take turns on the main thread's repaint cadence.
+- **Does it stay responsive? Yes.** Across all **180 trials** (both conditions, both configs) every injected scroll produced a detected banner render — **0 missed** — and the worst single latency was **19.31 ms** (during output), far below the ~100 ms threshold at which lag becomes perceptible. The terminal never stalled, dropped a scroll, or failed to catch up while output streamed.
+- **What is the latency/lag?** Idle scroll‑to‑render is **≈ 7 ms** regardless of config (median 7.14 ms C4 / 7.35 ms C5; the ≈ 6.5 ms floor is XTEST delivery + GL draw + buffer swap + detector poll) and is **stable run‑to‑run** (per‑run medians agree to ≈ 0.1 ms). Under continuous output the latency does **not** settle to a single stable value: it becomes **bimodal** (characterised in the next bullet) — a low mode ≈ 7 ms (the scroll lands in a gap between output bursts) and a high mode ≈ 13–16 ms (the scroll coincides with a throttled repaint tick). Because the two modes sit either side of a nearly empty 9–12 ms band, the *median* falls in that gap and is **unstable**: across the eight during‑output runs the per‑run median ranged **9.13–12.46 ms** (combined C4 9.78 ms, C5 10.94 ms), so no single during‑output median is a dependable figure — the honest summary is the distribution, not a point value. The *before/after* quiescent state is the stable idle distribution; the *during* state is the elevated, bimodal one; once output stops, latency returns to the idle distribution.
+- **Signs of prioritizing one operation over another? Yes — and it is visible in the distribution.** The during‑output latencies are **bimodal**: a cluster near the idle floor (≈ 7 ms, when the injected scroll arrives in a gap between output bursts) and a cluster at ≈ 13–16 ms (when it arrives just after a repaint has been scheduled and must wait for the next `repaint_delay`‑throttled tick). This is the direct signature of the scroll repaint **sharing the single main‑thread render loop** with output rendering. What the low‑latency tuning (C5: `input_delay 0` / `repaint_delay 2` / `sync_to_monitor no`) actually does is **tighten the distribution and cut the tail — not the median**: from C4 to C5 the during‑output **p90 falls 16.30 → 14.13 ms and the max 19.31 → 18.58 ms**, and the high‑mode centre drops from ≈ 16 ms to ≈ 13 ms as the bimodal high mode is suppressed (**26 of 60** during‑samples are ≈ 12 ms or more under C4; only **20 of 60** under C5, with the bulk shifted into the 9‑12 ms band). The **median does not fall** — C5's 10.94 ms is in fact slightly *above* C4's 9.78 ms, because C4 retains more near‑idle low‑mode samples that pull its median down toward the gap — so at the achievable sample size the C4→C5 median difference does **not** establish a fixed percentage reduction, nor by itself confirm causation; the robust, reproducible effect of the tuning is the **reduced tail/variance**. Idle is unchanged by the tuning (nothing to contend with). The I/O thread (`KittyChildMon`) keeps draining the PTY throughout, so output is never blocked by the user's scroll either — the two simply take turns on the main thread's repaint cadence.
 
 ### Throughput context — the `__benchmark__` kitten (NOT a latency measurement)
 
@@ -911,7 +971,7 @@ OBSERVED VmSize step first occurs at history count = 2049
 ASSERTION PASSED: 2nd-segment allocation bracketed at count in {2048,2049}
 ```
 
-**Boundary reading.** `VmSize` is **flat at 69,892 kB** while history `count` climbs through **2047 and 2048** (still one segment). The **instant `count` crosses 2048 → 2049** — i.e. the first write into history row index 2048, which lives in the second block — `add_segment` fires and `VmSize` **steps +5,132 kB to 75,024 kB** (segment count 1 → 2). It then stays flat again through `count=2060`. So the *k*‑th segment is allocated as `count` crosses `k*2048 → k*2048+1`. This reproduced at `count=2049` in **all three runs** and **also** against the fresh debug build (`fast_data_types.so` = 6,142,824 bytes), so the boundary is **build‑independent**. The `+5,132 kB` step (= 5,255,168 B) is the 5,251,072‑byte segment rounded up to the next 4,096‑byte page — reconciling the compiled size, the assembly, and the external monitor.
+**Boundary reading.** `VmSize` is **flat at 69,892 kB** while history `count` climbs through **2047 and 2048** (still one segment). The **instant `count` crosses 2048 → 2049** — i.e. the first write into history row index 2048, which lives in the second block — `add_segment` fires and `VmSize` **steps +5,132 kB to 75,024 kB** (segment count 1 → 2). It then stays flat again through `count=2060`. So the *k*‑th segment is allocated as `count` crosses `k*2048 → k*2048+1`. This reproduced at `count=2049` in **all three runs** and **also** against the fresh debug build (`fast_data_types.so` = 6,142,824 bytes), so the boundary is **build‑independent**. The `+5,132 kB` step (= 5,255,168 B) is the 5,251,072‑byte segment — which is *already* exactly page‑aligned (1,282 × 4,096) — plus one additional 4,096‑byte page for glibc's `mmap` chunk header, giving 5,255,168 B = 1,283 pages, reconciling the compiled size, the assembly, and the external monitor.
 
 ### What happens as the buffer keeps growing — plateau and the negative case
 
@@ -976,7 +1036,7 @@ All citations are anchored to HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 | Pager ring buffer API | `ringbuf_t` / `ringbuf_new` / `ringbuf_capacity` / `ringbuf_bytes_used` | 3rdparty/ringbuf/ringbuf.h:30,41,73,87 |
 | Global options / render‑scheduling state | global state backing `render()` | kitty/state.c |
 | CLI stops options after first positional | `Command.AllowOptionsAfterArgs` / parse loop | tools/cli/command.go; tools/cli/parse-args.go |
-| Benchmark measures parse time; rendering suppressed; option defaults | `present_result` / `EntryPoint` / `main` | tools/cmd/benchmark/main.go:59,302-305,317-352 |
+| Benchmark measures parse time; rendering suppressed; option defaults | `present_result` / `EntryPoint` / `main` | tools/cmd/benchmark/main.go:59,301-305,317-352 |
 
 **Inferred (not directly observed) items, labelled as such:** (a) the **segment count** is inferred as `(count-1)//2048 + 1` because `num_segments` is not exposed to Python (only `xnum/ynum/count` are read‑only members [kitty/history.c:556-558]); (b) the **OOM ceiling** of the negative/infinite buffer is inferred from `add_segment`'s `fatal` path [kitty/history.c:21,25] — the C3 run was intentionally not driven to memory exhaustion.
 
@@ -1581,11 +1641,11 @@ Every sub‑question and every named mechanism/flag/condition is answered with i
 | Q1e | Python allocation tracing | `tracemalloc` peak ≈ 12 MB flat while RSS→794 MB (C `calloc` invisible) | — | C2 `tmPeak` column |
 | Q1f | Scale / ≥2 runs / stability | 5k / 500k / 200k lines; 3 runs each; ≤ 0.66 % spread (C2/C3 ≤ 0.07 %) | — | three run files per condition |
 | Q1g | procfs precision caveat | `smaps_rollup` Rss/Pss corroborate VmRSS to a few kB at every phase | proc.rst (kernel) | `smapsRss`/`smapsPss` columns |
-| Q2a | Remains responsive? | Yes; 120/120 scrolls rendered; worst 16.13 ms ≪ 100 ms | child-monitor.c:1236-1237 | latency CSVs |
+| Q2a | Remains responsive? | Yes; 180/180 scrolls rendered (0 missed); worst 19.31 ms ≪ 100 ms | child-monitor.c:1236-1237 | latency CSVs |
 | Q2b | Latency value (idle) | ≈ 7 ms median (both configs) | window.py:1860; screen.c:4091 | c4_idle/c5_idle |
-| Q2c | Latency value (during output) | C4 14.83 ms median; C5 10.37 ms median | definition.py:866,878,889 | c4_during/c5_during |
+| Q2c | Latency value (during output) | Bimodal & run‑to‑run unstable: low mode ≈ 7 ms / high mode ≈ 13–16 ms; per‑run median 9.13–12.46 ms (combined C4 9.78 / C5 10.94) — reported as a distribution, not a point value | definition.py:866,878,889 | c4_during/c5_during |
 | Q2d | Prioritization signal | Bimodal during‑output dist.; scroll shares main‑thread repaint cadence | child-monitor.c:871,875-878 | c*_during CSV bimodality |
-| Q2e | `input_delay` / `repaint_delay` / `sync_to_monitor` | C4 3/10/yes vs C5 0/2/no; C5 cuts during median ~30 %, max 16.1→12.9 | definition.py:878,866,889 | matrix table |
+| Q2e | `input_delay` / `repaint_delay` / `sync_to_monitor` | C4 3/10/yes vs C5 0/2/no; C5 tightens the tail (p90 16.30→14.13, max 19.31→18.58) not the median (C5 10.94 ≥ C4 9.78) | definition.py:878,866,889 | matrix table |
 | Q2f | Thread model | parse+render on main thread; `KittyChildMon`=I/O; `KittyPeerMon` absent | child-monitor.c:1259,1489,1808,285 | live `/proc/1/task/*/comm` |
 | Q2g | Real scroll path (`scroll_home`) | key→window.py→`Screen.scroll`→`screen_history_scroll` | window.py:1860; screen.c:4091 | injected ctrl+shift+home detected |
 | Q2h | Benchmark arg order / value | options after `ascii` ignored; correct = 63.6–67.4 MB/s (throughput only) | command.go; parse-args.go; main.go | correct vs wrong run table |
