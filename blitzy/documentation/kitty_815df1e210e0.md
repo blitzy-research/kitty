@@ -14,7 +14,7 @@ directly exercised at runtime are explicitly labelled `INFERRED`; everything els
 | Fact | Value | Grounding |
 |------|-------|-----------|
 | Program | kitty | `kitty/constants.py:25` |
-| Version | `0.35.2` | `kitty/constants.py:25` `version = (0, 35, 2)` |
+| Version | `0.35.2` | `kitty/constants.py:25` `version: Version = Version(0, 35, 2)` |
 | Commit | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` | build VCS stamp (below) |
 | Branch | `kitty_815df1e210e0` | deliverable name |
 | Canonical binary used for every run | `$SCRATCH/clean815/kitty/launcher/kitty` | built below |
@@ -94,48 +94,61 @@ git diff 815df1e210e0..HEAD --stat                        # (run against /work) 
 **zero** source files. The clone has its own `.git`, so `/work/.git` and the assigned branch
 are never touched.
 
-**The wayland-protocols obstacle (observed, root-caused).** Both canonical build paths fail
-identically from the clean checkout:
+**The two documented build paths do not behave the same (observed, root-caused).** Run from
+independent pristine clones at the pinned commit, the container's system `wayland-protocols`
+and the two build entry points give different outcomes (each stable across two runs):
 
 ```
-$SCRATCH/clean815$ ./dev.sh build --verbose            # exit 1, ~12s
-$SCRATCH/clean815$ python3 setup.py build --verbose    # exit 1, same failure
+$ pkg-config --modversion wayland-protocols                    # container system: 1.34
+$SCRATCH/clean815$ python3 setup.py build --verbose            # exit 0, ~22-23 s — SUCCEEDS
+$SCRATCH/devsh$    ./dev.sh build                              # exit 1, ~12-13 s — FAILS
 ```
 
-Both stop at the bundled GLFW Wayland shim with, verbatim:
+A clean `python3 setup.py build` against the container's **system** `wayland-protocols`
+(1.34) **succeeds** and builds **both** GLFW backends — `kitty/glfw-x11.so` and
+`kitty/glfw-wayland.so` — its `wayland-scanner` reading the system
+`/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml`, with **zero** `wl_window.c`
+errors. This is the same system-lib path used to pre-build the container's ready-to-run
+`/app` and in CI, so it is the canonical build and the source of
+`$SCRATCH/clean815/kitty/launcher/kitty`. Both its artifact hashes are bit-reproducible
+across two independent clean clones (launcher `8311dadd…3fc24c`; C-extension
+`fast_data_types.so` `582933cf…22e8`); the launcher hash additionally equals the pre-built
+`/app` binary's (the `/app` `.so` differs only because it was compiled earlier).
+
+`./dev.sh build`, by contrast, downloads its **own** dependency bundle into
+`$SCRATCH/devsh/dependencies/`, and that bundle ships `wayland-protocols` **1.45**
+(`dependencies/linux-amd64/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml`), not the
+system 1.34. Version 1.45 adds the `xdg_toplevel` `XDG_TOPLEVEL_STATE_CONSTRAINED_*` states,
+which kitty 0.35.2's bundled GLFW `wl_window.c` `xdgToplevelHandleConfigure` `switch`
+(`glfw/wl_window.c:668`) does not handle; kitty's strict `-pedantic-errors -Werror` flags (its
+own defaults) then promote the unhandled-enum warning to a fatal error. `compile_glfw`
+(`setup.py:945-951`) wraps only dependency *detection* in try/except, not the gcc compile, so
+the too-new bundled protocols hard-fails rather than skipping gracefully. The failure is
+therefore specific to `./dev.sh build`'s own bundled 1.45 protocols — it is **not**
+method-independent, and it is **not** caused by the container's system libraries. The four
+verbatim compiler errors (one per unhandled state) are:
 
 ```
-glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT' not handled in switch [-Werror=switch]
-... (CONSTRAINED_RIGHT, CONSTRAINED_TOP, CONSTRAINED_BOTTOM likewise)
+glfw/wl_window.c: In function ‘xdgToplevelHandleConfigure’:
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT’ not handled in switch [-Werror=switch]
+  668 |         switch (*state) {
+      |         ^~~~~~
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_RIGHT’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_TOP’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM’ not handled in switch [-Werror=switch]
 cc1: all warnings being treated as errors
 ```
 
-Root cause (`file:line` grounded): kitty 0.35.2's bundled GLFW `wl_window.c`
-`xdgToplevelHandleConfigure` `switch` predates the `XDG_TOPLEVEL_STATE_CONSTRAINED_*`
-toplevel states, but the container's newer `wayland-protocols` generates an `xdg-shell`
-header that defines those enum values; the strict build flags `-pedantic-errors -Werror`
-(kitty's own defaults) promote the unhandled-enum warning to a fatal error.
-`compile_glfw` (`setup.py:945-951`) wraps only dependency *detection* in try/except, not the
-gcc compile, so there is no graceful skip. This is method-independent (both `dev.sh` and
-`setup.py` fail the same way): a clean from-scratch build of this commit is blocked in this
-container by wayland-protocols version drift.
-
-**Resolution using kitty's own supported path (no source edit).** kitty already supports
-building without the Wayland backend when `wayland-protocols` is too old. Shadowing
-`wayland-protocols.pc` with a `Version: 1.0` stub (below kitty's floor of `1.17`, read from
-`glfw/source-info.json`) triggers kitty's own code path:
-
-```
-PKG_CONFIG_PATH=$SCRATCH/wlstub python3 setup.py build --verbose    # exit 0, ~22s
-# emits, from kitty's own build logic:
-#   wayland-protocols >= 1.17 is required, found version: 1.0
-#   Disabling building of wayland backend
-```
-
-This is exactly the behaviour of the commit on any system with an older
-`wayland-protocols`; no source file is edited, no `-Werror` is relaxed, no check is
-disabled. The Wayland backend is never used under Xvfb (an X11 display), so the x11-only
-build is functionally identical for this investigation. The Go link line stamps the correct
+**No workaround is required (no source edit).** Because the clean `python3 setup.py build`
+succeeds and yields both backends, nothing needs to be worked around to obtain the canonical
+binary — no source file is edited, no `-Werror` is relaxed, and no check is disabled. (kitty
+does ship a supported no-Wayland fallback for systems whose `wayland-protocols` is below its
+floor of `1.17`, read from `glfw/source-info.json`; shadowing `wayland-protocols.pc` with a
+`Version: 1.0` stub triggers it, logging `wayland-protocols >= 1.17 is required, found
+version: 1.0` and `Disabling building of wayland backend`. That path is genuine but simply
+unnecessary here, since the system 1.34 builds cleanly.) Under Xvfb (an X11 display) kitty
+loads `glfw-x11.so`; the Wayland backend, though built, is never exercised in this
+investigation. The Go link line stamps the correct
 subject commit:
 
 ```
@@ -302,10 +315,11 @@ Complete captured output. **stdout** (the GL banner, `--debug-rendering`-gated,
 ```
 
 **Stability** (`M8`) · `OBSERVED`: exit code `0`, wall time ≈1.3 s on both runs. After
-timestamp normalisation the separated captures are identical
-(sha256 `bfd40625…173fe`); a line-buffered **merged** capture
-(`stdbuf -oL -eL … 2>&1`) is also identical across the two runs
-(sha256 `d0868582aea7c736ce4e3e1e4d7434ab49fc6a9846407542b57dab662bea4bc8`).
+timestamp normalisation the separated captures are identical (sha256 `bfd40625…173fe`, shown
+truncated because it is a per-capture, stream-split artifact — sensitive to how stdout and
+stderr are interleaved). The authoritative, fully reproducible stability figure is the
+line-buffered **merged** capture (`stdbuf -oL -eL … 2>&1`), also identical across the two
+runs (sha256 `d0868582aea7c736ce4e3e1e4d7434ab49fc6a9846407542b57dab662bea4bc8`).
 
 **True arrival order** (`M5`) · `OBSERVED`: because the GL banner is on stdout and the rest
 on stderr, comparing two separate streams can appear to invert them. The merged
@@ -851,8 +865,10 @@ launcher; find the window with `xdotool search --class kitty`; `import -window <
 This proves the 7 bytes were *understood*, not echoed literally: the five printable bytes
 `R E A D Y` were drawn as five glyphs via `screen_draw_text` (`kitty/vt-parser.c:226`), while
 `\r\n` were interpreted as **cursor control** (carriage-return + line-feed → move the cursor
-to row 1, column 0), not printed as glyphs. The parse→draw path is
-`child-monitor` read → `kitty/vt-parser.c:226` `screen_draw_text` → the line buffer in
+to row 1, column 0), not printed as glyphs. The parse→draw path is: the `child-monitor` read
+loop hands the PTY bytes to its parse worker — `parse_worker` (`kitty/child-monitor.c:181`),
+or `parse_worker_dump` (`kitty/child-monitor.c:180`) when `--dump-bytes` is set — which feeds
+them to `screen_draw_text` (`kitty/vt-parser.c:226`) and thence to the line buffer in
 `kitty/screen.c`.
 
 **Supplementary corroboration** (`non-canonical`): feeding the same `b"READY\r\n"` to the
@@ -870,7 +886,8 @@ exec-failure fallback (`child.c:161-167`, exercised), the exported environment
 (`TERM`/`COLORTERM`/`KITTY_PID`/`KITTY_PUBLIC_KEY`/`PWD`/`TERMINFO`/`KITTY_INSTALLATION_DIR`),
 both `TERMINFO` delivery modes, shell integration for supported vs unsupported shells with
 the concrete bash/zsh/fish assets, `--dump-bytes` first bytes, the parse→draw path
-(`vt-parser.c:226` → `screen.c`), and before/after live screen states.
+(the `parse_worker`/`parse_worker_dump` dispatch at `child-monitor.c:180-181` →
+`vt-parser.c:226` `screen_draw_text` → `screen.c`), and before/after live screen states.
 
 
 ## Q4 — Visible evidence that the display system is active (fonts, layout, scrolling, screen updates)
@@ -922,7 +939,9 @@ occurs, so shader compilation and the draw path succeeded.
 ### Fonts — resolution, rasterization, and the fallback report · `OBSERVED`
 
 The `--debug-font-fallback` dump from Q1 and the `Fonts:` block of the canonical
-`debug_config` report (Q2/E3) both show the resolved faces:
+`debug_config` report (Q2/E3) both show the resolved faces (reproduced here as an aligned,
+path-abbreviated view for readability; the byte-exact `--debug-font-fallback` output with
+timestamps is quoted verbatim in Q1):
 
 ```
 Normal:      DejaVuSansMono            /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:0
@@ -1139,10 +1158,15 @@ Windowing/GL: `kitty/glfw.c`, `kitty/state.c`, `kitty/gl.c`, `kitty/data-types.h
 
 ### Flags
 
-`--debug-rendering` (GL banner + `OS Window created`), `--debug-font-fallback` (`Text fonts:`
-dump), `--dump-bytes` (raw PTY bytes), `-o KEY=VALUE` (config override, e.g. `font_size`,
-`cursor_shape`, `terminfo_type`, `cursor_blink_interval`), `--version`. The `debug_config`
-action is a **keybinding** (`ctrl+shift+F6`), not a CLI flag, at this commit.
+`--debug-rendering` (GL banner + `OS Window created`; its alias `--debug-gl`,
+`kitty/cli.py:989`, enables the same OpenGL-error checking), `--debug-font-fallback`
+(`Text fonts:` dump, `kitty/cli.py:1002`), `--dump-bytes` (raw PTY bytes, `kitty/cli.py:985`),
+`-o KEY=VALUE` (config override, e.g. `font_size`, `cursor_shape`, `terminfo_type`,
+`cursor_blink_interval`), `--version`. Two further debug flags exist but were **not**
+exercised, because keyboard input is outside the four startup questions: `--debug-input` and
+its alias `--debug-keyboard` (`kitty/cli.py:996`, `dest=debug_keyboard`), which print key and
+mouse events as they are received. The `debug_config` action is a **keybinding**
+(`ctrl+shift+F6`), not a CLI flag, at this commit.
 
 ### "e.g. / such as / including / like" items from the questions
 
