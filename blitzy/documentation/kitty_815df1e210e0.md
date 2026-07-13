@@ -47,7 +47,7 @@ go version go1.22.12 linux/amd64
 ### command: pkg-config --version
 1.8.1
 
-### command: pkg-config --modversion harfbuzz libxxhash libcrypto libpng lcms2 fontconfig xkbcommon
+### command: for p in harfbuzz libxxhash libcrypto libpng lcms2 fontconfig xkbcommon; do printf '%s: %s\n' "$p" "$(pkg-config --modversion "$p")"; done
 harfbuzz: 10.2.0
 libxxhash: 0.8.3
 libcrypto: 3.5.3
@@ -65,21 +65,24 @@ The build/test libraries were provisioned in this ephemeral container only (no r
 
 ```text
 ### command: dpkg-query -W -f='${Package} ${Version} ${Status}\n' libssl-dev libharfbuzz-dev libxxhash-dev build-essential golang-go 2>&1
-build-essential 12.12ubuntu1	[install ok installed]
-libharfbuzz-dev 10.2.0-1	[install ok installed]
-libssl-dev 3.5.3-1ubuntu3.4	[install ok installed]
-libxxhash-dev 0.8.3-2	[install ok installed]
+dpkg-query: no packages found matching golang-go
+build-essential 12.12ubuntu1 install ok installed
+libharfbuzz-dev 10.2.0-1 install ok installed
+libssl-dev 3.5.3-1ubuntu3.4 install ok installed
+libxxhash-dev 0.8.3-2 install ok installed
 
-### command: pkg-config --exists libcrypto && echo 'libcrypto.pc FOUND' ; pkg-config --variable=pcfiledir libcrypto
+### command: pkg-config --exists libcrypto && echo 'libcrypto.pc FOUND'; echo "libcrypto.pc dir: $(pkg-config --variable=pcfiledir libcrypto)"
 libcrypto.pc FOUND
 libcrypto.pc dir: /usr/lib/x86_64-linux-gnu/pkgconfig
 
-### command: pip show Pillow pygments (installed via --break-system-packages, PEP668)
+### command: pip show Pillow pygments | grep -E '^(Name|Version):'
 Name: pillow
 Version: 12.3.0
 Name: Pygments
 Version: 2.20.0
 ```
+
+In the `dpkg-query` block above, the leading `dpkg-query: no packages found matching golang-go` line reflects that the Go toolchain is installed under `/usr/local/go` (per the `go version` line above), not via the apt `golang-go` package; the four library packages queried alongside it are each reported `install ok installed`. (`Pillow` and `pygments` were installed with `pip install --break-system-packages`, as this container is a PEP 668 externally-managed environment.)
 
 ## 1. Building kitty from source (canonical configuration)
 
