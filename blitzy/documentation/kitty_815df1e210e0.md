@@ -21,6 +21,8 @@ Wire up applying of font config
 
 **Filename derivation (corrected).** The deliverable filename `kitty_815df1e210e0.md` derives from the **source branch name** `kitty_815df1e210e0`, which corresponds to the upstream **source commit** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` ("Wire up applying of font config"). That source commit is the **parent** (`HEAD~1`) of the current working tree. The **active working branch** is `blitzy-c482b7b3-3c80-494a-aa8c-49c3573f10f8` and the **current `HEAD`** is `8684ee4be8e877d98f2c608322322a3f37885d00` (the commit that adds this document). The current `HEAD` (`8684ee4be8e877d98f2c608322322a3f37885d00`) is therefore **not** the source commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; the filename tracks the source branch/commit, not `HEAD`.
 
+**Authoring-time note (self-reference).** The `HEAD` value shown in the `git` output above (`8684ee4be…`) is accurate as of when this document was first committed. Because this Markdown file is itself the tracked deliverable, the review/correction commit that finalizes it necessarily advances `HEAD` beyond that hash — a self-documenting artifact cannot print its own final commit id. The captured `git rev-parse` and build-log output is preserved verbatim as recorded; only the source-branch↔source-commit derivation (`kitty_815df1e210e0` ↔ `815df1e210e0…`) is invariant.
+
 ### 0.2 Canonical environment (the mandated container)
 
 All observation was performed inside the mandated image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` (derived to `kitty-qna:local`, which adds *environment-level observation tooling only* — Xvfb, xauth, xdotool, gdb, strace, py-spy, mesa-utils — and changes **no** repository file). The running container has this repository bind-mounted at `/app`.
@@ -533,8 +535,9 @@ setsid env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" XDG_RUNTIME_DIR="$XDG_RUN
 KPID=$!
 trap 'kill -KILL -"$KPID" 2>/dev/null || true' EXIT
 sleep 3
+KEXE="$(readlink /proc/$KPID/exe 2>/dev/null || true)"
 WID="$(xdotool search --pid "$KPID" --class kitty 2>/dev/null | sort -n | head -1)"
-echo "RUN=$RUNID KPID=$KPID WID=$WID"
+echo "RUN=$RUNID KPID=$KPID KEXE=$KEXE WID=$WID"
 echo "child START lines:"; grep -aH 'START' "$FG" "$BG" 2>/dev/null || true
 xdotool windowfocus "$WID"; sleep 0.4
 bg_before="$(grep -c '^BG ' "$BG" 2>/dev/null || echo 0)"
@@ -2396,7 +2399,7 @@ Measured headline (means over 5 randomized runs; full distributions in §6.4–�
 | `30` ms       | **47.6** frames      | **31.70 ms**            | **1.53 s**        | ~100 000 lines            |
 | `100` ms      | **15.0** frames      | **100.88 ms**           | **0.84 s**        | ~98 000 lines             |
 
-The visible-update interval tracks `input_delay` almost exactly (`3.64≈3`, `31.70≈30`, `100.88≈100`), render count falls **~42×**, CPU falls **~12.9×**, while throughput stays flat — the signal lives in rendering responsiveness/CPU, provably **not** in throughput (§6.7).
+The visible-update interval tracks `input_delay` almost exactly (`3.64≈3`, `31.70≈30`, `100.88≈100`), render count falls **~39×**, CPU falls **~12.9×**, while throughput stays flat — the signal lives in rendering responsiveness/CPU, provably **not** in throughput (§6.7).
 
 ### 6.2 The mechanism in the source (where `input_delay` is enforced)
 
@@ -2685,7 +2688,7 @@ D=30  n=5  frames[47/47.6/48]  upd_ms[31.40/31.70/32.04]  cpu[149/156.80/168]  w
 D=100 n=5  frames[15/15.0/15]  upd_ms[100.47/100.88/102.00]  cpu[84/90.20/97]  wake[-/0.0/-]  thru_mean=97800
 ```
 
-Reading the result: as `input_delay` rises `0 → 3 → 30 → 100` ms, the **burst render count** falls `583.6 → 416.2 → 47.6 → 15.0` (a ~42× reduction) and the **mean visible-update interval** rises `2.59 → 3.64 → 31.70 → 100.88` ms — locking onto `input_delay` at the `30`/`100` values (`31.70≈30`, `100.88≈100`) and hitting a render-bound floor (~`2.5`–`3.7` ms) at `0`/`3` where redraws are limited by how fast a frame can be produced, not by `input_delay`. The distributions are tight across the 5 randomized runs (e.g. `D=100` gave `15/15/15` frames and `100.47`–`102.00` ms every time), confirming stability. The mean update interval is the **producer→visible latency granularity**: at `input_delay=100` the screen only refreshes ~10×/s, so newly produced output waits up to ~100 ms to appear; at `input_delay=0` it refreshes ~400×/s.
+Reading the result: as `input_delay` rises `0 → 3 → 30 → 100` ms, the **burst render count** falls `583.6 → 416.2 → 47.6 → 15.0` (a ~39× reduction) and the **mean visible-update interval** rises `2.59 → 3.64 → 31.70 → 100.88` ms — locking onto `input_delay` at the `30`/`100` values (`31.70≈30`, `100.88≈100`) and hitting a render-bound floor (~`2.5`–`3.7` ms) at `0`/`3` where redraws are limited by how fast a frame can be produced, not by `input_delay`. The distributions are tight across the 5 randomized runs (e.g. `D=100` gave `15/15/15` frames and `100.47`–`102.00` ms every time), confirming stability. The mean update interval is the **producer→visible latency granularity**: at `input_delay=100` the screen only refreshes ~10×/s, so newly produced output waits up to ~100 ms to appear; at `input_delay=0` it refreshes ~400×/s.
 
 
 ### 6.5 Result 2 — PUREST CPU (plain debug build, no EVDBG, no gdb, R=5 randomized)
@@ -3193,6 +3196,8 @@ $ docker exec kitty-setup-verify bash -lc 'cd /app; git check-ignore -v kitty/fa
 ```
 
 `--untracked-files=all` lists **exactly one** path — the deliverable (shown `M` because a first draft of it was committed at `HEAD` = `8684ee4be`, so the rewrite registers as a modification, not an addition). The `git diff --stat` confirms that same single file is the only content change. The `git check-ignore -v` lines explain why the canonical build leaves the tree clean: the native extension (`*.so`), the launcher (`/kitty/launcher/kitt*`), and every compiled object (under `/build/`) match `.gitignore` rules, so an in-tree `python3 setup.py build` / `make debug` produces **zero** untracked or modified tracked files. No source, test, or configuration file under version control was edited at any point in the investigation.
+
+**Authoring-time note (self-reference).** The `git status --porcelain` and `git diff --stat` output above reflects the working tree at authoring time, when the in-progress rewrite of this file was still uncommitted — hence the ` M` (modified) status and the shown insertion/deletion counts. Because the file is the tracked deliverable, committing it — and any subsequent review-fix commit — flips its status from ` M` to clean and advances `HEAD` beyond `8684ee4be…`; the substantive Part-7 claim (only this one file is a repository change, no versioned source/test/config was edited, and every temporary artifact was removed) holds independently of those moving self-referential values, which is why an independent post-review `git status` confirms a clean tree.
 
 ### 7.5 Coverage pass — every prompt part and named item answered
 
