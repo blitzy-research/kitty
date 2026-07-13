@@ -10,10 +10,16 @@
 > `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (subject *"Wire up applying of font config"*). That
 > commit is the logical source branch `kitty_815df1e210e0`, from which this document's file name
 > derives. The investigation and this deliverable are committed on the **destination** branch
-> `blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7`, whose HEAD is the documentation commit
-> `3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f` and whose **parent** is exactly the pinned source commit
-> above. In other words, the code exercised here is `HEAD~1` of the destination branch — the pinned
-> commit — built in its default configuration.
+> `blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7`. Because this deliverable was refined over several
+> documentation commits on that branch, the branch **HEAD is *ahead of* the pinned source commit**,
+> and its exact position moves with each revision — so the branch HEAD (and any relative reference
+> such as `HEAD~1`) is **not** a stable anchor. The immutable anchor is the pinned hash itself:
+> `git merge-base --is-ancestor 815df1e210e0 HEAD` confirms the pinned commit is an ancestor of HEAD,
+> and `git diff --name-status 815df1e210e0 HEAD` shows the only difference between the pinned commit
+> and HEAD is the addition of this one document — i.e. **no kitty source file differs** between the
+> pinned commit and HEAD (both invariants are verified in [§1.1](#11-provenance-and-toolchain)). The
+> code exercised here is therefore the pinned commit `815df1e210e0…`, built in its default
+> configuration.
 >
 > **Canonical build image.**
 > `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
@@ -60,21 +66,30 @@
 ### 1.1 Provenance and toolchain
 
 The following was captured at the repository root on the destination branch. It records the exact
-commit under study (the pinned source commit, which is `HEAD~1` here), the toolchain versions, and
-the `pkg-config` state that governs which GLFW backend is built (see [§1.3](#13-wayland-auto-disable-and-why-it-is-irrelevant-here)).
+commit under study by its **immutable pinned hash** `815df1e210e0…` — proving, in a way that does not
+depend on where the branch HEAD currently sits, that the pinned commit is an ancestor of HEAD and that
+the only difference between the two is this document — together with the toolchain versions and the
+`pkg-config` state that governs which GLFW backend is built (see [§1.3](#13-wayland-auto-disable-and-why-it-is-irrelevant-here)).
 
 Command:
 
 ```bash
 set -o pipefail
+pinned=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # immutable pinned source commit under study
 {
   echo "=== repo root (pwd) ==="; pwd
-  echo; echo "=== git provenance ==="
-  echo "destination/review branch: $(git rev-parse --abbrev-ref HEAD)"
-  echo "current HEAD (doc commit): $(git rev-parse HEAD)"
-  echo "current HEAD subject: $(git log -1 --format='%s' HEAD)"
-  echo "parent HEAD~1 (pinned source commit under study): $(git rev-parse HEAD~1)"
-  echo "parent subject: $(git log -1 --format='%s' HEAD~1)"
+  echo; echo "=== git provenance (anchored to the immutable pinned commit) ==="
+  echo "destination/review branch:        $(git rev-parse --abbrev-ref HEAD)"
+  echo "current branch HEAD (varies):     $(git rev-parse HEAD)"
+  echo "pinned source commit under study: $pinned"
+  echo "pinned commit subject:            $(git log -1 --format='%s' "$pinned")"
+  if git merge-base --is-ancestor "$pinned" HEAD; then
+    echo "pinned is an ancestor of HEAD:    YES (invariant)"
+  else
+    echo "pinned is an ancestor of HEAD:    NO"
+  fi
+  echo "diff pinned..HEAD (invariant — only the deliverable appears):"
+  git diff --name-status "$pinned" HEAD
   echo; echo "=== toolchain versions ==="
   python3 --version; cc --version | head -1; go version; pkg-config --version
   echo; echo "=== Wayland pkg-config probe (governs GLFW backend selection) ==="
@@ -92,12 +107,14 @@ Output **[observed]**:
 === repo root (pwd) ===
 /tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464
 
-=== git provenance ===
-destination/review branch: blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7
-current HEAD (doc commit): 3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f
-current HEAD subject: docs: add runtime-observed investigation of kitty keyboard-protocol stack vs alternate-screen
-parent HEAD~1 (pinned source commit under study): 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
-parent subject: Wire up applying of font config
+=== git provenance (anchored to the immutable pinned commit) ===
+destination/review branch:        blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7
+current branch HEAD (varies):     db9bbddeb0de105a7586119924309ab2c8df48b7
+pinned source commit under study: 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+pinned commit subject:            Wire up applying of font config
+pinned is an ancestor of HEAD:    YES (invariant)
+diff pinned..HEAD (invariant — only the deliverable appears):
+A	blitzy/documentation/kitty_815df1e210e0.md
 
 === toolchain versions ===
 Python 3.13.7
@@ -114,10 +131,14 @@ kitty/glfw-x11.so
 EXIT=0
 ```
 
-The two facts that matter downstream: the code under study is the pinned commit
-`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (the parent of the documentation commit), and
-`wayland-protocols` is **absent** from `pkg-config`, so only the X11 GLFW backend (`kitty/glfw-x11.so`)
-is built.
+Two provenance facts here are **invariant** — they hold regardless of where the branch HEAD currently
+sits, so they survive every future revision of this document: (i) the pinned commit
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` **is an ancestor of HEAD**, and (ii) the only difference
+between the pinned commit and HEAD is the addition of this document (**no kitty source file differs**).
+The `current branch HEAD` line above is expected to differ on re-run as the deliverable is revised and
+is *not* a reproducibility anchor. With provenance thus pinned, the two facts that matter downstream
+are: the code under study is the pinned commit `815df1e210e0…`, and `wayland-protocols` is **absent**
+from `pkg-config`, so only the X11 GLFW backend (`kitty/glfw-x11.so`) is built.
 
 ### 1.2 Building the C extension (canonical, default configuration)
 
@@ -258,10 +279,57 @@ kitty/tools/cmd
 /usr/bin/go build -v -ldflags '-X kitty.VCSRevision=3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464/tools/cmd
 ```
 
-Build summary **[observed]**: `BUILD_EXIT=0`; transcript = 104 lines / 58964 bytes;
-`sha256 = 841d09404c5d0e29f39ee985401d19cc49ad7a22e2fe1f36b9d75c235bc7ca11`; the `grep` for
-`warning:`/`error:` returned **NONE (zero warnings/errors)**. Re-running the command above and
-comparing against this `sha256` verifies the transcript byte-for-byte.
+Build summary **[observed]**: `BUILD_EXIT=0`, and the `grep` for `warning:`/`error:` returned
+**NONE (zero warnings/errors)** — with the strict `-pedantic-errors -Werror` set applied by default,
+a clean build is a zero-warning guarantee.
+
+The transcript above is a genuine capture, but **two of its lines are run/commit-specific and are
+deliberately *not* used as a reproducibility anchor**:
+
+- the `KITTY_VCS_REV="…"` field on the `kitty/data-types.c` compile line and the matching
+  `-X kitty.VCSRevision=…` field on the Go `kitten` build line both record the **checkout's git HEAD
+  at build time**. (This transcript was captured at an earlier documentation commit on the branch, so
+  those fields show that build-time HEAD — `3e8e1ae1b…` — not the current branch HEAD.)
+- the `go build -v` progress line(s) printed under `Updating Go generated files…` depend on the **Go
+  build-cache** warmth: a warm cache prints fewer package lines than a cold one.
+
+Because of the embedded `KITTY_VCS_REV`, the raw `sha256` of the **whole transcript** *and* the raw
+`sha256` of `kitty/fast_data_types.so` are only reproducible **at a fixed checkout**, not across
+commits — rebuilding at `815df1e21…` versus a later documentation commit changes only the embedded
+40-hex revision. (For the record, the whole-transcript `sha256` of the capture above was
+`841d09404c5d0e29f39ee985401d19cc49ad7a22e2fe1f36b9d75c235bc7ca11` at 104 lines *at capture time*; a
+fresh clean rebuild on a warm Go cache yields a different whole-transcript hash and 103 lines — as
+expected, and precisely why that hash is not used as an anchor.) The **stable, reproducible anchors** —
+the values a normal re-runner should actually check — are:
+
+1. `BUILD_EXIT=0`;
+2. zero `warning:`/`error:` lines (the `-Werror` guarantee);
+3. `kitty/fast_data_types.so` links, imports, and passes the behavior sanity check
+   (`current_key_encoding_flags() == 0`, `toggle_alt_screen` present — see the *Post-build
+   verification* block below);
+4. the artifact **size `1253792` bytes** (stable across commits because `KITTY_VCS_REV` is always a
+   fixed-width 40-hex string, so swapping one revision for another does not change the byte count); and
+5. a **revision-masked hash of the invariant compile + link commands**, which *is* byte-for-byte
+   reproducible across runs and across commits.
+
+Anchor (5) keeps only the `gcc` compile/link lines and masks the sole per-commit token among them
+(the 40-hex `KITTY_VCS_REV`); none of these lines contains a host-specific path, so the result is
+portable:
+
+```bash
+grep '^gcc ' /tmp/build.txt | sed 's/[0-9a-f]\{40\}/<REV>/g' | sha256sum
+```
+
+Output **[observed]** (identical on two consecutive clean rebuilds, and identical to the transcript
+above once masked):
+
+```text
+6921c2615358aa6551b95feeb8b48241c19a662f883847216dc4369579bc1a06  -
+```
+
+That normalized hash matches byte-for-byte between the transcript shown above (captured at an earlier
+commit) and a fresh clean rebuild at the current HEAD, confirming the **90 `gcc` compile/link commands
+are invariant**; only the embedded revision and the Go-cache progress line differ between runs.
 
 Post-build verification **[observed]**:
 
@@ -389,7 +457,7 @@ Script (reproducible):
 # Flag state is read CANONICALLY from the real per-buffer stack after driving the REAL VT parser.
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -468,7 +536,7 @@ Script (reproducible):
 # OBJ-2: 8-slot stack exhaustion (oldest silently evicted, no error) on BOTH buffers, plus isolation.
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -583,7 +651,7 @@ Script (reproducible):
 #         over-popping does not underflow/error (stays at 0).
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -684,7 +752,7 @@ Script (reproducible):
 # converted with .encode('ascii') exactly as kitty/window.py:L1801 does on the live path.
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -775,7 +843,7 @@ Script (reproducible):
 #           so they are a pure encoder cross-check, NOT proof of stack state.
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -887,7 +955,7 @@ Script (reproducible):
 # OBJ-5: rapid main<->alt switching while both stacks hold distinct flags; probe for any leakage.
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -968,7 +1036,7 @@ Script (reproducible):
 #         (C) SCORC confusion: bare CSI u = restore-cursor, NOT a keyboard-stack op.
 set -o pipefail
 umask 077
-repo="/tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464"
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/kbdobs.XXXXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/obs.py" <<'PYEOF'
@@ -1197,12 +1265,17 @@ The seven observation scripts from [§2](#2-obj-1--round-trip-stack-survival)–
 are deterministic. To confirm the reported values are stable, the full set was run **twice**
 unchanged, each run's concatenated output hashed, and the two runs compared byte-for-byte.
 
-Command (reproducible; `$R` is the directory holding the seven scripts shown above):
+Command (reproducible; `$R` is the directory holding the seven scripts shown above, and `$repo` is
+the checkout root — pass it as the first argument, or let it auto-detect via
+`git rev-parse --show-toplevel` when the runner is invoked from within the tree. The runner forwards
+`$repo` to each script as its first argument, matching the scripts' own `repo="${1:-$(git rev-parse --show-toplevel)}"`
+convention, so the whole set is portable and does not depend on the current working directory):
 
 ```bash
 set -o pipefail
+repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
 SCRIPTS="obj1_roundtrip obj2_exhaustion obj3_pop_reset obj4_ctrlshifta obj4b_contrast obj5_leakage obj6_modes"
-run_all() { for s in $SCRIPTS; do bash "$R/$s.sh"; done; }
+run_all() { for s in $SCRIPTS; do bash "$R/$s.sh" "$repo"; done; }
 run_all > run1.txt 2>&1; echo "run1 rc=$?"
 run_all > run2.txt 2>&1; echo "run2 rc=$?"
 echo "run1 sha256: $(sha256sum run1.txt | cut -d' ' -f1)"
