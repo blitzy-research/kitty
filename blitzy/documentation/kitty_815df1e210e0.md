@@ -691,6 +691,8 @@ kitten choose_fonts 0.35.2 created by Kovid Goyal
 43-    Choose the fonts used in kitty
 ```
 
+**Invalid values are rejected at parse time (nuance).** Passing a `--reload-in` value outside the declared choices does **not** start the kitten: the shared CLI's `StringOption` choices check rejects it with a `ParseError` (`tools/cli/option.go:176-177`) and the process exits `1` before `main()` runs. This is demonstrated at runtime — complete output, both spellings, and a valid‑value control — in §5.4a. **[observed in §5.4a; rejection site inferred from source]**
+
 ### R3.2 (b) Option / data flow
 
 The parsed `opts` flow from the CLI closure to the finalize step. The endpoints are **observed** (the `--help` above proves parsing; §5.4 observes the `--reload-in` effect); the intermediate assignments at the cited lines are **inferred** from source:
@@ -851,7 +853,7 @@ The three action strings are **[observed]** in the captured JSON above; that the
 
 `faces_settings.serialized()` (`kittens/choose_fonts/final.go:63-70`) emits exactly four lines. Each **key name is right‑padded with spaces to a 17‑character field** (i.e. the key is left‑aligned and the value begins at column 18); the four lines are joined by `\n`. **[inferred from source; the exact bytes are observed in R4.2 — e.g. `font_family` + 6 spaces, `bold_italic_font` + 1 space].**
 
-`Patcher.Patch` (`tools/config/api.go:310`) then: comments out any pre‑existing font lines (regex → `# $1`, `tools/config/api.go:325-326`); wraps the content in a `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` sentinel block (`tools/config/api.go:328-330`); replaces an existing block or appends a new one (`tools/config/api.go:331-340`); writes a `kitty.conf.bak` backup **only when the file was non‑empty beforehand** (`len(raw) > 0 && self.Write_backup`, `tools/config/api.go:343`); and updates the file **atomically** via `utils.AtomicUpdateFile` (`tools/config/api.go:347`, implemented at `tools/utils/atomic-write.go:79-89`, which calls `AtomicWriteFile` at `tools/utils/atomic-write.go:42`). The write happens only when the content actually changed (`!bytes.Equal(raw, nraw)`, `tools/config/api.go:347`). **[inferred from source; observed in R4.2 and §5.5]**
+`Patcher.Patch` (`tools/config/api.go:310`) then: comments out any pre‑existing font lines (regex → `# $1`, `tools/config/api.go:325-326`); wraps the content in a `# BEGIN_KITTY_FONTS … # END_KITTY_FONTS` sentinel block (`tools/config/api.go:328-330`); replaces an existing block or appends a new one (`tools/config/api.go:331-340`); writes a `kitty.conf.bak` backup **only when the file was non‑empty beforehand** (`len(raw) > 0 && self.Write_backup`, `tools/config/api.go:343`); and updates the file **atomically** via `utils.AtomicUpdateFile` (`tools/config/api.go:347`, implemented at `tools/utils/atomic-write.go:79-89`, which calls `AtomicWriteFile` at `tools/utils/atomic-write.go:42`). The write happens only when the content actually changed (`!bytes.Equal(raw, nraw)`, `tools/config/api.go:342`). **[inferred from source; observed in R4.2 and §5.5]**
 
 Persistence is the on‑disk write. The optional `SIGUSR1` reload (`config.ReloadConfigInKitty`, `tools/config/api.go:352-371`) only pushes the change into already‑running instances — it is a convenience, not the persistence mechanism. **[inferred from source; reload signalling observed in §5.4]**
 
@@ -1259,6 +1261,32 @@ Both runs **write** `kitty.conf` (190 bytes) but send **zero** `SIGUSR1` — con
 
 **[observed]** synthesis — stable across both runs of each mode: `parent` → **1** `SIGUSR1` to `$KITTY_PID`; `all` → **1** `SIGUSR1` to the sole live kitty‑GUI process; `none` → **0** `SIGUSR1`. All six runs wrote `kitty.conf` (190 bytes). So the **write is unconditional**; the reload signal is conditional on the mode (`parent`/`all` signal, `none` does not).
 
+### 5.4a `--reload-in` = invalid value → rejected at parse time (exit 1); the TUI never starts
+
+An out‑of‑range `--reload-in` value is rejected during **option parsing**, before `main()` runs and before the kitten's terminal UI (or even the controlling tty) is touched. **[inferred from source]** the responsible symbol is the `StringOption` choices check inside `func (self *Option) add_value(val string) error`: when `self.Choices != nil && !slices.Contains(self.Choices, val)` (`tools/cli/option.go:176`) it returns a `&ParseError{…}` (`tools/cli/option.go:177`) built from the message template `%s is not a valid value for %s. Valid values: %s` (the source wraps the two names in `:yellow:`/`:bold:` render markers, and the `Error: ` prefix is added when the `ParseError` is printed). **[observed]** driving the **real** `kitten choose-fonts` entry point with a bogus value produces the complete, unedited output below and exits `1`; the `=`‑joined and space‑separated spellings behave identically, and the result is stable across two runs:
+
+```
+### CMD: kitten choose-fonts --reload-in=bogus </dev/null 2>&1 ; echo "EXIT=$?"   (run 1 of 2)
+Error: bogus is not a valid value for --reload-in. Valid values: parent, all, none
+EXIT=1
+
+### CMD: kitten choose-fonts --reload-in=bogus </dev/null 2>&1 ; echo "EXIT=$?"   (run 2 of 2 — stable)
+Error: bogus is not a valid value for --reload-in. Valid values: parent, all, none
+EXIT=1
+
+### CMD: kitten choose-fonts --reload-in bogus </dev/null 2>&1 ; echo "EXIT=$?"   (space-separated spelling — identical)
+Error: bogus is not a valid value for --reload-in. Valid values: parent, all, none
+EXIT=1
+
+### CONTROL — a VALID value passes the same choices gate and proceeds PAST parse:
+### CMD: kitten choose-fonts --reload-in=parent </dev/null 2>&1 ; echo "EXIT=$?"
+Error: open /dev/tty: no such device or address
+EXIT=1
+### (This is NOT a parse error: `parent` was accepted by the choices check; the later failure is the UI's tty open, because stdin was redirected from /dev/null in this non-interactive probe. The invalid value above never reaches this point.)
+```
+
+Because parsing fails first, the finalize/`Patch` code is never reached and `kitty.conf` is **never written** on this path. **[observed]** exit status `1` for every invalid run (twice, plus the space spelling), versus the valid‑value control which is accepted by the choices gate and fails only later; **[inferred from source]** that exit originates from the `ParseError` returned at `tools/cli/option.go:177` propagating out of option parsing before the event loop starts.
+
 ### 5.5 Empty vs. pre‑populated `kitty.conf` — append, replace, comment‑out, `.bak`
 
 `Patcher.Patch` (`tools/config/api.go:310`) has three observable behaviors depending on the file's prior content. Every font write below is performed by the **real kitten** (no hand‑editing of the result). The `.bak` backup is written only when the prior file was non‑empty (`api.go:343`: gate `len(raw) > 0 && p.Write_backup`).
@@ -1605,6 +1633,7 @@ Every AAP requirement (R1–R4), every named entity, every secondary/edge condit
 | `--reload-in none` (×2) | file written; **0** `SIGUSR1` | observed | `"none"` absent from switch `final.go:86-93` | §5.4 | Trace count `0`/`0` |
 | `--reload-in parent` (×2) | file written; **1** `SIGUSR1` to `$KITTY_PID` | observed | `ReloadConfigInKitty(true)` `api.go:353-361` | §5.4 | fd→PID maps send to the GUI instance |
 | `--reload-in all` (×2) | file written; **1** `SIGUSR1` to the sole live kitty‑GUI proc | observed | `api.go:363-369`; `is_kitty_gui_cmdline` `api.go:282-303` | §5.4 | GUI inventory (=1) + fd→PID resolve the target |
+| `--reload-in` invalid value (×2) | rejected at parse time; `Error: bogus is not a valid value for --reload-in. Valid values: parent, all, none`; **exit 1**; TUI never starts; `kitty.conf` not written | rejection observed; exit‑origin inferred | `StringOption` choices check `tools/cli/option.go:176-177` (`ParseError`) | §5.4a | Valid‑value control proceeds past the same gate |
 | Empty/replace/pre‑populated | append (no `.bak`) / replace‑in‑place (`.bak`) / comment‑out + append (`.bak`) — all via the kitten | observed | `api.go:325-340`, `:343` | §R4.2, §5.5 | All three branches, zero hand‑editing of the result |
 | Config isolation | `KITTY_CONFIG_DIRECTORY` honored first; memoized per process | isolation observed; memoization inferred | `ConfigDirForName` `tools/utils/paths.go:88-91`; `ConfigDir` `sync.OnceValue` `:132-134` | §0.1, all §R4/§5 | Set before each launch |
 | Secondary invocation | `list-fonts` `main()` re‑execs `kitten choose-fonts` | observed via source read | `kitty/fonts/list.py:34` (`main`), `:41`, `:42` | §5.6 | Same real entry point |
@@ -1626,7 +1655,7 @@ Every AAP requirement (R1–R4), every named entity, every secondary/edge condit
 | §0.7.1 | Deliverable = `blitzy/documentation/<source_branch_name>.md`; the only artifact | this file `blitzy/documentation/kitty_815df1e210e0.md`; nothing else added to the repo | §6 (git status) |
 | §0.7.2 | Investigate by **running first**; canonical default config; **real entry point**; report exact build/invocation commands | built with `./dev.sh build`; drove the real `kitten choose-fonts`; no remote‑control/debug/synthetic substitute | §R1, §R2, §R3–§5 |
 | §0.7.2 | Magnitude/timing claims: ≥2 unchanged runs / distribution | builds ×2; each `--reload-in` mode ×2; durations reported as cache‑dependent, not essential | §R1.1–R1.2, §5.4 |
-| §0.7.3 | **Every condition** (primary + secondary); before/intermediate/after for state changes | Enter happy path + Esc/`s`/`S`/Ctrl+c + `--reload-in` ×3 + empty/replace/pre‑populated; before/during/after captured | §R4, §5 |
+| §0.7.3 | **Every condition** (primary + secondary); before/intermediate/after for state changes | Enter happy path + Esc/`s`/`S`/Ctrl+c + `--reload-in` ×3 (valid) + invalid `--reload-in` value + empty/replace/pre‑populated; before/during/after captured | §R4, §5 |
 | §0.7.3 | **Actual, complete, unedited output** + the producing command | complete outputs with `### CMD:` provenance throughout; no ellipses | §R1–§6 |
 | §0.7.3 | Answer **every part**; final coverage pass | this matrix (§7.1–§7.3) maps every named item | §7 |
 | §0.7.4 | Exact & grounded: actual value + `file:line` + responsible symbol | every row cites the responsible function/method/struct at its line | §7.1 |
