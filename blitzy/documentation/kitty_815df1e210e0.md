@@ -573,7 +573,7 @@ Two observed nuances worth recording:
 
 **How each transport reaches this core (ingress).** The parse/route core above is shared; only the ingress differs. The ingress steps below are **SOURCE‑VERIFIED** (read from the code; the individual C/boss hops were not separately instrumented), while the shared core they feed into is OBSERVED above from *both* transports:
 
-- **Socket ingress (SOURCE‑VERIFIED):** `boss.peer_message_received` (`kitty/boss.py:776`) → `_handle_remote_command` (`:590`) → `_execute_remote_command` (`:701`) → `from .remote_control import handle_cmd`.
+- **Socket ingress (SOURCE‑VERIFIED):** `boss.peer_message_received` (`kitty/boss.py:776`) → `_handle_remote_command` (`:590`) → `_execute_remote_command` (`:700`) → `from .remote_control import handle_cmd`.
 - **TTY ingress (SOURCE‑VERIFIED):** the C DCS parser dispatches `@kitty-cmd` at `kitty/vt-parser.c:603` (only after matching the `kitty-` marker) → `kitty/window.py:1279-1280` `handle_remote_cmd` → `get_boss().handle_remote_cmd(...)` → `kitty/boss.py:849` `handle_remote_cmd` → `_handle_remote_command` (`:590`).
 
 ### 5.4 The Go client's receive → decode → print path (the return leg)
@@ -745,7 +745,7 @@ u_str LISTEN 0      128    /tmp/kitty_obs_work/run.4VK8TB/nosikitty 728558053   
 
 `KITTY_SHELL_INTEGRATION` is now **empty** (`SI=[]`, shell integration genuinely off), yet `KITTY_PID` and `KITTY_LISTEN_ON` are **still set** (`child.py:244-249` exports them regardless of shell integration), and `kitten @ ls` still works (`KITTEN_EXIT=0`, `RESPONSE_JSON=VALID`) over the socket owned by pid `41580`. **Conclusion: shell integration is not what makes RC work** — the enabler is kitty's env export (`kitty/child.py:244-249`) plus the two RC transports.
 
-> **Gotcha you may hit:** the correct value is `shell_integration=disabled`, **not** `shell_integration=no`. `no` is an invalid token that kitty silently ignores, leaving shell integration *enabled*; the default is `enabled` (`kitty/options/definition.py:3141`).
+> **Gotcha you may hit:** the correct value is `shell_integration=disabled`, **not** `shell_integration=no`. `no` is an invalid token that kitty ignores **while emitting a diagnostic** — `Invalid shell integration options: frozenset({'no'}), ignoring` via `log_error` at `kitty/options/utils.py:985` (OBSERVED at startup) — leaving shell integration *enabled*; the default is `enabled` (`kitty/options/definition.py:3141`).
 
 ### 6.5 Resolution of your either/or
 
@@ -841,7 +841,7 @@ Every major claim is tagged **OBSERVED** (reproduced at runtime, with the produc
 | 20 | `KITTY_PUBLIC_KEY` is consumed **only** on the password/encryption path | SOURCE‑VERIFIED (not exercised) | `get_pubkey` `main.go:72-94`, `remote_control.py:516-524` |
 | 21 | `allow_remote_control` modes: `no`/`yes`/`password`/`socket-only`/`socket` & gating | SOURCE‑VERIFIED (`no`+`yes` OBSERVED) | `definition.py:2969-2999`; `boss.py:594-640` |
 | 22 | New command: Python server auto‑routes; Go client needs a generated file + rebuild | SOURCE‑VERIFIED | `base.py:451-453`; `cmd_ls_generated.go:1,148-149`, `go_code.py:667-671`, `setup.py:1102,1112` |
-| 23 | Socket ingress `peer_message_received → _handle_remote_command → _execute_remote_command` | SOURCE‑VERIFIED (calls the OBSERVED `parse_cmd`) | `boss.py:776,590,701` |
+| 23 | Socket ingress `peer_message_received → _handle_remote_command → _execute_remote_command` | SOURCE‑VERIFIED (calls the OBSERVED `parse_cmd`) | `boss.py:776,590,700` |
 | 24 | TTY ingress `vt-parser.c dispatch → window.handle_remote_cmd → boss.handle_remote_cmd` | SOURCE‑VERIFIED | `vt-parser.c:603`, `window.py:1279`, `boss.py:849` |
 | 25 | Response encode `encode_response_for_peer` / `send_cmd_response` | SOURCE‑VERIFIED (shape OBSERVED) | `remote_control.py:52-53`, `window.py:1386` |
 | 26 | A version newer than the instance is rejected | SOURCE‑VERIFIED (guard present; not triggered) | `remote_control.py:218`, `rc_protocol.rst:22-25` |
