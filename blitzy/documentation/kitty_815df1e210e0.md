@@ -38,28 +38,28 @@
    on the main buffer, switching to the alternate buffer, pushing *report-all-keys* (flag `8`) there,
    and switching back, the **active flags on the main buffer are `1` again** — the main-buffer stack
    survives the round trip intact because switching buffers only re-points an active pointer; it never
-   copies flags between the two arrays. **[observed]**, see [§2](#2-obj-1--round-trip-stack-survival).
+   copies flags between the two arrays. **[observed]**, see [§2](#2-obj-1-round-trip-stack-survival).
 
 2. **Exhaustion.** The stack holds **8 entries**. A push onto a full stack **silently evicts the
    oldest entry** (no error). Exhausting one buffer's stack does **not** affect the other's.
-   **[observed]**, see [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation).
+   **[observed]**, see [§3](#3-obj-2-stack-exhaustion-on-both-buffers-and-cross-buffer-isolation).
 
 3. **Pop-to-empty.** A pop that empties the stack **resets all flags to `0`**; over-popping does not
-   underflow or error. **[observed]**, see [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop).
+   underflow or error. **[observed]**, see [§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop).
 
 4. **Ctrl+Shift+a in the four requested states.** All four states emit the identical byte sequence
    **`b'\x1b[97;6u'`** (`ESC [ 97 ; 6 u`): codepoint `97` = `a`, modifier field `6` = the Ctrl+Shift
    bitmask `5` plus `1`. The *plain* and *Ctrl+a* keys, by contrast, differ per state and expose the
-   flag semantics. **[observed]**, see [§5](#5-obj-4--the-four-ctrlshifta-byte-captures-plus-contrast-and-flag-sensitivity).
+   flag semantics. **[observed]**, see [§5](#5-obj-4-the-four-ctrlshifta-byte-captures-plus-contrast-and-flag-sensitivity).
 
 5. **Independence & leakage.** The differing per-state byte captures, plus a 10-cycle rapid-switching
    probe, show the two buffers keep **independent** stacks with **no leakage**.
-   **[observed]**, see [§6](#6-obj-5--independence-proof-and-leakage-probe).
+   **[observed]**, see [§6](#6-obj-5-independence-proof-and-leakage-probe).
 
 6. **Mode-dependent edge cases.** Isolation holds across all three alternate-screen mode constants
    `47`/`1047`/`1049`; `DECCKM` interacts with the flags for cursor keys; and a bare `CSI u` is
    *restore-cursor* (SCORC), not a keyboard-stack operation.
-   **[observed]**, see [§7](#7-obj-6--mode-dependent-edge-cases-4710471049-decckm-and-scorc).
+   **[observed]**, see [§7](#7-obj-6-mode-dependent-edge-cases-4710471049-decckm-and-scorc).
 
 ## 1. Environment, build, and the canonical observation path
 
@@ -611,7 +611,7 @@ EXIT=0
   active value climb `1..12`, and the 12 pops read back `[11, 10, 9, 8, 7, 6, 5, 0, 0, 0, 0, 0]`. The
   ALT buffer, exercised the same way after `CSI ?1049h`, produces the **identical** push and pop
   sequences. Only the most-recent **8** values (`5..12`) were retained; the older values (`1..4`, and
-  the base-0 seed discussed in [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop))
+  the base-0 seed discussed in [§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop))
   were evicted by the `memmove` at [kitty/screen.c:L1241], and **no error was raised** at any point
   (the program ran to `EXIT=0`).
 
@@ -911,7 +911,7 @@ authoritative flag table ([docs/keyboard-protocol.rst:L275-L283]) and the encode
   [kitty/key_encoding.c:L422]): *every* key becomes a `CSI ... u` sequence, so even plain `a` reports
   as `b'\x1b[97u'`; Ctrl+a remains `b'\x1b[97;5u'`.
 
-This is the crux of the independence proof in [§6](#6-obj-5--independence-proof-and-leakage-probe):
+This is the crux of the independence proof in [§6](#6-obj-5-independence-proof-and-leakage-probe):
 the plain-`a` byte differs by buffer state (`b'a'` on the main buffer vs `b'\x1b[97u'` on the
 alternate buffer), which can only happen if the two buffers carry different active flags.
 
@@ -938,7 +938,7 @@ there any state leakage during rapid buffer switching while the keyboard mode is
 
 **Proof from the captures already shown.** Independence is established two ways:
 
-1. *Query replies* (canonical, child-visible): in [§2](#2-obj-1--round-trip-stack-survival) the flags
+1. *Query replies* (canonical, child-visible): in [§2](#2-obj-1-round-trip-stack-survival) the flags
    query returns `b'\x1b[?1u'` on the main buffer but `b'\x1b[?8u'` on the alternate buffer at the same
    point in the round trip, and returns to `b'\x1b[?1u'` on the main buffer afterward.
 2. *Key bytes* (contrast, [§5.2](#52-contrast-keys-canonical-stack-flags)): the plain-`a` byte is
@@ -1016,7 +1016,7 @@ consistent with the two physically separate arrays ([kitty/screen.h:L128]) and t
 
 **Question.** Enumerate and exercise the terminal-mode variants under which stack isolation might
 behave unexpectedly: the three alternate-screen mode constants `47`/`1047`/`1049`, the cursor-key mode
-`DECCKM`, and the first-push-from-empty behavior (covered in [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop)).
+`DECCKM`, and the first-push-from-empty behavior (covered in [§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop)).
 
 **Mechanism (source).** The three constants are `TOGGLE_ALT_SCREEN_1` (47), `TOGGLE_ALT_SCREEN_2`
 (1047), and `ALTERNATE_SCREEN` (1049) ([kitty/modes.h:L75-L77]). All three are dispatched to
@@ -1204,9 +1204,9 @@ that terminals *"must maintain separate stacks for the main and alternate screen
 request is received that empties the stack, all flags are reset"*, and that *"if a push request is
 received and the stack is full, the oldest entry from the stack must be evicted"*
 ([docs/keyboard-protocol.rst:L300-L303]). Every one of these was observed above: separate stacks
-([§2](#2-obj-1--round-trip-stack-survival), [§6](#6-obj-5--independence-proof-and-leakage-probe)),
-pop-to-empty reset ([§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop)), and
-oldest-entry eviction ([§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation)).
+([§2](#2-obj-1-round-trip-stack-survival), [§6](#6-obj-5-independence-proof-and-leakage-probe)),
+pop-to-empty reset ([§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop)), and
+oldest-entry eviction ([§3](#3-obj-2-stack-exhaustion-on-both-buffers-and-cross-buffer-isolation)).
 
 **Stack depth is kitty's implementation choice, not a spec minimum.** The specification does not
 mandate a minimum depth; it only says terminals *"should limit the size of the stack as appropriate,
@@ -1214,7 +1214,7 @@ to prevent Denial-of-Service attacks"* ([docs/keyboard-protocol.rst:L299-L300]).
 reported throughout this document is the size of kitty's own fixed arrays as observed in the source —
 `main_key_encoding_flags[8]` / `alt_key_encoding_flags[8]` ([kitty/screen.h:L128]) — and confirmed at
 runtime by the exhaustion test retaining exactly 8 values
-([§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation)). It is not attributed to
+([§3](#3-obj-2-stack-exhaustion-on-both-buffers-and-cross-buffer-isolation)). It is not attributed to
 any external "minimum depth" requirement.
 
 **Doc-vs-code naming skew (stated so the reader is not misled).** The user's "disambiguate mode" is
@@ -1235,23 +1235,23 @@ observed evidence:
 
 | Question part / named item | Section | Observed result |
 |----------------------------|---------|-----------------|
-| Round trip: which mode active at end | [§2](#2-obj-1--round-trip-stack-survival) | main active = `1` (disambiguate) |
-| Round trip: does main stack survive intact | [§2](#2-obj-1--round-trip-stack-survival) | yes, intact |
-| Round trip: escape produced in each intermediate state | [§2](#2-obj-1--round-trip-stack-survival) | query bytes `?0u`,`?1u`,`?0u`,`?8u`,`?1u` |
-| Exhaustion: silent drop / error / otherwise | [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | silent eviction of oldest, no error |
-| Exhaustion: does one buffer affect the other | [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | no; isolated |
-| Exhaustion exercised on the alternate buffer too | [§3](#3-obj-2--stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | identical push/pop sequences |
-| Pop-to-empty resets all flags | [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop) | resets to `0` |
-| First-push-from-empty behavior | [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop) | seeds base-0 entry |
-| Over-pop behavior | [§4](#4-obj-3--pop-to-empty-reset-first-push-from-empty-and-over-pop) | stays `0`, no underflow |
+| Round trip: which mode active at end | [§2](#2-obj-1-round-trip-stack-survival) | main active = `1` (disambiguate) |
+| Round trip: does main stack survive intact | [§2](#2-obj-1-round-trip-stack-survival) | yes, intact |
+| Round trip: escape produced in each intermediate state | [§2](#2-obj-1-round-trip-stack-survival) | query bytes `?0u`,`?1u`,`?0u`,`?8u`,`?1u` |
+| Exhaustion: silent drop / error / otherwise | [§3](#3-obj-2-stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | silent eviction of oldest, no error |
+| Exhaustion: does one buffer affect the other | [§3](#3-obj-2-stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | no; isolated |
+| Exhaustion exercised on the alternate buffer too | [§3](#3-obj-2-stack-exhaustion-on-both-buffers-and-cross-buffer-isolation) | identical push/pop sequences |
+| Pop-to-empty resets all flags | [§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop) | resets to `0` |
+| First-push-from-empty behavior | [§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop) | seeds base-0 entry |
+| Over-pop behavior | [§4](#4-obj-3-pop-to-empty-reset-first-push-from-empty-and-over-pop) | stays `0`, no underflow |
 | Ctrl+Shift+a (a) main / no flags | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `0`) |
 | Ctrl+Shift+a (b) main / disambiguate | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `1`) |
 | Ctrl+Shift+a (c) alt / report-all-keys | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `8`) |
 | Ctrl+Shift+a (d) back on main | [§5.1](#51-the-four-requested-states) | `b'\x1b[97;6u'` (stack `1`) |
 | Contrast keys (plain `a`, Ctrl+a) | [§5.2](#52-contrast-keys-canonical-stack-flags) | differ per state |
 | Flag sensitivity (bit 4) | [§5.3](#53-flag-sensitivity-explicit-non-canonical-encoder-characterization) | `b'\x1b[97:65;6u'` for flags 4/5 |
-| Independence proof | [§6](#6-obj-5--independence-proof-and-leakage-probe) | query + key bytes differ by buffer |
-| Leakage during rapid switching | [§6](#6-obj-5--independence-proof-and-leakage-probe) | none across 10 cycles |
+| Independence proof | [§6](#6-obj-5-independence-proof-and-leakage-probe) | query + key bytes differ by buffer |
+| Leakage during rapid switching | [§6](#6-obj-5-independence-proof-and-leakage-probe) | none across 10 cycles |
 | Mode constant `47` | [§7.1](#71-isolation-holds-across-47--1047--1049) | isolation holds |
 | Mode constant `1047` | [§7.1](#71-isolation-holds-across-47--1047--1049) | isolation holds |
 | Mode constant `1049` | [§7.1](#71-isolation-holds-across-47--1047--1049) | isolation holds |
@@ -1261,7 +1261,7 @@ observed evidence:
 
 ## 11. Reproducibility: two-run stability
 
-The seven observation scripts from [§2](#2-obj-1--round-trip-stack-survival)–[§7](#7-obj-6--mode-dependent-edge-cases-4710471049-decckm-and-scorc)
+The seven observation scripts from [§2](#2-obj-1-round-trip-stack-survival)–[§7](#7-obj-6-mode-dependent-edge-cases-4710471049-decckm-and-scorc)
 are deterministic. To confirm the reported values are stable, the full set was run **twice**
 unchanged, each run's concatenated output hashed, and the two runs compared byte-for-byte.
 
@@ -1320,21 +1320,24 @@ set -o pipefail
 rm -rf /tmp/kbd_evidence                 # remove the out-of-tree capture directory
 ls -d /tmp/kbdobs.* 2>/dev/null || echo "no private mktemp dirs remain (trap-removed)"
 find . -path ./.git -prune -o \( -name 'blitzy_adhoc_test_*' -o -name 'kbdobs.*' \) -print
-echo "--- git working-tree state ---"
-git status --porcelain
-git diff --name-status
+echo "--- working tree state (deliverable committed; tree clean) ---"
+git status --porcelain                                   # empty => nothing uncommitted
+echo "--- net change vs the pinned source commit (invariant) ---"
+git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
 ```
 
-Output **[observed]**:
+Output **[observed]** (in the committed, delivered state):
 
 ```text
 no private mktemp dirs remain (trap-removed)
---- git working-tree state ---
- M blitzy/documentation/kitty_815df1e210e0.md
-M	blitzy/documentation/kitty_815df1e210e0.md
+--- working tree state (deliverable committed; tree clean) ---
+--- net change vs the pinned source commit (invariant) ---
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
-The `find` prints nothing (no temporary script exists anywhere in the repository), and
-`git status --porcelain` lists exactly one changed file — the deliverable. The net repository change
-is this single Markdown document; everything else (temporary scripts, capture files, build outputs)
-is either out-of-tree or git-ignored.
+The `find` prints nothing (no temporary observation script exists anywhere in the repository)
+and `git status --porcelain` prints nothing — the deliverable is committed and the working
+tree is clean. The only net change relative to the pinned source commit `815df1e210e0…` is the
+single added file reported by `git diff --name-status` — this document — matching the
+invariant recorded in [§1.1](#11-provenance-and-toolchain). Everything else (temporary scripts,
+capture files, build outputs) is either out-of-tree or git-ignored.
