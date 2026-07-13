@@ -1366,7 +1366,7 @@ export PYTHONHOME=/root/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu
 export PYTHONPATH=/root/kitty-venv/lib/python3.11/site-packages
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
-OBS_DIR=/tmp/kitty-nosgid/kitty_obs.jWw1gwl6
+OBS_DIR="${OBS_DIR:-$(mktemp -d "$TMPDIR/kitty_obs.XXXXXXXX")}"; chmod 700 "$OBS_DIR"
 KITTY=./kitty/launcher/kitty
 PYBIN=/root/kitty-venv/bin/python3
 
@@ -1592,6 +1592,7 @@ finally:
 # PID is reaped exactly (no pkill) by this script and by common.sh's EXIT trap.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
+cd "$(git rev-parse --show-toplevel)"
 label="$1"; shift
 "$KITTY" -o close_on_child_death=yes "$@" sh -c 'sleep 60' >/dev/null 2>&1 &
 kpid=$!
@@ -1735,6 +1736,7 @@ print(f"mean_ms={ms(statistics.mean(vals)):.4f}")
 # first prompt marker; the launched PID is reaped exactly.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
+cd "$(git rev-parse --show-toplevel)"
 SOCK_PATH="$OBS_DIR/ksi.sock"
 SOCK="unix:$SOCK_PATH"
 DUMP="$OBS_DIR/osc133_bytes.bin"
@@ -1925,7 +1927,7 @@ with open(outpath, "wb") as f:
 #!/usr/bin/env bash
 source "$(dirname "$0")/common.sh"
 xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
-cd /tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657
+cd "$(git rev-parse --show-toplevel)"
 
 OUT="$OBS_DIR/out"
 reply="$OUT/decrqss_reply.txt"
@@ -1956,7 +1958,7 @@ wc -l < "$dump"
 # dispatch("cmd{",handle_remote_cmd,1) at L603) -- a path DISTINCT from the talk socket.
 source "$(dirname "$0")/common.sh"
 xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
-cd /tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657
+cd "$(git rev-parse --show-toplevel)"
 
 OUT="$OBS_DIR/out"
 dump="$OUT/inline_dcs_dump.txt"; err="$OUT/inline_dcs.err"
@@ -2041,7 +2043,7 @@ echo "$c"
 # with vs without concurrent chaos) is measured by pty_independence.sh separately.
 source "$(dirname "$0")/common.sh"
 xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
-cd /tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657
+cd "$(git rev-parse --show-toplevel)"
 
 N="${DISRUPT_N:-40}"
 OUT="$OBS_DIR/out"; sock="$OBS_DIR/ktalk.sock"; dlog="$OUT/remote_delivery.log"
@@ -2114,7 +2116,7 @@ kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
 # the PTY input pipeline is independent of talk-socket turmoil.
 source "$(dirname "$0")/common.sh"
 xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
-cd /tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657
+cd "$(git rev-parse --show-toplevel)"
 OUT="$OBS_DIR/out"; N="${PP_N:-200}"
 
 run_phase() {  # $1=label  $2=chaos(0/1)
@@ -2313,7 +2315,7 @@ for spec in sys.argv[1:]:
 # encoded bytes it sent) and the child's independently-logged received bytes.
 source "$(dirname "$0")/common.sh"
 xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
-cd /tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657
+cd "$(git rev-parse --show-toplevel)"
 OUT="$OBS_DIR/out"
 tag="${TAG:-legacy}"
 klog="$OUT/key_${tag}.log"; kerr="$OUT/key_${tag}.err"; kout="$OUT/key_${tag}.out"; kctl="$OUT/key_${tag}.ctl"
