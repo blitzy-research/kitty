@@ -11,7 +11,7 @@
 > **This document is explanatory only. It does not add a new RC command** — but §8 distills the exact pattern so you can add one later.
 
 - **Branch:** `blitzy-5272820a-f82d-4851-9076-f4ffb122d22c`.
-- **Code checkout:** the RC subsystem was read and run at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` ("Wire up applying of font config"), which is `HEAD~1` on this branch. This document is the only file added on top of it, committed as `7da6b37726335799f63f5ea0bca9185625382c21` (branch `HEAD`). Because that commit adds nothing but this `.md`, the C/Go/Python **source is byte‑identical to `815df1e2`** — but `setup.py` stamps the binary with the current git `HEAD`, so the build embeds `VCSRevision=7da6b37726335799f63f5ea0bca9185625382c21` (OBSERVED in the `--verbose` build line, §2).
+- **Code checkout:** the RC subsystem was read and run at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` ("Wire up applying of font config"), the branch's **base** commit. This document is added on top of that base as **documentation-only commit(s)**; the first was `7da6b37726335799f63f5ea0bca9185625382c21`, and the branch has since advanced with follow-up documentation edits (each touching **only this `.md`**). Because none of those commits change any C, Go, or Python file, the C/Go/Python **source is byte‑identical to `815df1e2`** — but `setup.py` stamps the binary with the current git `HEAD`, so the **authoring-time** build embedded `VCSRevision=7da6b37726335799f63f5ea0bca9185625382c21` (OBSERVED in the `--verbose` build line, §2).
 - **Build/version:** `kitty 0.35.2` (see §2).
 - **Transports exercised:** (1) configured UNIX socket, and (2) shell‑integration / RC‑over‑TTY. Both are demonstrated with before/after state.
 
@@ -25,7 +25,7 @@ It is **a socket or terminal (DCS) escape sequences — never an anonymous pipe.
 
 **Q2 — Why does poking around `/tmp` for the socket fail / not match the docs?**
 Three compounding reasons, all **OBSERVED** in §4:
-1. **Templated path (the big one)** — a `listen_on` value taken from the **config file** gets an automatic `-<PID>` suffix appended (`kitty/main.py:329`), so a configured `unix:.../cfgkitty` becomes `.../cfgkitty-<PID>` on disk (observed: `.../cfgkitty` → `.../cfgkitty-40761`, §4.1). A value passed on the **command line** (`--listen-on`) is used **verbatim** — with one exception: an explicit `{kitty_pid}` token *anywhere* in the value is always substituted with the real PID (`kitty/main.py:330`, unconditional), on the command line too (observed: `.../tplkitty-{kitty_pid}` → `.../tplkitty-40680`, §4.1). Only the *automatic* suffix is config‑file‑only; the `{kitty_pid}` expansion applies to both. This asymmetry is the single most likely cause of your failed search.
+1. **Templated path (the big one)** — a `listen_on` value taken from the **config file** gets an automatic `-<PID>` suffix appended (`kitty/main.py:329-330`), so a configured `unix:.../cfgkitty` becomes `.../cfgkitty-<PID>` on disk (observed: `.../cfgkitty` → `.../cfgkitty-40761`, §4.1). A value passed on the **command line** (`--listen-on`) is used **verbatim** — with one exception: an explicit `{kitty_pid}` token *anywhere* in the value is always substituted with the real PID (`kitty/main.py:331`, unconditional), on the command line too (observed: `.../tplkitty-{kitty_pid}` → `.../tplkitty-40680`, §4.1). Only the *automatic* suffix is config‑file‑only; the `{kitty_pid}` expansion applies to both. This asymmetry is the single most likely cause of your failed search.
 2. **Abstract sockets** — `unix:@name` creates a Linux abstract‑namespace socket (`kitty/utils.py:513-514`) that has **no filesystem entry at all**; `ls /tmp` can never find it.
 3. **Default‑off gating** — no socket is created unless **both** `allow_remote_control` (default `no`, `kitty/options/definition.py:2969`) **and** `listen_on` (default `none`, `:3000`) are set (`kitty/boss.py:364-366`).
 
@@ -83,7 +83,7 @@ Updating Go generated files...
 /usr/local/go/bin/go build -v -ldflags '-X kitty.VCSRevision=7da6b37726335799f63f5ea0bca9185625382c21 -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-5272820a-f82d-4851-9076-f4ffb122d22c_31872f/tools/cmd
 ```
 
-(The `VCSRevision` value `7da6b377…` is the branch `HEAD` — the commit that adds this document — because `setup.py` derives it from `git rev-parse HEAD`; the compiled C/Go/Python source is nonetheless identical to `815df1e2`, as explained in the header.)
+(The `VCSRevision` value captured above (`7da6b377…`) is the **authoring-time** documentation commit — the *first* commit that added this document — because `setup.py` derives the stamp from `git rev-parse HEAD`. The branch has since advanced with follow-up documentation-only commits, so a fresh `python3 setup.py` build today stamps the *current* `HEAD` instead; the stamp reflects only the checked-out commit. The compiled C/Go/Python source is identical to `815df1e2` regardless — so the binary's behavior is unchanged — as explained in the header.)
 
 The build produces the launcher at **`kitty/launcher/kitty`** and the client at **`kitty/launcher/kitten`** (build logic `setup.py:1230` `build_launcher`; `launcher_dir = 'kitty/launcher'` `setup.py:2099`). **OBSERVED:**
 
@@ -208,9 +208,9 @@ if '{kitty_pid}' not in listen_on and from_config_file and listen_on.startswith(
 listen_on = listen_on.replace('{kitty_pid}', str(os.getpid()))
 ```
 
-Two distinct behaviors live on these two lines and are easy to conflate:
-- **`main.py:329`** — the *automatic* `-{kitty_pid}` suffix. It is appended **only** when the value did not already contain `{kitty_pid}`, **and** it came from the config file (`from_config_file`), **and** it is a `unix:` spec.
-- **`main.py:330`** — the `{kitty_pid}` **token substitution**. It runs **unconditionally** on every value, so an explicit `{kitty_pid}` token is *always* replaced with the real PID — on the command line as well as in the config file.
+Two distinct behaviors live on these adjacent lines and are easy to conflate:
+- **`main.py:329-330`** — the *automatic* `-{kitty_pid}` suffix. It is appended **only** when the value did not already contain `{kitty_pid}`, **and** it came from the config file (`from_config_file`), **and** it is a `unix:` spec.
+- **`main.py:331`** — the `{kitty_pid}` **token substitution**. It runs **unconditionally** on every value, so an explicit `{kitty_pid}` token is *always* replaced with the real PID — on the command line as well as in the config file.
 
 The `from_config_file` flag is decided in `setup_environment` (`kitty/main.py:403-409`): if `--listen-on` was passed on the command line, `from_config_file` stays `False`; if the value came from the config file's `listen_on`, it becomes `True`. Relative UNIX paths are additionally resolved under `tempfile.gettempdir()` (`kitty/main.py:339`). Net effect: a **command‑line** value is used **verbatim** *unless it contains `{kitty_pid}`*; a **config‑file** value gets the automatic `-<PID>` suffix on top of any token substitution.
 
@@ -242,7 +242,7 @@ exit=0
 
 So the CLI value `.../mykitty` is on disk **verbatim** — no PID suffix.
 
-**(ii) CLI value *with an explicit* `{kitty_pid}` token → substituted (OBSERVED — the `main.py:330` nuance).** To prove `{kitty_pid}` is expanded even on the command line, the harness requested `--listen-on "unix:$WORK/tplkitty-{kitty_pid}"` (literal token). The owning kitty was captured as PID **40680**:
+**(ii) CLI value *with an explicit* `{kitty_pid}` token → substituted (OBSERVED — the `main.py:331` nuance).** To prove `{kitty_pid}` is expanded even on the command line, the harness requested `--listen-on "unix:$WORK/tplkitty-{kitty_pid}"` (literal token). The owning kitty was captured as PID **40680**:
 
 ```console
 $ "$KITTY" -o allow_remote_control=yes --listen-on "unix:$WORK/tplkitty-{kitty_pid}" bash -c 'sleep 600' & KPID=$!
@@ -253,7 +253,7 @@ $ ss -xlp | grep tplkitty
 u_str LISTEN 0      128    /tmp/kitty_obs_work/run.e6tI6X/tplkitty-40680 728482090            * 0    users:(("kitty",pid=40680,fd=6))
 ```
 
-The literal `{kitty_pid}` became `40680`, which equals the owning kitty PID — the unconditional replacement at `main.py:330`, on the command line. (Only the *automatic* `-<PID>` suffix in (iii) is config‑file‑only.)
+The literal `{kitty_pid}` became `40680`, which equals the owning kitty PID — the unconditional replacement at `main.py:331`, on the command line. (Only the *automatic* `-<PID>` suffix in (iii) is config‑file‑only.)
 
 **(iii) Config‑file value → automatic `-<PID>` suffix (OBSERVED).** Using a throwaway config file (inside `$WORK`, outside the repo) with `allow_remote_control yes` and `listen_on unix:$WORK/cfgkitty`, launched with `--config` (no `--listen-on` on the command line). The owning kitty was captured as PID **40761**:
 
@@ -271,7 +271,7 @@ $ ss -xlp | grep cfgkitty
 u_str LISTEN 0      128    /tmp/kitty_obs_work/run.e6tI6X/cfgkitty-40761 728347542            * 0    users:(("kitty",pid=40761,fd=6))
 ```
 
-The configured name `unix:$WORK/cfgkitty` became **`.../cfgkitty-40761`** on disk, and the suffix (`40761`) equals the owning kitty PID — exactly the `main.py:329` auto‑suffix.
+The configured name `unix:$WORK/cfgkitty` became **`.../cfgkitty-40761`** on disk, and the suffix (`40761`) equals the owning kitty PID — exactly the `main.py:329-330` auto‑suffix.
 
 > **This is almost certainly what happened to you:** you put `listen_on unix:/tmp/something` in `kitty.conf`, kitty created `/tmp/something-<PID>`, and a search for the literal name found nothing. (The kitty docs note this hyphen‑PID append at `kitty/options/definition.py:3000-3016`.)
 
@@ -581,7 +581,7 @@ Two observed nuances worth recording:
 The response DCS frame from §5.2 travels back to the `kitten` client, which decodes and either **prints the data to stdout** or **reports an error on stderr with a non‑zero exit**. This is the leg the earlier trace omitted. The receive chain is **SOURCE‑VERIFIED**:
 
 - **Read the frame off the transport.** For a socket, `read_response_from_conn` (`tools/cmd/at/socket_io.go:53-58`) feeds bytes to an `EscapeCodeParser` whose `HandleDCS` strips the `@kitty-cmd` prefix and yields the JSON envelope. For the TTY, `OnRCResponse` (`tools/cmd/at/tty_io.go:154`) sets the serialized response from the DCS payload read off the terminal.
-- **Decode.** `get_response` (`tools/cmd/at/main.go:223`) hands the serialized bytes to `json.Unmarshal` (`:248`), producing a `Response` struct with fields `Ok`, `Data`, `Error`, and `Traceback`.
+- **Decode.** `get_response` (`tools/cmd/at/main.go:223`) hands the serialized bytes to `json.Unmarshal` (`:247`), producing a `Response` struct with fields `Ok`, `Data`, `Error`, and `Traceback`.
 - **Print or fail.** `send_rc_command` inspects `response.Ok` (`tools/cmd/at/main.go:284-297`):
   - if **`!Ok`**, it prints `response.Traceback` to **stderr** when non‑empty (`:286`) and returns `response.Error` (`:288`), giving a non‑zero exit;
   - otherwise it prints the payload with `fmt.Println(strings.TrimRight(response.Data.as_str, "\n \t"))` (`:297`).
@@ -786,7 +786,7 @@ if not window_has_remote_control and not is_fd_peer:
         return {'ok': False, 'error': 'Remote control is allowed over a socket only'}
 ```
 
-It then computes `allowed_unconditionally` (`boss.py:620-626`): true when `allow_remote_control == 'y'` (`:621`), or the caller is a socket peer and the mode is `socket`/`socket-only` (`:622`), or a per‑window/per‑fd password check passes (`:623-624`). Otherwise per‑command permission falls to `is_cmd_allowed` (`boss.py:631`) and, for password mode, `PasswordAuthorizer` (`kitty/remote_control.py:134,177`). Because our runs used `allow_remote_control=yes`, the `:621` `== 'y'` branch is what admitted every `ls` above — no password path was taken.
+It then computes `allowed_unconditionally` (`boss.py:623-628`): true when `allow_remote_control == 'y'` (`:624`), or the caller is a socket peer and the mode is `socket`/`socket-only` (`:625`), or a per‑window/per‑fd password check passes (`:626-627`). Otherwise per‑command permission falls to `is_cmd_allowed` (`boss.py:633`) and, for password mode, `PasswordAuthorizer` (`kitty/remote_control.py:134,177`). Because our runs used `allow_remote_control=yes`, the `:624` `== 'y'` branch is what admitted every `ls` above — no password path was taken.
 
 ### 7.3 Encryption scheme (INFERRED‑from‑spec — NOT exercised)
 
@@ -819,12 +819,12 @@ Every major claim is tagged **OBSERVED** (reproduced at runtime, with the produc
 
 | # | Claim | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Build is `python3 setup.py`; launcher at `kitty/launcher/kitty`; banner `kitty 0.35.2`; binary stamps `VCSRevision=7da6b377` | OBSERVED | §2 `--verbose` build tail + `--version` |
+| 1 | Build is `python3 setup.py`; launcher at `kitty/launcher/kitty`; banner `kitty 0.35.2`; binary stamps `VCSRevision` of the checked-out git HEAD (authoring-time capture `7da6b377`; a fresh build stamps the current documentation commit) | OBSERVED | §2 `--verbose` build tail + `--version` |
 | 2 | Transport = socket **or** DCS‑over‑PTY, never a pipe | OBSERVED (both) | §4/§6 socket dial + §6.3 socketless TTY; `main.go:280` |
 | 3 | Target string present → `do_socket_io` (`net.Dial`) | OBSERVED | §4.1/§6.2 + `socket_io.go:177` |
 | 4 | Empty target string → `do_tty_io` (DCS to PTY), even with no socket for this instance | OBSERVED | §6.3 (no listener for pid 41484, still works) + `tty_io.go:79-82` |
-| 5 | CLI `--listen-on` is **verbatim** unless it contains `{kitty_pid}` | OBSERVED | §4.1 `.../mykitty` (pid 40579) & `.../tplkitty-40680`; `main.py:329-330` |
-| 6 | Config‑file `listen_on` gets an automatic `-<PID>` suffix | OBSERVED | §4.1 `.../cfgkitty-40761` (pid 40761) + `main.py:329` |
+| 5 | CLI `--listen-on` is **verbatim** unless it contains `{kitty_pid}` | OBSERVED | §4.1 `.../mykitty` (pid 40579) & `.../tplkitty-40680`; `main.py:329-331` |
+| 6 | Config‑file `listen_on` gets an automatic `-<PID>` suffix | OBSERVED | §4.1 `.../cfgkitty-40761` (pid 40761) + `main.py:329-330` |
 | 7 | `unix:@name` = abstract socket, no FS entry | OBSERVED | §4.2 `@obskitty` via `ss`/`lsof` + `utils.py:513-514` |
 | 8 | Default‑off: no socket unless `allow_remote_control` **and** `listen_on` set | OBSERVED | §4.3 grep_exit=1 + §6.3 empty `LISTEN_ON`; `boss.py:364-366`, `definition.py:2969,3000` |
 | 9 | Client request is a 58‑byte cleartext DCS `<ESC>P@kitty-cmd{…}<ESC>\`, version `[0,26,0]` | OBSERVED | §5.2 real‑client `od`/hex; `socket_io.go:82-83`, `main.go:33` |
@@ -865,4 +865,4 @@ Every major claim is tagged **OBSERVED** (reproduced at runtime, with the produc
 
 ---
 
-*End of document. All runtime evidence above was captured on `kitty 0.35.2` (source tree at VCS `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; the built binary stamps `VCSRevision=7da6b377`, the documentation commit — see §2) inside the prepared container, under `Xvfb :99` with the Mesa `llvmpipe` software GL renderer. Volatile values (PIDs such as `40579`/`42106`/`42182` in §4‑§5 and `41386`/`41484`/`41580` in §6, socket inode numbers, timestamps, and the ephemeral public key) are reported exactly as observed and will differ on other runs.*
+*End of document. All runtime evidence above was captured on `kitty 0.35.2` (source tree at base VCS `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`; the built binary stamps `VCSRevision` with the git HEAD checked out at build time (authoring-time capture `7da6b377`, the initial documentation commit; a fresh build stamps the current documentation commit) — see §2) inside the prepared container, under `Xvfb :99` with the Mesa `llvmpipe` software GL renderer. Volatile values (PIDs such as `40579`/`42106`/`42182` in §4‑§5 and `41386`/`41484`/`41580` in §6, socket inode numbers, timestamps, and the ephemeral public key) are reported exactly as observed and will differ on other runs.*
