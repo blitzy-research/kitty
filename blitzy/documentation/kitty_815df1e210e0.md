@@ -486,7 +486,8 @@ $ ls -la /etc/xdg/kitty/
 ls: cannot access '/etc/xdg/kitty/': No such file or directory      # SYSTEM_CONF absent
 $ ls -la "$SCRATCH/cfgempty"
 total 8
-drwx------ 2 root root 4096 ...        # empty -> defconf ($SCRATCH/cfgempty/kitty.conf) absent
+drwx------ 2 root root 4096 Jul 13 20:56 .
+drwxr-xr-x 7 root root 4096 Jul 13 20:56 ..    # only . and .. -> no kitty.conf, defconf ($SCRATCH/cfgempty/kitty.conf) absent
 ```
 
 Running the **real** `create_opts` path (via `create_default_opts`, `cli.py:1089`) with a
@@ -501,11 +502,11 @@ SYSTEM_CONF      = /etc/xdg/kitty/kitty.conf
 opts.config_paths      = ()
 opts.all_config_paths  = ('/etc/xdg/kitty/kitty.conf', '/tmp/kqna.wEhaOC/cfgempty/kitty.conf')
 opts.config_overrides  = ()
-font_family      = FontSpec(family='', style='', ... system='monospace' ...)
+font_family      = FontSpec(family='', style='', postscript_name='', full_name='', system='monospace', axes=(), variable_name='', created_from_string='')
 font_size        = 11.0
 cursor_shape     = 1          # 1 = block
-foreground       = Color(red=221, green=221, blue=221)     # :2:221:221:221
-background       = Color(red=0, green=0, blue=0)            # :2:0:0:0
+foreground       = Color(221, 221, 221)   # :2:221:221:221
+background       = Color(0, 0, 0)         # :2:0:0:0
 scrollback_lines = 2000
 ```
 
@@ -628,7 +629,7 @@ APPLIED cursor_shape     = 2 (default 1=block)
 APPLIED scrollback_lines = 5000 (default 2000)
 APPLIED background_opacity = 1.0 (default 1.0; bad line should be ignored)
 --- accumulated BadLine entries (known-key invalid value) ---
-  BadLine number=6 file=/tmp/kqna.wEhaOC/cfgcustom/kitty.conf
+  BadLine number=5 file=/tmp/kqna.wEhaOC/cfgcustom/kitty.conf
     line='background_opacity notanumber'
     exception=ValueError: could not convert string to float: 'notanumber'
 ```
@@ -670,7 +671,7 @@ The crafted file contains two kinds of bad line, handled by two different code p
 The error overlay was screenshotted from the live window (640×400). It renders, on black:
 a red bold title `Errors parsing configuration`; the grey body
 `In file /tmp/kqna.wEhaOC/cfgcustom/kitty.conf:` and
-`6:could not convert string to float: 'notanumber' in line: background_opacity notanumber`
+`5:could not convert string to float: 'notanumber' in line: background_opacity notanumber`
 — which is exactly `format_bad_line`'s template `'{number}:{exception} in line: {line}'`
 (`kitty/boss.py:2761`); and a green bold prompt `Press Enter or Esc to exit`
 (`show_error`, `boss.py:2050`).
