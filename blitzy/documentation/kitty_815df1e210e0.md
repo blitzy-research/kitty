@@ -506,10 +506,10 @@ Reading this carefully: a lone `=` in Fira Code is glyph **1578**; the pair `==`
 
 ### 6.A.2 Bidirectional (bidi) text — **HONEST NEGATIVE: kitty has no bidi reordering engine**
 
-kitty does **not** implement the Unicode Bidirectional Algorithm. There is no reordering pass; the only related control is the boolean option `force_ltr`, declared with default `'no'` [`kitty/options/definition.py:64`], whose own long-text states this in the first sentence (verbatim excerpt):
+kitty does **not** implement the Unicode Bidirectional Algorithm. There is no reordering pass; the only related control is the boolean option `force_ltr`, declared with default `'no'` [`kitty/options/definition.py:64`], whose own long-text opens with this statement (reproduced verbatim through its first sentence; later sentences are abridged, with each `…` marking an elision):
 
 ```text
-kitty/options/definition.py:66-82  (force_ltr long_text, verbatim opening)
+kitty/options/definition.py:66-82  (force_ltr long_text — opening sentence verbatim; … marks abridged elisions)
 "kitty does not support BIDI (bidirectional text), however, for RTL scripts,
  words are automatically displayed in RTL. That is to say, in an RTL script, the
  words "HELLO WORLD" display in kitty as "WORLD HELLO" … assuming the Hebrew word
@@ -523,7 +523,7 @@ So the authoritative negative is spelled out by the source itself: <q>kitty does
 
 **OBSERVED (canonical).** In both the default and forced-fallback runs, the Arabic word **مرحبا** is shaped and rendered with correct cursive presentation forms (the captured screenshots show the five letters joined right-to-left as connected glyphs, not isolated boxes), confirming HarfBuzz shaping runs even though there is no bidi reorder step.
 
-**INFERRED (source, no runtime log).** For RTL runs HarfBuzz emits glyphs whose cluster values *decrease* across the run; kitty's code comments document this ("in RTL text the cluster numbers are decreasing") at [`kitty/fonts.c:997`] and [`kitty/fonts.c:1079`]. No debug line prints cluster numbers, so this is labelled inferred from the source, corroborated by the correctly-joined visual output.
+**INFERRED (source, no runtime log).** For RTL runs HarfBuzz emits glyphs whose cluster values *decrease* across the run; kitty's code comments document this ("RTL languages like Arabic have decreasing cluster numbers") at [`kitty/fonts.c:997`] and [`kitty/fonts.c:1079`]. No debug line prints cluster numbers, so this is labelled inferred from the source, corroborated by the correctly-joined visual output.
 
 ### 6.A.3 Combining diacritics — one grapheme cluster maps to one cell
 
@@ -593,7 +593,7 @@ The launcher reaches the font diagnostics through this exact chain (every link v
 
 ```text
 kitty/launcher/kitty  (native launcher)
-  └─ Py_RunMain() with run-data key "kitty_main"        [kitty/launcher/main.c:168]
+  └─ Py_RunMain() with run-data key "kitty_main"        [kitty/launcher/main.c:168 (kitty_main key) → :216 (Py_RunMain call)]
       └─ ./__main__.py :  from kitty.entry_points import main; main()   [/__main__.py:5-7]
           └─ kitty.entry_points.main()                  [kitty/entry_points.py:183]
               └─ (no '+' subcommand) from kitty.main import main as kitty_main; kitty_main()  [:194-195]
@@ -844,7 +844,7 @@ $ glxinfo -l | grep -iE 'GL_MAX_TEXTURE_SIZE|GL_MAX_ARRAY_TEXTURE_LAYERS'
 | 2 | **Columns per layer** (`xnum`) | **1820** | `MIN(MAX(1, max_texture_size / cell_width), UINT16_MAX)` = `16384/9` = 1820 [`kitty/fonts.c:277`] |
 | 3 | **Max rows per layer** (`max_y`) | **910** | `MIN(MAX(1, max_texture_size / cell_height), UINT16_MAX)` = `16384/18` = 910 [`kitty/fonts.c:278`] |
 | 4 | **Slots per fully-grown layer** | **1,656,200** | `xnum × max_y` = `1820 × 910` |
-| 5 | **Layer cap** & **total capacity** | **2048** layers → **3,391,897,600** slots | `max_array_len = MIN(0xfffu, layers)` = `MIN(4095, 2048)` = 2048 [`kitty/fonts.c:236`]; total = per-layer × 2048 |
+| 5 | **Layer cap** & **total capacity** | **2048** layers → **3,391,897,600** slots | `max_array_len = MIN(0xfffu, layers)` = `MIN(4095, 2048)` = 2048 [`kitty/fonts.c:236-239`]; total = per-layer × 2048 |
 
 Two more values worth separating from the above:
 
@@ -877,7 +877,7 @@ alloc_sprite_map(unsigned int cell_width, unsigned int cell_height) {
         glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &(max_array_texture_layers));
 ```
 
-`sprite_tracker_set_limits` then clamps the usable layer count to `MIN(0xfffu, max_array_len_)` [`kitty/fonts.c:236`]. The texture itself is allocated **immutably** as `GL_SRGB8_ALPHA8` on a `GL_TEXTURE_2D_ARRAY` with `GL_NEAREST` filtering and `GL_CLAMP_TO_EDGE` wrapping, via `glTexStorage3D` [`kitty/shaders.c:110-123`]:
+`sprite_tracker_set_limits` then clamps the usable layer count to `MIN(0xfffu, max_array_len_)` [`kitty/fonts.c:236-239`]. The texture itself is allocated **immutably** as `GL_SRGB8_ALPHA8` on a `GL_TEXTURE_2D_ARRAY` with `GL_NEAREST` filtering and `GL_CLAMP_TO_EDGE` wrapping, via `glTexStorage3D` [`kitty/shaders.c:110-123`]:
 
 ```c
 // kitty/shaders.c:122-123
@@ -1059,7 +1059,7 @@ Per "exercise every condition, including secondary ones," the following variants
 
 All raw launcher captures referenced above were written to `stability/*.norm` and per-run `logs/*.log` inside the harness's private `$WORK` directory and mirrored to the evidence directory during the investigation; the **relevant unedited excerpts are embedded inline** at the point of each claim (§4.1, §6, §7, §8, §9, §10). Each embedded block shows the command that produced it and preserves the `[<seconds>]` monotonic prefixes (or the `[T]` normalization explicitly marked as such for the stability diffs). No claim in this document relies on a value that is not shown next to it.
 
-Because the harness removes `$WORK` on exit (§4, narrow teardown) and the investigation restores the tree to contain only this document (§14.2), the logs are not committed — reproducing them is a matter of re-running the embedded harness verbatim. The one full-length artifact reproduced verbatim in-document is the **canonical build transcript in Appendix A** (all 344 lines).
+Because the harness removes `$WORK` on exit (§4, narrow teardown) and the investigation restores the tree to contain only this document (§14.3), the logs are not committed — reproducing them is a matter of re-running the embedded harness verbatim. The one full-length artifact reproduced verbatim in-document is the **canonical build transcript in Appendix A** (all 344 lines).
 
 ---
 
@@ -1083,7 +1083,7 @@ Every mechanism, function, flag, file, and "e.g./such as" item named in the four
 | **C — strikethrough** (position/thickness) | §8.C.3 | SRC [freetype.c:396-403; shaders.py:162] |
 | **C — overline** | §8.C.4, §11.2 | NEG (0 in `kitty/`; XKB keysym only) |
 | **D — initial atlas layout / sizing** (`NEW_SPRITE_MAP`, `glTexStorage3D`) | §9.D.1-3 | SRC [shaders.c:24-31,51-54,108-123] + OBS GL limits |
-| **D — capacity** (per-layer / layers / total) | §9.D.2 | SRC [fonts.c:236,276-281] + OBS GL limits arithmetic |
+| **D — capacity** (per-layer / layers / total) | §9.D.2 | SRC [fonts.c:236-239,276-281] + OBS GL limits arithmetic |
 | **D — prerendered sprites** (blank/underline/strike/missing/cursor = 11) | §9.D.5 | SRC [fonts.c:1450-1471; render.py:364-395] + COR |
 | **D — readiness** (GL banner, `texture_storage` fatal) | §9.D.6 | OBS banner [gl.c:72] + SRC [gl.c:67; fonts.c:1463] |
 | **D — shared primary/fallback atlas + shader sampling** | §9.D.7 | SRC [glyph-cache.c:34; cell_fragment.glsl:10,124] |
@@ -1093,7 +1093,26 @@ Every mechanism, function, flag, file, and "e.g./such as" item named in the four
 | Three honest negatives | §11 | NEG×3 |
 | Variant coverage | §12 | OBS/VIS/COR per row |
 
-### 14.2 Read-only integrity
+### 14.2 Remaining checkpoint-named diagnostic flags (out-of-scope of the four objectives)
+
+For an exhaustive named-item pass, three further diagnostic flags named in the checkpoint scope are accounted for here. None of them emits any of the Objective A–D startup signals investigated above.
+
+- **`--debug-config` is not a startup CLI flag at all.** Passing it to the real launcher is rejected before startup begins:
+
+```text
+$ ./kitty/launcher/kitty --config NONE --debug-config -e true
+Unknown option: --debug-config
+$ echo $?
+1
+```
+
+  It does not appear in `kitty --help`. `kitty/cli.py` defines only `--debug-rendering`/`--debug-gl` [`kitty/cli.py:989`], `--debug-input`/`--debug-keyboard` [`kitty/cli.py:996`] and `--debug-font-fallback` [`kitty/cli.py:1002`] — there is no `--debug-config` option. The real `debug_config` is instead a **runtime keyboard action**, bound by default to `kitty_mod+f6` [`kitty/options/definition.py:4255-4256`] and handled by `Boss.debug_config` [`kitty/boss.py:3060`]; triggering it is interactive input handling, which is out-of-scope for a *startup* investigation per AAP §0.5.2. Its objective-relevant substance is already covered canonically: the resolved fonts it prints via `font.identify_for_debug()` in `debug_config()` [`kitty/debug_config.py:262-263`] use the **same `identify_for_debug` formatter** (`"%s: %V:%d"` [`kitty/freetype.c:738`]) that `dump_font_debug` already emits at real startup in §7.B.2. So `--debug-config` is corroborative only and adds no startup evidence beyond §7.
+
+- **`--debug-input` / `--debug-keyboard` are real CLI flags** [`kitty/cli.py:996`, `dest=debug_keyboard`] whose help text is *"Print out key and mouse events as they are received."* They debug **keyboard/mouse input events** — explicitly out-of-scope (AAP §0.5.2) and unrelated to Objectives A–D (shaping/fallback, startup diagnostics, cell metrics, GPU atlas). They emit none of the font/render/atlas signals this document investigates.
+
+Thus every diagnostic flag named in the checkpoint scope is accounted for: the three startup flags `--debug-font-fallback`, `--debug-rendering` and `--debug-gl` are exercised canonically above (§6–§9), while `--debug-config`, `--debug-input` and `--debug-keyboard` are scoped out for the reasons just given (a non-CLI keyboard action, and out-of-scope input-event debugging), with the one objective-relevant piece of `--debug-config` — its `identify_for_debug` font dump — already shown canonically in §7.
+
+### 14.3 Read-only integrity
 
 The investigation modified **no** source file. The only repository change is the addition of this document, `blitzy/documentation/kitty_815df1e210e0.md`. All temporary observation scripts and the harness `$WORK` directory were removed, the headless display stack was torn down (narrow, PID-scoped), and `git status` confirms a clean tree apart from this single added file.
 
