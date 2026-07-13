@@ -161,7 +161,7 @@ The compiled artifacts on disk after the canonical build (`ls -l`):
 
 ```console
 $ sed -n '239p' setup.py
-        raise SystemExit(f'The package {name} was not found on your system')
+            raise SystemExit(f'The package {error(pkg)} was not found on your system')
 ```
 
 kitty's CI apt list (`.github/workflows/ci.py:85-88`) does **not** include `libssl-dev`, yet `setup.py` needs the `libcrypto.pc` it provides. To observe the resulting failure **without touching any system file**, the build was re-run with `PKG_CONFIG_LIBDIR` pointed at a private symlink farm (created with `mktemp -d`) that contained every `.pc` file **except** `libcrypto.pc`/`openssl.pc`/`libssl.pc`. The system `pkg-config` directory was never modified (its `libcrypto` modversion remained `3.5.3` afterward). The command and its complete tail:
@@ -1891,6 +1891,8 @@ c0bf7b038558d5dfabd176602d7a05458459bc635ee8dd869e1125695dea35a8  kittens/transf
 $ ls -d /tmp/blitzy_qa_obs.* /tmp/blitzy_qa_stash.* 2>/dev/null || echo "no temporary observation scratch remains under /tmp"
 no temporary observation scratch remains under /tmp
 ```
+
+> **Self-reference note.** The `git log -1` and `git status --porcelain` lines above are the *authoring-time* snapshot captured while this document was being written — hence `git status` still shows the answer document as modified (` M`), and `git log -1` shows the commit that first added it. The commit that ultimately delivers this document (including this correction of it) necessarily carries a **different** hash from any shown here, because a document cannot embed the hash of the commit that adds it. After that commit the working tree is clean and `git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD --name-status` reports exactly one entry — `A blitzy/documentation/kitty_815df1e210e0.md` — confirming the read-only mandate: only the answer document is added; no existing source file is modified.
 
 ### Coverage of the nine sub-questions
 
