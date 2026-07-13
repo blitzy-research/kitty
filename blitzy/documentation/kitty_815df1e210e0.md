@@ -53,7 +53,7 @@ The flags are populated at startup from the CLI (`--debug-rendering`, `--debug-f
 
 ### 0.5 Source-anchor convention
 
-Every claim is anchored with a `file:line` reference to the checkout at HEAD `722ca9e9e` (branch content `kitty_815df1e210e0`). Line numbers were re-verified against the working tree.
+Every claim is anchored with a `file:line` reference to the checkout at the investigation-time commit `722ca9e9e` (branch content `kitty_815df1e210e0`). Line numbers were re-verified against the working tree. `722ca9e9e` is the commit at which the runtime observations in this document were captured; the subsequent commits on this branch (`e4e0f7afe`, `146e07c35`, and this reconciliation) are **documentation-only** — each modifies only this `.md` file. Consequently `git diff --name-only 815df1e21..HEAD` lists only this document, the source tree is byte-identical from the base commit `815df1e21` through the current `HEAD`, and every source `file:line` anchor below therefore remains exactly valid at whatever commit `HEAD` currently points to (re-running `git rev-parse HEAD` today returns a later, documentation-only commit than the one shown in §1.1).
 
 ---
 
@@ -85,6 +85,8 @@ $ git log --author=agent@blitzy.com --oneline -1
 ```
 
 An empty `git status --porcelain` and empty `git diff --stat` confirm the tree was clean before observation. The final integrity check (only this `.md` added; no source file modified) is shown in §8.4.
+
+> **Provenance note.** The `HEAD` printed above, `722ca9e9e`, is the *investigation-time* commit at which these baseline captures and all runtime observations in this document were taken. The document was subsequently revised in documentation-only commits (`e4e0f7afe`, then `146e07c35`, and this reconciliation), each of which modifies **only this `.md` file**. The source tree is therefore byte-identical from the base commit `815df1e21` through the current `HEAD` — `git diff --name-only 815df1e21..HEAD` lists only this document — so re-running `git rev-parse HEAD` today returns a later (documentation-only) commit than the `722ca9e9e` shown above, while every source `file:line` anchor in this document remains exactly valid.
 
 ---
 
@@ -197,7 +199,7 @@ all:
 	python3 setup.py $(VVAL)
 ```
 
-Exact build command and result (the **complete, unedited 344-line transcript is embedded verbatim in Appendix A**):
+Exact build command and result (the **complete, unedited transcript is embedded verbatim in Appendix A** — that block is 344 lines: 343 lines of raw `python3 setup.py` output plus the harness's trailing `[BUILD_EXIT=0] wall=65s` status line, so a fresh `CI=true python3 setup.py 2>&1 | wc -l` reports **343**):
 
 ```console
 $ python3 setup.py clean
@@ -689,15 +691,14 @@ As the screen grid initializes, `calc_cell_metrics(FontGroup *fg)` [`kitty/fonts
 
 ```c
 // kitty/freetype.c:387-405 (verbatim)
-cell_metrics(PyObject *s, unsigned int* cell_width, unsigned int* cell_height, unsigned int* baseline,
-             unsigned int* underline_position, unsigned int* underline_thickness,
-             unsigned int* strikethrough_position, unsigned int* strikethrough_thickness) {
+cell_metrics(PyObject *s, unsigned int* cell_width, unsigned int* cell_height, unsigned int* baseline, unsigned int* underline_position, unsigned int* underline_thickness, unsigned int* strikethrough_position, unsigned int* strikethrough_thickness) {
     Face *self = (Face*)s;
-    *cell_width = calc_cell_width(self);                                        // max ceil(horiAdvance/64), ASCII 32..127
-    *cell_height = calc_cell_height(self, true);                               // px_y(height), unless '_' overflows
-    *baseline = font_units_to_pixels_y(self, self->ascender);                  // ascender in px
+    *cell_width = calc_cell_width(self);
+    *cell_height = calc_cell_height(self, true);
+    *baseline = font_units_to_pixels_y(self, self->ascender);
     *underline_position = MIN(*cell_height - 1, (unsigned int)font_units_to_pixels_y(self, MAX(0, self->ascender - self->underline_position)));
     *underline_thickness = MAX(1, font_units_to_pixels_y(self, self->underline_thickness));
+
     if (self->strikethrough_position != 0) {
       *strikethrough_position = MIN(*cell_height - 1, (unsigned int)font_units_to_pixels_y(self, MAX(0, self->ascender - self->strikethrough_position)));
     } else {
@@ -1059,7 +1060,7 @@ Per "exercise every condition, including secondary ones," the following variants
 
 All raw launcher captures referenced above were written to `stability/*.norm` and per-run `logs/*.log` inside the harness's private `$WORK` directory and mirrored to the evidence directory during the investigation; the **relevant unedited excerpts are embedded inline** at the point of each claim (§4.1, §6, §7, §8, §9, §10). Each embedded block shows the command that produced it and preserves the `[<seconds>]` monotonic prefixes (or the `[T]` normalization explicitly marked as such for the stability diffs). No claim in this document relies on a value that is not shown next to it.
 
-Because the harness removes `$WORK` on exit (§4, narrow teardown) and the investigation restores the tree to contain only this document (§14.3), the logs are not committed — reproducing them is a matter of re-running the embedded harness verbatim. The one full-length artifact reproduced verbatim in-document is the **canonical build transcript in Appendix A** (all 344 lines).
+Because the harness removes `$WORK` on exit (§4, narrow teardown) and the investigation restores the tree to contain only this document (§14.3), the logs are not committed — reproducing them is a matter of re-running the embedded harness verbatim. The one full-length artifact reproduced verbatim in-document is the **canonical build transcript in Appendix A** (all 344 lines — 343 lines of raw `python3 setup.py` output plus the trailing harness-added `[BUILD_EXIT=0] wall=65s` status line, so a fresh `CI=true python3 setup.py 2>&1 | wc -l` reports 343).
 
 ---
 
@@ -1120,7 +1121,7 @@ The investigation modified **no** source file. The only repository change is the
 
 ## Appendix A — Complete, unedited canonical build transcript
 
-The full output of `CI=true python3 setup.py` (referenced in §3), reproduced verbatim (344 lines, `BUILD_EXIT=0`, wall 65 s). Preceded by `python3 setup.py clean` (exit 0). No line is elided.
+The full output of `CI=true python3 setup.py` (referenced in §3), reproduced verbatim. The block below is 344 lines: 343 lines of raw `setup.py` output plus the final harness-added `[BUILD_EXIT=0] wall=65s` status line (hence `CI=true python3 setup.py 2>&1 | wc -l` reports 343; `BUILD_EXIT=0`, wall 65 s). Preceded by `python3 setup.py clean` (exit 0). No line is elided.
 
 ```text
 Package wayland-protocols was not found in the pkg-config search path.
