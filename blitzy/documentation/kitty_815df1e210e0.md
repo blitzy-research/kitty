@@ -622,6 +622,69 @@ Note the ordering: results are sorted by relative name (`added_only`, `changed`,
 This is the recursive directory diffing documented in `docs/kittens/diff.rst` (see the
 cross‑check section).
 
+### Observed — the `ignore_name` filter (default vs. `-o ignore_name`)
+
+The walk that builds the name sets applies an optional **basename glob filter** *before* any
+pairing happens, so an ignored file never enters a name set and can therefore be neither
+paired nor reported. The filter is `allowed(path, patterns...)` (`collect.go:L230-237`): it
+takes `filepath.Base(path)` (`L231`) and returns `false` for the first pattern that
+`filepath.Match`es (`L233`). `walk` calls it at `collect.go:L269` and, on a non‑match, skips
+the entry — `fs.SkipDir` for a directory, `nil` for a file (`L270-275`); `collect_files`
+passes `conf.Ignore_name` into both walks (`collect.go:L299` and `L303`). The option is
+`ignore_name`, defined at `main.py:L56` with an **empty default** — so **nothing is filtered
+in the default configuration** — and its help text states matching names are “ignored when
+scanning the filesystem to look for files to diff” (`main.py:L59-60`).
+
+To observe it, a fixture pairs a text change that is always shown (`keep.txt`) with a second
+changed file whose basename matches a glob (`skip.log`):
+
+```
+$ mkdir -p /tmp/kd/ignL /tmp/kd/ignR
+$ printf 'keep alpha\nkeep beta\n' > /tmp/kd/ignL/keep.txt   # 21 B
+$ printf 'keep ALPHA\nkeep beta\n' > /tmp/kd/ignR/keep.txt   # 21 B
+$ printf 'log line one\n'          > /tmp/kd/ignL/skip.log   # 13 B
+$ printf 'log line ONE\n'          > /tmp/kd/ignR/skip.log   # 13 B
+```
+
+**Default configuration** — `ignore_name` is empty, so both changed files appear (the `:`
+status line reports `2,2` = two files; trailing blank rows trimmed):
+
+```
+$ python3 /tmp/pty_run.py 1.5 /tmp/ign_def.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/ignL /tmp/kd/ignR
+raw_bytes=6192 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/ign_def.raw 40 120
+   keep.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   @@ -1,2 +1,2 @@
+1  keep alpha                                               1  keep ALPHA
+2  keep beta                                                2  keep beta
+
+   skip.log
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   @@ -1,1 +1,1 @@
+1  log line one                                             1  log line ONE
+:                                                                                                                2,2  0%
+```
+
+**With `-o ignore_name=*.log`** — `skip.log` is filtered out *before* pairing and is entirely
+absent; only `keep.txt` remains (the `:` status line is now `1,1` = one file):
+
+```
+$ python3 /tmp/pty_run.py 1.5 /tmp/ign_flt.raw -- /app/kitty/launcher/kitten diff --config NONE -o 'ignore_name=*.log' /tmp/kd/ignL /tmp/kd/ignR
+raw_bytes=3552 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/ign_flt.raw 40 120
+   keep.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   @@ -1,2 +1,2 @@
+1  keep alpha                                               1  keep ALPHA
+2  keep beta                                                2  keep beta
+:                                                                                                                1,1  0%
+```
+
+Both `raw_bytes` values were stable across two runs each. Because the filter runs inside
+`walk` — before `left_names.Intersect(right_names)` (`collect.go:L306`) — an ignored name is
+invisible to pairing, change‑detection, and rename detection alike.
+
 ---
 
 ## Q2 — How does it recognize a rename instead of a delete + a brand‑new file?
@@ -2207,17 +2270,146 @@ $ python3 -c "import re;print('image diff _G =', len(re.findall(rb'\x1b_G', open
 image diff _G = 17
 ```
 
-**Not reproduced (stated honestly).** Two branches the code contains but that a
-default‑configuration run through the canonical entry point does not trigger without a hostile
-differ or a deliberately corrupt asset:
+**Observed under corrupt / hostile inputs.** Two branches the code contains — the
+image‑load‑failure path and the malformed‑patch path — are reachable through the canonical
+`kitten diff` entry point, so both are reported here as **observed**, not inferred: one is
+triggered under **default** configuration by a corrupt image asset, the other via the
+**documented** `-o diff_cmd` override.
 
-- **Malformed patch text.** `parse_patch` (`patch.go:L245`) trusts the differ's unified‑diff
-  format. The builtin differ never emits malformed output, and `git`/`diff` are well‑formed, so
-  a genuine parse failure would require a custom differ that prints garbage — not a
-  default condition. *(Inferred from code; not reproduced.)*
-- **Image‑load failure.** A file that passes `is_image` classification but fails to decode
-  would surface an error from `image_collection.LoadAll`; producing one reliably needs a
-  deliberately corrupt image, outside default behavior. *(Inferred from code; not reproduced.)*
+**Image‑load failure — observed under default configuration.** A path that passes `is_image`
+classification (extension‑based `mimetype_for_path`, `collect.go:L50`, used by `is_image`,
+`collect.go:L82`) but whose bytes are not a decodable image reaches the async image pipeline:
+`load_all_images` calls `image_collection.LoadAll()` (`ui.go:L206`), which stores the decode
+error in `img.err` via `OpenImageFromPath` (`collection.go:L301`); the error string itself
+originates at `tools/utils/images/loading.go:L623`
+(`fmt.Errorf("Failed to load image at %#v with error: %w", path, err)`). `GetSizeIfAvailable`
+then returns that `img.err` (`collection.go:L88`), and the `do_side` **else** branch renders it
+as the image line (`render.go:L366`, `return splitlines(fmt.Sprintf("%s", err), available_cols)`
+— note this is the branch *after* the `graphics.ErrNotFound` "Loading image..." case at
+`render.go:L364`). No configuration change is needed — only a corrupt `.png` input. Two
+variants, both under default `--config NONE`:
+
+*(v1) A plain‑text file carrying a `.png` extension* — classified as an image by extension,
+then undecodable, so it reports `image: unknown format`:
+
+```
+$ printf 'this is definitely not a png, just ascii text\n' > /tmp/kd/if1L/x.png
+$ printf 'neither is this one, also plain ascii text!!\n'  > /tmp/kd/if1R/x.png
+$ python3 /tmp/pty_run.py 1.5 /tmp/if1.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/if1L /tmp/kd/if1R
+$ python3 /tmp/screen_render.py /tmp/if1.raw 40 120
+   x.png
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Dimensions: 0x0 Size: 46 B                                  Dimensions: 0x0 Size: 45 B
+   Failed to load image at "/tmp/kd/if1L/x.png" with error:    Failed to load image at "/tmp/kd/if1R/x.png" with error:
+   image: unknown format                                       image: unknown format
+```
+
+*(v2) A file with a valid 8‑byte PNG signature (`89 50 4e 47 0d 0a 1a 0a`) followed by garbage*
+— decoding starts, recognises the container, then hits `unexpected EOF`:
+
+```
+$ printf '\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x01\x02\x03garbagegarbage' > /tmp/kd/if2L/x.png
+$ printf '\x89\x50\x4e\x47\x0d\x0a\x1a\x0aDIFFERENTgarbage\xff\xfe'        > /tmp/kd/if2R/x.png
+$ python3 /tmp/pty_run.py 1.5 /tmp/if2.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/if2L /tmp/kd/if2R
+$ python3 /tmp/screen_render.py /tmp/if2.raw 40 120
+   x.png
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Dimensions: 0x0 Size: 26 B                                  Dimensions: 0x0 Size: 26 B
+   Failed to load image at "/tmp/kd/if2L/x.png" with error:    Failed to load image at "/tmp/kd/if2R/x.png" with error:
+   unexpected EOF                                              unexpected EOF
+```
+
+Both runs exit `child_exit=0` and the rendered grid is **byte‑identical across three runs**
+(the raw byte‑stream size varies with redraw timing, as for every image capture in this
+document). A failed load transmits **no pixels**: scanning the pure‑failure v2 stream shows
+`query = 2` and **zero** direct pixel‑carrying transmissions (the `delete` count varies
+run‑to‑run, 4‑6 observed):
+
+```
+$ python3 /tmp/scan_graphics.py /tmp/if2.raw
+total _G sequences: 8
+by action:
+  delete(a=d)              6
+  query(a=q)               2
+chunks with m=1 (continuation): 0
+sequences carrying a base64 payload: 2
+total base64 payload bytes: 87
+direct pixel-carrying transmissions (seq#: base64 bytes): []
+```
+
+**Malformed patch text — observed via the documented `-o diff_cmd` override (non‑default
+configuration).** The builtin, `git`, and `diff` differs never emit malformed unified‑diff
+output, so this branch is genuinely unreachable in default config; but `diff_cmd` is a
+**documented** option (default `'auto'`, `main.py:L41`; resolved in `set_diff_command`,
+`patch.go:L44-59`) and a custom differ can emit anything. `parse_patch` (`patch.go:L245`) trusts
+the differ's format. Two hostile differs, each invoked through the real entry point, expose two
+**distinct** real behaviors — **neither** is the benign "parse failure" one might infer:
+
+*Case A — a differ that prints pure garbage (no `@@` hunk headers) and exits 1.* `run_diff`
+treats exit 1 as "has changes" (`patch.go:L321-322`) and hands the garbage to `parse_patch`,
+which finds no hunks — an empty patch — so the kitten renders **"The files are identical"**,
+silently wrong because the files differ:
+
+```
+$ cat /tmp/garbage_differ.sh
+#!/bin/sh
+echo "this is not a diff at all"
+echo "just some random garbage text"
+echo "no unified-diff hunk headers here"
+exit 1
+$ python3 /tmp/pty_run.py 1.5 /tmp/mp_garbage.raw -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=/tmp/garbage_differ.sh /tmp/kd/mp/left.txt /tmp/kd/mp/right.txt
+raw_bytes=2495 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/mp_garbage.raw 40 120
+   /tmp/kd/mp/left.txt                                         /tmp/kd/mp/right.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   The files are identical
+```
+
+*Case B — a differ that prints a malformed `@@` hunk header and exits 1.* The header parser
+cannot extract valid line counts, a `Chunk` is finalized with a negative start index, and
+`Chunk.finalize` indexes `left_lines[-1]` — producing an **unhandled panic**
+`index out of range [-1]`, not a graceful parse error. This panic is a **pre‑existing Kitty
+source behavior**, out of scope to change under this read‑only task; it is reported accurately
+rather than as a benign failure. Captured on a separate stderr pipe (`pty_run_stderr.py`); the
+child exits 2:
+
+```
+$ cat /tmp/malformed_differ.sh
+#!/bin/sh
+echo "--- a/left.txt"
+echo "+++ b/right.txt"
+echo "@@ this is a broken hunk header @@"
+echo "-beta"
+echo "+BETA-changed"
+exit 1
+$ python3 /tmp/pty_run_stderr.py 1.5 /tmp/mp_malformed.raw /tmp/mp_malformed.err -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=/tmp/malformed_differ.sh /tmp/kd/mp/left.txt /tmp/kd/mp/right.txt
+$ cat /tmp/mp_malformed.info
+raw_bytes=332 child_exit=2
+$ cat /tmp/mp_malformed.err
+panic: runtime error: index out of range [-1]
+
+goroutine 69 [running]:
+kitty/kittens/diff.(*Chunk).finalize(0xc000590100, {0xc000166a08, 0x4, 0x30?}, {0xc000168f08, 0x4, 0xc000600e08?})
+	/app/kittens/diff/patch.go:104 +0x18d
+kitty/kittens/diff.(*Hunk).finalize(0xc000c22070, {0xc000166a08, 0x4, 0x200}, {0xc000168f08, 0x4, 0x200})
+	/app/kittens/diff/patch.go:177 +0x272
+kitty/kittens/diff.parse_patch({0xc000268060, 0x56}, {0xc000166a08, 0x4, 0x200}, {0xc000168f08, 0x4, 0x200})
+	/app/kittens/diff/patch.go:269 +0x1a5
+kitty/kittens/diff.do_diff({0x7fff320d6e8f, 0x13}, {0x7fff320d6ea3, 0x14}, 0x0?)
+	/app/kittens/diff/patch.go:346 +0xd5
+kitty/kittens/diff.diff.func1(0xc000212310)
+	/app/kittens/diff/patch.go:365 +0xa6
+kitty/tools/utils/images.(*Context).Parallel.func1()
+	/app/tools/utils/images/utils.go:52 +0x4e
+created by kitty/tools/utils/images.(*Context).Parallel in goroutine 177
+	/app/tools/utils/images/utils.go:50 +0xe5
+```
+
+The stack trace confirms the parallel‑diff path exactly: `Chunk.finalize` (`patch.go:L104`) is
+called by `Hunk.finalize` (`patch.go:L177`) from `parse_patch` (`patch.go:L269`), reached via
+`do_diff` (`patch.go:L346`) and `diff.func1` (`patch.go:L365`) running inside the worker pool
+`(*Context).Parallel.func1` (`utils.go:L52`, created at `utils.go:L50`). Goroutine numbers vary
+per run; the frames and their line numbers are stable across runs.
 
 ---
 
@@ -2254,7 +2446,7 @@ Each item is tagged **Observed** (backed by captured CLI/byte output in this doc
 - **Q1 — directory collection / pairing** — *Observed.* Name‑intersection pairing
   (`Intersect`, `collect.go:L306`); content change (`ld != rd` → `add_change`,
   `collect.go:L317`/`L319`); mode‑only change (`collect.go:L321-327`, "Mode changed:");
-  negative control (`unchanged.txt` absent, `grep -c = 0`).
+  negative control (`unchanged.txt` absent, `grep -c = 0`); the `ignore_name` basename‑glob filter (`allowed`, `collect.go:L230-237`) observed default‑off vs. `-o ignore_name=*.log`.
 - **Q2 — rename detection** — *Observed.* Two‑stage guard: MD5 equal (`ah == rh`,
   `collect.go:L350`) **then** full bytes equal (`ld == rd`, `collect.go:L353`) →
   `add_rename` (`collect.go:L354`); a real rename observed; the **MD5‑collision** case
@@ -2304,8 +2496,11 @@ Each item is tagged **Observed** (backed by captured CLI/byte output in this doc
 - **Edge cases** — *Observed:* `/dev/null` (binary classification), symlinks (followed by both
   git and builtin differs; `EvalSymlinks` for every differ), wrong arity, dir/file mismatch,
   nonexistent operand, both screen‑size guards (`<8` cols, `<2` rows), and the no‑image flow
-  (zero `_G` sequences). *Not reproduced:* malformed‑patch parse failure and image‑load failure
-  (both require non‑default hostile inputs; stated honestly above).
+  (zero `_G` sequences); plus the **image‑load‑failure** branch (a corrupt `.png` under
+  default config → `image: unknown format` / `unexpected EOF`, `Dimensions: 0x0`) and the
+  **malformed‑patch** branches via the documented `-o diff_cmd` override (garbage differ →
+  silent "The files are identical"; malformed `@@` → unhandled panic `index out of range [-1]`)
+  — all captured above.
 - **Cross‑check** — *Observed.* All four `docs/kittens/diff.rst` "Major Features" reconciled
   with observations, each with both the doc line and the observed evidence.
 - **Runtime is Go** — *Observed.* `main.py` `main()` raises `SystemExit('Must be run as kitten
@@ -2322,8 +2517,6 @@ Each item is tagged **Observed** (backed by captured CLI/byte output in this doc
 - **Q5:** actual image **rendering** and the **"even over SSH"** documentation claim — the PTY
   captures the Graphics‑Protocol bytes but is not a kitty terminal, so pixels are transmitted
   but never painted; both are labelled inferred in‑section.
-- **Q7 / Edge:** **malformed‑patch** and **image‑load‑failure** branches — real code paths, but
-  not reachable under default configuration without a hostile custom differ or a corrupt image.
 
 Everything else in this document is backed by captured CLI output with the exact command that
 produced it.
