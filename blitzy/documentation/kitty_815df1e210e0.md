@@ -82,8 +82,9 @@ child and **10 were ignored**.
 
 > **Toolchain provenance.** The versions above are the exact toolchain of the canonical
 > build/observation environment — the reference Ubuntu 24.04.2 container — captured with the
-> commands shown immediately below. Two points of note: (1) Kitty's documented, tested Python
-> range ends at **3.11** (`docs/build.rst`), yet **Python 3.12.3 built and ran Kitty 0.35.2
+> commands shown immediately below. Two points of note: (1) Kitty documents a Python floor of
+> `>= 3.8` (`docs/build.rst:83`) and its CI tests up to Python 3.11 (`.github/workflows/ci.yml:85`),
+> yet **Python 3.12.3 built and ran Kitty 0.35.2
 > successfully here** — `setup.py build` completed with no errors and produced a working
 > launcher, so the newer interpreter is reported as an actual, verified success rather than a
 > documented-supported version. (2) Go builds only the standalone `kitten` CLI and is **not on
