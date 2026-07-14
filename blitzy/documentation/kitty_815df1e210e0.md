@@ -16,7 +16,7 @@ Every behavioral claim below is placed next to the **actual, unedited runtime ou
 |---|----------|---------------|
 | **OBJ-1** | After pushing flags on main, toggling to alternate, pushing different flags, and toggling back — which mode is active, does main's stack survive, and what bytes does a key press produce at each stage? | The mode pushed on **main survives** the round-trip and is active again at the end (`flags=1`, disambiguate). The alternate buffer has its **own independent, initially empty** stack. `Ctrl+Shift+a` emits `b'\x1b[97;6u'` in **every** intermediate state (it is not legacy-representable). |
 | **OBJ-2** | What is the real push limit, what happens on overflow, and does exhausting one buffer affect the other? | The limit is exactly **8** entries per buffer (a code fact from the array size, not a documented number). Overflow does **not** error — the **oldest** entry is silently evicted (FIFO). Exhausting one buffer's stack does **not** affect the other's. |
-| **OBJ-3** | Observe the exact bytes for the *same* key press under different stack states / buffers. | For `Ctrl+Shift+a` the bytes are `b'\x1b[97;6u'` (i.e. `ESC [ 9 7 ; 6 u`) in **all** states and on **both** buffers. The modifier parameter `6` = `1 + ctrl(4) + shift(1)`; `97` = `ord('a')`. |
+| **OBJ-3** | Observe the exact bytes for the *same* key press under different stack states / buffers. | For `Ctrl+Shift+a` the bytes are `b'\x1b[97;6u'` (i.e. `ESC [ 9 7 ; 6 u`, seven bytes) in **all** stack states exercised and on **both** buffers — this is the primary-key encoding; the one exception (report-alternate-keys **with** a shifted key → `b'\x1b[97:65;6u'`) is detailed in §5. The modifier parameter `6` = `1 + ctrl(4) + shift(1)`; `97` = `ord('a')`. |
 | **OBJ-4** | Prove the two buffers keep independent stacks; check for leakage during rapid switching. | Proven: across four rapid main↔alt cycles the values never cross (`main flags=1`, `alt flags=8` every cycle). **Zero** leakage. Independence is structural (two separate arrays; the toggle only repoints a pointer). |
 | **OBJ-5** | Identify mode/setting-dependent differences and any conditions where isolation breaks down. | The per-screen isolation itself does **not** break down under any observed condition. The mode/setting-dependent *behavioral* differences are: (a) which DEC mode performs the switch (**1049** also saves cursor + clears alt screen; **47**/**1047** do not); (b) empty/over-pop **resets to legacy 0**; (c) flags genuinely change the encoding of legacy-representable keys (report-all-keys turns plain `a` into `b'\x1b[97u'`); (d) the query `CSI ? u` reports the current flags as `CSI ? flags u`. |
 
@@ -34,49 +34,386 @@ python3 setup.py build --debug --ignore-compiler-warnings
 
 `--ignore-compiler-warnings` is required **only** to bypass an unrelated GLFW **Wayland backend** `-Werror=switch` failure at `glfw/wl_window.c:668` (caused by newer `wayland-protocols` enum values). The terminal-core extension compiles cleanly, and **no source file is modified** by that flag. In this run the extension was already present in a warm, reusable state and imported cleanly (`kitty.fast_data_types.Screen`, `encode_key_for_tty`, `GLFW_MOD_CONTROL == 4`, `GLFW_MOD_SHIFT == 1`), so it was used as-is.
 
-**Interpreter.** Observations were captured on **Python 3.13.7** (`/usr/bin/python3`). The project declares `requires-python = ">=3.8"` (`pyproject.toml:2`), which 3.13.7 satisfies.
-
-> Note: this interpreter (3.13.7) differs from an earlier reference run captured on Python 3.12.3. Every byte reported here was regenerated on 3.13.7 and is identical to that reference — i.e. the results are stable across those Python versions.
+**Interpreter.** Every observation in this document was captured on **Python 3.13.7** (`/usr/bin/python3`) — the interpreter the extension is linked against (`kitty/fast_data_types.so` → `libpython3.13.so.1.0`) and the only Python interpreter present in the environment. The project declares `requires-python = ">=3.8"` (`pyproject.toml:2`), which 3.13.7 satisfies, so this is a canonical, in-support configuration. Every byte-sensitive result below is the direct, unedited output of the probe that follows; its run-to-run stability is demonstrated by the two-run SHA-256 check shown after the probe. No cross-interpreter claim is made: 3.13.7 is the sole interpreter these bytes were observed on.
 
 **Real entry point (no bypass).** A live `Screen` is constructed through the `kitty_tests` harness. Raw CSI byte sequences are fed through the **real VT parser** with `kitty_tests.parse_bytes(screen, data)` (`kitty_tests/__init__.py:30`). The active mode is read with `screen.current_key_encoding_flags()` (backed by `screen_current_key_encoding_flags`, `kitty/screen.c:1204`). Keys are encoded with `kitty.fast_data_types.encode_key_for_tty(...)` (the Python entry `pyencode_key_for_tty`, `kitty/keys.c:311`, registered at `kitty/keys.c:334`). Bytes destined for the child process are captured from the harness accumulator `Callbacks.write` → `self.wtcbuf` (`kitty_tests/__init__.py:50-51`).
 
-**Stability.** All byte-sensitive observations were run **twice** in the same process (`RUN 1` and a `RUN 2` stability re-run) and confirmed **byte-for-byte identical** (identical SHA-256 of the two run sections).
+**Stability.** Every byte-sensitive observation was run **twice** in the same process (`RUN 1` and a `RUN 2` stability re-run); the two transcripts were SHA-256-hashed and confirmed **byte-for-byte identical**. The exact invocation command, the complete `RUN 1` transcript, and both SHA-256 hashes (with a one-line command to reproduce them) are shown immediately after the probe below.
 
 **Cleanup discipline.** The observation script lived **outside** the repository, at `/tmp/kbd_stack_probe.py`, and was deleted after use. `git status --porcelain` was used to confirm the source tree is unchanged apart from this single new document (only git-ignored `build/` artifacts and the compiled `*.so` remain, and those are ignored).
 
-**The exact probe (verbatim).** The following script — run from the repo root with `PYTHONPATH=. python3 /tmp/kbd_stack_probe.py` — produced every output block quoted in this document:
+**The exact probe (verbatim).** The complete, self-contained observation script is reproduced below exactly as it was run. It touches only kitty’s real input path (raw CSI bytes → `kitty_tests.parse_bytes` → live `Screen` → `encode_key_for_tty`) and prints every output block quoted in this document. It executes `run_once()` **twice** in one process and SHA-256-hashes the two transcripts to prove run-to-run stability:
 
 ```python
-import os, sys
+#!/usr/bin/env python3
+"""
+kitty keyboard-protocol flag-stack investigation probe.
+
+Drives kitty's REAL input path (raw CSI bytes -> VT parser -> live Screen -> key
+encoder) headlessly and prints byte-exact observed output for OBJ-1..OBJ-5.
+
+Run from the repo root with:
+
+    PYTHONPATH=. python3 /tmp/kbd_stack_probe.py
+
+The whole scenario body (run_once) is executed TWICE in the same process and the
+two transcripts are SHA-256 hashed and compared, proving run-to-run stability.
+"""
+import hashlib
+import os
+import sys
+
 REPO = os.environ.get("KITTY_REPO", os.getcwd())
 sys.path.insert(0, REPO)
-from kitty_tests import BaseTest, Callbacks, parse_bytes
-import kitty.fast_data_types as fdt
-from kitty.fast_data_types import Screen
 
-CTRL = fdt.GLFW_MOD_CONTROL
-SHIFT = fdt.GLFW_MOD_SHIFT
-A = ord('a')  # 97
+import kitty.fast_data_types as fdt
+from kitty.fast_data_types import Screen, encode_key_for_tty
+from kitty_tests import BaseTest, Callbacks, parse_bytes
+
+CTRL = fdt.GLFW_MOD_CONTROL      # 4
+SHIFT = fdt.GLFW_MOD_SHIFT       # 1
+PRESS = fdt.GLFW_PRESS           # 1
+RELEASE = fdt.GLFW_RELEASE       # 0
+REPEAT = fdt.GLFW_REPEAT         # 2
+A = ord('a')                     # 97
+SHIFTED_A = ord('A')             # 65
+
 
 class _H(BaseTest):
     def runTest(self):
         pass
 
+
 def new_screen():
-    h = _H(); h.set_options(None)
+    """Construct a live Screen through the real test harness (no bypass)."""
+    h = _H()
+    h.set_options(None)
     cb = Callbacks()
     # Screen(callbacks, lines, cols, scrollback, cell_width, cell_height, window_id, test_child)
     s = Screen(cb, 5, 5, 5, 10, 20, 0, cb)
     return s, cb
 
-def as_bytes(text):
-    return text.encode('utf-8')  # encode_key_for_tty returns str; show wire bytes
 
-def enc(screen, key=A, mods=0, text=None):
+def as_bytes(text):
+    # encode_key_for_tty returns a str; show the exact wire bytes.
+    return text.encode('utf-8')
+
+
+def enc(screen, key=A, mods=0, shifted_key=0, action=PRESS, text=None):
+    """Encode a key under the CURRENT flags of the active buffer."""
     flags = screen.current_key_encoding_flags()
-    out = fdt.encode_key_for_tty(key=key, mods=mods, key_encoding_flags=flags, text=text)
+    out = encode_key_for_tty(
+        key=key, shifted_key=shifted_key, mods=mods,
+        action=action, key_encoding_flags=flags, text=text)
     return flags, as_bytes(out)
-# ... run_once() drives the sequences whose output is quoted verbatim below ...
+
+
+def enc_flags(key=A, mods=0, shifted_key=0, action=PRESS, flags=0, text=None):
+    """Encode a key under an explicit flags value (no Screen needed)."""
+    out = encode_key_for_tty(
+        key=key, shifted_key=shifted_key, mods=mods,
+        action=action, key_encoding_flags=flags, text=text)
+    return as_bytes(out)
+
+
+def screen_text(scr):
+    return '|'.join(scr.line(i).as_ansi().rstrip() for i in range(scr.lines))
+
+
+def run_once(o):
+    """Append every deterministic observation line to list `o`."""
+    # ---- OBJ-1: round-trip main -> alternate -> main -----------------------
+    o.append("=== OBJ-1: round-trip (main -> alternate -> main) ===")
+    s, cb = new_screen()
+    f, b = enc(s, key=A, mods=CTRL | SHIFT)
+    o.append("A)  main, no flags pushed                flags=%d   bytes=%r" % (f, b))
+    parse_bytes(s, b'\x1b[>1u')                 # push disambiguate (0b1) on main
+    f, b = enc(s, key=A, mods=CTRL | SHIFT)
+    o.append("B)  main, after CSI>1u (disambiguate)     flags=%d   bytes=%r" % (f, b))
+    parse_bytes(s, b'\x1b[?1049h')              # switch to alternate screen
+    f, b = enc(s, key=A, mods=CTRL | SHIFT)
+    o.append("C0) alt, just switched (before push)      flags=%d   bytes=%r" % (f, b))
+    parse_bytes(s, b'\x1b[>8u')                 # push report-all-keys (0b1000) on alt
+    f, b = enc(s, key=A, mods=CTRL | SHIFT)
+    o.append("C)  alt, after CSI>8u (report-all)        flags=%d   bytes=%r" % (f, b))
+    parse_bytes(s, b'\x1b[?1049l')              # switch back to main
+    f, b = enc(s, key=A, mods=CTRL | SHIFT)
+    o.append("D)  main, after switching back            flags=%d   bytes=%r   <-- main flag 1 SURVIVED" % (f, b))
+    f, b = enc(s, key=A, mods=0)
+    o.append("D') main, plain 'a' (no mods)             flags=%d   bytes=%r" % (f, b))
+    o.append("")
+
+    # ---- OBJ-2: capacity / FIFO / cross-buffer isolation -------------------
+    o.append("=== OBJ-2: capacity (8), FIFO eviction, cross-buffer isolation ===")
+
+    def push_then_drain(n):
+        sc, _ = new_screen()
+        for v in range(1, n + 1):
+            parse_bytes(sc, ('\x1b[>%du' % v).encode())
+        seq = []
+        for _ in range(n + 3):                  # over-drain to show the reset floor
+            seq.append(sc.current_key_encoding_flags())
+            parse_bytes(sc, b'\x1b[<1u')         # pop one
+        return seq
+
+    o.append("push 1..8 -> pop sequence (top first): %s" % push_then_drain(8))
+    o.append("push 1..9 -> pop sequence (top first): %s" % push_then_drain(9))
+    # cross-buffer isolation under exhaustion of main
+    sc, _ = new_screen()
+    parse_bytes(sc, b'\x1b[?1049h')             # go to alt
+    parse_bytes(sc, b'\x1b[>3u')                # preset alt flags = 3
+    parse_bytes(sc, b'\x1b[?1049l')             # back to main
+    # overflow + fully drain main
+    for v in range(1, 10):
+        parse_bytes(sc, ('\x1b[>%du' % v).encode())
+    for _ in range(12):
+        parse_bytes(sc, b'\x1b[<1u')
+    main_after = sc.current_key_encoding_flags()
+    parse_bytes(sc, b'\x1b[?1049h')
+    alt_after = sc.current_key_encoding_flags()
+    o.append("after overflow+drain main: main flags=%d  alt flags=%d  (alt preset 3 intact)" % (main_after, alt_after))
+    o.append("")
+
+    # ---- OBJ-3: Ctrl+Shift+a modifier arithmetic cross-check ---------------
+    o.append("=== OBJ-3: Ctrl+Shift+a exact bytes + modifier arithmetic ===")
+    m = 0
+    if SHIFT:
+        m |= 1
+    if CTRL:
+        m |= 4
+    o.append("ord('a') = %d" % A)
+    o.append("GLFW_MOD_SHIFT = %d (csi maps ->1)" % SHIFT)
+    o.append("GLFW_MOD_CONTROL = %d (csi maps ->4)" % CTRL)
+    o.append("computed m = %d -> ;{m+1} = ;%d" % (m, m + 1))
+    got = enc_flags(key=A, mods=CTRL | SHIFT, flags=0)
+    expected = ("\x1b[%d;%du" % (A, m + 1)).encode()
+    o.append("encode_key_for_tty(Ctrl+Shift+a, flags=0) = %r" % got)
+    o.append("expected CSI form                          = %r" % expected)
+    o.append("MATCH: %s" % (got == expected))
+    o.append("")
+
+    # ---- OBJ-4: rapid switching (independence, no leakage) -----------------
+    o.append("=== OBJ-4: rapid switching (independence / no leakage) ===")
+    s, cb = new_screen()
+    parse_bytes(s, b'\x1b[>1u')                 # main flags = 1
+    parse_bytes(s, b'\x1b[?1049h')
+    parse_bytes(s, b'\x1b[>8u')                 # alt flags = 8
+    parse_bytes(s, b'\x1b[?1049l')
+    for cyc in range(4):
+        parse_bytes(s, b'\x1b[?1049h')
+        alt = s.current_key_encoding_flags()
+        parse_bytes(s, b'\x1b[?1049l')
+        main = s.current_key_encoding_flags()
+        o.append("rapid switch cycle %d: main flags=%d  alt flags=%d" % (cyc, main, alt))
+    o.append("")
+
+    # ---- OBJ-5(a): DEC mode 47 vs 1047 vs 1049 -----------------------------
+    o.append("=== OBJ-5(a): DEC 47 vs 1047 vs 1049 (stack + cursor + screen-clear) ===")
+    for mode in (47, 1047, 1049):
+        s, cb = new_screen()
+        parse_bytes(s, b'\x1b[4;5H')            # CUP row4 col5 -> cursor (x=4,y=3)
+        parse_bytes(s, b'\x1b[>1u')             # push disambiguate (1) on main
+        main_before = s.current_key_encoding_flags()
+        cur_before = (s.cursor.x, s.cursor.y)
+        parse_bytes(s, ('\x1b[?%dh' % mode).encode())   # ENTER alt
+        alt_during = s.current_key_encoding_flags()
+        cur_alt_entry = (s.cursor.x, s.cursor.y)
+        parse_bytes(s, b'\x1b[>8u')             # push report-all (8) on alt
+        parse_bytes(s, b'ZZ')                   # write marker on alt screen
+        alt_txt_during = screen_text(s)
+        parse_bytes(s, ('\x1b[?%dl' % mode).encode())   # BACK to main
+        main_after = s.current_key_encoding_flags()
+        cur_main_after = (s.cursor.x, s.cursor.y)
+        parse_bytes(s, ('\x1b[?%dh' % mode).encode())   # RE-ENTER alt
+        alt_reentry = s.current_key_encoding_flags()
+        alt_txt_reentry = screen_text(s)
+        o.append("mode %-4d | stack: main_before=%d alt_during=%d main_after=%d alt_reentry=%d"
+                 % (mode, main_before, alt_during, main_after, alt_reentry))
+        o.append("           cursor: main_before=%s alt_entry=%s main_after=%s%s"
+                 % (cur_before, cur_alt_entry, cur_main_after,
+                    "  (RESTORED)" if cur_main_after == cur_before else "  (NOT restored)"))
+        o.append("           alt screen: during=%r reentry=%r%s"
+                 % (alt_txt_during, alt_txt_reentry,
+                    "  (CLEARED on re-entry)" if alt_txt_reentry.strip('|') == '' else "  (NOT cleared)"))
+    o.append("")
+
+    # ---- OBJ-5(b): empty / over-pop reset + query --------------------------
+    o.append("=== OBJ-5(b): empty/over-pop reset + query response ===")
+    s, cb = new_screen()
+    parse_bytes(s, b'\x1b[>5u')                 # push 5
+    o.append("after push 5: flags=%d" % s.current_key_encoding_flags())
+    cb.wtcbuf = b''
+    parse_bytes(s, b'\x1b[?u')                  # query
+    o.append("query CSI ?u response to child: %r" % bytes(cb.wtcbuf))
+    parse_bytes(s, b'\x1b[<3u')                 # pop 3 (> pushed) -> reset
+    o.append("after pop 3 (>pushed): flags=%d (reset)" % s.current_key_encoding_flags())
+    cb.wtcbuf = b''
+    parse_bytes(s, b'\x1b[?u')
+    o.append("query after reset:               %r" % bytes(cb.wtcbuf))
+    o.append("")
+
+    # ---- OBJ-5(c): plain 'a' under flags 0/1/8/16 --------------------------
+    o.append("=== OBJ-5(c): plain 'a' under flags 0/1/8/16 (flags alter encoding) ===")
+    o.append("plain 'a' under flags=0  (legacy)          : %r" % enc_flags(key=A, mods=0, flags=0))
+    o.append("plain 'a' under flags=1  (disambiguate)    : %r" % enc_flags(key=A, mods=0, flags=1))
+    o.append("plain 'a' under flags=8  (report-all-keys) : %r" % enc_flags(key=A, mods=0, flags=8))
+    o.append("plain 'a' under flags=16 (report-text)     : %r" % enc_flags(key=A, mods=0, flags=16))
+    o.append("")
+
+    # ---- OBJ-5(d) / F5: bit-2 event types ----------------------------------
+    o.append("=== bit-2 (report event types) on plain 'a': press/repeat/release ===")
+    for fl in (0, 2):
+        o.append("flags=%-2d press  : %r" % (fl, enc_flags(key=A, mods=0, action=PRESS, flags=fl)))
+        o.append("flags=%-2d repeat : %r" % (fl, enc_flags(key=A, mods=0, action=REPEAT, flags=fl)))
+        o.append("flags=%-2d release: %r" % (fl, enc_flags(key=A, mods=0, action=RELEASE, flags=fl)))
+    o.append("")
+
+    # ---- F5: bit-4 report alternate keys (shifted_key populated) -----------
+    o.append("=== bit-4 (report alternate keys) — Ctrl+Shift+a with shifted_key=65 ===")
+    o.append("flags=0 (no bit4), no shifted_key      : %r" % enc_flags(key=A, shifted_key=0, mods=CTRL | SHIFT, flags=0))
+    o.append("flags=4 (bit4), no shifted_key         : %r" % enc_flags(key=A, shifted_key=0, mods=CTRL | SHIFT, flags=4))
+    o.append("flags=4 (bit4), shifted_key=65 ('A')   : %r" % enc_flags(key=A, shifted_key=SHIFTED_A, mods=CTRL | SHIFT, flags=4))
+    o.append("")
+
+    # ---- F5: CSI = set modes 1/2/3/default through the REAL parser ---------
+    o.append("=== CSI = set modes 1(replace) / 2(OR) / 3(AND-NOT) / default via parse_bytes ===")
+    s, cb = new_screen()
+    parse_bytes(s, b'\x1b[=5;1u')
+    o.append("CSI=5;1u (replace)     -> flags=%d" % s.current_key_encoding_flags())
+    parse_bytes(s, b'\x1b[=2;1u')
+    o.append("CSI=2;1u (replace)     -> flags=%d" % s.current_key_encoding_flags())
+    s, cb = new_screen()
+    parse_bytes(s, b'\x1b[=5u')
+    o.append("CSI=5u   (default=1)   -> flags=%d" % s.current_key_encoding_flags())
+    s, cb = new_screen()
+    parse_bytes(s, b'\x1b[=1;1u')
+    o.append("CSI=1;1u (base)        -> flags=%d" % s.current_key_encoding_flags())
+    parse_bytes(s, b'\x1b[=8;2u')
+    o.append("CSI=8;2u (OR onto 1)   -> flags=%d" % s.current_key_encoding_flags())
+    parse_bytes(s, b'\x1b[=1;3u')
+    o.append("CSI=1;3u (AND-NOT 1)   -> flags=%d" % s.current_key_encoding_flags())
+    parse_bytes(s, b'\x1b[=8;3u')
+    o.append("CSI=8;3u (AND-NOT 8)   -> flags=%d" % s.current_key_encoding_flags())
+
+
+def main():
+    buf1, buf2 = [], []
+    run_once(buf1)
+    run_once(buf2)
+    text1 = "\n".join(buf1) + "\n"
+    text2 = "\n".join(buf2) + "\n"
+    h1 = hashlib.sha256(text1.encode()).hexdigest()
+    h2 = hashlib.sha256(text2.encode()).hexdigest()
+
+    print("################  RUN 1 (scenario transcript)  ################")
+    print(text1, end="")
+    print("################  RUN 2 (stability re-run)  ################")
+    print(text2, end="")
+    print("################  STABILITY  ################")
+    print("RUN 1 SHA-256: %s" % h1)
+    print("RUN 2 SHA-256: %s" % h2)
+    print("IDENTICAL: %s" % (h1 == h2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Invocation (exact command).** Run from the repository root:
+
+```
+CI=true ASAN_OPTIONS=detect_leaks=0 PYTHONPATH=. python3 /tmp/kbd_stack_probe.py
+```
+
+**Complete captured output — the `RUN 1` transcript (byte-for-byte identical to `RUN 2`).** This is the full, unedited transcript printed between the `RUN 1` and `RUN 2` banners; every later section quotes its relevant excerpt from this transcript verbatim:
+
+```text
+=== OBJ-1: round-trip (main -> alternate -> main) ===
+A)  main, no flags pushed                flags=0   bytes=b'\x1b[97;6u'
+B)  main, after CSI>1u (disambiguate)     flags=1   bytes=b'\x1b[97;6u'
+C0) alt, just switched (before push)      flags=0   bytes=b'\x1b[97;6u'
+C)  alt, after CSI>8u (report-all)        flags=8   bytes=b'\x1b[97;6u'
+D)  main, after switching back            flags=1   bytes=b'\x1b[97;6u'   <-- main flag 1 SURVIVED
+D') main, plain 'a' (no mods)             flags=1   bytes=b'a'
+
+=== OBJ-2: capacity (8), FIFO eviction, cross-buffer isolation ===
+push 1..8 -> pop sequence (top first): [8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0]
+push 1..9 -> pop sequence (top first): [9, 8, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0]
+after overflow+drain main: main flags=0  alt flags=3  (alt preset 3 intact)
+
+=== OBJ-3: Ctrl+Shift+a exact bytes + modifier arithmetic ===
+ord('a') = 97
+GLFW_MOD_SHIFT = 1 (csi maps ->1)
+GLFW_MOD_CONTROL = 4 (csi maps ->4)
+computed m = 5 -> ;{m+1} = ;6
+encode_key_for_tty(Ctrl+Shift+a, flags=0) = b'\x1b[97;6u'
+expected CSI form                          = b'\x1b[97;6u'
+MATCH: True
+
+=== OBJ-4: rapid switching (independence / no leakage) ===
+rapid switch cycle 0: main flags=1  alt flags=8
+rapid switch cycle 1: main flags=1  alt flags=8
+rapid switch cycle 2: main flags=1  alt flags=8
+rapid switch cycle 3: main flags=1  alt flags=8
+
+=== OBJ-5(a): DEC 47 vs 1047 vs 1049 (stack + cursor + screen-clear) ===
+mode 47   | stack: main_before=1 alt_during=0 main_after=1 alt_reentry=8
+           cursor: main_before=(4, 3) alt_entry=(0, 0) main_after=(2, 0)  (NOT restored)
+           alt screen: during='ZZ||||' reentry='ZZ||||'  (NOT cleared)
+mode 1047 | stack: main_before=1 alt_during=0 main_after=1 alt_reentry=8
+           cursor: main_before=(4, 3) alt_entry=(0, 0) main_after=(2, 0)  (NOT restored)
+           alt screen: during='ZZ||||' reentry='ZZ||||'  (NOT cleared)
+mode 1049 | stack: main_before=1 alt_during=0 main_after=1 alt_reentry=8
+           cursor: main_before=(4, 3) alt_entry=(0, 0) main_after=(4, 3)  (RESTORED)
+           alt screen: during='ZZ||||' reentry='||||'  (CLEARED on re-entry)
+
+=== OBJ-5(b): empty/over-pop reset + query response ===
+after push 5: flags=5
+query CSI ?u response to child: b'\x1b[?5u'
+after pop 3 (>pushed): flags=0 (reset)
+query after reset:               b'\x1b[?0u'
+
+=== OBJ-5(c): plain 'a' under flags 0/1/8/16 (flags alter encoding) ===
+plain 'a' under flags=0  (legacy)          : b'a'
+plain 'a' under flags=1  (disambiguate)    : b'a'
+plain 'a' under flags=8  (report-all-keys) : b'\x1b[97u'
+plain 'a' under flags=16 (report-text)     : b'a'
+
+=== bit-2 (report event types) on plain 'a': press/repeat/release ===
+flags=0  press  : b'a'
+flags=0  repeat : b'a'
+flags=0  release: b''
+flags=2  press  : b'a'
+flags=2  repeat : b'\x1b[97;1:2u'
+flags=2  release: b'\x1b[97;1:3u'
+
+=== bit-4 (report alternate keys) — Ctrl+Shift+a with shifted_key=65 ===
+flags=0 (no bit4), no shifted_key      : b'\x1b[97;6u'
+flags=4 (bit4), no shifted_key         : b'\x1b[97;6u'
+flags=4 (bit4), shifted_key=65 ('A')   : b'\x1b[97:65;6u'
+
+=== CSI = set modes 1(replace) / 2(OR) / 3(AND-NOT) / default via parse_bytes ===
+CSI=5;1u (replace)     -> flags=5
+CSI=2;1u (replace)     -> flags=2
+CSI=5u   (default=1)   -> flags=5
+CSI=1;1u (base)        -> flags=1
+CSI=8;2u (OR onto 1)   -> flags=9
+CSI=1;3u (AND-NOT 1)   -> flags=8
+CSI=8;3u (AND-NOT 8)   -> flags=0
+```
+
+**Two-run stability (SHA-256).** After the two transcripts, the probe prints their SHA-256 digests and their equality:
+
+```text
+RUN 1 SHA-256: 6c51e422734df65527ed6d10b243552e5b7a1a6a9c5c37bdce28bec33b2d9ef2
+RUN 2 SHA-256: 6c51e422734df65527ed6d10b243552e5b7a1a6a9c5c37bdce28bec33b2d9ef2
+IDENTICAL: True
+```
+
+Reproduce the two hashes independently with:
+
+```
+CI=true ASAN_OPTIONS=detect_leaks=0 PYTHONPATH=. python3 /tmp/kbd_stack_probe.py | sed -n '/RUN 1 SHA-256/,$p'
 ```
 
 ---
@@ -87,11 +424,11 @@ The keyboard protocol's *progressive enhancement* is a set of bit-flags. kitty d
 
 | Bit | Value | Meaning | Spec |
 |-----|-------|---------|------|
-| `0b1` | 1 | disambiguate escape codes | `docs/keyboard-protocol.rst:278`, detail `:316` |
-| `0b10` | 2 | report event types | `docs/keyboard-protocol.rst:279`, detail `:350` |
-| `0b100` | 4 | report alternate keys | `docs/keyboard-protocol.rst:280`, detail `:367` |
-| `0b1000` | 8 | report all keys as escape codes | `docs/keyboard-protocol.rst:281`, detail `:376` |
-| `0b10000` | 16 | report associated text | `docs/keyboard-protocol.rst:282`, detail `:395` |
+| `0b1` | 1 | disambiguate escape codes | `docs/keyboard-protocol.rst:278`, detail `:319-327` |
+| `0b10` | 2 | report event types | `docs/keyboard-protocol.rst:279`, detail `:353-356` |
+| `0b100` | 4 | report alternate keys | `docs/keyboard-protocol.rst:280`, detail `:370-372` |
+| `0b1000` | 8 | report all keys as escape codes | `docs/keyboard-protocol.rst:281`, detail `:384-387` |
+| `0b10000` | 16 | report associated text | `docs/keyboard-protocol.rst:282`, detail `:398-400` |
 
 The escape-code vocabulary that manipulates the flags and the per-screen stack (all end in the final byte `u`):
 
@@ -103,6 +440,48 @@ The escape-code vocabulary that manipulates the flags and the per-screen stack (
 | **pop** off the stack | `CSI < number u` (number defaults to 1) | `docs/keyboard-protocol.rst:297` | `screen_pop_key_encoding_flags` (`kitty/screen.c:1248`) |
 
 The specification additionally mandates the stack-size limit, separate per-screen stacks, the empty-pop reset, and the oldest-first eviction policy at `docs/keyboard-protocol.rst:299-303`, with the design rationale for independent stacks at `docs/keyboard-protocol.rst:305-312`.
+
+**Observed effect of each flag bit (real parser + encoder).** These bits are not merely documented — each was exercised at runtime. `Ctrl+Shift+a` is not legacy-representable, so it isolates the *modifier / alternate-key* machinery; a plain `a` *is* legacy-representable, so it isolates the *disambiguate / report-all / report-text* machinery. Together they cover every bit.
+
+- **`0b1` disambiguate** and **`0b10000` report-associated-text** leave a legacy-representable key literal, while **`0b1000` report-all-keys** forces it into an escape code (full discussion in OBJ-5(c)):
+
+```text
+plain 'a' under flags=0  (legacy)          : b'a'
+plain 'a' under flags=1  (disambiguate)    : b'a'
+plain 'a' under flags=8  (report-all-keys) : b'\x1b[97u'
+plain 'a' under flags=16 (report-text)     : b'a'
+```
+
+- **`0b10` report event types** adds a per-event sub-parameter (`:1` press [default], `:2` repeat, `:3` release). With only this bit set, a *press* of a legacy key stays literal, but *repeat* and *release* — which legacy encoding cannot express — become CSI-`u` events:
+
+```text
+flags=0  press  : b'a'
+flags=0  repeat : b'a'
+flags=0  release: b''
+flags=2  press  : b'a'
+flags=2  repeat : b'\x1b[97;1:2u'
+flags=2  release: b'\x1b[97;1:3u'
+```
+
+- **`0b100` report alternate keys** appends the *shifted* key codepoint (as `base:shifted`) when the encoder is given one; with `Ctrl+Shift+a` and `shifted_key = ord('A') = 65` the `:65` field appears only once bit 4 is set:
+
+```text
+flags=0 (no bit4), no shifted_key      : b'\x1b[97;6u'
+flags=4 (bit4), no shifted_key         : b'\x1b[97;6u'
+flags=4 (bit4), shifted_key=65 ('A')   : b'\x1b[97:65;6u'
+```
+
+**Observed set-mode arithmetic (`CSI = flags ; mode u`, through the real parser).** Feeding the set sequences through `parse_bytes` confirms `screen_set_key_encoding_flags` (`kitty/screen.c:1220`): mode `1` = replace, mode `2` = OR (set bits), mode `3` = AND-NOT (reset bits), and an omitted mode defaults to replace:
+
+```text
+CSI=5;1u (replace)     -> flags=5
+CSI=2;1u (replace)     -> flags=2
+CSI=5u   (default=1)   -> flags=5
+CSI=1;1u (base)        -> flags=1
+CSI=8;2u (OR onto 1)   -> flags=9
+CSI=1;3u (AND-NOT 1)   -> flags=8
+CSI=8;3u (AND-NOT 8)   -> flags=0
+```
 
 ---
 
@@ -172,9 +551,9 @@ The second block is the cross-buffer isolation check: a value (`3`) is preset on
 
 ## Section 5 — OBJ-3: Controlled test with real byte capture
 
-**Direct answer.** For the same key press `Ctrl+Shift+a`, the exact bytes transmitted to the child are `ESC [ 9 7 ; 6 u` (`b'\x1b[97;6u'`) in **every** stack state and on **both** buffers — see the stage table in OBJ-1 (rows A–D). The bytes do not vary with the active flags for this particular key.
+**Direct answer.** For the same key press `Ctrl+Shift+a`, the exact bytes transmitted to the child are `ESC [ 9 7 ; 6 u` (`b'\x1b[97;6u'`, **seven** bytes) in **every** stack state exercised in the round-trip (`flags` = 0, 1, 8) and on **both** buffers — see the stage table in OBJ-1 (rows A–D). The invariance is specifically for the **primary-key encoding**: it also holds under report-alternate-keys (`flags` = 4) *as long as no shifted key is supplied*. The **one** way to change these bytes is to enable report-alternate-keys **and** hand the encoder a shifted key, which appends the alternate codepoint (`b'\x1b[97:65;6u'`, shown below). So the accurate claim is *“flag-invariant for the primary-key encoding of `Ctrl+Shift+a`”*, not *“invariant under every possible flag and parameter combination”*.
 
-**Observed output (unedited) — the same six-byte result at every stage:**
+**Observed output (unedited) — the same seven-byte result at every stage:**
 
 ```text
 A)  main, no flags pushed                flags=0   bytes=b'\x1b[97;6u'
@@ -184,7 +563,7 @@ C)  alt, after CSI>8u (report-all)        flags=8   bytes=b'\x1b[97;6u'
 D)  main, after switching back            flags=1   bytes=b'\x1b[97;6u'   <-- main flag 1 SURVIVED
 ```
 
-**Cause → effect.** A `Ctrl+Shift`+letter combination **cannot be represented in legacy encoding**, so kitty's encoder always falls back to the disambiguating CSI-`u` form regardless of which progressive-enhancement flags are active — which is why the bytes are flag-invariant here. Decoding the six bytes:
+**Cause → effect.** A `Ctrl+Shift`+letter combination **cannot be represented in legacy encoding**, so kitty's encoder always falls back to the disambiguating CSI-`u` form regardless of which progressive-enhancement flags are active *for the primary-key encoding* — which is why the bytes are invariant across the tested states here (the report-alternate-keys exception is shown afterward). Decoding the seven bytes:
 
 - `\x1b[` is the CSI introducer (`ESC [`).
 - `97` is the key's Unicode codepoint, `ord('a')` = 97 (decimal).
@@ -199,9 +578,19 @@ GLFW_MOD_SHIFT = 1 (csi maps ->1)
 GLFW_MOD_CONTROL = 4 (csi maps ->4)
 computed m = 5 -> ;{m+1} = ;6
 encode_key_for_tty(Ctrl+Shift+a, flags=0) = b'\x1b[97;6u'
-expected CSI form           = b'\x1b[97;6u'
+expected CSI form                          = b'\x1b[97;6u'
 MATCH: True
 ```
+
+**The one exception — report-alternate-keys with a shifted key (observed).** The invariance above is for the *primary-key* encoding. If the alternate-keys flag (`0b100`) is set **and** the encoder is handed a shifted key, the emitted bytes change — the alternate codepoint is appended as `base:shifted`. This was exercised directly through `encode_key_for_tty`:
+
+```text
+flags=0 (no bit4), no shifted_key      : b'\x1b[97;6u'
+flags=4 (bit4), no shifted_key         : b'\x1b[97;6u'
+flags=4 (bit4), shifted_key=65 ('A')   : b'\x1b[97:65;6u'
+```
+
+So `Ctrl+Shift+a` becomes `b'\x1b[97:65;6u'` — `97` (`a`) and `65` (`A`) joined by `:` — under report-alternate-keys once a shifted key is provided. This is the **sole** observed condition under which the `Ctrl+Shift+a` byte stream departs from `b'\x1b[97;6u'`, and it is exactly why the OBJ-3 invariance is stated for the *primary-key encoding* rather than unconditionally.
 
 **The path these bytes travel.** In the live runtime, a key event is composed by `encode_glfw_key_event(ev, screen->modes.mDECCKM, screen_current_key_encoding_flags(screen), encoded_key)` (`kitty/keys.c:250-251`) — note the third argument is the **current** flags of the **currently active** buffer, read via `screen_current_key_encoding_flags` (`kitty/screen.c:1204`). The Python entry point used for this investigation, `pyencode_key_for_tty` (`kitty/keys.c:311-319`), composes the **same** `encode_glfw_key_event(...)` call and is registered to Python as `encode_key_for_tty` at `kitty/keys.c:334`. That is why encoding through `encode_key_for_tty` is a faithful stand-in for what the terminal sends to the child.
 
@@ -249,7 +638,23 @@ case ALTERNATE_SCREEN:
     else if (!val && self->linebuf != self->main_linebuf) screen_toggle_screen_buffer(self, mode == ALTERNATE_SCREEN, mode == ALTERNATE_SCREEN);
 ```
 
-Crucially for this investigation, the key-encoding-flag pointer is repointed **identically for all three modes** — the repoint at `kitty/screen.c:1079`/`1086` runs unconditionally inside `screen_toggle_screen_buffer` regardless of the `save_cursor`/`clear_alt_screen` arguments. So the **choice of DEC mode does not affect the flag-stack isolation**; the flag stack is independent of the cursor-save/screen-clear behavior. (This is why the investigation uses `1049` throughout — the mode difference matters for the cursor and screen contents, not for the stacks.)
+The **mechanism** is that the key-encoding-flag pointer is repointed **identically for all three modes**: the repoint at `kitty/screen.c:1079`/`1086` runs unconditionally inside `screen_toggle_screen_buffer`, independent of the `save_cursor`/`clear_alt_screen` arguments. Rather than rely on that reading alone, each mode was driven through the **real parser** and compared directly. For every mode the probe positions the cursor at row 4 / col 5 (`CSI 4 ; 5 H` → cursor `(x=4, y=3)`), pushes disambiguate on main (`CSI > 1 u`), enters the alternate screen (`CSI ? <mode> h`), pushes report-all-keys on alternate (`CSI > 8 u`) and writes `ZZ`, switches back (`CSI ? <mode> l`), then re-enters (`CSI ? <mode> h`) — reading the flag stacks, cursor, and alt-screen text at each stage:
+
+**Observed output (unedited) — DEC 47 vs 1047 vs 1049, stack + cursor + alt-screen at each stage (before / during / after / re-entry):**
+
+```text
+mode 47   | stack: main_before=1 alt_during=0 main_after=1 alt_reentry=8
+           cursor: main_before=(4, 3) alt_entry=(0, 0) main_after=(2, 0)  (NOT restored)
+           alt screen: during='ZZ||||' reentry='ZZ||||'  (NOT cleared)
+mode 1047 | stack: main_before=1 alt_during=0 main_after=1 alt_reentry=8
+           cursor: main_before=(4, 3) alt_entry=(0, 0) main_after=(2, 0)  (NOT restored)
+           alt screen: during='ZZ||||' reentry='ZZ||||'  (NOT cleared)
+mode 1049 | stack: main_before=1 alt_during=0 main_after=1 alt_reentry=8
+           cursor: main_before=(4, 3) alt_entry=(0, 0) main_after=(4, 3)  (RESTORED)
+           alt screen: during='ZZ||||' reentry='||||'  (CLEARED on re-entry)
+```
+
+**What is observed.** For **all three** modes the flag-stack columns are **identical** — `main_before=1`, `alt_during=0` (the alternate buffer’s own initially-empty stack), `main_after=1` (main’s pushed flag survived the round-trip), and `alt_reentry=8` (the alternate buffer’s own pushed flag survived). So the **choice of DEC mode does not affect the flag-stack isolation** — this is now an **observed** result, not a code inference. What **does** differ is precisely the cursor and alt-screen side effects: under **`1049`** the cursor is **restored** to its pre-switch `(4, 3)` and the alternate screen is **cleared** on re-entry (`reentry='||||'`), whereas under **`47`** and **`1047`** the cursor is **not** restored (it stays at `(2, 0)`, where writing `ZZ` left it) and the alternate-screen content **persists** (`reentry='ZZ||||'`). This matches the source exactly: `save_cursor` / `clear_alt_screen` are `mode == ALTERNATE_SCREEN` (true only for `1049`) while the flag-pointer repoint is unconditional. (The rest of the investigation uses `1049`; the mode difference matters for cursor/screen contents, not for the stacks.)
 
 ### (b) Empty / over-pop reset, and the query response
 
@@ -277,7 +682,7 @@ plain 'a' under flags=8  (report-all-keys) : b'\x1b[97u'
 plain 'a' under flags=16 (report-text)     : b'a'
 ```
 
-**Cause → effect.** Report-all-keys (`0b1000`) forces even a plain `a` into an escape code, `CSI 97 u` (`b'\x1b[97u'`), because that flag *"turns on key reporting even for key events that would otherwise generate text"* (`docs/keyboard-protocol.rst:376`). Disambiguate (`0b1`, `docs/keyboard-protocol.rst:316`) and report-associated-text (`0b10000`, `docs/keyboard-protocol.rst:395`) leave the plain key as the literal byte `b'a'`. This is the concrete reason the buffer a key is encoded under matters: because each buffer carries its **own** current flags, the **same** physical key can yield **different** bytes depending on which buffer is active — e.g. a plain `a` typed on an alternate screen running under report-all-keys would be `b'\x1b[97u'`, while the same key on a main screen in legacy mode would be `b'a'`. (Contrast this with `Ctrl+Shift+a` in OBJ-3, which is flag-*invariant* because it is not legacy-representable.)
+**Cause → effect.** Report-all-keys (`0b1000`) forces even a plain `a` into an escape code, `CSI 97 u` (`b'\x1b[97u'`), because that flag *"turns on key reporting even for key events that generate text"* (`docs/keyboard-protocol.rst:384-385`). Disambiguate (`0b1`, `docs/keyboard-protocol.rst:319-327`) and report-associated-text (`0b10000`, `docs/keyboard-protocol.rst:398-400`) leave the plain key as the literal byte `b'a'`. This is the concrete reason the buffer a key is encoded under matters: because each buffer carries its **own** current flags, the **same** physical key can yield **different** bytes depending on which buffer is active — e.g. a plain `a` typed on an alternate screen running under report-all-keys would be `b'\x1b[97u'`, while the same key on a main screen in legacy mode would be `b'a'`. (Contrast this with `Ctrl+Shift+a` in OBJ-3, whose *primary-key* encoding is flag-invariant because it is not legacy-representable — the sole exception being report-alternate-keys with a shifted key, which appends `:65`.)
 
 ### (d) How the parser routes these operations
 
@@ -316,4 +721,3 @@ So readers can see how each escape code reaches the handlers above, the CSI-`u` 
 **Headless harness (`kitty_tests/`).** `parse_bytes` drives the real VT parser (`kitty_tests/__init__.py:30`); `Callbacks.write` accumulates child-bound bytes into `wtcbuf` (`kitty_tests/__init__.py:50-51`); `create_screen` is the standard `Screen` factory (`kitty_tests/__init__.py:237`). Alternate-buffer test patterns live in `kitty_tests/screen.py`, and the modifier-encoding `csi()` helper cross-checked in OBJ-3 is in `kitty_tests/keys.py:22`.
 
 **Out-of-scope note.** `keyboard_mode_stack` (`kitty/keys.py:67`) is kitty's internal key-*mapping* mode stack and is a **different** mechanism from the per-screen C protocol-enhancement flag stack that is the subject of this document. It is named here solely to keep the two from being conflated.
-
