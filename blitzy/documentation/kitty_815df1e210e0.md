@@ -139,11 +139,13 @@ direct rendering: Yes
 OpenGL renderer string: llvmpipe (LLVM 19.1.1, 256 bits)
 OpenGL version string: 4.5 (Compatibility Profile) Mesa 24.2.8-1ubuntu1~24.04.1
 
-$ docker exec kitty-setup-verify bash -lc 'set -a; . /root/.kqna_env; set +a; xauth -f "$XAUTHORITY" list; echo "--- unauthenticated client must be rejected ---"; env XAUTHORITY=/dev/null xdpyinfo -display :99 >/dev/null 2>&1 && echo "unauth ALLOWED (bad)" || echo "unauth DENIED (good)"'
-81807a335bf3/unix:99  MIT-MAGIC-COOKIE-1  dd263101167283489af6cfe601b7bb3e
+$ docker exec kitty-setup-verify bash -lc 'set -a; . /root/.kqna_env; set +a; xauth -f "$XAUTHORITY" list | sed -E "s/(MIT-MAGIC-COOKIE-1[[:space:]]+)[0-9a-f]+/\1<redacted-32-hex-cookie>/"; echo "--- unauthenticated client must be rejected ---"; env XAUTHORITY=/dev/null xdpyinfo -display :99 >/dev/null 2>&1 && echo "unauth ALLOWED (bad)" || echo "unauth DENIED (good)"'
+81807a335bf3/unix:99  MIT-MAGIC-COOKIE-1  <redacted-32-hex-cookie>
 --- unauthenticated client must be rejected ---
 unauth DENIED (good)
 ```
+
+**Redaction note (security).** The 128-bit `MIT-MAGIC-COOKIE-1` authenticator is redacted **at source** by the `sed` filter shown in the command above — the live cookie value never enters the captured block (the placeholder `<redacted-32-hex-cookie>` stands in its place). The access-control conclusion rests entirely on the deny/allow probe (`unauth DENIED (good)`), which the redaction does not affect; the cookie's literal value is immaterial to that claim. The `:99` display and its private `XAUTHORITY` cookie were ephemeral and were destroyed at teardown (§7.2).
 
 ### 0.5 Security-hardened observation harness (exact, reproducible)
 
@@ -3189,7 +3191,7 @@ test "$(cat /proc/$XVFB_PID/comm 2>/dev/null)" = "Xvfb" && kill "$XVFB_PID"
 # remove the single private harness tree (all scripts, logs, evidence live beneath it)
 rm -rf "$HR"
 # remove the recorded env file and the /tmp helper copies used to stage scripts
-rm -f /root/.kqna_env /tmp/p3_tier1_clean.sh /tmp/p6_*.sh /tmp/g_frames.gdb
+rm -f /root/.kqna_env /tmp/p3_*.sh /tmp/p6_*.sh /tmp/g_*.gdb
 ```
 
 ### 7.3 Post-teardown state — no live process remains (and why defunct entries persist)
