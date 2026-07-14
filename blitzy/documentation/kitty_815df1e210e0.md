@@ -85,7 +85,7 @@ $ git log --author=agent@blitzy.com --oneline -1
 
 An empty `git status --porcelain` and empty `git diff --stat` confirm the tree was clean before observation. The final integrity check (only this `.md` added; no source file modified) is shown in §14.3.
 
-> **Provenance note.** The `HEAD` printed above, `722ca9e9e`, is the *investigation-time* commit at which these baseline captures and all runtime observations in this document were taken. The document was subsequently revised in documentation-only commits (`e4e0f7afe`, then `146e07c35`, and this reconciliation), each of which modifies **only this `.md` file**. The source tree is therefore byte-identical from the base commit `815df1e21` through the current `HEAD` — `git diff --name-only 815df1e21..HEAD` lists only this document — so re-running `git rev-parse HEAD` today returns a later (documentation-only) commit than the `722ca9e9e` shown above, while every source `file:line` anchor in this document remains exactly valid.
+> **Provenance note.** The `HEAD` printed above, `722ca9e9e`, is the *investigation-time* commit at which these baseline captures and all runtime observations in this document were taken. The document was subsequently revised in a series of documentation-only commits, each of which modifies **only this `.md` file**. The source tree is therefore byte-identical from the base commit `815df1e21` through the current `HEAD` — `git diff --name-only 815df1e21..HEAD` lists only this document — so re-running `git rev-parse HEAD` today returns a later (documentation-only) commit than the `722ca9e9e` shown above, while every source `file:line` anchor in this document remains exactly valid.
 
 ---
 
@@ -101,7 +101,7 @@ $ uname -a
 Linux reverse-code-generator-ed2699d3-g28x9 6.6.122+ #1 SMP Thu Apr  2 09:59:00 UTC 2026 x86_64 GNU/Linux
 ```
 
-The canonical build/run container is the image named in the setup instructions, `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (from `ghcr.io/scaleapi/swe-atlas`), a Linux/FontConfig/FreeType environment (the canonical platform for this investigation; macOS CoreText is documented for completeness only).
+The canonical build/run container is the image named in the setup instructions, `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (from `ghcr.io/scaleapi/swe-atlas`), a Linux/FontConfig/FreeType environment (the canonical platform for this investigation; macOS CoreText is documented for completeness only). (The `uname -a` line above prints an ephemeral CI/Kubernetes pod hostname, `reverse-code-generator-ed2699d3-g28x9`, which carries no secret, credential, or network-topology significance; it is reproduced here unaltered only because the rule set mandates complete, unedited command output.)
 
 ### 2.2 Toolchain
 
@@ -159,7 +159,7 @@ There are **37** Arabic-capable family+file entries (26 unique family names). Cr
 
 ### 2.4 Display stack, window manager, and readiness (OBSERVED)
 
-Reaching atlas initialization at real startup requires an OpenGL context, and reaching the per-cell render path requires the OS window to be **mapped and exposed** — otherwise `should_os_window_be_rendered()` [`kitty/glfw.c:1812`] returns false (iconified / not-visible / occluded) and the render path never runs. A headless X server (Xvfb) plus a window manager (openbox) satisfies both. The harness (§4) allocates a **unique free display**, starts Xvfb and openbox, captures their exact PIDs, waits for readiness, and tears down only those PIDs. Bring-up header of the canonical harness run whose complete output is embedded in §4.1 (same `WORK` directory, `/tmp/kitty_obs.c2jvSe3Q`; the `WORK` suffix and PIDs are per-run `mktemp`/process values and differ on every invocation):
+Reaching atlas initialization at real startup requires an OpenGL context, and reaching the per-cell render path requires the OS window to be **mapped and exposed** — otherwise `should_os_window_be_rendered()` [`kitty/glfw.c:1812`] returns false (iconified / not-visible / occluded) and the render path never runs. A headless X server (Xvfb) plus a window manager (openbox) satisfies both. The `-ac` flag on the Xvfb invocation (shown below and in §4) disables X host-based access control; it is reproduced verbatim from the approved canonical setup instructions and is safe in this context because Xvfb listens only on a Unix-domain socket (it defaults to `-nolisten tcp`, so there is **no** network exposure), each run allocates its own unique display, and the container is single-tenant and ephemeral — on a shared multi-user host, `-ac` should be reconsidered. The harness (§4) allocates a **unique free display**, starts Xvfb and openbox, captures their exact PIDs, waits for readiness, and tears down only those PIDs. Bring-up header of the canonical harness run whose complete output is embedded in §4.1 (same `WORK` directory, `/tmp/kitty_obs.c2jvSe3Q`; the `WORK` suffix and PIDs are per-run `mktemp`/process values and differ on every invocation):
 
 ```text
 WORK=/tmp/kitty_obs.c2jvSe3Q  (umask=0077)
@@ -1254,6 +1254,7 @@ The `create_test_font_group` cell-metric corroboration and the C metrics probe (
 [T] U+62d using previous fallback font at index: 0
 [T] U+628 using previous fallback font at index: 0
 [T] U+627 using previous fallback font at index: 0
+[T] U+6f U+301 U+323 using previous fallback font at index: 0
 [T] GL version string: '4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 4.5
 ```
 
