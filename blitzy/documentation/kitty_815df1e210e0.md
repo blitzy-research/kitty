@@ -593,7 +593,7 @@ additions [kittens/diff/collect.go:332-333].
 **Run & output** [OBSERVED] — fixture **F1**:
 
 ```console
-$ python3 /tmp/dk_harness/make_fixtures.sh
+$ bash /tmp/dk_harness/make_fixtures.sh
 $ DK_ROWS=40 DK_COLS=120 python3 /tmp/dk_harness/ptycap.py /tmp/dk_captures/F1.raw 2.0 -- \
       ./kitty/launcher/kitty +kitten diff /tmp/dk_fixtures/F1/left /tmp/dk_fixtures/F1/right
 $ DK_ROWS=40 DK_COLS=120 python3 /tmp/dk_harness/vtframes.py /tmp/dk_captures/F1.raw --final
