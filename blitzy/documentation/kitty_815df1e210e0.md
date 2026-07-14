@@ -1414,7 +1414,35 @@ bold_italic_font DejaVuSansMono-BoldOblique
 # END_KITTY_FONTS-----END kitty.conf.bak-----
 ```
 
-  The block is replaced in place (`api.go:331-334`) and `.bak` (the prior 190‑byte block) is written because the file was non‑empty (`api.go:343-344`). (`Symbols Nerd Font Mono` has only a `Regular` style, so `bold_font`/`italic_font`/`bold_italic_font` resolve to `auto`, and the family is written in the `family="…"` spec form.) **[observed]**
+  The block is replaced in place (`api.go:331-334`) and `.bak` (the prior 190‑byte block) is written because the file was non‑empty (`api.go:343-344`). **[observed]**
+
+  **Why `font_family` takes the `family="…"` form while the other three keys become `auto`.** This is **not** governed by how many styles the chosen family has — it is governed by whether the chosen family matches the family the *prior* `kitty.conf` resolved to. Here the chosen family (`Symbols Nerd Font Mono`) does not equal the prior resolved family (`DejaVu Sans Mono`, written by run #1). The four serialized strings are computed by `faces.on_enter` (`kittens/choose_fonts/faces.go:145-159`): for each face it runs `*setting = utils.IfElse(family == conf.Family, conf.Spec, defval)` (`faces.go:150`), where `conf` is taken from `resolved_faces_from_kitty_conf` — a `ResolvedFaces` (`kittens/choose_fonts/types.go:78-83`; each field a `ResolvedFace{Family, Spec}`, `types.go:73-76`) populated at `ui.go:97` from the backend's `list_monospaced_fonts` resolution of the current/prior config. On a **match** the resolved spec is emitted (`conf.Spec`, e.g. `DejaVuSansMono-Bold`); on a **mismatch** `font_family` falls back to a `fmt.Sprintf` of `family="%s"` (`faces.go:152`) and `bold_font`/`italic_font`/`bold_italic_font` fall back to `auto` (`faces.go:153-155`). `serialized()` (`final.go:63-70`) then merely joins whatever strings `faces_settings` already holds. *(Code path read from source; the resulting behavior is confirmed at runtime by the discriminator below.)*
+
+  **Discriminator — same chosen family, opposite prior config, opposite form.** Driving the **real** `kitten choose-fonts`: choosing **DejaVu Sans Mono** on a pristine dir (whose default already resolves to DejaVu — a *match*) writes the resolved face names, whereas choosing the **same** DejaVu Sans Mono in a dir whose block already resolves to Symbols (a *mismatch*) writes `font_family family="DejaVu Sans Mono"` plus three `auto` values — even though DejaVu Sans Mono has real `Bold`/`Oblique`/`Bold Oblique` faces (its FontList shows `Styles: Bold, Bold Oblique, Book, Oblique`; cf. the backend `resolved_faces` capture in §R3.4). This refutes any "`Symbols Nerd Font Mono` has only a `Regular` style, so … `auto`" reading:
+
+```
+===== DISCRIMINATOR: same family (DejaVu Sans Mono, 4 real faces), different prior config =====
+### CMD: (real kitten) pristine dir -> filter 'DejaVu Sans Mono' -> Enter/Enter/Enter   [MATCH: default already resolves to DejaVu]
+-----BEGIN kitty.conf-----
+# BEGIN_KITTY_FONTS
+font_family      DejaVuSansMono
+bold_font        DejaVuSansMono-Bold
+italic_font      DejaVuSansMono-Oblique
+bold_italic_font DejaVuSansMono-BoldOblique
+# END_KITTY_FONTS-----END kitty.conf-----
+### (190 bytes, sha256 db8f2c845fe9d52b3a58790a090a4947eaad63b726777d536904064201235da5)
+### CMD: (real kitten) SAME family 'DejaVu Sans Mono' in a config whose block already resolves to Symbols -> Enter/Enter/Enter   [MISMATCH]
+-----BEGIN kitty.conf-----
+# BEGIN_KITTY_FONTS
+font_family      family="DejaVu Sans Mono"
+bold_font        auto
+italic_font      auto
+bold_italic_font auto
+# END_KITTY_FONTS-----END kitty.conf-----
+### (146 bytes, sha256 31536af22fac45010728b0e1a393d66418ba1988fd8a445045231f1b052894cc)
+```
+
+  Same chosen family, opposite prior config, opposite serialized form — the deciding factor is `family == conf.Family` (`faces.go:150`), not the chosen family's style count. **[observed]**
 
 - **Pre‑existing user config → comment‑out existing bare font line + append after a blank‑line separator; `.bak` written.** The `printf` below only establishes a *normal, pre‑existing, user‑authored* `kitty.conf` (a comment, `cursor_shape beam`, and a bare hand‑typed `font_family Ubuntu Mono`); it does **not** fake the font result and is **not** a substitute for the kitten flow — the real kitten still performs the font write:
 
