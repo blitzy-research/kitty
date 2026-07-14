@@ -278,8 +278,8 @@ kitty's own observed behaviour.
 
 - **`(OS contract)` `SIGCHLD` is not queued.** Standard signals are not queued: if multiple children change
   state while `SIGCHLD` is blocked or pending, the parent still sees a *single* `SIGCHLD`, so a correct
-  handler must `waitpid(…, WNOHANG)` in a **loop** to reap them all (`signal(7)`, "Standard signals … are not
-  queued"; `wait(2)`). This is exactly `reap_children()` (`child-monitor.c:1413-1426`).
+  handler must `waitpid(…, WNOHANG)` in a **loop** to reap them all (`signal(7)`: "Standard signals do not
+  queue."; `wait(2)`). This is exactly `reap_children()` (`child-monitor.c:1413-1426`).
 - **`(OS contract)` `TIOCSWINSZ` → `SIGWINCH`.** Setting the window size on the PTY *master* makes the kernel
   send `SIGWINCH` to the *foreground process group* of the terminal and stores the size in the kernel
   (`tty_ioctl(4)`: "TIOCSWINSZ … The kernel … sends a `SIGWINCH` signal to the foreground process group").
@@ -954,33 +954,76 @@ reap_children(ChildMonitor *self, bool enable_close_on_child_death) {
 (`kitty/child-monitor.c:1413-1426`.) Note the two roles: `mark_child_for_removal` is **gated** by the option
 (off by default), while `mark_monitored_pids` always runs to reap zombies and capture monitored statuses.
 
-**Reaping and zombies — now *observed* at the syscall level.** The earlier draft rested the reaping claim on
-UI convergence; it is now upgraded to a direct `wait4` capture. Tracing the canonical binary with
-`strace -f -e trace=wait4,waitid` through an **N = 40 instant-exit + 1 keeper** session reaped **every** child
-(stable across 3 identical runs):
+**Reaping and zombies — now *observed* at the syscall level, across both churn regimes.** The earlier draft
+rested the reaping claim on UI convergence; it is now upgraded to a direct `wait4` capture. Tracing the
+canonical binary with `strace -f -e trace=wait4,waitid` and reducing every `reap_children` call — each
+`waitpid(-1, &status, WNOHANG)` at `:1418`, which glibc lowers to the `wait4` syscall — to its outcome yields
+two distinct, fully reproducible signatures that differ **only** in whether a **long-lived keeper** child is
+present. Regime A uses the canonical saturated session `$S40` from the §11.1 harness (`make_churn 40` = 40 ×
+`launch sh -c 'exit 0'` + 1 × `launch sh -c 'sleep 30'`); Regime B uses the identical generator **without** the
+trailing keeper line (`$S40nk` = 41 × `launch sh -c 'exit 0'`). Both sessions create **41** children. Each
+regime below was run **twice, identically**, and both runs of each regime were byte-identical in these counts.
+
+*Regime A — 40 instant-exit windows **plus 1 keeper**; 41 children total.* The keeper is deliberately still
+alive when the run's `timeout` bound fires, so `waitpid(-1, WNOHANG)` **never** sees an empty process table:
+it returns `0` ("a child exists, none newly exited" — the `else break` branch at `:1424`), **never**
+`-1 ECHILD`, and the 40 short-lived children are each reaped exactly once:
 
 ```
 $ strace -f -e trace=wait4,waitid -o wait4.out \
     timeout --signal=TERM --kill-after=5s 8 \
-    ./kitty/launcher/kitty --debug-rendering --config NONE --session "$CHURN_SESSION"
+    ./kitty/launcher/kitty --debug-rendering --config NONE --session "$S40"
+Child launched (children created):                          41
+wait4() calls returning a positive pid (successful reaps):  40
+wait4() = 0    (WNOHANG, no exited child yet):              40
+wait4() = -1 ECHILD (loop terminator, no children left):     0
+kitty exit=124
+```
+
+`kitty exit=124` is the `timeout` bound being reached while the keeper still runs (the §1/§2 convention:
+124 = "time limit reached", **not** a crash); 40 of the 41 children are reaped and the keeper is intentionally
+left alive.
+
+*Regime B — 41 instant-exit windows, **no keeper**; 41 children total.* Every child exits, so after the
+**last** one is reaped the next `waitpid(-1, WNOHANG)` returns `-1 ECHILD` ("no children left") — the loop's
+`pid == -1` terminator at `:1419-1420` — and kitty then self-quits once its final window is gone:
+
+```
+$ strace -f -e trace=wait4,waitid -o wait4.out \
+    timeout --signal=TERM --kill-after=5s 8 \
+    ./kitty/launcher/kitty --debug-rendering --config NONE --session "$S40nk"
 Child launched (children created):                          41
 wait4() calls returning a positive pid (successful reaps):  41
 wait4() = 0    (WNOHANG, no exited child yet):              40
-wait4() = -1 ECHILD (loop terminator, no children left):     2
+wait4() = -1 ECHILD (loop terminator, no children left):     1
 kitty exit=0
 ```
 
-with representative reap lines (glibc `waitpid` lowering to the `wait4` syscall — exactly `reap_children`'s
-`waitpid(-1, &status, WNOHANG)` at `:1418`):
+The single `ECHILD` terminator is captured verbatim (the reaper task-id and the buffer address vary
+run-to-run):
 
 ```
-96059 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 96060
-96059 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 96061
-96059 wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 96062
+501   wait4(-1, 0x7f4e7e7fbe60, WNOHANG, NULL) = -1 ECHILD (No child processes)
 ```
 
-**41 reaps for 41 children** (with `kitty exit=0`) is direct evidence of complete reaping; **no `waitid` lines
-appeared**, confirming glibc lowers `waitpid` to `wait4` here. The complementary **zombie check** (the §8
+with representative reap lines — note each positive reap (`P`) is immediately followed by a `WNOHANG`-empty
+`= 0` (`Z`), i.e. every pass drained exactly **one** child (identical shape in both regimes):
+
+```
+501   wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 502
+501   wait4(-1, 0x7f4e7e7fbe60, WNOHANG, NULL) = 0
+501   wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 503
+501   wait4(-1, 0x7f4e7e7fbe60, WNOHANG, NULL) = 0
+501   wait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 504
+501   wait4(-1, 0x7f4e7e7fbe60, WNOHANG, NULL) = 0
+```
+
+**Reading the two regimes together** makes the terminator semantics unambiguous: `-1 ECHILD` appears **only**
+when no child of any kind remains (Regime B — exactly **1** such call, at the very end) and is **impossible**
+while a live keeper exists (Regime A — **0** such calls, the loop always exiting via the `pid == 0` /
+`else break` branch). Both regimes reap every child they are meant to (40-of-40 short-lived in A, the keeper
+deliberately spared; 41-of-41 in B), and **no `waitid` lines appeared** in either regime, confirming glibc
+lowers `waitpid` to `wait4` here. The complementary **zombie check** (the §8
 lifecycle probe) sampled the live process table and found **0** `Z`-state children parented to kitty **both**
 while children were alive **and** after they exited — kitty reaps promptly and leaks no zombies. (Post-*exit*
 orphans reparent to the container's non-reaping PID 1 `sleep infinity`; that is a container artifact outside
@@ -989,25 +1032,25 @@ what kitty controls, **not** a kitty leak.)
 **Coalescing multiplicity — probed directly, and *not* observed on this build `(observed + inferred)`.** The
 reason `reap_children` uses a `while … waitpid(WNOHANG)` **loop** is the OS contract that `SIGCHLD` is not
 queued (§4): one delivery may stand for several exits. Whether a *single* pass actually drains several
-children is timing-dependent, so it was measured by reducing each `wait4` outcome to a symbol (`P` = reap,
-`Z` = WNOHANG-empty, `E` = ECHILD) and taking the longest run of consecutive `P`s per reap pass:
+children is timing-dependent, so each `wait4` outcome was reduced to a symbol (`P` = positive reap,
+`Z` = `WNOHANG`-empty / `pid == 0`, `E` = `ECHILD` / `pid == -1`) and the longest run of consecutive `P`s per
+reap pass was taken. Both regimes — **including Regime B, where all 41 children exit near-simultaneously** (the
+case most likely to coalesce) — showed a **maximum of 1 child per pass**, stable across both runs of each:
 
 ```
---- run-length distribution: how many children each reap pass drained in ONE WNOHANG loop ---
-  passes that reaped 0 child(ren) in one loop:  2
-  passes that reaped 1 child(ren) in one loop: 41
---- max children reaped in a single pass ---
-1
---- first 80 outcome symbols in order (P/Z/E) ---
+--- run-length distribution: children drained per reap_children pass (each stable across 2 identical runs) ---
+Regime A (keeper):    passes that reaped 1 child = 40;  passes that reaped 0 = 0;  max in a single pass = 1
+Regime B (no keeper): passes that reaped 1 child = 41;  passes that reaped 0 = 0;  max in a single pass = 1
+--- Regime A: full 80 outcome symbols in order (P=reap / Z=WNOHANG-empty / E=ECHILD) ---
 PZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZ
+--- Regime B: full 82 outcome symbols in order (note the trailing `PE`: last reap, then the ECHILD terminator) ---
+PZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPZPE
 ```
 
-Across **four** runs — three with spaced `exit 0` children and one variant engineered to *maximise*
-coalescing (all 40 children `sleep 0.6` so they exit simultaneously, giving the pattern `EPZEPZEPZ…`) — the
-maximum was **1 child per pass** every time. So on this Linux/`signalfd` build the loop demonstrably reaps
-**all** children (observed) but its *multiplicity* benefit (>1 reap per pass) was **never manifested**: the
-`signalfd`-drained poll loop calls `reap_children` frequently enough that each pass finds at most one
-freshly-exited child. The multiplicity is therefore a **latent, defensive** property grounded in the OS
+So on this Linux/`signalfd` build the loop demonstrably reaps **all** children (observed) but its
+*multiplicity* benefit (>1 reap per pass) was **never manifested** — even in Regime B where 41 children exit
+at once: the `signalfd`-drained poll loop calls `reap_children` frequently enough that each pass finds at most
+one freshly-exited child. The multiplicity is therefore a **latent, defensive** property grounded in the OS
 contract and the loop structure `(inferred)` — a distinction the earlier text under-stated by labelling the
 whole effect merely "inferred." Note too that in the **default** config ordinary-window removal is driven
 by **PTY EOF** (`:1535`), not by the reaper marking children, so this reap loop's role by default is zombie
