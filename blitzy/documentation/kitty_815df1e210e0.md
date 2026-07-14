@@ -464,11 +464,11 @@ Command: `make_screen(cols=1, scrollback=…)`, `feed(s, FAMILY)`, then read `s.
 
 ```
 scrollback=0:   visible='👦' [U+1F466] cursor x=2 y=0 ; historybuf.count=1
-scrollback=100: visible='👦' [U+1F466] cursor x=2 y=0 ; historybuf.count=4
+scrollback=100:   visible='👦' [U+1F466] cursor x=2 y=0 ; historybuf.count=4
   history[0]='👧\u200d' [U+1F467 U+200D]
   history[1]='👩\u200d' [U+1F469 U+200D]
   history[2]='👨\u200d' [U+1F468 U+200D]
-  history[3]=''         []
+  history[3]='\x00' [U+0000]
 ```
 
 The history is newest-first: the three evicted *base + ZWJ* groups plus the initial blank line were scrolled off, and the visible cell retains only the newest base. (The blank oldest line reads back as the empty string `''` via `str(historybuf.line(3))`; read by cell index it is a NUL, `'\x00'`/`U+0000` — the same empty line, two readback representations.) In short: the terminal's screen buffer decides *what to keep* by width bookkeeping — a width-2 base overwrites the visible column and everything attached to the prior base leaves the viewport. The AAP's "overwrites cell 0" is the correct **net visible effect**; the precise observed mechanism is **scroll-then-redraw**.
@@ -509,7 +509,7 @@ Command: `feed(s, FAMILY)` then `cpr(s, c)` (sends `b'\x1b[6n'`, reads the reply
 
 ```
   1x1 : cursor before query x=2 y=0 ; send ESC[6n -> reply b'\x1b[1;2R' (ESC[1;2R)
-  20x1: cursor before query x=8 y=0 ; send ESC[6n -> reply b'\x1b[1;9R' (ESC[1;9R)
+  20x1 : cursor before query x=8 y=0 ; send ESC[6n -> reply b'\x1b[1;9R' (ESC[1;9R)
 ```
 
 **Cause → effect (naming the code that does the work):**
@@ -550,8 +550,8 @@ kitty's "grapheme breaking" is width-based segmentation performed inline in **`d
 Command: feed `X` + a zero-width codepoint + `Y` on 20×1. Produced by `obs.py`: `q4b_grapheme()`.
 
 ```
-  'X'+U+200B(ZWSP)+'Y' on 20x1: str='X\u200bY' cells x0='X\u200b' x1='Y' x2='\x00' cursor x=2
-  'X'+U+200D(ZWJ)+'Y'  on 20x1: str='X\u200dY' cells x0='X\u200d'[U+0058 U+200D] x1='Y' cursor x=2
+  'X'+U+200B(ZWSP)+'Y' on 20x1: str='X\u200bY' cells x0='X\u200b'[U+0058 U+200B] x1='Y' x2='\x00' cursor x=2
+  'X'+U+200D(ZWJ)+'Y' on 20x1: str='X\u200dY' cells x0='X\u200d'[U+0058 U+200D] x1='Y' x2='\x00' cursor x=2
 ```
 
 Both `X` and `Y` are width-1 and each begins its own cell; the zero-width joiner/space attaches to the preceding `X`. The cursor advances only 2 columns — the width of `X` and `Y` — with the zero-width codepoint contributing nothing. This matches kitty's own `test_zwj` zero-width cases (`kitty_tests/screen.py:L129-L134`: `X\u200bY`, `X\u200cY`, `X\u200dY` each satisfy `str == input` and `cursor.x == 2`).
@@ -623,8 +623,7 @@ Command: call the extension's `wcswidth(ch)` on each single codepoint. Produced 
 Widths via the extension's `wcswidth` (each a single codepoint):
 
 ```
-man U+1F468=2, ZWJ U+200D=0, heavy-x U+2716=1, VS16 U+FE0F=0, VS15 U+FE0E=0,
-comb-acute U+0301=0, RI-U U+1F1FA=2, ZWSP U+200B=0
+  man U+1F468=2, ZWJ U+200D=0, heavy-x U+2716=1, VS16 U+FE0F=0, VS15 U+FE0E=0, comb-acute U+0301=0, RI-U U+1F1FA=2, ZWSP U+200B=0
 ```
 
 These are the exact widths that `draw_text_loop` uses to decide cell boundaries: width-2 codepoints begin a two-column glyph, width-1 codepoints begin a one-column cell, and width-0 codepoints attach as combining marks. `wcwidth_std` is **defined** in `kitty/wcwidth-std.h:L9-L10` and **called** from `kitty/wcswidth.c:L62`; the emoji-presentation helper `is_emoji_presentation_base` is **defined** in `kitty/wcwidth-std.h:L2941-L2942` and **called** from `kitty/wcswidth.c:L47`/`L54`. (This width rule is the *default*; the regional-indicator pair in §6.3 and the VS16/VS15 selectors in §6.2 are the documented exceptions where a codepoint instead mutates a neighbouring cell.)
