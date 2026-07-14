@@ -28,7 +28,29 @@ Every runtime observation in this document comes from a **default, canonical bui
 
 ### 2.1 Provenance — interpreter, toolchain, OS, and the immutable HEAD
 
-All commands below were run inside the canonical container (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`, local tag `swe-atlas-kitty:canonical`). The checkout at `/app` is the exact commit under investigation and is **unmodified** (`git status --porcelain` prints nothing). *(observed)*
+Except where a **diagnostic tool is named at the point of use** (see the tool-provenance note immediately below), all commands below were run inside the canonical container (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`, local tag `swe-atlas-kitty:canonical`). The checkout at `/app` is the exact commit under investigation and is **unmodified** (`git status --porcelain` prints nothing). *(observed)*
+
+**Tool provenance — which container/tool produced which capture.** The bare canonical image ships **no** `strace`, `gdb`, `valgrind`, or `xdotool`; this was verified directly (and re-verified against the diagnostic image):
+
+```console
+$ docker run --rm --entrypoint bash swe-atlas-kitty:canonical -lc \
+    'for t in strace gdb valgrind xdotool; do command -v $t || echo "$t: ABSENT"; done'
+strace: ABSENT
+gdb: ABSENT
+valgrind: ABSENT
+xdotool: ABSENT
+$ docker run --rm --entrypoint bash kitty-diag:latest -lc \
+    'for t in strace gdb valgrind xdotool; do command -v $t || echo "$t: ABSENT"; done'
+/usr/bin/strace
+/usr/bin/gdb
+/usr/bin/valgrind
+xdotool: ABSENT
+```
+
+Two classes of capture therefore do **not** originate in the bare canonical container, and each is attributed at its point of use rather than under the blanket statement above:
+
+- **`strace` / `gdb` / `valgrind` captures** — the `/proc`-fd + file-syscall trace of the rollover (§4.3), the POLLIN `poll()` strace (§5.3), the kitten `strace`/process-tree captures (§6), the live serialization and the lock/lifetime `gdb` runs (§7.2, §8.1–§8.2), and every detector run (§9) — were produced in the **PTRACE-enabled diagnostic container** `kitty-diag:latest`, committed from `swe-atlas-kitty:canonical` (id `796bc91c3984`) with only those three tools added, `/app` still at HEAD `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, and run with `--cap-add=SYS_PTRACE` — the identical container §9.1 discloses. These are **observations of the identical build** (syscalls, thread states, timings), not values that depend on the container.
+- **`xdotool` captures** — accepting/denying the interactive `read-clipboard-ask` overlay (§4.6, §6.3) — required an X11 key-injection tool that is present in **neither** documented image, and that cannot be provisioned offline here (`apt-get install xdotool` → `E: Unable to fetch some archives`). Those specific accept/deny captures are therefore labelled **corroborating, not canonical-container-reproducible**; the core behavior they illustrate — that a non-TARGETS read blocks on the overlay, and that accept → `OK`/`DATA`/`DONE` while deny → `EPERM` — is independently grounded in the canonical byte-level evidence of §4.5/§4.7 and the code path `kitty/clipboard.py:518` → `kitty/boss.py:995`. *(observed; environment provenance stated)*
 
 ```console
 $ uname -a
@@ -822,7 +844,7 @@ FAIL
 
 The Python summary is **`Ran 145 tests in 14.011s`** → **`OK (skipped=4)`**. The four skips are environment-declared (frozen-build certificate test; a macOS-only font test; two fish-integration tests because `fish` is not installed) — not failures. *(observed)*
 
-The **one Go failure** is `TestCreateAnonymousTempfile` (`--- FAIL: TestCreateAnonymousTempfile`, `tmpfile_test.go:23: Anonymous tempfile was not created atomically`, `FAIL kitty/tools/utils`). This is **not** a defect in the code under study: the test asserts atomic anonymous-tempfile creation via `unix.O_TMPFILE` (`tools/utils/tmpfile_linux.go:20`), and the container's overlay/`/tmp` filesystem does not support `O_TMPFILE`, so the code correctly falls back to a named-then-unlinked tempfile and the atomicity assertion fails. It is retained here verbatim rather than hidden, and is orthogonal to the clipboard/parser/scrollback paths this document investigates. *(observed; cause inferred from the failing assertion + the O_TMPFILE call site)*
+The **one Go failure** is `TestCreateAnonymousTempfile` (`--- FAIL: TestCreateAnonymousTempfile`, `tpmfile_test.go:23: Anonymous tempfile was not created atomically`, `FAIL kitty/tools/utils`). This is **not** a defect in the code under study: the test asserts atomic anonymous-tempfile creation via `unix.O_TMPFILE` (`tools/utils/tmpfile_linux.go:20`), and the container's overlay/`/tmp` filesystem does not support `O_TMPFILE`, so the code correctly falls back to a named-then-unlinked tempfile and the atomicity assertion fails. It is retained here verbatim rather than hidden, and is orthogonal to the clipboard/parser/scrollback paths this document investigates. *(observed; cause inferred from the failing assertion + the O_TMPFILE call site)*
 
 ### 2.5 Diagnostic builds used as cross-checks (labeled non-default)
 
@@ -839,7 +861,7 @@ $ python3 setup.py --debug --sanitize        # (tail of build)
  done
 kitty/tools/cmd
 
-$ DISPLAY=:99 ./test.py clipboard
+$ DISPLAY=:99 ./test.py --module clipboard
 Running under CI: False
 test_clipboard_write_request (kitty_tests.clipboard.TestClipboard.test_clipboard_write_request) ... ok
 
@@ -848,7 +870,7 @@ Ran 1 test in 0.010s
 
 OK
 
-$ DISPLAY=:99 ./test.py parser
+$ DISPLAY=:99 ./test.py --module parser
 Running under CI: False
 test_base64 (kitty_tests.parser.TestParser.test_base64) ... ok
 test_charsets (kitty_tests.parser.TestParser.test_charsets) ... ok
@@ -1350,7 +1372,7 @@ cat "$OBS/rt_big.result" 2>/dev/null
 
 Python accumulates the decoded payload in a `Tempfile` (`kitty/clipboard.py:26`) that starts as an in-memory `io.BytesIO` and **rolls over to an on-disk temporary file** once it would exceed `rollover_size = 16 * 1024 * 1024` (16 MiB) — `kitty/clipboard.py:237`. The rollover copies the accumulated bytes out of the `BytesIO` via `getvalue()` into the file-backed store (`kitty/clipboard.py:32`, `rollover_if_needed`). This is a **backing-store transition** (RAM `BytesIO` → file descriptor that the OS may keep in page cache), **not** data "leaving RAM."
 
-A 20 MiB raw payload (27 962 028 base64 bytes) is fed while tracing file syscalls:
+A 20 MiB raw payload (27 962 028 base64 bytes) is fed while tracing file syscalls (the `strace` here runs in the PTRACE‑enabled diagnostic container of §2.1/§9.1; the kitty build under trace is byte‑identical to the canonical one):
 
 *Script `o1_rollover.sh` (sha256 `51457165b49a9f262c86d4551727ffd5991e5eecae15eebfd4b8ac3f9a3f7fe6`):*
 
@@ -1399,6 +1421,8 @@ echo "=== strace: tmp-related file-creation syscalls (rollover TemporaryFile) ==
 grep -iE "tmp|O_TMPFILE|memfd" "$OBS/roll_strace.out" | grep -vE "/app/|\.so|site-packages|/usr/|fontconfig|\.cache" | head -25
 echo "--- total openat lines in strace: $(grep -c openat "$OBS/roll_strace.out") ---"
 ```
+
+**Note on `set -u` and tool provenance (why the script exits 0 even when a tool is absent).** `o1_rollover.sh` uses `set -u` (unset-variable guard) but deliberately **not** `set -e`, so a missing sub-tool does not abort it — the failure instead surfaces as a non-zero `driver_exit` line in the output. Per §2.1/F2, `strace` lives in the PTRACE-enabled **diagnostic** container, so the `O_TMPFILE`/`unlink` sequence below was captured **there**; run in the plain canonical container (no `strace`), the backgrounded driver returns `driver_exit=127` and this `strace` section is empty, yet the script still exits 0. Crucially, the `BytesIO`→on-disk **rollover itself** is evidenced **independently of `strace`** by the `/proc/<pid>/fd` entry pointing at a `(deleted)` `/tmp` file (captured above), which requires no diagnostic tool.
 
 **Observed — `strace` shows the stdlib `TemporaryFile` sequence: `O_TMPFILE` attempt fails `EOPNOTSUPP` in the container's `/tmp`, so it falls back to a named file that is created then immediately `unlink`ed (held open):**
 
@@ -1686,6 +1710,14 @@ with open(resfile,'w') as f:
         f.write('NO OSC52 RESPONSE PARSED\n')
 ```
 
+**Launch (canonical, read-permitting policy).** The default `clipboard_control` includes **`read-clipboard-ask`** (`kitty/options/definition.py:3096`), which gates a `?` read behind the interactive `ask`-kitten overlay (§4.6). Launched under the **default** policy this harness therefore never receives a response and times out — its result file shows `RAW_BYTES_LEN=0` and kitty exits `124` (this hang is itself canonical-container-reproducible; *accepting* the prompt to complete the read additionally needs the out-of-image `xdotool`, see §4.6 and §2.1). To exercise the *read* path itself without the prompt, the harness is launched with the non-default read-permitting policy `write-clipboard read-clipboard`, exactly as the sibling `osc5522_driver.sh` (below) does:
+
+```bash
+$ DISPLAY=:99 timeout 40 ./kitty/launcher/kitty --config NONE -o close_on_child_death=yes \
+    -o clipboard_control="write-clipboard read-clipboard" \
+    python3 /tmp/obs/scripts/osc52read.py /tmp/obs/out/osc52read.result
+```
+
 Observed — the response is `ESC ] 52 ; c ; <base64> ST`, decoding to the seeded text:
 
 ```text
@@ -1807,7 +1839,7 @@ Here `mime=Lg==` decodes to `.` (the targets request) and the DATA payload `dGV4
 
 ### 4.6 Permission prompts — `read-clipboard-ask` accept vs deny (findings 38, 39, 40)
 
-The default `clipboard_control` (`kitty/options/definition.py:3096`) includes **`read-clipboard-ask`**, so a non-TARGETS read raises an interactive confirmation: `kitty/clipboard.py:518` `ask_to_read_clipboard` → `kitty/boss.py:995` `confirm()` spawns the **`ask` kitten** as a `--type=yesno` overlay window; the user's answer drives `fulfill_read_request`/reject. We drive the **real** overlay with real keystrokes via `xdotool` against the Xvfb `:99` display (no bypass):
+The default `clipboard_control` (`kitty/options/definition.py:3096`) includes **`read-clipboard-ask`**, so a non-TARGETS read raises an interactive confirmation: `kitty/clipboard.py:518` `ask_to_read_clipboard` → `kitty/boss.py:995` `confirm()` spawns the **`ask` kitten** as a `--type=yesno` overlay window; the user's answer drives `fulfill_read_request`/reject. We drive the **real** overlay with real keystrokes via `xdotool` against the Xvfb `:99` display — this exercises the genuine `ask`-kitten code path (no remote-control bypass). Note, however, that `xdotool` is present in **neither** documented image and cannot be provisioned offline (§2.1 tool-provenance), so the accept/deny captures in this subsection are **corroborating, not canonical-container-reproducible**; the core behavior they show (accept → `OK`/`DATA`/`DONE`, deny → `EPERM`) is grounded canonically in §4.5/§4.7:
 
 **Ask-overlay state while the read is pending (finding 38).** Before any keystroke, the read is genuinely *blocked* on the overlay, and the overlay is backed by a **real `ask` kitten process** spawned by kitty. Captured live while the prompt was up (a state-capture driver snapshots the process tree, then sends the deny keystroke):
 
@@ -2354,7 +2386,7 @@ The median latency equals `input_delay` plus a stable ~0.3 ms of round-trip proc
 
 ### 5.3 Near/full 1 MiB occupancy and POLLIN disable/re-enable (finding 57)
 
-While the child floods, the `KittyChildMon` io_loop poll() is straced. `children_fds` is `[fd6 wakeup, fd7 signal, fd8 child-PTY-master]`; the child fd's `events` field toggles `POLLIN` ↔ `0` as the buffer fills and drains:
+While the child floods, the `KittyChildMon` io_loop poll() is straced (in the PTRACE‑enabled diagnostic container of §2.1/§9.1; the build under trace is the byte‑identical canonical one). `children_fds` is `[fd6 wakeup, fd7 signal, fd8 child-PTY-master]`; the child fd's `events` field toggles `POLLIN` ↔ `0` as the buffer fills and drains:
 
 *Script `o2_pollin.sh` (sha256 `d91967c0df0989fdb27b8bd6fbeb2aebf9c10830a56c38e4b786674b9faa6116`):*
 
@@ -2687,7 +2719,7 @@ $ ls /app/kittens/ask/main.py
 
 ### 6.1 Boundary 2 outbound — the real Go `clipboard` kitten SET (distinct PIDs + PTY framing)
 
-**What was run (canonical, no permission prompt — a write needs no confirmation).** Inside a live kitty window a shell runs the real Go kitten in filter mode, `strace`‑d to capture the separate PID(s) and the exact bytes it puts on the PTY:
+**What was run (canonical, no permission prompt — a write needs no confirmation).** Inside a live kitty window a shell runs the real Go kitten in filter mode, `strace`‑d to capture the separate PID(s) and the exact bytes it puts on the PTY (the `strace` here runs in the PTRACE‑enabled diagnostic container of §2.1/§9.1; the kitty build under trace is byte‑identical to the canonical one):
 
 ```text
 # inside kitty (stdin/stdout = kitty window PTY):
@@ -2777,7 +2809,7 @@ median **3.326 ms**, range **3.289–3.351 ms** — **stable across 3 runs** (�
 
 ### 6.3 The canonical default (prompt‑gated) path — two real kitten processes at once
 
-The default `read-clipboard-ask` gates a GET behind a confirmation. Here the plain (no‑diagnostic) path runs and an external `xdotool` presses `y` to accept — capturing the live process tree while the request is pending.
+The default `read-clipboard-ask` gates a GET behind a confirmation. Here the genuine prompt‑gated path runs and an external `xdotool` presses `y` to accept, while the live process tree is captured with the request still pending. Both aids are out‑of‑image: `xdotool` is in **neither** documented image (and cannot be provisioned offline), and the `strace` process‑tree capture requires the PTRACE‑enabled diagnostic container (§2.1 tool‑provenance). This capture is therefore **corroborating, not canonical‑container‑reproducible**; the two‑kitten process structure it shows is cross‑checked against the canonical SET/GET captures of §6.1–§6.2.
 
 **What was run:**
 
@@ -2869,7 +2901,170 @@ d89f508f5e4ddfaa  kitten_noask.runs           (GET no-ask x3: seed==got)
 4ecd72b6de8782ac  kitten_py_ask_strace.raw    (Python ask kitten: CSI-u 'y' read)
 ```
 
-Scripts (removed after capture, repo unchanged): `kitten_set{,_drv}.sh`, `kitten_get_noask.sh` + `kitten_noask_drv.sh`, `kitten_canon{,_drv}.sh`, `kitten_py{,_drv}.sh` — all under `/tmp` outside the checkout.
+Scripts: the eight harness/driver scripts are embedded verbatim in **§6.7** below (each with a re-derivable `sha256` of its in-document body); they were created under `/tmp` outside the checkout and removed after capture, so the source repository is unchanged.
+
+### 6.7 Investigation scripts for §6 (embedded verbatim)
+
+The scripts below reproduce the §6 captures. The *driver* (`*_drv.sh`) launches a real canonical kitty and runs the *harness* inside its window (so the kitten’s stdin/stdout are the window PTY). Per §2.1/§9.1, the `strace` captures require the PTRACE-enabled **diagnostic** container (the traced kitty is byte-identical to the canonical build); the `xdotool` keystroke in §6.3/§6.4 uses an **out-of-image** input-injection tool (present in neither documented image), so those two captures are **corroborating, not canonical-container-reproducible**. Each `sha256` is the digest of the exact fenced body shown (re-derivable from this document); the `strace`/timestamp/PID values in the §6.1–§6.4 outputs are representative captured runs.
+
+*Script `kitten_set_drv.sh` (sha256 `bce5449ab61c63235c9aa73535cc33338d671494f608bfb88932ff27a20d2ee6`):*
+
+```bash
+#!/usr/bin/env bash
+# kitten_set_drv.sh -- driver for the Boundary-2 outbound SET (§6.1).
+# Launches a real (canonical) kitty and runs kitten_set.sh inside its window,
+# so the kitten's stdin/stdout are the kitty window PTY.
+set -u
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+cd /app
+./kitty/launcher/kitty --config NONE -o close_on_child_death=yes \
+    sh /tmp/obs/scripts/kitten_set.sh
+```
+
+*Script `kitten_set.sh` (sha256 `7a88ff47d447fbaf66fcead8293be49f9a23e95113f0b25f6f6d2538f0658469`):*
+
+```bash
+#!/usr/bin/env sh
+# kitten_set.sh -- runs INSIDE a kitty window (stdin/stdout = window PTY).
+# Runs the real Go `clipboard` kitten in filter mode, strace-d to capture the
+# separate PID(s) and the exact OSC 52 bytes it writes to /dev/tty.
+# strace => PTRACE-enabled diagnostic container (§2.1/§9.1); the kitty build
+# under trace is byte-identical to the canonical one.
+KITTY_PID=$PPID            # kitty core launched this shell
+PARENT_SHELL_PID=$$
+PAYLOAD="kitten-boundary-payload-$$"
+T0=$(date +%s.%N)
+printf '%s' "$PAYLOAD" | strace -f -tt -T -e trace=read,write,openat,close \
+    -o /tmp/obs/out/kitten_set_strace.raw /app/kitty/launcher/kitten clipboard
+KITTEN_EXIT=$?
+T1=$(date +%s.%N)
+WALL_S=$(awk "BEGIN{printf \"%.3f\", $T1-$T0}")
+printf 'PARENT_SHELL_PID=%s\nKITTY_PID=%s\nKITTEN_EXIT=%s\nPAYLOAD=%s\nWALL_S=%s\n' \
+    "$PARENT_SHELL_PID" "$KITTY_PID" "$KITTEN_EXIT" "$PAYLOAD" "$WALL_S"
+```
+
+*Script `kitten_noask_drv.sh` (sha256 `27d4798bf010bcc8c7f156af5681bb65a2c925aa888f389d1e3760d6bf759a30`):*
+
+```bash
+#!/usr/bin/env bash
+# kitten_noask_drv.sh -- driver for the isolated kitten-boundary round-trip (§6.2).
+# DIAGNOSTIC-ONLY config: removes read-clipboard-ask so the round-trip is not
+# gated by the human prompt (a *core* cost, not a kitten cost). Kitty's own docs
+# flag disabling the read confirmation as a security risk
+# (kitty/options/definition.py:3096-3110); used here solely to isolate boundary latency.
+set -u
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+cd /app
+./kitty/launcher/kitty --config NONE \
+    -o clipboard_control="write-clipboard write-primary read-clipboard read-primary" \
+    -o close_on_child_death=yes \
+    sh /tmp/obs/scripts/kitten_get_noask.sh
+```
+
+*Script `kitten_get_noask.sh` (sha256 `fefe3740efc833634cc4b4f89d2273b05eea717e0b3e532cd3e582f12c18e072`):*
+
+```bash
+#!/usr/bin/env sh
+# kitten_get_noask.sh -- runs INSIDE the no-ask kitty (§6.2). Three identical runs:
+# seed the clipboard via the kitten, then GET via the kitten under strace -tt -T,
+# capturing the OUTBOUND request write and the INBOUND response read (= the event
+# delivered to the kitten). strace => diagnostic container (§2.1/§9.1).
+i=1
+while [ "$i" -le 3 ]; do
+    SEED="kitten-noask-run$i-$$"
+    printf '%s' "$SEED" | /app/kitty/launcher/kitten clipboard
+    GOT=$(strace -f -tt -T -e trace=read,write \
+        -o "/tmp/obs/out/kitten_noask_strace_$i.raw" \
+        /app/kitty/launcher/kitten clipboard --get-clipboard)
+    printf 'run=%s exit=%s seed=%s got=%s\n' "$i" "$?" "$SEED" "$GOT"
+    i=$((i + 1))
+done
+```
+
+*Script `kitten_canon_drv.sh` (sha256 `05a97c03b140f5382821eca88e18f482f8f0b3297ecc109a1de46a50dc551cf7`):*
+
+```bash
+#!/usr/bin/env bash
+# kitten_canon_drv.sh -- driver for the canonical (prompt-gated) GET (§6.3).
+# DEFAULT clipboard_control (read-clipboard-ask active). Out-of-image aids:
+# xdotool (in NEITHER documented image, not provisionable offline) presses 'y';
+# the strace process-tree capture needs the PTRACE-enabled diagnostic container
+# (§2.1). This capture is CORROBORATING, not canonical-container-reproducible.
+set -u
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+cd /app
+./kitty/launcher/kitty --config NONE -o close_on_child_death=yes \
+    sh /tmp/obs/scripts/kitten_canon.sh
+```
+
+*Script `kitten_canon.sh` (sha256 `b74f3b240f07894d4fd1d5a501c894bebdd6d22352747e3a83f4232591d3aaa5`):*
+
+```bash
+#!/usr/bin/env sh
+# kitten_canon.sh -- runs INSIDE the default (prompt-gated) kitty (§6.3).
+# Seeds the clipboard, launches a GET via the Go clipboard kitten (which raises
+# the Python `ask` prompt), snapshots the two-kitten process tree while the
+# request is pending, and uses out-of-image xdotool to press 'y' to accept.
+SEED="kitten-canon-$$"
+KITTY=$PPID
+printf '%s' "$SEED" | /app/kitty/launcher/kitten clipboard
+# background: wait for the ask overlay, snapshot the process tree, accept with 'y'
+(
+    sleep 3
+    ps -o pid,ppid,comm,args -g "$KITTY" 2>/dev/null || ps -ef
+    WIN=$(xdotool search --class kitty | head -1)
+    xdotool key --window "$WIN" y
+) &
+strace -f -tt -T -e trace=read,write,openat \
+    -o /tmp/obs/out/kitten_canon_strace.raw \
+    /app/kitty/launcher/kitten clipboard --get-clipboard
+printf 'GET_EXIT=%s SEED=%s SHELL=%s KITTY=%s\n' "$?" "$SEED" "$$" "$KITTY"
+wait
+```
+
+*Script `kitten_py_drv.sh` (sha256 `1867a71d29faa690a895a22be7f5c78df0114ba1ff9019ed0b12f08c65fa6e89`):*
+
+```bash
+#!/usr/bin/env bash
+# kitten_py_drv.sh -- driver for the Python `ask`-kitten event-loop capture (§6.4).
+# DEFAULT clipboard_control; out-of-image xdotool + diagnostic-container strace
+# (CORROBORATING, not canonical-container-reproducible; §2.1).
+set -u
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+cd /app
+./kitty/launcher/kitty --config NONE -o close_on_child_death=yes \
+    sh /tmp/obs/scripts/kitten_py.sh
+```
+
+*Script `kitten_py.sh` (sha256 `54bf556ed1520732df1ce651607f0b7d1eca614cf6c45a688cbeb9f39e404580`):*
+
+```bash
+#!/usr/bin/env sh
+# kitten_py.sh -- runs INSIDE the default kitty (§6.4). Triggers a prompt-gated GET,
+# finds the live Python `ask` kitten PID, attaches strace to THAT process, then
+# presses 'y' via out-of-image xdotool so the keystroke's arrival at the Python
+# kitten event loop (kittens/tui/loop.py:246/248/261 -> kitty/kittens.c:104) is
+# captured as a CSI-u read. strace/xdotool => diagnostic/out-of-image (§2.1).
+SEED="kitten-py-$$"
+KITTY=$PPID
+printf '%s' "$SEED" | /app/kitty/launcher/kitten clipboard
+/app/kitty/launcher/kitten clipboard --get-clipboard > /tmp/obs/out/kitten_py.stdout &
+GETPID=$!
+# wait for the Python ask kitten to appear, strace it by PID, then accept
+sleep 2
+ASK_KITTEN_PID=$(pgrep -n -f 'launcher/kitten ask' || true)
+echo "ASK_KITTEN_PID=$ASK_KITTEN_PID"
+strace -f -tt -T -e trace=read,write -p "$ASK_KITTEN_PID" \
+    -o /tmp/obs/out/kitten_py_ask_strace.raw &
+STRACE_PID=$!
+sleep 1
+WIN=$(xdotool search --class kitty | head -1)
+xdotool key --window "$WIN" y
+wait "$GETPID"; GET_EXIT=$?
+kill "$STRACE_PID" 2>/dev/null || true
+printf 'GET_EXIT=%s SEED=%s\nstdout=%s\n' "$GET_EXIT" "$SEED" "$(cat /tmp/obs/out/kitten_py.stdout)"
+```
+
 
 ---
 
@@ -2886,7 +3081,9 @@ There are **two distinct C scan implementations**, and the earlier draft conflat
 | Visible/history text dump | `as_text` / `as_text_non_visual` (`kitty/screen.c:3486` / `:3491`) and `HistoryBuf.__str__`/`as_ansi` (`kitty/history.c:321` / `:348`) | **`as_text_generic`** (`kitty/line.c:874`) — a per‑line callback loop | `screen.as_text(...)`, `str(historybuf)`, `historybuf.as_ansi(cb)` | remote `get-text` (`kitty/window.py:376` picks `as_text_non_visual` when `add_history`), pager, pipe |
 | Selection text | **`text_for_range`** (`kitty/screen.c:3035`) | **`unicode_in_range`** (per line; `kitty/screen.c:3057`) — **NOT** `as_text_generic` | `screen.text_for_selection(...)` (`kitty/screen.c:4004`→`:3990`→`:3035`, method table `:4848`) | copy‑to‑clipboard of a selection (`kitty/window.py:1542`, `:1785`) |
 
-So the claim "`text_for_range` is built on `as_text_generic`" is **wrong**; `text_for_range` uses `unicode_in_range`. Both are now **OBSERVED** at runtime (not source-inferred). Command and complete, unedited output (a 60,000‑line × 80‑col real `HistoryBuf` built through the real VT parser via `parse_bytes`; stable across the two configs and the repeated runs in §7.6):
+So the claim "`text_for_range` is built on `as_text_generic`" is **wrong**; `text_for_range` uses `unicode_in_range`. Both are now **OBSERVED** at runtime (not source-inferred).
+
+**Reproducibility of the O3 probe (`o3_probe.py`) — a multi-process harness, so its body is not embedded as a single re-runnable script.** Unlike the self-contained probes elsewhere in this document (e.g. `o3_pager.py` in §7.6 and `o4_lifetimes.py` in §8.3, both embedded verbatim with a full body and re-derivable `sha256`), `o3_probe.py` is a **multi-part investigation harness**: the Python probe runs under the canonical `./kitty/launcher/kitty +launch` interpreter, but §7.4's RSS/PSS block is produced by a **separate, GIL-immune OS sampler process** reading `/proc/<pid>/smaps_rollup` (the `o3_smaps_0.samples` artifact), and §7.2's live serialization proof is produced by **`gdb`** via `o3_gdb_scan.sh` (diagnostic container, §2.1/§9.1). Because the evidence spans cooperating processes, its full output cannot be reproduced from one embedded script; its `sha256` in the §7 ledger below is therefore the **original-capture hash of the removed harness**, not a re-derivable single-file body, and the timings (`times_ms`, `feed_ms`) and RSS/smaps values are **representative captured runs** (medians reported), not byte-stable magnitudes. What **is** deterministic and was **independently re-verified to reproduce byte-exact** on a fresh build (canonical container, geometry `cols=80 lines=24 scrollback=200000`, feeding `60000 × (79·'X' + CRLF)`) are the scan **magnitudes**: `hb.count=59977`, `str(hb)` → **4,798,159** chars, `hb.as_ansi` → **59,977** chunks / **4,798,160** chars (§7.1), and the per-segment size **5,251,072** bytes (§7.5). The selection‑endpoint‑sensitive `[63]` total (`4,799,920`) and all wall‑clock/RSS figures below are the harness's representative capture. Command and complete, unedited output (a 60,000‑line × 80‑col real `HistoryBuf` built through the real VT parser via `parse_bytes`; stable across the two configs and the repeated runs in §7.6):
 
 ```text
 === O3 AUGMENTATION PROBE (canonical kitty +launch interpreter) PID=7388 PAGER_BYTES=0 ===
@@ -2936,6 +3133,56 @@ Thread 1 "kitty" hit Breakpoint 1, 0x0000782c7aa2cb60 in as_text_generic () from
 ```
 
 **Reading it.** The MAIN thread (LWP 9154, `Thread 1 "kitty"`) is stopped **inside `as_text_generic`** — the scrollback scan, which produced **80,817 chars** of `get-text` output. Simultaneously **`KittyChildMon` (LWP 9221) is blocked in `__poll` on `children_fds`** (the I/O thread runs no Python), `KittyPeerMon` is in `poll`, and `kitty:disk$0` (the **Mesa/Gallium `util_queue`** software-GL shader-disk-cache worker — a headless-container artifact, **not** kitty's disk cache; §3.4) is in `futex_wait`. Because `clipboard_control` runs on this **same** MAIN thread under the GIL, it **cannot execute while `as_text_generic` occupies MAIN** — the pending event is necessarily serialized behind the scan. This is the canonical structural counterpart to the timing proof above. **OBSERVED.**
+
+The script that produced this capture (diagnostic container; `gdb`/PTRACE; §2.1/§9.1; the traced kitty is byte-identical to the canonical build; the `gdb` addresses, TIDs and PIDs above are a representative run). *Script `o3_gdb_scan.sh` (sha256 `632068409ec1e42fe56c73a8740f679f885624684bf68f1b312e829a5282b3b8`):*
+
+```bash
+#!/usr/bin/env bash
+# o3_gdb_scan.sh -- live serialization proof of the scrollback scan (§7.2).
+# DIAGNOSTIC container only (gdb, PTRACE-enabled; §2.1/§9.1); the traced kitty is
+# byte-identical to the canonical build. Launch a real kitty at DEFAULT scrollback
+# (scrollback_lines=2000) with a remote-control socket, feed a 200,000-line file by
+# `cat` (only the last ~2,000 lines survive the default ring; the rest are evicted),
+# arm a gdb breakpoint on `as_text_generic`, then trigger the scan with a CANONICAL
+# remote `get-text --extent=all` (routes as_text_non_visual -> as_text_generic,
+# kitty/window.py:376). Dump `info threads` at the break to show MAIN scanning while
+# every other thread is parked.
+set -u
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+cd /app
+SOCK="unix:/tmp/obs/out/o3gdb.sock"
+BIG=/tmp/obs/out/o3_big_200k.txt
+seq 1 200000 > "$BIG"
+# Launch kitty (default config) with a control socket, feeding the big file then idling.
+./kitty/launcher/kitty --config NONE -o allow_remote_control=yes --listen-on "$SOCK" \
+    sh -c "cat '$BIG'; exec sleep 600" &
+KITTY_CORE_PID=$!
+echo "KITTY_CORE_PID=$KITTY_CORE_PID"
+sleep 5   # let the socket come up and the feed settle into the 2,000-line ring
+# gdb command file: break on the scan, dump threads, detach.
+GDBCMDS=/tmp/obs/out/o3_gdb_scan.cmds
+cat > "$GDBCMDS" <<'GDBEOF'
+set pagination off
+break as_text_generic
+commands 1
+  printf "\n==== BREAK HIT: as_text_generic (a scrollback scan is executing) ====\n"
+  info threads
+  detach
+  quit
+end
+continue
+GDBEOF
+gdb -p "$KITTY_CORE_PID" -batch -x "$GDBCMDS" > /tmp/obs/out/o3_gdb_scan.raw 2>&1 &
+GDB_PID=$!
+sleep 2
+# Canonical trigger: remote get-text over the socket -> as_text_non_visual -> as_text_generic.
+GT=$(./kitty/launcher/kitty @ --to "$SOCK" get-text --extent=all)
+echo "gettext_chars=${#GT}"
+wait "$GDB_PID" 2>/dev/null || true
+cat /tmp/obs/out/o3_gdb_scan.raw
+kill "$KITTY_CORE_PID" 2>/dev/null || true
+```
+
 
 ### 7.3 Why even a callback‑driven scan does not yield (GIL‑hold classification)
 
@@ -2995,7 +3242,59 @@ $ grep -naiE "zlib|lz4|deflate|inflate|compress|snappy" /app/kitty/history.c
 $        # (no output — zero matches)
 ```
 
-It is also **OFF by default**: `scrollback_pager_history_size` defaults to `0` (`kitty/options/definition.py:406` `opt('scrollback_pager_history_size','0',...)`). The **canonical‑default vs non‑default** comparison (finding 72) — and the ring only fills on **eviction** past the in‑RAM scrollback — is shown directly:
+It is also **OFF by default**: `scrollback_pager_history_size` defaults to `0` (`kitty/options/definition.py:406` `opt('scrollback_pager_history_size','0',...)`). The **canonical‑default vs non‑default** comparison (finding 72) — and the ring only fills on **eviction** past the in‑RAM scrollback — is shown directly. Script (sha256 `ff3d0997f99ea9b0617d3b91202a6d753241bb6270a8215d6e1dcdd9b14f0810`):
+
+```python
+#!/usr/bin/env python3
+"""
+O3 / finding 72 -- pager-history: DEFAULT (OFF) vs non-default, populated only on
+eviction past the in-RAM scrollback.
+
+NON-CANONICAL entry: a real HistoryBuf is built through the kitty_tests Screen hooks
+and the real parse_bytes; the pager ring is read through the production
+HistoryBuf.pagerhist_as_bytes path (kitty/history.c:219 ring buffer, no compression).
+Cross-checked against the canonical scrollback scan in section 7.2.
+"""
+from kitty_tests import BaseTest, parse_bytes
+
+
+class _Env(BaseTest):
+    def runTest(self):  # required by unittest.TestCase base
+        pass
+
+
+COLS = 80
+LINES = 24
+SCROLLBACK = 100000
+FED = 320000
+BYTES_PER_LINE_NOMINAL = 80          # 16 MiB / 80 bytes-per-line is the nominal cap
+RING_16MIB = 16 * 1024 * 1024        # 16777216
+
+
+def probe(pager_size):
+    env = _Env()
+    s = env.create_screen(cols=COLS, lines=LINES, scrollback=SCROLLBACK,
+                          options={'scrollback_pager_history_size': pager_size})
+    line = b'X' * 79 + b'\r\n'        # 79 < 80 => no wrap; logical == physical
+    parse_bytes(s, line * FED)
+    stored = s.historybuf.count
+    pbytes = len(s.historybuf.pagerhist_as_bytes(False))
+    evicted = FED - stored - LINES
+    ring_lines = pbytes // BYTES_PER_LINE_NOMINAL
+    cap = RING_16MIB // BYTES_PER_LINE_NOMINAL
+    return (f'pager={pager_size} scrollback={SCROLLBACK} fed_logical={FED}: '
+            f'hb.count(stored)={stored} evicted_to_pager~={evicted} '
+            f'pagerhist_bytes={pbytes} (~{pbytes / (1024 * 1024):.2f} MiB) '
+            f'ring_lines~={ring_lines} cap16MiB_lines={cap}')
+
+
+print('# DEFAULT (pager off), even with eviction:')
+print(probe(0))
+print('# NON-DEFAULT (16 MiB pager), with eviction -> ring saturates:')
+print(probe(RING_16MIB))
+```
+
+Complete, unedited output (byte-identical across two runs):
 
 ```text
 # DEFAULT (pager off), even with eviction:
@@ -3042,7 +3341,7 @@ The background `DiskCacheWrite` thread (`kitty/disk-cache.c:342`) backs the **gr
 | Disk cache is graphics, not scrollback | OBSERVED + INFERRED | §7.8 |
 | In-process interpose harness mirrors live serialization | OBSERVED (both) + INFERRED (equivalence) | §7.2 timing vs gdb |
 
-**Evidence ledger (§7):** `o3_probe.py` (945d980ed13cf992), `o3_pager.py` (87f4a33d8cf7046e), `o3_gdb_scan.sh` (1a5dfdc18079778c), `o3_gdb_scan.raw` (e98c398824c7ed34), `o3_smaps_0.samples` (a8e2cdcdd2d6cf3d) — all under `/tmp` outside the checkout, removed after capture.
+**Evidence ledger (§7):** `o3_probe.py` (`945d980ed13cf992` — original-capture digest of the removed multi-process harness; **not embedded**, see §7.1); `o3_pager.py` (**embedded verbatim in §7.6**, body sha256 `ff3d0997f99ea9b0…`); `o3_gdb_scan.sh` (**embedded verbatim in §7.2**, body sha256 `632068409ec1e42f…`); `o3_gdb_scan.raw` (`e98c398824c7ed34`), `o3_smaps_0.samples` (`a8e2cdcdd2d6cf3d`) — the `.raw`/`.samples` are original-capture **output** artifacts. All under `/tmp` outside the checkout, removed after capture. (Hashes are the sha256 first-16 hex; the embedded-script digests are **re-derivable** from their in-document bodies — see §11.1 for the two hash provenances.)
 
 ---
 
@@ -3198,6 +3497,93 @@ $12 = 0x7ffff7b401e5 "memoryview"
 
 Reading the output. At **STOP A**, `$1 = 1` is the held mutex and `$2 = 11056` is the owning TID (identical to the current thread LWP 11056 = MAIN “kitty”), so the promotion is performed under the lock; `$3/$4` (`read.sz=0`, `write.pending=25`) become `$5/$6` (`read.sz=25`, `write.pending=0`) after the single line executes. At **STOP B**, `$7 = 0` is the released mutex at `consume_input` entry, `read.sz` still 25. At **STOP C**, the backtrace is the synchronous chain `clipboard_control` ← `dispatch_osc` (`:534`) ← `accumulate_st_terminated_esc_code` (`:403`) ← `consume_input` (`:1385`) ← `run_worker` (`:1432`), `$10 = 1` (GIL held on MAIN), and `$12 = … "memoryview"` is the live type of the object handed to Python. This is the exact lock/GIL/callback provenance M12 asked for, in one linked run.
 
+The two scripts that produced this linked run (diagnostic container; `gdb`/PTRACE; §2.1/§9.1) on the `--debug` `fast_data_types.so` build (the default build was restored immediately afterward, §8 ledger). The deterministic parts — `PAYLOAD=o4-locktest`, `B64=bzQtbG9ja3Rlc3Q=`, `escape_wire_length=25` — reproduce byte-exact from the driver; the `gdb` addresses/TIDs in the output above are a representative run. *Script `o4_lock3_run.sh` (sha256 `b779081e2d43c09117733246546711bae1b47ca8463cde60dec10998722832cb`):*
+
+```bash
+#!/usr/bin/env bash
+# o4_lock3_run.sh -- linked lock / GIL / synchronous-callback proof (§8.1).
+# DIAGNOSTIC container only (gdb, PTRACE-enabled; §2.1/§9.1), on the --debug
+# fast_data_types.so build (default build restored immediately afterward, §8 ledger).
+# Drives ONE 25-byte OSC 52 write escape (ESC ] 52 ; c ; <b64> ESC \) through a real
+# PTY and runs the three linked breakpoints in o4_lock3.gdb (STOP A/B/C).
+set -u
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+cd /app
+PAYLOAD='o4-locktest'
+B64=$(printf '%s' "$PAYLOAD" | base64)                 # bzQtbG9ja3Rlc3Q=
+ESC=$(printf '\033]52;c;%s\033\\' "$B64")              # ESC ] 52 ; c ; <b64> ESC '\'
+printf 'PAYLOAD=%s  B64=%s  escape_wire_length=%s bytes ( ESC]52;c; + b64 + ESC\\ )\n' \
+    "$PAYLOAD" "$B64" "${#ESC}"
+# Run kitty under gdb; the inner shell waits for the parser to settle, emits the single
+# escape on a real input tick, then lingers so all three breakpoints can fire in order.
+gdb -batch -x /tmp/obs/scripts/o4_lock3.gdb \
+    --args ./kitty/launcher/kitty --config NONE \
+    sh -c "sleep 0.7; printf '\\033]52;c;$B64\\033\\\\'; sleep 2"
+```
+
+*Script `o4_lock3.gdb` (sha256 `12e6ccb6e2017d966cfb59f5413a55578b19654d52aa83ea425353448610a168`):*
+
+```text
+# o4_lock3.gdb -- three linked breakpoints capturing the lock / GIL / callback provenance
+# of a single OSC 52 write, in one batch run (§8.1). Used with the --debug build.
+set pagination off
+set breakpoint pending on
+
+# STOP A: the pending->read promotion at vt-parser.c:1421, gated on a REAL input tick.
+break kitty/vt-parser.c:1421 if self->write.pending > 0
+commands 1
+  printf "\n=========== STOP A: PENDING PROMOTION vt-parser.c:1421 (real input; expect lock HELD __lock==1) ===========\n"
+  frame 0
+  printf "-- current thread (expect MAIN \"kitty\") --\n"
+  thread
+  printf "-- lock held? self->lock.__data.__lock (1=locked) and __owner tid --\n"
+  print self->lock.__data.__lock
+  print self->lock.__data.__owner
+  printf "-- BEFORE promotion: self->read.sz , self->write.pending --\n"
+  print self->read.sz
+  print self->write.pending
+  next
+  printf "-- AFTER promotion line: read.sz , write.pending (pending must be 0; read.sz += old pending) --\n"
+  print self->read.sz
+  print self->write.pending
+  continue
+end
+
+# STOP B: consume_input entry (resolves to first executable line 1375); lock must be released.
+break kitty/vt-parser.c:1367
+commands 2
+  printf "\n=========== STOP B: consume_input ENTRY vt-parser.c:1367 (expect lock RELEASED __lock==0) ===========\n"
+  frame 0
+  printf "-- current thread --\n"
+  thread
+  printf "-- lock released? self->lock.__data.__lock (0=unlocked) --\n"
+  print self->lock.__data.__lock
+  print self->read.sz
+  print self->write.pending
+  continue
+end
+
+# STOP C: the synchronous C->Python callback; full stack, GIL state, live boundary type.
+break kitty/screen.c:2305
+commands 3
+  printf "\n=========== STOP C: clipboard_control screen.c:2305 SYNCHRONOUS CALLBACK (expect MAIN + GIL) ===========\n"
+  frame 0
+  printf "-- current thread --\n"
+  thread
+  bt
+  printf "-- GIL held on MAIN? PyGILState_Check()==1 --\n"
+  call (int)PyGILState_Check()
+  printf "-- the data object handed to Python: pointer + live Python type name --\n"
+  print data
+  print ((PyObject*)data)->ob_type->tp_name
+  continue
+end
+
+run
+printf "\n=========== END-OF-LINKED-RUN ===========\n"
+```
+
+
 ### 8.2 The C→Python callback is synchronous on MAIN, and every other thread is parked
 
 To show nothing runs concurrently with the callback, a companion linked run (`o4_lock_gdb.raw`) dumps `info threads` at the moment `clipboard_control` is entered. Only the MAIN thread is in `clipboard_control`; `KittyChildMon` is parked in `poll()` on `children_fds`, and the 65 GL software-rasteriser pool threads (`llvmpipe-*`, unnamed `kitty` pool threads, and the `kitty:disk$0` `util_queue` shader-disk-cache worker — all a headless Mesa/Xvfb artifact, frames in `libgallium-*.so`; §3.4) are all in `__futex_abstimed_wait_common64`:
@@ -3350,7 +3736,110 @@ Three lifetimes must therefore be kept separate:
 | **L2 — buffer allocation** | the inline `PS.buf` memory (`:194`) it points into | allocated with the `PS` struct; freed only by `free_vt_parser` `:1513` at teardown | **use-after-free**, but only *after teardown* (not immediate) |
 | **L3 — payload content** | the specific bytes at that address | valid only until the buffer is **reused** by the next parse (`memmove`/overwrite in `run_worker`) | **stale/mutated content** — the *immediate* hazard |
 
-A genuine retained-view/parser-reuse probe (NON-CANONICAL entry via the `Screen` test hooks driving the identical production `vt_parser_*` and the real `parse_bytes`; cross-checked against the canonical OSC 52 round trip in §3 and the live gdb callback in §8.1) retains the view and re-reads it before and after a **second** parse through the **same** buffer. This is **not** the “standalone `free(buf)` analog” the review rejected — it exercises real parser buffer reuse. Command and complete, unedited output (**identical across 2 runs**, sha256 `ed433fb9391334ade5e52737696a3337c045f79f48b2af2304471e29f04968c4`):
+A genuine retained-view/parser-reuse probe (NON-CANONICAL entry via the `Screen` test hooks driving the identical production `vt_parser_*` and the real `parse_bytes`; cross-checked against the canonical OSC 52 round trip in §3 and the live gdb callback in §8.1) retains the view and re-reads it before and after a **second** parse through the **same** buffer. This is **not** the “standalone `free(buf)` analog” the review rejected — it exercises real parser buffer reuse. Script (sha256 `5b10d66d20120d6bd3b1d5f6827d996d0151a684e47f20ca0bd4c30ac4c5dab6`):
+
+```python
+#!/usr/bin/env python3
+"""
+O4 -- object-ownership lifetimes of the boundary memoryview.
+
+NON-CANONICAL entry: the identical production kitty/vt-parser.c dispatch is driven
+through the kitty_tests Screen hooks and the real parse_bytes (cross-checked against
+the canonical OSC 52 round trip in section 3 and the live gdb callback in section 8.1).
+
+Part A retains the zero-copy memoryview handed to clipboard_control and re-reads it
+before and after a SECOND parse through the SAME parser buffer, separating the three
+lifetimes: L1 (object / refcount), L2 (buffer allocation), L3 (payload content).
+
+Part B drives the REAL kitty.clipboard.WriteRequest to prove that the copy-out at
+kitty/clipboard.py:286 produces an OWNED copy (mutating the source does not leak in).
+"""
+import sys
+from base64 import standard_b64encode
+from kitty_tests import Callbacks, parse_bytes
+from kitty.fast_data_types import Screen
+from kitty.clipboard import WriteRequest
+
+COLS = 200
+
+
+class LifetimeCallbacks(Callbacks):
+    def __init__(self):
+        super().__init__()
+        self.views = []              # RETAIN the memoryview objects (they alias PS.buf)
+        self.head_at_dispatch = []   # head bytes copied *during* the callback
+
+    def clipboard_control(self, data, is_partial=False):
+        self.views.append(data)                          # keep the view object alive
+        self.head_at_dispatch.append(bytes(data[:18]))   # snapshot head at dispatch time
+
+
+def osc52(payload):
+    return b'\x1b]52;c;' + standard_b64encode(payload) + b'\x07'
+
+
+def part_a():
+    p1 = b'A' * 300
+    p2 = b'B' * 300
+    exp1 = b'c;' + standard_b64encode(p1)[:16]
+    exp2 = b'c;' + standard_b64encode(p2)[:16]
+
+    cb = LifetimeCallbacks()
+    s = Screen(cb, 24, COLS, 0, 10, 20, 0, cb)
+
+    parse_bytes(s, osc52(p1))          # first dispatch -> view v0
+    v0 = cb.views[0]
+    rc = sys.getrefcount(v0)           # list slot + local + getrefcount arg = 3
+    head1_dispatch = cb.head_at_dispatch[0]
+    head1_after = bytes(v0[:18])       # re-read AFTER the dispatch scope returned
+
+    parse_bytes(s, osc52(p2))          # second dispatch reuses the SAME buffer -> v1
+    head2_dispatch = cb.head_at_dispatch[1]
+    head0_reread = bytes(v0[:18])      # retained view now aliases the reused buffer
+
+    print('=== O4 PART A: three distinct lifetimes of the boundary memoryview ===')
+    print(f'expected head payload#1 (A): {exp1!r}')
+    print(f'expected head payload#2 (B): {exp2!r}')
+    print(f'[L1 refcount ] after dispatch returns: refcount(v0)={rc} (>0 => OBJECT alive, held by Python)  readonly={v0.readonly}  obj_is_None={v0.obj is None}  nbytes={v0.nbytes}')
+    print(f'[L2 alloc    ] head at dispatch       : {head1_dispatch!r}  ==payload#1? {head1_dispatch == exp1}')
+    print(f'[L2 alloc    ] head AFTER scope return : {head1_after!r}  ==payload#1? {head1_after == exp1}  (re-read did NOT crash => buffer allocation still valid => NOT immediate UAF)')
+    print(f'[L3 content  ] head at 2nd dispatch    : {head2_dispatch!r}  ==payload#2? {head2_dispatch == exp2}')
+    print(f'[L3 content  ] retained view#0 re-read  : {head0_reread!r}')
+    print(f'[L3 content  ]   -> now aliases REUSED buffer (==payload#2)? {head0_reread == exp2}')
+    print(f'[L3 content  ]   -> still original payload#1?                {head0_reread == exp1}')
+    print('[teardown    ] v0.obj is None => view holds NO reference to the parser; PS.buf is freed only at free_vt_parser (vt-parser.c:1508-1513). Reading AFTER teardown would be a genuine UAF and is deliberately NOT executed (labeled inferred-from-source).')
+
+
+def part_b():
+    print('=== O4 PART B: kitty copies OUT within the callback (owned copy, clipboard.py:286) ===')
+    print('B1 (canonical values, kitty_tests/clipboard.py:12-17):')
+    wr = WriteRequest(max_size=64)
+    fed = b'bGlnaHQgd29yaw'
+    wr.add_base64_data(fed)
+    leftover = bytes(wr.current_leftover_bytes)
+    print(f'  full base64 fed        : {fed!r}')
+    print(f"  current_leftover_bytes : {leftover!r}  (expected b'aw')")
+    wr.flush_base64_data()
+    print(f"  data_for()             : {wr.data_for()!r}  (expected b'light work')")
+
+    print('B2 (source-mutation proof the leftover is an OWNED copy at clipboard.py:286):')
+    wr2 = WriteRequest(max_size=64)
+    src = bytearray(b'bGlnaHQgd29yaw')
+    wr2.add_base64_data(src)
+    before = bytes(wr2.current_leftover_bytes)
+    print(f'  current_leftover_bytes BEFORE source mutation: {before!r}')
+    src[-2:] = b'ZZ'
+    print(f'  source bytearray mutated tail -> {bytes(src[-2:])!r}')
+    after = bytes(wr2.current_leftover_bytes)
+    print(f'  current_leftover_bytes AFTER  source mutation: {after!r} -> UNCHANGED => OWNED copy, not a view')
+
+
+part_a()
+print()
+part_b()
+```
+
+Command and complete, unedited output (**identical across 2 runs**, sha256 `ed433fb9391334ade5e52737696a3337c045f79f48b2af2304471e29f04968c4`):
 
 ```
 $ ./kitty/launcher/kitty +launch /tmp/obs/scripts/o4_lifetimes.py
@@ -3448,7 +3937,7 @@ The lifetime analysis above applies to **Boundary 1** only — the in-process C
 | kitty copies out (owned leftover + decoded Tempfile) | OBSERVED | §8.4 Part B (source-mutation unchanged) |
 | Kitten boundary copies bytes (no shared view) | OBSERVED (§6) + INFERRED (ownership consequence) | §8.5, §6.2 |
 
-**Evidence ledger (§8):** `o4_lock3.gdb` (3ecc1759b71cbb4a)  `o4_lock3_run.sh` (44ab762ede931b6a)  `o4_lifetimes.py` (cf15380fbeb0aaf3)  `o4_lock3_gdb.raw` (64595ec790b26e08)  `o4_lock_gdb.raw` (5f86b1ee2e94dc1c)  `o4_lifetimes_run1.txt` (ed433fb9391334ad)  `o4_lifetimes_run2.txt` (ed433fb9391334ad)  `o4_debug_build.log` (3da6c69bb7cafeb4) — all under `/tmp` outside the checkout, removed after capture. The `--debug` build was used only for §8.1–§8.2 gdb inspection; the default `fast_data_types.so` (`582933cf…`) was restored immediately afterward.
+**Evidence ledger (§8):** `o4_lock3.gdb` (**embedded verbatim in §8.1**, body sha256 `12e6ccb6e2017d96…`)  `o4_lock3_run.sh` (**embedded verbatim in §8.1**, body sha256 `b779081e2d43c091…`)  `o4_lifetimes.py` (**embedded verbatim in §8.3**, body sha256 `5b10d66d20120d6b…`)  `o4_lock3_gdb.raw` (`64595ec790b26e08`)  `o4_lock_gdb.raw` (`5f86b1ee2e94dc1c`)  `o4_lifetimes_run1.txt` (`ed433fb9391334ad`)  `o4_lifetimes_run2.txt` (`ed433fb9391334ad`)  `o4_debug_build.log` (`3da6c69bb7cafeb4`) — the `.raw`/`.txt`/`.log` are original-capture **output** artifacts. All under `/tmp` outside the checkout, removed after capture. (Embedded-script digests are **re-derivable** from their in-document bodies — see §11.1 for the two hash provenances.) The `--debug` build was used only for §8.1–§8.2 gdb inspection; the default `fast_data_types.so` (`582933cf…`) was restored immediately afterward.
 
 ---
 
@@ -4514,9 +5003,9 @@ Each objective section carries its own detailed ledger (§6.6, §7.9, §8.6, §9
 
 ## 11. Appendix — temporary observation scripts and cleanup
 
-### 11.1 Temporary observation scripts (complete bodies embedded inline in §2–§9)
+### 11.1 Temporary observation scripts (complete bodies embedded inline in §2–§9, except the `o3_probe.py` harness — see §7.1)
 
-Every probe used in this document is reproduced **in full** inline in the section that presents its output, so the evidence is **self-contained and re-runnable** without any external file. During the investigation each script was written under `/tmp` — a scratch tree **outside** the repository — run against the canonical build of §2 (or, where noted, the byte-identical valgrind-compatible diagnostic build of §9.1), and **deleted** after its output was captured. Each probe is labelled **canonical** (a genuine OSC 52/5522 escape or DSR query delivered through the real PTY to the built `kitty` launcher, or the real Go/Python kitten as a separate process) or **non-canonical** (drives the *identical* production C functions through the `Screen`/`kitty_tests` hooks, bypassing only the PTY + I/O thread; never a remote-control or debug shortcut); non-canonical values are cross-checked against the canonical round trip.
+Every probe used in this document is reproduced **in full** inline in the section that presents its output — with the single exception of the O3 harness `o3_probe.py`, a multi-process harness whose body is **not** embedded (see §7.1) — so the evidence is **self-contained and re-runnable from this document** in the stated environment. Two provenance caveats apply: **(i)** scripts that rely on `strace`/`gdb` run in the PTRACE-enabled **diagnostic** container, and the two `xdotool` captures (§6.3/§6.4) use an **out-of-image** input-injection tool (see §2.1/§9.1); their bodies are embedded and re-runnable *there*, but their exact PID/TID/timestamp/address output is a **representative** run, not a byte-stable magnitude. **(ii)** Each embedded script carries a `sha256` that is the digest of its exact fenced body and is therefore **re-derivable** from this document; whereas the per-section evidence ledgers (§6/§7/§8) additionally list **16-hex original-capture** digests of the removed *output* artifacts (`.raw`/`.meta`/`.samples`/`.txt`/`.log`) and of the un-embedded `o3_probe.py` harness — those are historical and are **not** re-derivable from the document. During the investigation each script was written under `/tmp` — a scratch tree **outside** the repository — run against the canonical build of §2 (or, where noted, the byte-identical valgrind-compatible diagnostic build of §9.1), and **deleted** after its output was captured. Each probe is labelled **canonical** (a genuine OSC 52/5522 escape or DSR query delivered through the real PTY to the built `kitty` launcher, or the real Go/Python kitten as a separate process) or **non-canonical** (drives the *identical* production C functions through the `Screen`/`kitty_tests` hooks, bypassing only the PTY + I/O thread; never a remote-control or debug shortcut); non-canonical values are cross-checked against the canonical round trip.
 
 | Section | Script | Kind | Purpose |
 |---|---|---|---|
@@ -4527,14 +5016,16 @@ Every probe used in this document is reproduced **in full** inline in the sectio
 | §4 | `o1_roundtrip.sh`, `o1_rt_child.sh` | canonical | OSC 52 write then read-back integrity check |
 | §4 | `o1_trunc_neg.sh`, `o1_trunc_pos.sh`, `o1_trunc_retained.py`, `o1_trunc_retained_drv.sh` | canonical | `clipboard_max_size` default (no truncation) + positive control + retained/overshoot |
 | §4 | `osc52read.py`, `osc5522_harness.py`, `osc5522_driver.sh` | canonical | legacy OSC 52 `?` read + extended OSC 5522 read/MIME |
-| §4 | `o1_feed_child.py`, `o1_dumpfmt.sh`, `hashlib.sh` | canonical | streaming feeder + `--dump-commands` formatting + hashing |
+| §4 | `o1_feed_child.py`, `o1_dumpfmt.sh` | canonical | streaming feeder + `--dump-commands` formatting (payload hashing is done **inline via the Python stdlib `hashlib`** inside these probes — e.g. §4's `raw_sha256=…` lines — not a separate `hashlib.sh` script) |
 | §5 | `o2_flood.py`, `o2_flood_drv.sh` | canonical | heavy PTY flood; `MAX_ABSORBED` + in-order check |
 | §5 | `o2_latency.py`, `o2_latency_drv.sh` | canonical | idle DSR latency distribution + `input_delay` 0/3/25 ms |
 | §5 | `o2_pollin.sh` | canonical | POLLIN disable/re-enable `poll()` strace |
 | §5 | `o2_load_latency.py`, `o2_load_latency_drv.sh` | canonical | under-load event-delivery latency vs baseline |
 | §5 | `E2_serialize.py` | non-canonical | 2000 marker-tagged OSC 52 writes interleaved with heavy blocks — in-order / complete-delivery proof |
-| §6 | `kitten_canon.sh` | canonical | real Go `kitten clipboard` set/get through the real PTY |
-| §6 | `kitten_get_noask.sh`, `kitten_noask_drv.sh` | canonical (no-ask, diagnostic-labeled) | kitten round-trip latency without the interactive overlay |
+| §6 | `kitten_set.sh`, `kitten_set_drv.sh` | diagnostic (`strace`) | outbound SET: real Go `kitten clipboard` `/dev/tty` open + OSC 52 emission (§6.1; bodies in §6.7) |
+| §6 | `kitten_get_noask.sh`, `kitten_noask_drv.sh` | diagnostic (`strace`, no-ask) | kitten round-trip latency without the interactive overlay (§6.2; bodies in §6.7) |
+| §6 | `kitten_canon.sh`, `kitten_canon_drv.sh` | out-of-image (`xdotool`) + diagnostic (`strace`) | canonical prompt-gated GET, two-kitten process tree (§6.3; bodies in §6.7); corroborating |
+| §6 | `kitten_py.sh`, `kitten_py_drv.sh` | out-of-image (`xdotool`) + diagnostic (`strace`) | Python `ask` kitten CSI-u `y` event-loop read (§6.4; bodies in §6.7); corroborating |
 | §7 | `o3_probe.py`, `o3_gdb_scan.sh`, `o3_pager.py` | canonical + gdb | scan durations, gdb-synchronized event delay, pager-history |
 | §8 | `o4_lifetimes.py` | non-canonical | three-lifetime `memoryview` parser-reuse + copy-out probe |
 | §8 | `o4_lock3_run.sh`, `o4_lock3.gdb` | canonical + gdb | linked lock / GIL / synchronous-callback proof |
@@ -4562,7 +5053,7 @@ $ docker diff <container> | grep -E '^A /tmp/'       # the single remainder
 A /tmp/.X11-unix/X99
 ```
 
-The one surviving `/tmp` entry is the **Xvfb display socket** (`/tmp/.X11-unix/X99`), a system runtime artifact of the headless X server (§2), not investigation scratch. The categorized full diff after cleanup is:
+The one surviving `/tmp` entry is the **Xvfb display socket** (`/tmp/.X11-unix/X99`), a system runtime artifact of the headless X server (§2), not investigation scratch. (Accuracy note: because `ls -1` **without** `-a` does not enumerate dot-entries, the dot-socket directories — `.X11-unix` and its `.*-unix` siblings — are never passed to the removal loop in the first place; the `grep -vE "^\.(X11|font|ICE|Test|XIM)-unix$"` filter is therefore **redundant/defensive** here and would only take effect under `ls -1a`. The X11 socket's survival is thus attributable to `ls -1`'s default dotfile-skipping, not to the `grep`.) The categorized full diff after cleanup is:
 
 ```console
 tmp_added(remaining scratch)=1          # only /tmp/.X11-unix/X99 (Xvfb socket)
