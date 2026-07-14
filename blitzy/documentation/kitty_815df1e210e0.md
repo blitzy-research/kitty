@@ -1301,7 +1301,7 @@ can rely on the always-present `base64` module and so uses the simpler encoding 
 Everything above concerns the *outer* encoding of the whole bootstrap script. When the user passes an **explicit remote command** (`kitten ssh host <cmd…>`, i.e. `len(cd.remote_args) > 0` [kittens/ssh/main.go:428]), a *second*, inner encoding is produced by `prepare_exec_cmd()` and substituted into the bootstrap at the `EXEC_CMD` placeholder. The two interpreters diverge here, and — unlike the outer encoding — the `py` inner path uses an **unpadded** Base64:
 
 ```text
-$ sed -n "391,402p" kittens/ssh/main.go
+$ sed -n "391,403p" kittens/ssh/main.go
 func prepare_exec_cmd(cd *connection_data) string {
 	// ssh simply concatenates multiple commands using a space see
 	// line 1129 of ssh.c and on the remote side sshd.c runs the
@@ -2072,11 +2072,11 @@ not a gap in the mechanism explanation.
 
 ### Source-tree integrity (read-only rule) — with honest disclosure (C-3)
 
-The only repository change is the single new file `blitzy/documentation/kitty_815df1e210e0.md`. No existing source, configuration, build, or test file was created, modified, or deleted. Proof:
+The only repository change is the single new file `blitzy/documentation/kitty_815df1e210e0.md`. No existing source, configuration, build, or test file was created, modified, or deleted. Proof — a full-tree diff against the base commit `815df1e21` shows exactly one **added** file (status `A`) and nothing modified or deleted:
 
 ```text
-$ git status --porcelain
- M blitzy/documentation/kitty_815df1e210e0.md
+$ git diff 815df1e21 --name-status
+A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 **Honest disclosure (C-3).** During an earlier session an ad-hoc Go test file was mistakenly written into the source tree (`kittens/ssh/blitzy_adhoc_test_obs_test.go`), which violated the read-only rule. It was removed; no such file exists now, and no other source file was touched. Confirmed at authoring time (`2026-07-13T20:11:18Z`):
