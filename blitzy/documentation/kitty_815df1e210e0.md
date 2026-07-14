@@ -430,13 +430,26 @@ Likewise, **"Child launched" is a post‑layout / terminal‑ready diagnostic, n
 
 ```text
 $ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 glxinfo | grep -iE 'vendor|renderer|version string'
+server glx vendor string: SGI
+server glx version string: 1.4
+client glx vendor string: Mesa Project and SGI
+client glx version string: 1.4
+    GLX_MESA_copy_sub_buffer, GLX_MESA_gl_interop, GLX_MESA_query_renderer, 
+    GLX_MESA_gl_interop, GLX_MESA_query_renderer, GLX_SGIS_multisample, 
+Extended renderer info (GLX_MESA_query_renderer):
+    Vendor: Mesa (0xffffffff)
 OpenGL vendor string: Mesa
 OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits)
 OpenGL core profile version string: 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2
+OpenGL core profile shading language version string: 4.50
+OpenGL version string: 4.5 (Compatibility Profile) Mesa 25.2.8-0ubuntu0.25.10.2
 OpenGL shading language version string: 4.50
+OpenGL ES profile version string: OpenGL ES 3.2 Mesa 25.2.8-0ubuntu0.25.10.2
+OpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.20
 ```
 
 *[OBSERVED‑AUXILIARY]* — this confirms the backend is Mesa software `llvmpipe`, and the core‑profile version string equals what kitty printed.
+The `glxinfo` command prints the full GLX and OpenGL summary shown above; the rows that corroborate the backend are `OpenGL vendor string: Mesa`, `OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits)`, and `OpenGL core profile version string: 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2`, while the broad `grep` pattern additionally matches the server and client GLX vendor and version rows.
 
 **Backend selection mechanism.** The GLFW platform is chosen by the vendored GLFW fork at `glfwInit`/window‑creation time from what is compiled in and available; because only X11 was compiled (§1.3) and `DISPLAY` points at Xvfb, **X11 is selected**. Wayland selection is **INFERRED** (would require the Wayland backend and a compositor, neither present). `kitty/constants.py` exposes the `is_wayland`/`is_macos` predicates used elsewhere to branch on backend.
 
