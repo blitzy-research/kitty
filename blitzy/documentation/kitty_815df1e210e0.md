@@ -8,8 +8,14 @@
 >
 > 1. **Byte‑level output** (command stdout/stderr, exit codes, `md5sum`/`cmp`/`wc`/`ls`
 >    output, crash stacks, ThreadSanitizer reports, and the decoded terminal escape‑code
->    scans) is shown **complete and unedited** — the exact bytes the command produced, with
->    the exact command that produced it. Where a byte is not printable it is shown in an
+>    scans) is shown **verbatim (unedited)** — the exact bytes the command produced, with
+>    the exact command that produced it — with one explicit exception: a few
+>    **very large or highly repetitive** captures (the multi‑goroutine fatal crash
+>    dump, whose 128 worker stacks are byte‑identical, and the multi‑block `-race`
+>    report) are shown as a clearly **labelled representative excerpt** with their full
+>    byte size stated, so nothing is silently truncated. Every PTY capture additionally
+>    shows the harness's `raw_bytes=… child_exit=…` status line. Where a byte is
+>    not printable it is shown in an
 >    explicitly labelled hex/escaped form.
 > 2. **Full‑screen TUI screens.** `kitten diff` is a full‑screen terminal application that
 >    emits cursor‑addressing escape codes, not a plain line stream. To show what actually
@@ -125,11 +131,17 @@ $ git status --porcelain -- ':!blitzy/documentation'              # after build
 Internally `setup.py` builds the Go binary with (from `setup.py:L1148‑L1166`):
 
 ```
-go build -v -ldflags '-X kitty.VCSRevision=<rev> -s -w' -o kitty/launcher/kitten tools/cmd
+go build -v -ldflags '-X kitty.VCSRevision=<rev> -s -w' -o kitty/launcher/kitten /app/tools/cmd
 ```
 
 `-s -w` strip the symbol table/DWARF on a normal (non‑`--debug`) build, and the binary is
-produced at `kitty/launcher/kitten`.
+produced at `kitty/launcher/kitten`. The final argument is the **absolute** package directory
+`os.path.abspath('tools/cmd')` → `/app/tools/cmd` (`setup.py:L1163`); this is deliberate, because
+a *bare relative* `tools/cmd` is not accepted by `go build` — it is read as a standard‑library
+import path and rejected (`go build … tools/cmd` → `package tools/cmd is not in std`, exit 1),
+whereas `/app/tools/cmd` (or the relative `./tools/cmd`) builds with exit 0. That absolute
+*filesystem* path is a different thing from the *import* path `kitty/tools/cmd` that `go build -v`
+prints as its progress line (shown as the `kitty/tools/cmd` output above).
 
 ### Canonical invocation and the complete `--help`
 
@@ -186,10 +198,17 @@ kitten diff 0.35.2 created by Kovid Goyal
 `kitten diff` is a full‑screen terminal application: it emits cursor‑addressing escape
 codes, not a plain line stream, and it enables the kitty keyboard protocol
 (report‑all‑keys), so a raw `q`/`Ctrl‑C` is treated as literal text and will **not** quit
-— the quit key must be sent as the escape sequence `ESC[113u`. It also divides by the
-terminal cell size, so the pseudo‑terminal must have a **real**, non‑zero winsize
-(rows, cols, and *pixel* width/height) or `loop.update_screen_size`
-(`tools/tui/loop/run.go`) divides by zero.
+— the quit key must be sent as the escape sequence `ESC[113u`. It also computes the
+terminal cell size by dividing the pixel dimensions by the cell counts, so the
+pseudo‑terminal must have **non‑zero rows and cols** — those are the *divisors* in
+`loop.update_screen_size`: `s.CellWidth = s.WidthPx / s.WidthCells` (`tools/tui/loop/run.go:L80`)
+and `s.CellHeight = s.HeightPx / s.HeightCells` (`run.go:L81`). A zero **cols** value panics with
+an integer divide‑by‑zero at `run.go:L80`, and a zero **rows** value at `run.go:L81` (both
+observed). The *pixel* width/height are the **numerators**, not divisors — a winsize with zero
+pixels but non‑zero rows/cols runs fine (cell size is then simply `0`, no panic; observed: a
+`40×120×0×0` winsize renders normally and exits `0`). The harness therefore supplies real,
+non‑zero rows and cols; it also supplies real pixel dimensions so that cell‑size and image
+geometry stay meaningful, but those pixels are not what guards against the divide‑by‑zero.
 
 A few small, deterministic, **temporary** Python tools (removed at the end) implement this.
 The two PTY harnesses (`pty_run.py` and `pty_run_stderr.py`) only supply the terminal and
@@ -517,11 +536,11 @@ shown at all.
 
 ### Observed
 
-**Fixture creation** (exact commands; the full builder script is `make_fixtures_collect.sh`,
-run once). Two directories `/tmp/kd/L` and `/tmp/kd/R` are populated with overlapping and
-non‑overlapping relative names:
+**Fixture creation** (exact, self‑contained commands). Two directories `/tmp/kd/L` and
+`/tmp/kd/R` are created, then populated with overlapping and non‑overlapping relative names:
 
 ```
+$ mkdir -p /tmp/kd/L /tmp/kd/R
 $ printf 'same line 1\nsame line 2\n' > /tmp/kd/L/unchanged.txt   # control: identical on both sides
 $ printf 'same line 1\nsame line 2\n' > /tmp/kd/R/unchanged.txt
 $ printf 'alpha\nbeta\ngamma\ndelta\n'                  > /tmp/kd/L/changed.txt
@@ -702,6 +721,7 @@ The second, full‑byte stage exists specifically to defeat MD5 hash collisions.
 **identical bytes** but different names:
 
 ```
+$ mkdir -p /tmp/kd/renL /tmp/kd/renR
 $ printf 'quarterly report\nrevenue up 3%%\n' > /tmp/kd/renL/report_v1.txt
 $ printf 'quarterly report\nrevenue up 3%%\n' > /tmp/kd/renR/report_final.txt
 $ md5sum /tmp/kd/renL/report_v1.txt /tmp/kd/renR/report_final.txt
@@ -733,6 +753,7 @@ collision** is used: two 128‑byte blobs with the **same MD5** but **different 
 placed under different names. Exact fixture‑creation and byte‑level proof:
 
 ```
+$ mkdir -p /tmp/kd/cgL /tmp/kd/cgR
 $ python3 - <<'PY'
 b1 = bytes.fromhex(
  "d131dd02c5e6eec4693d9a0698aff95c2fcab58712467eab4004583eb8fb7f89"
@@ -802,6 +823,75 @@ For the collision fixture, stage one (`L350`) is **true** (MD5s match) but stage
 (`L353`) is **false** (bytes differ at char 20), so control falls through to
 removal + add — precisely the observed two‑entry output. This is *why* the guard needs the
 `ld == rd` full‑byte comparison and not the hash alone.
+
+### Observed — an *ambiguous* rename picks a nondeterministic target
+
+**Direct answer.** When one removed file is byte‑identical to **two or more** added
+files, *which* added file is reported as the rename target is **not deterministic** —
+it varies from run to run. The inner match loop (just described) scans the added files
+in Go **map** iteration order, which the runtime deliberately randomizes per process,
+and stops at the **first** confirmed match; with several equally‑valid candidates the
+"winner" is whichever the randomized order happens to reach first.
+
+**Fixture:** one left file and two byte‑identical right files — all three share
+one MD5:
+
+```
+$ mkdir -p /tmp/kd/dupL /tmp/kd/dupR
+$ printf 'shared body line one\nshared body line two\n' > /tmp/kd/dupL/original.txt
+$ printf 'shared body line one\nshared body line two\n' > /tmp/kd/dupR/copy_a.txt
+$ printf 'shared body line one\nshared body line two\n' > /tmp/kd/dupR/copy_b.txt
+$ md5sum /tmp/kd/dupL/original.txt /tmp/kd/dupR/copy_a.txt /tmp/kd/dupR/copy_b.txt
+99f6f49ca9123399aa8459f32f3b35d7  /tmp/kd/dupL/original.txt
+99f6f49ca9123399aa8459f32f3b35d7  /tmp/kd/dupR/copy_a.txt
+99f6f49ca9123399aa8459f32f3b35d7  /tmp/kd/dupR/copy_b.txt
+```
+
+A single run reports the rename as `original.txt` → `copy_a.txt` and the *other*
+identical file (`copy_b.txt`) as a plain addition (the trailing blank rows and the
+interactive `:` prompt are trimmed from the fixed‑size screen render, as elsewhere in
+this document):
+
+```
+$ python3 /tmp/pty_run.py 1.2 /tmp/dup1.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/dupL /tmp/kd/dupR
+raw_bytes=5038 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/dup1.raw 40 120
+   copy_b.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   This file was added                                      1  shared body line one
+                                                            2  shared body line two
+   original.txt                                                copy_a.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Re‑running the **identical** command 30 times counts how often each candidate wins:
+
+```
+$ a=0; b=0
+$ for i in $(seq 1 30); do
+    python3 /tmp/pty_run.py 1.0 /tmp/dup_$i.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/dupL /tmp/kd/dupR 2>/dev/null
+    line=$(python3 /tmp/screen_render.py /tmp/dup_$i.raw 40 120 | grep original.txt)
+    case "$line" in *copy_a.txt*) a=$((a+1));; *copy_b.txt*) b=$((b+1));; esac
+  done
+$ echo "copy_a=$a copy_b=$b"
+copy_a=16 copy_b=14
+```
+
+Re‑running the identical loop a second time gave `copy_a=18 copy_b=12`; both targets
+occur in every batch and the ratio moves, so treat these figures as evidence that
+**neither** candidate is privileged rather than as a fixed probability.
+
+**Why.** The rename‑matching block iterates the *added* hashes with
+`for n, ah := range ahash` (`collect.go:L349`), where `ahash` is a Go `map`; the runtime
+randomizes map iteration order per process. On the **first** added file that satisfies
+both stages — `ah == rh` (`L350`) and the full‑byte `ld == rd` (`L353`) — it calls
+`self.add_rename(...)` (`L354`), removes that name with `added.Discard(n)` (`L355`), and
+**`break`s** out of the inner loop. Because `copy_a.txt` and `copy_b.txt` match
+`original.txt` equally, the winner is whichever the randomized iteration reaches first;
+the loser stays in the `added` set and renders as an addition via `add_add`
+(`collect.go:L366`). The kitten applies **no tie‑break** (there is no lexicographic
+ordering of candidates before the loop), so the choice is genuinely nondeterministic
+across runs.
 
 ---
 
@@ -920,8 +1010,15 @@ distinct 24-bit bg colors: 10
 bg: ['#acf2bd', '#cdffd8', '#dbedff', '#e6ffed', '#f1f8ff', '#fafbfc', '#fdb8c0', '#ffdce0', '#ffeef0', '#ffffff']
 ```
 
-Blue `#0000ff` (keywords / `def` / function names), green `#008000` (comments), red `#ba2121`
-(string literals) and `#a45a77` (numbers) are **Chroma token colors**; `#acf2bd`/`#fdb8c0` are
+`#0000ff` (function and class **names** — `NameFunction`/`NameClass`, `highlight.go:L39`/`L40`;
+observed on `greet`), `#008000` (**keywords** and builtins — `Keyword`/`NameBuiltin`, `L33`/`L38`;
+observed on `def`, `return`, `str`), `#666666` (**operators** and **numbers** —
+`Operator`/`LiteralNumber`, `L36`/`L57`; observed on `=`, `42`, `100`), `#a45a77` (f‑string
+**interpolation** and regex — `LiteralStringInterpol`/`LiteralStringRegex`, `L52`/`L54`; observed
+on the `{`…`}` delimiters of the f‑string) and red `#ba2121` (**string literals** —
+`LiteralString`, `L50`) are the **Chroma token colors** from `DefaultStyle`
+(`highlight.go:L29‑L62`) — note keywords such as `def` are **green**, not blue, and comments
+(`Comment`, italic `#3D7B7B`, `L31`) do not appear in this fixture's visible frame; `#acf2bd`/`#fdb8c0` are
 the intraline added/removed foregrounds and `#e6ffed`/`#ffeef0` the added/removed line
 backgrounds. Their presence confirms the highlight layer completed and cache #7 was consulted
 for the rendered result. This color set is **stable across waits of 1.0 s, 2.0 s and 3.0 s**
@@ -984,14 +1081,72 @@ cache to the highlighted‑line cache:
    len(plain_lines)` → return `ans` (`collect.go:L153-154`).
 3. Otherwise it returns the plain lines (`collect.go:L156`).
 
-That miss branch (`Get` returning "not yet cached", so plain text is used) is not merely
-read from the code — it is **observed** in the `-race` read stack in Q4, where the main
-goroutine calls `highlighted_lines_for_path → LRUCache.Get` (`collect.go:L153`,
-`cache.go:L27`) *during the first render, before the highlight workers have populated the
-cache*. What is **_(inferred)_** is only the exact sub‑perceptible timing of an isolated
-"plain frame" for small inputs: for small diffs the highlight goroutine wins the race so
-quickly that a cleanly‑isolated plain‑only frame is not visible to the harness even at a
-zero wait; the fallback path is nonetheless exercised (per the observed `Get` miss).
+That "not yet cached" branch — `Get` returning `found == false` (or a stale-length slice), so
+plain text is used — is **directly observable** as an externally-visible *plain → highlighted*
+transition rather than a value read only from the code. A small diff highlights faster than the
+harness can sample, so widening the window needs a large highlightable input and a single
+scheduler thread: a deterministically-generated ~30,000-line Python file (6,000 function blocks)
+with exactly one changed string literal, diffed under `GOMAXPROCS=1`, renders a **plain** frame
+first and a **syntax-highlighted** frame only after the highlight worker finishes. Scanning each
+captured frame for the highlighter's 24-bit foreground SGR colors (`38:2:R:G:B`) — stable across
+2 runs per wait — shows the transition:
+
+```
+$ mkdir -p /tmp/qafix/hlbig
+$ python3 - <<'PY'
+def gen(changed):
+    out = []
+    for n in range(6000):
+        out.append(f"def function_number_{n}(argument_{n}):")
+        s = "CHANGED value" if (changed and n == 2) else f"payload value {n}"
+        out.append(f'    local_string = "{s}"')
+        out.append(f"    total = {n} + argument_{n}")
+        out.append("    return total")
+        out.append("")
+    return out[:29999]
+with open("/tmp/qafix/hlbig/left.py", "w") as f:
+    f.write(chr(10).join(gen(False)) + chr(10))
+with open("/tmp/qafix/hlbig/right.py", "w") as f:
+    f.write(chr(10).join(gen(True)) + chr(10))
+PY
+$ for w in 0.5 1.0 2.0 4.0 8.0 12.0; do
+    GOMAXPROCS=1 python3 /tmp/pty_run.py $w /tmp/tl_$w.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/qafix/hlbig/left.py /tmp/qafix/hlbig/right.py
+  done
+raw_bytes=3095 child_exit=0
+raw_bytes=3095 child_exit=0
+raw_bytes=3095 child_exit=0
+raw_bytes=6281 child_exit=0
+raw_bytes=6281 child_exit=0
+raw_bytes=6281 child_exit=0
+$ grep -ao '38:2:[0-9]*:[0-9]*:[0-9]*' /tmp/tl_2.0.raw | sort -u    # PLAIN frame (3095 B)
+38:2:0:0:0
+38:2:170:170:170
+38:2:172:242:189
+38:2:253:184:192
+$ grep -ao '38:2:[0-9]*:[0-9]*:[0-9]*' /tmp/tl_4.0.raw | sort -u    # HIGHLIGHTED frame (6281 B)
+38:2:0:0:0
+38:2:0:0:255
+38:2:0:128:0
+38:2:102:102:102
+38:2:170:170:170
+38:2:172:242:189
+38:2:186:33:33
+38:2:253:184:192
+```
+
+The six `raw_bytes` lines correspond to the six waits in order: the first three (0.5/1.0/2.0 s)
+carry only the four diff-chrome colors (`#000000`, `#aaaaaa`, `#acf2bd`, `#fdb8c0`) and total
+3095 bytes; the last three (4.0/8.0/12.0 s) additionally carry the four Chroma syntax colors
+(`#0000ff` function names, `#008000` keywords, `#666666` numbers, `#ba2121` strings) and grow to
+6281 bytes — the plain → highlighted transition falls between the 2 s and 4 s samples. The plain
+frame is the fallback at `collect.go:L156` returning plain lines because the highlighted-line
+cache is not yet populated; the larger frame is the asynchronous re-render after `highlight_all`
+finishes and the per-path highlighted lines are cached. What remains **_(inferred / source-read)_**
+is the exact `found` boolean *inside* `Get`: the `-race` `Get` frame in Q4 proves
+`highlighted_lines_for_path → LRUCache.Get` is *called* on the first-render path, but a stack
+frame does not expose `Get`'s return value, so the miss itself is read from the source guard
+(`collect.go:L153`) and is **confirmed** by this observed plain-then-highlighted transition rather
+than asserted from the stack.
 
 ### Why it stays efficient
 
@@ -1075,6 +1230,9 @@ color form (`38:2:R:G:B`, emitted at `highlight.go:L134`), stable across 2 runs:
 
 ```
 $ scan(){ grep -ao '38:2:[0-9]*:[0-9]*:[0-9]*' "$1" | sort -u; }
+$ mkdir -p /tmp/kd/nlL /tmp/kd/nlR
+$ printf 'the quick brown fox jumps over the lazy dog\nlorem ipsum dolor sit amet consectetur\n' > /tmp/kd/nlL/notes.zzq
+$ printf 'the quick brown fox jumps over the lazy dog\nlorem ipsum DOLOR SIT AMET consectetur\n' > /tmp/kd/nlR/notes.zzq
 $ ls /tmp/kd/nlL /tmp/kd/nlR         # the no-lexer fixture pair
 /tmp/kd/nlL:
 notes.zzq
@@ -1084,7 +1242,7 @@ $ cat /tmp/kd/nlL/notes.zzq
 the quick brown fox jumps over the lazy dog
 lorem ipsum dolor sit amet consectetur
 $ python3 /tmp/pty_run.py 1.5 /tmp/nl.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/nlL /tmp/kd/nlR
-raw_bytes=3778 child_exit=0
+raw_bytes=3550 child_exit=0
 $ scan /tmp/nl.raw            # NO-LEXER (.zzq): only diff-chrome colors, no syntax colors
 38:2:0:0:0
 38:2:170:170:170
@@ -1232,7 +1390,10 @@ created by kitty/tools/utils/images.(*Context).Parallel in goroutine 152
 ### Observed — the `-race` detector pinpoints the exact lines
 
 Running the `-race`‑instrumented build (`/tmp/kitten-race`, built via
-`GOFLAGS=-race python3 setup.py`; ~10× slower, so it needs a larger wait) against the same
+`GOFLAGS=-race python3 setup.py`; measured ~17× slower on a single large highlight path —
+median `≈3.2 s` vs `≈55 s` to the first highlighted frame on a ~30 000‑line file (two rounds of
+3 runs each: normal `3.06–3.26 s`, `-race` `52.6–56.0 s`, ratio `17.2–17.4×`); the exact factor
+is workload‑dependent — so it needs a much larger wait) against the same
 corpora emits `WARNING: DATA RACE` reports. Two distinct races are observed, matching the two
 fatal‑error forms above. The 16‑byte heap addresses and the numeric goroutine ids differ from
 run to run (they are runtime‑assigned), but the **source lines are stable across runs**; both
@@ -1254,6 +1415,8 @@ $ for n in $(seq 1 40); do
 
 ```
 $ python3 /tmp/pty_run_stderr.py 12.0 /tmp/ww.raw /tmp/ww.err -- /tmp/kitten-race diff --config NONE /tmp/kd/medL /tmp/kd/medR
+$ cat /tmp/ww.info
+raw_bytes=21843 child_exit=66
 $ cat /tmp/ww.err
 ==================
 WARNING: DATA RACE
@@ -1296,6 +1459,14 @@ Goroutine 179 (finished) created at:
 Found 1 data race(s)
 ```
 
+`child_exit=66` is ThreadSanitizer's report-and-exit code for a detected race, matching
+the clean `Found 1 data race(s)` summary above. This write/write race is itself
+nondeterministic: across 6 back-to-back runs this session, 4 ended exactly as shown
+(`raw_bytes=21843 child_exit=66`) while 2 instead tripped Go's own fatal
+`concurrent map writes` runtime check *before* the detector's summary could print,
+aborting with `raw_bytes=10339 child_exit=2` — the same underlying race, two
+possible terminations.
+
 **(2) read/write** — a highlight worker assigns the map while the **main** goroutine reads it
 during rendering. This needs the fast `DIFF` stage to finish (triggering `render_diff`) while
 the slow 300‑file `HIGHLIGHT` stage is still writing, so it requires the larger corpus and a
@@ -1304,6 +1475,8 @@ read‑vs‑write block extracted from the emitted report, verbatim and complete
 
 ```
 $ python3 /tmp/pty_run_stderr.py 35.0 /tmp/rw.raw /tmp/rw.err -- /tmp/kitten-race diff --config NONE /tmp/kd/bigL /tmp/kd/bigR
+$ cat /tmp/rw.info
+raw_bytes=317 child_exit=2
 $ awk '/^==================$/{if(buf ~ /Read at .* by main goroutine/){print buf "=================="} buf=""} {buf=buf $0 ORS}' /tmp/rw.err
 ==================
 WARNING: DATA RACE
@@ -1413,6 +1586,8 @@ they render as a single `Binary file: <size>` line.
 ```
 $ python3 -c 'd=open("/tmp/kd/L/data.bin","rb").read(); print(" ".join("%02x"%b for b in d[:8])); d.decode("utf-8")'
 ff fe 00 01 02 ff ff 80
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
 UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
 
 $ python3 /tmp/pty_run.py 1.5 /tmp/bin.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/L/data.bin /tmp/kd/R/data.bin
@@ -1707,17 +1882,20 @@ Calculating diff, please wait...
 ```
 
 The placeholder is emitted by the `draw_screen` guard (`ui.go:L349`) whenever **any** of
-`logical_lines`, `diff_map`, or `collection` is still `nil`. That condition is true in **two**
-distinct pre‑render windows, not just before the diff: (a) the very first `draw_screen` called
-at the end of `initialize` (`ui.go:L139`), when `collection` is still `nil` because the
-`COLLECTION` goroutine has not returned; and (b) after `COLLECTION`, while `generate_diff` has
-reset `diff_map = nil` (`ui.go:L143`) and the `DIFF` goroutine has not yet posted. Both windows
-print the identical text.
+`logical_lines`, `diff_map`, or `collection` is still `nil`. That guard condition, and the **two** distinct pre-render windows it covers, are
+**_(inferred / source-read)_** — read from `ui.go`, not separately observed: (a) the very first
+`draw_screen` at the end of `initialize` (`ui.go:L139`), when `collection` is still `nil` because
+the `COLLECTION` goroutine has not returned; and (b) after `COLLECTION`, while `generate_diff`
+has reset `diff_map = nil` (`ui.go:L143`) and the `DIFF` goroutine has not yet posted. What is
+**observed** is only the placeholder text itself (above); the harness cannot attribute a given
+capture to window (a) versus (b).
 
-### Observed — the "after" state (`diff_map` populated, full render)
+### Observed — the "after" state (full render replaces the placeholder)
 
-Once the `DIFF` result arrives, `diff_map` is set and the full side‑by‑side diff renders, and
-the placeholder is gone. A small, stable input (3 text files/side; larger inputs risk the Q4
+Once the `DIFF` result arrives the placeholder is replaced by the full side-by-side diff — the
+externally-visible **observed** artifact captured below. That the render now reads `self.diff_map`,
+set from the `DIFF` result at `ui.go:L253`, is the **_(inferred / source-read)_** internal cause;
+the CLI exposes the render, never the field. A small, stable input (3 text files/side; larger inputs risk the Q4
 highlight race) at a longer wait:
 
 ```
@@ -1798,7 +1976,7 @@ Reading this honestly:
   fan‑out repaint made visible; the `-race` witness below proves the same overlap
   deterministically.
 
-### Observed — the pipeline wiring, proven by the runtime stack
+### Observed — the read-side call chain, witnessed by the runtime stack
 
 The Q4 `-race` read stack is not just a bug report; it is a **runtime witness of the exact
 call chain** the pipeline uses on the `DIFF` result. Reading the main goroutine outer‑to‑inner
@@ -1820,6 +1998,10 @@ and the racing worker side is `highlight_all.func1 → (*Context).Parallel.func1
 stages after `COLLECTION` are concurrent, not sequential. These are the functions named below.
 
 ### Why (causal explanation, `main.go` + `ui.go`)
+
+Every `file:line` in this subsection is **_(inferred / source-read)_** from the named files, not
+separately observed at runtime; the runtime-observed anchors are the placeholder, the full render,
+the progressive-repaint sizes, and the `-race` stack above.
 
 - **Synchronous startup (`main.go`).** `main` (`main.go:L102`) checks there are exactly two
   operands (`main.go:L108-110`), runs `set_diff_command(conf.Diff_cmd)` (`main.go:L111`, see
@@ -1938,6 +2120,7 @@ documented `pty_run.py` + `screen_render.py` harness; trailing blank rows and th
 
 ```
 $ python3 /tmp/pty_run.py 1.2 /tmp/q7_auto.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/anchorL/code.go /tmp/kd/anchorR/code.go
+raw_bytes=7430 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/q7_auto.raw 40 120
    /tmp/kd/anchorL/code.go                                   /tmp/kd/anchorR/code.go
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1969,6 +2152,7 @@ show the two forms in full.
 
 ```
 $ python3 /tmp/pty_run.py 1.2 /tmp/q7_builtin.raw -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=builtin /tmp/kd/anchorL/code.go /tmp/kd/anchorR/code.go
+raw_bytes=7430 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/q7_builtin.raw 40 120
    /tmp/kd/anchorL/code.go                                     /tmp/kd/anchorR/code.go
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1990,6 +2174,7 @@ $ python3 /tmp/screen_render.py /tmp/q7_builtin.raw 40 120
 
 ```
 $ python3 /tmp/pty_run.py 1.2 /tmp/q7_git.raw -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=git /tmp/kd/anchorL/code.go /tmp/kd/anchorR/code.go
+raw_bytes=7430 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/q7_git.raw 40 120
    /tmp/kd/anchorL/code.go                                     /tmp/kd/anchorR/code.go
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2039,6 +2224,7 @@ A differ that cannot be executed (nonexistent binary):
 
 ```
 $ python3 /tmp/pty_run.py 1.2 /tmp/q7_err.raw -- /app/kitty/launcher/kitten diff --config NONE -o "diff_cmd=/nonexistent/differ-xyz --" /tmp/kd/anchorL/code.go /tmp/kd/anchorR/code.go
+raw_bytes=478 child_exit=1
 $ python3 /tmp/screen_render.py /tmp/q7_err.raw 40 120
 Calculating diff, please wait...
 Error: Failed to diff /tmp/kd/anchorL/code.go vs. /tmp/kd/anchorR/code.go with errors:
@@ -2049,6 +2235,7 @@ A differ that exits with a non‑1 code (a two‑line script `#!/bin/sh` / `exit
 ```
 $ printf '#!/bin/sh\nexit 2\n' > /tmp/kd/exit2.sh && chmod +x /tmp/kd/exit2.sh
 $ python3 /tmp/pty_run.py 1.2 /tmp/q7_err2.raw -- /app/kitty/launcher/kitten diff --config NONE -o "diff_cmd=/tmp/kd/exit2.sh _CONTEXT_ --" /tmp/kd/anchorL/code.go /tmp/kd/anchorR/code.go
+raw_bytes=478 child_exit=1
 $ python3 /tmp/screen_render.py /tmp/q7_err2.raw 40 120
 Calculating diff, please wait...
 Error: Failed to diff /tmp/kd/anchorL/code.go vs. /tmp/kd/anchorR/code.go with errors:
@@ -2155,6 +2342,7 @@ Diffed through the canonical entry point (default `auto` → git):
 
 ```
 $ python3 /tmp/pty_run.py 1.3 /tmp/sym_auto.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/symL /tmp/kd/symR
+raw_bytes=5996 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/sym_auto.raw 40 120
    link_to_left.txt
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2195,6 +2383,7 @@ git‑specific:
 
 ```
 $ python3 /tmp/pty_run.py 1.3 /tmp/sym_builtin.raw -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=builtin /tmp/kd/symL /tmp/kd/symR
+raw_bytes=5996 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/sym_builtin.raw 40 120
    link_to_left.txt
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2229,6 +2418,7 @@ exit=1
 source message (`main.go:L130`):
 
 ```
+$ printf 'a plain file, used as a file operand for the checks below\n' > /tmp/kd/afile.txt
 $ /app/kitty/launcher/kitten diff --config NONE /tmp/kd/R /tmp/kd/afile.txt 2>&1; echo "exit=$?"
 Error: The items to be diffed should both be either directories or files. Comparing a directory to a file is not valid.'
 exit=1
@@ -2245,14 +2435,18 @@ exit=1
 ```
 
 **Constrained screen** (`render_diff`, `ui.go:L295-300`) — both guards fire on a real tiny
-winsize. The harness accepts an optional `PTY_WINSIZE=<rows>x<cols>x<xpix>x<ypix>` override (pixels
-kept non‑zero so `update_screen_size` does not divide by zero):
+winsize. The harness accepts an optional `PTY_WINSIZE=<rows>x<cols>x<xpix>x<ypix>` override (rows
+and cols are kept non‑zero — they, not the pixels, are the divisors in `update_screen_size` at
+`run.go:L80‑81` — so a deliberately tiny winsize such as `40×6` or `1×120` still does not divide
+by zero):
 
 ```
 $ PTY_WINSIZE=40x6x72x800 python3 /tmp/pty_run.py 1.2 /tmp/narrow.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/smL /tmp/kd/smR
+raw_bytes=415 child_exit=1
 $ strings /tmp/narrow.raw | grep -o 'Screen too narrow, need at least 8 columns'
 Screen too narrow, need at least 8 columns
 $ PTY_WINSIZE=1x120x1440x20 python3 /tmp/pty_run.py 1.2 /tmp/short.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/smL /tmp/kd/smR
+raw_bytes=411 child_exit=1
 $ strings /tmp/short.raw | grep -o 'Screen too short, need at least 2 rows'
 Screen too short, need at least 2 rows
 ```
@@ -2263,12 +2457,18 @@ posts `IMAGE_LOAD` only when `image_count > 0` (`ui.go:L202`, Q6). Observed indi
 
 ```
 $ python3 /tmp/pty_run.py 1.2 /tmp/noimg.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/smL /tmp/kd/smR
+raw_bytes=11790 child_exit=0
 $ python3 -c "import re;print('text diff _G =', len(re.findall(rb'\x1b_G', open('/tmp/noimg.raw','rb').read())))"
 text diff _G = 0
 $ python3 /tmp/pty_run.py 1.5 /tmp/imgchk.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/imgL /tmp/kd/imgR
+raw_bytes=12719 child_exit=0
 $ python3 -c "import re;print('image diff _G =', len(re.findall(rb'\x1b_G', open('/tmp/imgchk.raw','rb').read())))"
 image diff _G = 17
 ```
+
+The text diff's `raw_bytes=11790` and both `_G` counts (0 vs 17) are stable across runs;
+the image diff's `raw_bytes` varies by ±1 B with graphics-redraw timing (`12719` on 6 of
+8 runs, `12718` on the other 2), as noted for every image capture in this document.
 
 **Observed under corrupt / hostile inputs.** Two branches the code contains — the
 image‑load‑failure path and the malformed‑patch path — are reachable through the canonical
@@ -2293,9 +2493,11 @@ variants, both under default `--config NONE`:
 then undecodable, so it reports `image: unknown format`:
 
 ```
+$ mkdir -p /tmp/kd/if1L /tmp/kd/if1R
 $ printf 'this is definitely not a png, just ascii text\n' > /tmp/kd/if1L/x.png
 $ printf 'neither is this one, also plain ascii text!!\n'  > /tmp/kd/if1R/x.png
 $ python3 /tmp/pty_run.py 1.5 /tmp/if1.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/if1L /tmp/kd/if1R
+raw_bytes=10035 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/if1.raw 40 120
    x.png
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2308,9 +2510,11 @@ $ python3 /tmp/screen_render.py /tmp/if1.raw 40 120
 — decoding starts, recognises the container, then hits `unexpected EOF`:
 
 ```
+$ mkdir -p /tmp/kd/if2L /tmp/kd/if2R
 $ printf '\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x01\x02\x03garbagegarbage' > /tmp/kd/if2L/x.png
 $ printf '\x89\x50\x4e\x47\x0d\x0a\x1a\x0aDIFFERENTgarbage\xff\xfe'        > /tmp/kd/if2R/x.png
 $ python3 /tmp/pty_run.py 1.5 /tmp/if2.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/kd/if2L /tmp/kd/if2R
+raw_bytes=10052 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/if2.raw 40 120
    x.png
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2351,12 +2555,17 @@ which finds no hunks — an empty patch — so the kitten renders **"The files a
 silently wrong because the files differ:
 
 ```
-$ cat /tmp/garbage_differ.sh
+$ mkdir -p /tmp/kd/mp
+$ printf 'alpha\nbeta\ngamma\n'         > /tmp/kd/mp/left.txt
+$ printf 'alpha\nBETA-changed\ngamma\n' > /tmp/kd/mp/right.txt
+$ cat > /tmp/garbage_differ.sh <<'EOF'
 #!/bin/sh
 echo "this is not a diff at all"
 echo "just some random garbage text"
 echo "no unified-diff hunk headers here"
 exit 1
+EOF
+$ chmod +x /tmp/garbage_differ.sh
 $ python3 /tmp/pty_run.py 1.5 /tmp/mp_garbage.raw -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=/tmp/garbage_differ.sh /tmp/kd/mp/left.txt /tmp/kd/mp/right.txt
 raw_bytes=2495 child_exit=0
 $ python3 /tmp/screen_render.py /tmp/mp_garbage.raw 40 120
@@ -2374,7 +2583,7 @@ rather than as a benign failure. Captured on a separate stderr pipe (`pty_run_st
 child exits 2:
 
 ```
-$ cat /tmp/malformed_differ.sh
+$ cat > /tmp/malformed_differ.sh <<'EOF'
 #!/bin/sh
 echo "--- a/left.txt"
 echo "+++ b/right.txt"
@@ -2382,6 +2591,8 @@ echo "@@ this is a broken hunk header @@"
 echo "-beta"
 echo "+BETA-changed"
 exit 1
+EOF
+$ chmod +x /tmp/malformed_differ.sh
 $ python3 /tmp/pty_run_stderr.py 1.5 /tmp/mp_malformed.raw /tmp/mp_malformed.err -- /app/kitty/launcher/kitten diff --config NONE -o diff_cmd=/tmp/malformed_differ.sh /tmp/kd/mp/left.txt /tmp/kd/mp/right.txt
 $ cat /tmp/mp_malformed.info
 raw_bytes=332 child_exit=2
@@ -2437,27 +2648,115 @@ scale‑dependent defect, not a documentation error.
 
 ---
 
+## Additional collection & rename conditions — nested overlap, same basename, moved-and-modified
+
+Three further conditions the pairing (Q1) and rename (Q2) logic imply are observed here through
+the canonical `kitten diff` path, each with a self-contained fixture, the exact command, the
+`raw_bytes` status line (stable across ≥ 3 runs), and the rendered file-classification lines
+(excerpted from the full frame via `grep`).
+
+**Nested overlap — pairing is by *full relative path*, so a file nested identically deep on both
+sides is paired and diffed as a change, not add+remove.**
+
+```
+$ mkdir -p /tmp/qafix/nest/L/sub/deep /tmp/qafix/nest/R/sub/deep
+$ printf 'alpha\nbeta\ngamma\n' > /tmp/qafix/nest/L/sub/deep/a.txt
+$ printf 'alpha\nBETA\ngamma\n' > /tmp/qafix/nest/R/sub/deep/a.txt
+$ printf 'top unchanged\n'      > /tmp/qafix/nest/L/top.txt
+$ printf 'top unchanged\n'      > /tmp/qafix/nest/R/top.txt
+$ python3 /tmp/pty_run.py 1.0 /tmp/nest.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/qafix/nest/L /tmp/qafix/nest/R
+raw_bytes=2176 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/nest.raw 40 120 | grep -aE 'a\.txt|@@|alpha|beta|BETA|gamma'
+   sub/deep/a.txt
+   @@ -1,3 +1,3 @@
+1  alpha                                                    1  alpha
+2  beta                                                     2  BETA
+3  gamma                                                    3  gamma
+```
+
+The changed file is listed by its **full relative name** `sub/deep/a.txt` — the key built by
+`filepath.Rel(base, path)` (`collect.go:L283`) and kept by `Intersect` (`collect.go:L306`), then
+iterated at `L308` where `ld != rd` routes it to `add_change` (`collect.go:L317`/`L319`). The
+byte-identical `top.txt` on both sides is unchanged and absent from the change view. The `raw_bytes`
+count for this fixture is **bimodal** across runs — `2176` or `3992` — the same
+progressive-repaint transient characterized in Q6 (an extra repaint of the *identical* diff);
+the rendered classification above is stable either way.
+
+**Same basename at a different relative path — *not* paired (and, with differing content, not a
+rename either): one side is removed, the other added.**
+
+```
+$ mkdir -p /tmp/qafix/sb/L/dirA /tmp/qafix/sb/R/dirB
+$ printf 'content for A\n' > /tmp/qafix/sb/L/dirA/x.txt
+$ printf 'content for B\n' > /tmp/qafix/sb/R/dirB/x.txt
+$ python3 /tmp/pty_run.py 1.0 /tmp/sb.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/qafix/sb/L /tmp/qafix/sb/R
+raw_bytes=4584 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/sb.raw 40 120 | grep -aE 'x\.txt|content|added|removed'
+   dirA/x.txt
+1  content for A                                               This file was removed
+   dirB/x.txt
+   This file was added                                      1  content for B
+```
+
+`dirA/x.txt` and `dirB/x.txt` share the basename `x.txt` but have **different relative paths**, so
+they never enter `common_names`; `Subtract` places them in *removed* (`collect.go:L332`) and
+*added* (`collect.go:L333`). Because their contents also differ, the Q2 rename guard does not fire
+either. (Had the bytes been identical, rename detection *would* pair them across the differing
+paths — that path/basename-agnostic behavior is exactly Q2.)
+
+**Moved-and-modified — a moved file whose contents also changed is remove+add, *not* a rename
+(the rename guard requires byte-identical content).**
+
+```
+$ mkdir -p /tmp/qafix/mm/L /tmp/qafix/mm/R
+$ printf 'line1\nline2\nline3\n'   > /tmp/qafix/mm/L/old.txt
+$ printf 'line1\nCHANGED\nline3\n' > /tmp/qafix/mm/R/new.txt
+$ python3 /tmp/pty_run.py 1.0 /tmp/mm.raw -- /app/kitty/launcher/kitten diff --config NONE /tmp/qafix/mm/L /tmp/qafix/mm/R
+raw_bytes=6472 child_exit=0
+$ python3 /tmp/screen_render.py /tmp/mm.raw 40 120 | grep -aE '\.txt|line|CHANGED|added|removed'
+   new.txt
+   This file was added                                      1  line1
+                                                            2  CHANGED
+                                                            3  line3
+   old.txt
+1  line1                                                       This file was removed
+2  line2
+3  line3
+```
+
+`old.txt` is *removed* and `new.txt` is *added* as two independent entries; they are **not**
+collapsed into a rename because their bytes differ (`line2` vs `CHANGED`), so the MD5-then-full-
+bytes guard `ah == rh` (`collect.go:L350`) then `ld == rd` (`collect.go:L353`) → `add_rename`
+(`collect.go:L354`) never matches. This is the ordinary "moved and edited" case, the complement
+of the byte-identical rename in Q2.
+
 ## Coverage pass — every named item addressed
 
 Each item is tagged **Observed** (backed by captured CLI/byte output in this document),
 **Code‑read** (a structural fact cited to source, not a runtime measurement), or
-**Not reproduced** (a code branch stated honestly as untriggered under default configuration).
+**Not reproduced** (a code branch stated honestly as untriggered under default configuration), or
+**Limitation** (a condition the harness or environment cannot reproduce — for example no on-screen
+pixels, or always-root readability — stated with its reason).
 
 - **Q1 — directory collection / pairing** — *Observed.* Name‑intersection pairing
   (`Intersect`, `collect.go:L306`); content change (`ld != rd` → `add_change`,
   `collect.go:L317`/`L319`); mode‑only change (`collect.go:L321-327`, "Mode changed:");
-  negative control (`unchanged.txt` absent, `grep -c = 0`); the `ignore_name` basename‑glob filter (`allowed`, `collect.go:L230-237`) observed default‑off vs. `-o ignore_name=*.log`.
+  negative control (`unchanged.txt` absent, `grep -c = 0`); the `ignore_name` basename‑glob filter (`allowed`, `collect.go:L230-237`) observed default‑off vs. `-o ignore_name=*.log`. Pairing is by **full relative path**, not basename: a deeply **nested** file present on both sides is paired and diffed as a change, while the **same basename at a different relative path** (`dirA/x.txt` vs `dirB/x.txt`) is *not* paired — one removed, one added (`Subtract`, `collect.go:L332-333`) — both in the *Additional collection & rename conditions* section above.
 - **Q2 — rename detection** — *Observed.* Two‑stage guard: MD5 equal (`ah == rh`,
   `collect.go:L350`) **then** full bytes equal (`ld == rd`, `collect.go:L353`) →
   `add_rename` (`collect.go:L354`); a real rename observed; the **MD5‑collision** case
   (Wang et al. pair — equal MD5, different bytes) observed to render as removal + addition,
-  **not** a rename.
+  **not** a rename; and the **ambiguous** case — one removed file byte‑identical to *two*
+  added files — observed **nondeterministic** across two 30‑run batches (`copy_a=16 copy_b=14`,
+  then `18/12`; both targets occur), because the inner loop scans the `ahash` map in the
+  runtime‑randomized order and `break`s at the first confirmed match (`collect.go:L349`,
+  `L354‑355`) with **no tie‑break**. A **moved-and-modified** file (a moved file whose bytes also changed) is *not* a rename — it renders as remove+add because the byte-identical guard (`ld == rd`, `collect.go:L353`) fails — observed in the *Additional collection & rename conditions* section above.
 - **Q3 — caching** — *mixed.* **Code‑read:** all **seven** caches and their accessors —
   bounded via `GetOrCreate` (`size_cache`, `data_cache`, `hash_cache`, `lines_cache`) vs.
   **unbounded** via `MustGetOrCreate` (`mimetypes_cache`, `is_text_cache`) and via `Set`
   (`highlighted_lines_cache`) (`collect.go:L30-36`, `cache.go`); the generic `LRUCache` guarded
   by `sync.RWMutex`; the highlighted‑vs‑plain fallback branch (`collect.go:L148-156`).
-  **Observed:** per‑process determinism across 4 runs (byte‑identical). **Not reproduced:** LRU
+  **Observed:** per‑process determinism across 4 runs (byte‑identical), and the plain → highlighted **fallback transition** on a large corpus (raw_bytes 3095 → 6281 under `GOMAXPROCS=1`; see Q3). **Not reproduced:** LRU
   eviction (no fixture reached the 4096 `GetOrCreate` cap) and exact hit counters (not exposed
   by the CLI) — clearly labelled inferred in‑section.
 - **Q4 — parallel highlighting / concurrency** — *Observed.* `Parallel` worker‑pool mechanism
@@ -2476,14 +2775,15 @@ Each item is tagged **Observed** (backed by captured CLI/byte output in this doc
   invariant and **only 2 carry pixel payloads** (1024 B and 2304 B). **Not reproduced:** actual
   on‑screen image display and the "even over SSH" claim (the PTY is not a kitty renderer) — see
   the Q5 limitation note.
-- **Q6 — async pipeline** — *Observed.* `COLLECTION` is the **only guaranteed‑first** stage;
-  after it, `DIFF`, `HIGHLIGHT`, and (only if images) `IMAGE_LOAD` run **concurrently and
-  complete in any order**, plus a **fifth** result type `IMAGE_RESIZE` (`ui.go:L25-29`); the
-  `async_results` channel (buffer 32, `ui.go:L132`); `on_wakeup`/`handle_async_result` with two
-  error returns (`ui.go:L161`/`L166-172`/`L245`); `diff_map` **before** (`nil`, `ui.go:L143`,
-  placeholder) and **after** (`ui.go:L253`); the timestamped before→intermediate→after sweep;
-  and the `-race` read/write overlap as a runtime witness that the `DIFF`‑render and `HIGHLIGHT`
-  stages run at the same instant.
+- **Q6 — async pipeline** — *mixed.* **Observed:** the `COLLECTION`-first ordering and
+  the concurrent post-`COLLECTION` stages, via the timestamped placeholder→progressive-
+  repaint→full-render sweep, and the `-race` read/write overlap as a runtime witness that a
+  `DIFF`-render and the `HIGHLIGHT` stage run at the same instant. **Code‑read:** the internal
+  wiring — the five `ResultType` constants incl. `IMAGE_RESIZE` (`ui.go:L25-29`), the
+  `async_results` channel (buffer 32, `ui.go:L132`), `on_wakeup`/`handle_async_result` with two
+  error returns (`ui.go:L161`/`L166-172`/`L245`), and the `diff_map` field **before** (`nil`,
+  `ui.go:L143`) / **after** (`ui.go:L253`) — whose externally-visible effect (placeholder
+  vs. full render) is what is observed.
 - **Q7 — diff algorithm** — *Observed* (algorithmic complexity is *code‑read*). All
   `set_diff_command` options — `auto`, `builtin`/`""`, `git`, `diff`, custom
   (`patch.go:L44-59`) — each run with complete grids/headers; default `auto`→git observed;
@@ -2510,16 +2810,34 @@ Each item is tagged **Observed** (backed by captured CLI/byte output in this doc
 ### Inferred / not‑reproduced statements, and why
 
 - **Q3:** LRU **eviction** (`GetOrCreate`, `cache.go:L48-53`) — no fixture reached the 4096‑entry
-  cap; exact per‑access **hit counters** — not exposed through the CLI. The isolated
-  **plain‑only frame** for tiny inputs is timing‑sensitive (highlight usually wins the race
-  before the harness can sample), but the fallback path itself *is* witnessed by the `-race`
-  `Get` on the highlight cache (Q4/Q6).
+  cap; exact per‑access **hit counters** — not exposed through the CLI. The highlighted-vs-plain
+  **fallback** is now **observed** directly as an externally-visible plain → highlighted
+  transition on a ~30,000-line corpus under `GOMAXPROCS=1` (raw_bytes 3095 → 6281; four
+  diff-chrome colors → eight, adding the Chroma syntax set; see Q3); only the *isolated
+  plain-only frame for tiny inputs* stays timing-sensitive (highlight usually wins the race
+  before the harness can sample), and the exact `found` boolean inside `Get` is source-read (a
+  stack frame shows `Get` is called, not its return value).
 - **Q5:** actual image **rendering** and the **"even over SSH"** documentation claim — the PTY
   captures the Graphics‑Protocol bytes but is not a kitty terminal, so pixels are transmitted
   but never painted; both are labelled inferred in‑section.
 
-Everything else in this document is backed by captured CLI output with the exact command that
-produced it.
+Most other statements in this document are backed by captured CLI output with the exact command
+that produced it; the exceptions are the code-read and limitation items called out **in-section**
+and summarized here:
+
+- **Unreadable-file error path** — *Limitation.* The investigation runs as **root**, so `os.Open`
+  never fails on permissions and the read-error branch cannot be triggered; it is code-read only.
+- **Live resize / `IMAGE_RESIZE` on a size change** — *Limitation.* The PTY harness uses a fixed
+  winsize (40×120), so the resize path `resize_all_images_if_needed` (`ui.go:L213`) is code-read;
+  only the initial layout is observed.
+- **Full size/performance series** — *Partly observed.* Two timing points are observed — the
+  `-race` slowdown (Q4/Q6) and the plain→highlighted transition on a ~30k-line corpus (Q3) —
+  but a full input-size scaling curve was not swept.
+- **All-path association integrity at scale (hundreds of paths)** — *Code-read.* Per-path keying
+  is cited to source and shown by the `-race` `Get`/`Set` path keys (Q4); a hundreds-of-files
+  association sweep was not run.
+- **Cache 4096/4097 capacity boundary** — *Not reproduced.* No fixture reached the 4096-entry cap,
+  so the `GetOrCreate` eviction branch (`cache.go:L48-53`) never fired (see Q3).
 
 ---
 
