@@ -20,9 +20,9 @@ stack artifacts from the running program.
   modified**; every scratch artifact lived under `/tmp/kitty_probe` (outside the tree) and was
   removed afterwards (see §10). This answer document is the only file added to the repository.
 
-The single live Kitty session used for every capture in this document is **PID 281** (the main
-process), running under a virtual X display driven by `Xvfb` (PID 209). Unless stated otherwise,
-every `/proc`, thread, stack, and control-interface artifact below was taken from PID 281.
+The single live Kitty session used for every capture in this document is **PID 181113** (the main
+process), running under a virtual X display driven by `Xvfb` (PID 181020). Unless stated otherwise,
+every `/proc`, thread, stack, and control-interface artifact below was taken from PID 181113.
 
 ---
 
@@ -36,8 +36,18 @@ space in the way the term "one program" suggests.** What runs, and where, is as 
    GPU draw path, the windowing/GL-context layer, and the PTY-I/O and render loops — is compiled
    into a single CPython extension module, `kitty.fast_data_types` (the file
    `kitty/fast_data_types.so`). **[OBSERVED]** In the running main process this `.so` is mapped
-   (§4), its functions dominate every native stack (§8), and the threads that read the PTY and
-   service remote control live inside it (`io_loop`, `talk_loop` — §5, §8).
+   (§4); under a live `gdb thread apply all bt` its functions appear in exactly **3 of the 68**
+   native thread stacks — the main render/event thread, the PTY-I/O thread (`io_loop`), and the
+   remote-control talk thread (`talk_loop`). This "3" is stable across repeated snapshots (§8
+   confirms it on two independent captures). The other **65** stacks are Mesa's software-GL worker
+   pool parked in `libgallium`, and those 65 always show a `libgallium` frame; the main render
+   thread additionally shows a `libgallium` frame *when the snapshot catches it mid-frame in its
+   GPU-draw path* (as in the §8 `draw_cells` capture), so a during-draw snapshot shows **66 of 68**
+   stacks touching `libgallium` and makes the main thread the single stack carrying **both**
+   `fast_data_types.so` and `libgallium` frames (§5, §8). The C engine therefore *owns* the
+   terminal-work threads (parse, PTY I/O, remote-control talk, and the per-frame GPU draw), even
+   though on this software-GL host it is outnumbered in the raw thread table by Mesa's rasteriser
+   pool.
 
 2. **Python is the orchestrator, and it runs *inside* the main process.** The `kitty.*` Python
    packages (`boss`, `window`, `tabs`, `child`, `config`, the `rc.*` remote-control command
@@ -57,8 +67,8 @@ A one-line summary of the division, each part backed by the section that demonst
 
 | Language | Where it runs | What it owns (runtime-demonstrated) | Shown in |
 |---|---|---|---|
-| **C** (`fast_data_types.so`) | Inside main PID 281 | Parser, screen+scrollback model, fonts, graphics protocol, GPU draw (`draw_cells`), GL/windowing, PTY-I/O + render + talk threads | §4, §5, §8 |
-| **Python** (embedded CPython) | Inside main PID 281 (1 thread) | Startup, window/tab/child lifecycle, configuration, remote-control command surface (`@ ls`, …) | §5, §6, §8 |
+| **C** (`fast_data_types.so`) | Inside main PID 181113 | Parser, screen+scrollback model, fonts, graphics protocol, GPU draw (`draw_cells`), GL/windowing, PTY-I/O + render + talk threads | §4, §5, §8 |
+| **Python** (embedded CPython) | Inside main PID 181113 (1 thread) | Startup, window/tab/child lifecycle, configuration, remote-control command surface (`@ ls`, …) | §5, §6, §8 |
 | **Go** (`kitten` binary) | Separate child processes | `kitten` CLI, the `@` RC client, wrapped kittens (`icat`, …) | §7 |
 
 Two clarifications that the runtime evidence forces, and which a source-only reading gets wrong:
@@ -88,80 +98,211 @@ docker run -d --name kitty_dev --init --cap-add SYS_PTRACE \
 ```
 
 **Build.** The single canonical build command is `python3 setup.py` with no flags. It compiles the
-C extension into `kitty/fast_data_types.so`, builds the vendored GLFW backends, and runs `go build`
-to produce the `kitten` binary. Running it (the image had already performed the initial full build,
-so this is the idempotent incremental pass) completed cleanly:
+C extension into `kitty/fast_data_types.so`, builds the vendored GLFW backends (X11 and Wayland),
+compiles the `rsync` helper, and links the launcher. To capture a **clean** build (not an
+incremental pass), the commit was checked out into a fresh working tree (`git clone /app /work`, so
+no build artifacts are inherited) and built there; the Go module cache at `/root/go/pkg/mod` is
+shared and warm, so `go build` of `kitten` reuses it. The build was run **twice** from fresh clones
+and produced a **byte-identical 158-line transcript** both times (28 code-generation steps + 122
+C-compile steps + 5 link steps), completing in ≈19 s. The complete, unedited transcript of the
+canonical clean build (run 1; run 2 was identical) is reproduced in full below:
+
+<details>
+<summary><code>$ cd /work &amp;&amp; python3 setup.py    # exit 0, clean build — complete, unedited 158-line output</code></summary>
 
 ```
-$ cd /app && python3 setup.py    # exit 0, ~6s incremental — complete, unedited output:
-[1/35] Compiling [wayland] glfw/input.c ...
-[2/35] Compiling [wayland] glfw/xkb_glfw.c ...
-[3/35] Compiling [wayland] glfw/wl_client_side_decorations.c ...
-[4/35] Compiling [wayland] glfw/window.c ...
-[5/35] Compiling [wayland] glfw/wl_init.c ...
-[6/35] Compiling [wayland] glfw/egl_context.c ...
-[7/35] Compiling [wayland] glfw/context.c ...
-[8/35] Compiling [wayland] glfw/ibus_glfw.c ...
-[9/35] Compiling [wayland] glfw/monitor.c ...
-[10/35] Compiling [wayland] glfw/backend_utils.c ...
-[11/35] Compiling [wayland] glfw/linux_joystick.c ...
-[12/35] Compiling [wayland] glfw/init.c ...
-[13/35] Compiling [wayland] glfw/dbus_glfw.c ...
-[14/35] Compiling [wayland] glfw/vulkan.c ...
-[15/35] Compiling [wayland] glfw/osmesa_context.c ...
-[16/35] Compiling [wayland] glfw/wayland-tablet-unstable-v2-client-protocol.c ...
-[17/35] Compiling [wayland] glfw/linux_desktop_settings.c ...
-[18/35] Compiling [wayland] glfw/wl_text_input.c ...
-[19/35] Compiling [wayland] glfw/wl_monitor.c ...
-[20/35] Compiling [wayland] glfw/wayland-xdg-shell-client-protocol.c ...
-[21/35] Compiling [wayland] glfw/linux_notify.c ...
-[22/35] Compiling [wayland] glfw/wayland-primary-selection-unstable-v1-client-protocol.c ...
-[23/35] Compiling [wayland] glfw/wayland-pointer-constraints-unstable-v1-client-protocol.c ...
-[24/35] Compiling [wayland] glfw/wayland-text-input-unstable-v3-client-protocol.c ...
-[25/35] Compiling [wayland] glfw/wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
-[26/35] Compiling [wayland] glfw/posix_thread.c ...
-[27/35] Compiling [wayland] glfw/wayland-xdg-activation-v1-client-protocol.c ...
-[28/35] Compiling [wayland] glfw/wayland-xdg-decoration-unstable-v1-client-protocol.c ...
-[29/35] Compiling [wayland] glfw/wayland-relative-pointer-unstable-v1-client-protocol.c ...
-[30/35] Compiling [wayland] glfw/wayland-cursor-shape-v1-client-protocol.c ...
-[31/35] Compiling [wayland] glfw/wayland-fractional-scale-v1-client-protocol.c ...
-[32/35] Compiling [wayland] glfw/wayland-viewporter-client-protocol.c ...
-[33/35] Compiling [wayland] glfw/wayland-single-pixel-buffer-v1-client-protocol.c ...
-[34/35] Compiling [wayland] glfw/wl_cursors.c ...
-[35/35] Compiling [wayland] glfw/wayland-kwin-blur-v1-client-protocol.c ...
+[1/28] Generating wayland-xdg-shell-client-protocol.h ...
+[2/28] Generating wayland-xdg-shell-client-protocol.c ...
+[3/28] Generating wayland-viewporter-client-protocol.h ...
+[4/28] Generating wayland-viewporter-client-protocol.c ...
+[5/28] Generating wayland-relative-pointer-unstable-v1-client-protocol.h ...
+[6/28] Generating wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[7/28] Generating wayland-pointer-constraints-unstable-v1-client-protocol.h ...
+[8/28] Generating wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[9/28] Generating wayland-xdg-decoration-unstable-v1-client-protocol.h ...
+[10/28] Generating wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+[11/28] Generating wayland-primary-selection-unstable-v1-client-protocol.h ...
+[12/28] Generating wayland-primary-selection-unstable-v1-client-protocol.c ...
+[13/28] Generating wayland-text-input-unstable-v3-client-protocol.h ...
+[14/28] Generating wayland-text-input-unstable-v3-client-protocol.c ...
+[15/28] Generating wayland-xdg-activation-v1-client-protocol.h ...
+[16/28] Generating wayland-xdg-activation-v1-client-protocol.c ...
+[17/28] Generating wayland-tablet-unstable-v2-client-protocol.h ...
+[18/28] Generating wayland-tablet-unstable-v2-client-protocol.c ...
+[19/28] Generating wayland-cursor-shape-v1-client-protocol.h ...
+[20/28] Generating wayland-cursor-shape-v1-client-protocol.c ...
+[21/28] Generating wayland-fractional-scale-v1-client-protocol.h ...
+[22/28] Generating wayland-fractional-scale-v1-client-protocol.c ...
+[23/28] Generating wayland-single-pixel-buffer-v1-client-protocol.h ...
+[24/28] Generating wayland-single-pixel-buffer-v1-client-protocol.c ...
+[25/28] Generating wayland-kwin-blur-v1-client-protocol.h ...
+[26/28] Generating wayland-kwin-blur-v1-client-protocol.c ...
+[27/28] Generating wayland-wlr-layer-shell-unstable-v1-client-protocol.h ...
+[28/28] Generating wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
  done
-[1/3] Linking [wayland] kitty/glfw-wayland ...
-[2/3] Linking kittens/transfer/rsync ...
-[3/3] Linking launcher ...
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[4/122] Compiling [x11] glfw/x11_window.c ...
+[5/122] Compiling kitty/glfw.c ...
+[6/122] Compiling kitty/graphics.c ...
+[7/122] Compiling kitty/child-monitor.c ...
+[8/122] Compiling kitty/fonts.c ...
+[9/122] Compiling kitty/shaders.c ...
+[10/122] Compiling kitty/vt-parser.c ...
+[11/122] Compiling kitty/vt-parser.c ...
+[12/122] Compiling kitty/state.c ...
+[13/122] Compiling [x11] glfw/input.c ...
+[14/122] Compiling [wayland] glfw/input.c ...
+[15/122] Compiling kitty/mouse.c ...
+[16/122] Compiling [x11] glfw/xkb_glfw.c ...
+[17/122] Compiling [wayland] glfw/xkb_glfw.c ...
+[18/122] Compiling kitty/freetype.c ...
+[19/122] Compiling [wayland] glfw/wl_client_side_decorations.c ...
+[20/122] Compiling [x11] glfw/window.c ...
+[21/122] Compiling [wayland] glfw/window.c ...
+[22/122] Compiling kitty/line.c ...
+[23/122] Compiling kitty/glfw-wrapper.c ...
+[24/122] Compiling kittens/transfer/algorithm.c ...
+[25/122] Compiling [wayland] glfw/wl_init.c ...
+[26/122] Compiling [x11] glfw/x11_init.c ...
+[27/122] Compiling kitty/freetype_render_ui_text.c ...
+[28/122] Compiling [x11] glfw/egl_context.c ...
+[29/122] Compiling [wayland] glfw/egl_context.c ...
+[30/122] Compiling kitty/disk-cache.c ...
+[31/122] Compiling [x11] glfw/glx_context.c ...
+[32/122] Compiling kitty/line-buf.c ...
+[33/122] Compiling kitty/data-types.c ...
+[34/122] Compiling kitty/colors.c ...
+[35/122] Compiling kitty/history.c ...
+[36/122] Compiling kitty/keys.c ...
+[37/122] Compiling [x11] glfw/x11_monitor.c ...
+[38/122] Compiling kitty/fontconfig.c ...
+[39/122] Compiling [x11] glfw/context.c ...
+[40/122] Compiling [wayland] glfw/context.c ...
+[41/122] Compiling kitty/crypto.c ...
+[42/122] Compiling [x11] glfw/ibus_glfw.c ...
+[43/122] Compiling [wayland] glfw/ibus_glfw.c ...
+[44/122] Compiling kitty/key_encoding.c ...
+[45/122] Compiling kitty/launcher/main.c ...
+[46/122] Compiling [x11] glfw/monitor.c ...
+[47/122] Compiling [wayland] glfw/monitor.c ...
+[48/122] Compiling kitty/font-names.c ...
+[49/122] Compiling [x11] glfw/backend_utils.c ...
+[50/122] Compiling [wayland] glfw/backend_utils.c ...
+[51/122] Compiling kitty/charsets.c ...
+[52/122] Compiling [x11] glfw/linux_joystick.c ...
+[53/122] Compiling [wayland] glfw/linux_joystick.c ...
+[54/122] Compiling [x11] glfw/init.c ...
+[55/122] Compiling [wayland] glfw/init.c ...
+[56/122] Compiling [x11] glfw/dbus_glfw.c ...
+[57/122] Compiling [wayland] glfw/dbus_glfw.c ...
+[58/122] Compiling kitty/gl.c ...
+[59/122] Compiling [x11] glfw/vulkan.c ...
+[60/122] Compiling [wayland] glfw/vulkan.c ...
+[61/122] Compiling [x11] glfw/osmesa_context.c ...
+[62/122] Compiling [wayland] glfw/osmesa_context.c ...
+[63/122] Compiling kitty/cursor.c ...
+[64/122] Compiling kitty/launcher/single-instance.c ...
+[65/122] Compiling kitty/desktop.c ...
+[66/122] Compiling kitty/loop-utils.c ...
+[67/122] Compiling 3rdparty/ringbuf/ringbuf.c ...
+[68/122] Compiling kitty/simd-string.c ...
+[69/122] Compiling kitty/systemd.c ...
+[70/122] Compiling kitty/shlex.c ...
+[71/122] Compiling [wayland] glfw/wayland-tablet-unstable-v2-client-protocol.c ...
+[72/122] Compiling kitty/child.c ...
+[73/122] Compiling [wayland] glfw/linux_desktop_settings.c ...
+[74/122] Compiling [wayland] glfw/wl_text_input.c ...
+[75/122] Compiling [wayland] glfw/wl_monitor.c ...
+[76/122] Compiling kitty/kittens.c ...
+[77/122] Compiling 3rdparty/base64/lib/codec_choose.c ...
+[78/122] Compiling kitty/png-reader.c ...
+[79/122] Compiling [wayland] glfw/wayland-xdg-shell-client-protocol.c ...
+[80/122] Compiling [x11] glfw/linux_notify.c ...
+[81/122] Compiling [wayland] glfw/linux_notify.c ...
+[82/122] Compiling kitty/rowcolumn-diacritics.c ...
+[83/122] Compiling kitty/hyperlink.c ...
+[84/122] Compiling [wayland] glfw/wayland-primary-selection-unstable-v1-client-protocol.c ...
+[85/122] Compiling kitty/wcswidth.c ...
+[86/122] Compiling [wayland] glfw/wayland-pointer-constraints-unstable-v1-client-protocol.c ...
+[87/122] Compiling kitty/fast-file-copy.c ...
+[88/122] Compiling [wayland] glfw/wayland-text-input-unstable-v3-client-protocol.c ...
+[89/122] Compiling [wayland] glfw/wayland-wlr-layer-shell-unstable-v1-client-protocol.c ...
+[90/122] Compiling 3rdparty/base64/lib/lib.c ...
+[91/122] Compiling [x11] glfw/posix_thread.c ...
+[92/122] Compiling [wayland] glfw/posix_thread.c ...
+[93/122] Compiling kitty/window_logo.c ...
+[94/122] Compiling [wayland] glfw/wayland-xdg-activation-v1-client-protocol.c ...
+[95/122] Compiling [wayland] glfw/wayland-xdg-decoration-unstable-v1-client-protocol.c ...
+[96/122] Compiling [wayland] glfw/wayland-relative-pointer-unstable-v1-client-protocol.c ...
+[97/122] Compiling [wayland] glfw/wayland-cursor-shape-v1-client-protocol.c ...
+[98/122] Compiling [wayland] glfw/wayland-fractional-scale-v1-client-protocol.c ...
+[99/122] Compiling kitty/glyph-cache.c ...
+[100/122] Compiling [wayland] glfw/wayland-viewporter-client-protocol.c ...
+[101/122] Compiling kitty/logging.c ...
+[102/122] Compiling 3rdparty/base64/lib/arch/neon64/codec.c ...
+[103/122] Compiling [wayland] glfw/wayland-single-pixel-buffer-v1-client-protocol.c ...
+[104/122] Compiling 3rdparty/base64/lib/tables/tables.c ...
+[105/122] Compiling [wayland] glfw/wl_cursors.c ...
+[106/122] Compiling 3rdparty/base64/lib/arch/neon32/codec.c ...
+[107/122] Compiling [wayland] glfw/wayland-kwin-blur-v1-client-protocol.c ...
+[108/122] Compiling 3rdparty/base64/lib/arch/avx/codec.c ...
+[109/122] Compiling 3rdparty/base64/lib/arch/ssse3/codec.c ...
+[110/122] Compiling 3rdparty/base64/lib/arch/sse42/codec.c ...
+[111/122] Compiling 3rdparty/base64/lib/arch/sse41/codec.c ...
+[112/122] Compiling 3rdparty/base64/lib/arch/avx2/codec.c ...
+[113/122] Compiling kitty/utmp.c ...
+[114/122] Compiling 3rdparty/base64/lib/arch/avx512/codec.c ...
+[115/122] Compiling 3rdparty/base64/lib/arch/generic/codec.c ...
+[116/122] Compiling kitty/cleanup.c ...
+[117/122] Compiling [x11] glfw/monotonic.c ...
+[118/122] Compiling [wayland] glfw/monotonic.c ...
+[119/122] Compiling kitty/monotonic.c ...
+[120/122] Compiling kitty/simd-string-128.c ...
+[121/122] Compiling kitty/simd-string-256.c ...
+[122/122] Compiling kitty/gl-wrapper.c ...
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
  done
 ```
+</details>
 
-This incremental pass recompiled only the **Wayland** GLFW backend and relinked the launcher, rsync
-helper, and GLFW backends; the C extension `fast_data_types.so`, the X11 GLFW backend `glfw-x11.so`,
-and the Go `kitten` were already current from the image's initial full `python3 setup.py`. (Because
-the launcher file was relinked here, a `readlink /proc/281/exe` taken *after* this pass shows
-`/app/kitty/launcher/kitty (deleted)` — the running process is unchanged and still identified by its
-start-time `300084875`; only the on-disk launcher inode was replaced.) The three build products and
-their sizes (canonical `stat` output — byte-identical before and after, a deterministic build):
+This is a genuine full clean build: it **generates** the Wayland protocol sources, **compiles** all
+122 C translation units (the `kitty/*.c` core, both GLFW backends, the vendored `3rdparty` code, and
+the SIMD string helpers), and performs the **5** final links — `kitty/fast_data_types` (the C
+extension), `glfw-x11`, `glfw-wayland`, `kittens/transfer/rsync`, and `launcher`. The Go `kitten`
+binary is produced by the launcher-link step's `go build` using the shared module cache. The three
+build products, their sizes (canonical `stat`), and their SHA-256 hashes — deterministic and
+byte-identical across the two runs — are:
 
 ```
-/app/kitty/fast_data_types.so  1213072 bytes
-/app/kitty/launcher/kitty  36224 bytes
-/app/kitty/launcher/kitten  15945988 bytes
+$ stat -c '%s %n' kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten
+1213072 kitty/fast_data_types.so
+36224 kitty/launcher/kitty
+15945988 kitty/launcher/kitten
+$ sha256sum kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten
+582933cfd7b6cecb5ee60cfd20ef35a1f74acc2c6a905022180a60a76bf722e8  kitty/fast_data_types.so
+8311daddf6bbccf949233c9fdd58fbbe46748dbfc957847b7e4228b4973fc24c  kitty/launcher/kitty
+f63379576d684441bbbdd2c56062a04e5932bb41c74e16ad20d28ab373213284  kitty/launcher/kitten
 ```
 
 **Version banners (byte-verbatim).** Captured from the freshly-built binaries; shown once plainly
 and once through `cat -A` to prove there is no trailing whitespace (each line ends exactly at `$`):
 
 ```
-$ /app/kitty/launcher/kitty --version
+$ /work/kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
-$ /app/kitty/launcher/kitten --version
+$ /work/kitty/launcher/kitten --version
 kitten 0.35.2 created by Kovid Goyal
 
-$ /app/kitty/launcher/kitty --version | cat -A
+$ /work/kitty/launcher/kitty --version | cat -A
 kitty 0.35.2 created by Kovid Goyal$
-$ /app/kitty/launcher/kitten --version | cat -A
+$ /work/kitty/launcher/kitten --version | cat -A
 kitten 0.35.2 created by Kovid Goyal$
 ```
 
@@ -184,9 +325,9 @@ control-interface environment dump in §6 is safe to publish verbatim), with **n
 "pure defaults": the overrides are stated here explicitly.
 
 ```
-env -i HOME=/root PATH=/app/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+env -i HOME=/root PATH=/work/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color \
-  /app/kitty/launcher/kitty --config NONE \
+  /work/kitty/launcher/kitty --config NONE \
     -o allow_remote_control=yes -o enabled_layouts=all \
     --listen-on unix:/tmp/kitty_probe/mykitty.sock &
 ```
@@ -199,8 +340,8 @@ env -i HOME=/root PATH=/app/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/us
 - `-o enabled_layouts=all` → make all tiling layouts available for the window/tab workloads.
 
 The listening socket was created mode `0700` and owned by the launching user; the scratch directory
-`/tmp/kitty_probe` was likewise `0700`. The resolved main process is **PID 281**
-(`/proc/281/comm` = `kitty`, `/proc/281/exe` = `/app/kitty/launcher/kitty`), verified as the socket
+`/tmp/kitty_probe` was likewise `0700`. The resolved main process is **PID 181113**
+(`/proc/181113/comm` = `kitty`, `/proc/181113/exe` = `/work/kitty/launcher/kitty`), verified as the socket
 owner via `lsof`. That PID is the subject of every subsequent section.
 
 ---
@@ -222,14 +363,16 @@ synchronized-update escapes `ESC[?2026h`/`ESC[?2026l` **only** when rendering is
 (`if !opts.Render`); with `--render` those bracketing escapes are not sent, so the frames are drawn
 as they arrive. All O1 benchmark runs below use `--render`, so the throughput figures reflect
 parsing *while the GPU pipeline is also running* (lower than parser-only figures, as expected for
-software GL). During every run, `/proc/281` showed sustained CPU on the main thread plus the Mesa
+software GL). During every run, `/proc/181113` showed sustained CPU on the main thread plus the Mesa
 `llvmpipe` worker pool (quantified in §5).
 
 ### Workload 1 — lots of colored output (CSI-heavy)
 
 The `csi` benchmark sends a large stream of SGR-colour / cursor CSI sequences. It was run at 100
 repetitions (calibration) and then twice at 1000 repetitions. The blocks below are the **literal,
-unedited** capture from the driver script `o1_final.sh`, which records for each run the exact
+unedited** capture from the `run_bench` driver (`benchlib.sh`), which launches each benchmark in a
+real kitty window via `@ launch --type=tab`, polls for completion, closes the window, and records
+for each run the exact
 `COMMAND`, the child `EXIT` code, the measured `WALL` clock time (launch-to-completion, including
 the RC launch + poll overhead), and the benchmark's own verbatim `OUTPUT`. The `OUTPUT` still
 contains the raw escape/colour bytes emitted by the tool (a following `cat -v` view makes them
@@ -237,40 +380,40 @@ visible):
 
 ```
 ### tag=csi_calib
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --repetitions 100 csi
-EXIT: 0   WALL: 5.60s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --repetitions 100 csi
+EXIT: 0   WALL: 3.86s   (window id=3, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  CSI codes with few chars : 4.79s      @ [32m20.9   [m MB/s
+  CSI codes with few chars : 3.1s       @ [32m32.3   [m MB/s
 -----
 ### tag=csi_run1
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --repetitions 1000 csi
-EXIT: 0   WALL: 46.89s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --repetitions 1000 csi
+EXIT: 0   WALL: 33.78s   (window id=4, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  CSI codes with few chars : 46.25s     @ [32m21.6   [m MB/s
+  CSI codes with few chars : 33.05s     @ [32m30.3   [m MB/s
 -----
 ### tag=csi_run2
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --repetitions 1000 csi
-EXIT: 0   WALL: 47.39s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --repetitions 1000 csi
+EXIT: 0   WALL: 33.29s   (window id=5, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  CSI codes with few chars : 46.56s     @ [32m21.5   [m MB/s
+  CSI codes with few chars : 32.47s     @ [32m30.8   [m MB/s
 -----
 ```
 
-The benchmark's own reported parse throughput was **21.6 MB/s** (run 1) then **21.5 MB/s** (run 2)
-at 1000 reps — ≈0.5 % apart, i.e. stable — with wall times 46.89 s and 47.39 s. Calibration at 100
-reps parsed in 4.79 s (20.9 MB/s), roughly one-tenth the 1000-rep parse time, confirming the load
+The benchmark's own reported parse throughput was **30.3 MB/s** (run 1) then **30.8 MB/s** (run 2)
+at 1000 reps — ≈1.6 % apart, i.e. stable — with wall times 33.78 s and 33.29 s. Calibration at 100
+reps parsed in 3.1 s (32.3 MB/s), roughly one-tenth the 1000-rep parse time, confirming the load
 scales ~linearly with input and is genuinely sustained rather than a fixed startup cost.
 
 **Byte-safety of the output (run 1 `OUTPUT`, through `cat -v`).** The benchmark brackets its report
@@ -283,7 +426,7 @@ a full reset `ESC c` (`RIS`):
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  CSI codes with few chars : 46.25s     @ ^[[32m21.6   ^[[m MB/s
+  CSI codes with few chars : 33.05s     @ ^[[32m30.3   ^[[m MB/s
 ```
 
 ### Workload 2 — heavy scrollback churn
@@ -296,38 +439,38 @@ codes, and images — so **all five rows** appear in each run. Two sustained run
 
 ```
 ### tag=scroll_run1
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --with-scrollback --repetitions 200
-EXIT: 0   WALL: 44.12s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --with-scrollback --repetitions 200
+EXIT: 0   WALL: 42.64s   (window id=6, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  Only ASCII chars         : 11.1s      @ [32m36.0   [m MB/s
-  Unicode chars            : 9.22s      @ [32m38.4   [m MB/s
-  CSI codes with few chars : 9.2s       @ [32m21.8   [m MB/s
-  Long escape codes        : 7.6s       @ [32m206.4  [m MB/s
-  Images                   : 6.17s      @ [32m173.0  [m MB/s
+  Only ASCII chars         : 11.87s     @ [32m33.7   [m MB/s
+  Unicode chars            : 9.65s      @ [32m36.7   [m MB/s
+  CSI codes with few chars : 6.31s      @ [32m31.7   [m MB/s
+  Long escape codes        : 7.63s      @ [32m205.4  [m MB/s
+  Images                   : 6.44s      @ [32m165.5  [m MB/s
 -----
 ### tag=scroll_run2
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --with-scrollback --repetitions 200
-EXIT: 0   WALL: 44.63s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --with-scrollback --repetitions 200
+EXIT: 0   WALL: 45.74s   (window id=7, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  Only ASCII chars         : 10.85s     @ [32m36.9   [m MB/s
-  Unicode chars            : 9.13s      @ [32m38.8   [m MB/s
-  CSI codes with few chars : 9.64s      @ [32m20.7   [m MB/s
-  Long escape codes        : 7.78s      @ [32m201.7  [m MB/s
-  Images                   : 6.5s       @ [32m164.2  [m MB/s
+  Only ASCII chars         : 12.7s      @ [32m31.5   [m MB/s
+  Unicode chars            : 10.76s     @ [32m32.9   [m MB/s
+  CSI codes with few chars : 6.97s      @ [32m28.7   [m MB/s
+  Long escape codes        : 7.96s      @ [32m197.0  [m MB/s
+  Images                   : 6.69s      @ [32m159.6  [m MB/s
 -----
 ```
 
 All five rows are present in both runs, and the per-row throughputs are stable run-to-run
-(ASCII 36.0→36.9, Unicode 38.4→38.8, CSI 21.8→20.7, long-escape 206.4→201.7, images 173.0→164.2
-MB/s; wall 44.12 s → 44.63 s). This is the correct, complete output of the no-positional
+(ASCII 33.7→31.5, Unicode 36.7→32.9, CSI 31.7→28.7, long-escape 205.4→197.0, images 165.5→159.6
+MB/s; wall 42.64 s → 45.74 s). This is the correct, complete output of the no-positional
 `--with-scrollback` invocation — a single positional name would have produced only one row.
 
 ### Workload 3 — image/graphics-protocol load (supporting)
@@ -336,28 +479,28 @@ The `images` benchmark drives the terminal graphics protocol. Two runs at 400 re
 
 ```
 ### tag=images_run1
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --repetitions 400 images
-EXIT: 0   WALL: 13.67s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --repetitions 400 images
+EXIT: 0   WALL: 14.01s   (window id=8, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  Images     : 12.84s     @ [32m166.2  [m MB/s
+  Images     : 13.2s      @ [32m161.6  [m MB/s
 -----
 ### tag=images_run2
-COMMAND: /app/kitty/launcher/kitten __benchmark__ --render --repetitions 400 images
-EXIT: 0   WALL: 13.16s
+COMMAND: /work/kitty/launcher/kitten __benchmark__ --render --repetitions 400 images
+EXIT: 0   WALL: 13.50s   (window id=9, closed after)
 OUTPUT (verbatim):
 ]\cThese results measure the time it takes the terminal to fully parse all the data sent to it.
 Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.
 
 Results:
-  Images     : 12.49s     @ [32m170.9  [m MB/s
+  Images     : 12.87s     @ [32m165.8  [m MB/s
 -----
 ```
 
-Stable at 166.2 → 170.9 MB/s (wall 13.67 s → 13.16 s). During this workload a transient disk-cache
+Stable at 161.6 → 165.8 MB/s (wall 14.01 s → 13.50 s). During this workload a transient disk-cache
 writer thread (`DiskCacheWrite`) appears in the main process (§5) — the graphics protocol spools
 image data through Kitty's on-disk cache.
 
@@ -372,61 +515,150 @@ resizes (25 cycles × 8 sizes: 800×600, 1000×700, 1200×800, 1400×900, 1600×
 $ # per run: for 25 cycles, for each of 8 pixel sizes:
 $ #   kitten @ resize-os-window --action=resize --unit=pixels --width=W --height=H
 $ # run 1 (window started at 800x600):
-run=1 resizes_issued=200 succeeded=200 failed=0 wall=4.76s geom_before=800x600+0+0 final_requested=1920x1080 geom_after=1920x1080+0+0
+run=1 resizes_issued=200 succeeded=200 failed=0 wall=5.13s geom_before=800x600+0+0 final_requested=1920x1080 geom_after=1920x1080+0+0
 $ # run 2:
-run=2 resizes_issued=200 succeeded=200 failed=0 wall=5.61s geom_before=1920x1080+0+0 final_requested=1920x1080 geom_after=1920x1080+0+0
+run=2 resizes_issued=200 succeeded=200 failed=0 wall=5.73s geom_before=1920x1080+0+0 final_requested=1920x1080 geom_after=1920x1080+0+0
 ```
 
-All 200 resizes succeeded in each run (0 failures), wall times 4.76 s and 5.61 s, and the geometry
+All 200 resizes succeeded in each run (0 failures), wall times 5.13 s and 5.73 s, and the geometry
 changed as requested (run 1 went from `800x600+0+0` to `1920x1080+0+0`). Each resize forces the C
 layer to reflow the screen grid and re-render; the main thread is busy throughout.
 
 ### Workload 5 — tab switching
 
-Tabs were also driven through remote control by the script `tabs_consistent.sh` (which uses
-`set -euo pipefail` and self-cleans). Starting from the single-tab baseline, six additional tabs
-were created (seven total, each its own child shell with a distinct PID); the tab tree was captured
-via `@ ls`; the target tab id was then chosen **from that captured tree** (the first non-active id);
-the active tab was cycled with 100 `next_tab` actions, twice; and finally that target tab was
-focused with `focus-tab`. All ids, PIDs, and the focus target below therefore come from the *same*
-tree snapshot. The structural summary below is rendered from the real `@ ls` JSON; the complete,
-unedited JSON tree is reproduced in §6 (O4).
+Tabs were driven through remote control from the single-tab baseline: **eight** additional tabs
+were created (**nine total**, each its own child-shell process with a distinct PID); the full tab
+tree was captured via `@ ls` (saved to `ls_tabs.json`); the target tab id was then chosen **from
+that captured tree** (the first non-active id); the active tab was cycled with **250** `next_tab`
+actions, **twice**; and finally that target tab was focused with `focus-tab`, asserting that the
+active tab afterwards equals the chosen target. All ids, PIDs, and the focus target below therefore
+come from the *same* tree snapshot. The complete, unedited `@ ls` JSON tree this summary was
+rendered from is reproduced in §6 (O4).
 
 ```
-$ # create 6 tabs:  kitten @ --to unix:/tmp/kitty_probe/mykitty.sock launch --type=tab --tab-title probe_tN sh   (x6)
-$ kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls   # tab tree (seven tabs, distinct child PIDs), summarized:
-os_window id=1 num_tabs=7
-  tab id=1  title='/app'     active=False  windows=[win1(pid 354)]
-  tab id=31 title='probe_t1' active=False  windows=[win63(pid 49851)]
-  tab id=32 title='probe_t2' active=False  windows=[win64(pid 49868)]
-  tab id=33 title='probe_t3' active=False  windows=[win65(pid 49885)]
-  tab id=34 title='probe_t4' active=False  windows=[win66(pid 49898)]
-  tab id=35 title='probe_t5' active=False  windows=[win67(pid 49913)]
-  tab id=36 title='probe_t6' active=True   windows=[win68(pid 49931)]
-
-$ cat tab_target.txt    # target id chosen from the tree above (first non-active id)
-TARGET_TAB_ID=1
-
-$ # 100x per run:  kitten @ --to <sock> action next_tab
-$ cat tab_switch2_run1.txt tab_switch2_run2.txt
-tab_switch run=1 cycles=100 succeeded=100 wall=2.39s
-tab_switch run=2 cycles=100 succeeded=100 wall=2.37s
-
-$ kitten @ --to unix:/tmp/kitty_probe/mykitty.sock focus-tab --match id:1   # target the id from the tree
-$ cat focus_tab2.txt
-focus-tab --match id:1 exit=0  active_tab_after=1
+########## O1 WORKLOAD 5: TAB SWITCHING AT SCALE (>=8 tabs, >=200 transitions x2) ##########
+### create 8 probe tabs (baseline tab 1 + 8 = 9 total)
+### full tab tree via @ ls (saved to ls_tabs.json)
+os_window id=1 num_tabs=9
+  tab id=1   title='/app'     active=False -> win1(pid 181182)
+  tab id=10  title='probe_t1' active=False -> win10(pid 189777)
+  tab id=11  title='probe_t2' active=False -> win11(pid 189793)
+  tab id=12  title='probe_t3' active=False -> win12(pid 189810)
+  tab id=13  title='probe_t4' active=False -> win13(pid 189828)
+  tab id=14  title='probe_t5' active=False -> win14(pid 189845)
+  tab id=15  title='probe_t6' active=False -> win15(pid 189861)
+  tab id=16  title='probe_t7' active=False -> win16(pid 189875)
+  tab id=17  title='probe_t8' active=True  -> win17(pid 189891)
+TARGET_TAB_ID(chosen from tree, first non-active)=1
+### active tab BEFORE focus-tab: 17
+### 250 next_tab transitions x2 runs
+tab_switch run=1 cycles=250 succeeded=250 failed=0 wall=6.07s
+tab_switch run=2 cycles=250 succeeded=250 failed=0 wall=5.99s
+### focus-tab --match id:1 (target from tree)
+focus-tab --match id:1 exit=0  active_tab_after=1  (assert active_tab_after==target: PASS)
+### close 8 probe tabs, restore baseline
+num_tabs_after_cleanup=1
 ```
 
-Seven tabs were created, each backed by a **separate child-shell process** with its own PID
-(354, 49851, 49868, 49885, 49898, 49913, 49931). Both 100-cycle switching runs completed 100/100
-(2.39 s, 2.37 s). The target tab id (1) was taken from the captured tree, so
-`focus-tab --match id:1` returned exit 0 and the active tab afterwards was confirmed to be tab 1
-(`active_tab_after=1`). After the workload the six probe tabs were closed, restoring the single-tab
-baseline (verified in §10).
+**Nine** tabs were created, each backed by a **separate child-shell process** with its own PID
+(181182, 189777, 189793, 189810, 189828, 189845, 189861, 189875, 189891). Both **250-cycle**
+switching runs completed 250/250 with **zero** failures (6.07 s and 5.99 s). The active tab
+immediately before the focus was tab **17**; the target tab id (**1**) was taken from the captured
+tree, so `focus-tab --match id:1` returned exit 0 and the active tab afterwards was confirmed to be
+tab 1 (`active_tab_after=1`) — the assertion `active_tab_after == target` **passed**. After the
+workload the eight probe tabs were closed, restoring the single-tab baseline (verified in §10).
+
+### Workload 6 — combined sustained load (all four workloads at once)
+
+The four named workloads were also run **concurrently against the one session**, to show
+behaviour under overlapping pressure rather than in isolation. A sustained
+`__benchmark__ --render --with-scrollback --repetitions 300` (colored output **+** scrollback
+churn, rendered in its own tab) ran while a background loop simultaneously hammered the control
+interface with **resizes** and **tab switches**, sampling RSS / thread-count / active-tab every
+~2 s. All three streams share the single main **PID 181113** and the single socket
+`unix:/tmp/kitty_probe/mykitty.sock`. The complete, unedited timestamped log (37 during-load
+samples) follows:
+
+<details>
+<summary><code>combined concurrent load — complete, unedited timestamped log (benchmark + resizes + tab-switches overlapping)</code></summary>
+
+```
+########## O1/F4 COMBINED CONCURRENT LOAD (single session PID=181113, socket=unix:/tmp/kitty_probe/mykitty.sock) ##########
+[00:55:19.522] BASELINE  rss=220476 kB  threads=68  active_tab=1  num_tabs=1
+[00:55:19.716] LAUNCH sustained benchmark: __benchmark__ --render --with-scrollback --repetitions 300 (async, in its own tab)
+[00:55:20.767] benchmark window id=21 launched
+[00:55:22.441] DURING  rss=254860 kB  threads=68  active_tab=21  resizes_ok=25  switches_ok=25  geom=1000x700+0+0
+[00:55:24.280] DURING  rss=255996 kB  threads=68  active_tab=21  resizes_ok=50  switches_ok=50  geom=1200x800+0+0
+[00:55:26.226] DURING  rss=257148 kB  threads=68  active_tab=21  resizes_ok=75  switches_ok=75  geom=1400x900+0+0
+[00:55:28.118] DURING  rss=258448 kB  threads=68  active_tab=21  resizes_ok=100  switches_ok=100  geom=1600x1000+0+0
+[00:55:30.068] DURING  rss=255796 kB  threads=68  active_tab=21  resizes_ok=125  switches_ok=125  geom=1280x720+0+0
+[00:55:32.045] DURING  rss=260296 kB  threads=68  active_tab=21  resizes_ok=150  switches_ok=150  geom=1920x1080+0+0
+[00:55:33.864] DURING  rss=262244 kB  threads=68  active_tab=21  resizes_ok=175  switches_ok=175  geom=1000x700+0+0
+[00:55:35.664] DURING  rss=255988 kB  threads=68  active_tab=21  resizes_ok=200  switches_ok=200  geom=1200x800+0+0
+[00:55:37.399] DURING  rss=257140 kB  threads=68  active_tab=21  resizes_ok=225  switches_ok=225  geom=1400x900+0+0
+[00:55:39.206] DURING  rss=258440 kB  threads=68  active_tab=21  resizes_ok=250  switches_ok=250  geom=1600x1000+0+0
+[00:55:40.939] DURING  rss=255788 kB  threads=68  active_tab=21  resizes_ok=275  switches_ok=275  geom=1280x720+0+0
+[00:55:42.697] DURING  rss=260288 kB  threads=68  active_tab=21  resizes_ok=300  switches_ok=300  geom=1920x1080+0+0
+[00:55:44.545] DURING  rss=254988 kB  threads=68  active_tab=21  resizes_ok=325  switches_ok=325  geom=1000x700+0+0
+[00:55:46.533] DURING  rss=255988 kB  threads=68  active_tab=21  resizes_ok=350  switches_ok=350  geom=1200x800+0+0
+[00:55:48.561] DURING  rss=257140 kB  threads=68  active_tab=21  resizes_ok=375  switches_ok=375  geom=1400x900+0+0
+[00:55:50.664] DURING  rss=258440 kB  threads=68  active_tab=21  resizes_ok=400  switches_ok=400  geom=1600x1000+0+0
+[00:55:52.705] DURING  rss=255788 kB  threads=68  active_tab=21  resizes_ok=425  switches_ok=425  geom=1280x720+0+0
+[00:55:54.596] DURING  rss=260288 kB  threads=68  active_tab=21  resizes_ok=450  switches_ok=450  geom=1920x1080+0+0
+[00:55:56.072] DURING  rss=254988 kB  threads=68  active_tab=21  resizes_ok=475  switches_ok=475  geom=1000x700+0+0
+[00:55:57.566] DURING  rss=255988 kB  threads=68  active_tab=21  resizes_ok=500  switches_ok=500  geom=1200x800+0+0
+[00:55:58.993] DURING  rss=257140 kB  threads=68  active_tab=21  resizes_ok=525  switches_ok=525  geom=1400x900+0+0
+[00:56:00.459] DURING  rss=258440 kB  threads=68  active_tab=21  resizes_ok=550  switches_ok=550  geom=1600x1000+0+0
+[00:56:01.891] DURING  rss=255788 kB  threads=68  active_tab=21  resizes_ok=575  switches_ok=575  geom=1280x720+0+0
+[00:56:03.352] DURING  rss=260288 kB  threads=68  active_tab=21  resizes_ok=600  switches_ok=600  geom=1920x1080+0+0
+[00:56:04.810] DURING  rss=254988 kB  threads=68  active_tab=21  resizes_ok=625  switches_ok=625  geom=1000x700+0+0
+[00:56:06.276] DURING  rss=255988 kB  threads=68  active_tab=21  resizes_ok=650  switches_ok=650  geom=1200x800+0+0
+[00:56:07.696] DURING  rss=257140 kB  threads=68  active_tab=21  resizes_ok=675  switches_ok=675  geom=1400x900+0+0
+[00:56:09.149] DURING  rss=258440 kB  threads=68  active_tab=21  resizes_ok=700  switches_ok=700  geom=1600x1000+0+0
+[00:56:10.591] DURING  rss=255788 kB  threads=69  active_tab=21  resizes_ok=725  switches_ok=725  geom=1280x720+0+0
+[00:56:12.163] DURING  rss=260288 kB  threads=69  active_tab=21  resizes_ok=750  switches_ok=750  geom=1920x1080+0+0
+[00:56:13.700] DURING  rss=254988 kB  threads=69  active_tab=21  resizes_ok=775  switches_ok=775  geom=1000x700+0+0
+[00:56:15.168] DURING  rss=255988 kB  threads=69  active_tab=21  resizes_ok=800  switches_ok=800  geom=1200x800+0+0
+[00:56:16.641] DURING  rss=257140 kB  threads=69  active_tab=21  resizes_ok=825  switches_ok=825  geom=1400x900+0+0
+[00:56:18.082] DURING  rss=258440 kB  threads=69  active_tab=21  resizes_ok=850  switches_ok=850  geom=1600x1000+0+0
+[00:56:19.596] DURING  rss=255788 kB  threads=69  active_tab=21  resizes_ok=875  switches_ok=875  geom=1280x720+0+0
+[00:56:21.086] DURING  rss=260288 kB  threads=69  active_tab=21  resizes_ok=900  switches_ok=900  geom=1920x1080+0+0
+[00:56:22.598] DURING  rss=254988 kB  threads=69  active_tab=21  resizes_ok=925  switches_ok=925  geom=1000x700+0+0
+[00:56:24.028] benchmark COMPLETE: COMBO_DONE_rc=0
+[00:56:24.032] concurrent RC totals: resizes_ok=948 resizes_fail=0 switches_ok=948 switches_fail=0 during_samples=37
+### benchmark result rows (proves render path ran while RC hammered the session):
+  Only ASCII chars         : 13.73s     @ [32m43.7   [m MB/s
+  Unicode chars            : 9.56s      @ [32m55.5   [m MB/s
+  CSI codes with few chars : 10.71s     @ [32m28.0   [m MB/s
+  Long escape codes        : 15.17s     @ [32m155.0  [m MB/s
+  Images                   : 14.49s     @ [32m110.4  [m MB/s
+[00:56:24.035] RECOVERY: RC still responsive? @ ls exit code + tab count:
+  @ ls exit=0
+[00:56:24.674] AFTER-RECOVERY  rss=206532 kB  threads=68  active_tab=1  num_tabs=1
+```
+</details>
+
+**What the combined run shows [OBSERVED]:**
+
+- **Everything succeeded under overlap.** Over ~65 s, **948 resizes and 948 tab-switches** were
+  issued through remote control while the benchmark rendered — **0 resize failures, 0 switch
+  failures** (`resizes_ok=948 resizes_fail=0 switches_ok=948 switches_fail=0`).
+- **The render path genuinely ran.** The benchmark completed `COMBO_DONE_rc=0` and produced all
+  five result rows (ASCII 43.7, Unicode 55.5, CSI 28.0, long-escape 155.0, images 110.4 MB/s) —
+  proof the GPU draw path was active throughout, not suppressed.
+- **The thread count is stable.** Threads held at **68** for most of the run and rose transiently
+  to **69** only during the image phase (the extra thread is Kitty's `DiskCacheWrite`, §5), then
+  returned to 68.
+- **Memory grows then recovers.** RSS climbed from a **220476 kB** baseline to a peak of
+  **262244 kB** under load, then fell back to **206532 kB** after the workload and cleanup — no
+  runaway growth; the session ended *below* its starting RSS.
+- **The control interface stayed responsive and the session recovered.** Immediately after the
+  benchmark finished, `@ ls` returned **exit 0**, and the tab/active-tab state was restored to the
+  single-tab baseline (`num_tabs=1 active_tab=1`).
 
 ### What the system is doing during the load (summary)
 
-**[OBSERVED]** Across all workloads, the picture from `/proc/281` (detailed in §5 and §8) is
+**[OBSERVED]** Across all workloads, the picture from `/proc/181113` (detailed in §5 and §8) is
 consistent: the **single Python thread** stays parked in the C event loop while the **C engine**
 does the work on the main thread (`main_loop` → parse/screen-update → `draw_cells`), the
 **PTY-I/O thread** (`KittyChildMon`) feeds bytes in, and **Mesa's `llvmpipe` worker pool** burns CPU
@@ -439,14 +671,14 @@ threads or additional interpreters in the main process.
 
 ## §4 — O2: What loads into the main process
 
-**Direct answer.** Into the single main `kitty` process (PID 281) three kinds of native object are
+**Direct answer.** Into the single main `kitty` process (PID 181113) three kinds of native object are
 mapped, all sharing one address space: **(1)** Kitty's C engine, the CPython extension
 `kitty/fast_data_types.so` (plus the separately-loaded windowing backend `glfw-x11.so`); **(2)** the
-embedded CPython interpreter `libpython3.12.so.1.0`, hosting **60** loaded `kitty.*` Python modules;
+embedded CPython interpreter `libpython3.12.so.1.0`, hosting **62** loaded `kitty.*` Python modules;
 and **(3)** the major rendering/font/crypto libraries the C extension links — FreeType, HarfBuzz,
 FontConfig, lcms2, libpng, OpenGL and libcrypto — which in turn pull in the full Mesa `llvmpipe`
 software-GL stack and the X11/XCB client libraries. In total **81 distinct shared objects** are
-mapped. Evidence for all of `/proc/281/maps`, `lsof -p 281`, and a live `sys.modules` dump follows.
+mapped. Evidence for all of `/proc/181113/maps`, `lsof -p 181113`, and a live `sys.modules` dump follows.
 
 ### The C engine — `kitty.fast_data_types` (C extension)
 
@@ -457,32 +689,32 @@ as the extension `kitty/fast_data_types` (**[INFERRED from source]** `setup.py:1
 GLFW backend is compiled by `compile_glfw`, invoked at `setup.py:1094`):
 
 ```
-$ grep '/app/kitty/fast_data_types.so' /proc/281/maps
-7d8f72733000-7d8f72744000 r--p 00000000 103:01 537915706                 /app/kitty/fast_data_types.so
-7d8f72744000-7d8f727fc000 r-xp 00011000 103:01 537915706                 /app/kitty/fast_data_types.so
-7d8f727fc000-7d8f72834000 r--p 000c9000 103:01 537915706                 /app/kitty/fast_data_types.so
-7d8f72834000-7d8f72836000 r--p 00100000 103:01 537915706                 /app/kitty/fast_data_types.so
-7d8f72836000-7d8f7283f000 rw-p 00102000 103:01 537915706                 /app/kitty/fast_data_types.so
+$ grep '/work/kitty/fast_data_types.so' /proc/181113/maps
+7d03aa425000-7d03aa436000 r--p 00000000 103:01 547207606                 /work/kitty/fast_data_types.so
+7d03aa436000-7d03aa4ee000 r-xp 00011000 103:01 547207606                 /work/kitty/fast_data_types.so
+7d03aa4ee000-7d03aa526000 r--p 000c9000 103:01 547207606                 /work/kitty/fast_data_types.so
+7d03aa526000-7d03aa528000 r--p 00100000 103:01 547207606                 /work/kitty/fast_data_types.so
+7d03aa528000-7d03aa531000 rw-p 00102000 103:01 547207606                 /work/kitty/fast_data_types.so
 ```
 
 Its on-disk size and the fact that Kitty's own GLFW backend is a *separate* loadable object
 (`glfw-x11.so`, selected at runtime for the X11 platform) are confirmed by `stat` and `lsof`:
 
 ```
-$ stat -c '%s %n' /app/kitty/fast_data_types.so /app/kitty/launcher/kitty /app/kitty/launcher/kitten
-1213072 /app/kitty/fast_data_types.so
-36224 /app/kitty/launcher/kitty
-15945988 /app/kitty/launcher/kitten
+$ stat -c '%s %n' /work/kitty/fast_data_types.so /work/kitty/launcher/kitty /work/kitty/launcher/kitten
+1213072 /work/kitty/fast_data_types.so
+36224 /work/kitty/launcher/kitty
+15945988 /work/kitty/launcher/kitten
 
-$ lsof -p 281 | grep -E 'fast_data_types|glfw-x11'
-kitty   281 root  mem       REG              259,1          537915715 /app/kitty/glfw-x11.so (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          537915706 /app/kitty/fast_data_types.so (path dev=0,1506)
+$ lsof -p 181113 | grep -E 'fast_data_types|glfw-x11'
+kitty   181113 root  mem       REG              259,1          547207605 /work/kitty/glfw-x11.so (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          547207606 /work/kitty/fast_data_types.so (path dev=0,1506)
 ```
 
-### The Python orchestration layer — 60 live `kitty.*` modules
+### The Python orchestration layer — 62 live `kitty.*` modules
 
 **[OBSERVED]** The main process embeds CPython (`libpython3.12.so.1.0`, mapped below). To prove the
-Python layer runs *inside* PID 281 (not in a helper), the live interpreter was made to dump its own
+Python layer runs *inside* PID 181113 (not in a helper), the live interpreter was made to dump its own
 `sys.modules` by injecting a one-line `PyRun_SimpleString` call through gdb. The gdb attach is
 identity-guarded (it verifies the target's `exe` and start-time **before** attaching), time-bounded,
 and always ends with `detach`+`quit`. The complete, unedited transcript — including gdb's
@@ -492,88 +724,94 @@ full:
 
 ```
 GDB INJECTION (via gdbguard.sh: identity-guarded on exe+starttime BEFORE attach, timeout-bounded, always ends -ex detach -ex quit):
-  bash gdbguard.sh 281 60 gdb_sysmods_final.log -- -ex 'call (int) PyRun_SimpleString("exec(open('/tmp/kitty_probe/sysmods.py').read())")'
-  where sysmods.py = { import sys; write sorted names m in sys.modules with m=='kitty' or m.startswith('kitty.') }
+  bash gdbguard.sh 181113 60 gdb_sysmods.log -- -ex 'call (int) PyRun_SimpleString("exec(open(\"/tmp/kitty_probe/sysmods.py\").read())")'
+  where sysmods.py = { import sys; write KITTY_MODULE_COUNT + sorted names m in sys.modules with m=='kitty' or m.startswith('kitty.') }
 ----- gdbguard transcript (verbatim; LWP lines are the 67 sibling threads gdb enumerated) -----
-GUARD-OK: pid=281 exe=/app/kitty/launcher/kitty start=300084875
-[New LWP 353]
-[New LWP 352]
-[New LWP 351]
-[New LWP 350]
-[New LWP 349]
-[New LWP 348]
-[New LWP 347]
-[New LWP 346]
-[New LWP 345]
-[New LWP 344]
-[New LWP 343]
-[New LWP 342]
-[New LWP 341]
-[New LWP 340]
-[New LWP 339]
-[New LWP 338]
-[New LWP 337]
-[New LWP 336]
-[New LWP 335]
-[New LWP 334]
-[New LWP 333]
-[New LWP 332]
-[New LWP 331]
-[New LWP 330]
-[New LWP 329]
-[New LWP 328]
-[New LWP 327]
-[New LWP 326]
-[New LWP 325]
-[New LWP 324]
-[New LWP 323]
-[New LWP 322]
-[New LWP 321]
-[New LWP 320]
-[New LWP 319]
-[New LWP 318]
-[New LWP 317]
-[New LWP 316]
-[New LWP 315]
-[New LWP 314]
-[New LWP 313]
-[New LWP 312]
-[New LWP 311]
-[New LWP 310]
-[New LWP 309]
-[New LWP 308]
-[New LWP 307]
-[New LWP 306]
-[New LWP 305]
-[New LWP 304]
-[New LWP 303]
-[New LWP 302]
-[New LWP 301]
-[New LWP 300]
-[New LWP 299]
-[New LWP 298]
-[New LWP 297]
-[New LWP 296]
-[New LWP 295]
-[New LWP 294]
-[New LWP 293]
-[New LWP 292]
-[New LWP 291]
-[New LWP 290]
-[New LWP 289]
-[New LWP 288]
-[New LWP 287]
+GUARD-OK: pid=181113 exe=/work/kitty/launcher/kitty start=302476926
+[New LWP 181181]
+[New LWP 181180]
+[New LWP 181179]
+[New LWP 181178]
+[New LWP 181177]
+[New LWP 181176]
+[New LWP 181175]
+[New LWP 181174]
+[New LWP 181173]
+[New LWP 181172]
+[New LWP 181171]
+[New LWP 181170]
+[New LWP 181169]
+[New LWP 181168]
+[New LWP 181167]
+[New LWP 181166]
+[New LWP 181165]
+[New LWP 181164]
+[New LWP 181163]
+[New LWP 181162]
+[New LWP 181161]
+[New LWP 181160]
+[New LWP 181159]
+[New LWP 181158]
+[New LWP 181157]
+[New LWP 181156]
+[New LWP 181155]
+[New LWP 181154]
+[New LWP 181153]
+[New LWP 181152]
+[New LWP 181151]
+[New LWP 181150]
+[New LWP 181149]
+[New LWP 181148]
+[New LWP 181147]
+[New LWP 181146]
+[New LWP 181145]
+[New LWP 181144]
+[New LWP 181143]
+[New LWP 181142]
+[New LWP 181141]
+[New LWP 181140]
+[New LWP 181139]
+[New LWP 181138]
+[New LWP 181137]
+[New LWP 181136]
+[New LWP 181135]
+[New LWP 181134]
+[New LWP 181133]
+[New LWP 181132]
+[New LWP 181131]
+[New LWP 181130]
+[New LWP 181129]
+[New LWP 181128]
+[New LWP 181127]
+[New LWP 181126]
+[New LWP 181125]
+[New LWP 181124]
+[New LWP 181123]
+[New LWP 181122]
+[New LWP 181121]
+[New LWP 181120]
+[New LWP 181119]
+[New LWP 181118]
+[New LWP 181117]
+[New LWP 181116]
+[New LWP 181115]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
 [Thread debugging using libthread_db enabled]
 Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
-0x00007d8f733604cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
+0x00007d03ab0524cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
 $1 = 0
-[Inferior 1 (process 281) detached]
+[Inferior 1 (process 181113) detached]
 GDB-EXIT=0
------ resulting kitty.* modules in the live main process (sysmods.txt) -----
-count=60
+----- resulting kitty.* modules in the live main process (sysmods_out.txt) -----
+count=62
 ```
 
-The dump wrote the following **60** module names (every `m` in `sys.modules` where `m == "kitty"`
+The dump wrote the following **62** module names (every `m` in `sys.modules` where `m == "kitty"`
 or `m.startswith("kitty.")`), reproduced complete and unedited. Note the C extension
 `kitty.fast_data_types` appears here as a *Python-visible module* (it is the import surface of the
 `.so` above), alongside the orchestration modules (`boss`, `child`, `window`, `tabs`, `main`), the
@@ -581,7 +819,8 @@ remote-control command modules (`rc.*`), the layout engine (`layout.*`), the fon
 (`fonts.*`), and the options system (`options.*`):
 
 ```
-$ cat sysmods.txt    # written by the injected dump; 60 lines
+$ cat sysmods_out.txt    # written by the injected dump; 63 lines (1 count header + 62 module names)
+KITTY_MODULE_COUNT=62
 kitty
 kitty.borders
 kitty.boss
@@ -622,12 +861,14 @@ kitty.os_window_size
 kitty.rc
 kitty.rc.action
 kitty.rc.base
+kitty.rc.close_tab
 kitty.rc.close_window
 kitty.rc.focus_tab
 kitty.rc.get_text
 kitty.rc.launch
 kitty.rc.ls
 kitty.rc.resize_os_window
+kitty.rc.send_text
 kitty.remote_control
 kitty.rgb
 kitty.search_query_parser
@@ -644,9 +885,10 @@ kitty.window
 kitty.window_list
 ```
 
-**[OBSERVED]** The `rc.*` set present here — `rc.close_window`, `rc.focus_tab`, `rc.get_text`,
-`rc.launch`, `rc.ls`, `rc.resize_os_window` — corresponds one-to-one with the remote-control
-commands exercised in this session (§3, §6): this capture was taken after those RC commands had run.
+**[OBSERVED]** The `rc.*` command set present here — `rc.action`, `rc.close_tab`, `rc.close_window`,
+`rc.focus_tab`, `rc.get_text`, `rc.launch`, `rc.ls`, `rc.resize_os_window`, `rc.send_text` (plus the
+package `rc` and its `rc.base`) — corresponds one-to-one with the remote-control commands exercised
+in this session (§3, §5, §6): this capture was taken after those RC commands had run.
 **[INFERRED from source]** each command module is imported lazily on first use:
 `command_for_name()` (`kitty/rc/base.py:449`) does `import_module(f'kitty.rc.{cmd_name}')`, so the
 specific `rc.*` modules present reflect exactly the commands that were invoked; each is a Python
@@ -668,21 +910,40 @@ class in its own file (e.g. `kitty/rc/ls.py`, `kitty/rc/focus_tab.py`).
 | OpenGL | `libGL.so.1.7.0` | GPU rendering pipeline | `gl_libs` L639, ldpaths L642 |
 | libcrypto | `libcrypto.so.3` | hashing (graphics/transfer) | `libcrypto_flags()` L253, used L616–617, ldpaths L642 |
 
-**[OBSERVED]** all seven are mapped in PID 281 (and confirmed resident via `lsof`):
+**[OBSERVED]** all seven are mapped in PID 181113 and confirmed resident via `lsof`. The `grep`
+pattern used below is deliberately broad, so besides the seven named libraries it also matches
+**seven further rows**; the **complete, unedited** output is therefore **14 rows**, every one of
+which is shown (nothing was trimmed):
 
 ```
-$ lsof -p 281 | grep -E 'freetype|harfbuzz|fontconfig|lcms2|png16|libGL\.so|libcrypto|python3.12'
-kitty   281 root  mem       REG              259,1          534022301 /usr/lib/x86_64-linux-gnu/libGL.so.1.7.0 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534022490 /usr/lib/x86_64-linux-gnu/libfontconfig.so.1.12.1 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534022494 /usr/lib/x86_64-linux-gnu/libfreetype.so.6.20.1 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534011179 /usr/lib/x86_64-linux-gnu/libcrypto.so.3 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534022612 /usr/lib/x86_64-linux-gnu/liblcms2.so.2.0.14 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534022670 /usr/lib/x86_64-linux-gnu/libpng16.so.16.43.0 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534022553 /usr/lib/x86_64-linux-gnu/libharfbuzz.so.0.60830.0 (path dev=0,1506)
-kitty   281 root  mem       REG              259,1          534022682 /usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0 (path dev=0,1506)
+$ lsof -p 181113 | grep -E 'freetype|harfbuzz|fontconfig|lcms2|png16|libGL\.so|libcrypto|python3.12'
+kitty   181113 root  mem       REG              259,1          534022301 /usr/lib/x86_64-linux-gnu/libGL.so.1.7.0 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534022490 /usr/lib/x86_64-linux-gnu/libfontconfig.so.1.12.1 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534129782 /var/cache/fontconfig/cb6837c09f0a995c916a42480c4bfbd2-le64.cache-9 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534129783 /var/cache/fontconfig/d589a48862398ed80a3d6066f4f56f4c-le64.cache-9 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534021553 /usr/lib/python3.12/lib-dynload/_json.cpython-312-x86_64-linux-gnu.so (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534021546 /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534022494 /usr/lib/x86_64-linux-gnu/libfreetype.so.6.20.1 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534011179 /usr/lib/x86_64-linux-gnu/libcrypto.so.3 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534022612 /usr/lib/x86_64-linux-gnu/liblcms2.so.2.0.14 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534022670 /usr/lib/x86_64-linux-gnu/libpng16.so.16.43.0 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534022553 /usr/lib/x86_64-linux-gnu/libharfbuzz.so.0.60830.0 (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534021555 /usr/lib/python3.12/lib-dynload/_lzma.cpython-312-x86_64-linux-gnu.so (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534021537 /usr/lib/python3.12/lib-dynload/_bz2.cpython-312-x86_64-linux-gnu.so (path dev=0,1506)
+kitty   181113 root  mem       REG              259,1          534022682 /usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0 (path dev=0,1506)
 ```
 
-**The complete set of mapped shared objects.** `/proc/281/maps` maps **81 distinct `.so` files**.
+The seven **named** rendering/font/crypto libraries are the seven table rows above (`libGL`,
+`libfontconfig`, `libfreetype`, `libcrypto`, `liblcms2`, `libpng16`, `libharfbuzz`). The other
+**seven** rows are honest artefacts of the broad pattern, not additional "rendering libraries", and
+are shown so the output is not silently trimmed: the token `fontconfig` also matches the two
+memory-mapped **FontConfig cache files** under `/var/cache/fontconfig/` (`…cb6837…-le64.cache-9` and
+`…d589a4…-le64.cache-9`), and the token `python3.12` also matches the **CPython interpreter**
+`libpython3.12.so.1.0` **plus four stdlib C-extensions** whose path contains the `python3.12/`
+directory component (`_json`, `_ctypes`, `_lzma`, `_bz2`). That is `7 + 2 + 1 + 4 = 14` rows — the
+exact set the printed command emits.
+
+**The complete set of mapped shared objects.** `/proc/181113/maps` maps **81 distinct `.so` files**.
 Categorised (counts sum to 81): **2** Kitty-built objects (`fast_data_types.so`, `glfw-x11.so`);
 **5** CPython objects (`libpython3.12.so.1.0` + four stdlib C extensions `_bz2`, `_ctypes`, `_json`,
 `_lzma`); **9** font-pipeline libs (the five above plus their deps `libgraphite2`, `libbrotlidec`,
@@ -694,9 +955,7 @@ Categorised (counts sum to 81): **2** Kitty-built objects (`fast_data_types.so`,
 `liblzma`/`libbz2`/`liblz4`, etc.). The complete, unedited list of unique objects follows:
 
 ```
-$ awk '{print $6}' /proc/281/maps | grep '\.so' | sort -u    # 81 lines
-/app/kitty/fast_data_types.so
-/app/kitty/glfw-x11.so
+$ awk '{print $6}' /proc/181113/maps | grep '\.so' | sort -u    # 81 lines
 /usr/lib/python3.12/lib-dynload/_bz2.cpython-312-x86_64-linux-gnu.so
 /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
 /usr/lib/python3.12/lib-dynload/_json.cpython-312-x86_64-linux-gnu.so
@@ -776,6 +1035,8 @@ $ awk '{print $6}' /proc/281/maps | grep '\.so' | sort -u    # 81 lines
 /usr/lib/x86_64-linux-gnu/libxshmfence.so.1.0.0
 /usr/lib/x86_64-linux-gnu/libz.so.1.3
 /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.5
+/work/kitty/fast_data_types.so
+/work/kitty/glfw-x11.so
 ```
 
 Two facts stand out for the language question. First, **`libpython3.12.so.1.0` is mapped in the
@@ -788,11 +1049,11 @@ which is why a worker-thread pool dominates CPU under load (§5) and why the `--
 in §7.
 
 The remote-control listening socket is also held by this process (a Unix domain socket in LISTEN
-state), confirming the control interface (§6) is served from within PID 281:
+state), confirming the control interface (§6) is served from within PID 181113:
 
 ```
-$ lsof -p 281 | grep mykitty.sock
-kitty   281 root    6u     unix 0x0000000000000000      0t0 728894531 /tmp/kitty_probe/mykitty.sock type=STREAM (LISTEN)
+$ lsof -p 181113 | grep mykitty.sock
+kitty   181113 root    6u     unix 0x0000000000000000      0t0 758367605 /tmp/kitty_probe/mykitty.sock type=STREAM (LISTEN)
 ```
 
 ---
@@ -807,12 +1068,12 @@ under load is not the *set* but the *CPU activity*: at idle every pool measures 
 threads are few and named: **main**, **`KittyChildMon`** (PTY I/O), **`KittyPeerMon`** (remote-control
 peer), plus two **transient** workers that appear only for specific workloads — **`DiskCacheWrite`**
 (image/graphics load) and **`KittyWriteStdin`** (feeding a large buffer to a slow child). The other
-64 threads are **Mesa's** software-GL worker pools, not Kitty logic. All before/during/after
-snapshots come from the same PID 281.
+65 threads are **Mesa's** software-GL worker pools (32 `llvmpipe-N` + 32 `"kitty"`-named + 1
+`"kitty:disk$0"`), not Kitty logic. All before/during/after snapshots come from the same PID 181113.
 
 ### Idle baseline — the complete thread census
 
-**[OBSERVED]** `for t in /proc/281/task/*/comm; do cat "$t"; done | sort | uniq -c` — the complete
+**[OBSERVED]** `for t in /proc/181113/task/*/comm; do cat "$t"; done | sort | uniq -c` — the complete
 name census of all 68 threads at idle:
 
 ```
@@ -854,92 +1115,92 @@ name census of all 68 threads at idle:
       1 KittyChildMon
 ```
 
-The same set seen through `ps -T -p 281` (SPID = thread id; complete, unedited — 32 `llvmpipe-N`
+The same set seen through `ps -T -p 181113` (SPID = thread id; complete, unedited — 32 `llvmpipe-N`
 rows, 32 unnamed `kitty` worker rows, and the three named Kitty threads plus main):
 
 ```
-$ ps -T -p 281
+$ ps -T -p 181113
     PID    SPID TTY          TIME CMD
-    281     281 ?        00:03:13 kitty
-    281     287 ?        00:00:04 llvmpipe-0
-    281     288 ?        00:00:04 llvmpipe-1
-    281     289 ?        00:00:04 llvmpipe-2
-    281     290 ?        00:00:04 llvmpipe-3
-    281     291 ?        00:00:04 llvmpipe-4
-    281     292 ?        00:00:04 llvmpipe-5
-    281     293 ?        00:00:04 llvmpipe-6
-    281     294 ?        00:00:04 llvmpipe-7
-    281     295 ?        00:00:04 llvmpipe-8
-    281     296 ?        00:00:04 llvmpipe-9
-    281     297 ?        00:00:04 llvmpipe-10
-    281     298 ?        00:00:03 llvmpipe-11
-    281     299 ?        00:00:03 llvmpipe-12
-    281     300 ?        00:00:03 llvmpipe-13
-    281     301 ?        00:00:03 llvmpipe-14
-    281     302 ?        00:00:03 llvmpipe-15
-    281     303 ?        00:00:03 llvmpipe-16
-    281     304 ?        00:00:03 llvmpipe-17
-    281     305 ?        00:00:03 llvmpipe-18
-    281     306 ?        00:00:03 llvmpipe-19
-    281     307 ?        00:00:03 llvmpipe-20
-    281     308 ?        00:00:03 llvmpipe-21
-    281     309 ?        00:00:03 llvmpipe-22
-    281     310 ?        00:00:03 llvmpipe-23
-    281     311 ?        00:00:03 llvmpipe-24
-    281     312 ?        00:00:03 llvmpipe-25
-    281     313 ?        00:00:03 llvmpipe-26
-    281     314 ?        00:00:03 llvmpipe-27
-    281     315 ?        00:00:03 llvmpipe-28
-    281     316 ?        00:00:03 llvmpipe-29
-    281     317 ?        00:00:03 llvmpipe-30
-    281     318 ?        00:00:03 llvmpipe-31
-    281     319 ?        00:00:00 kitty
-    281     320 ?        00:00:00 kitty
-    281     321 ?        00:00:00 kitty
-    281     322 ?        00:00:00 kitty
-    281     323 ?        00:00:00 kitty
-    281     324 ?        00:00:00 kitty
-    281     325 ?        00:00:00 kitty
-    281     326 ?        00:00:00 kitty
-    281     327 ?        00:00:00 kitty
-    281     328 ?        00:00:00 kitty
-    281     329 ?        00:00:00 kitty
-    281     330 ?        00:00:00 kitty
-    281     331 ?        00:00:00 kitty
-    281     332 ?        00:00:00 kitty
-    281     333 ?        00:00:00 kitty
-    281     334 ?        00:00:00 kitty
-    281     335 ?        00:00:00 kitty
-    281     336 ?        00:00:00 kitty
-    281     337 ?        00:00:00 kitty
-    281     338 ?        00:00:00 kitty
-    281     339 ?        00:00:00 kitty
-    281     340 ?        00:00:00 kitty
-    281     341 ?        00:00:00 kitty
-    281     342 ?        00:00:00 kitty
-    281     343 ?        00:00:00 kitty
-    281     344 ?        00:00:00 kitty
-    281     345 ?        00:00:00 kitty
-    281     346 ?        00:00:00 kitty
-    281     347 ?        00:00:00 kitty
-    281     348 ?        00:00:00 kitty
-    281     349 ?        00:00:00 kitty
-    281     350 ?        00:00:00 kitty
-    281     351 ?        00:00:00 kitty:disk$0
-    281     352 ?        00:00:00 KittyPeerMon
-    281     353 ?        00:00:36 KittyChildMon
+ 181113  181113 ?        00:06:51 kitty
+ 181113  181115 ?        00:01:16 llvmpipe-0
+ 181113  181116 ?        00:01:16 llvmpipe-1
+ 181113  181117 ?        00:01:15 llvmpipe-2
+ 181113  181118 ?        00:01:15 llvmpipe-3
+ 181113  181119 ?        00:01:15 llvmpipe-4
+ 181113  181120 ?        00:01:15 llvmpipe-5
+ 181113  181121 ?        00:01:15 llvmpipe-6
+ 181113  181122 ?        00:01:15 llvmpipe-7
+ 181113  181123 ?        00:01:15 llvmpipe-8
+ 181113  181124 ?        00:01:15 llvmpipe-9
+ 181113  181125 ?        00:01:15 llvmpipe-10
+ 181113  181126 ?        00:01:15 llvmpipe-11
+ 181113  181127 ?        00:01:15 llvmpipe-12
+ 181113  181128 ?        00:01:15 llvmpipe-13
+ 181113  181129 ?        00:01:14 llvmpipe-14
+ 181113  181130 ?        00:01:14 llvmpipe-15
+ 181113  181131 ?        00:01:14 llvmpipe-16
+ 181113  181132 ?        00:01:14 llvmpipe-17
+ 181113  181133 ?        00:01:14 llvmpipe-18
+ 181113  181134 ?        00:01:14 llvmpipe-19
+ 181113  181135 ?        00:01:14 llvmpipe-20
+ 181113  181136 ?        00:01:14 llvmpipe-21
+ 181113  181137 ?        00:01:14 llvmpipe-22
+ 181113  181138 ?        00:01:14 llvmpipe-23
+ 181113  181139 ?        00:01:14 llvmpipe-24
+ 181113  181140 ?        00:01:14 llvmpipe-25
+ 181113  181141 ?        00:01:13 llvmpipe-26
+ 181113  181142 ?        00:01:13 llvmpipe-27
+ 181113  181143 ?        00:01:13 llvmpipe-28
+ 181113  181144 ?        00:01:13 llvmpipe-29
+ 181113  181145 ?        00:01:14 llvmpipe-30
+ 181113  181146 ?        00:01:15 llvmpipe-31
+ 181113  181147 ?        00:00:00 kitty
+ 181113  181148 ?        00:00:00 kitty
+ 181113  181149 ?        00:00:00 kitty
+ 181113  181150 ?        00:00:00 kitty
+ 181113  181151 ?        00:00:00 kitty
+ 181113  181152 ?        00:00:00 kitty
+ 181113  181153 ?        00:00:00 kitty
+ 181113  181154 ?        00:00:00 kitty
+ 181113  181155 ?        00:00:00 kitty
+ 181113  181156 ?        00:00:00 kitty
+ 181113  181157 ?        00:00:00 kitty
+ 181113  181158 ?        00:00:00 kitty
+ 181113  181159 ?        00:00:00 kitty
+ 181113  181160 ?        00:00:00 kitty
+ 181113  181161 ?        00:00:00 kitty
+ 181113  181162 ?        00:00:00 kitty
+ 181113  181163 ?        00:00:00 kitty
+ 181113  181164 ?        00:00:00 kitty
+ 181113  181165 ?        00:00:00 kitty
+ 181113  181166 ?        00:00:00 kitty
+ 181113  181167 ?        00:00:00 kitty
+ 181113  181168 ?        00:00:00 kitty
+ 181113  181169 ?        00:00:00 kitty
+ 181113  181170 ?        00:00:00 kitty
+ 181113  181171 ?        00:00:00 kitty
+ 181113  181172 ?        00:00:00 kitty
+ 181113  181173 ?        00:00:00 kitty
+ 181113  181174 ?        00:00:00 kitty
+ 181113  181175 ?        00:00:00 kitty
+ 181113  181176 ?        00:00:00 kitty
+ 181113  181177 ?        00:00:00 kitty
+ 181113  181178 ?        00:00:00 kitty
+ 181113  181179 ?        00:00:00 kitty:disk$0
+ 181113  181180 ?        00:00:00 KittyPeerMon
+ 181113  181181 ?        00:02:14 KittyChildMon
 ```
 
 **Classification (observed names → owner, with grounding).** Only four distinct owners exist:
 
 | comm (observed) | count | Owner | Grounding |
 |-----------------|-------|-------|-----------|
-| `kitty` (TID 281) | 1 | **Kitty** main GUI/render thread | stack `__poll ← glfwRunMainLoop ← main_loop ← …Python… ← main` (§8) |
+| `kitty` (TID 181113) | 1 | **Kitty** main GUI/render thread | stack `__poll ← glfwRunMainLoop ← main_loop ← …Python… ← main` (§8) |
 | `KittyChildMon` | 1 | **Kitty** PTY-I/O thread | `set_thread_name("KittyChildMon")` `kitty/child-monitor.c:1489` |
 | `KittyPeerMon` | 1 | **Kitty** remote-control peer thread | `set_thread_name("KittyPeerMon")` `kitty/child-monitor.c:1808` |
 | `llvmpipe-0`…`llvmpipe-31` | 32 | **Mesa** llvmpipe rasteriser pool | name string `llvmpipe-%u` present in `libgallium-24.2.8*.so` |
 | `kitty:disk$0` | 1 | **Mesa** shader-disk-cache (util_queue) | name string `disk$` present in `libgallium`; Kitty's own disk thread is named `DiskCacheWrite`, not `disk$0` |
-| `kitty` (TID 319–350) | 32 | **Mesa** worker pool (inherits process comm) | **[INFERRED]** parked in `pthread_cond_wait`; Kitty creates no such pool (its model is Main+I/O+Talk); `mesa_glthread` present in `libgallium`. Stacks bottomed at `pthread_cond_wait` so a library symbol could not be unwound — attribution is inferred, not symbol-proven |
+| `kitty` (TID 181147–181178) | 32 | **Mesa** worker pool (inherits process comm) | **[INFERRED]** parked in `pthread_cond_wait`; Kitty creates no such pool (its model is Main+I/O+Talk); `mesa_glthread` present in `libgallium`. Stacks bottomed at `pthread_cond_wait` so a library symbol could not be unwound — attribution is inferred, not symbol-proven |
 
 **[INFERRED from source]** Kitty's documented threading model is exactly Main + I/O + Talk: the I/O
 and Talk loops are `pthread_create`d in `kitty/child-monitor.c`, which is why only three
@@ -955,14 +1216,96 @@ $ diff <(sort threads_idle_summary.txt) <(sort threads_during_ep1.txt) && echo I
 IDENTICAL
 ```
 
+The complete raw `ps -T` taken *during* the load confirms the identical 68-thread set (the same
+SPIDs as the idle block above — 181113 main, 181115–181146 `llvmpipe-0..31`, 181147–181178 the
+unnamed Mesa `kitty` workers, 181179 `kitty:disk$0`, 181180 `KittyPeerMon`, 181181 `KittyChildMon`;
+only the cumulative `TIME` column has advanced). Full unedited capture:
+
+<details><summary>complete raw during-load <code>ps -T -p 181113</code> (68 threads)</summary>
+
+```
+$ ps -T -p 181113
+    PID    SPID TTY          TIME CMD
+ 181113  181113 ?        00:06:53 kitty
+ 181113  181115 ?        00:01:16 llvmpipe-0
+ 181113  181116 ?        00:01:16 llvmpipe-1
+ 181113  181117 ?        00:01:16 llvmpipe-2
+ 181113  181118 ?        00:01:15 llvmpipe-3
+ 181113  181119 ?        00:01:15 llvmpipe-4
+ 181113  181120 ?        00:01:15 llvmpipe-5
+ 181113  181121 ?        00:01:15 llvmpipe-6
+ 181113  181122 ?        00:01:15 llvmpipe-7
+ 181113  181123 ?        00:01:15 llvmpipe-8
+ 181113  181124 ?        00:01:15 llvmpipe-9
+ 181113  181125 ?        00:01:15 llvmpipe-10
+ 181113  181126 ?        00:01:15 llvmpipe-11
+ 181113  181127 ?        00:01:15 llvmpipe-12
+ 181113  181128 ?        00:01:15 llvmpipe-13
+ 181113  181129 ?        00:01:15 llvmpipe-14
+ 181113  181130 ?        00:01:14 llvmpipe-15
+ 181113  181131 ?        00:01:14 llvmpipe-16
+ 181113  181132 ?        00:01:14 llvmpipe-17
+ 181113  181133 ?        00:01:14 llvmpipe-18
+ 181113  181134 ?        00:01:14 llvmpipe-19
+ 181113  181135 ?        00:01:14 llvmpipe-20
+ 181113  181136 ?        00:01:14 llvmpipe-21
+ 181113  181137 ?        00:01:14 llvmpipe-22
+ 181113  181138 ?        00:01:14 llvmpipe-23
+ 181113  181139 ?        00:01:14 llvmpipe-24
+ 181113  181140 ?        00:01:14 llvmpipe-25
+ 181113  181141 ?        00:01:14 llvmpipe-26
+ 181113  181142 ?        00:01:13 llvmpipe-27
+ 181113  181143 ?        00:01:14 llvmpipe-28
+ 181113  181144 ?        00:01:14 llvmpipe-29
+ 181113  181145 ?        00:01:14 llvmpipe-30
+ 181113  181146 ?        00:01:15 llvmpipe-31
+ 181113  181147 ?        00:00:00 kitty
+ 181113  181148 ?        00:00:00 kitty
+ 181113  181149 ?        00:00:00 kitty
+ 181113  181150 ?        00:00:00 kitty
+ 181113  181151 ?        00:00:00 kitty
+ 181113  181152 ?        00:00:00 kitty
+ 181113  181153 ?        00:00:00 kitty
+ 181113  181154 ?        00:00:00 kitty
+ 181113  181155 ?        00:00:00 kitty
+ 181113  181156 ?        00:00:00 kitty
+ 181113  181157 ?        00:00:00 kitty
+ 181113  181158 ?        00:00:00 kitty
+ 181113  181159 ?        00:00:00 kitty
+ 181113  181160 ?        00:00:00 kitty
+ 181113  181161 ?        00:00:00 kitty
+ 181113  181162 ?        00:00:00 kitty
+ 181113  181163 ?        00:00:00 kitty
+ 181113  181164 ?        00:00:00 kitty
+ 181113  181165 ?        00:00:00 kitty
+ 181113  181166 ?        00:00:00 kitty
+ 181113  181167 ?        00:00:00 kitty
+ 181113  181168 ?        00:00:00 kitty
+ 181113  181169 ?        00:00:00 kitty
+ 181113  181170 ?        00:00:00 kitty
+ 181113  181171 ?        00:00:00 kitty
+ 181113  181172 ?        00:00:00 kitty
+ 181113  181173 ?        00:00:00 kitty
+ 181113  181174 ?        00:00:00 kitty
+ 181113  181175 ?        00:00:00 kitty
+ 181113  181176 ?        00:00:00 kitty
+ 181113  181177 ?        00:00:00 kitty
+ 181113  181178 ?        00:00:00 kitty
+ 181113  181179 ?        00:00:00 kitty:disk$0
+ 181113  181180 ?        00:00:00 KittyPeerMon
+ 181113  181181 ?        00:02:14 KittyChildMon
+```
+
+</details>
+
 The real change is CPU time. CPU was measured as a delta of `utime+stime` jiffies (USER_HZ=100) over
 a **fixed 20 s window**, taken first as an **idle control** and then, at equal duration, **during** a
 `csi --render --repetitions 1500` load — repeated as two independent episodes. Every line is the
 verbatim tool output (note the ISO start→end timestamps proving equal windows):
 
 ```
-[idle_control_ep1] window=20.0s  2026-07-13T18:12:31 -> 2026-07-13T18:12:51  (jiffies = utime+stime; USER_HZ=100)
-  main(281)                        threads=  1  delta_jiffies=0
+[idle_control_ep1] window=20.0s  2026-07-14T02:02:24 -> 2026-07-14T02:02:44  (jiffies = utime+stime; USER_HZ=100)
+  main(181113)                     threads=  1  delta_jiffies=0
   llvmpipe pool [Mesa]             threads= 32  delta_jiffies=0
   gallium "kitty" pool [Mesa]      threads= 32  delta_jiffies=0
   kitty:disk$0 [Mesa]              threads=  1  delta_jiffies=0
@@ -970,17 +1313,17 @@ verbatim tool output (note the ISO start→end timestamps proving equal windows)
   KittyChildMon                    threads=  1  delta_jiffies=0
   TOTAL                                       delta_jiffies=0
 
-[during_csi_load_ep1] window=20.0s  2026-07-13T18:12:54 -> 2026-07-13T18:13:14  (jiffies = utime+stime; USER_HZ=100)
-  main(281)                        threads=  1  delta_jiffies=1926
-  llvmpipe pool [Mesa]             threads= 32  delta_jiffies=912
-  KittyChildMon                    threads=  1  delta_jiffies=171
+[during_csi_load_ep1] window=20.0s  2026-07-14T02:02:48 -> 2026-07-14T02:03:08  (jiffies = utime+stime; USER_HZ=100)
+  llvmpipe pool [Mesa]             threads= 32  delta_jiffies=2858
+  main(181113)                     threads=  1  delta_jiffies=1867
+  KittyChildMon                    threads=  1  delta_jiffies=143
   gallium "kitty" pool [Mesa]      threads= 32  delta_jiffies=0
   kitty:disk$0 [Mesa]              threads=  1  delta_jiffies=0
   KittyPeerMon                     threads=  1  delta_jiffies=0
-  TOTAL                                       delta_jiffies=3009
+  TOTAL                                       delta_jiffies=4868
 
-[idle_control_ep2] window=20.0s  2026-07-13T18:13:47 -> 2026-07-13T18:14:07  (jiffies = utime+stime; USER_HZ=100)
-  main(281)                        threads=  1  delta_jiffies=0
+[idle_control_ep2] window=20.0s  2026-07-14T02:03:43 -> 2026-07-14T02:04:03  (jiffies = utime+stime; USER_HZ=100)
+  main(181113)                     threads=  1  delta_jiffies=0
   llvmpipe pool [Mesa]             threads= 32  delta_jiffies=0
   gallium "kitty" pool [Mesa]      threads= 32  delta_jiffies=0
   kitty:disk$0 [Mesa]              threads=  1  delta_jiffies=0
@@ -988,23 +1331,24 @@ verbatim tool output (note the ISO start→end timestamps proving equal windows)
   KittyChildMon                    threads=  1  delta_jiffies=0
   TOTAL                                       delta_jiffies=0
 
-[during_csi_load_ep2] window=20.0s  2026-07-13T18:14:10 -> 2026-07-13T18:14:30  (jiffies = utime+stime; USER_HZ=100)
-  main(281)                        threads=  1  delta_jiffies=1915
-  llvmpipe pool [Mesa]             threads= 32  delta_jiffies=1006
-  KittyChildMon                    threads=  1  delta_jiffies=176
+[during_csi_load_ep2] window=20.0s  2026-07-14T02:04:06 -> 2026-07-14T02:04:26  (jiffies = utime+stime; USER_HZ=100)
+  llvmpipe pool [Mesa]             threads= 32  delta_jiffies=2873
+  main(181113)                     threads=  1  delta_jiffies=1863
+  KittyChildMon                    threads=  1  delta_jiffies=140
   gallium "kitty" pool [Mesa]      threads= 32  delta_jiffies=0
   kitty:disk$0 [Mesa]              threads=  1  delta_jiffies=0
   KittyPeerMon                     threads=  1  delta_jiffies=0
-  TOTAL                                       delta_jiffies=3097
+  TOTAL                                       delta_jiffies=4876
 ```
 
 **Reading the numbers.** Idle: **0** jiffies everywhere (both episodes) — a true quiescent control.
-Under load, over 20 s (2000 jiffies = one fully-busy core): the **main thread ≈1926 / 1915** jiffies
-(~96 % of a core — the C parse + `draw_cells` render path), the **`llvmpipe` pool ≈912 / 1006**
-jiffies aggregate (software rasterisation), and **`KittyChildMon` ≈171 / 176** jiffies (PTY I/O
+Under load, over 20 s (2000 jiffies = one fully-busy core): the **`llvmpipe` pool ≈2858 / 2873**
+jiffies aggregate across its 32 software-rasteriser threads (the largest aggregate consumer — Mesa
+doing the actual pixel work with no GPU), the **main thread ≈1867 / 1863** jiffies (~93 % of one
+core — the C parse + `draw_cells` render path), and **`KittyChildMon` ≈143 / 140** jiffies (PTY I/O
 feeding bytes in). The `gallium "kitty"` pool, `kitty:disk$0`, and `KittyPeerMon` stay at **0** — a
 CSI stream needs no GL-thread, no shader-disk cache, and no RC-peer traffic. The two episodes agree
-to within ~1 % on the main thread, confirming stability. **No Python thread appears or becomes
+to within ~1 % on every owner, confirming stability. **No Python thread appears or becomes
 active** — Python remains parked on the main thread inside the C loop (proven by `py-spy` in §8).
 
 **The measurement method (shown in full).** `cpu_sample.py` takes two `/proc/<pid>/task/*/stat`
@@ -1063,13 +1407,13 @@ set -u
 N="$1"
 L=/tmp/kitty_probe/logs
 MAIN=$(cat /tmp/kitty_probe/kitty.pid)
-KAT="/app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock"
+KAT="/work/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock"
 export DISPLAY=:99
 # 1) idle control (equal duration, no load)
 python3 /tmp/kitty_probe/cpu_sample.py 20 "idle_control_ep${N}" | tee "$L/cpu_idle_ep${N}.txt"
 # 2) start a long csi --render load asynchronously inside a kitty window
 OUT="$L/cpuload_ep${N}.out"; RCF="/tmp/kitty_probe/cpuload_ep${N}.rc"; rm -f "$OUT" "$RCF"
-CHILD="/app/kitty/launcher/kitten __benchmark__ --render --repetitions 1500 csi > '$OUT' 2>&1; echo \$? > '$RCF'"
+CHILD="/work/kitty/launcher/kitten __benchmark__ --render --repetitions 1500 csi > '$OUT' 2>&1; echo \$? > '$RCF'"
 $KAT launch --type=window --keep-focus sh -c "$CHILD" >/dev/null 2>&1
 sleep 3
 # 3) during-load thread set snapshot (same PID)
@@ -1085,14 +1429,14 @@ echo "episode ${N} load exit=$(cat "$RCF" 2>/dev/null)"
 
 A CSI stream does not change the thread set, but two *other* workloads spawn short-lived Kitty
 worker threads that **do** appear as set deltas. Both are Kitty's own C threads (named via
-`set_thread_name`), and both were observed by polling `/proc/281/task/*/comm`:
+`set_thread_name`), and both were observed by polling `/proc/181113/task/*/comm`:
 
 **`DiskCacheWrite`** — appears while the **image/graphics** benchmark spools decoded image data to
 Kitty's on-disk cache:
 
 ```
-$ # during: kitten __benchmark__ --render images ; poll /proc/281/task/*/comm
-  TID=2039 comm=DiskCacheWrite
+$ # during: kitten __benchmark__ --render images ; poll /proc/181113/task/*/comm
+  TID=257169 comm=DiskCacheWrite
 ```
 Grounded in `set_thread_name("DiskCacheWrite")` at `kitty/disk-cache.c:342`.
 
@@ -1102,8 +1446,8 @@ Driven by `writestdin3.sh` (a large producer window, then a slow `cat >/dev/null
 `--stdin-source=@screen_scrollback`), then polled from `/proc`:
 
 ```
-KittyWriteStdin OBSERVED at poll 3:
-  TID=3380 comm=KittyWriteStdin
+KittyWriteStdin OBSERVED at poll 1:
+  TID=312326 comm=KittyWriteStdin
 ```
 Grounded in `set_thread_name("KittyWriteStdin")` at `kitty/child-monitor.c:967`; the thread runs the
 C function `thread_write` (`kitty/child-monitor.c:965`), created by `cm_thread_write` via
@@ -1118,16 +1462,16 @@ comm `kitty`, not `KittyWriteStdin`. This is expected: `set_thread_name("KittyWr
 form is shown there):
 
 ```
-0x00007d8f733604cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
-Breakpoint 1 at 0x7d8f727470d0
-[Detaching after fork from child process 2282]
-[New Thread 0x7d8e41dfc6c0 (LWP 2283)]
-[Switching to Thread 0x7d8e41dfc6c0 (LWP 2283)]
+0x00007d03ab0524cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
+Breakpoint 1 at 0x7d03aa4390d0
+[Detaching after fork from child process 312588]
+[Detaching after fork from child process 312623]
+[New Thread 0x7d027a7fc6c0 (LWP 312624)]
+[Switching to Thread 0x7d027a7fc6c0 (LWP 312624)]
 
-Thread 69 "kitty" hit Breakpoint 1, 0x00007d8f727470d0 in thread_write () from /app/kitty/launcher/../../kitty/fast_data_types.so
-Breakpoint 2 at 0x7d8f67ac8768
-[Thread 0x7d8e41dfc6c0 (LWP 2283) exited]
-[Inferior 1 (process 281) detached]
+Thread 69 "kitty" hit Breakpoint 1, 0x00007d03aa4390d0 in thread_write () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#0  0x00007d03aa4390d0 in thread_write () from /work/kitty/launcher/../../kitty/fast_data_types.so
+[Inferior 1 (process 181113) detached]
 GDB-EXIT=0
 ```
 
@@ -1141,9 +1485,89 @@ the name/symbol relationship explained rather than glossed.
 exited); it is byte-identical to the idle census above:
 
 ```
-$ diff <(sort threads_idle_summary.txt) <(sort threads_after.txt) && echo IDENTICAL
+$ diff <(sort threads_idle_summary.txt) <(sort threads_after_summary.txt) && echo IDENTICAL
 IDENTICAL
 ```
+
+And the complete raw `ps -T` after the load has returned to the same 68-thread set — the transients
+(`DiskCacheWrite`, `KittyWriteStdin`) have exited and the persistent set is byte-identical to idle:
+
+<details><summary>complete raw after-load <code>ps -T -p 181113</code> (68 threads)</summary>
+
+```
+$ ps -T -p 181113
+    PID    SPID TTY          TIME CMD
+ 181113  181113 ?        00:08:38 kitty
+ 181113  181115 ?        00:01:21 llvmpipe-0
+ 181113  181116 ?        00:01:21 llvmpipe-1
+ 181113  181117 ?        00:01:21 llvmpipe-2
+ 181113  181118 ?        00:01:21 llvmpipe-3
+ 181113  181119 ?        00:01:21 llvmpipe-4
+ 181113  181120 ?        00:01:21 llvmpipe-5
+ 181113  181121 ?        00:01:20 llvmpipe-6
+ 181113  181122 ?        00:01:20 llvmpipe-7
+ 181113  181123 ?        00:01:20 llvmpipe-8
+ 181113  181124 ?        00:01:20 llvmpipe-9
+ 181113  181125 ?        00:01:20 llvmpipe-10
+ 181113  181126 ?        00:01:20 llvmpipe-11
+ 181113  181127 ?        00:01:20 llvmpipe-12
+ 181113  181128 ?        00:01:20 llvmpipe-13
+ 181113  181129 ?        00:01:20 llvmpipe-14
+ 181113  181130 ?        00:01:20 llvmpipe-15
+ 181113  181131 ?        00:01:19 llvmpipe-16
+ 181113  181132 ?        00:01:19 llvmpipe-17
+ 181113  181133 ?        00:01:19 llvmpipe-18
+ 181113  181134 ?        00:01:19 llvmpipe-19
+ 181113  181135 ?        00:01:19 llvmpipe-20
+ 181113  181136 ?        00:01:19 llvmpipe-21
+ 181113  181137 ?        00:01:19 llvmpipe-22
+ 181113  181138 ?        00:01:19 llvmpipe-23
+ 181113  181139 ?        00:01:19 llvmpipe-24
+ 181113  181140 ?        00:01:19 llvmpipe-25
+ 181113  181141 ?        00:01:19 llvmpipe-26
+ 181113  181142 ?        00:01:19 llvmpipe-27
+ 181113  181143 ?        00:01:19 llvmpipe-28
+ 181113  181144 ?        00:01:19 llvmpipe-29
+ 181113  181145 ?        00:01:19 llvmpipe-30
+ 181113  181146 ?        00:01:20 llvmpipe-31
+ 181113  181147 ?        00:00:00 kitty
+ 181113  181148 ?        00:00:00 kitty
+ 181113  181149 ?        00:00:00 kitty
+ 181113  181150 ?        00:00:00 kitty
+ 181113  181151 ?        00:00:00 kitty
+ 181113  181152 ?        00:00:00 kitty
+ 181113  181153 ?        00:00:00 kitty
+ 181113  181154 ?        00:00:00 kitty
+ 181113  181155 ?        00:00:00 kitty
+ 181113  181156 ?        00:00:00 kitty
+ 181113  181157 ?        00:00:00 kitty
+ 181113  181158 ?        00:00:00 kitty
+ 181113  181159 ?        00:00:00 kitty
+ 181113  181160 ?        00:00:00 kitty
+ 181113  181161 ?        00:00:00 kitty
+ 181113  181162 ?        00:00:00 kitty
+ 181113  181163 ?        00:00:00 kitty
+ 181113  181164 ?        00:00:00 kitty
+ 181113  181165 ?        00:00:00 kitty
+ 181113  181166 ?        00:00:00 kitty
+ 181113  181167 ?        00:00:00 kitty
+ 181113  181168 ?        00:00:00 kitty
+ 181113  181169 ?        00:00:00 kitty
+ 181113  181170 ?        00:00:00 kitty
+ 181113  181171 ?        00:00:00 kitty
+ 181113  181172 ?        00:00:00 kitty
+ 181113  181173 ?        00:00:00 kitty
+ 181113  181174 ?        00:00:00 kitty
+ 181113  181175 ?        00:00:00 kitty
+ 181113  181176 ?        00:00:00 kitty
+ 181113  181177 ?        00:00:00 kitty
+ 181113  181178 ?        00:00:00 kitty
+ 181113  181179 ?        00:00:00 kitty:disk$0
+ 181113  181180 ?        00:00:00 KittyPeerMon
+ 181113  181181 ?        00:02:22 KittyChildMon
+```
+
+</details>
 
 **Summary of O3.** Under stress the *set* of persistent threads does not grow; work concentrates on
 Kitty's **main C thread** and **`KittyChildMon`**, plus **Mesa's** `llvmpipe` pool doing software GL.
@@ -1158,7 +1582,7 @@ threads.
 **Direct answer.** While the load runs, Kitty exposes its live UI state through its **remote-control**
 ("control interface") as a JSON tree of OS-windows → tabs → windows, each window carrying its id,
 title, cwd, PID, command line, environment, and **live foreground process(es)**. This state is
-served **from inside PID 281** by the Python remote-control server, and the tree itself is assembled
+served **from inside PID 181113** by the Python remote-control server, and the tree itself is assembled
 by the **Python** method `boss.list_os_windows()` (`kitty/boss.py:432`), called from the `LS` command
 class (`kitty/rc/ls.py:15`, whose `response_from_kitty` at `:48` runs `boss.list_os_windows(...)` at
 `:57`) and serialized to JSON. It is therefore **Python orchestration state** (with individual
@@ -1168,12 +1592,14 @@ why §2 launched with `-o allow_remote_control=yes --listen-on unix:/tmp/kitty_p
 
 ### Idle — `@ ls` baseline (complete, unedited JSON)
 
-**[OBSERVED]** With one window open, `kitten @ ls` returns the full tree below. (The only edit is a
-single clearly-labelled redaction of the session-ephemeral RC public key inside `env`; every other
-byte is verbatim.)
+**[OBSERVED]** With one window open, `kitten @ ls` returns the full tree below — **complete and
+unedited, byte-for-byte** (including the `env.KITTY_PUBLIC_KEY` value). That value is a *public* key,
+not secret credential material: it is the RC peer's public half, validated as public at
+`kitty/boss.py:341` and `kitty/child.py:245`, so publishing it verbatim leaks nothing while keeping
+the evidence complete.)
 
 ```
-$ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls
+$ /work/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls
 [
   {
     "background_opacity": 1.0,
@@ -1224,35 +1650,35 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls
         "title": "/app",
         "windows": [
           {
-            "at_prompt": true,
+            "at_prompt": false,
             "cmdline": [
               "/bin/bash",
               "--posix"
             ],
-            "columns": 71,
-            "created_at": 1783965859676530754,
+            "columns": 133,
+            "created_at": 1783989780342207129,
             "cwd": "/app",
             "env": {
               "COLORTERM": "truecolor",
               "DISPLAY": ":99",
-              "ENV": "/app/shell-integration/bash/kitty.bash",
+              "ENV": "/work/shell-integration/bash/kitty.bash",
               "HISTFILE": "/root/.bash_history",
               "HOME": "/root",
               "KITTY_BASH_INJECT": "1",
               "KITTY_BASH_UNEXPORT_HISTFILE": "1",
-              "KITTY_INSTALLATION_DIR": "/app",
+              "KITTY_INSTALLATION_DIR": "/work",
               "KITTY_LISTEN_ON": "unix:/tmp/kitty_probe/mykitty.sock",
-              "KITTY_PID": "281",
-              "KITTY_PUBLIC_KEY": "[redacted: session-ephemeral RC public key]",
+              "KITTY_PID": "181113",
+              "KITTY_PUBLIC_KEY": "1:s#croCm?gwa0?-1HRH@Ain-ZoP&QTzN0>3$O%ZrV",
               "KITTY_SHELL_INTEGRATION": "enabled",
               "KITTY_WINDOW_ID": "1",
               "LANG": "C.UTF-8",
               "LC_ALL": "C.UTF-8",
               "LIBGL_ALWAYS_SOFTWARE": "1",
-              "PATH": "/app/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+              "PATH": "/work/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
               "PWD": "/app",
               "TERM": "xterm-kitty",
-              "TERMINFO": "/app/terminfo",
+              "TERMINFO": "/work/terminfo",
               "WINDOWID": "2097164"
             },
             "foreground_processes": [
@@ -1262,7 +1688,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls
                   "--posix"
                 ],
                 "cwd": "/app",
-                "pid": 354
+                "pid": 181182
               }
             ],
             "id": 1,
@@ -1271,8 +1697,8 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
-            "lines": 22,
-            "pid": 354,
+            "lines": 44,
+            "pid": 181182,
             "title": "/app",
             "user_vars": {}
           }
@@ -1289,13 +1715,13 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls
 
 **[OBSERVED]** A `csi --render --repetitions 1500` benchmark was launched into a second window, and
 `@ ls` was captured **while it was running**. The tree now has two windows: the original bash
-(win 1, pid 354) and the benchmark window (win 21, pid 3844), whose `foreground_processes` array
+(win 1, pid 181182) and the benchmark window (win 46, pid 256141), whose `foreground_processes` array
 shows both the `sh -c` wrapper **and the live `kitten __benchmark__ --render --repetitions 1500 csi`
 process** — direct, verifiable evidence of the running workload. (No redaction was needed here: with
 `all_env_vars` off, only *differing* env vars are shown, so the common RC key was already omitted.)
 
 ```
-$ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # during csi --render load
+$ /work/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # during csi --render load
 [
   {
     "background_opacity": 1.0,
@@ -1306,7 +1732,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
     "platform_window_id": 2097164,
     "tabs": [
       {
-        "active_window_history": [],
+        "active_window_history": [
+          1,
+          46
+        ],
         "enabled_layouts": [
           "fat",
           "grid",
@@ -1324,9 +1753,9 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
             ]
           },
           {
-            "id": 21,
+            "id": 46,
             "windows": [
-              21
+              46
             ]
           }
         ],
@@ -1350,16 +1779,16 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         "title": "/app",
         "windows": [
           {
-            "at_prompt": true,
+            "at_prompt": false,
             "cmdline": [
               "/bin/bash",
               "--posix"
             ],
-            "columns": 70,
-            "created_at": 1783965859676530754,
+            "columns": 133,
+            "created_at": 1783989780342207129,
             "cwd": "/app",
             "env": {
-              "ENV": "/app/shell-integration/bash/kitty.bash",
+              "ENV": "/work/shell-integration/bash/kitty.bash",
               "HISTFILE": "/root/.bash_history",
               "KITTY_BASH_INJECT": "1",
               "KITTY_BASH_UNEXPORT_HISTFILE": "1",
@@ -1373,7 +1802,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "--posix"
                 ],
                 "cwd": "/app",
-                "pid": 354
+                "pid": 181182
               }
             ],
             "id": 1,
@@ -1382,8 +1811,8 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
-            "lines": 11,
-            "pid": 354,
+            "lines": 22,
+            "pid": 181182,
             "title": "/app",
             "user_vars": {}
           },
@@ -1392,27 +1821,27 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
             "cmdline": [
               "/usr/bin/sh",
               "-c",
-              "/app/kitty/launcher/kitten __benchmark__ --render --repetitions 1500 csi > /tmp/kitty_probe/logs/o4load.out 2>&1; echo $? > /tmp/kitty_probe/o4load.rc"
+              "/work/kitty/launcher/kitten __benchmark__ --render --repetitions 1500 csi > '/tmp/qacap/cpuload_ep1.out' 2>&1; echo $? > '/tmp/kitty_probe/cpuload_ep1.rc'"
             ],
-            "columns": 70,
-            "created_at": 1783966936495214125,
+            "columns": 133,
+            "created_at": 1783994564833139754,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "21"
+              "KITTY_WINDOW_ID": "46"
             },
             "foreground_processes": [
               {
                 "cmdline": [
                   "/usr/bin/sh",
                   "-c",
-                  "/app/kitty/launcher/kitten __benchmark__ --render --repetitions 1500 csi > /tmp/kitty_probe/logs/o4load.out 2>&1; echo $? > /tmp/kitty_probe/o4load.rc"
+                  "/work/kitty/launcher/kitten __benchmark__ --render --repetitions 1500 csi > '/tmp/qacap/cpuload_ep1.out' 2>&1; echo $? > '/tmp/kitty_probe/cpuload_ep1.rc'"
                 ],
                 "cwd": "/app",
-                "pid": 3844
+                "pid": 256141
               },
               {
                 "cmdline": [
-                  "/app/kitty/launcher/kitten",
+                  "/work/kitty/launcher/kitten",
                   "__benchmark__",
                   "--render",
                   "--repetitions",
@@ -1420,17 +1849,17 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "csi"
                 ],
                 "cwd": "/app",
-                "pid": 3846
+                "pid": 256143
               }
             ],
-            "id": 21,
+            "id": 46,
             "is_active": false,
             "is_focused": false,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
-            "lines": 11,
-            "pid": 3844,
+            "lines": 22,
+            "pid": 256141,
             "title": "sh",
             "user_vars": {}
           }
@@ -1450,21 +1879,22 @@ and returned the live text of the focused window — the shell prompt, whose hos
 (`52aba8ef1544`) matches the container id from §2:
 
 ```
-$ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock get-text    # during load
+$ /work/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock get-text    # during load
 root@52aba8ef1544:/app#
 ```
 
-### During tab-switching load — the complete seven-tab `@ ls` tree
+### During tab-switching load — the complete nine-tab `@ ls` tree
 
 **[OBSERVED]** This is the full, unedited `@ ls` JSON captured during the tab-switching workload of §3
 (Workload 5) — the authoritative tree that §3's structural summary was rendered from. It shows one
-OS-window with **seven tabs** (ids 1, 31–36), each tab backed by a **separate child-shell process**
-with a distinct PID (354, 49851, 49868, 49885, 49898, 49913, 49931), and tab 36 (`probe_t6`) active
-after the switching cycles. (No redaction was needed: the six probe tabs were launched as bare `sh`,
+OS-window with **nine tabs** (ids 1, 10–17), each tab backed by a **separate child-shell process**
+with a distinct PID (181182, 189777, 189793, 189810, 189828, 189845, 189861, 189875, 189891), and tab
+17 (`probe_t8`) active after the switching cycles. (No redaction was needed: the eight probe tabs
+were launched as bare `sh`,
 so no RC key appears anywhere in this tree.)
 
 ```
-$ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # during tab-switch workload (seven tabs)
+$ /work/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # during tab-switch workload (nine tabs)
 [
   {
     "background_opacity": 1.0,
@@ -1475,7 +1905,9 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
     "platform_window_id": 2097164,
     "tabs": [
       {
-        "active_window_history": [],
+        "active_window_history": [
+          1
+        ],
         "enabled_layouts": [
           "fat",
           "grid",
@@ -1519,10 +1951,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "--posix"
             ],
             "columns": 213,
-            "created_at": 1783965859676530754,
+            "created_at": 1783989780342207129,
             "cwd": "/app",
             "env": {
-              "ENV": "/app/shell-integration/bash/kitty.bash",
+              "ENV": "/work/shell-integration/bash/kitty.bash",
               "HISTFILE": "/root/.bash_history",
               "KITTY_BASH_INJECT": "1",
               "KITTY_BASH_UNEXPORT_HISTFILE": "1",
@@ -1536,7 +1968,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "--posix"
                 ],
                 "cwd": "/app",
-                "pid": 354
+                "pid": 181182
               }
             ],
             "id": 1,
@@ -1546,7 +1978,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 354,
+            "pid": 181182,
             "title": "/app",
             "user_vars": {}
           }
@@ -1554,7 +1986,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
       },
       {
         "active_window_history": [
-          63
+          10
         ],
         "enabled_layouts": [
           "fat",
@@ -1567,13 +1999,13 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         ],
         "groups": [
           {
-            "id": 63,
+            "id": 10,
             "windows": [
-              63
+              10
             ]
           }
         ],
-        "id": 31,
+        "id": 10,
         "is_active": false,
         "is_focused": false,
         "layout": "fat",
@@ -1598,10 +2030,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "/usr/bin/sh"
             ],
             "columns": 213,
-            "created_at": 1783969744982551855,
+            "created_at": 1783990463093145685,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "63"
+              "KITTY_WINDOW_ID": "10"
             },
             "foreground_processes": [
               {
@@ -1609,17 +2041,17 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "/usr/bin/sh"
                 ],
                 "cwd": "/app",
-                "pid": 49851
+                "pid": 189777
               }
             ],
-            "id": 63,
+            "id": 10,
             "is_active": true,
             "is_focused": true,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 49851,
+            "pid": 189777,
             "title": "sh",
             "user_vars": {}
           }
@@ -1627,7 +2059,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
       },
       {
         "active_window_history": [
-          64
+          11
         ],
         "enabled_layouts": [
           "fat",
@@ -1640,13 +2072,13 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         ],
         "groups": [
           {
-            "id": 64,
+            "id": 11,
             "windows": [
-              64
+              11
             ]
           }
         ],
-        "id": 32,
+        "id": 11,
         "is_active": false,
         "is_focused": false,
         "layout": "fat",
@@ -1671,10 +2103,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "/usr/bin/sh"
             ],
             "columns": 213,
-            "created_at": 1783969745044162569,
+            "created_at": 1783990463134220417,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "64"
+              "KITTY_WINDOW_ID": "11"
             },
             "foreground_processes": [
               {
@@ -1682,17 +2114,17 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "/usr/bin/sh"
                 ],
                 "cwd": "/app",
-                "pid": 49868
+                "pid": 189793
               }
             ],
-            "id": 64,
+            "id": 11,
             "is_active": true,
             "is_focused": true,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 49868,
+            "pid": 189793,
             "title": "sh",
             "user_vars": {}
           }
@@ -1700,7 +2132,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
       },
       {
         "active_window_history": [
-          65
+          12
         ],
         "enabled_layouts": [
           "fat",
@@ -1713,13 +2145,13 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         ],
         "groups": [
           {
-            "id": 65,
+            "id": 12,
             "windows": [
-              65
+              12
             ]
           }
         ],
-        "id": 33,
+        "id": 12,
         "is_active": false,
         "is_focused": false,
         "layout": "fat",
@@ -1744,10 +2176,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "/usr/bin/sh"
             ],
             "columns": 213,
-            "created_at": 1783969745097836326,
+            "created_at": 1783990463178499993,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "65"
+              "KITTY_WINDOW_ID": "12"
             },
             "foreground_processes": [
               {
@@ -1755,17 +2187,17 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "/usr/bin/sh"
                 ],
                 "cwd": "/app",
-                "pid": 49885
+                "pid": 189810
               }
             ],
-            "id": 65,
+            "id": 12,
             "is_active": true,
             "is_focused": true,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 49885,
+            "pid": 189810,
             "title": "sh",
             "user_vars": {}
           }
@@ -1773,7 +2205,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
       },
       {
         "active_window_history": [
-          66
+          13
         ],
         "enabled_layouts": [
           "fat",
@@ -1786,13 +2218,13 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         ],
         "groups": [
           {
-            "id": 66,
+            "id": 13,
             "windows": [
-              66
+              13
             ]
           }
         ],
-        "id": 34,
+        "id": 13,
         "is_active": false,
         "is_focused": false,
         "layout": "fat",
@@ -1817,10 +2249,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "/usr/bin/sh"
             ],
             "columns": 213,
-            "created_at": 1783969745145495782,
+            "created_at": 1783990463223559835,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "66"
+              "KITTY_WINDOW_ID": "13"
             },
             "foreground_processes": [
               {
@@ -1828,17 +2260,17 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "/usr/bin/sh"
                 ],
                 "cwd": "/app",
-                "pid": 49898
+                "pid": 189828
               }
             ],
-            "id": 66,
+            "id": 13,
             "is_active": true,
             "is_focused": true,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 49898,
+            "pid": 189828,
             "title": "sh",
             "user_vars": {}
           }
@@ -1846,7 +2278,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
       },
       {
         "active_window_history": [
-          67
+          14
         ],
         "enabled_layouts": [
           "fat",
@@ -1859,13 +2291,13 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         ],
         "groups": [
           {
-            "id": 67,
+            "id": 14,
             "windows": [
-              67
+              14
             ]
           }
         ],
-        "id": 35,
+        "id": 14,
         "is_active": false,
         "is_focused": false,
         "layout": "fat",
@@ -1890,10 +2322,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "/usr/bin/sh"
             ],
             "columns": 213,
-            "created_at": 1783969745193794185,
+            "created_at": 1783990463266585301,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "67"
+              "KITTY_WINDOW_ID": "14"
             },
             "foreground_processes": [
               {
@@ -1901,17 +2333,17 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "/usr/bin/sh"
                 ],
                 "cwd": "/app",
-                "pid": 49913
+                "pid": 189845
               }
             ],
-            "id": 67,
+            "id": 14,
             "is_active": true,
             "is_focused": true,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 49913,
+            "pid": 189845,
             "title": "sh",
             "user_vars": {}
           }
@@ -1919,7 +2351,7 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
       },
       {
         "active_window_history": [
-          68
+          15
         ],
         "enabled_layouts": [
           "fat",
@@ -1932,15 +2364,15 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
         ],
         "groups": [
           {
-            "id": 68,
+            "id": 15,
             "windows": [
-              68
+              15
             ]
           }
         ],
-        "id": 36,
-        "is_active": true,
-        "is_focused": true,
+        "id": 15,
+        "is_active": false,
+        "is_focused": false,
         "layout": "fat",
         "layout_opts": {
           "bias": 50,
@@ -1963,10 +2395,10 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
               "/usr/bin/sh"
             ],
             "columns": 213,
-            "created_at": 1783969745246950605,
+            "created_at": 1783990463314108566,
             "cwd": "/app",
             "env": {
-              "KITTY_WINDOW_ID": "68"
+              "KITTY_WINDOW_ID": "15"
             },
             "foreground_processes": [
               {
@@ -1974,18 +2406,284 @@ $ /app/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # d
                   "/usr/bin/sh"
                 ],
                 "cwd": "/app",
-                "pid": 49931
+                "pid": 189861
               }
             ],
-            "id": 68,
+            "id": 15,
             "is_active": true,
             "is_focused": true,
             "is_self": false,
             "last_cmd_exit_status": 0,
             "last_reported_cmdline": "",
             "lines": 59,
-            "pid": 49931,
+            "pid": 189861,
             "title": "sh",
+            "user_vars": {}
+          }
+        ]
+      },
+      {
+        "active_window_history": [
+          16
+        ],
+        "enabled_layouts": [
+          "fat",
+          "grid",
+          "horizontal",
+          "splits",
+          "stack",
+          "tall",
+          "vertical"
+        ],
+        "groups": [
+          {
+            "id": 16,
+            "windows": [
+              16
+            ]
+          }
+        ],
+        "id": 16,
+        "is_active": false,
+        "is_focused": false,
+        "layout": "fat",
+        "layout_opts": {
+          "bias": 50,
+          "full_size": 1,
+          "mirrored": false
+        },
+        "layout_state": {
+          "biased_map": {},
+          "main_bias": [
+            0.5,
+            0.5
+          ],
+          "num_full_size_windows": 1
+        },
+        "title": "probe_t7",
+        "windows": [
+          {
+            "at_prompt": false,
+            "cmdline": [
+              "/usr/bin/sh"
+            ],
+            "columns": 213,
+            "created_at": 1783990463352634815,
+            "cwd": "/app",
+            "env": {
+              "KITTY_WINDOW_ID": "16"
+            },
+            "foreground_processes": [
+              {
+                "cmdline": [
+                  "/usr/bin/sh"
+                ],
+                "cwd": "/app",
+                "pid": 189875
+              }
+            ],
+            "id": 16,
+            "is_active": true,
+            "is_focused": true,
+            "is_self": false,
+            "last_cmd_exit_status": 0,
+            "last_reported_cmdline": "",
+            "lines": 59,
+            "pid": 189875,
+            "title": "sh",
+            "user_vars": {}
+          }
+        ]
+      },
+      {
+        "active_window_history": [
+          17
+        ],
+        "enabled_layouts": [
+          "fat",
+          "grid",
+          "horizontal",
+          "splits",
+          "stack",
+          "tall",
+          "vertical"
+        ],
+        "groups": [
+          {
+            "id": 17,
+            "windows": [
+              17
+            ]
+          }
+        ],
+        "id": 17,
+        "is_active": true,
+        "is_focused": true,
+        "layout": "fat",
+        "layout_opts": {
+          "bias": 50,
+          "full_size": 1,
+          "mirrored": false
+        },
+        "layout_state": {
+          "biased_map": {},
+          "main_bias": [
+            0.5,
+            0.5
+          ],
+          "num_full_size_windows": 1
+        },
+        "title": "probe_t8",
+        "windows": [
+          {
+            "at_prompt": false,
+            "cmdline": [
+              "/usr/bin/sh"
+            ],
+            "columns": 213,
+            "created_at": 1783990463397036680,
+            "cwd": "/app",
+            "env": {
+              "KITTY_WINDOW_ID": "17"
+            },
+            "foreground_processes": [
+              {
+                "cmdline": [
+                  "/usr/bin/sh"
+                ],
+                "cwd": "/app",
+                "pid": 189891
+              }
+            ],
+            "id": 17,
+            "is_active": true,
+            "is_focused": true,
+            "is_self": false,
+            "last_cmd_exit_status": 0,
+            "last_reported_cmdline": "",
+            "lines": 59,
+            "pid": 189891,
+            "title": "sh",
+            "user_vars": {}
+          }
+        ]
+      }
+    ],
+    "wm_class": "kitty",
+    "wm_name": "kitty"
+  }
+]
+```
+
+### After the load — `@ ls` returns to baseline (complete, unedited JSON)
+
+**[OBSERVED]** After the workloads finish and the benchmark/probe windows are closed, `@ ls` shows
+the tree has returned to the **single-window baseline** — one OS-window, one tab (id 1, title
+`/app`), one child shell (pid 181182, the same baseline `bash --posix` seen in the idle tree). This
+is the *after* leg of the before/during/after RC triple (idle tree and during-load tree are shown
+above; the matching thread-level after-state is the complete after `ps -T` in §5). Complete,
+unedited output:
+
+```
+$ /work/kitty/launcher/kitten @ --to unix:/tmp/kitty_probe/mykitty.sock ls    # after load, windows closed
+[
+  {
+    "background_opacity": 1.0,
+    "id": 1,
+    "is_active": true,
+    "is_focused": true,
+    "last_focused": true,
+    "platform_window_id": 2097164,
+    "tabs": [
+      {
+        "active_window_history": [],
+        "enabled_layouts": [
+          "fat",
+          "grid",
+          "horizontal",
+          "splits",
+          "stack",
+          "tall",
+          "vertical"
+        ],
+        "groups": [
+          {
+            "id": 1,
+            "windows": [
+              1
+            ]
+          }
+        ],
+        "id": 1,
+        "is_active": true,
+        "is_focused": true,
+        "layout": "fat",
+        "layout_opts": {
+          "bias": 50,
+          "full_size": 1,
+          "mirrored": false
+        },
+        "layout_state": {
+          "biased_map": {},
+          "main_bias": [
+            0.5,
+            0.5
+          ],
+          "num_full_size_windows": 1
+        },
+        "title": "/app",
+        "windows": [
+          {
+            "at_prompt": false,
+            "cmdline": [
+              "/bin/bash",
+              "--posix"
+            ],
+            "columns": 133,
+            "created_at": 1783989780342207129,
+            "cwd": "/app",
+            "env": {
+              "COLORTERM": "truecolor",
+              "DISPLAY": ":99",
+              "ENV": "/work/shell-integration/bash/kitty.bash",
+              "HISTFILE": "/root/.bash_history",
+              "HOME": "/root",
+              "KITTY_BASH_INJECT": "1",
+              "KITTY_BASH_UNEXPORT_HISTFILE": "1",
+              "KITTY_INSTALLATION_DIR": "/work",
+              "KITTY_LISTEN_ON": "unix:/tmp/kitty_probe/mykitty.sock",
+              "KITTY_PID": "181113",
+              "KITTY_PUBLIC_KEY": "1:s#croCm?gwa0?-1HRH@Ain-ZoP&QTzN0>3$O%ZrV",
+              "KITTY_SHELL_INTEGRATION": "enabled",
+              "KITTY_WINDOW_ID": "1",
+              "LANG": "C.UTF-8",
+              "LC_ALL": "C.UTF-8",
+              "LIBGL_ALWAYS_SOFTWARE": "1",
+              "PATH": "/work/kitty/launcher:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+              "PWD": "/app",
+              "TERM": "xterm-kitty",
+              "TERMINFO": "/work/terminfo",
+              "WINDOWID": "2097164"
+            },
+            "foreground_processes": [
+              {
+                "cmdline": [
+                  "/bin/bash",
+                  "--posix"
+                ],
+                "cwd": "/app",
+                "pid": 181182
+              }
+            ],
+            "id": 1,
+            "is_active": true,
+            "is_focused": true,
+            "is_self": false,
+            "last_cmd_exit_status": 0,
+            "last_reported_cmdline": "",
+            "lines": 44,
+            "pid": 181182,
+            "title": "/app",
             "user_vars": {}
           }
         ]
@@ -2020,9 +2718,9 @@ state is Python-owned, C-informed.
 
 **Direct answer.** Running `kitty +kitten icat <image>` (the exact invocation named in the prompt)
 launches a **separate process** — it is **not** a thread of, and is **not** linked into, the main
-Kitty process. In the canonical no-hold case the `kitten` process is a **direct child** of the main
-Kitty process (PPid = 281). That process runs the **Go** `kitten` binary
-(`/app/kitty/launcher/kitten`): its `comm` is `kitten`, and its address space maps **only** `libc.so.6`
+Kitty process. In the canonical case the `kitten` process is a **direct child** of the main
+Kitty process (PPid = 181113). That process runs the **Go** `kitten` binary
+(`/work/kitty/launcher/kitten`): its `comm` is `kitten`, and its address space maps **only** `libc.so.6`
 and the dynamic loader — **no `libpython3.12.so`, no `kitty.fast_data_types.so`** are mapped
 (observed `libpython_segs=0`, `fast_data_types_segs=0`). The `kitten` executable is a **near-statically
 linked Go ELF**: `file` reports a Go BuildID, and `readelf -d` lists exactly one `NEEDED` shared
@@ -2040,110 +2738,100 @@ guess that `kitty +kitten icat` runs the Python module `kittens.icat.main`; that
 **shim** (see below). By contrast, a *non-wrapped* kitten such as `broadcast` is **not** delegated and
 *does* run under Python (observed below).
 
-### Canonical run — `kitty +kitten icat` with no hold (process is a direct child of PID 281)
+### Canonical run — the exact command `kitty +kitten icat <image>`, traced
 
-**[OBSERVED]** The image is displayed, then the short-lived `kitten` process is frozen with `SIGSTOP`
-the instant it appears so `/proc` can be read stably (the process otherwise exits in milliseconds).
-Its parent is the main Kitty process, PID 281:
+**[OBSERVED]** The exact user-specified invocation is run as an ordinary shell command under
+`strace -f -e trace=execve`, which captures the launcher's hand-off to Go directly. The **same PID**
+(`314489`) issues **two** `execve` calls — first the `kitty` launcher, then, *in place*, the Go
+`kitten` binary. `execv` **replaces the process image**, so the C launcher *becomes* the Go program
+with no `fork` and, crucially, **before any Python interpreter is initialized** on this path. The
+trailing `SIGURG {si_code=SI_TKILL}` signals are the Go runtime's asynchronous-preemption
+scheduler — themselves a fingerprint of a running Go process. The trace ends when the kitten exits
+(exit status 1: there is no controlling terminal under `strace`, so `icat` cannot draw):
 
 ```
-### canonical no-hold icat, FROZEN pid=17142
+$ strace -f -e trace=execve /work/kitty/launcher/kitty +kitten icat /tmp/kitty_probe/test.png
+314489 execve("/work/kitty/launcher/kitty", ["/work/kitty/launcher/kitty", "+kitten", "icat", "/tmp/kitty_probe/test.png"], 0x7ffed48a1218 /* 12 vars */) = 0
+314489 execve("/work/kitty/launcher/kitten", ["kitten", "icat", "/tmp/kitty_probe/test.png"], 0x7ffff812f300 /* 12 vars */) = 0
+314492 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314491 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314496 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314491 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314498 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314495 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314491 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314493 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314495 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314498 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314495 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314493 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314497 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+314489 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=314489, si_uid=0} ---
+```
+
+The two `execve` lines are the whole answer to O5's language question: `+kitten icat` **leaves the C
+launcher and enters the Go binary before any Python starts**. (The identical command was also run
+without `strace` and the resulting short-lived `kitten` frozen for a stable `/proc` read below; each
+invocation is a fresh process, so the strace PID `314489` and the frozen PID `314519` differ — this
+is expected, not an inconsistency.)
+
+### The frozen `kitten` process — a direct child of the main kitty, no Python, no C extension
+
+**[OBSERVED]** The identical command was launched from *within* the running kitty session, so the
+`kitten` is a **direct child of the main process (PID 181113)**, and it was `SIGSTOP`ped the instant
+it appeared so `/proc` could be read stably (it otherwise exits in milliseconds — see the lifetime
+note below). The `/proc` snapshot **and** the process tree below are the **same** frozen PID
+(`314519`): its parent is `kitty` (181113), it runs `exe=/work/kitty/launcher/kitten`, and its
+address space maps **zero** `libpython` segments, **zero** `fast_data_types` segments, and only
+**two** unique `.so`s (the dynamic loader and `libc`):
+
+```
+### CANONICAL `kitty +kitten icat` run — icat kitten pid=314519 FROZEN (SIGSTOP) for a stable /proc read
+comm=kitten
+exe=/work/kitty/launcher/kitten
 cmdline=kitten icat /tmp/kitty_probe/test.png
-PPid=281
---- pstree -sp 17142 ---
-docker-init(1)---kitty(281)---kitten(17142)-+-{kitten}(17183)
-                                            |-{kitten}(17184)
-                                            |-{kitten}(17185)
-                                            |-{kitten}(17186)
-                                            |-{kitten}(17187)
-                                            |-{kitten}(17194)
-                                            |-{kitten}(17196)
-                                            |-{kitten}(17197)
-                                            |-{kitten}(17206)
-                                            `-{kitten}(17207)
---- ps chain ---
+PPid=181113  parent_comm=kitty
+Threads=5  State=T(stopped)
+libpython_segments=0   fast_data_types_segments=0   unique_so=2
+   /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+   /usr/lib/x86_64-linux-gnu/libc.so.6
+--- pstree -sp 314519 (same frozen pid) ---
+docker-init(1)---kitty(181113)---kitten(314519)-+-{kitten}(314520)
+                                                |-{kitten}(314521)
+                                                |-{kitten}(314522)
+                                                `-{kitten}(314523)
+--- ps chain (PID/PPID/COMMAND) ---
     PID    PPID COMMAND         COMMAND
-  17142     281 kitten          kitten icat /tmp/kitty_probe/test.png
+ 314519  181113 kitten          kitten icat /tmp/kitty_probe/test.png
 ```
 
-### Frozen `kitten` snapshot — address space contains no Python, no C extension
+The `{kitten}(3145xx)` leaves are the Go runtime's own OS threads (the `Threads=5` count), which
+belong to *this separate Go process* — they are not threads of, and share no address space with, the
+main kitty process.
 
-**[OBSERVED]** To read a *complete, stable* `/proc` snapshot of the (otherwise millisecond-lived)
-kitten, a second run was launched with Kitty's hold wrapper (`KITTY_HOLD=1`, which keeps the kitten
-alive) and the icat `kitten` was `SIGSTOP`ped. **Note the topology difference introduced by the hold
-wrapper:** here `PPid = 16526` is an *intermediate* `kitten` (the hold/run-shell wrapper), not 281 —
-this intermediate exists only because of the hold technique, whereas the canonical no-hold run above
-is a direct child of 281. What matters for the language question is identical in both: `comm=kitten`,
-`exe=/app/kitty/launcher/kitten`, and an address space with **zero** libpython/fast_data_types
-segments:
+### Address-space contrast — the Go kitten vs. the C+Python main process
 
-```
-### FROZEN snapshot pid=16605 at=18:32:47.160131678 (process SIGSTOPped, /proc stable)
--- comm --
-kitten
--- exe (readlink) --
-/app/kitty/launcher/kitten
--- cmdline --
-kitten icat /tmp/kitty_probe/big.png
--- status Name/State/PPid/Threads --
-Name:	kitten
-State:	T (stopped)
-PPid:	16526
-Threads:	12
--- parent identity (PPid -> comm/exe) --
-PPid=16526 comm=kitten exe=/app/kitty/launcher/kitten
--- libpython / fast_data_types / libpthread / libc matches in maps --
-/usr/lib/x86_64-linux-gnu/libc.so.6
--- libpython segment count --
-0
--- fast_data_types segment count --
-0
--- ALL unique mapped .so --
-/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-/usr/lib/x86_64-linux-gnu/libc.so.6
-```
-
-Process tree for that frozen run (the hold wrapper `kitten(16526)` between `kitty(281)` and the icat
-`kitten(16605)`, whose 11 `{kitten}` entries are its Go-runtime OS threads):
+**[OBSERVED]** Side by side, the separation is explicit. The icat `kitten` maps **0** libpython, **0**
+fast_data_types, and **2** unique `.so`s; the main `kitty` process (PID 181113) maps **5** libpython
+segments, **5** fast_data_types segments, and the **81** unique `.so`s enumerated in §4 (the idle
+canonical baseline). They are different programs in different address spaces:
 
 ```
-docker-init(1)---kitty(281)---kitten(16526)---kitten(16605)-+-{kitten}(16611)
-                                                            |-{kitten}(16612)
-                                                            |-{kitten}(16614)
-                                                            |-{kitten}(16615)
-                                                            |-{kitten}(16616)
-                                                            |-{kitten}(16623)
-                                                            |-{kitten}(16627)
-                                                            |-{kitten}(16628)
-                                                            |-{kitten}(16635)
-                                                            |-{kitten}(16636)
-                                                            `-{kitten}(16637)
-```
-
-### Ancestor chain — the Go kitten vs. the C+Python main process (side-by-side segment counts)
-
-**[OBSERVED]** Walking from the frozen icat `kitten` up to the main process makes the address-space
-contrast explicit. Both `kitten` layers map **0** libpython and **0** fast_data_types segments and only
-**2** unique `.so`s; the main `kitty` (PID 281) maps **5** libpython segments, **5** fast_data_types
-segments, and **81** unique `.so`s (matching §4):
-
-```
-### ancestor chain from icat kitten pid=16906 up to kitty(281) at=18:34:43.961160596
---------- pid=16906 ---------
-comm=kitten  exe=/app/kitty/launcher/kitten
-cmdline=kitten icat /tmp/kitty_probe/big.png
-state=T(stopped)  threads=10
-libpython_segs=0  fast_data_types_segs=0  unique_so=2
---------- pid=16828 ---------
-comm=kitten  exe=/app/kitty/launcher/kitten
-cmdline=/app/kitty/launcher/kitten run-shell --shell=/bin/bash --shell-integration=enabled --env=KITTY_HOLD=1 /app/kitty/launcher/kitty +kitten icat /tmp/kitty_probe/big.png
-state=T(stopped)  threads=14
-libpython_segs=0  fast_data_types_segs=0  unique_so=2
---------- pid=281 ---------
-comm=kitty  exe=/app/kitty/launcher/kitty
-cmdline=/app/kitty/launcher/kitty --config NONE -o allow_remote_control=yes -o enabled_layouts=all --listen-on unix:/tmp/kitty_probe/mykitty.sock
-state=S(sleeping)  threads=68
-libpython_segs=5  fast_data_types_segs=5  unique_so=81
+icat kitten (pid 314519):  comm=kitten  exe=/work/kitty/launcher/kitten  libpython_segs=0  fast_data_types_segs=0  unique_so=2
+main kitty  (pid 181113):  comm=kitty   exe=/work/kitty/launcher/kitty    libpython_segs=5  fast_data_types_segs=5  unique_so=81
 ```
 
 ### Inspecting the `kitten` executable itself — a near-static Go ELF
@@ -2155,7 +2843,7 @@ section lists exactly **one** `NEEDED` library — `libc.so.6` — i.e. it is *n
 
 ```
 ### file
-/app/kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, Go BuildID=AlhWoIJDeIELAP8tGXeU/GbuqO94v7SewTmecNOW6/wb1LLrzAHcBD-WDH2-DG/AEDf0YG2C9FaWa3a0HW7, stripped
+/work/kitty/launcher/kitten: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, Go BuildID=S0UUeZMNSE_OQP8o7cjA/iCipySI2kXs8T6D3rUou/8Fhlu-s5wSQxZJf9yJUS/gdBB6m1e0sA24hGaNvaT, stripped
 ### readelf -h
 ELF Header:
   Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
@@ -2209,7 +2897,7 @@ built from *this* repository at *this* commit. Note `go1.23.4`, `path kitty/tool
 `vcs.modified=false`:
 
 ```
-/app/kitty/launcher/kitten: go1.23.4
+/work/kitty/launcher/kitten: go1.23.4
 	path	kitty/tools/cmd
 	mod	kitty	(devel)
 	dep	github.com/ALTree/bigfloat	v0.2.0	h1:AwNzawrpFuw55/YDVlcPw0F0cmmXrmngBHhVrvdXPvM=
@@ -2254,18 +2942,22 @@ built from *this* repository at *this* commit. Note `go1.23.4`, `path kitty/tool
 
 **[OBSERVED]** The launcher only delegates *wrapped* kittens to Go. To show the other branch, a
 non-wrapped kitten, `broadcast`, was run and frozen. It stays in the `kitty` launcher, `comm=kitty`,
-`exe=/app/kitty/launcher/kitty`, and its address space **does** map `libpython3.12.so` — i.e. it runs
-as **Python** (note `fast_data_types_segs=0`: this is a fresh Python launcher process, not the main
-C-extension-bearing process):
+`exe=/work/kitty/launcher/kitty`, and its address space **does** map `libpython3.12.so` — i.e. it runs
+as **Python**. The invariant discriminator versus the wrapped `icat` above is `comm=kitty` +
+`exe=.../kitty` + a mapped `libpython3.12.so` (a Python process), against `icat`'s `comm=kitten` +
+`exe=.../kitten` + **no** libpython (a Go process). (At the instant frozen here `fast_data_types` is
+not yet mapped; the Python path *does* import the `kitty` package and can map the C extension a moment
+later — but it remains a distinct, short-lived process, `unique_so=6` here versus the main process's
+81.):
 
 ```
-### non-wrapped +kitten broadcast, FROZEN pid=17225 at=18:36:07.898403052
-comm=kitty  exe=/app/kitty/launcher/kitty
-cmdline=/app/kitty/launcher/kitty +kitten broadcast --help
-state=T(stopped)  threads=1
--- libpython / fast_data_types matches --
+### non-wrapped `+kitten broadcast` — FROZEN pid=314471 (SIGSTOP)
+comm=kitty  exe=/work/kitty/launcher/kitty
+cmdline=/work/kitty/launcher/kitty +kitten broadcast --help
+PPid=314469  State=T(stopped)  threads=1
+-- libpython mapping present --
 /usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0
-libpython_segs=5  fast_data_types_segs=0  unique_so=6
+libpython_segments=5   fast_data_types_segments=0   unique_so=6
 ```
 
 This is why the two-path coverage matters: `+kitten icat` and `+kitten broadcast`, superficially the
@@ -2277,7 +2969,7 @@ same syntax, resolve to **different languages** — Go and Python respectively.
 **shim**: run as a script it refuses to do anything, raising `SystemExit` at **L171–172**:
 
 ```
-$ sed -n '171,172p' kittens/icat/main.py    # run inside container, cwd /app
+$ sed -n '171,172p' kittens/icat/main.py    # run inside container, cwd /work
 if __name__ == '__main__':
     raise SystemExit('This should be run as kitten icat')
 ```
@@ -2309,7 +3001,7 @@ recorded here for transparency.
 
 ### What is *not* claimed
 
-**[OBSERVED, scoped]** The `kitten` binary is **not mapped in the observed main process** (PID 281):
+**[OBSERVED, scoped]** The `kitten` binary is **not mapped in the observed main process** (PID 181113):
 §4's `maps_full.txt` contains no `launcher/kitten` mapping, and the frozen kitten's maps contain no
 libpython/fast_data_types. This is a statement about *these observed processes*, not an absolute
 "never" — it is exactly what the separate-address-space, separate-process design predicts.
@@ -2318,35 +3010,39 @@ libpython/fast_data_types. This is a statement about *these observed processes*,
 
 ## §8 — O6: Symbol/stack snapshot during the stress run
 
-**Direct answer.** Stack snapshots taken *during* the sustained render load show that of PID 281's
-**68 threads, exactly one runs Python** — the main thread — and even it is caught **blocked in a native
-call** (it has handed control to C). The actual per-frame **rendering runs in C**: a breakpoint on
-`draw_cells` fires on the main thread with the stack
-`draw_cells` ← `process_global_state` ← `dispatchTimers`/`glfwRunMainLoop` (GLFW) ← `main_loop`
-(all in `fast_data_types.so` / `glfw-x11.so`) ← libpython (startup) ← `main()`. The remaining
-**64+ worker threads are the Mesa software-GL pool** (`libgallium`), not Kitty code. Six complementary
-methods were used; one (`/proc/<tid>/stack`) was blocked and its error is shown verbatim before
-switching methods, exactly as the prompt anticipates.
+**Direct answer.** Stack snapshots taken *during* the sustained render load show that of PID 181113's
+**68 threads, exactly one runs Python** — the main thread — and `py-spy` marks that Python stack
+**`(idle)`**: Python has handed control to the native event loop. The native side is where the work is:
+the main thread's C stack was caught **mid-render inside `draw_cells`** —
+`draw_cells_simple` ← `draw_cells` ← `process_global_state` ← `glfwRunMainLoop` (GLFW) ← `main_loop`
+(all in `fast_data_types.so` / `glfw-x11.so`) ← libpython (startup) ← `main()` — and a deterministic
+breakpoint on `draw_cells` confirms it. The remaining **65 worker threads are the Mesa software-GL
+pool** (`libgallium`), not Kitty code. Counted across all 68 stacks, **exactly 3 contain
+`fast_data_types.so`** (the main thread + `KittyChildMon` + `KittyPeerMon`) and **66 contain
+`libgallium`** — the empirical basis for §1's corrected claim. Five complementary inspection methods
+were used; **two were blocked** (`/proc/<tid>/stack` and `eu-stack`'s frame unwind) and their errors
+are shown verbatim, after which `gdb` (via `CAP_SYS_PTRACE`) and `py-spy` still give full stack/symbol
+visibility — exactly the "if something is blocked, show the error and use another method" situation the
+prompt anticipates.
 
 **[OBSERVED — load context]** Every attach below was taken while a documented load was running: a
 shell loop of `kitten __benchmark__ --render --repetitions 1500 ascii_with_csi` in a Kitty window,
-with the main thread's CPU confirmed active (25–34 % in the sampling window, per §5's method)
-immediately before each attach. After each attach the process was verified still `State=S` (running,
-never left stopped).
+with the main thread's CPU confirmed active immediately before each attach (per §5's CPU-sampling
+method). After each attach the process was verified still `State=S` (running, never left stopped).
 
 ### Method 1 — `py-spy dump` (which threads run Python)
 
-**[OBSERVED]** `py-spy dump --pid 281` (exit 0). Only **one** thread — `MainThread` — has a Python
+**[OBSERVED]** `py-spy dump --pid 181113` (exit 0). Only **one** thread — `MainThread` — has a Python
 stack, and py-spy marks it **`(idle)`**, meaning Python is blocked inside a native call. The Python
 stack bottoms in Kitty's own `kitty/main.py` startup chain. The other 67 threads have **no** Python
 frame at all (they are pure C/native):
 
 ```
-$ py-spy dump --pid 281
-Process 281: /app/kitty/launcher/kitty --config NONE -o allow_remote_control=yes -o enabled_layouts=all --listen-on unix:/tmp/kitty_probe/mykitty.sock
-Python v3.12.3 (/app/kitty/launcher/kitty)
+$ py-spy dump --pid 181113
+Process 181113: /work/kitty/launcher/kitty --config NONE -o allow_remote_control=yes -o enabled_layouts=all --listen-on unix:/tmp/kitty_probe/mykitty.sock
+Python v3.12.3 (/work/kitty/launcher/kitty)
 
-Thread 281 (idle): "MainThread"
+Thread 181113 (idle): "MainThread"
     _run_app (kitty/main.py:234)
     __call__ (kitty/main.py:252)
     _main (kitty/main.py:518)
@@ -2357,204 +3053,936 @@ Thread 281 (idle): "MainThread"
     _run_module_as_main (<frozen runpy>:198)
 ```
 
-### Method 2 — `gdb -p 281 -batch thread apply all bt` (all 68 threads)
+### Method 2 — `gdb -p 181113 -batch thread apply all bt` (all 68 threads)
 
 **[OBSERVED]** The attach was made through a **guarded, bounded** harness (see "Debugger discipline"
-below): identity is verified *before* attach (`GUARD-OK: pid=281 exe=/app/kitty/launcher/kitty
-start=300084875`), the run is `timeout`-bounded, and it **always** ends with `detach`+`quit`
-(`GDB-EXIT=0`). The full capture is 68 threads / 692 lines; below are the **distinct thread classes**,
-each shown **complete** (no within-stack elision). The complete file and the independent `eu-stack`
-unwind (Method 5) corroborate all 68.
+below): identity is verified *before* attach (`GUARD-OK: pid=181113 exe=/work/kitty/launcher/kitty
+start=302476926`), the run is `timeout`-bounded, and it **always** ends with `detach`+`quit`
+(`GDB-EXIT=0`). The full capture is **68 threads / 712 lines** and is embedded **complete** in the
+collapsible appendix at the end of this method; below are the **distinct thread classes**, each shown
+**complete** (no within-stack elision).
 
-**Thread 1 — the main GUI/render thread** (`LWP 281 "kitty"`): blocked in `poll` between frames,
-under GLFW's main loop, under C `main_loop`, under libpython startup, under `main()`:
-
-```
-$ gdb -p 281 -batch -ex 'thread apply all bt'    # via guarded harness; Thread 1 (main):
-Thread 1 (Thread 0x7d8f7310f740 (LWP 281) "kitty"):
-#0  0x00007d8f733604cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
-#1  0x00007d8f7176087f in glfwRunMainLoop () from /app/kitty/glfw-x11.so
-#2  0x00007d8f72746cfc in main_loop.lto_priv () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#3  0x00007d8f735e7ce2 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#4  0x00007d8f735d9b2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#5  0x00007d8f735745ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#6  0x00007d8f735db580 in _PyObject_FastCallDictTstate () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#7  0x00007d8f735db7ee in _PyObject_Call_Prepend () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#8  0x00007d8f7365a075 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#9  0x00007d8f735d97df in _PyObject_MakeTpCall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#10 0x00007d8f735745ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#11 0x00007d8f736f791f in PyEval_EvalCode () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#12 0x00007d8f736f38b0 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#13 0x00007d8f73636adc in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#14 0x00007d8f735d9b2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#15 0x00007d8f735745ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#16 0x00007d8f7377c242 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#17 0x00007d8f7377cda3 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#18 0x00007d8f7377d39c in Py_RunMain () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#19 0x00005d2735e8b0ed in main ()
-[Inferior 1 (process 281) detached]
-```
-
-**Thread 2 — `KittyChildMon`** (`LWP 353`): Kitty's PTY I/O thread, blocked in `poll` under
-`io_loop` (`fast_data_types.so`) — grounded at `kitty/child-monitor.c:1489` (thread name) /
-`io_loop`:
+**Thread 1 — the main GUI/render thread** (`LWP 181113 "kitty"`): caught **actively rendering** — its
+native stack runs through `draw_cells_simple` ← `draw_cells` ← `process_global_state` ←
+`glfwRunMainLoop` ← `main_loop` (Kitty's C extension + GLFW), with libpython *below* it (the C event
+loop was entered once from Python and stays in C) and `main()` at the base; frames #0–#11 are inside
+`libgallium` (Mesa) executing the GL the draw call issued:
 
 ```
-Thread 2 (Thread 0x7d8e42ffd6c0 (LWP 353) "KittyChildMon"):
-#0  0x00007d8f733604cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
-#1  0x00007d8f72748125 in io_loop () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#2  0x00007d8f732e1aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
-#3  0x00007d8f7336ec3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+$ gdb -p 181113 -batch -ex 'thread apply all bt'    # via guarded harness; Thread 1 (main):
+Thread 1 (Thread 0x7d03aae01740 (LWP 181113) "kitty"):
+#0  0x00007d03a6b0c737 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#1  0x00007d03a6b0d526 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#2  0x00007d03a6b0de89 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6a47f6d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a6a42b0b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03a6a42ef9 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#6  0x00007d03a69d48b2 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#7  0x00007d03a69cd6a2 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#8  0x00007d03a69cda70 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#9  0x00007d03a69cdf2d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#10 0x00007d03a6af275d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#11 0x00007d03a664d1f8 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#12 0x00007d03aa4b0a65 in draw_cells_simple.lto_priv () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#13 0x00007d03aa4ba729 in draw_cells () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#14 0x00007d03aa43c267 in process_global_state () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#15 0x00007d03a9205bc8 in glfwRunMainLoop () from /work/kitty/glfw-x11.so
+#16 0x00007d03aa438cfc in main_loop.lto_priv () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#17 0x00007d03ab2d9ce2 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#18 0x00007d03ab2cbb2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#19 0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#20 0x00007d03ab2cd580 in _PyObject_FastCallDictTstate () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#21 0x00007d03ab2cd7ee in _PyObject_Call_Prepend () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#22 0x00007d03ab34c075 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#23 0x00007d03ab2cb7df in _PyObject_MakeTpCall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#24 0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#25 0x00007d03ab3e991f in PyEval_EvalCode () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#26 0x00007d03ab3e58b0 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#27 0x00007d03ab328adc in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#28 0x00007d03ab2cbb2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#29 0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#30 0x00007d03ab46e242 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#31 0x00007d03ab46eda3 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#32 0x00007d03ab46f39c in Py_RunMain () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#33 0x00005beaeb0330ed in main ()
+[Inferior 1 (process 181113) detached]
+GDB-EXIT=0
 ```
 
-**Thread 3 — `KittyPeerMon`** (`LWP 352`): Kitty's remote-control peer thread, blocked in `poll`
+**Thread 2 — `KittyChildMon`** (`LWP 181181`): Kitty's PTY I/O thread, blocked in `poll` under
+`io_loop` (`fast_data_types.so`) — grounded at `kitty/child-monitor.c:1489` (thread name) / `io_loop`:
+
+```
+Thread 2 (Thread 0x7d027affd6c0 (LWP 181181) "KittyChildMon"):
+#0  0x00007d03ab0524cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aa43a125 in io_loop () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#2  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+```
+
+**Thread 3 — `KittyPeerMon`** (`LWP 181180`): Kitty's remote-control peer thread, blocked in `poll`
 under `talk_loop` (`fast_data_types.so`) — grounded at `kitty/child-monitor.c:1808`:
 
 ```
-Thread 3 (Thread 0x7d8e437fe6c0 (LWP 352) "KittyPeerMon"):
-#0  0x00007d8f733604cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
-#1  0x00007d8f7274be62 in talk_loop () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#2  0x00007d8f732e1aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
-#3  0x00007d8f7336ec3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+Thread 3 (Thread 0x7d027b7fe6c0 (LWP 181180) "KittyPeerMon"):
+#0  0x00007d03ab0524cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aa43de62 in talk_loop () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#2  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
 ```
 
-**Thread 68 — a Mesa `llvmpipe` worker** (`LWP 287 "llvmpipe-0"`): parked in `pthread_cond_wait`
+**Thread 68 — a Mesa `llvmpipe` worker** (`LWP 181115 "llvmpipe-0"`): parked in `pthread_cond_wait`
 inside `libgallium` (Mesa's software-GL rasterizer pool — **not** Kitty code):
 
 ```
-Thread 68 (Thread 0x7d8f647286c0 (LWP 287) "llvmpipe-0"):
-#0  0x00007d8f732ddd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
-#1  0x00007d8f732e07ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
-#2  0x00007d8f6e96540d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
-#3  0x00007d8f6f004bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
-#4  0x00007d8f6e96533c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
-#5  0x00007d8f732e1aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
-#6  0x00007d8f7336ec3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+Thread 68 (Thread 0x7d039c2196c0 (LWP 181115) "llvmpipe-0"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
 ```
 
-**Thread 33 — a `"kitty"`-named worker** (`LWP 322`): despite its `comm=kitty` name, its stack is
-**identical** to the `llvmpipe` worker above — `pthread_cond_wait` inside the *same* `libgallium` —
-proving these 32 same-named threads are **Mesa's pool**, not Kitty threads (resolves the §5/#28
-classification empirically):
+**Thread 33 — a `"kitty"`-named worker** (`LWP 181150`): despite its `comm=kitty` name, its stack is
+**identical** to the `llvmpipe` worker above — `pthread_cond_wait` inside the *same* `libgallium`
+(note the shared `#2`/`#4` return addresses) — proving these 32 same-named threads are **Mesa's pool**,
+not Kitty threads (resolves the §5 classification empirically). The 33rd Mesa-named thread,
+`"kitty:disk$0"` (`LWP 181179`), is Mesa's on-disk shader-cache thread (Mesa names it after the
+program), also parked in `libgallium` — so 32 `llvmpipe` + 32 `"kitty"` + 1 `"kitty:disk$0"` = **65
+Mesa threads**, leaving exactly **3 Kitty C threads** (main + `KittyChildMon` + `KittyPeerMon`):
 
 ```
-Thread 33 (Thread 0x7d8ee0ff96c0 (LWP 322) "kitty"):
-#0  0x00007d8f732ddd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
-#1  0x00007d8f732e07ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
-#2  0x00007d8f6e96540d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
-#3  0x00007d8f6f00104b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
-#4  0x00007d8f6e96533c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
-#5  0x00007d8f732e1aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
-#6  0x00007d8f7336ec3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+Thread 33 (Thread 0x7d0318ff96c0 (LWP 181150) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
 ```
+
+<details>
+<summary><b>Complete `gdb -p 181113 -batch -ex 'thread apply all bt'` — all 68 threads, 712 lines (click to expand)</b></summary>
+
+```
+GUARD-OK: pid=181113 exe=/work/kitty/launcher/kitty start=302476926
+[New LWP 181181]
+[New LWP 181180]
+[New LWP 181179]
+[New LWP 181178]
+[New LWP 181177]
+[New LWP 181176]
+[New LWP 181175]
+[New LWP 181174]
+[New LWP 181173]
+[New LWP 181172]
+[New LWP 181171]
+[New LWP 181170]
+[New LWP 181169]
+[New LWP 181168]
+[New LWP 181167]
+[New LWP 181166]
+[New LWP 181165]
+[New LWP 181164]
+[New LWP 181163]
+[New LWP 181162]
+[New LWP 181161]
+[New LWP 181160]
+[New LWP 181159]
+[New LWP 181158]
+[New LWP 181157]
+[New LWP 181156]
+[New LWP 181155]
+[New LWP 181154]
+[New LWP 181153]
+[New LWP 181152]
+[New LWP 181151]
+[New LWP 181150]
+[New LWP 181149]
+[New LWP 181148]
+[New LWP 181147]
+[New LWP 181146]
+[New LWP 181145]
+[New LWP 181144]
+[New LWP 181143]
+[New LWP 181142]
+[New LWP 181141]
+[New LWP 181140]
+[New LWP 181139]
+[New LWP 181138]
+[New LWP 181137]
+[New LWP 181136]
+[New LWP 181135]
+[New LWP 181134]
+[New LWP 181133]
+[New LWP 181132]
+[New LWP 181131]
+[New LWP 181130]
+[New LWP 181129]
+[New LWP 181128]
+[New LWP 181127]
+[New LWP 181126]
+[New LWP 181125]
+[New LWP 181124]
+[New LWP 181123]
+[New LWP 181122]
+[New LWP 181121]
+[New LWP 181120]
+[New LWP 181119]
+[New LWP 181118]
+[New LWP 181117]
+[New LWP 181116]
+[New LWP 181115]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007d03a6b0c737 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+
+Thread 68 (Thread 0x7d039c2196c0 (LWP 181115) "llvmpipe-0"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 67 (Thread 0x7d039ba186c0 (LWP 181116) "llvmpipe-1"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 66 (Thread 0x7d0393fff6c0 (LWP 181117) "llvmpipe-2"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 65 (Thread 0x7d039b2176c0 (LWP 181118) "llvmpipe-3"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 64 (Thread 0x7d039aa166c0 (LWP 181119) "llvmpipe-4"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 63 (Thread 0x7d039a2156c0 (LWP 181120) "llvmpipe-5"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 62 (Thread 0x7d0399a146c0 (LWP 181121) "llvmpipe-6"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 61 (Thread 0x7d03992136c0 (LWP 181122) "llvmpipe-7"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 60 (Thread 0x7d0398a126c0 (LWP 181123) "llvmpipe-8"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 59 (Thread 0x7d03937fe6c0 (LWP 181124) "llvmpipe-9"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 58 (Thread 0x7d0392ffd6c0 (LWP 181125) "llvmpipe-10"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 57 (Thread 0x7d03927fc6c0 (LWP 181126) "llvmpipe-11"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 56 (Thread 0x7d0391ffb6c0 (LWP 181127) "llvmpipe-12"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 55 (Thread 0x7d03917fa6c0 (LWP 181128) "llvmpipe-13"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 54 (Thread 0x7d0390ff96c0 (LWP 181129) "llvmpipe-14"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 53 (Thread 0x7d0357fff6c0 (LWP 181130) "llvmpipe-15"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 52 (Thread 0x7d03577fe6c0 (LWP 181131) "llvmpipe-16"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 51 (Thread 0x7d0356ffd6c0 (LWP 181132) "llvmpipe-17"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 50 (Thread 0x7d03567fc6c0 (LWP 181133) "llvmpipe-18"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 49 (Thread 0x7d0355ffb6c0 (LWP 181134) "llvmpipe-19"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 48 (Thread 0x7d03557fa6c0 (LWP 181135) "llvmpipe-20"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 47 (Thread 0x7d0354ff96c0 (LWP 181136) "llvmpipe-21"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 46 (Thread 0x7d033ffff6c0 (LWP 181137) "llvmpipe-22"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 45 (Thread 0x7d033f7fe6c0 (LWP 181138) "llvmpipe-23"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 44 (Thread 0x7d033effd6c0 (LWP 181139) "llvmpipe-24"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 43 (Thread 0x7d033e7fc6c0 (LWP 181140) "llvmpipe-25"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 42 (Thread 0x7d033dffb6c0 (LWP 181141) "llvmpipe-26"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 41 (Thread 0x7d033d7fa6c0 (LWP 181142) "llvmpipe-27"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 40 (Thread 0x7d033cff96c0 (LWP 181143) "llvmpipe-28"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 39 (Thread 0x7d031bfff6c0 (LWP 181144) "llvmpipe-29"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 38 (Thread 0x7d031b7fe6c0 (LWP 181145) "llvmpipe-30"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 37 (Thread 0x7d031affd6c0 (LWP 181146) "llvmpipe-31"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af5bc3 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 36 (Thread 0x7d031a7fc6c0 (LWP 181147) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 35 (Thread 0x7d0319ffb6c0 (LWP 181148) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 34 (Thread 0x7d03197fa6c0 (LWP 181149) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 33 (Thread 0x7d0318ff96c0 (LWP 181150) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 32 (Thread 0x7d02fbfff6c0 (LWP 181151) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 31 (Thread 0x7d02fb7fe6c0 (LWP 181152) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 30 (Thread 0x7d02faffd6c0 (LWP 181153) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 29 (Thread 0x7d02fa7fc6c0 (LWP 181154) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 28 (Thread 0x7d02f9ffb6c0 (LWP 181155) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 27 (Thread 0x7d02f97fa6c0 (LWP 181156) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 26 (Thread 0x7d02f8ff96c0 (LWP 181157) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 25 (Thread 0x7d02dbfff6c0 (LWP 181158) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 24 (Thread 0x7d02db7fe6c0 (LWP 181159) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 23 (Thread 0x7d02daffd6c0 (LWP 181160) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 22 (Thread 0x7d02da7fc6c0 (LWP 181161) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 21 (Thread 0x7d02d9ffb6c0 (LWP 181162) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 20 (Thread 0x7d02d97fa6c0 (LWP 181163) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 19 (Thread 0x7d02d8ff96c0 (LWP 181164) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 18 (Thread 0x7d02bbfff6c0 (LWP 181165) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 17 (Thread 0x7d02bb7fe6c0 (LWP 181166) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 16 (Thread 0x7d02baffd6c0 (LWP 181167) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 15 (Thread 0x7d02ba7fc6c0 (LWP 181168) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 14 (Thread 0x7d02b9ffb6c0 (LWP 181169) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 13 (Thread 0x7d02b97fa6c0 (LWP 181170) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 12 (Thread 0x7d02b8ff96c0 (LWP 181171) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 11 (Thread 0x7d029bfff6c0 (LWP 181172) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 10 (Thread 0x7d029b7fe6c0 (LWP 181173) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 9 (Thread 0x7d029affd6c0 (LWP 181174) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 8 (Thread 0x7d029a7fc6c0 (LWP 181175) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 7 (Thread 0x7d0299ffb6c0 (LWP 181176) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 6 (Thread 0x7d02997fa6c0 (LWP 181177) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 5 (Thread 0x7d0298ff96c0 (LWP 181178) "kitty"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6af204b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 4 (Thread 0x7d027bfff6c0 (LWP 181179) "kitty:disk$0"):
+#0  0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aafd27ed in pthread_cond_wait () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007d03a645640d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6434d0b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a645633c in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 3 (Thread 0x7d027b7fe6c0 (LWP 181180) "KittyPeerMon"):
+#0  0x00007d03ab0524cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aa43de62 in talk_loop () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#2  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 2 (Thread 0x7d027affd6c0 (LWP 181181) "KittyChildMon"):
+#0  0x00007d03ab0524cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007d03aa43a125 in io_loop () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#2  0x00007d03aafd3aa4 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007d03ab060c3c in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 1 (Thread 0x7d03aae01740 (LWP 181113) "kitty"):
+#0  0x00007d03a6b0c737 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#1  0x00007d03a6b0d526 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#2  0x00007d03a6b0de89 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#3  0x00007d03a6a47f6d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#4  0x00007d03a6a42b0b in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#5  0x00007d03a6a42ef9 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#6  0x00007d03a69d48b2 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#7  0x00007d03a69cd6a2 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#8  0x00007d03a69cda70 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#9  0x00007d03a69cdf2d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#10 0x00007d03a6af275d in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#11 0x00007d03a664d1f8 in ?? () from /lib/x86_64-linux-gnu/libgallium-24.2.8-1ubuntu1~24.04.1.so
+#12 0x00007d03aa4b0a65 in draw_cells_simple.lto_priv () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#13 0x00007d03aa4ba729 in draw_cells () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#14 0x00007d03aa43c267 in process_global_state () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#15 0x00007d03a9205bc8 in glfwRunMainLoop () from /work/kitty/glfw-x11.so
+#16 0x00007d03aa438cfc in main_loop.lto_priv () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#17 0x00007d03ab2d9ce2 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#18 0x00007d03ab2cbb2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#19 0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#20 0x00007d03ab2cd580 in _PyObject_FastCallDictTstate () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#21 0x00007d03ab2cd7ee in _PyObject_Call_Prepend () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#22 0x00007d03ab34c075 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#23 0x00007d03ab2cb7df in _PyObject_MakeTpCall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#24 0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#25 0x00007d03ab3e991f in PyEval_EvalCode () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#26 0x00007d03ab3e58b0 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#27 0x00007d03ab328adc in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#28 0x00007d03ab2cbb2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#29 0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#30 0x00007d03ab46e242 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#31 0x00007d03ab46eda3 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#32 0x00007d03ab46f39c in Py_RunMain () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#33 0x00005beaeb0330ed in main ()
+[Inferior 1 (process 181113) detached]
+GDB-EXIT=0
+```
+</details>
 
 ### Method 3 — deterministic **render** stack via breakpoint (resolves the parse-vs-render question)
 
 **[OBSERVED]** To capture the *rendering* path specifically (not just wherever the loop happened to
 be), a breakpoint was set on `draw_cells` and the load was run until it fired. The **complete,
-unedited** transcript is below — including gdb's per-thread `[New LWP …]` attach lines (68 of them),
-so nothing is curated. The breakpoint fires on **Thread 1 "kitty"**, and the backtrace is the real GPU
-draw path:
+unedited** transcript is below — including gdb's per-thread `[New LWP …]` attach lines (67 of them) and
+the interactive debuginfod prompt, so nothing is curated. The breakpoint fires on **Thread 1 "kitty"**
+at `0x7d03aa4b9770` (= `fast_data_types.so` base `0x7d03aa425000` + `nm` offset `0x94770` for
+`draw_cells`), and the backtrace is the real GPU draw path:
 
 ```
-$ gdb -p 281 -batch -ex 'break draw_cells' -ex continue -ex bt    # via guarded harness
-GUARD-OK: pid=281 exe=/app/kitty/launcher/kitty start=300084875
-[New LWP 353]
-[New LWP 352]
-[New LWP 351]
-[New LWP 350]
-[New LWP 349]
-[New LWP 348]
-[New LWP 347]
-[New LWP 346]
-[New LWP 345]
-[New LWP 344]
-[New LWP 343]
-[New LWP 342]
-[New LWP 341]
-[New LWP 340]
-[New LWP 339]
-[New LWP 338]
-[New LWP 337]
-[New LWP 336]
-[New LWP 335]
-[New LWP 334]
-[New LWP 333]
-[New LWP 332]
-[New LWP 331]
-[New LWP 330]
-[New LWP 329]
-[New LWP 328]
-[New LWP 327]
-[New LWP 326]
-[New LWP 325]
-[New LWP 324]
-[New LWP 323]
-[New LWP 322]
-[New LWP 321]
-[New LWP 320]
-[New LWP 319]
-[New LWP 318]
-[New LWP 317]
-[New LWP 316]
-[New LWP 315]
-[New LWP 314]
-[New LWP 313]
-[New LWP 312]
-[New LWP 311]
-[New LWP 310]
-[New LWP 309]
-[New LWP 308]
-[New LWP 307]
-[New LWP 306]
-[New LWP 305]
-[New LWP 304]
-[New LWP 303]
-[New LWP 302]
-[New LWP 301]
-[New LWP 300]
-[New LWP 299]
-[New LWP 298]
-[New LWP 297]
-[New LWP 296]
-[New LWP 295]
-[New LWP 294]
-[New LWP 293]
-[New LWP 292]
-[New LWP 291]
-[New LWP 290]
-[New LWP 289]
-[New LWP 288]
-[New LWP 287]
+$ gdb -p 181113 -batch -ex 'break draw_cells' -ex continue -ex bt    # via guarded harness
+GUARD-OK: pid=181113 exe=/work/kitty/launcher/kitty start=302476926
+[New LWP 181181]
+[New LWP 181180]
+[New LWP 181179]
+[New LWP 181178]
+[New LWP 181177]
+[New LWP 181176]
+[New LWP 181175]
+[New LWP 181174]
+[New LWP 181173]
+[New LWP 181172]
+[New LWP 181171]
+[New LWP 181170]
+[New LWP 181169]
+[New LWP 181168]
+[New LWP 181167]
+[New LWP 181166]
+[New LWP 181165]
+[New LWP 181164]
+[New LWP 181163]
+[New LWP 181162]
+[New LWP 181161]
+[New LWP 181160]
+[New LWP 181159]
+[New LWP 181158]
+[New LWP 181157]
+[New LWP 181156]
+[New LWP 181155]
+[New LWP 181154]
+[New LWP 181153]
+[New LWP 181152]
+[New LWP 181151]
+[New LWP 181150]
+[New LWP 181149]
+[New LWP 181148]
+[New LWP 181147]
+[New LWP 181146]
+[New LWP 181145]
+[New LWP 181144]
+[New LWP 181143]
+[New LWP 181142]
+[New LWP 181141]
+[New LWP 181140]
+[New LWP 181139]
+[New LWP 181138]
+[New LWP 181137]
+[New LWP 181136]
+[New LWP 181135]
+[New LWP 181134]
+[New LWP 181133]
+[New LWP 181132]
+[New LWP 181131]
+[New LWP 181130]
+[New LWP 181129]
+[New LWP 181128]
+[New LWP 181127]
+[New LWP 181126]
+[New LWP 181125]
+[New LWP 181124]
+[New LWP 181123]
+[New LWP 181122]
+[New LWP 181121]
+[New LWP 181120]
+[New LWP 181119]
+[New LWP 181118]
+[New LWP 181117]
+[New LWP 181116]
+[New LWP 181115]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
 [Thread debugging using libthread_db enabled]
 Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
-0x00007d8f733604cd in poll () from /lib/x86_64-linux-gnu/libc.so.6
-Breakpoint 1 at 0x7d8f727c7770
+0x00007d03aafcfd71 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+Breakpoint 1 at 0x7d03aa4b9770
 
-Thread 1 "kitty" hit Breakpoint 1, 0x00007d8f727c7770 in draw_cells () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#0  0x00007d8f727c7770 in draw_cells () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#1  0x00007d8f7274afa5 in process_global_state () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#2  0x00007d8f7177d493 in dispatchTimers.part.0.constprop.0.isra.0 () from /app/kitty/glfw-x11.so
-#3  0x00007d8f71760b1e in glfwRunMainLoop () from /app/kitty/glfw-x11.so
-#4  0x00007d8f72746cfc in main_loop.lto_priv () from /app/kitty/launcher/../../kitty/fast_data_types.so
-#5  0x00007d8f735e7ce2 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#6  0x00007d8f735d9b2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#7  0x00007d8f735745ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#8  0x00007d8f735db580 in _PyObject_FastCallDictTstate () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#9  0x00007d8f735db7ee in _PyObject_Call_Prepend () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#10 0x00007d8f7365a075 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#11 0x00007d8f735d97df in _PyObject_MakeTpCall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#12 0x00007d8f735745ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#13 0x00007d8f736f791f in PyEval_EvalCode () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#14 0x00007d8f736f38b0 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#15 0x00007d8f73636adc in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#16 0x00007d8f735d9b2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#17 0x00007d8f735745ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#18 0x00007d8f7377c242 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#19 0x00007d8f7377cda3 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#20 0x00007d8f7377d39c in Py_RunMain () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
-#21 0x00005d2735e8b0ed in main ()
-[Inferior 1 (process 281) detached]
+Thread 1 "kitty" hit Breakpoint 1, 0x00007d03aa4b9770 in draw_cells () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#0  0x00007d03aa4b9770 in draw_cells () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#1  0x00007d03aa43cfa5 in process_global_state () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#2  0x00007d03a9205bc8 in glfwRunMainLoop () from /work/kitty/glfw-x11.so
+#3  0x00007d03aa438cfc in main_loop.lto_priv () from /work/kitty/launcher/../../kitty/fast_data_types.so
+#4  0x00007d03ab2d9ce2 in ?? () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#5  0x00007d03ab2cbb2c in PyObject_Vectorcall () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#6  0x00007d03ab2665ee in _PyEval_EvalFrameDefault () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+#7  0x00007d03ab2cd580 in _PyObject_FastCallDictTstate () from /lib/x86_64-linux-gnu/libpython3.12.so.1.0
+[Inferior 1 (process 181113) detached]
 GDB-EXIT=0
 ```
 
@@ -2562,105 +3990,209 @@ GDB-EXIT=0
 us *correct a common misreading*:
 
 - The **real GPU draw** is `draw_cells` (`kitty/shaders.c:1009`), reached from
-  `process_global_state` → `dispatchTimers`/`glfwRunMainLoop` (`glfw-x11.so`) → `main_loop`
+  `process_global_state` → `glfwRunMainLoop` (`glfw-x11.so`) → `main_loop`
   (`kitty/child-monitor.c`); `draw_cells` issues the actual GL via `glDrawArraysInstanced`
-  (`kitty/shaders.c:579,899,903`). Static corroboration: disassembly of `draw_cells` shows it calling
-  GLAD GL wrappers (`glad_debug_glBindBuffer`, `glad_debug_glMapBuffer`, `glad_debug_glUseProgram`, …)
-  and `draw_cells_simple`/`draw_tint`.
+  (`kitty/shaders.c:579,899,903`). Static corroboration: `nm` locates `draw_cells` (offset `0x94770`)
+  and `draw_cells_simple.lto_priv.0` (offset `0x8ba20`) as non-stripped local symbols in
+  `fast_data_types.so`, and the Thread 1 all-bt stack shows `draw_cells` calling `draw_cells_simple`.
 - By contrast, `draw_text_loop` (`kitty/screen.c:762`) and `draw_text` (`kitty/screen.c:848`) are
   **not** the GPU path at all — they populate the `GPUCell` **screen model** in C *during byte
-  parsing*. They run on the parse side, not the GL draw side. (This corrects the earlier draft, which
-  conflated the two.)
+  parsing*. They run on the parse side, not the GL draw side.
 - Under this load the main thread was also independently caught executing **inside `libgallium`**
-  (Mesa) during a render, consistent with `draw_cells` driving the software-GL backend. Direct
-  breakpoints on `glDrawArraysInstanced` did not fire because the GLVND/GLAD dispatch goes through
-  function *pointers* rather than the named stub — the `draw_cells` frame plus the disassembly plus
-  the main-thread-in-Mesa observation together establish the chain without needing the leaf frame.
+  (Mesa) during a render (frames #0–#11 of Thread 1 in Method 2), consistent with `draw_cells` driving
+  the software-GL backend. Direct breakpoints on `glDrawArraysInstanced` did not fire because the
+  GLVND/GLAD dispatch goes through function *pointers* rather than the named stub — the `draw_cells`
+  frame plus the `nm` symbols plus the main-thread-in-Mesa observation together establish the chain
+  without needing the leaf frame.
 
 ### Method 4 — `/proc/<tid>/stack` — **BLOCKED** (error shown verbatim, then method switched)
 
 **[OBSERVED]** The ptrace-free kernel stack interface was attempted first as the least-invasive
 option. It is **blocked** in this container — reading `/proc/<tid>/stack` requires `CAP_SYS_ADMIN`,
 which the container does not grant (it grants `CAP_SYS_PTRACE` + `seccomp=unconfined`, enough for
-gdb/py-spy/eu-stack, but not `/proc/stack`). The exact error, captured verbatim:
+`gdb`/`py-spy`, but not `/proc/stack`, and — as Method 5 shows — not `eu-stack`'s frame unwind
+either). The exact error, captured verbatim for the three named Kitty C threads:
 
 ```
-$ cat /proc/281/task/281/stack /proc/281/task/353/stack /proc/281/task/352/stack
-### /proc/281/task/281/stack  (comm=kitty)
-cat: /proc/281/task/281/stack: Permission denied
+$ cat /proc/181113/task/181113/stack /proc/181113/task/181181/stack /proc/181113/task/181180/stack
+### /proc/181113/task/181113/stack  (comm=kitty)
+cat: /proc/181113/task/181113/stack: Permission denied
 
-### /proc/281/task/353/stack  (comm=KittyChildMon)
-cat: /proc/281/task/353/stack: Permission denied
+### /proc/181113/task/181181/stack  (comm=KittyChildMon)
+cat: /proc/181113/task/181181/stack: Permission denied
 
-### /proc/281/task/352/stack  (comm=KittyPeerMon)
-cat: /proc/281/task/352/stack: Permission denied
-
+### /proc/181113/task/181180/stack  (comm=KittyPeerMon)
+cat: /proc/181113/task/181180/stack: Permission denied
 ```
 
 This is exactly the "if something is blocked, show the error and use another method" situation. The
-working alternative is `eu-stack` (Method 5).
+working alternatives that *do* give real stack/symbol visibility are `gdb` (Method 2/3) and `py-spy`
+(Method 1).
 
-### Method 5 — `eu-stack -p 281` (working ptrace alternative; independent unwinder)
+### Method 5 — `eu-stack -p 181113` — frame unwind **BLOCKED** (error shown verbatim; second blocked tool)
 
-**[OBSERVED]** `eu-stack` (elfutils) attaches via ptrace and unwinds all 68 threads (exit 0, 555
-lines). It **independently corroborates** gdb. The main thread (TID 281) unwinds one level deeper than
-gdb — all the way to `_start` — confirming the `__poll` ← `glfwRunMainLoop` ← `main_loop` ← Python ←
-`main` chain:
+**[OBSERVED]** `eu-stack` (elfutils) is an independent, ptrace-based unwinder. In this environment it
+**attaches and enumerates all 68 threads** (so thread discovery works and the TID list independently
+corroborates §5's census, `181113` + `181115`–`181181`), **but its per-thread DWARF frame unwind is
+refused**: every thread reports `eu-stack: dwfl_thread_getframes tid <n>: Operation not permitted`, and
+it ends with `eu-stack: Couldn't show any frames.` This is the kernel `yama` `ptrace_scope=1` policy
+blocking the deeper per-thread `PTRACE_GETREGSET`/frame walk that `eu-stack` performs (the
+`ptrace_scope=0` mitigation is unavailable here — `/proc/sys/kernel/yama/ptrace_scope` is read-only in
+the container). `gdb` succeeds where `eu-stack` does not because it is granted `CAP_SYS_PTRACE` and uses
+a different attach path. The **complete, unedited** 138-line output (all 68 TIDs) is embedded below:
 
-```
-$ eu-stack -p 281    # TID 281 (main); full 68-TID output in o6_eustack.txt
-PID 281 - process
-TID 281:
-#0  0x00007d8f733604cd __poll
-#1  0x00007d8f7176087f glfwRunMainLoop
-#2  0x00007d8f72746cfc main_loop.lto_priv.0
-#3  0x00007d8f735e7ce2
-#4  0x00007d8f735d9b2c PyObject_Vectorcall
-#5  0x00007d8f735745ee _PyEval_EvalFrameDefault
-#6  0x00007d8f735db580 _PyObject_FastCallDictTstate
-#7  0x00007d8f735db7ee _PyObject_Call_Prepend
-#8  0x00007d8f7365a075
-#9  0x00007d8f735d97df _PyObject_MakeTpCall
-#10 0x00007d8f735745ee _PyEval_EvalFrameDefault
-#11 0x00007d8f736f791f PyEval_EvalCode
-#12 0x00007d8f736f38b0
-#13 0x00007d8f73636adc
-#14 0x00007d8f735d9b2c PyObject_Vectorcall
-#15 0x00007d8f735745ee _PyEval_EvalFrameDefault
-#16 0x00007d8f7377c242
-#17 0x00007d8f7377cda3
-#18 0x00007d8f7377d39c Py_RunMain
-#19 0x00005d2735e8b0ed main
-#20 0x00007d8f7326f1ca
-#21 0x00007d8f7326f28b __libc_start_main
-#22 0x00005d2735e8b505 _start
-```
-
-And it confirms Kitty's two C service threads by name-mapped symbol (`talk_loop` = `KittyPeerMon`
-TID 352; `io_loop` = `KittyChildMon` TID 353), plus the Mesa worker pattern (TID 287 in
-`pthread_cond_wait`):
+<details>
+<summary><b>Complete `eu-stack -p 181113` — all 68 TIDs, frame unwind blocked, 138 lines (click to expand)</b></summary>
 
 ```
-$ eu-stack -p 281    # tail: the two Kitty C threads + a Mesa worker
-TID 287:
-#0  0x00007d8f732ddd71
-#1  0x00007d8f732e07ed pthread_cond_wait
-#2  0x00007d8f6e96540d
-#3  0x00007d8f6f004bc3
-#4  0x00007d8f6e96533c
-#5  0x00007d8f732e1aa4
-#6  0x00007d8f7336ec3c
-TID 352:
-#0  0x00007d8f733604cd __poll
-#1  0x00007d8f7274be62 talk_loop
-#2  0x00007d8f732e1aa4
-#3  0x00007d8f7336ec3c
-TID 353:
-#0  0x00007d8f733604cd __poll
-#1  0x00007d8f72748125 io_loop
-#2  0x00007d8f732e1aa4
-#3  0x00007d8f7336ec3c
+$ eu-stack -p 181113
+PID 181113 - process
+TID 181113:
+eu-stack: dwfl_thread_getframes tid 181113: Operation not permitted
+TID 181115:
+eu-stack: dwfl_thread_getframes tid 181115: Operation not permitted
+TID 181116:
+eu-stack: dwfl_thread_getframes tid 181116: Operation not permitted
+TID 181117:
+eu-stack: dwfl_thread_getframes tid 181117: Operation not permitted
+TID 181118:
+eu-stack: dwfl_thread_getframes tid 181118: Operation not permitted
+TID 181119:
+eu-stack: dwfl_thread_getframes tid 181119: Operation not permitted
+TID 181120:
+eu-stack: dwfl_thread_getframes tid 181120: Operation not permitted
+TID 181121:
+eu-stack: dwfl_thread_getframes tid 181121: Operation not permitted
+TID 181122:
+eu-stack: dwfl_thread_getframes tid 181122: Operation not permitted
+TID 181123:
+eu-stack: dwfl_thread_getframes tid 181123: Operation not permitted
+TID 181124:
+eu-stack: dwfl_thread_getframes tid 181124: Operation not permitted
+TID 181125:
+eu-stack: dwfl_thread_getframes tid 181125: Operation not permitted
+TID 181126:
+eu-stack: dwfl_thread_getframes tid 181126: Operation not permitted
+TID 181127:
+eu-stack: dwfl_thread_getframes tid 181127: Operation not permitted
+TID 181128:
+eu-stack: dwfl_thread_getframes tid 181128: Operation not permitted
+TID 181129:
+eu-stack: dwfl_thread_getframes tid 181129: Operation not permitted
+TID 181130:
+eu-stack: dwfl_thread_getframes tid 181130: Operation not permitted
+TID 181131:
+eu-stack: dwfl_thread_getframes tid 181131: Operation not permitted
+TID 181132:
+eu-stack: dwfl_thread_getframes tid 181132: Operation not permitted
+TID 181133:
+eu-stack: dwfl_thread_getframes tid 181133: Operation not permitted
+TID 181134:
+eu-stack: dwfl_thread_getframes tid 181134: Operation not permitted
+TID 181135:
+eu-stack: dwfl_thread_getframes tid 181135: Operation not permitted
+TID 181136:
+eu-stack: dwfl_thread_getframes tid 181136: Operation not permitted
+TID 181137:
+eu-stack: dwfl_thread_getframes tid 181137: Operation not permitted
+TID 181138:
+eu-stack: dwfl_thread_getframes tid 181138: Operation not permitted
+TID 181139:
+eu-stack: dwfl_thread_getframes tid 181139: Operation not permitted
+TID 181140:
+eu-stack: dwfl_thread_getframes tid 181140: Operation not permitted
+TID 181141:
+eu-stack: dwfl_thread_getframes tid 181141: Operation not permitted
+TID 181142:
+eu-stack: dwfl_thread_getframes tid 181142: Operation not permitted
+TID 181143:
+eu-stack: dwfl_thread_getframes tid 181143: Operation not permitted
+TID 181144:
+eu-stack: dwfl_thread_getframes tid 181144: Operation not permitted
+TID 181145:
+eu-stack: dwfl_thread_getframes tid 181145: Operation not permitted
+TID 181146:
+eu-stack: dwfl_thread_getframes tid 181146: Operation not permitted
+TID 181147:
+eu-stack: dwfl_thread_getframes tid 181147: Operation not permitted
+TID 181148:
+eu-stack: dwfl_thread_getframes tid 181148: Operation not permitted
+TID 181149:
+eu-stack: dwfl_thread_getframes tid 181149: Operation not permitted
+TID 181150:
+eu-stack: dwfl_thread_getframes tid 181150: Operation not permitted
+TID 181151:
+eu-stack: dwfl_thread_getframes tid 181151: Operation not permitted
+TID 181152:
+eu-stack: dwfl_thread_getframes tid 181152: Operation not permitted
+TID 181153:
+eu-stack: dwfl_thread_getframes tid 181153: Operation not permitted
+TID 181154:
+eu-stack: dwfl_thread_getframes tid 181154: Operation not permitted
+TID 181155:
+eu-stack: dwfl_thread_getframes tid 181155: Operation not permitted
+TID 181156:
+eu-stack: dwfl_thread_getframes tid 181156: Operation not permitted
+TID 181157:
+eu-stack: dwfl_thread_getframes tid 181157: Operation not permitted
+TID 181158:
+eu-stack: dwfl_thread_getframes tid 181158: Operation not permitted
+TID 181159:
+eu-stack: dwfl_thread_getframes tid 181159: Operation not permitted
+TID 181160:
+eu-stack: dwfl_thread_getframes tid 181160: Operation not permitted
+TID 181161:
+eu-stack: dwfl_thread_getframes tid 181161: Operation not permitted
+TID 181162:
+eu-stack: dwfl_thread_getframes tid 181162: Operation not permitted
+TID 181163:
+eu-stack: dwfl_thread_getframes tid 181163: Operation not permitted
+TID 181164:
+eu-stack: dwfl_thread_getframes tid 181164: Operation not permitted
+TID 181165:
+eu-stack: dwfl_thread_getframes tid 181165: Operation not permitted
+TID 181166:
+eu-stack: dwfl_thread_getframes tid 181166: Operation not permitted
+TID 181167:
+eu-stack: dwfl_thread_getframes tid 181167: Operation not permitted
+TID 181168:
+eu-stack: dwfl_thread_getframes tid 181168: Operation not permitted
+TID 181169:
+eu-stack: dwfl_thread_getframes tid 181169: Operation not permitted
+TID 181170:
+eu-stack: dwfl_thread_getframes tid 181170: Operation not permitted
+TID 181171:
+eu-stack: dwfl_thread_getframes tid 181171: Operation not permitted
+TID 181172:
+eu-stack: dwfl_thread_getframes tid 181172: Operation not permitted
+TID 181173:
+eu-stack: dwfl_thread_getframes tid 181173: Operation not permitted
+TID 181174:
+eu-stack: dwfl_thread_getframes tid 181174: Operation not permitted
+TID 181175:
+eu-stack: dwfl_thread_getframes tid 181175: Operation not permitted
+TID 181176:
+eu-stack: dwfl_thread_getframes tid 181176: Operation not permitted
+TID 181177:
+eu-stack: dwfl_thread_getframes tid 181177: Operation not permitted
+TID 181178:
+eu-stack: dwfl_thread_getframes tid 181178: Operation not permitted
+TID 181179:
+eu-stack: dwfl_thread_getframes tid 181179: Operation not permitted
+TID 181180:
+eu-stack: dwfl_thread_getframes tid 181180: Operation not permitted
+TID 181181:
+eu-stack: dwfl_thread_getframes tid 181181: Operation not permitted
+eu-stack: Couldn't show any frames.
 ```
+</details>
+
+So of the two ptrace-free / independent tools, **both are blocked** (`/proc/<tid>/stack` at the read
+step, `eu-stack` at the frame-unwind step), and their exact errors are shown above. Real stack and
+symbol visibility is nevertheless achieved through `py-spy` (Method 1, Python view), `gdb` (Method 2,
+all 68 native stacks; Method 3, the deterministic `draw_cells` breakpoint), and `nm` (symbol offsets in
+`fast_data_types.so`) — satisfying O6's requirement that a blocked tool be met with a working
+alternative.
 
 ### Debugger discipline — guarded identity, bounded runtime, guaranteed detach
 
@@ -2668,8 +4200,8 @@ TID 353:
 is the intended process by matching **both** the executable path **and** the kernel start-time
 *before* attaching, (2) bounds the run with `timeout --preserve-status`, and (3) **always** ends the
 gdb batch with `detach` + `quit`, then records `GDB-EXIT`. This is why every transcript opens with
-`GUARD-OK: … start=300084875` and closes with `[Inferior 1 (process 281) detached]` / `GDB-EXIT=0` —
-the process is never left stopped. The harness verbatim:
+`GUARD-OK: … start=302476926` and closes with `[Inferior 1 (process 181113) detached]` / `GDB-EXIT=0`
+— the process is never left stopped. The harness verbatim:
 
 ```
 $ cat /tmp/kitty_probe/gdbguard.sh
@@ -2694,19 +4226,19 @@ timeout --preserve-status "$TIMO" gdb -p "$EXP_PID" -batch "$@" -ex detach -ex q
 echo "GDB-EXIT=$?" >> "$OUT"
 ```
 
-**[OBSERVED — honesty note on a later GUARD-FAIL]** The `gdbguard.sh` identity check is strict enough
-that, *after* §2's canonical `python3 setup.py` re-linked the on-disk launcher, a fresh attach to the
-still-running PID 281 now reports `GUARD-FAIL: identity mismatch … exe=/app/kitty/launcher/kitty
-(deleted)`. This is the guard working as designed: the process is unchanged (start-time still
-`300084875`), but its on-disk `exe` inode was replaced by the rebuild, so the guard refuses. **All
-gdb/eu-stack/py-spy evidence in this section was captured *before* that rebuild**, from the same PID
-281, and is internally consistent (identical LWP numbers, identical `main_loop`/`glfwRunMainLoop`
-addresses across methods).
+The guard matches on `main_exe.txt` = `/work/kitty/launcher/kitty` and `main_starttime.txt` =
+`302476926`; had a later `python3 setup.py` re-linked the on-disk launcher, `CUR_EXE` would read
+`… (deleted)` (new inode) and the guard would print `GUARD-FAIL: identity mismatch` and refuse to
+attach — which is precisely why **every** stack in this section carries `GUARD-OK` with the *same*
+`start=302476926` and identical `main_loop`/`glfwRunMainLoop`/`draw_cells` addresses across methods:
+all of it is from the one PID 181113 session.
 
 **[OBSERVED — breakpoint thread-name honesty]** A separate breakpoint experiment (§5) that caught a
-transient stdin-writer thread saw `comm=kitty` (LWP 2283) at the moment `thread_write` began, because
-gdb stopped it *before* `set_thread_name` ran; the same worker observed through `/proc` a moment later
-was already renamed `KittyWriteStdin` (TID 3380). Both observations are real and are reported as such,
+transient stdin-writer thread saw `comm=kitty` at the moment `thread_write` (`fast_data_types.so`,
+`0x7d03aa4390d0` = base + `nm` offset `0x140d0`) began — gdb stopped the writer (gdb thread #69,
+`LWP 230658`) *before* `set_thread_name` ran, so it still bore the inherited `kitty` comm; §5's
+independent `/proc` transient scan caught a *different* ephemeral instance of the same writer code path
+already renamed `KittyWriteStdin` (`TID 312326`). Both observations are real and are reported as such,
 rather than silently harmonized.
 
 ---
@@ -2720,7 +4252,7 @@ the screen/scrollback model, GPU drawing, fonts, and the event/I/O loops — all
 remote-control command surface — running as embedded CPython on exactly **one** thread that spends
 its time *blocked in C*. **Go owns the standalone CLI/kitten tooling** — a separate, near-static
 binary that runs in its **own process and address space**, never linked into the main process. The
-worker-thread bulk (64 threads) is **not Kitty at all** — it is Mesa's software-GL pool.
+worker-thread bulk (65 threads) is **not Kitty at all** — it is Mesa's software-GL pool.
 
 ### Responsibilities, split by evidence type
 
@@ -2730,10 +4262,10 @@ column 2 is a runtime claim.
 
 | Layer | Observed at runtime (this session, §-refs) | Role inferred from source (labelled) |
 |-------|--------------------------------------------|--------------------------------------|
-| **C** — `kitty.fast_data_types.so` | Mapped into PID 281, 5 segments (§4). The render breakpoint fires in `draw_cells` here; the event loop (`main_loop`), PTY I/O (`io_loop`/`KittyChildMon`), and RC peer (`talk_loop`/`KittyPeerMon`) all execute here (§8). The main thread spends its time in C (`poll` between frames); even Python is `(idle)` = handed to C (§8). Under load, `main` (PID 281) burns the CPU, not the workers (§5). | VT escape parsing (`vt-parser.c`), screen+scrollback model (`screen.c`, incl. `draw_text`/`draw_text_loop` populating `GPUCell`), GPU shader programs (`shaders.c` → `glDrawArraysInstanced`), font rasterization/shaping (`fonts.c`, `freetype.c`, HarfBuzz). |
-| **Python** — embedded CPython + `kitty.*` | Exactly **1 of 68** threads runs Python; its stack bottoms in `kitty/main.py:234` `_run_app` (§8). 60 `kitty.*` modules loaded (§4). The `@ ls` tree is assembled by the Python `boss.list_os_windows()` (§6). Python *calls into* C `main_loop` (gdb: `main_loop` ← libpython ← `main`, §8). | Process/UI orchestration, window/tab/child lifecycle (`boss.py`, `window.py`, `tabs.py`), configuration (`options/*`), and the 41-command remote-control server (`rc/*.py`). |
-| **Go** — `kitten` binary | A **separate process** (child of PID 281, PPid=281), Go ELF (`go version -m` → `go1.23.4`, `mod kitty`), near-static (one `NEEDED`: `libc.so.6`), address space maps **0** libpython / **0** fast_data_types segments (§7). | CLI framework, the `@` remote-control client, and the kittens (`icat`, `diff`, `hints`, …) under `tools/**` and `kittens/**/*.go`. |
-| **(not Kitty)** — Mesa | 64 worker threads (32 `llvmpipe-N` + 32 `"kitty"`-named) all park in `pthread_cond_wait` inside `libgallium` (§8); `glxinfo` = llvmpipe/Mesa (§2). | Software-GL rasterization backend (Mesa), used because the container has no hardware GPU. |
+| **C** — `kitty.fast_data_types.so` | Mapped into PID 181113, 5 segments (§4). The render breakpoint fires in `draw_cells` here; the event loop (`main_loop`), PTY I/O (`io_loop`/`KittyChildMon`), and RC peer (`talk_loop`/`KittyPeerMon`) all execute here (§8). The main thread spends its time in C (`poll` between frames); even Python is `(idle)` = handed to C (§8). Under load, `main` (PID 181113) burns the CPU, not the workers (§5). | VT escape parsing (`vt-parser.c`), screen+scrollback model (`screen.c`, incl. `draw_text`/`draw_text_loop` populating `GPUCell`), GPU shader programs (`shaders.c` → `glDrawArraysInstanced`), font rasterization/shaping (`fonts.c`, `freetype.c`, HarfBuzz). |
+| **Python** — embedded CPython + `kitty.*` | Exactly **1 of 68** threads runs Python; its stack bottoms in `kitty/main.py:234` `_run_app` (§8). 62 `kitty.*` modules loaded (§4). The `@ ls` tree is assembled by the Python `boss.list_os_windows()` (§6). Python *calls into* C `main_loop` (gdb: `main_loop` ← libpython ← `main`, §8). | Process/UI orchestration, window/tab/child lifecycle (`boss.py`, `window.py`, `tabs.py`), configuration (`options/*`), and the 41-command remote-control server (`rc/*.py`). |
+| **Go** — `kitten` binary | A **separate process** (child of PID 181113, PPid=181113), Go ELF (`go version -m` → `go1.23.4`, `mod kitty`), near-static (one `NEEDED`: `libc.so.6`), address space maps **0** libpython / **0** fast_data_types segments (§7). | CLI framework, the `@` remote-control client, and the kittens (`icat`, `diff`, `hints`, …) under `tools/**` and `kittens/**/*.go`. |
+| **(not Kitty)** — Mesa | 65 worker threads (32 `llvmpipe-N` + 32 `"kitty"`-named + 1 `"kitty:disk$0"`) all park in `pthread_cond_wait` inside `libgallium` (§8); `glxinfo` = llvmpipe/Mesa (§2). | Software-GL rasterization backend (Mesa), used because the container has no hardware GPU. |
 
 ### Interpretations ruled out by the observed evidence
 
@@ -2746,10 +4278,10 @@ the `GPUCell` **screen model during byte parsing**, a different phase. So the GL
 made.)
 
 **Ruled out #2 — "`kitten` is loaded into the main process (a Python module or a shared library of
-PID 281)."**
+PID 181113)."**
 FALSE, by observation. `kitty +kitten icat` runs as a **separate process** (distinct PID, child of
-281), and that process's address space maps **zero** `libpython` and **zero** `fast_data_types`
-segments — only `libc.so.6` + the loader (§7). Nothing named `kitten` appears in PID 281's own
+181113), and that process's address space maps **zero** `libpython` and **zero** `fast_data_types`
+segments — only `libc.so.6` + the loader (§7). Nothing named `kitten` appears in PID 181113's own
 `maps` (§4). It is a Go ELF (`go version -m`), not anything hosted inside the C+Python process.
 
 **Ruled out #3 — "The dozens of `"kitty"`-named worker threads are Kitty's own parallel
@@ -2830,9 +4362,9 @@ untouched, and the one modified path is the answer document this task exists to 
 ### Methodology and reproducibility
 
 **[OBSERVED — session identity]** Every artifact in §2–§9 comes from **one** Kitty process,
-`PID 281` (`exe=/app/kitty/launcher/kitty`, kernel start-time `300084875`, `comm=kitty`), under a
+`PID 181113` (`exe=/work/kitty/launcher/kitty`, kernel start-time `302476926`, `comm=kitty`), under a
 headless `Xvfb :99`, with the control socket `unix:/tmp/kitty_probe/mykitty.sock` (mode `0700`). The
-identity was re-verified before every privileged attach (`GUARD-OK … start=300084875`) and after each
+identity was re-verified before every privileged attach (`GUARD-OK … start=302476926`) and after each
 (`State=S`), so all thread/stack/RC/map observations are mutually consistent.
 
 **[OBSERVED — scale and repetition]** Each stateful or timing-sensitive observation was run at
@@ -2840,11 +4372,12 @@ sufficient scale and **repeated ≥ 2×**, with stability confirmed:
 
 | Workload / measurement | Scale | Runs | Stability observed |
 |------------------------|-------|------|--------------------|
-| Colored output (`csi`) | 100-rep calibration, then 1000 reps | calib + **2** | ~21.5 MB/s both runs |
+| Colored output (`csi`) | 100-rep calibration, then 1000 reps | calib + **2** | ~30.5 MB/s both runs (30.3 / 30.8) |
 | Scrollback churn (`--with-scrollback`, all 5 benchmarks) | 200 reps | **2** | all 5 rows both runs, close values |
-| Image/graphics load (`images`) | 400 reps | **2** | ~168 MB/s both runs |
-| Repeated resizes | 200 resizes | **2** | 200/200 succeeded both runs |
-| Tab switching | 100 `next_tab` cycles | **2** | 100/100 both runs |
+| Image/graphics load (`images`) | 400 reps | **2** | ~163 MB/s both runs (161.6 / 165.8) |
+| Repeated resizes | 200 resizes (25 × 8 sizes) | **2** | 200/200 succeeded both runs |
+| Tab switching | **9 tabs**, 250 `next_tab` cycles | **2** | 250/250 both runs; focus-tab assert PASS |
+| Combined load (benchmark + resizes + switches) | ~65 s overlap | **1** sustained | 948 resizes + 948 switches, 0 fail; RSS recovered |
 | Thread set + CPU (idle vs load) | 20-s equal windows | **2** episodes | set identical; CPU shift stable |
 
 **[OBSERVED — before/during/after discipline]** State-changing observations report all three phases:
@@ -2860,44 +4393,44 @@ and the deliverable). Teardown targets **only the exact PIDs captured at launch*
 
 ```
 # kill only the PIDs captured at launch (no pkill/killall)
-kill "$(cat /tmp/kitty_probe/kitty.pid)"    # the kitty main process (281)
-kill "$(cat /tmp/kitty_probe/xvfb.pid)"     # the Xvfb display   (209)
+kill "$(cat /tmp/kitty_probe/kitty.pid)"    # the kitty main process (181113)
+kill "$(cat /tmp/kitty_probe/xvfb.pid)"     # the Xvfb display   (181020)
 # remove the scratch tree (a specific path inside /tmp, never the workspace)
 rm -rf /tmp/kitty_probe
 # negative residue checks (each must report absence):
-test ! -e /proc/281                         && echo "proc 281: gone"
+test ! -e /proc/181113                      && echo "proc 181113: gone"
 test ! -S /tmp/kitty_probe/mykitty.sock     && echo "socket: gone"
 test ! -e /tmp/kitty_probe                  && echo "scratch dir: gone"
 ```
 
 **[OBSERVED — confirmation]** Running that teardown produced the transcript below. The `ELAPSED`
-column proves the observed session had been alive continuously (`02:00:52`) — i.e. every workload
-and snapshot above was taken against one sustained, long-lived instance (PID 281), not a series of
+column proves the observed session had been alive continuously (`02:33:37`) — i.e. every workload
+and snapshot above was taken against one sustained, long-lived instance (PID 181113), not a series of
 short relaunches — and after teardown every residue check reports absence, so no scratch process,
 socket, or directory survives:
 
 ```
 # proof the session was alive immediately before teardown (etime = sustained uptime):
     PID    PPID COMMAND             ELAPSED                  STARTED
-    209       1 Xvfb               02:00:52 Mon Jul 13 18:04:18 2026
-    281       1 kitty              02:00:52 Mon Jul 13 18:04:18 2026
+ 181020       1 Xvfb               02:34:04 Tue Jul 14 00:42:32 2026
+ 181113       1 kitty              02:33:37 Tue Jul 14 00:42:59 2026
 
 # pid files captured at launch:
-kitty.pid=281  xvfb.pid=209
+kitty.pid=181113  xvfb.pid=181020
 # socket present before teardown:
-srwx------ 1 root root 0 Jul 13 18:04 /tmp/kitty_probe/mykitty.sock
+srwx------ 1 root root 0 Jul 14 00:43 /tmp/kitty_probe/mykitty.sock
 
 # --- teardown: kill ONLY the exact PIDs captured at launch (no pkill/killall) ---
-sent SIGTERM to kitty  281
-sent SIGTERM to Xvfb   209
+sent SIGTERM to kitty  181113
+sent SIGTERM to Xvfb   181020
 waited 2s for clean exit
 
 # remove the scratch tree (a specific path inside /tmp, never the workspace):
 removed /tmp/kitty_probe
 
 # --- negative residue checks (each must report absence) ---
-proc 281 (kitty): gone
-proc 209 (xvfb): gone
+proc 181113 (kitty): gone
+proc 181020 (xvfb): gone
 socket: gone
 scratch dir: gone
 ```
