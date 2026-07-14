@@ -232,13 +232,13 @@ XVFB_PID=13983  (owner=root)
 DISPLAY=:99  XAUTHORITY=/tmp/kitty-qna.ZXuOylNP8q/Xauthority  XDG_RUNTIME_DIR=/tmp/kitty-qna.ZXuOylNP8q/xdg
 ```
 
-For this run the harness root is `/tmp/kitty-qna.ZXuOylNP8q` and the Xvfb PID is `13983`. **Process-safety rules obeyed throughout** (F-18): every spawned process PID is captured with `$!`; before any signal the target's owner and its `/proc/$pid/exe` symlink are validated; PIDs are always quoted; `gdb` runs in `-batch` with a `timeout`; core dumps are disabled (`ulimit -c 0`) before any `SIGABRT`; and teardown (Part 7) kills only the exact recorded PIDs.
+For this run the harness root is `/tmp/kitty-qna.ZXuOylNP8q` and the Xvfb PID is `13983`. **Process-safety rules obeyed throughout** (F-18): every spawned process PID is captured with `$!`; each driver installs an `EXIT` trap (the Part-6 producers additionally trap `TERM`/`INT` via a `cleanup` handler) that signals only the process group of the launcher it spawned, addressed by its recorded, always-quoted PID (`kill -KILL -"$KPID"`); every run identifier is allowlist-validated before it is used to build any filesystem path; the drivers that attach to or introspect a live PID (the Tier-1 attach probe and the `faulthandler`, unfocused-route, just-closed-route, thread/library-ownership, and mouse-routing drivers) first confirm `/proc/$KPID/exe` resolves to the canonical `/app/kitty/launcher/kitty` and refuse otherwise; the Tier-1 attach probe runs `gdb -p "$KPID" -batch` under a `timeout`, while the launch-as-child gdb drivers run bounded command files (ending in `detach`/`quit`) and are themselves bounded by a `timeout` or fixed `sleep`; and teardown (Part 7) kills only the exact recorded PIDs.
 
-The bootstrap is additionally **fail-safe and parallel-safe** (F-18). An `EXIT` trap (§0) removes the private tree and kills the spawned Xvfb on any failure *before* readiness; `ENV_READY=1` (§5) is the success gate, so a bootstrap that succeeds intentionally leaves both the tree and the Xvfb running for the later drivers (a bootstrap's resources must outlive it). The display number is parameterized (`DISPLAY_NUM`, default `:99`, §3) so concurrent harnesses can each own a display, and a post-readiness guard (§4b) rejects a display that turns out to be served by a *pre-existing* server rather than by the Xvfb we spawned (readiness alone can be satisfied by a squatter). These two failure guards were exercised by fault injection against the **exact** script published above (extracted from this document with `sed -n '154,223p'`, so the tested bytes are the published bytes), confirming a clean non-zero exit and **zero leaked harness trees** in each case (`before=after`; the single persistent tree is the successful `:99` session, correctly neither removed nor duplicated):
+The bootstrap is additionally **fail-safe and parallel-safe** (F-18). An `EXIT` trap (§0) removes the private tree and kills the spawned Xvfb on any failure *before* readiness; `ENV_READY=1` (§5) is the success gate, so a bootstrap that succeeds intentionally leaves both the tree and the Xvfb running for the later drivers (a bootstrap's resources must outlive it). The display number is parameterized (`DISPLAY_NUM`, default `:99`, §3) so concurrent harnesses can each own a display, and a post-readiness guard (§4b) rejects a display that turns out to be served by a *pre-existing* server rather than by the Xvfb we spawned (readiness alone can be satisfied by a squatter). These two failure guards were exercised by fault injection against the **exact** script published above (extracted from this document with `sed -n '156,225p'`, so the tested bytes are the published bytes), confirming a clean non-zero exit and **zero leaked harness trees** in each case (`before=after`; the single persistent tree is the successful `:99` session, correctly neither removed nor duplicated):
 
 ```console
 $ DOC=blitzy/documentation/kitty_815df1e210e0.md
-$ sed -n '154,223p' "$DOC" > /tmp/kqna_pub.sh; chmod +x /tmp/kqna_pub.sh
+$ sed -n '156,225p' "$DOC" > /tmp/kqna_pub.sh; chmod +x /tmp/kqna_pub.sh
 $ bash -n /tmp/kqna_pub.sh && echo SYNTAX_OK
 SYNTAX_OK
 $ # FAULT A: stub Xvfb that exits immediately, forcing the bounded readiness poll to time out
@@ -342,6 +342,31 @@ finally:
 # so TIMELINE progressing past ~64 KB is proof the I/O thread read the (possibly
 # unfocused) window. After emitting, sleeps to keep the window alive.
 import sys, os, time
+def _usage(msg):
+    sys.stderr.write("bggen.py: %s\n" % msg)
+    sys.stderr.write("usage: bggen.py TAG {flood <bytes>|timed <count>:<interval>} TIMELINE\n")
+    raise SystemExit(2)
+if len(sys.argv) != 5:
+    _usage("expected 4 arguments, got %d" % (len(sys.argv) - 1))
+if sys.argv[2] not in ("flood", "timed"):
+    _usage("unknown mode %r (want flood|timed)" % sys.argv[2])
+if sys.argv[2] == "flood":
+    try:
+        _n = int(sys.argv[3])
+    except ValueError:
+        _usage("flood arg must be an integer byte count, got %r" % sys.argv[3])
+    if _n < 0:
+        _usage("flood byte count must be >= 0, got %d" % _n)
+else:
+    _parts = sys.argv[3].split(":")
+    if len(_parts) != 2:
+        _usage("timed arg must be <count>:<interval>, got %r" % sys.argv[3])
+    try:
+        _c = int(_parts[0]); _i = float(_parts[1])
+    except ValueError:
+        _usage("timed arg must be <int_count>:<float_interval>, got %r" % sys.argv[3])
+    if _c < 0 or _i < 0:
+        _usage("timed count and interval must be >= 0, got %d:%g" % (_c, _i))
 tag, mode, arg, timeline = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 tl = open(timeline, 'w')
 tl.write("BGSTART %s %.9f pid=%d\n" % (tag, time.time(), os.getpid())); tl.flush()
@@ -377,7 +402,7 @@ Driver (published in full):
 # SYNTHETIC INPUT via XTEST). Tab1={W1,W2}, Tab2={W3}, each running recorder.py.
 # Injects: type '1' -> next_window -> type '2' -> next_tab -> type '3'.
 set -euo pipefail
-RUNID="$1"; D="$HR/ev/$RUNID"; mkdir -p "$D"
+RUNID="$1"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; mkdir -p "$D"
 SESS="$D/session.conf"
 cat > "$SESS" <<CONF
 launch python3 $HR/bin/recorder.py W1 $D/w1.hex
@@ -484,11 +509,12 @@ Because all Kitty windows report the same default 640×400 geometry (and there i
 # which X window maps to which kitty OS-window-id via on_focus_change, then alternate
 # focus between the two top-levels, capturing paired focused:0/focused:1 transitions.
 set -euo pipefail
-RUNID="$1"; D="$HR/ev/$RUNID"; mkdir -p "$D"; LOG="$D/kbd.log"
+RUNID="$1"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; mkdir -p "$D"; LOG="$D/kbd.log"
 setsid env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" LIBGL_ALWAYS_SOFTWARE=1 \
   kitty/launcher/kitty --config NONE --debug-keyboard sh -c 'sleep 600' >"$LOG" 2>&1 &
-KPID=$!; echo "$KPID">"$D/kitty.pid"; sleep 3
+KPID=$!; echo "$KPID">"$D/kitty.pid"
 trap 'kill -KILL -"$KPID" 2>/dev/null || true' EXIT
+sleep 3
 echo "kitty pid=$KPID exe=$(readlink /proc/$KPID/exe)"
 xdotool key --clearmodifiers ctrl+shift+n; sleep 2     # new_os_window (definition.py:3730)
 strip(){ sed -E 's/\x1b\[[0-9;]*m//g'; }
@@ -570,6 +596,7 @@ The driver launches window 0 = a foreground recorder (active at session load —
 # Type HELLO directly into FG (NO next_window). BG runs a timed output generator.
 set -euo pipefail
 RUNID="${1:-P1bg2}"
+case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac
 D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; LOG="$D/kbd.log"
 FG="$D/fg.hex"; BG="$D/bg_timeline.log"
@@ -763,6 +790,7 @@ For completeness (no elided logic), the three drivers whose invocations and outp
 # Proves keyboard routing to active_window() continues across resize (a main-thread event).
 set -euo pipefail
 RUNID="${1:-P1resize}"
+case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac
 D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; LOG="$D/kbd.log"; REC="$D/rec.hex"
 printf 'launch python3 %s/bin/recorder.py W %s\n' "$HR" "$REC" > "$SESS"
@@ -813,6 +841,7 @@ echo "RUN $RUNID done"
 # keys still delivered to the child (snap-to-bottom on key input, keys.c:247).
 set -euo pipefail
 RUNID="${1:-P1scroll}"
+case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac
 D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; LOG="$D/kbd.log"; REC="$D/rec.hex"
 printf 'launch sh -c "seq 1 300; exec python3 %s/bin/recorder.py W %s"\n' "$HR" "$REC" > "$SESS"
@@ -852,6 +881,7 @@ echo "RUN $RUNID done"
 # child received. Designed to be run repeatedly with identical input to test stability.
 set -euo pipefail
 RUNID="${1:?need runid}"
+case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac
 STR="kitty0123"   # fixed input string, 9 chars
 D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; LOG="$D/kbd.log"; REC="$D/rec.hex"
@@ -1134,7 +1164,7 @@ Every command and its complete, unedited output are shown. All tiers observe the
 # ATTACH by PID with py-spy, gdb, strace. Under ptrace_scope=1 with no CAP_SYS_PTRACE
 # these MUST fail. Capture the exact, verbatim errors + the exact commands.
 set -euo pipefail
-RUNID="${1:-P3tier1}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P3tier1}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"
 printf 'launch python3 %s/bin/recorder.py W %s/rec.hex\n' "$HR" "$D" > "$SESS"
 setsid env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" LIBGL_ALWAYS_SOFTWARE=1 \
@@ -1151,8 +1181,9 @@ echo "ptrace_scope = $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
 echo "CapEff of this shell = $(grep CapEff /proc/self/status | awk "{print \$2}") (bit 19 CAP_SYS_PTRACE is clear)"
 echo ""
 echo "=== Tier 1a: py-spy dump --pid $KPID (attach) ==="
-( py-spy dump --pid "$KPID" ) 2>&1 | head -8 || true
-echo "[exit=${PIPESTATUS[0]:-?}]"
+out="$(py-spy dump --pid "$KPID" 2>&1)" && ps=0 || ps=$?
+printf '%s\n' "$out" | head -8
+echo "[py-spy exit=$ps]"
 echo ""
 echo "=== Tier 1b: gdb -p $KPID (attach) ==="
 ( timeout 15 gdb -p "$KPID" -batch -ex "bt" ) 2>&1 | grep -iE "ptrace|not permitted|Could not attach|warning" | head -6 || true
@@ -1177,7 +1208,7 @@ Error: Failed to copy Py_Version symbol
 Caused by:
     0: Permission denied (os error 13)
     1: Permission denied (os error 13)
-[exit=0]
+[py-spy exit=1]
 
 === Tier 1b: gdb -p 57344 (attach) ===
 Could not attach to process.  If your uid matches the uid of the target
@@ -1203,7 +1234,7 @@ A parent may always trace a child it creates, so py-spy is made the **parent** o
 # --native merges C frames with Python frames. Inject keystrokes during recording so the
 # input path is sampled; then show representative merged stacks (native + Python).
 set -euo pipefail
-RUNID="${1:-P3tier2}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P3tier2}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; RAW="$D/pyspy_raw.txt"
 printf 'launch python3 %s/bin/recorder.py W %s/rec.hex\n' "$HR" "$D" > "$SESS"
 export DISPLAY XAUTHORITY XDG_RUNTIME_DIR LIBGL_ALWAYS_SOFTWARE=1
@@ -1355,7 +1386,7 @@ The driver launches the canonical launcher with that `PYTHONPATH`, triggers the 
 # CLAIM SCOPE: Python-managed threads only; NO native/C frames, and pure-C OS threads
 # (e.g. the ChildMonitor I/O thread) do NOT appear -> that is why Tiers 2a/2b are needed.
 set -euo pipefail
-RUNID="${1:-P3fh}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P3fh}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 FHSITE="$HR/bin/fhsite"
 SESS="$D/session.conf"; REC="$D/rec.hex"
 printf "launch python3 %s/bin/recorder.py W %s\n" "$HR" "$REC" > "$SESS"
@@ -1363,7 +1394,7 @@ setsid env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" XDG_RUNTIME_DIR="$XDG_RUN
   LIBGL_ALWAYS_SOFTWARE=1 PYTHONPATH="$FHSITE" FH_DUMP_DIR="$D" \
   kitty/launcher/kitty --config NONE --session "$SESS" sh >"$D/kitty.log" 2>&1 &
 KPID=$!
-trap "kill -KILL -$KPID 2>/dev/null || true" EXIT
+trap 'kill -KILL -"$KPID" 2>/dev/null || true' EXIT
 sleep 3
 KEXE="$(readlink /proc/$KPID/exe 2>/dev/null || true)"
 echo "target kitty launcher: PID=$KPID exe=$KEXE"
@@ -1442,13 +1473,13 @@ The always-available in-repo facility [kitty/cli.py:L996] prints symbol-level in
 #!/usr/bin/env bash
 # P3tier4 [F-10 Tier 4]: in-repo --debug-keyboard symbol log; no tracing permission needed.
 set -euo pipefail
-RUNID="${1:-P3tier4}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P3tier4}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; REC="$D/rec.hex"
 printf "launch python3 %s/bin/recorder.py W %s\n" "$HR" "$REC" > "$SESS"
 setsid env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" LIBGL_ALWAYS_SOFTWARE=1 \
   kitty/launcher/kitty --config NONE --debug-keyboard --session "$SESS" sh >"$D/kbd.log" 2>&1 &
 KPID=$!
-trap "kill -KILL -$KPID 2>/dev/null || true" EXIT
+trap 'kill -KILL -"$KPID" 2>/dev/null || true' EXIT
 sleep 3
 WID="$(xdotool search --class kitty 2>/dev/null | sort -n | head -1 || true)"
 [ -n "$WID" ] && xdotool windowfocus "$WID" && sleep 0.3 && xdotool key --clearmodifiers a
@@ -1512,7 +1543,7 @@ Driver — two recorder windows (`W_A`, `W_B`) in a **single** OS window, `W_A` 
 # focus switch: keystrokes land only in the focused window; the unfocused window's recorder
 # is frozen (receives nothing) yet its child stays alive (unfocused != closed).
 set -uo pipefail
-RUNID="${1:-P4unfocused}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P4unfocused}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; RECA="$D/recA.hex"; RECB="$D/recB.hex"; KBD="$D/kbd.log"
 { printf "launch python3 %s/bin/recorder.py A %s\n" "$HR" "$RECA"
   printf "launch python3 %s/bin/recorder.py B %s\n" "$HR" "$RECB"; } > "$SESS"
@@ -1590,7 +1621,7 @@ Driver — type into `W_A`, close `W_A` with `close_window` (`ctrl+shift+w`, `ki
 # removed window). Two recorder windows; W_A active at load. Type into W_A, CLOSE W_A
 # (ctrl+shift+w), then type again -> the byte lands in W_B.
 set -uo pipefail
-RUNID="${1:-P4close_route}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P4close_route}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; RECA="$D/recA.hex"; RECB="$D/recB.hex"; KBD="$D/kbd.log"
 { printf "launch python3 %s/bin/recorder.py A %s\n" "$HR" "$RECA"
   printf "launch python3 %s/bin/recorder.py B %s\n" "$HR" "$RECB"; } > "$SESS"
@@ -1702,7 +1733,7 @@ Driver — type a burst `x y z` into `W_A` and *immediately* close it, racing to
 #  (3) reap_children (I/O thread) waitpid on child death
 # A burst is typed immediately before the close to try to catch queued-but-unwritten bytes.
 set -uo pipefail
-RUNID="${1:-P4close_gdb}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P4close_gdb}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; RECA="$D/recA.hex"; RECB="$D/recB.hex"; GLOG="$D/gdb.log"
 { printf "launch python3 %s/bin/recorder.py A %s\n" "$HR" "$RECA"
   printf "launch python3 %s/bin/recorder.py B %s\n" "$HR" "$RECB"; } > "$SESS"
@@ -1830,7 +1861,7 @@ run
 # contrast with per-child remove_children/cleanup_child, which run on the I/O thread
 # (see P4close_gdb).
 set -uo pipefail
-RUNID="${1:-P4oswin_close}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P4oswin_close}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; REC="$D/rec.hex"; GLOG="$D/gdb.log"
 printf "launch python3 %s/bin/recorder.py W %s\n" "$HR" "$REC" > "$SESS"
 GPID=""
@@ -2131,7 +2162,7 @@ Reproducibly (no `ptrace`), the canonical process's live OS threads and their ke
 #      (glfw-x11.so, dlopen'd via glfw-wrapper.c), the C extension (fast_data_types.so), and
 #      the Python runtime (libpython) all live in ONE process.
 set -uo pipefail
-RUNID="${1:-P5libs_threads}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P5libs_threads}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; KBD="$D/kbd.log"
 { printf "launch python3 %s/bin/recorder.py A %s/recA.hex\n" "$HR" "$D"
   printf "launch python3 %s/bin/recorder.py B %s/recB.hex\n" "$HR" "$D"
@@ -2369,7 +2400,7 @@ $ awk '/===INFO THREADS/{f=1} f{print} /===END INFO THREADS===/{exit}' "$HR/ev/P
 # proving a click re-targets by position. Also capture on_mouse_input (mouse.c:188) to show
 # the mouse path is a distinct code path from on_key_input (keys.c:166).
 set -uo pipefail
-RUNID="${1:-P5mouse}"; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
+RUNID="${1:-P5mouse}"; case "$RUNID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RUNID" >&2; exit 2;; esac; D="$HR/ev/$RUNID"; rm -rf "$D"; mkdir -p "$D"
 SESS="$D/session.conf"; RECA="$D/recA.hex"; RECB="$D/recB.hex"; KBD="$D/kbd.log"
 { printf "launch python3 %s/bin/recorder.py A %s\n" "$HR" "$RECA"
   printf "launch python3 %s/bin/recorder.py B %s\n" "$HR" "$RECB"; } > "$SESS"
@@ -2459,7 +2490,7 @@ The visible-update interval tracks `input_delay` almost exactly (`3.64≈3`, `31
 
 ### 6.2 The mechanism in the source (where `input_delay` is enforced)
 
-`input_delay` is enforced in the I/O thread's `io_loop` (coalescing the main-loop wakeups) and again on the main thread in `do_parse` (bounding the re-parse wait). The render path it feeds is `render()` → `draw_os_window` → `render_prepared_os_window` → `swap_window_buffers`. The claim in §6.1 is derived from the *measurements* below; the code here only identifies the exact functions/lines being exercised.
+`input_delay` is enforced in the I/O thread's `io_loop` (coalescing the main-loop wakeups) and again on the main thread in `do_parse` (bounding the re-parse wait). The render path it feeds is `render()` → `render_os_window` → `render_prepared_os_window` → `swap_window_buffers`. The claim in §6.1 is derived from the *measurements* below; the code here only identifies the exact functions/lines being exercised.
 
 **I/O-thread wakeup coalescing** — `io_loop` (`kitty/child-monitor.c`). When child output is read, the main loop is woken *only* if more than `input_delay` has elapsed since the last wakeup; otherwise the wakeup is deferred and the next `poll()` is bounded to the remaining window:
 
@@ -2521,7 +2552,7 @@ render(monotonic_t now, bool input_read) {
     }
 ```
 
-The actual frame is presented downstream: `render()` → `draw_os_window` (increments `w->render_calls++` at `kitty/child-monitor.c:848`) → `render_prepared_os_window` (`kitty/child-monitor.c:788`) → **`swap_window_buffers`** (`kitty/child-monitor.c:810`; defined `kitty/glfw.c:1802`) — the last is the gdb-counted frame in §6.6. Related timing levers: `repaint_delay` (default `10` ms, `kitty/options/definition.py:866`) and `sync_to_monitor` (default `yes`, `kitty/options/definition.py:889`, gating `USE_RENDER_FRAMES` at `kitty/child-monitor.c:40`).
+The actual frame is presented downstream: `render()` → `render_os_window` (increments `w->render_calls++` at `kitty/child-monitor.c:848`) → `render_prepared_os_window` (`kitty/child-monitor.c:788`) → **`swap_window_buffers`** (`kitty/child-monitor.c:810`; defined `kitty/glfw.c:1802`) — the last is the gdb-counted frame in §6.6. Related timing levers: `repaint_delay` (default `10` ms, `kitty/options/definition.py:866`) and `sync_to_monitor` (default `yes`, `kitty/options/definition.py:889`, gating `USE_RENDER_FRAMES` at `kitty/child-monitor.c:40`).
 
 
 ### 6.3 Measurement harness (published, reproducible)
@@ -2550,7 +2581,10 @@ BUILD_EXIT=0
 # burst renders WITHOUT any wall/monotonic clock matching. Producer also samples
 # kitty CPU from /proc/$PPID/stat (PPID==kitty). Fixed-duration bursty producer.
 set -u
-RID="$1"; D="$2"; BSEC="${3:-1.5}"
+RID="$1"; case "$RID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RID" >&2; exit 2;; esac; D="$2"; BSEC="${3:-1.5}"
+case "$D" in ''|*[!0-9]*) echo "FATAL: input_delay must be a non-negative integer, got '$D'" >&2; exit 2;; esac
+case "$BSEC" in ''|*[!0-9.]*|*.*.*) echo "FATAL: BSEC must be a positive number, got '$BSEC'" >&2; exit 2;; esac
+awk "BEGIN{exit !($BSEC+0>0)}" || { echo "FATAL: BSEC must be > 0, got '$BSEC'" >&2; exit 2; }
 EV="$HR/ev/$RID"; mkdir -p "$EV"
 EVLOG="$EV/producer.log"; : >"$EVLOG"
 KLOG="$EV/kitty.stderr"; : >"$KLOG"
@@ -2581,6 +2615,7 @@ setsid kitty/launcher/kitty --config NONE -o input_delay="$D" -o repaint_delay=1
     bash "$PROD" >/dev/null 2>"$KLOG" &
 KPID=$!
 for _ in $(seq 1 60); do grep -q '^Tend=' "$EVLOG" && break; sleep 0.2; done
+if ! grep -q '^Tend=' "$EVLOG"; then echo "FATAL: producer never completed (no Tend in $EVLOG); kitty likely failed to launch" >&2; exit 3; fi
 sleep 0.5
 frames=$(grep -oa 'input_read: 1,' "$KLOG" | wc -l)
 idle=$(grep -oa 'input_read: 0,' "$KLOG" | wc -l)
@@ -2604,7 +2639,10 @@ printf 'RID=%s D=%s dur=%ss lines=%s frames_input_read1=%s idle_input_read0=%s c
 # from /proc/$PPID/stat immediately before/after the burst. input_delay is set
 # canonically at launch via -o (a launch-time override, not committed to repo).
 set -u
-RID="$1"; D="$2"; BSEC="${3:-1.5}"
+RID="$1"; case "$RID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RID" >&2; exit 2;; esac; D="$2"; BSEC="${3:-1.5}"
+case "$D" in ''|*[!0-9]*) echo "FATAL: input_delay must be a non-negative integer, got '$D'" >&2; exit 2;; esac
+case "$BSEC" in ''|*[!0-9.]*|*.*.*) echo "FATAL: BSEC must be a positive number, got '$BSEC'" >&2; exit 2;; esac
+awk "BEGIN{exit !($BSEC+0>0)}" || { echo "FATAL: BSEC must be > 0, got '$BSEC'" >&2; exit 2; }
 EV="$HR/ev/$RID"; mkdir -p "$EV"
 EVLOG="$EV/producer.log"; : >"$EVLOG"
 KLOG="$EV/kitty.log"; : >"$KLOG"
@@ -2636,6 +2674,7 @@ setsid kitty/launcher/kitty --config NONE -o input_delay="$D" -o repaint_delay=1
     bash "$PROD" >"$KLOG" 2>&1 &
 KPID=$!
 for _ in $(seq 1 40); do grep -q '^Tend=' "$EVLOG" && break; sleep 0.2; done
+if ! grep -q '^Tend=' "$EVLOG"; then echo "FATAL: producer never completed (no Tend in $EVLOG); kitty likely failed to launch" >&2; exit 3; fi
 sleep 0.6
 get(){ grep -oE "\<$1=[0-9.]+" "$EVLOG" | head -1 | cut -d= -f2; }
 T0=$(get T0); utime0=$(get utime0); stime0=$(get stime0)
@@ -2658,17 +2697,32 @@ printf 'RID=%s D=%s dur=%ss lines=%s cpu_ticks=%s cpu_u=%s cpu_s=%s cpu_sec=%s\n
 # interval min/mean/max, CPU min/mean/max, mean throughput).
 set -u
 DRV="$1"; REPS="${2:-5}"; BSEC="${3:-1.5}"
+case "$DRV" in evloop|cpu|frames) ;; *) echo "FATAL: p6_orch: unknown driver '$DRV' (want evloop|cpu|frames)" >&2; exit 2;; esac
+case "$REPS" in ''|*[!0-9]*) echo "FATAL: p6_orch: REPS must be a positive integer, got '$REPS'" >&2; exit 2;; esac
+[ "$REPS" -ge 1 ] || { echo "FATAL: p6_orch: REPS must be >= 1, got '$REPS'" >&2; exit 2; }
+case "$BSEC" in ''|*[!0-9.]*|*.*.*) echo "FATAL: p6_orch: BSEC must be a positive number, got '$BSEC'" >&2; exit 2;; esac
+awk "BEGIN{exit !($BSEC+0>0)}" || { echo "FATAL: p6_orch: BSEC must be > 0, got '$BSEC'" >&2; exit 2; }
 OUT="$HR/ev/P6orch_${DRV}"; mkdir -p "$OUT"
 RES="$OUT/results.txt"; : >"$RES"
 seqf="$OUT/order.txt"; : >"$seqf"
 for D in 0 3 30 100; do for r in $(seq 1 "$REPS"); do echo "$D $r"; done; done | shuf > "$seqf"
 echo "=== randomized trial order ($(wc -l <"$seqf") trials) ==="; cat "$seqf"
 echo "=== per-run results ==="
+orch_fail=0; orch_ok=0
 while read -r D r; do
   rid="P6${DRV}_d${D}_r${r}"
-  line=$(timeout 90 bash "$HR/bin/p6_${DRV}.sh" "$rid" "$D" "$BSEC" 2>&1 | tail -1)
+  raw="$OUT/raw_${D}_r${r}.log"
+  timeout 90 bash "$HR/bin/p6_${DRV}.sh" "$rid" "$D" "$BSEC" >"$raw" 2>&1; st=$?
+  line=$(tail -1 "$raw")
   echo "$line" | tee -a "$RES"
+  if [ "$st" -ne 0 ] || ! printf '%s\n' "$line" | grep -q '^RID='; then
+    echo "WARN: p6_orch trial $rid failed (exit=$st)" >&2; orch_fail=$((orch_fail+1))
+  else
+    orch_ok=$((orch_ok+1))
+  fi
 done < "$seqf"
+if [ "$orch_ok" -eq 0 ]; then echo "FATAL: p6_orch: no successful trials for driver '$DRV' ($orch_fail failed)" >&2; exit 3; fi
+if [ "$orch_fail" -ne 0 ]; then echo "FATAL: p6_orch: $orch_fail of $((orch_ok+orch_fail)) trials failed for driver '$DRV'" >&2; exit 3; fi
 echo "=== SUMMARY per input_delay ==="
 awk '{
   delete v; for(i=1;i<=NF;i++){split($i,a,"=");v[a[1]]=a[2]}
@@ -2855,7 +2909,10 @@ quit
 # absolute frame count is compressed vs a clean run, but the RELATIVE trend
 # across input_delay is preserved (stated as a caveat in the doc).
 set -u
-RID="$1"; D="$2"; BSEC="${3:-1.5}"
+RID="$1"; case "$RID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RID" >&2; exit 2;; esac; D="$2"; BSEC="${3:-1.5}"
+case "$D" in ''|*[!0-9]*) echo "FATAL: input_delay must be a non-negative integer, got '$D'" >&2; exit 2;; esac
+case "$BSEC" in ''|*[!0-9.]*|*.*.*) echo "FATAL: BSEC must be a positive number, got '$BSEC'" >&2; exit 2;; esac
+awk "BEGIN{exit !($BSEC+0>0)}" || { echo "FATAL: BSEC must be > 0, got '$BSEC'" >&2; exit 2; }
 EV="$HR/ev/$RID"; mkdir -p "$EV"
 EVLOG="$EV/producer.log"; : >"$EVLOG"
 GLOG="$EV/gdb.log"; : >"$GLOG"
@@ -2888,6 +2945,7 @@ setsid gdb -batch -x "$HR/bin/g_frames.gdb" \
 GPID=$!
 for _ in $(seq 1 60); do grep -q '^Tend=' "$EVLOG" && break; sleep 0.2; done
 for _ in $(seq 1 40); do grep -q '^SWAPS=' "$GLOG" && break; sleep 0.2; done
+if ! grep -q '^Tend=' "$EVLOG" || ! grep -q '^SWAPS=' "$GLOG"; then echo "FATAL: frames producer/gdb never completed (missing Tend or SWAPS); launch likely failed" >&2; exit 3; fi
 sleep 0.3
 T0=$(grep -oE '\<T0=[0-9.]+' "$EVLOG" | head -1 | cut -d= -f2)
 Tend=$(grep -oE '\<Tend=[0-9.]+' "$EVLOG" | head -1 | cut -d= -f2)
@@ -2973,6 +3031,7 @@ Rule "exercise every condition the question implies" requires the secondary key 
 # XTEST events to the focused window); routing PATH is the canonical path.
 set -u
 RID="${1:-P6edge}"
+case "$RID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RID" >&2; exit 2;; esac
 EV="$HR/ev/$RID"; mkdir -p "$EV"
 KLOG="$EV/kbd.log"; : >"$KLOG"
 REC="$EV/rec.log"; : >"$REC"
@@ -2989,6 +3048,7 @@ for _ in $(seq 1 30); do
   [ -n "$WID" ] && break; sleep 0.3
 done
 echo "KPID=$KPID WID=$WID"
+if [ -z "$WID" ]; then echo "FATAL: kitty window never appeared (WID empty); launch likely failed" >&2; exit 3; fi
 foc(){ xdotool windowfocus "$WID" 2>/dev/null; sleep 0.2; }
 foc; echo "getwindowfocus=$(xdotool getwindowfocus)  (expect $WID)"
 xset r on 2>/dev/null; xset r rate 180 40 2>/dev/null
@@ -3075,6 +3135,7 @@ The complementary edge is the **DECARM-off** branch at `keys.c:243`–`246`: whe
 # off", keys.c:244) instead of sending them to the child.
 set -u
 RID="${1:-P6decarm}"
+case "$RID" in ''|.|*..*|*[!A-Za-z0-9._-]*) echo "FATAL: unsafe run id: $RID" >&2; exit 2;; esac
 EV="$HR/ev/$RID"; mkdir -p "$EV"
 KLOG="$EV/kbd.log"; : >"$KLOG"; REC="$EV/rec.log"; : >"$REC"
 KPID=""
@@ -3087,6 +3148,7 @@ KPID=$!
 WID=""
 for _ in $(seq 1 30); do grep -q '^START ' "$REC" && WID="$(xdotool search --class kitty | head -1)"; [ -n "$WID" ] && break; sleep 0.3; done
 echo "KPID=$KPID WID=$WID"
+if [ -z "$WID" ]; then echo "FATAL: kitty window never appeared (WID empty); launch likely failed" >&2; exit 3; fi
 xdotool windowfocus "$WID" 2>/dev/null; sleep 0.2
 xset r on 2>/dev/null; xset r rate 180 40 2>/dev/null
 echo "--- hold key b ~0.9s with DECARM OFF [expect PRESS sent, REPEATs DISCARDED] ---"
