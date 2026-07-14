@@ -648,7 +648,7 @@ A graphics reply is dispatched as an APC sequence onto the shared output buffer:
 if (response != NULL) write_escape_code_to_child(self, ESC_APC, response);
 ```
 
-`write_escape_code_to_child` (`kitty/screen.c:979`) prepends the APC introducer (`"\033_"`, `:970`) and calls `schedule_write_to_child`, so a graphics `OK`/error reply is subject to the **same** 100 MiB cap and `POLLOUT` draining as any other output. There is **no** graphics-specific write prioritization. (Evidence F uses DA2 replies, which travel this identical path.)
+`write_escape_code_to_child` (`kitty/screen.c:979`) prepends the APC introducer (`"\033_"`, `:971`) and calls `schedule_write_to_child`, so a graphics `OK`/error reply is subject to the **same** 100 MiB cap and `POLLOUT` draining as any other output. There is **no** graphics-specific write prioritization. (Evidence F uses DA2 replies, which travel this identical path.)
 
 ---
 
@@ -886,7 +886,7 @@ C4-post-2s     dt_from_pause=+3.000 resp=b'\x1b[?2026;2$y'
 - `kitty/graphics.c:631-634` — `initialize_load_data` sets `start_command = *g`; `:717` — `start_command.id = iid`.
 - `kitty/graphics.c:759` — `finish_command_response`; `:762-764` — `q=` suppression; `:765` — needs `g->id || g->image_number`; `:2177`/`:2180` — transmit reply uses `lg = &start_command`.
 - `kitty/graphics.c:1570-1573` — frame cache `storage_limit*5`: reclaim (`:1571`) → recheck (`:1572`) → `ENOSPC` (`:1573`); `:2197-2198` — `ENOENT` on an animation command for a missing image (`:2199` starts the `else`).
-- `kitty/screen.c:970` `ESC_APC` prefix `"\033_"`; `:979` `write_escape_code_to_child`; `:1050` graphics reply onto shared output path; `:2128` DA2 reply (`>1;PRIMARY;SECONDARYc`).
+- `kitty/screen.c:970` `ESC_APC` case, `:971` prefix `"\033_"`; `:979` `write_escape_code_to_child`; `:1050` graphics reply onto shared output path; `:2128` DA2 reply (`>1;PRIMARY;SECONDARYc`).
 - `kitty/screen.c:1174-1176` pending-mode already-current `log_error`; `:2237-2238` DECRQM `PENDING_UPDATE` status; `:2489-2490` auto-unpause; `:2506` `screen_pause_rendering`; `:2521` default 2000 ms; `kitty/child-monitor.c:729` render-loop `screen_check_pause_rendering` caller.
 
 **Config defaults, constants, docs, tests:**
