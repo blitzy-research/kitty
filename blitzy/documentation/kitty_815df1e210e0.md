@@ -361,20 +361,23 @@ $SCRATCH/clean815$ ldd kitty/launcher/kitty | grep -i python
 
 $SCRATCH/clean815$ readelf -W --dyn-syms kitty/launcher/kitty | \
     grep -oE 'Py_(PreInitialize|InitializeFromConfig|RunMain|ExitStatusException)|PyConfig_[A-Za-z]+|PyStatus_[A-Za-z]+' | sort -u
-Py_ExitStatusException
-Py_InitializeFromConfig
-Py_PreInitialize
-Py_RunMain
+PyConfig_Clear
 PyConfig_InitPythonConfig
 PyConfig_SetBytesArgv
 PyConfig_SetBytesString
 PyStatus_Exception
 PyStatus_IsExit
+Py_ExitStatusException
+Py_InitializeFromConfig
+Py_PreInitialize
+Py_RunMain
 ```
 
 Source order of those symbols in the launcher: `Py_PreInitialize` (`main.c:190`) →
 `PyConfig_InitPythonConfig` (`main.c:193`) → `Py_InitializeFromConfig` (`main.c:211`) →
-`Py_RunMain` (`main.c:216`). The `libpython3.12` link and the imported symbols are
+`Py_RunMain` (`main.c:216`); `PyConfig_Clear` then releases the config struct after a
+successful init (`main.c:213`) and again on the error path (`main.c:218`). The `libpython3.12`
+link and the imported symbols are
 `OBSERVED`; the internal control flow inside `main.c` is `INFERRED` from source.
 
 #### 2. CPython-side dispatch — `kitty/entry_points.py` · `observed-effect + inferred-correlation`
