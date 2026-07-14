@@ -264,8 +264,8 @@ $ git merge-base --is-ancestor 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD && 
 subject commit is an ancestor of HEAD
 
 $ git diff --stat 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
- blitzy/documentation/kitty_815df1e210e0.md | 1796 ++++++++++++++++++++++++++++
- 1 file changed, 1796 insertions(+)
+ blitzy/documentation/kitty_815df1e210e0.md | 2099 ++++++++++++++++++++++++++++
+ 1 file changed, 2099 insertions(+)
 
 $ git status --porcelain      # after the rebuild and both observation runs
                               # (empty output = clean working tree; artifacts are gitignored)
@@ -428,7 +428,7 @@ In the per-codepoint draw loop (inside `screen_draw_text`), a codepoint classifi
 - `is_combining_char(ch)` (`kitty/unicode-data.c:L11`) is **true** for ZWJ `U+200D` (see Section 7), so ZWJ takes the combining branch and is handed to `draw_combining_char` — it is **appended**, never allocated a new cell.
 - **Exception visible in this same snippet — regional-indicator flags.** A flag codepoint (`is_flag_codepoint`, `U+1F1E6..U+1F1FF`) takes the `draw_second_flag_codepoint` branch, which `continue`s (appends) **only if it pairs** with a pending first flag; the **first/unpaired** flag returns `false` there and *falls through* to normal base placement, taking its **own cell** (observed in §7.7). So the append-without-a-new-cell behaviour holds for ZWJ and the variation selectors but **not** for the first regional indicator.
 
-`draw_combining_char` (`kitty/screen.c:L663-L710`) locates the "previous" cell — the cell at `cursor->x - 1` on the current row, or, when the cursor is at column 0, the **last column of the previous row** (`ypos = cursor->y - 1`, `xpos = columns - 1`) — and then calls `line_add_combining_char(cp, gp, ch, xpos)` to append the codepoint into that base's slots. (The complete function body, including the VS16/VS15 width-flip branches, is shown and analysed in **Section 7.5**; it is not excerpted here to avoid eliding any logic.) In the family stream each ZWJ arrives while the cursor is at `x=2` (just past a width-2 base occupying the single column), so `xpos = 1` — the position of the base's *trailing* half. `line_add_combining_char` finds that trailing half empty but sees that the cell to its left is a width-2 base, so it **retargets** the append onto the base itself (the `x > 0 && width == 2 && cpu_cells[x-1].ch` guard, §4.2). This is why the observed cell shows `['U+1F468', 'U+200D']` — the ZWJ landed in the Man base's first combining slot — with the cursor unchanged at `x=2`.
+`draw_combining_char` (`kitty/screen.c:L663-L702`) locates the "previous" cell — the cell at `cursor->x - 1` on the current row, or, when the cursor is at column 0, the **last column of the previous row** (`ypos = cursor->y - 1`, `xpos = columns - 1`) — and then calls `line_add_combining_char(cp, gp, ch, xpos)` to append the codepoint into that base's slots. (The complete function body, including the VS16/VS15 width-flip branches, is shown and analysed in **Section 7.5**; it is not excerpted here to avoid eliding any logic.) In the family stream each ZWJ arrives while the cursor is at `x=2` (just past a width-2 base occupying the single column), so `xpos = 1` — the position of the base's *trailing* half. `line_add_combining_char` finds that trailing half empty but sees that the cell to its left is a width-2 base, so it **retargets** the append onto the base itself (the `x > 0 && width == 2 && cpu_cells[x-1].ch` guard, §4.2). This is why the observed cell shows `['U+1F468', 'U+200D']` — the ZWJ landed in the Man base's first combining slot — with the cursor unchanged at `x=2`.
 
 ### 4.4 What actually happens to each width-2 base: autowrap into history (not in-place overwrite)
 
@@ -795,7 +795,7 @@ Three qualifications keep this answer precise and prevent it from being misread:
 
 ### 6.1 The DSR/CPR code and the bottom-row column adjustment
 
-`CSI 6 n` (Device Status Report — cursor position) is handled by `report_device_status` — `kitty/screen.c:L2179-L2199`:
+`CSI 6 n` (Device Status Report — cursor position) is handled by `report_device_status` — `kitty/screen.c:L2179-L2200`:
 
 ```c
 report_device_status(Screen *self, unsigned int which, bool private) {
@@ -963,7 +963,7 @@ These three facts (each grounded in code) are what route a ZWJ into a combining 
 
 ### 7.5 Variation-selector width flips (and how they change the state report)
 
-Because the variation selectors are combining, they reach `draw_combining_char` (`kitty/screen.c:L663-L710`), which contains two special branches that **mutate the base cell's effective width** — and therefore the cursor column that `CSI 6 n` later echoes:
+Because the variation selectors are combining, they reach `draw_combining_char` (`kitty/screen.c:L663-L702`), which contains two special branches that **mutate the base cell's effective width** — and therefore the cursor column that `CSI 6 n` later echoes:
 
 - **VS16 `U+FE0F` (emoji presentation) widens** a default text-presentation emoji to width 2 (branch `if (ch == 0xfe0f)` at `kitty/screen.c:L679`). Its precondition — `gpu_cell->attrs.width != 2 && cpu_cell->cc_idx[0] == VS16 && is_emoji_presentation_base(...)` — is at `kitty/screen.c:L682`; on success it sets `gpu_cell->attrs.width = 2` (`L683`); if there is a spare column (`xpos + 1 < self->columns`, `L684`) it zeroes the next cell and does `self->cursor->x++` (`L687`), **otherwise** it calls `move_widened_char` (`L688`, defined at `kitty/screen.c:L575`) and the cursor is **not** incremented.
 - **VS15 `U+FE0E` (text presentation) narrows** to width 1 (branch `else if (ch == 0xfe0e)` at `kitty/screen.c:L690`). Its precondition — crucially `gpu_cell->attrs.width == 2 && cpu_cell->cc_idx[0] == VS15 && is_emoji_presentation_base(...)` — is at `kitty/screen.c:L696`; on success it sets `attrs.width = 1` (`L697`) and does `self->cursor->x--` (`L698`).
