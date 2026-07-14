@@ -79,39 +79,42 @@ def main():
     log('# OBJ-1 child pid=%d' % os.getpid())
     old = None
     try:
-        old = termios.tcgetattr(0)
-        tty.setraw(0)                      # raw: no ICANON so nothing is line-buffered
-        log('# stdin set to raw mode')
-    except Exception as e:
-        log('# raw mode unavailable: %r' % e)
-    # 100x100 RGB image (30000 raw bytes -> 40000 base64) makes each command large and
-    # its dispatch (base64 decode + image store) slower than the read, so read.sz climbs.
-    raw = b'a' * (100 * 100 * 3)
-    img = base64.standard_b64encode(raw).decode('ascii')
-    cmd = ('\033_Gi=2,a=t,q=2,s=100,v=100,f=24;' + img + '\033\\').encode('ascii')
-    log('# per-command bytes=%d (quiet=2 => no responses)' % len(cmd))
-    log('# attach window: sleeping 5s for strace to attach')
-    time.sleep(5)
-    log('# FLOOD start duration=%.1fs' % DURATION)
-    t0 = time.time(); n = 0; max_write_ms = 0.0; stalls = 0; last = t0
-    end = t0 + DURATION
-    while time.time() < end:
-        w0 = time.time()
-        os.write(1, cmd)               # blocks when kitty de-arms POLLIN and PTY fills
-        dw = (time.time() - w0) * 1000.0
-        if dw > max_write_ms: max_write_ms = dw
-        if dw > 50.0: stalls += 1
-        n += 1
-        now = time.time()
-        if now - last >= 1.0:
-            log('# t=%5.2fs cmds=%d max_write=%.1fms stalls>50ms=%d' % (now - t0, n, max_write_ms, stalls))
-            last = now
-    log('# FLOOD done cmds=%d elapsed=%.2fs max_single_write=%.1fms stalls>50ms=%d'
-        % (n, time.time() - t0, max_write_ms, stalls))
-    try:
-        if old is not None: termios.tcsetattr(0, termios.TCSANOW, old)
-    except Exception: pass
-    log('# OBJ-1 child exiting')
+        try:
+            old = termios.tcgetattr(0)
+            tty.setraw(0)                      # raw: no ICANON so nothing is line-buffered
+            log('# stdin set to raw mode')
+        except Exception as e:
+            log('# raw mode unavailable: %r' % e)
+        # 100x100 RGB image (30000 raw bytes -> 40000 base64) makes each command large and
+        # its dispatch (base64 decode + image store) slower than the read, so read.sz climbs.
+        raw = b'a' * (100 * 100 * 3)
+        img = base64.standard_b64encode(raw).decode('ascii')
+        cmd = ('\033_Gi=2,a=t,q=2,s=100,v=100,f=24;' + img + '\033\\').encode('ascii')
+        log('# per-command bytes=%d (quiet=2 => no responses)' % len(cmd))
+        log('# attach window: sleeping 5s for strace to attach')
+        time.sleep(5)
+        log('# FLOOD start duration=%.1fs' % DURATION)
+        t0 = time.time(); n = 0; max_write_ms = 0.0; stalls = 0; last = t0
+        end = t0 + DURATION
+        while time.time() < end:
+            w0 = time.time()
+            os.write(1, cmd)               # blocks when kitty de-arms POLLIN and PTY fills
+            dw = (time.time() - w0) * 1000.0
+            if dw > max_write_ms: max_write_ms = dw
+            if dw > 50.0: stalls += 1
+            n += 1
+            now = time.time()
+            if now - last >= 1.0:
+                log('# t=%5.2fs cmds=%d max_write=%.1fms stalls>50ms=%d' % (now - t0, n, max_write_ms, stalls))
+                last = now
+        log('# FLOOD done cmds=%d elapsed=%.2fs max_single_write=%.1fms stalls>50ms=%d'
+            % (n, time.time() - t0, max_write_ms, stalls))
+    finally:
+        # try/finally guarantees the tty is restored even if the body raises.
+        try:
+            if old is not None: termios.tcsetattr(0, termios.TCSANOW, old)
+        except Exception: pass
+        log('# OBJ-1 child exiting')
 
 if __name__ == '__main__':
     main()
@@ -281,80 +284,91 @@ def drain_available(recv, budget=0.0):
         recv += d
 
 def main():
+    # Fail fast and loudly on invalid input rather than silently succeeding: an
+    # unrecognised MODE (or CMDTYPE) prints a clear error and exits non-zero.
+    VALID_MODES = ('control', 'retention', 'eagain', 'cap')
+    if MODE not in VALID_MODES:
+        sys.stderr.write('unknown MODE %r (expected %s)\n' % (MODE, '|'.join(VALID_MODES)))
+        sys.exit(2)
+    CMDTYPE = sys.argv[4] if len(sys.argv) > 4 else 'ok'
+    if CMDTYPE not in ('ok', 'einval'):
+        sys.stderr.write('unknown CMDTYPE %r (expected ok|einval)\n' % CMDTYPE)
+        sys.exit(2)
     log('# OBJ-2 child pid=%d mode=%s N=%d' % (os.getpid(), MODE, N))
     old = None
     try:
-        old = termios.tcgetattr(0); tty.setraw(0)
-        log('# stdin set to raw mode')
-    except Exception as e:
-        log('# raw mode unavailable: %r' % e)
-    CMDTYPE = sys.argv[4] if len(sys.argv) > 4 else 'ok'
-    if CMDTYPE == 'einval':
-        # Declare a 100x100 RGB image (expects 30000 bytes) but send only 3 bytes:
-        # kitty rejects with a long EINVAL "Image dimensions ... do not match data size"
-        # response (~85 bytes) -> accumulates write_buf ~8x faster than the 11-byte OK.
-        px  = base64.standard_b64encode(b'\x00\x00\x00').decode('ascii')
-        cmd = ('\033_Gi=123456,I=123456,p=123456,a=t,s=9999,v=9999,f=24;' + px + '\033\\').encode('ascii')
-        log('# per-command bytes=%d (non-quiet dimension-mismatch => ~80-byte ENODATA response)' % len(cmd))
-    else:
-        px  = base64.standard_b64encode(b'\x00\x00\x00').decode('ascii')
-        cmd = ('\033_Gi=2,a=t,s=1,v=1,f=24;' + px + '\033\\').encode('ascii')
-        log('# per-command bytes=%d (non-quiet => 11-byte ;OK response each)' % len(cmd))
-    time.sleep(3)   # attach window
+        try:
+            old = termios.tcgetattr(0); tty.setraw(0)
+            log('# stdin set to raw mode')
+        except Exception as e:
+            log('# raw mode unavailable: %r' % e)
+        if CMDTYPE == 'einval':
+            # Declare a 100x100 RGB image (expects 30000 bytes) but send only 3 bytes:
+            # kitty rejects with a long EINVAL "Image dimensions ... do not match data size"
+            # response (~85 bytes) -> accumulates write_buf ~8x faster than the 11-byte OK.
+            px  = base64.standard_b64encode(b'\x00\x00\x00').decode('ascii')
+            cmd = ('\033_Gi=123456,I=123456,p=123456,a=t,s=9999,v=9999,f=24;' + px + '\033\\').encode('ascii')
+            log('# per-command bytes=%d (non-quiet dimension-mismatch => ~80-byte ENODATA response)' % len(cmd))
+        else:
+            px  = base64.standard_b64encode(b'\x00\x00\x00').decode('ascii')
+            cmd = ('\033_Gi=2,a=t,s=1,v=1,f=24;' + px + '\033\\').encode('ascii')
+            log('# per-command bytes=%d (non-quiet => 11-byte ;OK response each)' % len(cmd))
+        time.sleep(3)   # attach window
 
-    if MODE == 'control':
-        recv = bytearray(); sent = 0
-        for i in range(N):
-            os.write(1, cmd); sent += 1
-            drain_available(recv)                 # keep up continuously
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            drain_available(recv, 0.2)
-            if recv.count(b';OK') >= sent: break
-        log('# CONTROL sent=%d received_OK=%d' % (sent, recv.count(b';OK')))
+        if MODE == 'control':
+            recv = bytearray(); sent = 0
+            for i in range(N):
+                os.write(1, cmd); sent += 1
+                drain_available(recv)                 # keep up continuously
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                drain_available(recv, 0.2)
+                if recv.count(b';OK') >= sent: break
+            log('# CONTROL sent=%d received_OK=%d' % (sent, recv.count(b';OK')))
 
-    elif MODE == 'retention':
-        sent = 0
-        for i in range(N):
-            os.write(1, cmd); sent += 1           # blocking writes; back-pressure OK
-        log('# RETENTION burst done sent=%d; write_buf accumulated during stall' % sent)
-        time.sleep(2)                             # hold the stall
-        recv = bytearray(); deadline = time.time() + 25
-        while time.time() < deadline:
-            drain_available(recv, 0.2)
-            if recv.count(b';OK') >= sent: break
-        log('# RETENTION sent=%d received_OK=%d (equal => all retained/delivered)'
-            % (sent, recv.count(b';OK')))
+        elif MODE == 'retention':
+            sent = 0
+            for i in range(N):
+                os.write(1, cmd); sent += 1           # blocking writes; back-pressure OK
+            log('# RETENTION burst done sent=%d; write_buf accumulated during stall' % sent)
+            time.sleep(2)                             # hold the stall
+            recv = bytearray(); deadline = time.time() + 25
+            while time.time() < deadline:
+                drain_available(recv, 0.2)
+                if recv.count(b';OK') >= sent: break
+            log('# RETENTION sent=%d received_OK=%d (equal => all retained/delivered)'
+                % (sent, recv.count(b';OK')))
 
-    elif MODE == 'eagain':
-        for i in range(N):
-            os.write(1, cmd)
-        log('# EAGAIN burst done sent=%d; now slow drip-read (128B / 30ms)' % N)
-        total = 0; end = time.time() + 35
-        while time.time() < end:
-            r, _, _ = select.select([0], [], [], 0)
-            if r:
-                d = os.read(0, 128)               # drip
-                if d: total += len(d)
-            time.sleep(0.03)
-        log('# EAGAIN slow-drain read %d bytes total' % total)
+        elif MODE == 'eagain':
+            for i in range(N):
+                os.write(1, cmd)
+            log('# EAGAIN burst done sent=%d; now slow drip-read (128B / 30ms)' % N)
+            total = 0; end = time.time() + 35
+            while time.time() < end:
+                r, _, _ = select.select([0], [], [], 0)
+                if r:
+                    d = os.read(0, 128)               # drip
+                    if d: total += len(d)
+                time.sleep(0.03)
+            log('# EAGAIN slow-drain read %d bytes total' % total)
 
-    elif MODE == 'cap':
-        log('# CAP flood start (never reading; driver watches stderr for the cap log)')
-        n = 0; t0 = time.time(); last = t0
-        while True:
-            for _ in range(500):
-                os.write(1, cmd); n += 1
-            time.sleep(0.01)          # throttle to ~50k cmds/s so post-cap logging is catchable
-            now = time.time()
-            if now - last >= 2.0:
-                log('# CAP t=%.1fs sent=%d rate=%.0f/s' % (now - t0, n, n / (now - t0)))
-                last = now
-
-    try:
-        if old is not None: termios.tcsetattr(0, termios.TCSANOW, old)
-    except Exception: pass
-    log('# OBJ-2 child exiting mode=%s' % MODE)
+        elif MODE == 'cap':
+            log('# CAP flood start (never reading; driver watches stderr for the cap log)')
+            n = 0; t0 = time.time(); last = t0
+            while True:
+                for _ in range(500):
+                    os.write(1, cmd); n += 1
+                time.sleep(0.01)          # throttle to ~50k cmds/s so post-cap logging is catchable
+                now = time.time()
+                if now - last >= 2.0:
+                    log('# CAP t=%.1fs sent=%d rate=%.0f/s' % (now - t0, n, n / (now - t0)))
+                    last = now
+    finally:
+        # try/finally guarantees the tty is restored even if the body raises.
+        try:
+            if old is not None: termios.tcsetattr(0, termios.TCSANOW, old)
+        except Exception: pass
+        log('# OBJ-2 child exiting mode=%s' % MODE)
 
 if __name__ == '__main__':
     main()
@@ -371,6 +385,18 @@ $LAUNCH python3 obj2_child.py "$LOG" eagain    60000            # exit status: 0
 timeout 55 strace -tt -p "$TID" -e trace=write -o "$STRACE"     # exit status: 0
 $LAUNCH python3 obj2_child.py "$LOG" cap 0 einval               # driver SIGKILLs on first cap log
 ```
+
+The `cap`‑mode **driver** referenced on the last line is this small wrapper — it launches the cap child, blocks until the **first** 100 MiB cap log appears on kitty's stderr, then `SIGKILL`s **only** the kitty PID (letting `xvfb-run` run its own cleanup, so no `Xvfb` is orphaned), keeping the run bounded. It reaps by specific PID and never uses `pkill`:
+```bash
+ERR="$WS/cap.stderr"
+$LAUNCH python3 obj2_child.py "$LOG" cap 0 einval >/dev/null 2>"$ERR" &
+WRAP=$!
+tail -n +1 -f "$ERR" | grep -q -m1 'Too much data being sent to child'  # block until 1st cap log
+kill -KILL "$(pgrep -x kitty | head -1)" 2>/dev/null   # SIGKILL the specific kitty pid only
+wait "$WRAP" 2>/dev/null                               # xvfb-run cleans up Xvfb; reap the wrapper
+grep -m1 'Too much data being sent to child' "$ERR"    # -> the (b.4) cap log line
+```
+Re‑running this fresh reproduced the (b.4) cap log (`id=1`, `t≈30s`): run 1 `[30.030]`, run 2 `[30.011]` — corroborating the `[30.038]`/`[30.230]` in (b.4) — and bounded the output to a few hundred cap lines (`524`/`549` here; the exact count is only a function of detect‑then‑`SIGKILL` latency, cf. the `60`/`47` first captured in (b.4)), versus `7,417,872` for an unbounded run. No `kitty`/`Xvfb` process was left behind.
 
 **(b.1) Retention — before / during / after.** The child bursts 50,000 commands **without reading**, so kitty's `;OK` replies accumulate in `screen->write_buf`; it then drains and counts. Complete child log (run 1, unedited):
 ```
@@ -869,6 +895,7 @@ kitty's response to pressure is a **mix**: the flow‑control adaptations on the
 - Path B OBJ‑1 (read pause): `timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" ./kitty/launcher/kitty --config NONE -o confirm_os_window_close=0 python3 obj1_child.py "$LOG" 20`, with `timeout 30 strace -tt -p "$TID" -e trace=poll,read -o "$STRACE"` on the `KittyChildMon` TID.
 - Path B OBJ‑2 (retention/control/eagain/cap): the same launcher pattern running `obj2_child.py "$LOG" MODE N`, where `MODE` is one of `retention`/`control`/`eagain`/`cap` and `N` is the burst count (the four concrete calls with their literal arguments are listed in §(b)); with `timeout 55 strace -tt -p "$TID" -e trace=write -o "$STRACE"` for the `eagain` mode; the `cap` mode driver `SIGKILL`s kitty on the first cap log.
 - `$WS` is the isolated build workspace; `$TID` is located via `for t in /proc/$(pgrep -x kitty)/task/*; do [ "$(cat $t/comm)" = KittyChildMon ] && basename $t; done`.
+- **Path B exit status — the launcher masks the child.** Under Path B the probe runs *inside* kitty, and the `kitty` launcher **exits `0` regardless of the child's exit code**; the `exit status: 0` annotated on the Path B commands above is therefore kitty's, not the child's. Path B success is judged from the child **LOG contents** (e.g. `RETENTION sent=50000 received_OK=50000`, the `FLOOD done …` line), not the launcher's exit code. Run **standalone** (outside the launcher) each probe instead exits **non‑zero** on invalid input: an unrecognised `MODE`/`CMDTYPE` in `obj2_child.py` exits `2`, and a non‑numeric `N`/`DURATION` exits `1`.
 
 **Scale and stability (≥2 runs each).**
 - OBJ‑1 read pause: two 20 s floods; max parser occupancy `1,047,076` B and `1,047,821` B (both ≈ `BUF_SZ` = `1048576`); `POLLIN`→`0` de‑arm observed in both.
