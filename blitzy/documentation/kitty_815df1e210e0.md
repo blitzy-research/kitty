@@ -220,7 +220,7 @@ $ cat /tmp/k.err      # STDERR
 
 **Source authority.** The GL line uses `printf(...)` -> **stdout** `[kitty/gl.c:72]`. The other three use stderr: `OS Window created` via the `debug` macro (`#define debug debug_rendering` `[kitty/glfw.c:34]`) which routes to `fprintf(stderr, ...)` `[kitty/logging.c:56,61]`; the systemd line via `log_error(...)` `[kitty/systemd.c:87]` (same stderr path); and `Child launched` via `print(..., file=sys.stderr)` `[kitty/window.py:871]`.
 
-**Interpretation.** By **timestamp** (monotonic seconds since start, `monotonic_t_to_s_double(monotonic())` `[kitty/gl.c:72]`) the true event order is **GL context `0.183` -> OS Window created `0.251` -> systemd attempt `0.263` -> Child launched `0.266`**. In the merged pipe the GL line appears *last* only because **stdout is block-buffered when piped** (flushed at process exit) whereas **stderr is unbuffered**; the ordering is a buffering artifact, not evidence of thread ordering. (`--debug-gl` is a pure alias of `--debug-rendering`; both names are defined together with `type=bool-set` `[kitty/cli.py:989]`.)
+**Interpretation.** By **timestamp** (monotonic seconds since start, `monotonic_t_to_s_double(monotonic())` `[kitty/gl.c:72]`) the true event order is **GL context `0.183` -> OS Window created `0.251` -> systemd attempt `0.263` -> Child launched `0.266`**. In the merged pipe the GL line appears *last* only because **stdout is block-buffered when piped** (flushed at process exit) whereas **stderr is unbuffered**; the ordering is a buffering artifact, not evidence of thread ordering. (`--debug-gl` is a pure alias of `--debug-rendering`; both names are defined together with `type=bool-set` `[kitty/cli.py:989-990]`.)
 
 ### 2.2 Subsystem-by-subsystem, with the exact emitter and true position
 
@@ -228,13 +228,13 @@ $ cat /tmp/k.err      # STDERR
 
 **(2) Python bootstrap / mode dispatch.** `entry_points.main()` `[kitty/entry_points.py:183]` is the first Python function; it looks `sys.argv[1]` up in the `entry_points` table `[kitty/entry_points.py:151]` and, for the default GUI invocation, calls `from kitty.main import main as kitty_main; kitty_main()`. *(The exact branch is `(inferred)`; it must have been taken, because the GUI window and GL context below exist only on that path.)*
 
-**(3) GUI init and OS-window creation.** `kitty.main.main()` `[kitty/main.py:524]` initialises GLFW through `init_glfw_module()` `[kitty/main.py:90]` -> `glfw_init(...)` `[kitty/main.py:91]` with the backend chosen by `init_glfw()` `[kitty/main.py:95]` (here **x11**), then runs `_run_app()` `[kitty/main.py:202]`. Inside `_run_app`, in source order: the startup **sessions are prepared** by `create_sessions(...)` `[kitty/main.py:214]`; then the **OS window is created** by `create_os_window(...)` `[kitty/main.py:220-224]` (passing the `load_all_shaders` callback, so shader programs are built here).
+**(3) GUI init and OS-window creation.** `kitty.main.main()` `[kitty/main.py:524]` initialises GLFW through `init_glfw_module()` `[kitty/main.py:90]` -> `glfw_init(...)` `[kitty/main.py:91]` with the backend chosen by `init_glfw()` `[kitty/main.py:95]` (here **x11**), then runs `_run_app()` `[kitty/main.py:202]`. Inside `_run_app`, in source order: the startup **sessions are prepared** by `create_sessions(...)` `[kitty/main.py:214]`; then the **OS window is created** by `create_os_window(...)` `[kitty/main.py:221-225]` (passing the `load_all_shaders` callback, so shader programs are built here).
 
 **(4) OpenGL context (emitted first) and the `OS Window created` completion marker.** Window creation runs `if (is_first_window) gl_init();` `[kitty/glfw.c:1212]`, and `gl_init()` is what prints the `GL version string` line `[kitty/gl.c:72]` -- hence its earliest timestamp. The literal string `OS Window created` is emitted by `debug("OS Window created\n")` `[kitty/glfw.c:1321]` at the **very end** of the same window-creation function, *after* `gl_init`. So the GL line genuinely precedes the `OS Window created` marker in both timestamp and source causality; the marker is a *completion* signal for window setup, not the first thing that happens.
 
-**(5) Boss controller -- constructed after the window exists.** Only after the window is created does `_run_app` construct `boss = Boss(opts, args, cached_values, global_shortcuts, talk_fd)` `[kitty/main.py:225]` (`class Boss` `[kitty/boss.py:323]`) and call `boss.start(window_id, startup_sessions)` `[kitty/main.py:226]`. Boss therefore does **not** create the initial OS window or the sessions (both already exist); `Boss.start()` `[kitty/boss.py:1181]` **starts monitoring and launches the first child into the existing window/session**: it calls `self.child_monitor.start()` `[kitty/boss.py:1183]` and then `self.startup_first_child(first_os_window_id, startup_sessions=startup_sessions)` `[kitty/boss.py:1194]`. *(Boss emits no `--debug-rendering` line; its effect -- a forked child whose bytes are drawn -- is observed via `Child launched` and the rendered screen in Q3/Q4.)*
+**(5) Boss controller -- constructed after the window exists.** Only after the window is created does `_run_app` construct `boss = Boss(opts, args, cached_values, global_shortcuts, talk_fd)` `[kitty/main.py:226]` (`class Boss` `[kitty/boss.py:323]`) and call `boss.start(window_id, startup_sessions)` `[kitty/main.py:227]`. Boss therefore does **not** create the initial OS window or the sessions (both already exist); `Boss.start()` `[kitty/boss.py:1181]` **starts monitoring and launches the first child into the existing window/session**: it calls `self.child_monitor.start()` `[kitty/boss.py:1183]` and then `self.startup_first_child(first_os_window_id, startup_sessions=startup_sessions)` `[kitty/boss.py:1194]`. *(Boss emits no `--debug-rendering` line; its effect -- a forked child whose bytes are drawn -- is observed via `Child launched` and the rendered screen in Q3/Q4.)*
 
-**(6) Child monitor -- I/O thread always, talk thread conditional.** The monitor does **not** fork the shell. Its `start()` unconditionally creates the I/O thread and creates the remote-control "talk" thread **only if** a talk/listen fd exists: `if (self->talk_fd > -1 || self->listen_fd > -1) { pthread_create(&self->talk_thread, ...); } ... pthread_create(&self->io_thread, ...)` `[kitty/child-monitor.c:281-289]`. So the thread set is: the main/render thread, the always-present I/O-poll thread, and a *conditional* talk thread. The parse function pointer is selected at construction (`self->parse_func = parse_worker` or `parse_worker_dump`) `[kitty/child-monitor.c:178-181]`, and `parse_worker` itself is defined in `kitty/vt-parser.c:1496` (not in `child-monitor.c`).
+**(6) Child monitor -- I/O thread always, talk thread conditional.** The monitor does **not** fork the shell. Its `start()` unconditionally creates the I/O thread and creates the remote-control "talk" thread **only if** a talk/listen fd exists: `if (self->talk_fd > -1 || self->listen_fd > -1) { pthread_create(&self->talk_thread, ...); } ... pthread_create(&self->io_thread, ...)` `[kitty/child-monitor.c:281-292]`. So the thread set is: the main/render thread, the always-present I/O-poll thread, and a *conditional* talk thread. The parse function pointer is selected at construction (`self->parse_func = parse_worker` or `parse_worker_dump`) `[kitty/child-monitor.c:178-181]`, and `parse_worker` itself is defined in `kitty/vt-parser.c:1496` (not in `child-monitor.c`).
 
 **(7) Fork of the shell child + optional post-fork systemd scope.** The fork happens in `Child.fork()` `[kitty/child.py:276]` (via `fast_data_types.spawn(...)`), reached from `Tab.launch_child()` under `startup_first_child`. **After** the fork returns, and only on Linux, kitty attempts to move the *child* PID into its own systemd scope: `fast_data_types.systemd_move_pid_into_new_scope(pid, f'kitty-{ppid}-{self.id}.scope', ...)` `[kitty/child.py:346-353]`. So systemd is a **post-fork, child-scope** operation, not an early startup step (the old placement before Boss/fork was wrong).
 
@@ -251,16 +251,16 @@ launcher main() [main.c:439]
       -> init_glfw / glfw_init [main.py:90-95]
       -> _run_app [main.py:202]
         -> create_sessions (sessions prepared) [main.py:214]
-        -> create_os_window [main.py:220-224]
+        -> create_os_window [main.py:221-225]
              -> gl_init() [glfw.c:1212] -> GL version string (STDOUT, t=0.183) [gl.c:72]
              -> OS Window created marker (STDERR, t=0.251)               [glfw.c:1321]
-        -> Boss(...) constructed in existing window [main.py:225]
+        -> Boss(...) constructed in existing window [main.py:226]
         -> boss.start() [boss.py:1181]
-             -> child_monitor.start(): io thread always, talk thread conditional [child-monitor.c:281-289]
+             -> child_monitor.start(): io thread always, talk thread conditional [child-monitor.c:281-292]
              -> startup_first_child -> Child.fork()/spawn [child.py:276]
                   -> post-fork systemd scope attempt (STDERR, t=0.263; NotImplementedError caught) [child.py:346-353; systemd.c:87,185-188]
              -> PTY geometry set -> mark_terminal_ready -> "Child launched" (STDERR, t=0.266) [window.py:861-871; child.py:362-364]
-        -> boss.child_monitor.main_loop() [main.py:232] -> reads child bytes (Q3)
+        -> boss.child_monitor.main_loop() [main.py:234] -> reads child bytes (Q3)
 ```
 
 ---
@@ -1340,7 +1340,7 @@ source at commit `815df1e210e0`).
 | systemd | raises `PyExc_NotImplementedError` | `kitty/systemd.c:185-188` |
 | systemd (py) | `systemd_move_pid_into_new_scope()`; `except NotImplementedError: pass` | `kitty/child.py:346-353` |
 | Boss | `Boss.start()` | `kitty/boss.py:1181` |
-| Child monitor | I/O threads created in `start()` | `kitty/child-monitor.c:281-289` |
+| Child monitor | I/O threads created in `start()` | `kitty/child-monitor.c:281-292` |
 | VT parser worker | `parse_worker` | `kitty/vt-parser.c:1495-1496` |
 | Config dir | `config_dir` / `defconf` | `kitty/constants.py:131,133` |
 | Config dir env | `_get_config_dir` / `KITTY_CONFIG_DIRECTORY` | `kitty/constants.py:87-89` |
