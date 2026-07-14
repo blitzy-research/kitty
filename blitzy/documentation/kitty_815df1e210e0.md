@@ -4,11 +4,11 @@
 
 **Direct answer to the question, up front.** On the exercised platform (Linux, headless container), kitty **0.35.2** starts up as follows, and every value below is proven at runtime later in this document:
 
-- **Rendering backend it actually selects:** the **X11** GLFW platform backend with an **OpenGL 4.5 (Core Profile)** context supplied by **Mesa's software rasterizer, `llvmpipe`**. Wayland is compiled out of this build (§1.3), so X11 is the only backend present. *[OBSERVED‑CANONICAL]*
-- **OpenGL it requires vs. detects:** the required minimum on Linux is **3.1** (`3.3` applies only to macOS) *[CODE‑DERIVED]*; the driver reports **4.5**, which passes the gate. *[OBSERVED‑CANONICAL]*
+- **Rendering backend it actually selects:** the **X11** GLFW platform backend with an **OpenGL 4.5 (Core Profile)** context — the GL version string is printed by kitty's **own** `--debug-rendering` startup path *[OBSERVED‑CANONICAL]*. The context is a **software** one whose renderer identity is **Mesa's `llvmpipe`**; that renderer *name* comes from **auxiliary** `glxinfo`, because kitty prints `GL_VERSION` (not `GL_RENDERER`) at startup, so the renderer name is not itself part of the canonical launcher output *[OBSERVED‑AUXILIARY, §3.1]*. Wayland is compiled out of this build (§1.3), so X11 is the only backend present.
+- **OpenGL it requires vs. detects:** the required minimum on Linux is **3.1** (`3.3` applies only to macOS) — and this boundary is **empirically confirmed**: a non‑default `MESA_GL_VERSION_OVERRIDE=3.0` makes context creation abort, while `=3.1` starts normally (§8.3) *[minimum CODE‑DERIVED; boundary OBSERVED‑EDGE/NON‑DEFAULT]*; the driver here reports **4.5**, which passes the gate. *[OBSERVED‑CANONICAL]*
 - **Display configuration it detects:** content scale **1.0**, logical **DPI 96×96**, OS window **640×400 px**, framebuffer **640×400 px**, cell grid **71 columns × 22 rows**. *[OBSERVED‑CANONICAL]*
-- **Text‑rendering capabilities it reports:** default `monospace` resolves to **DejaVu Sans Mono** (four faces); cell metrics **9×18 px**, baseline **14 px**; self‑reported device attributes **`ESC[?62;c`** (primary) and **`ESC[>1;4000;35c`** (secondary); **`TERM=xterm-kitty`**. *[OBSERVED‑CANONICAL]*
-- **Initialization order (subsystem sequence before any content is displayed):** GLFW platform backend selected → **temp probe window created + content scale/DPI queried** → **CPU‑side font/cell metrics computed** (no GL context needed) → OS window pixel size decided → **real window created + its GL context made current** → GL loader/version gate → shaders loaded, glyph sprites uploaded, blank frame swapped, viewport set → child shell forked and terminal marked ready. *[OBSERVED‑CANONICAL + CODE‑DERIVED ordering, §5]*
+- **Text‑rendering capabilities it reports:** default `monospace` resolves to **DejaVu Sans Mono** (four faces, from kitty's own `--debug-font-fallback`); the **cell size is 9×18 px** (confirmed inside the GUI process by a watcher, §3.3); self‑reported device attributes **`ESC[?62;c`** (primary) and **`ESC[>1;4000;35c`** (secondary, captured from a real child PTY, §4.3); **`TERM=xterm-kitty`**. *[OBSERVED‑CANONICAL]* — The finer per‑metric values (baseline **14 px**, and the underline/strikethrough positions and thicknesses) are **not** emitted on the canonical startup path; they come from an **auxiliary** run of kitty's own font harness (injected DPI = the detected 96, so directly comparable) and are cross‑checked against the canonical cell size (§4.2). *[baseline & per‑metric values OBSERVED‑AUXILIARY]*
+- **Initialization order (subsystem sequence before any content is displayed):** GLFW platform backend selected → **temp probe window created** — during which GLFW *transiently makes the temp GL context current to read the driver's GL version, then clears it* → **content scale/DPI queried** → **CPU‑side font/cell metrics computed** (pure‑CPU FreeType; **no** context is current at this instant, though the temp context has already been made‑current‑and‑cleared just above) → OS window pixel size decided → **real window created** (GLFW again transiently binds then clears its context) → **kitty explicitly makes the real context current** (its only *explicit* make‑current, `kitty/glfw.c:L1211`) → GL loader/version gate → shaders loaded, glyph sprites uploaded, blank frame swapped, viewport set → child shell forked and terminal marked ready. *[OBSERVED‑CANONICAL — confirmed by a GLX make‑current/clear trace, §5; + CODE‑DERIVED ordering]*
 - **The window↔GPU↔cell relationship:** a **temp window** must exist so the driver is validated and the **DPI** is known; the DPI + resolved font face drive the **CPU** cell‑metric computation; the cell size then divides the (separately determined) pixel **viewport** into the terminal's rows/columns. The **default OS window pixel size is a fixed 640×400** (or a remembered cached size), **not** derived from the cell grid (§3.3, §5).
 - **Limitations of this run:** software GL (`llvmpipe`) only; **Wayland**, **hardware GPU**, and **macOS/CoreText** are not exercised and are labelled **INFERRED/CODE‑DERIVED** wherever they appear.
 
@@ -18,15 +18,16 @@ The remainder of this document backs every one of these claims with the exact co
 
 ## Methodology & labelling conventions
 
-- **Run‑first.** kitty was compiled from source and launched through its **canonical entry point**, the native launcher binary `kitty/launcher/kitty`. No remote‑control hook, no `--debug` bypass of the real path, no mock, and no synthetic stand‑in was used. Where a value is not printed by a debug flag, it was obtained either from **inside the real GUI process** through kitty's own first‑class **watcher** mechanism (a temporary watcher file loaded with `-o watcher=…`; watchers run on the canonical startup path, `kitty/main.py:L506-508`, `kitty/launch.py:L381`) or from a **real child process** attached to kitty's PTY. Auxiliary cross‑checks that do *not* traverse the GUI startup path (kitty's font test harness run under `kitty +launch`, and the external tools `glxinfo`/`fc-match`/`xdpyinfo`) are labelled as such and never presented as canonical startup evidence.
+- **Run‑first.** kitty was compiled from source and launched through its **canonical entry point**, the native launcher binary `kitty/launcher/kitty`. No remote‑control hook, no `--debug` bypass of the real path, no mock, and no synthetic stand‑in was used. Where a value is not printed by a debug flag, it was obtained either from **inside the real GUI process** through kitty's own first‑class **watcher** mechanism (a temporary watcher file loaded with `-o watcher=…`; the `-o watcher=` **config** option is read and its module loaded on the canonical startup path by `GlobalWatchers.__call__` — which reads `get_options().watcher` (`kitty/window.py:L504-512`) and calls `load_watch_modules` (`kitty/launch.py:L381-409`) — **not** the deprecated `--watcher` CLI path at `kitty/main.py:L506-508`) or from a **real child process** attached to kitty's PTY. Auxiliary cross‑checks that do *not* traverse the GUI startup path (kitty's font test harness run under `kitty +launch`, and the external tools `glxinfo`/`fc-match`/`xdpyinfo`) are labelled as such and never presented as canonical startup evidence.
 - **Default configuration.** kitty was run as a normal user with **no custom `kitty.conf`**; the only command‑line override used for observation is `-o watcher=…`, which adds an observation callback and changes no font/metric/DA value. The built version is **`0.35.2`** (`kitty/constants.py:L25` → `version: Version = Version(0, 35, 2)`).
-- **Isolation & safety.** Every run used a **freshly created private `HOME`/XDG tree** (`mktemp -d`, mode 700) so no cached window size or state leaks between runs; the virtual display was started on a **checked‑free display number** with its **PID captured** and a **readiness poll**; and all temporary observation scripts were created inside a **private `mktemp -d` directory (mode 700)** and removed afterward (§9).
+- **Isolation & safety.** Every run used a **freshly created private `HOME`/XDG tree** (`mktemp -d`, mode 700) so no cached window size or state leaks between runs, and each launch was prefixed with **`env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET`** so no inherited, higher‑precedence config/cache/runtime override could silently leak in — a fresh `HOME` alone does **not** neutralize these (see §1.5 for the precedence and the observed 26×52→9×18 override evidence). The virtual display was **allocated atomically by Xvfb via `-displayfd`** (not a check‑then‑start free‑number scan, which is TOCTOU‑prone under concurrency) with its **PID captured** and its **ownership verified (`kill -0 "$XVFB_PID"`) before** the **readiness poll**; and all temporary observation scripts were created inside a **private `mktemp -d` directory (mode 700)** and removed afterward (§9).
 - **Stability.** Every timing/ordering/value observation was confirmed **stable across two runs**; both raw captures and their comparison are shown.
 - **Per‑value labelling.** Labels are applied **per value**, not per section:
   - **[OBSERVED‑CANONICAL]** — captured at runtime through the canonical launcher: kitty's own startup diagnostics, kitty's own public getters queried inside the GUI process by a watcher, or the real child PTY.
   - **[OBSERVED‑AUXILIARY]** — real runtime output, but *not* the GUI startup path: kitty's font harness under `kitty +launch`, or external tools (`glxinfo`, `fc-match`, `xdpyinfo`).
+  - **[OBSERVED‑EDGE/NON‑DEFAULT]** — reproduced at runtime through the canonical launcher, but only under a **non‑default** environment override deliberately set to force an edge path (e.g. `MESA_GL_VERSION_OVERRIDE`); the exact override is always disclosed alongside the output.
   - **[CODE‑DERIVED]** — read from source constants/logic, not exercised at runtime.
-  - **[INFERRED]** — not reproducible in this environment (Wayland, hardware GPU, macOS/CoreText, the unreproduced abort guards).
+  - **[INFERRED]** — not reproducible in this environment (Wayland, hardware GPU, macOS/CoreText, and the abort guards that stay unreproduced here — the GL‑version‑too‑low gate and the zero‑cell‑width guard).
 
 ## Environment actually observed (the exact build/run context)
 
@@ -53,13 +54,15 @@ All values are the actual container values and form the reproducibility context 
 
 ### 1.1 The exact build command, complete raw transcript, and verified exit status
 
-Commands begin at the repository root (`/tmp/blitzy/kitty/blitzy-ac3dbd4e-f0c4-4b0d-95de-f07df32f3dde_ff67aa`). The build was captured to a log **first** (so the producer is never killed by a `head` `SIGPIPE`, and the real exit code is preserved), then inspected:
+Commands begin at the repository root (`/tmp/blitzy/kitty/blitzy-ac3dbd4e-f0c4-4b0d-95de-f07df32f3dde_ff67aa`). **Precondition — this transcript is a cold/clean build, not a warmed rerun.** `setup.py` builds **incrementally**: it compiles only those sources whose object files under `build/` are missing or older than the source (an mtime comparison), so a bare `python3 setup.py` on an already‑built ("warm") tree is a **6‑line no‑op** — it prints only the Wayland‑disable preamble and **0** `Compiling` lines — and does **not** force a full rebuild. To capture the complete forced‑full‑recompile transcript below, the ignored build outputs are therefore removed **first** (the cold/clean precondition), and the build is captured to a log **first** (so the producer is never killed by a `head` `SIGPIPE`, and the real exit code is preserved), then inspected:
 
 ```bash
-python3 setup.py > /tmp/blitzy_obs/build.log 2>&1 ; echo "exit=$?"    # == `make all` (Makefile:L12-13)
+OBS_DIR=$(mktemp -d)                                                 # private capture dir (mktemp -d; avoids fixed-name /tmp symlink races)
+rm -rf build kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten   # cold/clean precondition: forces a full recompile
+python3 setup.py > "$OBS_DIR/build.log" 2>&1 ; echo "exit=$?"        # == `make all` (Makefile:L12-13)
 ```
 
-**Raw output — complete `build.log` (98 lines), verbatim:**
+**Raw output — complete forced‑full‑recompile `build.log`, verbatim** (line count is **97–98** depending on the *Go* build cache: the trailing `kitty/tools/cmd` progress line is emitted only when the Go tools cache is cold — see the warmed‑rerun evidence after the transcript):
 
 ```text
 Package wayland-protocols was not found in the pkg-config search path.
@@ -167,15 +170,34 @@ kitty/tools/cmd
 ```bash
 $ echo "exit=$?"            # captured immediately after the build
 exit=0
-$ grep -c 'Compiling'  /tmp/blitzy_obs/build.log   ;  grep -c '\[x11\]' /tmp/blitzy_obs/build.log ; grep -c '\[wayland\]' /tmp/blitzy_obs/build.log
+$ grep -c 'Compiling'  "$OBS_DIR/build.log"   ;  grep -c '\[x11\]' "$OBS_DIR/build.log" ; grep -c '\[wayland\]' "$OBS_DIR/build.log"
 85
 21
 0
-$ grep -ciE 'warning:|error:' /tmp/blitzy_obs/build.log
+$ grep -ciE 'warning:|error:' "$OBS_DIR/build.log"
 0
 ```
 
-So the build **completed (exit 0)**, compiled **85 units** and linked **4 targets**, is **X11‑only** (21 `[x11]` lines, 0 `[wayland]` lines), and produced **zero warnings/errors** (consistent with the default `-pedantic-errors -Werror`). Wall time was ≈ **24 s** on a forced full recompile.
+So the **cold/clean (forced full recompile)** build **completed (exit 0)**, compiled **85 units** and linked **4 targets**, is **X11‑only** (21 `[x11]` lines, 0 `[wayland]` lines), and produced **zero warnings/errors** (consistent with the default `-pedantic-errors -Werror`). Wall time was ≈ **24 s**.
+
+**Warmed‑rerun evidence (no clean).** Immediately re‑running the *same* bare command on the now‑built tree is a fast no‑op — `setup.py` finds every object file up‑to‑date and compiles nothing:
+
+```bash
+$ python3 setup.py > "$OBS_DIR/build_warm.log" 2>&1 ; echo "exit=$?"
+exit=0
+$ wc -l < "$OBS_DIR/build_warm.log" ; grep -c 'Compiling' "$OBS_DIR/build_warm.log"
+6
+0
+$ cat "$OBS_DIR/build_warm.log"
+Package wayland-protocols was not found in the pkg-config search path.
+Perhaps you should add the directory containing `wayland-protocols.pc'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+```
+
+The warmed rerun emits **6 lines / 0 `Compiling` units** (only the Wayland‑disable preamble) and still exits `0`. This is why the long 85‑unit transcript above **requires** the cold/clean precondition (the `rm -rf build …` step); bare `python3 setup.py` does **not** force a full rebuild on a warm tree.
 
 Version check through the canonical binary:
 
@@ -188,7 +210,7 @@ This matches `kitty/constants.py:L25` (`version: Version = Version(0, 35, 2)`).
 
 ### 1.2 Build blocker 1 — SIMDe headers (resolved at environment level)
 
-`setup.py` loads SIMDe include flags best‑effort via pkg‑config; `kitty/simd-string-128.c` `#include`s `simde/x86/avx2.h`. Without the package the compile fails with `simde/x86/avx2.h: No such file`. The fix is an **environment install** of `libsimde-dev` (observed 0.8.2‑3; header at `/usr/include/simde/x86/avx2.h`), grounded in the best‑effort pkg‑config call in `setup.py`. **No source change.**
+`setup.py` loads SIMDe include flags best‑effort via pkg‑config. The AVX2 header is pulled in **transitively**, not by a direct include in the compiled translation unit: `kitty/simd-string-128.c:L9` includes only `"simd-string-impl.h"` (its sole `#include`), and `kitty/simd-string-impl.h:L36` is what `#include`s `<simde/x86/avx2.h>` (alongside `<simde/arm/neon.h>` at `L36`–`L37`). So the include chain is `kitty/simd-string-128.c:L9` → `kitty/simd-string-impl.h:L36` → `<simde/x86/avx2.h>`. Without the package the compile fails with `simde/x86/avx2.h: No such file` while building the `simd-string-128.c` unit. The fix is an **environment install** of `libsimde-dev` (observed 0.8.2‑3; header at `/usr/include/simde/x86/avx2.h`), grounded in the best‑effort pkg‑config call in `setup.py`. **No source change.**
 
 ### 1.3 Build blocker 2 — vendored Wayland backend vs. newer wayland‑protocols (resolved at environment level)
 
@@ -204,33 +226,75 @@ The vendored GLFW fork's `glfw/wl_window.c` has a `switch` over XDG toplevel sta
 | `kitty/launcher/kitty` | 40,384 | `.gitignore` `/kitty/launcher/kitt*` (`L18`) |
 | `kitty/launcher/kitten` | 16,429,348 | `.gitignore` `/kitty/launcher/kitt*` (`L18`) |
 
-`git check-ignore` confirms all three are ignored and `git status --porcelain` is **empty** after the build — the raw evidence is in §9.
+`git check-ignore` confirms all three are ignored, so the build introduces **no new tracked or non‑ignored changes**: after the build, `git status --porcelain=v1 --untracked-files=all` reports exactly the single **pre‑existing** modification to this deliverable — ` M blitzy/documentation/kitty_815df1e210e0.md` (the leading space then `M` is git's "modified, unstaged" porcelain code) — and nothing else (the three build artifacts do not appear because they are gitignored). The working tree is therefore **baseline‑preserving**, not empty; the raw evidence is in §9.
 
 ### 1.5 The exact launch command (canonical entry point, default config, headless, safely managed)
 
-kitty needs a windowing system and a working OpenGL context, so in this headless container it is launched under a virtual X display (Xvfb) with software OpenGL forced on (Mesa `llvmpipe`). The display is started on a **checked‑free** number with its **PID captured** and a **readiness poll**, and each run uses a **fresh private `HOME`** so no cache carries over:
+kitty needs a windowing system and a working OpenGL context, so in this headless container it is launched under a virtual X display (Xvfb) with software OpenGL forced on (Mesa `llvmpipe`). Three correctness details make the run **canonical and race‑free**: (1) the display number is **allocated atomically by Xvfb itself** via `-displayfd` — Xvfb picks a free display and writes the chosen number back, side‑stepping the check‑then‑start TOCTOU race of scanning `/tmp/.X11-unix` (two concurrent scanners can pick the same number); (2) the server's **PID is captured** and its **ownership verified with `kill -0 "$XVFB_PID"` *before* readiness is trusted**, so a readiness poll cannot silently pass by attaching to a *different* process's server; and (3) the launch is prefixed with **`env -u …`** to strip every higher‑precedence kitty/XDG **config**, **cache**, and **runtime** override before pointing `XDG_*` into a **fresh private `HOME`** — because a fresh `HOME` alone does **not** neutralize `KITTY_CONFIG_DIRECTORY`, `XDG_CONFIG_DIRS`, `KITTY_CACHE_DIRECTORY`, or `KITTY_RUNTIME_DIRECTORY` (see the precedence note and the observed override evidence below), and only then are the reported values the canonical defaults a normal user gets:
 
 ```bash
-# 1) Start a managed virtual display on the first free number, capture PID, poll readiness.
-DISP=99; while [ -e "/tmp/.X11-unix/X${DISP}" ] || [ -e "/tmp/.X${DISP}-lock" ]; do DISP=$((DISP+1)); done
-Xvfb :$DISP -screen 0 1280x800x24 & XVFB_PID=$!
+# 1) Start a managed virtual display; let Xvfb pick a free number ATOMICALLY via -displayfd
+#    (avoids the check-then-start race of scanning /tmp/.X11-unix), then capture and VERIFY its PID.
+DISPFILE=$(mktemp)                                                    # race-free per-run temp
+Xvfb -displayfd 1 -screen 0 1280x800x24 > "$DISPFILE" 2>/dev/null & XVFB_PID=$!
+for i in $(seq 1 100); do [ -s "$DISPFILE" ] && break; sleep 0.1; done # wait for Xvfb to report its number
+DISP=$(tr -d '[:space:]' < "$DISPFILE")
+kill -0 "$XVFB_PID" || { echo "our Xvfb died before readiness"; exit 1; }   # own-the-server check BEFORE trusting readiness
 for i in $(seq 1 50); do DISPLAY=:$DISP xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
 
-# 2) Launch kitty through the canonical launcher, in a fresh private HOME, with a short-lived child.
+# 2) Launch kitty through the canonical launcher in a fresh private HOME, with a short-lived child.
+#    `env -u ...` strips every higher-precedence config/cache/runtime override (see precedence note
+#    below) so the run uses the canonical DEFAULT configuration; XDG_* are then repointed into $KHOME.
 KHOME=$(mktemp -d); chmod 700 "$KHOME"
-DISPLAY=:$DISP LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" \
+env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY \
+    -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+  DISPLAY=:$DISP LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" \
   XDG_CONFIG_HOME="$KHOME/.config" XDG_CACHE_HOME="$KHOME/.cache" XDG_RUNTIME_DIR="$KHOME/run" \
   ./kitty/launcher/kitty --debug-rendering --debug-font-fallback \
   sh -c 'printf "CHILD_RAN\n"; sleep 0.3'
 
-# 3) Teardown (see §9): rm -rf "$KHOME"; kill "$XVFB_PID"
+# 3) Teardown (see §9): rm -rf "$KHOME" "$DISPFILE"; kill "$XVFB_PID"
 ```
 
 - `--debug-rendering` (alias `--debug-gl`) surfaces the GL version line (`kitty/cli.py:L989` defines `--debug-rendering --debug-gl`).
 - `--debug-font-fallback` surfaces the resolved "Text fonts:" block (`kitty/cli.py:L1002` defines `--debug-font-fallback`).
 - The short‑lived child lets startup complete and then exit cleanly.
 
+**Why `env -u …` is required (config precedence).** A fresh `HOME` (plus repointed `XDG_CONFIG_HOME`) is *not* sufficient to guarantee the default configuration, because kitty consults several environment variables that take **precedence over `~/.config`**. In `kitty/constants.py`, `_get_config_dir()` returns `KITTY_CONFIG_DIRECTORY` **first of all** if set (`kitty/constants.py:L87-88`), only then considering `XDG_CONFIG_HOME` (`L92-93`), `~/.config` (`L94`), and every writable `XDG_CONFIG_DIRS` entry containing a `kitty.conf` (`L97-102`); likewise `cache_dir()` honours `KITTY_CACHE_DIRECTORY` first (`kitty/constants.py:L137-139`) and `runtime_dir()` honours `KITTY_RUNTIME_DIRECTORY` first (`kitty/constants.py:L151-152`). So an inherited `KITTY_CONFIG_DIRECTORY`, writable `XDG_CONFIG_DIRS`, or `KITTY_CACHE_DIRECTORY` would be used **silently**. Unsetting them with `env -u` (and `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` for backend determinism) is what makes the run canonical.
+
+**Observed evidence — the override really changes the result, and `env -u` neutralizes it (OBSERVED).** Using a hostile config dir containing `kitty.conf` with `font_size 33`, the effective cell size is read **inside the real GUI process** by a watcher (`cell_size_for_window`):
+
+```bash
+# hostile config: $HOSTILE/kitty/kitty.conf contains "font_size 33"
+# (A) fresh-HOME recipe WITHOUT env -u, with KITTY_CONFIG_DIRECTORY inherited -> hostile config applied
+$ KITTY_CONFIG_DIRECTORY="$HOSTILE/kitty" DISPLAY=:$DISP LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" \
+    XDG_CONFIG_HOME="$KHOME/.config" ./kitty/launcher/kitty -o watcher="$OBS_DIR/cellprobe.py" sh -c 'sleep 0.4'
+cell=26x52     # exit=0 — NOT the default; the inherited config silently won
+
+# (B) same hostile var present, but the recipe's env -u strips it -> canonical default restored
+$ KITTY_CONFIG_DIRECTORY="$HOSTILE/kitty" \
+    env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    DISPLAY=:$DISP LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" XDG_CONFIG_HOME="$KHOME/.config" \
+    ./kitty/launcher/kitty -o watcher="$OBS_DIR/cellprobe.py" sh -c 'sleep 0.4'
+cell=9x18      # exit=0 — matches the documented default
+
+# (C) clean control (no hostile var at all)
+cell=9x18      # exit=0 — identical to (B)
+```
+
+Confirming **no config file is loaded** under the fix, a `kitty +launch` probe of `kitty.constants.config_dir` (with the same hostile var set but stripped by `env -u`) reports the resolved dir is the fresh `HOME`, the variable is gone, and no `kitty.conf` exists there:
+
+```text
+RESOLVED_CONFIG_DIR=/tmp/tmp.PJpGbKr0CN/.config/kitty
+KITTY_CONFIG_DIRECTORY_in_env=False
+kitty.conf_exists=False
+```
+
+So case (A) reproduces the silent override (cell `26x52`, matching a 33 pt font), while (B)/(C) restore the canonical `9x18` — the `env -u` prefix is what guarantees the default. *(This override probe uses a watcher for the value read‑back and is OBSERVED; it exercises the real launcher on the canonical path.)*
+
 **The canonical process entry (active from‑source path).** The native launcher's `int main(...)` is at `kitty/launcher/main.c:L439`; it calls **`run_embedded(&run_data)`** at `kitty/launcher/main.c:L464`. `run_embedded` (`kitty/launcher/main.c:L177`) initializes CPython and calls **`Py_RunMain()`** at `kitty/launcher/main.c:L216`, which runs the repository `__main__.py:L5-7` (`from kitty.entry_points import main; main()`). `kitty/entry_points.py:main()` (`L183`) has no matching sub‑command for the default GUI invocation and therefore falls through to `from kitty.main import main as kitty_main; kitty_main()` at `kitty/entry_points.py:L194-195`. (The frozen/bundle path — `kitty_main`/`bypy_run_interpreter` near `kitty/launcher/main.c:L168`, and `kitty/entry_points.py:L49-50` inside `open_urls()` — is a *different* path and is **not** used by the from‑source binary.)
+
+**Reading convention for the command snippets in §2–§8.** To keep the raw‑output blocks legible, later snippets abbreviate the full §1.5 boilerplate — they omit the repeated Xvfb `-displayfd` management and the `env -u …` isolation prefix, which apply to **every** run. They also write `DISPLAY=:99` literally: `:99` is simply the number that Xvfb allocated during the original capture session (the canonical recipe allocates it atomically and refers to it as `$DISP`). Because the capture environment had **no** hostile `KITTY_CONFIG_DIRECTORY`/`XDG_CONFIG_DIRS`/`KITTY_CACHE_DIRECTORY` set, the `env -u` prefix does not change any captured value here — the clean‑control run (case (C) above) yields the identical `9x18` default — so the transcripts below are the true canonical‑default output.
 
 ---
 
@@ -240,7 +304,20 @@ DISPLAY=:$DISP LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" \
 
 ### 2.1 Run 1 — raw, unedited
 
-Command (from §1.5, `--debug-rendering --debug-font-fallback`, private HOME, managed Xvfb on `:99`):
+**Capture command for run 1** (copy‑pasteable; abbreviates the §1.5 boilerplate per the reading convention — the full `env -u …` isolation prefix and Xvfb `-displayfd` management still apply; `$OBS_DIR` is the private capture dir created in §1.1/§1.5). The **stdout** and **stderr** channels are saved to **separate** files, then concatenated **stdout‑first, then stderr** into `run1.txt` — that concatenation is the exact byte layout hashed in §2.3:
+
+```bash
+KHOME=$(mktemp -d); chmod 700 "$KHOME"                                          # fresh private HOME for this run
+env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+  DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" XDG_CONFIG_HOME="$KHOME/.config" \
+  ./kitty/launcher/kitty --debug-rendering --debug-font-fallback \
+  sh -c 'printf "CHILD_RAN\n"; sleep 0.3' \
+  > "$OBS_DIR/run1.out" 2> "$OBS_DIR/run1.err"                                   # stdout channel -> run1.out ; stderr channel -> run1.err
+cat "$OBS_DIR/run1.out" "$OBS_DIR/run1.err" > "$OBS_DIR/run1.txt"               # normalization copy: run1.txt == stdout-then-stderr
+rm -rf "$KHOME"
+```
+
+The two captured channels are shown verbatim below — the `STDOUT:` block **is** `run1.out`, the `STDERR:` block **is** `run1.err`; `run1.txt` is their in‑order concatenation (the `STDOUT:`/`STDERR:` markers are editorial section labels, not bytes in `run1.txt`):
 
 ```text
 STDOUT:
@@ -260,6 +337,19 @@ STDERR:
 Process exit status: `0`; wall time ≈ `0.63 s`.
 
 ### 2.2 Run 2 — raw, unedited (same command, fresh private HOME)
+
+**Capture command for run 2** (identical to run 1 except the output file suffix; each run gets its own fresh `mktemp -d` HOME):
+
+```bash
+KHOME=$(mktemp -d); chmod 700 "$KHOME"
+env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+  DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" XDG_CONFIG_HOME="$KHOME/.config" \
+  ./kitty/launcher/kitty --debug-rendering --debug-font-fallback \
+  sh -c 'printf "CHILD_RAN\n"; sleep 0.3' \
+  > "$OBS_DIR/run2.out" 2> "$OBS_DIR/run2.err"
+cat "$OBS_DIR/run2.out" "$OBS_DIR/run2.err" > "$OBS_DIR/run2.txt"
+rm -rf "$KHOME"
+```
 
 ```text
 STDOUT:
@@ -283,12 +373,16 @@ Process exit status: `0`; wall time ≈ `0.63 s`.
 Normalizing the leading `[n.nnn]` timestamp and hashing both captures yields the **same digest**, and a raw `diff` of the two captures shows **only** timestamps differ:
 
 ```bash
-$ for f in run1 run2; do sed -E 's/^\[[0-9]+\.[0-9]+\]/[T]/' /tmp/blitzy_obs/$f.txt | sha256sum; done
+$ for f in run1 run2; do sed -E 's/^\[[0-9]+\.[0-9]+\]/[T]/' "$OBS_DIR/$f.txt" | sha256sum; done
 c66e9828df401dcb63582b59ef4a9b9c4eee32b71882e83aa0d8c3f0f286a69c  -
 c66e9828df401dcb63582b59ef4a9b9c4eee32b71882e83aa0d8c3f0f286a69c  -
+
+$ diff <(sed -E 's/^\[[0-9]+\.[0-9]+\]/[T]/' "$OBS_DIR/run1.txt") \
+       <(sed -E 's/^\[[0-9]+\.[0-9]+\]/[T]/' "$OBS_DIR/run2.txt") && echo "identical after timestamp normalization"
+identical after timestamp normalization
 ```
 
-The digests are identical, so the startup content is **deterministic** across runs (only wall‑clock timestamps vary). *[OBSERVED‑CANONICAL]*
+The digests are identical and the normalized `diff` is empty, so the startup content is **deterministic** across runs (only wall‑clock timestamps vary — the raw, un‑normalized `diff` differs solely in each line's leading `[n.nnn]` prefix). *[OBSERVED‑CANONICAL]*
 
 ### 2.4 Who emits each line (emitter provenance) — corrected
 
@@ -348,13 +442,13 @@ OpenGL shading language version string: 4.50
 
 ### 3.2 The GL‑context guard (what happens if creation fails)
 
-kitty creates a small **temporary window first** to validate that a usable GL context can be made; if that fails it aborts with the "requires working OpenGL … drivers" message (`kitty/glfw.c:L1198-1199`). This guard is exercised indirectly by the no‑display edge cases in §8. *[fatal path INFERRED; the glfwInit no‑display failure is OBSERVED — §8]*
+kitty creates a small **temporary window first** to validate that a usable GL context can be made; if that fails it aborts with the "requires working OpenGL … drivers" message (`kitty/glfw.c:L1198-1199`). This guard is **reproduced** in §8.3 via a non‑default `MESA_GL_VERSION_OVERRIDE=3.0` (context creation fails with `GLXBadFBConfig`), and also fires on the no‑display edge cases in §8. *[temp‑window context‑failure path OBSERVED‑EDGE/NON‑DEFAULT via override — §8.3; glfwInit no‑display failure OBSERVED — §8.1–8.2]*
 
 ### 3.3 The display configuration it detects (canonical values)
 
 **Direct answer.** With software GL on a 1280×800 Xvfb screen and **no custom config**, kitty detects **content scale 1.0**, sets **logical DPI 96×96**, creates a **fixed default OS window of 640×400 px**, obtains a **640×400 px framebuffer**, and — after cell metrics — lays out a **71‑column × 22‑row** grid. These are captured **inside the real GUI process** by a watcher (canonical), not inferred.
 
-**How the values were captured canonically.** A temporary watcher module was loaded with `-o watcher=…`. Watchers run on the canonical startup path (`kitty/main.py:L506-508`; loaded by `kitty/launch.py:load_watch_modules` at `kitty/launch.py:L381`), and a watcher's `on_resize(boss, window, data)` fires during initial layout (`call_watchers(..., 'on_resize', ...)` at `kitty/window.py:L856`). From inside it we called kitty's own public getters — `get_os_window_size(os_window_id)` (`kitty/state.c:L1067-1083`), `cell_size_for_window(os_window_id)` (`kitty/state.c:L811`), `current_fonts(os_window_id)`, and read `window.screen.columns/.lines` and `data['new_geometry']` (a `WindowGeometry(left, top, right, bottom, xnum, ynum)`). The script appends one JSON record per callback to a file named by the `KITTY_OBS_OUT` environment variable (kept outside the terminal's own stdout/stderr so it does not perturb the trace).
+**How the values were captured canonically.** A temporary watcher module was loaded with `-o watcher=…`. The `-o watcher=` **config** option is loaded on the canonical startup path by `GlobalWatchers.__call__` — which reads `get_options().watcher` (`kitty/window.py:L504-512`) and calls `load_watch_modules` (`kitty/launch.py:L381-409`) — and a watcher's `on_resize(boss, window, data)` fires during initial layout (`call_watchers(..., 'on_resize', ...)` at `kitty/window.py:L856`). (This is the configuration‑watcher path, distinct from the deprecated `--watcher` CLI option handled at `kitty/main.py:L506-508`.) From inside it we called kitty's own public getters — `get_os_window_size(os_window_id)` (`kitty/state.c:L1067-1083`), `cell_size_for_window(os_window_id)` (`kitty/state.c:L811`), `current_fonts(os_window_id)`, and read `window.screen.columns/.lines` and `data['new_geometry']` (a `WindowGeometry(left, top, right, bottom, xnum, ynum)`). The script appends one JSON record per callback to a file named by the `KITTY_OBS_OUT` environment variable (kept outside the terminal's own stdout/stderr so it does not perturb the trace).
 
 **Exact watcher source used** (temporary; created under a private `mktemp -d`, mode 700; removed in §9):
 
@@ -409,7 +503,20 @@ def on_focus_change(boss, window, data):
     _dump('on_focus_change', window, data)
 ```
 
-Launched exactly as in §1.5 with `-o watcher="$OBS_DIR/watcher.py"` and `KITTY_OBS_OUT` set. **Raw output — the complete file contents, both records, identical in both runs** (the `on_resize` record carries `new_geometry`; the later `on_focus_change` record does not — both report the same window/DPI/cell values):
+**Capture command (copy‑pasteable; both runs).** The watcher module is loaded with `-o watcher=…`; the `KITTY_OBS_OUT` environment variable names the per‑run capture file the watcher **appends** to (each `on_*` callback writes one `WATCHER_JSON=` line). This abbreviates the §1.5 boilerplate per the reading convention (`$OBS_DIR` and `watcher.py` are from §1.5/above):
+
+```bash
+for N in 1 2; do
+  KHOME=$(mktemp -d); chmod 700 "$KHOME"                                        # fresh private HOME per run
+  env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    KITTY_OBS_OUT="$OBS_DIR/watch_run$N.jsonl" DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" XDG_CONFIG_HOME="$KHOME/.config" \
+    ./kitty/launcher/kitty -o watcher="$OBS_DIR/watcher.py" \
+    sh -c 'sleep 0.4'                                                           # writes $OBS_DIR/watch_runN.jsonl
+  rm -rf "$KHOME"
+done
+```
+
+**Raw output — the complete `watch_run1.jsonl` contents, both records, identical in both runs** (the `on_resize` record carries `new_geometry`; the later `on_focus_change` record does not — both report the same window/DPI/cell values):
 
 ```text
 WATCHER_JSON={"cell_size_for_window": [9, 18], "font_sz_in_pts": 11.0, "logical_dpi_x": 96.0, "logical_dpi_y": 96.0, "new_geometry": {"bottom": 398, "left": 0, "right": 639, "top": 2, "xnum": 71, "ynum": 22}, "os_window_size": {"cell_height": 18, "cell_width": 9, "framebuffer_height": 400, "framebuffer_width": 640, "height": 400, "width": 640, "xdpi": 96.0, "xscale": 1.0, "ydpi": 96.0, "yscale": 1.0}, "screen_columns": 71, "screen_lines": 22, "tag": "on_resize"}
@@ -419,6 +526,7 @@ WATCHER_JSON={"cell_size_for_window": [9, 18], "font_sz_in_pts": 11.0, "logical_
 **Two‑run identity proof (watcher).** The startup was watched twice; the two capture files are byte‑identical:
 
 ```text
+$ cd "$OBS_DIR"                                        # the capture dir from §1.5; holds watch_run{1,2}.jsonl
 $ diff -q watch_run1.jsonl watch_run2.jsonl && echo identical
 identical
 $ sha256sum watch_run1.jsonl watch_run2.jsonl
@@ -546,7 +654,18 @@ print('METRICS_JSON=' + json.dumps(out, sort_keys=True))
 ```
 
 ```bash
-$ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME=$(mktemp -d) ./kitty/launcher/kitty +launch "$OBS_DIR/metrics_probe.py"
+# Capture command (both runs). `+launch` runs the auxiliary probe inside a kitty
+# interpreter; the probe prints exactly ONE METRICS_JSON line to stdout (stderr is
+# empty), redirected to metrics_runN.out. Abbreviates the §1.5 boilerplate per the
+# reading convention (`$OBS_DIR`/`metrics_probe.py` are from §1.5/above).
+for N in 1 2; do
+  KHOME=$(mktemp -d); chmod 700 "$KHOME"                                        # fresh private HOME per run
+  env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" XDG_CONFIG_HOME="$KHOME/.config" \
+    ./kitty/launcher/kitty +launch "$OBS_DIR/metrics_probe.py" \
+    > "$OBS_DIR/metrics_run$N.out"                                              # one METRICS_JSON line -> metrics_runN.out
+  rm -rf "$KHOME"
+done
 ```
 
 **Raw output — verbatim `METRICS_JSON` line (identical in both runs):**
@@ -587,6 +706,7 @@ This reproduces the observed baseline 14 and cell height 18 from the raw face me
 **Two‑run identity proof (metrics).** The probe was run twice; the two captures are byte‑identical:
 
 ```text
+$ cd "$OBS_DIR"                                        # the capture dir from §1.5; holds metrics_run{1,2}.out
 $ diff -q metrics_run1.out metrics_run2.out && echo identical
 identical
 $ sha256sum metrics_run1.out metrics_run2.out
@@ -656,7 +776,18 @@ sys.stderr.write(line + '\n')
 ```
 
 ```bash
-$ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME=$(mktemp -d) ./kitty/launcher/kitty python3 "$OBS_DIR/pty_child.py"
+# Capture command (both runs). The probe runs as kitty's REAL child on kitty's PTY;
+# it appends one PTY_JSON line to the KITTY_OBS_OUT file (and echoes it to stderr).
+# KITTY_OBS_OUT names the per-run capture file pty_runN.txt; it is removed first
+# because the child opens it in append mode. Abbreviates the §1.5 boilerplate.
+for N in 1 2; do
+  KHOME=$(mktemp -d); chmod 700 "$KHOME"                                        # fresh private HOME per run
+  rm -f "$OBS_DIR/pty_run$N.txt"                                                # append-mode target -> start clean
+  env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    KITTY_OBS_OUT="$OBS_DIR/pty_run$N.txt" DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME="$KHOME" XDG_CONFIG_HOME="$KHOME/.config" \
+    ./kitty/launcher/kitty python3 "$OBS_DIR/pty_child.py"                      # child appends one PTY_JSON line -> pty_runN.txt
+  rm -rf "$KHOME"
+done
 ```
 
 **Raw output — verbatim `PTY_JSON` line (identical in both runs):**
@@ -685,6 +816,7 @@ So: **primary DA `ESC[?62;c`** (VT‑220 level 62), **secondary DA `ESC[>1;4000;
 **Two‑run identity proof (PTY/DA).** The child probe was run twice; the two captures are byte‑identical:
 
 ```text
+$ cd "$OBS_DIR"                                        # the capture dir from §1.5; holds pty_run{1,2}.txt
 $ diff -q pty_run1.txt pty_run2.txt && echo identical
 identical
 $ sha256sum pty_run1.txt pty_run2.txt
@@ -715,11 +847,16 @@ $ sha256sum pty_run1.txt pty_run2.txt
 **Direct answer.** The three subsystems have a strict dependency chain, but it is **not** "GPU context first, then everything else." Concretely:
 
 1. **A window must exist before a GL context, and before the DPI is known.** GLFW needs a window to create a GL context and to report content scale/DPI. kitty therefore creates a **small temporary probe window** first (`kitty/glfw.c:L1198`, size 640×480), and queries its **content scale** immediately (`get_window_content_scale`, `kitty/glfw.c:L1200`).
-2. **Text‑cell calculations happen on the CPU and need only the DPI + font face — not a current GL context.** Using the probe window's scale/DPI, kitty computes cell metrics via `load_fonts_data()` → `calc_cell_metrics` (`kitty/glfw.c:L1202`; `kitty/fonts.c:L373-380`) **before** the real window's context is made current. FreeType rasterization and metric computation are pure CPU work.
-3. **Only then is the real window created and its GL context made current.** kitty reads the desired window size (`get_window_size`, `kitty/glfw.c:L1203`), creates the **real** window (`kitty/glfw.c:L1208`), destroys the temp window (`kitty/glfw.c:L1209`), and calls `glfwMakeContextCurrent(real_window)` (`kitty/glfw.c:L1211`) — **the only explicit make‑current in this path**. GL loader init/version gate follow in `gl_init()` (`kitty/gl.c:L46-74`).
+2. **Text‑cell calculations happen on the CPU and need only the DPI + font face — not a *currently‑bound* GL context.** Using the probe window's scale/DPI, kitty computes cell metrics via `load_fonts_data()` → `calc_cell_metrics` (`kitty/glfw.c:L1202`; `kitty/fonts.c:L373-380`). At that instant no context is bound — but note the temp probe window's context **was** transiently made current just above (to read the GL version) and then cleared (see the GLX‑trace correction below); the accurate claim is that the metric *computation* is pure‑CPU FreeType work needing no bound context, not that no context has ever been current. This happens **before** the real window's context is made current.
+3. **Only then is the real window created and its context made current by kitty.** kitty reads the desired window size (`get_window_size`, `kitty/glfw.c:L1203`), creates the **real** window (`kitty/glfw.c:L1208`) — during which GLFW again transiently binds and clears the real context to read its attributes — destroys the temp window (`kitty/glfw.c:L1209`), and then calls `glfwMakeContextCurrent(real_window)` (`kitty/glfw.c:L1211`). That L1211 call is kitty's **only *explicit* make‑current**, but it is **not** the only make‑current overall: GLFW binds each context (and clears it) once inside `glfwCreateWindow` to probe it (confirmed by the GLX trace below). GL loader init/version gate follow in `gl_init()` (`kitty/gl.c:L46-74`).
 4. **The cell size then divides the pixel viewport into rows/columns.** The window pixel size is fixed/cached (§3.4); dividing it by the 9×18 cell yields the 71×22 grid (§3.3) and the child PTY geometry (§4.4).
 
-> **GPU semantics correction (finding #9).** The earlier draft implied a current GL context is a **prerequisite** for the font/cell calculations. It is not: cell metrics are computed from the **temp window's DPI + FreeType on the CPU** (`kitty/glfw.c:L1200-1202`) *before* any context is made current (`kitty/glfw.c:L1211`). The real GL context is required only for **uploading** the resulting glyph sprites and drawing — i.e., after the metrics already exist.
+> **GPU semantics correction.** The earlier draft implied a current GL context is a **prerequisite** for the font/cell calculations, and also that kitty's `kitty/glfw.c:L1211` is the *only* make‑current with *no* context current before the metrics. Both are wrong. The accurate picture, confirmed by the GLX trace in §5.1.1:
+> - Cell metrics are computed from the **temp window's DPI + FreeType on the CPU** (`kitty/glfw.c:L1200-1202`) at a point where **no context is currently bound** — so the *computation* needs no bound context.
+> - But a context **has already been made current and then cleared** before the metrics: GLFW transiently binds the **temp** context while creating it (`kitty/glfw.c:L1198`) to read the driver's `GL_VERSION`, then unbinds it — this is `_glfwRefreshContextAttribs` (`glfw/context.c:L177`), which calls `glfwMakeContextCurrent(window)` (`glfw/context.c:L195`) and restores the previous binding (`glfw/context.c:L398`), invoked from inside `glfwCreateWindow` (`glfw/window.c:L267`).
+> - GLFW does the same transient bind/clear again for the **real** window at `kitty/glfw.c:L1208`; kitty's own explicit `glfwMakeContextCurrent` at `kitty/glfw.c:L1211` binds the real context only **after** the metrics already exist.
+>
+> So the real GL context is required only for **uploading** the resulting glyph sprites and drawing — but "no bound context during the metric computation" must not be conflated with "no context ever made current beforehand."
 
 ### 5.1 Pre‑display stages that were previously omitted (finding #11)
 
@@ -739,19 +876,34 @@ Between "context current" and "first content," the following stages run (all bef
 | j | **Viewport updated** (`update_os_window_viewport`) | `kitty/glfw.c:L1276` (function defined at `L130`) |
 | k | `"OS Window created"` diagnostic printed | `kitty/glfw.c:L1321` |
 
+### 5.1.1 Observed GLX make‑current/clear trace (OBSERVED)
+
+To settle the make‑current chronology empirically, kitty was run under a small `LD_PRELOAD` shim that logs every `glXMakeCurrent`. (A naïve symbol‑override shim does **not** work here: the vendored GLFW resolves `glXMakeCurrent` dynamically via `dlopen`+`dlsym` in `glfw/glx_context.c` and binds it behind `#define glXMakeCurrent _glfw.glx.MakeCurrent`, bypassing symbol interposition — so the shim instead interposes `dlsym` itself and hands back a wrapper.) The trace is **stable across two runs** (only the pointer addresses differ; the drawable/context *pattern* is identical):
+
+```text
+glXMakeCurrent drawable=0x200008 ctx=0x5a3838e308c0 MAKE-CURRENT   # temp window (created at kitty/glfw.c:L1198) — GLFW probes GL_VERSION
+glXMakeCurrent drawable=0x0      ctx=(nil)          CLEAR-CURRENT   # temp context cleared (glfw/context.c:L398)
+glXMakeCurrent drawable=0x20000d ctx=0x5a383905b530 MAKE-CURRENT   # real window (created at kitty/glfw.c:L1208) — GLFW refresh probe
+glXMakeCurrent drawable=0x0      ctx=(nil)          CLEAR-CURRENT   # real context cleared
+glXMakeCurrent drawable=0x20000d ctx=0x5a383905b530 MAKE-CURRENT   # kitty's EXPLICIT glfwMakeContextCurrent (kitty/glfw.c:L1211)
+glXMakeCurrent drawable=0x0      ctx=(nil)          CLEAR-CURRENT   # teardown
+```
+
+Two facts follow directly. First, there are **two distinct contexts** (temp `…308c0`, real `…5b530`) and **two distinct drawables** (`0x200008`, `0x20000d`); the **temp** context completes its full make‑current→clear lifecycle (events 1–2) **before** the real context is ever touched, and the CPU cell‑metric computation (`kitty/glfw.c:L1202`) runs in the gap between event 2 and event 3 — i.e., with **no** context bound, but **after** the temp context was already made current and cleared. Second, kitty issues exactly **one** explicit make‑current (event 5, its `L1211` call on the real context `…5b530`, the same context GLFW had already probed at event 3); events 1 and 3 are GLFW‑internal probes, so `L1211` is the only *explicit* — not the only — make‑current. *[OBSERVED; interposer source and exact capture command in Appendix C.]*
+
 ### 5.2 Corrected dependency/order diagram
 
 ```mermaid
 graph TD
-    A["main() orchestration<br/>kitty/main.py:L524"] --> RUN["AppRunner.__call__<br/>set_font_family(opts) L251<br/>(FontConfig face resolution)"]
-    RUN --> B["init_glfw() / platform backend selected<br/>kitty/main.py:L95 — X11 observed / Wayland inferred"]
-    B --> C["Temp probe window created (640x480)<br/>kitty/glfw.c:L1198"]
+    A["main() orchestration<br/>kitty/main.py:L524 (calls init_glfw L514, then run_app L518)"] --> B["init_glfw() / platform backend selected<br/>kitty/main.py:L95 (called at L514) — X11 observed / Wayland inferred"]
+    B --> RUN["AppRunner.__call__ (run_app, L518)<br/>set_font_family(opts) L251<br/>(FontConfig face resolution)"]
+    RUN --> C["Temp probe window created (640x480)<br/>GLFW transiently binds+clears temp ctx to probe GL_VERSION<br/>kitty/glfw.c:L1198; glfw/context.c:L195,L398"]
     C --> D["Query content scale / DPI (=1.0 -> 96)<br/>kitty/glfw.c:L1200, L811/L816/L822/L824"]
-    D --> E["CPU cell metrics via load_fonts_data<br/>(FreeType; NO current GL context)<br/>kitty/glfw.c:L1202; kitty/fonts.c:L373-380"]
+    D --> E["CPU cell metrics via load_fonts_data<br/>(FreeType; no currently-bound GL context — temp ctx already probed+cleared)<br/>kitty/glfw.c:L1202; kitty/fonts.c:L373-380"]
     D --> F["Read desired window size (fixed 640x400)<br/>kitty/glfw.c:L1203; kitty/os_window_size.py"]
     E --> G["Create REAL window; destroy temp<br/>kitty/glfw.c:L1208-1209"]
     F --> G
-    G --> H["glfwMakeContextCurrent(REAL)<br/>kitty/glfw.c:L1211 — only explicit make-current"]
+    G --> H["glfwMakeContextCurrent(REAL)<br/>kitty/glfw.c:L1211 — kitty's only EXPLICIT make-current (GLFW also binds each ctx during creation)"]
     H --> I["GL loader init + version detect/gate<br/>kitty/gl.c:L46-74 (4.5 detected, >= 3.1)"]
     I --> J["Blank canvas + swap<br/>kitty/glfw.c:L1218,L1221"]
     J --> K["Shaders compiled/linked (load_programs)<br/>kitty/glfw.c:L1243"]
@@ -822,7 +974,7 @@ graph TD
 
 ## 8. Error / edge conditions (four startup guards)
 
-**Direct answer.** kitty's early startup has **four** distinct fatal guards. **Two are OBSERVED** (the `glfwInit` no‑display failures) and **two are INFERRED** (fatal only when a driver/font pathology occurs that this environment does not produce). The earlier draft said "three" while presenting four — corrected here.
+**Direct answer.** kitty's early startup has **four** distinct fatal guards. **Three are reproduced at runtime** — the two `glfwInit` no‑display failures (§8.1–8.2, **OBSERVED**) and the temp‑window GL‑context‑creation failure (§8.3, **OBSERVED‑EDGE** via a non‑default `MESA_GL_VERSION_OVERRIDE=3.0`) — while the **fourth**, the GL‑version‑too‑low gate in `gl_init` (§8.4), stays **INFERRED** for a concrete reason: forcing a sub‑minimum version makes context *creation* fail earlier at guard 3, so execution never reaches the `gl.c` version gate. A separate zero‑cell‑width guard (§8.5) is also **INFERRED**. The earlier draft said "three" while presenting four, and mislabeled guard 3 as inferred — both corrected here.
 
 Each probe below captures the **command**, **stdout**, **stderr**, and the **real exit status** separately.
 
@@ -852,17 +1004,67 @@ exit=1
 ```
 *[OBSERVED‑CANONICAL]* — `:77` has no server; `glfwInit`/display‑open fails and kitty aborts with exit 1.
 
-### 8.3 Guard 3 — temp‑window GL‑context creation fails (INFERRED)
+### 8.3 Guard 3 — temp‑window GL‑context creation fails (OBSERVED‑EDGE / NON‑DEFAULT)
 
-If the probe window cannot yield a usable GL context, kitty aborts with the "requires working OpenGL … drivers" message (`kitty/glfw.c:L1198-1199`). Not reproducible here because Mesa `llvmpipe` always provides a software context; **INFERRED** from source.
+kitty creates a small temporary probe window to validate that a usable GL context can be obtained; if that fails it aborts with the "requires working OpenGL … drivers" message (`kitty/glfw.c:L1198-1199`). The default `llvmpipe` driver always yields a working context, so this guard does not fire on the canonical path. It **is**, however, reproducible by forcing the driver to advertise a version **below** kitty's Linux minimum (3.1) via the non‑default `MESA_GL_VERSION_OVERRIDE`: GLX can then find no matching framebuffer config and the **temp‑window** context creation fails. Both the failing and the passing boundary values were exercised through the canonical, config‑isolated recipe of §1.5 on the private display; each probe shows its exact command below.
+
+**Failing boundary — `MESA_GL_VERSION_OVERRIDE=3.0`:**
+
+```bash
+$ env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY \
+      -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+      DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 MESA_GL_VERSION_OVERRIDE=3.0 HOME=$(mktemp -d) \
+      ./kitty/launcher/kitty --debug-rendering sh -c 'printf CHILD_RAN'; echo "exit=$?"
+```
+```text
+STDOUT: (empty)
+STDERR: [0.107] [glfw error 65543]: GLX: Failed to create context: GLXBadFBConfig
+        [0.107] Failed to create GLFW temp window! This usually happens because of old/broken OpenGL drivers. kitty requires working OpenGL 3.1 drivers.
+exit=1
+```
+
+**Passing boundary — `MESA_GL_VERSION_OVERRIDE=3.1`:**
+
+```bash
+$ env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY \
+      -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+      DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 MESA_GL_VERSION_OVERRIDE=3.1 HOME=$(mktemp -d) \
+      ./kitty/launcher/kitty --debug-rendering sh -c 'printf CHILD_RAN'; echo "exit=$?"
+```
+```text
+STDOUT: [0.168] GL version string: '3.1 (Core Profile) Mesa 25.2.8-0ubuntu0.25.10.2' Detected version: 3.1
+STDERR: [0.229] OS Window created
+        [0.238] Failed to open systemd user bus with error: Connection refused
+        [0.241] Child launched
+exit=0
+```
+
+Exit codes are **stable across two runs** each (`3.0`→`exit=1`; `3.1`→`exit=0`). The failure message names the **temp window** explicitly ("Failed to create GLFW temp window!"), confirming the abort occurs at the temp‑window context‑creation path (`kitty/glfw.c:L1198-1199`) — guard 3 — and **not** at the `gl.c` version gate (guard 4, §8.4). The exact minimum (3.1 on Linux) is `CODE‑DERIVED` from `kitty/data-types.h:L20-24`; the **boundary behaviour** demonstrated here is **OBSERVED‑EDGE/NON‑DEFAULT**.
 
 ### 8.4 Guard 4 — GL version below the required minimum (INFERRED)
 
-If `glGetString(GL_VERSION)` reports a version below the required minimum, `gl_init` aborts (`kitty/gl.c:L74`, using the minimum from `kitty/data-types.h:L20-24`). Not reproducible here because the driver reports 4.5 ≥ 3.1; **INFERRED** from source.
+If `glGetString(GL_VERSION)` reports a version below the required minimum, `gl_init` aborts (`kitty/gl.c:L74`, using the minimum from `kitty/data-types.h:L20-24`). This gate stays **INFERRED** even though §8.3 *does* force a sub‑minimum version: on this GLX stack, requesting a context below 3.1 makes **context creation itself** fail first (guard 3, `GLXBadFBConfig`), so control never reaches the `gl.c:L74` comparison. On the unforced canonical path the driver reports 4.5 ≥ 3.1, so the gate is likewise never taken. The `gl.c` gate is thus reachable only when a driver *successfully creates* a context yet still advertises a version below the minimum — a combination this environment does not produce; **INFERRED** from source.
 
-### 8.5 (Related) Zero cell‑width guard (INFERRED)
+### 8.5 (Related) Zero cell‑width guard (INFERRED / CODE‑DERIVED — with attempted runtime probe)
 
-If `cell_metrics` computes a zero cell width, `calc_cell_metrics` aborts (`kitty/fonts.c:L376`). Not reproducible with a valid monospace face; **INFERRED** from source. *(This is a font‑metric guard rather than a windowing/GL startup guard, hence listed separately from the four startup guards above.)*
+If `cell_metrics` returns a zero cell width, `calc_cell_metrics` aborts with `fatal("Failed to calculate cell width for the specified font")` (`kitty/fonts.c:L376`). The only way to *attempt* this without editing source is to drive the width to zero through config, so it was attempted on the canonical launcher with a large negative width adjustment (the watcher `cellprobe.py` reads kitty's own `cell_size_for_window` from inside the GUI process, exactly as in §3.3):
+
+```bash
+$ env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY \
+      -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+      KITTY_CELLPROBE_OUT=cell.txt DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME=$(mktemp -d) \
+      ./kitty/launcher/kitty -o 'modify_font=cell_width -1000px' -o watcher=cellprobe.py \
+      sh -c 'sleep 0.4'; echo "exit=$?"; cat cell.txt
+```
+```text
+STDERR: [0.155] Cell width invalid after adjustment, ignoring modify_font cell_width
+exit=0
+cell.txt: cell=9x18
+```
+
+So: `requested_adjustment=-1000px`, `resulting_cell_width=9` (unchanged), and the `L376` fatal is **not** reached — kitty starts normally (`exit=0`).
+
+**Why option normalization prevents zero width (from source).** The `L376` fatal tests the **face‑derived** width that `cell_metrics` returns (9 px for DejaVu Sans Mono) **before** any `modify_font` adjustment (`kitty/fonts.c:L375-376`). The config adjustment is then applied to a **copy** `cw` by `adjust_metric`, whose underflow branch clamps the copy to 0 for `-1000px` (`kitty/fonts.c:L362`). But the copy is validated against `MIN_WIDTH 2` (`kitty/fonts.c:L382,L384`): since `0 < 2`, the adjusted value is **rejected** and the original face width **retained**, emitting `log_error("Cell width invalid after adjustment, ignoring modify_font cell_width")` (`kitty/fonts.c:L385`). The adjustment therefore can never make `cell_width` zero *at the `L376` check*; that fatal is reachable only if the **font face itself** yields a zero advance width, which a valid monospace face never does. The guard thus stays **INFERRED / CODE‑DERIVED**: its logic is proven from source and its non‑triggering was confirmed at runtime, but the fatal branch is unreachable via any default‑or‑config input here. *(This is a font‑metric guard rather than a windowing/GL startup guard, hence listed separately from the four startup guards above.)*
 
 ---
 
@@ -888,26 +1090,29 @@ Did you forget to 'git add'?
 
 The **only** path `git status` reports is the deliverable itself — `blitzy/documentation/kitty_815df1e210e0.md` (shown as `M` because this file was already tracked from a prior commit of this same document; it is the sole path this task changes). **No existing source file appears as modified or added.** The three build artifacts are gitignored (`git check-ignore` echoes them) and are *not* tracked (`git ls-files --error-unmatch` errors on them), so the compile changed no tracked repository state.
 
-**Cleanup performed (temporary scripts and display) — verbatim:**
+**Cleanup performed (temporary scripts and display) — verbatim.** The teardown removes the **same populated originals** bound earlier — `$OBS_DIR` (§1.1), and `$KHOME`/`$DISPFILE`/`$XVFB_PID` (§1.5) — by their **exact quoted paths, with no `mktemp` reassignment** before removal (an earlier version mistakenly re‑ran `mktemp -d` here, which created and then deleted *fresh empty* directories while the real evidence dirs survived), and then **asserts** each path is gone:
 
 ```text
-$ OBS_DIR=$(mktemp -d); chmod 700 "$OBS_DIR"           # holds watcher.py / metrics_probe.py / pty_child.py
-$ echo "created: $OBS_DIR (mode $(stat -c '%a' "$OBS_DIR"))"
-created: /tmp/tmp.0bCYcBySNn (mode 2700)
+$ echo "OBS_DIR=$OBS_DIR"; echo "KHOME=$KHOME"; echo "DISPFILE=$DISPFILE"   # the ORIGINALS from §1.1/§1.5 — NOT reassigned
+OBS_DIR=/tmp/tmp.QBH7acOzJz
+KHOME=/tmp/tmp.Peo8OplODQ
+DISPFILE=/tmp/tmp.1U59DQYZkQ
 
-$ rm -rf "$OBS_DIR"; ls -d "$OBS_DIR" 2>&1
-ls: cannot access '/tmp/tmp.0bCYcBySNn': No such file or directory
+$ ls "$OBS_DIR" | sort | tr '\n' ' '; echo                                  # the populated capture dir, before removal
+metrics_probe.py metrics_run1.out metrics_run2.out pty_child.py pty_run1.txt pty_run2.txt run1.err run1.out run1.txt run2.err run2.out run2.txt watch_run1.jsonl watch_run2.jsonl watcher.py
 
-$ KH=$(mktemp -d); echo "private HOME: $KH"; rm -rf "$KH"; ls -d "$KH" 2>&1
-private HOME: /tmp/tmp.OsZEV6XHik
-ls: cannot access '/tmp/tmp.OsZEV6XHik': No such file or directory
+$ rm -rf "$OBS_DIR" "$KHOME" "$DISPFILE"                                     # remove the ORIGINALS by exact quoted path
+$ for d in "$OBS_DIR" "$KHOME" "$DISPFILE"; do [ -e "$d" ] && echo "STILL PRESENT: $d" || echo "removed: $d"; done
+removed: /tmp/tmp.QBH7acOzJz
+removed: /tmp/tmp.Peo8OplODQ
+removed: /tmp/tmp.1U59DQYZkQ
 
 $ kill "$XVFB_PID" 2>/dev/null; sleep 0.2; ps -p "$XVFB_PID" >/dev/null && echo alive || echo gone
 gone
 ```
 
-- All temporary observation scripts lived **outside** the repository tree, inside a private `mktemp -d` (owner‑only `rwx------`; the `2700` shown is `/tmp`'s inherited setgid bit plus `700`), and were removed — the `ls` errors above prove the directories no longer exist.
-- Every per‑run `HOME`/XDG tree was an independent private `mktemp -d` and was removed.
+- The temporary observation scripts (`watcher.py`, `metrics_probe.py`, `pty_child.py`) and all captured run files lived **outside** the repository tree, inside the private `$OBS_DIR` (`mktemp -d`, owner‑only mode `700`), and were removed by exact quoted path — the existence assertion above prints `removed:` for **every** original path (and would print `STILL PRESENT:` if any survived), proving the populated originals — not fresh empty stand‑ins — are gone.
+- The `$KHOME` HOME/XDG tree and `$DISPFILE` (the Xvfb `-displayfd` temp) were removed in the **same** `rm -rf` by their original quoted paths; every additional **ephemeral per‑run** `HOME` was its own `mktemp -d` and was already removed inline at the end of its run (`rm -rf "$KHOME"` inside each capture loop in §2–§4).
 - The managed Xvfb was stopped by its captured PID (`$XVFB_PID`).
 - Build artifacts (`*.so`, `kitty/launcher/kitt*`) are gitignored (`.gitignore:L1,L18`) and were never committed.
 
@@ -936,6 +1141,82 @@ The repository therefore differs from its pre‑task state by **exactly one file
 
 - **OBSERVED‑CANONICAL:** X11 backend; GL_VERSION 4.5 and gate pass; content scale 1.0 → DPI 96; window 640×400; framebuffer 640×400; cell 9×18; grid 71×22; font faces (DejaVu Sans Mono ×4); font size 11 pt; primary/secondary DA; `TERM=xterm-kitty`; child PTY geometry; the whole emission timeline.
 - **OBSERVED‑AUXILIARY:** per‑metric baseline/underline/strikethrough values (font harness, injected DPI = detected 96); `glxinfo` vendor/renderer/GLSL; `fc-match`; `xdpyinfo`.
+- **OBSERVED‑EDGE/NON‑DEFAULT:** the temp‑window GL‑context‑creation guard, reproduced via `MESA_GL_VERSION_OVERRIDE=3.0` (context creation fails, `GLXBadFBConfig`, `exit=1`) with `=3.1` as the passing boundary (`exit=0`) — see §8.3.
 - **CODE‑DERIVED:** GL required minimum (3.1 Linux / 3.3 Apple); GLSL `140` floor; cursor beam/underline thickness point defaults; the fatal‑guard logic.
-- **INFERRED (not reproducible here):** Wayland backend & runtime behaviour; hardware‑GPU rendering; macOS/CoreText; the temp‑window GL guard, the GL‑version‑too‑low guard, and the zero‑cell‑width guard.
+- **INFERRED (not reproducible here):** Wayland backend & runtime behaviour; hardware‑GPU rendering; macOS/CoreText; the GL‑version‑too‑low gate (unreachable in this environment — see §8.4) and the zero‑cell‑width guard.
+
+
+---
+
+## Appendix C — GLX make‑current interposer (reproduction of the §5.1.1 trace)
+
+The make‑current chronology in §5.1.1 was captured with a small `LD_PRELOAD` shim. A plain symbol‑override shim does **not** work here, because the vendored GLFW resolves `glXMakeCurrent` dynamically through `dlopen`+`dlsym` (`glfw/glx_context.c`) and calls it behind `#define glXMakeCurrent _glfw.glx.MakeCurrent`; the shim therefore interposes **`dlsym` itself** and returns a wrapper for `glXMakeCurrent`. The complete, unelided source (`dlsym_glx_trace.c`) is:
+
+```c
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <GL/glx.h>
+
+/* Interpose dlsym itself: GLFW resolves glXMakeCurrent dynamically via dlopen+dlsym
+   (glfw/glx_context.c), so a plain LD_PRELOAD symbol override is bypassed. By
+   interposing dlsym we can hand back our own wrapper for glXMakeCurrent. */
+
+typedef Bool (*pfn_mc)(Display*, GLXDrawable, GLXContext);
+static pfn_mc real_mc = NULL;
+static FILE *logf = NULL;
+
+static void ensure_log(void){
+    if (!logf){
+        const char *p = getenv("GLX_TRACE_OUT");
+        logf = p ? fopen(p, "a") : stderr;
+        if (!logf) logf = stderr;
+    }
+}
+
+Bool my_glXMakeCurrent(Display *dpy, GLXDrawable draw, GLXContext ctx){
+    ensure_log();
+    if (ctx == NULL || draw == 0)
+        fprintf(logf, "glXMakeCurrent drawable=0x%lx ctx=%p CLEAR-CURRENT\n", (unsigned long)draw, (void*)ctx);
+    else
+        fprintf(logf, "glXMakeCurrent drawable=0x%lx ctx=%p MAKE-CURRENT\n", (unsigned long)draw, (void*)ctx);
+    fflush(logf);
+    return real_mc(dpy, draw, ctx);
+}
+
+/* real dlsym, resolved via the versioned symbol to avoid recursing into ourselves */
+typedef void* (*pfn_dlsym)(void*, const char*);
+static pfn_dlsym real_dlsym = NULL;
+
+void* dlsym(void *handle, const char *symbol){
+    if (!real_dlsym)
+        real_dlsym = (pfn_dlsym)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (symbol && strcmp(symbol, "glXMakeCurrent") == 0){
+        if (!real_mc) real_mc = (pfn_mc)real_dlsym(handle, symbol);
+        return (void*)my_glXMakeCurrent;
+    }
+    return real_dlsym(handle, symbol);
+}
+```
+
+**Compile:**
+
+```bash
+$ gcc -shared -fPIC -o dlsym_glx_trace.so dlsym_glx_trace.c -ldl
+```
+
+**Capture (canonical, config‑isolated recipe of §1.5, on the private display):**
+
+```bash
+$ env -u KITTY_CONFIG_DIRECTORY -u KITTY_CACHE_DIRECTORY -u KITTY_RUNTIME_DIRECTORY \
+      -u XDG_CONFIG_DIRS -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+      GLX_TRACE_OUT=glx_trace.txt LD_PRELOAD=./dlsym_glx_trace.so \
+      DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 HOME=$(mktemp -d) \
+      ./kitty/launcher/kitty sh -c 'printf CHILD_RAN; sleep 0.2'
+$ cat glx_trace.txt
+```
+
+Re‑running this yields the identical six‑event drawable/context *pattern* shown in §5.1.1 (only the context pointer values differ between runs, as expected under ASLR); the two distinct drawables `0x200008` (temp) and `0x20000d` (real) recur across runs. The shim, its shared object, and `glx_trace.txt` are temporary observation artifacts created **outside** the tracked source tree and removed afterward (see §9), so the repository is left unchanged.
 
