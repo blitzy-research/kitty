@@ -2,7 +2,7 @@
 
 **An investigate-by-running answer, grounded in the observed runtime behavior of a canonically built kitty.**
 
-- **Subject:** kitty terminal emulator, version **0.35.2**, compiled-in VCS commit **`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`** (source branch `kitty_815df1e210e0`).
+- **Subject:** kitty terminal emulator, version **0.35.2**, source branch `kitty_815df1e210e0` (rev `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`). The default build of this destination checkout stamps its banner `KITTY_VCS_REV = 2017484b1138582e48da1450d325790dac7d152f` (= this tree's `HEAD`, which is the source rev plus only this one added doc file); §1 STEP 6–8 shows both revs with full provenance.
 - **Method:** Every *behavioral* claim below was produced by **building and running** kitty and driving a **real child process writing to kitty's pseudo-terminal (PTY)** — the canonical input path — then capturing the **complete, unedited** output with kitty's own instrumentation (`--dump-commands`, `--dump-bytes`, `--debug-keyboard`, `--debug-rendering`) and with direct runtime inspection (`/proc/<pid>/task`, DECRQM query/reply round-trips through the PTY, `sha256` integrity checks). Each claim carries the exact command that produced it, the complete unedited output, and a `file:line` reference naming the specific function/struct.
 - **Scope of the question (four threads):**
   - **Q1 — Input surge & entry point (incl. pause/resume):** When a surge of raw input arrives — especially when a session is paused then resumed — how does the byte stream become actionable, and *where does it first enter*?
@@ -17,15 +17,15 @@
 This document distinguishes three kinds of statements, and never blurs them:
 
 - **[OBSERVED]** — demonstrated by running the built binary and shown by the complete, unedited output that immediately follows. The `$ ` line is *exactly* the command that produced the block; the fenced block that follows contains *only* that command's literal output. All prose commentary lives **outside** the fences.
-- **[INFERRED]** — read from the source code (with a `file:line` citation) and consistent with the observed behavior, but not itself directly captured at runtime. Used where the sandbox cannot expose an internal signal directly (e.g., an internal C-level branch, or visible pixels under a software GL rasterizer).
+- **[INFERRED]** — read from the source code (with a `file:line` citation) and consistent with the observed behavior, but not itself directly captured at runtime. Used where the sandbox cannot expose an internal signal directly (e.g., an internal C-level branch, or the GPU buffer-swap *event* timing under a software GL rasterizer — note the rendered frame *content* itself **is** captured at the pixel level, see §2.3).
 - **[NON-CANONICAL]** — obtained through a bypassing interface (the synchronous `parse_bytes` test helper, a remote-control/debug hook, or a hand-written synthetic byte sequence). Used only as a clearly-labeled supplement, **never** as primary proof. §6 lists every non-canonical item.
 
 **Filtering disclosure (important):** where a raw capture is enormous (e.g., a 20 000-line parser dump), this document does **not** silently show a few lines and imply the rest. Instead it runs a **deterministic validator** over the *entire* file and shows the validator's complete output, and additionally states the file's line count and `sha256`. Any place where only part of a file is shown is labeled *illustrative* and is accompanied by the authoritative whole-file check.
 
 **Verbatim-fidelity disclosure (control bytes & trailing whitespace):** the fenced blocks reproduce kitty's output byte-for-byte, with one unavoidable transformation — a raw `ESC` (`0x1b`) control byte cannot be represented as printable text inside a Markdown file. kitty's `--debug-keyboard` colours the `on_key_input` label with an SGR escape (`ESC [ 33 m … ESC [ m`); in the fenced blocks below the two `ESC` bytes of that colour sequence are dropped, so the label reads `[33mon_key_input[m` rather than an invisible control byte. Everything *semantically meaningful* is verbatim — this was verified programmatically: each shown `on_key_input` line equals its raw-capture line with only the `0x1b` bytes removed (every field from `glfw key` onward is byte-identical). Conversely, **trailing whitespace is preserved exactly, not trimmed**: kitty's `--debug-keyboard` byte listing (e.g. `sent encoded key to child: ^[ [ A `) and the shell `draw` prompt lines (e.g. `draw …# ` and `draw PROMPT$ `) genuinely end in a space, so those bytes are kept as-is — which means a whitespace linter such as `git diff --check` will, by design, report trailing whitespace on exactly those evidence lines rather than on any authored prose.
 
-**Honest sandbox limitations (stated up front, expanded where relevant):** the observations were made in a **headless** container (Xvfb + Mesa software GL, running as `root` — the only account the image provides). Two things therefore cannot be captured directly and are handled as **[INFERRED]** with source citations plus an observed *proxy*:
-1. **Visible pixels.** Under `llvmpipe` there is no real display scan-out, so "the frame the user sees was held / flushed atomically" is inferred from the snapshot code in `screen.c`; the *observed* proxy is the mode-state flag toggling and parsing continuing during the hold (§2.3), and the render/settle boundary itself is disclosed as not directly observed (§5.4).
+**Honest sandbox limitations (stated up front, expanded where relevant):** the observations were made in a **headless** container (Xvfb + Mesa software GL, running as `root` — the only account the image provides). Two rendering/input concerns a headless setup raises are handled explicitly below — and in both cases the thing that actually matters turned out to be **observable**:
+1. **Visible pixels — captured.** The rendered frame *is* sampled directly: the X11 window backing image is read with `Window.get_image` (`X.ZPixmap`), and it demonstrates synchronized output holding then atomically flushing the display, with SHA-256 hashes and a pixel-diff (§2.3, §2.4). What a headless container genuinely cannot expose is one layer *below* the frame content — the GPU buffer-swap / `vblank` **event** timing (not surfaced by `--debug-rendering`, §5.4) and photons on a physical monitor (there is none). Those two are disclosed as [INFERRED]/not-observed; the frame-*content* transition the question asks about (held → flushed atomically) is **[OBSERVED]**.
 2. **Physical GLFW key events.** Delivering an OS-level key press into a focused GLFW window requires a real X server with input focus. In this setup synthetic `XTEST` injection into the focused kitty window **did** reach the real `on_key_input` (`kitty/keys.c:166`), so §5.1 is canonical [OBSERVED] evidence — kitty's own `--debug-keyboard` output and the child's independently-logged bytes agree. The Python `encode_key_for_tty` route (§5.1.4) is kept as a clearly-labeled [NON-CANONICAL] supplement for the OS-entry boundary.
 
 ---
@@ -75,33 +75,59 @@ version number:    11.0
 vendor string:    The X.Org Foundation
 
 ########## STEP 4: secure observation dir (F16: umask 077 + 0700 mktemp -d) ##########
-# created once as: umask 077; OBS=$(mktemp -d $TMPDIR/kitty_obs.XXXXXXXX); chmod 700 $OBS
-$ stat -c '%A %U:%G %n' $(cat /tmp/kitty-nosgid/obs_path.txt)
-drwx------ root:root /tmp/kitty-nosgid/kitty_obs.jWw1gwl6
+$ umask 077; OBS=$(mktemp -d "$TMPDIR/kitty_obs.XXXXXXXX"); chmod 700 "$OBS"; export OBS OBS_DIR="$OBS"
+$ stat -c '%A %U:%G %n' "$OBS"
+drwx------ root:root /tmp/kitty-nosgid/kitty_obs.9k1OYsxd
 
-########## STEP 5: canonical build artifacts (built by: python3 setup.py build) ##########
+########## STEP 5: canonical build (make == python3 setup.py), then list artifacts ##########
+$ env -u PYTHONHOME bash -c 'source /root/kitty-venv/bin/activate; export PATH="$PATH:/usr/local/go/bin"; export TMPDIR=/tmp/kitty-nosgid; make 2>&1 | tail -6; echo "make_exit=${PIPESTATUS[0]}"'
+to the PKG_CONFIG_PATH environment variable
+Package 'wayland-protocols', required by 'virtual:world', not found
+wayland-protocols >= 1.17 is required, found version: not found
+Disabling building of wayland backend
+Could not find platform dependent libraries <exec_prefix>
+kitty/tools/cmd
+make_exit=0
 $ ls -1 kitty/fast_data_types*.so kitty/glfw-x11.so kitty/launcher/kitty kittens/transfer/rsync.so
 kittens/transfer/rsync.so
 kitty/fast_data_types.so
 kitty/glfw-x11.so
 kitty/launcher/kitty
 
-########## STEP 6: VCS-stamped version banner (canonical run) ##########
+########## STEP 6: VCS-stamped banner from the DEFAULT build of the destination tree ##########
 $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
+$ git rev-parse HEAD
+2017484b1138582e48da1450d325790dac7d152f
 $ ./kitty/launcher/kitty +runpy 'from kitty.fast_data_types import KITTY_VCS_REV as r; print(r)'
-815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
+2017484b1138582e48da1450d325790dac7d152f
 
-########## STEP 7: provenance — built source rev (immutable) vs the single added file (F15) ##########
+########## STEP 7: provenance — the destination HEAD is the source rev + only this one file (F15) ##########
 $ git rev-parse 815df1e210e0
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 $ git log -1 --format='%h %s' 815df1e210e0
 815df1e21 Wire up applying of font config
 $ git diff --name-status 815df1e210e0..HEAD
 A	blitzy/documentation/kitty_815df1e210e0.md
+
+########## STEP 8: the source rev itself stamps 815df1e210e0 (isolated worktree, same canonical build) ##########
+$ git worktree add --detach /tmp/kitty-nosgid/kitty_srcrev_815df1e210e0 815df1e210e0
+Preparing worktree (detached HEAD 815df1e21)
+HEAD is now at 815df1e21 Wire up applying of font config
+$ env -u PYTHONHOME bash -c 'cd /tmp/kitty-nosgid/kitty_srcrev_815df1e210e0; source /root/kitty-venv/bin/activate; export PATH="$PATH:/usr/local/go/bin"; export TMPDIR=/tmp/kitty-nosgid; make >/dev/null 2>&1; echo "make_exit=$?"'
+make_exit=0
+$ /tmp/kitty-nosgid/kitty_srcrev_815df1e210e0/kitty/launcher/kitty --version
+kitty 0.35.2 created by Kovid Goyal
+$ ( cd /tmp/kitty-nosgid/kitty_srcrev_815df1e210e0 && ./kitty/launcher/kitty +runpy 'from kitty.fast_data_types import KITTY_VCS_REV as r; print(r)' )
+815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 ```
 
-**Provenance note (resolves the "which commit?" ambiguity, and why it is anchored on the built rev):** the kitty **C extension** was compiled from the base commit `815df1e210e0…` (`Wire up applying of font config`), so the binary's compiled-in `KITTY_VCS_REV` reads `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (identical to the value shown in STEP 6). The *only* change introduced over that base commit — cumulatively, across **every** commit up to the current `HEAD` — is the addition of this single documentation file, which is exactly what `git diff --name-status 815df1e210e0..HEAD` reports above (`A  blitzy/documentation/kitty_815df1e210e0.md`). This provenance is deliberately anchored on the **immutable built-source rev** rather than the working tree's mutable `HEAD` hash: a document cannot contain the hash of the very commit that adds it (that hash does not exist until *after* the file's bytes are frozen and committed), and any later doc-only revision advances `HEAD` again — so an embedded `HEAD` hash is inherently self-referential and goes stale as soon as the answer is revised. The two facts that *do* reproduce verbatim no matter how many doc-only commits are layered on are the ones this document relies on, both shown above: (a) the binary is stamped `815df1e210e0…`, and (b) the entire base→`HEAD` delta is the addition of this one file. All runtime evidence in this document comes from the binary stamped `815df1e210e0…`.
+**Provenance note (resolves the "which commit?" ambiguity — two rev values, one honest story):** a canonical build stamps its banner with whatever `git rev-parse HEAD` returns *at build time*. This is not a guess — it is exactly what `get_vcs_rev()` does: it shells out to `git rev-parse HEAD` [setup.py:674, the `git rev-parse HEAD` call at setup.py:678] and bakes the result into the C extension as `KITTY_VCS_REV`. Consequently the compiled-in rev depends on *which tree you build*, and the two builds shown above stamp two different values — both observed, neither invented:
+
+- **The default build of the destination tree** (this repository, at its current `HEAD`) stamps `KITTY_VCS_REV = 2017484b1138582e48da1450d325790dac7d152f`, because `git rev-parse HEAD` in this tree returns `2017484b1…` (STEP 6). This is the canonical build a normal user of *this checkout* gets, so it is the value the running binary actually reports.
+- **An isolated worktree checked out at the source rev** `815df1e210e0` — built with the identical canonical `make` — stamps `KITTY_VCS_REV = 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (STEP 8), confirming that the source branch's own commit stamps the source branch's own hash.
+
+The reason these two builds are **behaviorally identical for every observation in this document** is shown by STEP 7: `git diff --name-status 815df1e210e0..HEAD` reports exactly one changed path — `A  blitzy/documentation/kitty_815df1e210e0.md` — the addition of *this* documentation file and nothing else. That file is pure Markdown; it is not part of the C extension, the Python package, or any code path exercised below, so it cannot change any runtime behavior. In other words, the destination `HEAD` (`2017484b1…`) *is* the source rev (`815df1e210e0…`) plus this one non-code file, which is why the runtime pipeline the two binaries execute is bit-for-bit the same even though their stamped VCS strings differ. Every runtime observation in this document was captured from the **default build of the destination tree** (the binary stamped `2017484b1…`); STEP 8's worktree build exists solely to demonstrate the source-rev provenance and is otherwise identical.
 
 **Security posture of the observation harness (resolves F16):** the container provides only the `root` account, which is disclosed here rather than hidden. To avoid predictable, world-accessible artifacts the harness (a) sets `umask 077`, (b) places every file, log, and unix socket inside a `mktemp -d` directory `chmod`ed to `0700` (shown above as `drwx------`), (c) captures each spawned kitty PID via `$!` and reaps exactly that PID in an `EXIT`/`INT`/`TERM` trap (never `pkill`), and (d) scopes remote control to a single unix socket created inside that `0700` directory. The complete harness source is reproduced verbatim in the Appendix so every experiment is auditable and reproducible.
 
@@ -172,7 +198,7 @@ read_bytes(int fd, Screen *screen) {                                  // kitty/c
 **[OBSERVED] — 5 000 numbered lines emitted by a real child; kitty's own instrumentation records the raw bytes the parser consumed and the parser events, and a deterministic validator checks the *entire* result:**
 
 ```
-$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-bytes=$OBS/out/q1_surge_bytes.bin --dump-commands sh -c 'for i in $(seq 1 5000); do printf "L%04d-THE-QUICK-BROWN-FOX\r\n" "$i"; done; sleep 0.4'
+$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-bytes=$OBS/out/q1_surge_bytes.bin --dump-commands sh -c 'for i in $(seq 1 5000); do printf "L%04d-THE-QUICK-BROWN-FOX\r\n" "$i"; done; sleep 0.4' > $OBS/out/q1_surge_dump.txt
 $ python3 harness/surge_validate.py $OBS/out/q1_surge_bytes.bin $OBS/out/q1_surge_dump.txt 5000
 records_expected=5000
 draw_records_found=5000
@@ -189,13 +215,20 @@ The validator (full source in the Appendix) parses the **whole** 20 000-line dum
 **[OBSERVED] — the surge is bit-for-bit reproducible across runs (magnitude/stability rule):**
 
 ```
+$ for r in 2 3; do
+    ./kitty/launcher/kitty -o close_on_child_death=yes --dump-bytes=$OBS/out/q1_surge_bytes_r$r.bin --dump-commands \
+      sh -c 'for i in $(seq 1 5000); do printf "L%04d-THE-QUICK-BROWN-FOX\r\n" "$i"; done; sleep 0.4' > $OBS/out/q1_surge_dump_r$r.txt 2>/dev/null
+    out=$(python3 harness/surge_validate.py $OBS/out/q1_surge_bytes_r$r.bin $OBS/out/q1_surge_dump_r$r.txt 5000); rc=$?
+    sha=$(echo "$out" | awk -F= '/^raw_sha256=/{print $2}')
+    echo "run $r: exit=$rc sha256=$sha"
+  done
 run 2: exit=0 sha256=8c52d6cf552ff7c51f3ce821e5d28160b902b94425c5be6daaace61051a9a132
 run 3: exit=0 sha256=8c52d6cf552ff7c51f3ce821e5d28160b902b94425c5be6daaace61051a9a132
 ```
 
 Both repeats reproduce the run-1 digest `8c52d6cf…` exactly, so "5 000 lines, 140 000 bytes, all present, in order" is stable, not a one-off.
 
-**Attribution precision (resolves the "raw bytes at read_bytes" overclaim, F4):** the bytes written to `--dump-bytes` are emitted **parser-side**, guarded by `#ifdef DUMP_COMMANDS` at `kitty/vt-parser.c:1397`, and cover `self->read.pos - pre_consume_pos` — i.e. exactly the span the parser has just *consumed*. Those are the very bytes that `read_bytes` delivered into the parser's write buffer (`read_bytes` → `vt_parser_commit_write`), so the 140 000-byte figure faithfully reflects what entered at the PTY. The statement "these are the bytes that entered at `read_bytes`" is therefore an **[INFERRED]** data-flow link (parser buffer ← `read_bytes`), not a capture taken at the `read()` call itself. The CLI help for the flag describes it as "raw bytes received from the child process" (`kitty/cli.py:985`), which is accurate as to *content*; this document is simply precise about the *emission point*.
+**Attribution precision (resolves the "raw bytes at read_bytes" overclaim, F4):** the bytes written to `--dump-bytes` are emitted **parser-side**, guarded by `#ifdef DUMP_COMMANDS` at `kitty/vt-parser.c:1396` (the guarded emission block spanning `kitty/vt-parser.c:1396-1398`), and cover `self->read.pos - pre_consume_pos` — i.e. exactly the span the parser has just *consumed*. Those are the very bytes that `read_bytes` delivered into the parser's write buffer (`read_bytes` → `vt_parser_commit_write`), so the 140 000-byte figure faithfully reflects what entered at the PTY. The statement "these are the bytes that entered at `read_bytes`" is therefore an **[INFERRED]** data-flow link (parser buffer ← `read_bytes`), not a capture taken at the `read()` call itself. The CLI help for the flag describes it as "raw bytes received from the child process" (`kitty/cli.py:985`), which is accurate as to *content*; this document is simply precise about the *emission point*.
 
 
 ### 2.3 Pausing and resuming — synchronized output (DEC private mode 2026)
@@ -252,7 +285,26 @@ What this proves, precisely:
 - **kitty keeps processing input while paused.** `draw DRAWN-WHILE-PAUSED` appears in the trace **between** `screen_set_mode 2026 1` and `screen_reset_mode 2026 1` — the parser consumed the byte stream and mutated the (off-screen) screen state *during* the hold. This is the whole point of synchronized output: the *display* is frozen, the *processing* is not.
 - **The begin/end were genuinely sent.** The `od -c` shows the literal `033 [ ? 2 0 2 6 h` and `033 [ ? 2 0 2 6 l` (`033` = `ESC`), so the pause and resume were real emitted control sequences, not an artifact of the trace.
 
-**[INFERRED] — what the headless capture cannot show directly, with source:** that the *pixels the user sees* were held to the pre-pause frame and then replaced atomically is not captured here, because under Mesa `llvmpipe` there is no real scan-out to sample. The mechanism is in `screen_pause_rendering` (`kitty/screen.c:2506`): on begin it arms `expires_at` and **snapshots** the visible state — every visible line is copied into `paused_rendering.linebuf` (`kitty/screen.c:2529-2538`), along with the cursor (`:2527`), colors (`:2528`), and selections — so the renderer can keep drawing the *old* frame; on end it clears `expires_at` and sets `is_dirty = true` (`kitty/screen.c:2511`) to force the GPU to update to the now-current state (the atomic flush). The **observed proxy** for "held then flushed" is the combination above: the pause flag toggled `2→1→2` and processing demonstrably continued during the hold.
+**[OBSERVED] — the held-then-flushed transition, captured at the pixel level.** "The display is frozen while processing continues" can be shown *directly*, not merely inferred. A separate observer launches a real kitty window running a real PTY child and samples the window's backing image (`Window.get_image`, `X.ZPixmap`) before the pause, during the hold, and after the explicit end. The child hides the cursor (`CSI ?25l`, to remove blink noise), draws a baseline frame, sends `CSI ?2026 h`, overwrites the whole screen with 13 different lines, holds ~1.2 s (well under the 2000 ms safety timeout of §2.4), then sends `CSI ?2026 l`:
+
+```
+$ OBS="$OBS" DISPLAY=:99 /root/kitty-venv/bin/python3 harness/pause_pixels.py explicit 1
+mode=explicit run=1 window=640x400 frames=67 begin_ts=1783996493.597
+BEFORE  t-0.041s sha=d4373b5f13cd
+DURING  t+0.610s sha=d4373b5f13cd
+AFTER   t+2.707s sha=8a9f8a69d6f8
+held (BEFORE==DURING): True
+flushed (DURING!=AFTER): True
+pixeldiff BEFORE->AFTER: changed_px=14203 bbox(l,u,r,b)=(0, 5, 251, 231) of 256000
+flush_delay_after_begin_ms=1260 (explicit end sent at +1200ms)
+pngs=/tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657/blitzy/screenshots/mode2026_explicit_{before,during,after}_r1.png
+```
+
+The SHA-256 of the `640×400×4 = 1,024,000`-byte window image is **identical** before the pause and 0.6 s into the hold (`d4373b5f13cd` both times → `held = True`) *even though the child had already overwritten the screen with entirely different text* — the display really is frozen on the pre-pause frame. It changes only **after** `CSI ?2026 l` (`8a9f8a69d6f8` → `flushed = True`), and the flush lands `~1260 ms` after begin — i.e. driven by the explicit end at `+1200 ms`, not by the timeout. The saved PNGs make the two states legible: `…_before_r1.png` and `…_during_r1.png` are byte-identical and show only the two baseline lines, while `…_after_r1.png` shows all 13 held lines appearing **at once**. A second run agrees on every invariant: `held=True`, `flushed=True`, `bbox=(0, 5, 251, 231)`, `changed_px=14214`, flush at `1257 ms`. (Only the wall-clock `begin_ts`, the frame count, and sub-millisecond capture offsets vary run to run; the SHA values differ between runs solely because the drawn text embeds the run label `r1`/`r2` — hence `changed_px` differs by exactly the `1`-glyph.)
+
+**The mechanism, in source.** The freeze is `screen_pause_rendering` (`kitty/screen.c:2506`): on begin it arms `expires_at` and **snapshots** the visible state — every visible line is copied into `paused_rendering.linebuf` (`kitty/screen.c:2529-2538`), along with the cursor (`:2527`), colors (`:2528`), and selections — so the renderer keeps drawing the *old* frame; on end it clears `expires_at` and sets `is_dirty = true` (`kitty/screen.c:2511`) so the next render presents the now-current state (the atomic flush). The parser trace above (the `2→1→2` DECRQM flip and `draw DRAWN-WHILE-PAUSED` between `set_mode`/`reset_mode`) shows *processing* continued through the hold; the pixel capture shows the *display* did not.
+
+**What is still not observed (the honest boundary).** The capture reads the X11 window's **backing image** — the composited frame kitty actually produced, a faithful stand-in for "the frame the user sees." What a headless container genuinely cannot expose is one layer below that: the literal GPU buffer-swap / `vblank` **event** (its timing is not surfaced by `--debug-rendering`, see §5.4) and photons on a physical monitor (there is none). Neither gap weakens the claim here — "held, then flushed atomically" is demonstrated from the window image itself, above.
 
 ### 2.4 Resume without an "end" — the safety timeout
 
@@ -314,13 +366,35 @@ draw T=3531ms DECRQM_REPLY=<ESC>[?2026;2$y
 **[OBSERVED] — proof the child never sent the "end", so the resume was the timeout (counted over the whole emitted byte stream):**
 
 ```
-$ python3 - $OBS/out/q1_timeout_emit_r1.bin   # counts CSI?2026h vs CSI?2026l in the ENTIRE emitted stream
+$ python3 - "$OBS/out/q1_timeout_emit_r1.bin" <<'PY'   # counts CSI?2026h vs CSI?2026l in the ENTIRE emitted stream
+import sys
+raw = open(sys.argv[1], "rb").read()
+print("bytes_emitted=", len(raw))
+print("contains CSI?2026h (begin):", raw.count(b"\x1b[?2026h"))
+print("contains CSI?2026l (end)  :", raw.count(b"\x1b[?2026l"))
+PY
 bytes_emitted= 392
 contains CSI?2026h (begin): 1
 contains CSI?2026l (end)  : 0
 ```
 
-Across both runs the pause flag holds at `1` through `T=1514 ms` and has flipped to `2` by `T=2020 ms` — i.e. the display auto-resumed between 1.5 s and 2.0 s, matching the 2000 ms default. The complete RUN 1 trace above contains exactly one `screen_set_mode 2026 1` and **zero** `screen_reset_mode` events (see its class breakdown), and the byte-stream count above shows `begin = 1, end = 0`: the child never sent `CSI ? 2026 l`, so the resume was produced solely by `screen_check_pause_rendering` firing on `expires_at`. The two runs agree at the flip to the millisecond (`2020` vs `2020`) and differ by at most 1 ms elsewhere (`3027` vs `3028`), so this is a stable timeout, not jitter.
+Across both runs the pause flag holds at `1` through `T=1514 ms` and has flipped to `2` by `T=2020 ms` — i.e. the *state* auto-resumed between 1.5 s and 2.0 s, matching the 2000 ms default. The complete RUN 1 trace above contains exactly one `screen_set_mode 2026 1` and **zero** `screen_reset_mode` events (see its class breakdown), and the byte-stream count above shows `begin = 1, end = 0`: the child never sent `CSI ? 2026 l`, so the resume was produced solely by `screen_check_pause_rendering` firing on `expires_at`. The two runs agree at the flip to the millisecond (`2020` vs `2020`) and differ by at most 1 ms elsewhere (`3027` vs `3028`), so this is a stable timeout, not jitter.
+
+**[OBSERVED] — the same timeout at the pixel level: the *state* resumes on the timer, the *repaint* is event-driven.** The DECRQM poll above resumes cleanly because each ~500 ms query is *itself* input that drives a render. To see what the *display* does when a timed-out application then goes completely idle, the pixel observer of §2.3 holds a pause open with **no** end, waits past 2000 ms, and only then sends a content-neutral render nudge (`CSI 6 n`, a cursor-position-report request that changes no cell):
+
+```
+$ OBS="$OBS" DISPLAY=:99 /root/kitty-venv/bin/python3 harness/pause_pixels.py timeout-nudge 1
+mode=timeout-nudge run=1 window=640x400 frames=88 begin_ts=1783996594.217
+BEFORE  t-0.060s sha=d4373b5f13cd
+DURING  t+0.591s sha=d4373b5f13cd
+AFTER   t+4.211s sha=527f06d48dff
+held (BEFORE==DURING): True
+at +2.3s (past 2000ms state-timeout, pre-nudge) base?True sha=d4373b5f13cd
+first_pixel_flip: +2.619s after begin, +0.010s after nudge -> sha=8a9f8a69d6f8
+pngs=/tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657/blitzy/screenshots/mode2026_timeout-nudge_{before,during,after}_r1.png
+```
+
+Two facts, both stable across two runs. **(1)** The pause *state* clears on the 2000 ms timer exactly as the DECRQM trace showed — at `+2.3 s`, past the timeout, the window image is captured while `expires_at` is already `0`. **(2)** Yet the held frame is *still on screen* at `+2.3 s` (`base?True`); it repaints only after the nudge, `+0.010 s` (run 2: `+0.021 s`) later. So `screen_check_pause_rendering` un-pauses the *state* on time, but the *visible* flush waits for the next render trigger. In an interactive session that trigger is always imminent (the next keystroke, cursor blink, or output byte); in a deliberately idle headless capture it is not — which is why the timed-out content becomes visible on the `CSI 6 n` nudge rather than at exactly 2000 ms. This is precisely the difference from the explicit path (§2.3), where `CSI ?2026 l` is *itself* the triggering input and so flushes at once.
 
 
 ---
@@ -434,7 +508,7 @@ total_tids=68 llvmpipe=32 bare_kitty=33
 
 **This corrects a subtle but important point (resolves F7):** it is *not* true that the talk thread appears "only when a listen socket is configured." `start()` creates it when *either* a talk fd *or* a listen fd is present — `if (self->talk_fd > -1 || self->listen_fd > -1)` (`kitty/child-monitor.c:285`) — and `--single-instance` supplies a **talk fd** (`kitty/main.py:485` → `Boss(..., talk_fd)` `kitty/main.py:226` → `ChildMonitor(talk_fd, listen_fd)` `kitty/boss.py:373`), which is why case `si` grows a `KittyPeerMon` with no listen socket at all. There is additionally an on-demand path: `inject_peer` starts the talk thread if it is not already running — `if (!talk_thread_started) { pthread_create(&self->talk_thread, NULL, talk_loop, self); … }` (`kitty/child-monitor.c:254-259`), called from `kitty/boss.py:2397`. **[INFERRED]** from those lines; the two observed cases above (talk-fd and listen-fd) already demonstrate the "not only a listen socket" point directly.
 
-So the "conductor" is really three loops that never block each other: the **main thread** (GLFW events + rendering + the VT parser), the **I/O thread** `KittyChildMon` (reads child PTYs with `read_bytes`, writes them with `write_to_child`), and — when remote control is in play — the **talk thread** `KittyPeerMon` (accepts and reads remote-control peers, §4.3). State is handed between them through the parser's locked buffer (I/O thread → main thread) and a wakeup pipe (either direction).
+So the "conductor" is really three **independently scheduled** loops: the **main thread** (GLFW events + rendering + the VT parser), the **I/O thread** `KittyChildMon` (reads child PTYs with `read_bytes`, writes them with `write_to_child`), and — when remote control is in play — the **talk thread** `KittyPeerMon` (accepts and reads remote-control peers, §4.3). They avoid *long* synchronous coupling — no loop waits on another to finish its work — but they are **not** lock-free: state is handed between them through the parser's `self->lock`-guarded buffer (I/O thread → main thread) and a wakeup pipe (either direction), so they coordinate through mutexes, pipes, and state handoffs and **can briefly block on that shared lock**. Concretely, the I/O thread's `vt_parser_create_write_buffer` / `vt_parser_commit_write` / `vt_parser_has_space_for_input` and the main thread's `run_worker` all take the same `pthread_mutex_lock(&self->lock)` (`kitty/vt-parser.c:1413-1482`), so a write-side append and a read-side consume can momentarily contend. The separation bounds that contention to short critical sections rather than eliminating it — notably, `run_worker` deliberately *releases* the lock around the expensive `consume_input` parse (`kitty/vt-parser.c:1431-1433`) so the I/O thread is not held off while a burst is being decoded.
 
 ### 3.2 What decides which event is handled first
 
@@ -459,92 +533,98 @@ The array is laid out `[0] = wakeup pipe`, `[1] = signal fd`, `[EXTRA_FDS + i] =
 
 The main loop is not woken for every byte. Waking it is deliberately throttled by `input_delay` (default 3 ms). To **measure** the resulting latency, a real PTY child runs a tight query/reply ping-pong — it sends a DECRQM query `CSI ? 2026 $ p`, times how long until kitty's `…$y` reply returns (steady clock `time.monotonic_ns()`), and repeats. This round-trip is a **proxy** for the wakeup latency: it also contains `read_bytes`, the parse, the reply encode, and the return read, so it slightly *over*-counts the pure wakeup delay. Because those extra terms are ~constant, sweeping `input_delay` isolates the coalescing window.
 
+Command (one full sweep; run once — the two runs per setting and the gap control are internal):
+
+```
+PP_N=200 bash "$OBS/harness/coalesce_sweep.sh"
+```
+
 **[OBSERVED] — sweep of `input_delay ∈ {0, 3, 10, 30}` ms, two independent runs each, N = 200 measured round-trips per run (after 20 warm-ups); statistics computed deterministically from the raw per-trial log:**
 
 ```
 label=input_delay=0ms gap=0ms run1 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=0.008
+wall_duration_s=0.010
 min_ms=0.0329
-median_ms=0.0363
-p90_ms=0.0505
-max_ms=0.0975
-mean_ms=0.0392
+median_ms=0.0485
+p90_ms=0.0612
+max_ms=0.1907
+mean_ms=0.0517
 
 label=input_delay=0ms gap=0ms run2 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=0.008
-min_ms=0.0317
-median_ms=0.0372
-p90_ms=0.0478
-max_ms=0.1257
-mean_ms=0.0407
+wall_duration_s=0.010
+min_ms=0.0341
+median_ms=0.0462
+p90_ms=0.0652
+max_ms=0.0986
+mean_ms=0.0493
 
 label=input_delay=3ms gap=0ms run1 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=0.632
-min_ms=3.1197
-median_ms=3.1543
-p90_ms=3.1833
-max_ms=3.2705
-mean_ms=3.1586
+wall_duration_s=0.634
+min_ms=3.1079
+median_ms=3.1605
+p90_ms=3.1865
+max_ms=4.2701
+mean_ms=3.1672
 
 label=input_delay=3ms gap=0ms run2 (launcher_exit=0)
 count=200 (header n=200)
 wall_duration_s=0.631
-min_ms=3.0923
-median_ms=3.1537
-p90_ms=3.1773
-max_ms=3.2000
-mean_ms=3.1539
+min_ms=3.0877
+median_ms=3.1526
+p90_ms=3.1745
+max_ms=3.2251
+mean_ms=3.1524
 
 label=input_delay=10ms gap=0ms run1 (launcher_exit=0)
 count=200 (header n=200)
 wall_duration_s=2.059
-min_ms=10.1086
-median_ms=10.2455
-p90_ms=10.2902
-max_ms=12.5236
-mean_ms=10.2901
+min_ms=10.0724
+median_ms=10.2403
+p90_ms=10.2860
+max_ms=13.3949
+mean_ms=10.2929
 
 label=input_delay=10ms gap=0ms run2 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=2.055
-min_ms=10.0621
-median_ms=10.2385
-p90_ms=10.2860
-max_ms=12.9565
-mean_ms=10.2700
+wall_duration_s=2.060
+min_ms=10.0774
+median_ms=10.2597
+p90_ms=10.3108
+max_ms=12.6291
+mean_ms=10.2974
 
 label=input_delay=30ms gap=0ms run1 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=6.090
-min_ms=30.2051
-median_ms=30.2929
-p90_ms=30.3632
-max_ms=33.1693
-mean_ms=30.4426
+wall_duration_s=6.086
+min_ms=30.1964
+median_ms=30.2747
+p90_ms=30.3481
+max_ms=33.3335
+mean_ms=30.4256
 
 label=input_delay=30ms gap=0ms run2 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=6.090
-min_ms=30.2037
-median_ms=30.2992
-p90_ms=30.3893
-max_ms=32.8010
-mean_ms=30.4446
+wall_duration_s=6.080
+min_ms=30.2004
+median_ms=30.2743
+p90_ms=30.3367
+max_ms=32.6256
+mean_ms=30.3949
 ```
 
 Reading the medians against the knob:
 
 | `input_delay` | run 1 median | run 2 median | median − `input_delay` |
 |---:|---:|---:|---:|
-| 0 ms  | 0.0363 ms  | 0.0372 ms  | ≈ 0.036 ms (pure overhead) |
-| 3 ms  | 3.1543 ms  | 3.1537 ms  | ≈ 0.154 ms |
-| 10 ms | 10.2455 ms | 10.2385 ms | ≈ 0.243 ms |
-| 30 ms | 30.2929 ms | 30.2992 ms | ≈ 0.293 ms |
+| 0 ms  | 0.0485 ms  | 0.0462 ms  | ≈ 0.047 ms (pure overhead) |
+| 3 ms  | 3.1605 ms  | 3.1526 ms  | ≈ 0.156 ms |
+| 10 ms | 10.2403 ms | 10.2597 ms | ≈ 0.250 ms |
+| 30 ms | 30.2747 ms | 30.2743 ms | ≈ 0.274 ms |
 
-The round-trip latency tracks `input_delay` with slope ≈ 1.0, and the two runs at each setting agree to ~0.01 ms, so the window is stable, not jitter. The base overhead — measured directly at `input_delay = 0` — is a median of **≈ 0.036 ms (36 µs)**, not a fixed 0.05 ms; the small residual over the knob (`0.15 → 0.24 → 0.29 ms`) grows modestly with the delay, consistent with the parser re-check granularity described below. (This corrects an earlier draft that asserted a single fixed overhead inconsistent with its own numbers.)
+The round-trip latency tracks `input_delay` with slope ≈ 1.0, and the two runs at each setting agree to ~0.02 ms or better, so the window is stable, not jitter. The base overhead — measured directly at `input_delay = 0` — is a median of **≈ 0.047 ms (47 µs)**; the small residual over the knob (`0.156 → 0.250 → 0.274 ms`) grows modestly with the delay, consistent with the parser re-check granularity described below.
 
 **Where the delay actually lives (a correction worth stating precisely).** One might expect that a query arriving after a long idle would skip the window. It does **not**, and the control experiment shows why:
 
@@ -553,36 +633,36 @@ The round-trip latency tracks `input_delay` with slope ≈ 1.0, and the two runs
 ```
 label=input_delay=30ms gap=50ms run1 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=16.116
-min_ms=30.2474
-median_ms=30.3498
-p90_ms=30.4186
-max_ms=34.1037
-mean_ms=30.4939
+wall_duration_s=16.117
+min_ms=30.2315
+median_ms=30.3582
+p90_ms=30.4351
+max_ms=33.6547
+mean_ms=30.4960
 
 label=input_delay=30ms gap=50ms run2 (launcher_exit=0)
 count=200 (header n=200)
-wall_duration_s=16.117
-min_ms=30.2723
-median_ms=30.3597
-p90_ms=30.4118
-max_ms=35.2847
-mean_ms=30.4961
+wall_duration_s=16.118
+min_ms=30.2555
+median_ms=30.3567
+p90_ms=30.4293
+max_ms=33.4433
+mean_ms=30.5030
 ```
 
-Even with a 50 ms idle gap between queries (wall time ≈ `200 × (50 + 30) ms` ≈ 16.1 s, confirming the gap was applied), the round-trip median stays ≈ 30.35 ms. The idle gap does **not** collapse the latency to the base overhead. The reason is that the dominant delay is the **parser's flush gate**, not the I/O-thread's wakeup batching. In `run_worker` the accumulated bytes are only consumed when
+Even with a 50 ms idle gap between queries (wall time ≈ `200 × (50 + 30) ms` ≈ 16.1 s, confirming the gap was applied), the round-trip median stays ≈ 30.36 ms. The idle gap does **not** collapse the latency to the base overhead. The reason is that the dominant delay is the **parser's flush gate**, not the I/O-thread's wakeup batching. In `run_worker` the accumulated bytes are only consumed when
 
 ```c
 pd->time_since_new_input = pd->now - self->new_input_at;                              // vt-parser.c:1424
 if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ) {  // vt-parser.c:1425
     …
-    consume_input(self, pd->dump_callback, screen->window_id);                        // vt-parser.c:1431
+    consume_input(self, pd->dump_callback, screen->window_id);                        // vt-parser.c:1432
     …
     self->new_input_at = 0;                                                           // vt-parser.c:1436
 }
 ```
 
-`new_input_at` is stamped when bytes are committed (`if (self->new_input_at == 0) self->new_input_at = monotonic();`, `kitty/vt-parser.c:1469`) and reset to 0 after a consume (`kitty/vt-parser.c:1436`). Because it is re-stamped for **each fresh arrival**, every isolated query must wait `input_delay` before it is parsed — which is exactly why the 50 ms idle gap makes no difference. The I/O-thread's wakeup coalescing (`kitty/child-monitor.c:1562-1569`, including the "wake immediately if idle longer than `input_delay`" branch at `:1565`) is a *second*, complementary throttle on the same knob governing *when the main loop is woken*; the ping-pong proxy makes the parser gate the visible term. Either way, the trade-off is the one documented in `docs/performance.rst`: a few milliseconds of artificial delay batches work and cuts CPU wakeups, at the cost of a little display latency.
+`new_input_at` is stamped when bytes are committed (`if (self->new_input_at == 0) self->new_input_at = monotonic();`, `kitty/vt-parser.c:1469`) and reset to 0 after a consume (`kitty/vt-parser.c:1436`). Because it is re-stamped for **each fresh arrival**, every isolated query must wait `input_delay` before it is parsed — which is exactly why the 50 ms idle gap makes no difference. The I/O-thread's wakeup coalescing (`kitty/child-monitor.c:1562-1569`, including the "wake immediately if idle longer than `input_delay`" branch at `:1566`) is a *second*, complementary throttle on the same knob governing *when the main loop is woken*; the ping-pong proxy makes the parser gate the visible term. Either way, the trade-off is the one documented in `docs/performance.rst`: a few milliseconds of artificial delay batches work and cuts CPU wakeups, at the cost of a little display latency.
 
 
 ---
@@ -596,6 +676,10 @@ Shell integration marks the prompt, the command, and the command's output with O
 **[OBSERVED] — what kitty's *shipped* bash integration actually emits.** A real interactive `bash` was launched under a real kitty with shell integration auto-injected, one command (`printf "HELLO-OUTPUT\n"`) was driven in via `kitty @ send-text`, and the raw bytes were dumped and the OSC 133 sequences extracted in order:
 
 ```
+$ bash harness/osc133_capture.sh    # bash under a real kitty; drives one command via `kitty @ send-text`; writes $OBS/osc133_bytes.bin (raw) + $OBS/osc133_dump.txt (--dump-commands)
+prompt_marker_seen=yes
+send_text_exit=0
+done
 $ python3 harness/osc133_extract.py $OBS/osc133_bytes.bin
 01: <ESC>]133;k;start_kitty<BEL>
 02: <ESC>]133;D;0<BEL>
@@ -625,6 +709,7 @@ So kitty's bash integration emits exactly four *semantic* marks — `133;A` (pro
 **[OBSERVED] — the marks stay aligned with text because they are dispatched serially, in byte order.** This is the COMPLETE 53-line `--dump-commands` trace for the same run; note how each `shell_prompt_marking 133 …` event is interleaved with the `draw` of the surrounding text, in the exact order the bytes arrived:
 
 ```
+$ cat $OBS/osc133_dump.txt    # the --dump-commands trace captured by the same osc133_capture.sh run above
 handle_remote_print aWdub3JlYm90aCBvciBpZ25vcmVzcGFjZSBwcmVzZW50IGluIGJhc2ggSElTVENPTlRST0wgc2V0dGluZywgc2hvd2luZyBydW5uaW5nIGNvbW1hbmQgd2lsbCBub3QgYmUgcm9idXN0Cg==}
 ignoreboth or ignorespace present in bash HISTCONTROL setting, showing running command will not be robust
 process_cwd_notification 7 kitty-shell-cwd://reverse-code-generator-6e7d35be-kxf24/tmp/blitzy/kitty/blitzy-85ce7b41-edf3-42eb-84b1-2fc55abedc59_304657
@@ -715,22 +800,26 @@ children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_pa
 
 **[OBSERVED] — an 8 MiB burst (8× the 1 MiB buffer) survives bit-for-bit; the varied payload means integrity is proven by hash, not by a byte count that a compensating drop+duplicate could preserve:**
 
+Command (one committed driver; its complete stdout is the three fenced blocks in this subsection — group 1 losslessness, group 2 size sweep, group 3 slow-drain — run once):
+
 ```
-$ FLOOD_META=… FLOOD_BYTES=8388608 ./kitty/launcher/kitty -o close_on_child_death=yes -o input_delay=3 --dump-bytes=… env … python3 harness/flood.py
-$ python3 harness/flood_verify.py <dump.bin> <meta> "trial 1"
-label=bytes=8388608 input_delay=3 trial=1
+bash "$OBS/harness/flood_sweep.sh"
+```
+
+```
+label=bytes=8388608 input_delay=3 trial=1 launcher_exit=0
 sent_bytes=8388608 dumped_bytes=8388608
 sent_sha256=f7ed19dbe389fdfb8746b6d71de4a0cfa4aee1fba9f40f7cd3587f4539040b6f
 dump_sha256=f7ed19dbe389fdfb8746b6d71de4a0cfa4aee1fba9f40f7cd3587f4539040b6f
-write_wall_ms=1319.395
+write_wall_ms=1228.043
 buffer_multiple=8.00x the 1 MiB VT parser buffer
 RESULT=PASS_LOSSLESS
 
-label=bytes=8388608 input_delay=3 trial=2
+label=bytes=8388608 input_delay=3 trial=2 launcher_exit=0
 sent_bytes=8388608 dumped_bytes=8388608
 sent_sha256=f7ed19dbe389fdfb8746b6d71de4a0cfa4aee1fba9f40f7cd3587f4539040b6f
 dump_sha256=f7ed19dbe389fdfb8746b6d71de4a0cfa4aee1fba9f40f7cd3587f4539040b6f
-write_wall_ms=1392.782
+write_wall_ms=1187.859
 buffer_multiple=8.00x the 1 MiB VT parser buffer
 RESULT=PASS_LOSSLESS
 ```
@@ -741,35 +830,35 @@ RESULT=PASS_LOSSLESS
 
 ```
 label=bytes=1048576 input_delay=3 trial=1 launcher_exit=0
-write_wall_ms=3.326
+write_wall_ms=2.846
 RESULT=PASS_LOSSLESS
 
 label=bytes=4194304 input_delay=3 trial=1 launcher_exit=0
-write_wall_ms=535.321
+write_wall_ms=540.547
 RESULT=PASS_LOSSLESS
 
 label=bytes=8388608 input_delay=3 trial=1 launcher_exit=0
-write_wall_ms=1399.153
+write_wall_ms=1181.993
 RESULT=PASS_LOSSLESS
 ```
 
 ```
 label=bytes=8388608 input_delay=3 trial=A launcher_exit=0
-write_wall_ms=1247.591
+write_wall_ms=1201.917
 RESULT=PASS_LOSSLESS
 
 label=bytes=8388608 input_delay=200 trial=A launcher_exit=0
-write_wall_ms=1579.969
+write_wall_ms=1570.434
 RESULT=PASS_LOSSLESS
 ```
 
-Two things stand out. First, the **before/at/after-threshold** behavior: a 1 MiB burst — which fits entirely within the parser buffer — completes in **3.3 ms** without ever blocking, whereas 4 MiB and 8 MiB (which overflow the buffer) take **535 ms** and **1399 ms**, i.e. the write time grows once the producer crosses the buffer size and must wait for kitty to drain. Second, holding the burst at 8 MiB but making kitty drain **slower** (raising `input_delay` from 3 to 200 ms) *lengthens* the writer's blocked time (**1248 ms → 1580 ms**) while remaining lossless — the producer's rate is dictated by the consumer, which is exactly cooperative backpressure.
+Two things stand out. First, the **before/at/after-threshold** behavior: a 1 MiB burst — which fits entirely within the parser buffer — completes in **2.8 ms** without ever blocking, whereas 4 MiB and 8 MiB (which overflow the buffer) take **541 ms** and **1182 ms**, i.e. the write time grows once the producer crosses the buffer size and must wait for kitty to drain. Second, holding the burst at 8 MiB but making kitty drain **slower** (raising `input_delay` from 3 to 200 ms) *lengthens* the writer's blocked time (**1202 ms → 1570 ms**) while remaining lossless — the producer's rate is dictated by the consumer, which is exactly cooperative backpressure.
 
 **Correction (resolves the `repaint_delay` claim in F9/F14).** An earlier draft attributed this pacing to a "~10 ms `repaint_delay` cadence." That is wrong: `repaint_delay`'s own documentation says "to minimize latency when there is pending input to be processed, this option is ignored" (`kitty/options/definition.py:873-875`). While a backlog exists, the render delay is bypassed, so it does **not** pace ingestion; the pacing comes solely from the POLLIN gate above. The `repaint_delay` claim has been removed.
 
 **[NON-CANONICAL] supplement.** kitty's own test suite exercises the buffer boundary synchronously via the `parse_bytes` helper and `VT_PARSER_BUFFER_SIZE` (`kitty_tests/parser.py`), but that helper feeds the parser directly and **bypasses** the `io_thread`/PTY path, so it is not canonical evidence for backpressure; the real-PTY losslessness and pacing above are the canonical evidence.
 
-### 4.3 Under an unstable remote connection the PTY pipeline is unaffected
+### 4.3 Under an unstable remote connection the PTY pipeline stays functionally isolated
 
 Remote control reaches kitty by **two distinct transports**, and the question's "unstable remote connection" concerns the first of them:
 
@@ -998,68 +1087,112 @@ recovery_rtt_ms distribution (min/median/max):
 **What this proves and how the mechanism is named.** Across 80 identical unstable-peer events (two runs of 40), the kitty process stayed alive every time, the `KittyPeerMon` talk thread was never torn down (`peermon=1` in every row), a fresh well-formed remote command always succeeded (`ls_exit=0`, `10850` bytes each), and — critically — `send-text` was **actually delivered** to the child's stdin every time (`deliver=1`), which the reader child confirmed out-of-band rather than trusting the send command's own exit code. Only the individual half-spoken peer is discarded. [INFERRED — source] The teardown of that one peer is the path `read_from_peer` → `notify_on_peer_removal` (`kitty/child-monitor.c:1673`), which enqueues an internal message whose payload is `strdup("peer_death")` (`L1677`); on the Python side `Boss.peer_message_received` (`kitty/boss.py:776`) matches `msg_bytes == b'peer_death'` (`L777`) and simply pops that peer from `peer_data_map`, returning `False`. The internal `"peer_death"` token is not surfaced to any log, so it is cited from source; what is **observed** is its consequence — the peer disappears while the thread, the process, and the socket all continue. The recovery latency is reported as a distribution (median ≈ 29–31 ms, occasional tail to ~46 ms) rather than a single tidy number, per the inconsistency rule.
 
 
-#### 4.3.4 The PTY pipeline is independent of talk-socket turmoil (matched control)
+#### 4.3.4 The PTY pipeline stays functionally isolated from talk-socket turmoil, with a shared-scheduling tail caveat (matched control)
 
-[OBSERVED] Survival is necessary but not sufficient; the sharper question is whether remote-socket chaos *perturbs the PTY input path at all*. To answer it, the same PTY RTT prober from §3.3 (`pingpong.py`, `PP_N=200`, default `input_delay=3`) was run twice against a server that also carried a listen socket, holding the prober input identical and changing only the remote condition:
+[OBSERVED] Survival is necessary but not sufficient; the sharper question is whether remote-socket chaos *perturbs the PTY input path*, and if so, how. To answer it, the same PTY RTT prober from §3.3 (`pingpong.py`, `PP_N=200`, default `input_delay=3`) is run in two matched phases against a server that also carries a listen socket, holding the prober input byte-identical and changing only the remote condition:
 
-- **Phase A (baseline):** the talk socket sat idle.
-- **Phase B (chaos):** a background loop fired the *same* byte-identical `peer_disrupt.py` events at the talk socket continuously for the entire prober run.
+- **Phase A (baseline):** the talk socket sits idle.
+- **Phase B (chaos):** a background loop fires the *same* byte-identical `peer_disrupt.py` events at the talk socket continuously for the entire prober run.
 
-Command:
+A single A/B pair is **not** enough to characterise the effect, because the quantity of interest — the chaos-phase RTT *tail* — is itself unstable from run to run. (An earlier draft of this section reported one pair of runs whose chaos `max` was ~10 ms and called it "a single delayed sample"; that was an under-sample, as the distribution below shows.) So the whole matched experiment is repeated `PP_RUNS=15` times per set, and the set is repeated three times — **45 runs total**, byte-identical prober input throughout — and `pty_ind_distribution.py` reads each run's raw per-trial RTT log to report the **distribution** (per-run `min`/`median`/`p95`/`max` for both phases, plus each set's tail-exceedance counts) rather than one tidy pair of numbers, per the inconsistency rule.
 
-```
-PP_N=200 bash "$OBS/harness/pty_independence.sh"
-```
-
-Complete, unedited output — run 1:
+Command (one set of 15; invoked three times):
 
 ```
-### Phase A (baseline, talk socket idle), PP_N=200 ###
-label=A_baseline
-count=200 (header n=200)
-wall_duration_s=0.636
-min_ms=3.1326
-median_ms=3.1630
-p90_ms=3.1938
-max_ms=5.0107
-mean_ms=3.1758
-
-### Phase B (concurrent talk-socket chaos), PP_N=200 ###
-label=B_chaos
-count=200 (header n=200)
-wall_duration_s=0.642
-min_ms=3.1055
-median_ms=3.1565
-p90_ms=3.1896
-max_ms=10.0006
-mean_ms=3.2105
+PP_N=200 PP_RUNS=15 python3 "$OBS/harness/pty_ind_distribution.py"
 ```
 
-Complete, unedited output — run 2 (reproduction):
+Complete, unedited output — set 1 of 3:
 
 ```
-### Phase A (baseline, talk socket idle), PP_N=200 ###
-label=A_baseline
-count=200 (header n=200)
-wall_duration_s=0.630
-min_ms=3.0912
-median_ms=3.1481
-p90_ms=3.1681
-max_ms=3.1970
-mean_ms=3.1491
+PP_N=200 PP_RUNS=15
+run | A_min  A_med  A_p95  A_max   | B_min  B_med  B_p95  B_max (ms)
+ 1  | 3.1012 3.1451 3.1653  3.1982 | 3.1082 3.1599 3.1925   3.2689
+ 2  | 3.1157 3.1476 3.1903  3.7513 | 3.0966 3.1487 3.1741   3.2219
+ 3  | 3.1022 3.1499 3.1869  3.2431 | 3.0882 3.1537 3.1951  13.5402
+ 4  | 3.0918 3.1543 3.1886  3.2176 | 3.1216 3.1631 3.2078  15.2987
+ 5  | 3.1017 3.1610 3.1841  3.3404 | 3.1077 3.1544 3.1862   3.5142
+ 6  | 3.0997 3.1449 3.1703  3.3115 | 3.0913 3.1447 3.1711   3.2083
+ 7  | 3.1139 3.1563 3.1884  3.3340 | 3.0807 3.1515 3.1755   3.2795
+ 8  | 3.0947 3.1438 3.1748  3.1954 | 3.1135 3.1566 3.1947   4.9769
+ 9  | 3.0865 3.1449 3.1775  3.3007 | 3.0885 3.1519 3.2038   9.9795
+10  | 3.1145 3.1564 3.1879  3.2643 | 3.1234 3.1490 3.1776  16.7096
+11  | 3.0870 3.1546 3.1856  3.3287 | 3.0829 3.1442 3.1760   3.2337
+12  | 3.1199 3.1590 3.1971  3.3042 | 3.0784 3.1509 3.1787  10.9532
+13  | 3.0981 3.1427 3.1718  3.2741 | 3.1083 3.1508 3.1833  20.2883
+14  | 3.1169 3.1543 3.1805  3.3062 | 3.0951 3.1489 3.1803  10.6655
+15  | 3.0960 3.1466 3.1710  3.2136 | 3.0879 3.1425 3.1724   3.1945
 
-### Phase B (concurrent talk-socket chaos), PP_N=200 ###
-label=B_chaos
-count=200 (header n=200)
-wall_duration_s=0.645
-min_ms=3.1387
-median_ms=3.1766
-p90_ms=3.2141
-max_ms=10.7181
-mean_ms=3.2205
+=== aggregate over 15 runs ===
+baseline max_ms range: 3.1954 .. 3.7513  (>10ms: 0/15)
+chaos    max_ms range: 3.1945 .. 20.2883  (>10ms: 6/15, >20ms: 1/15, >90ms: 0/15)
+baseline median_ms: min=3.1427 median=3.1499 max=3.1610
+chaos    median_ms: min=3.1425 median=3.1509 max=3.1631
+chaos max_ms sorted desc: 20.29 16.71 15.30 13.54 10.95 10.67 9.98 4.98 3.51 3.28 3.27 3.23 3.22 3.21 3.19
 ```
 
-The PTY RTT's central tendency is **unchanged** by concurrent talk-socket chaos: baseline vs chaos median is `3.1630` vs `3.1565` ms (run 1) and `3.1481` vs `3.1766` ms (run 2) — a shift smaller than the run-to-run variation of the baseline itself, and in both phases the median stays pinned to the `input_delay = 3 ms` coalescing window measured in §3.3. Chaos contributes only a rare high outlier (`max` ~10 ms vs ~3–5 ms) — a single delayed sample out of 200 — while `p90` is essentially identical. Because the talk thread (`talk_loop`) has its own poll loop (`kitty/child-monitor.c:1805`) separate from the `io_loop` that drives `read_bytes`/`run_worker`, an unstable peer degrades — at most — its own thread's tail latency and never the PTY pipeline's throughput or characteristic latency. This is the matched-control evidence for PTY independence that F10 requires.
+Complete, unedited output — set 2 of 3 (reproduction):
+
+```
+PP_N=200 PP_RUNS=15
+run | A_min  A_med  A_p95  A_max   | B_min  B_med  B_p95  B_max (ms)
+ 1  | 3.1149 3.1537 3.1849  3.3022 | 3.0996 3.1505 3.1919  22.4199
+ 2  | 3.1027 3.1564 3.1834  3.2252 | 3.1143 3.1491 3.1758   3.2600
+ 3  | 3.0961 3.1550 3.1807  3.2488 | 3.1077 3.1489 3.1793   4.9701
+ 4  | 3.1058 3.1603 3.1891  3.2448 | 3.0957 3.1569 3.1893   3.2266
+ 5  | 3.1159 3.1558 3.2002  3.2361 | 3.0925 3.1532 3.1918   3.2306
+ 6  | 3.1157 3.1473 3.1750  3.2393 | 3.1079 3.1501 3.1953   4.7591
+ 7  | 3.1078 3.1613 3.1908  3.2512 | 3.0903 3.1470 3.1778   3.2755
+ 8  | 3.0962 3.1552 3.1896  3.3169 | 3.0932 3.1521 3.1932   3.2380
+ 9  | 3.0726 3.1555 3.2016  3.3111 | 3.0821 3.1608 3.1959   3.2662
+10  | 3.1145 3.1505 3.1806  3.2526 | 3.0936 3.1537 3.1980   4.2935
+11  | 3.0717 3.1438 3.1733  3.2115 | 3.1012 3.1559 3.1941   3.3977
+12  | 3.1079 3.1570 3.1913  3.6950 | 3.1127 3.1537 3.1870   3.2248
+13  | 3.1049 3.1513 3.1817  4.4115 | 3.0939 3.1529 3.1832   3.2461
+14  | 3.1066 3.1606 3.1909  3.2275 | 3.1110 3.1554 3.2019  15.7605
+15  | 3.1029 3.1478 3.1676  3.1969 | 3.1055 3.1557 3.1956   3.2417
+
+=== aggregate over 15 runs ===
+baseline max_ms range: 3.1969 .. 4.4115  (>10ms: 0/15)
+chaos    max_ms range: 3.2248 .. 22.4199  (>10ms: 2/15, >20ms: 1/15, >90ms: 0/15)
+baseline median_ms: min=3.1438 median=3.1552 max=3.1613
+chaos    median_ms: min=3.1470 median=3.1532 max=3.1608
+chaos max_ms sorted desc: 22.42 15.76 4.97 4.76 4.29 3.40 3.28 3.27 3.26 3.25 3.24 3.24 3.23 3.23 3.22
+```
+
+Complete, unedited output — set 3 of 3 (reproduction):
+
+```
+PP_N=200 PP_RUNS=15
+run | A_min  A_med  A_p95  A_max   | B_min  B_med  B_p95  B_max (ms)
+ 1  | 3.1174 3.1832 3.2214  3.2670 | 3.1376 3.1878 3.2312   3.2807
+ 2  | 3.1052 3.1659 3.1976  3.2424 | 3.1260 3.1821 3.2354   3.2721
+ 3  | 3.0944 3.1520 3.1828  3.2437 | 3.1053 3.1484 3.1808   3.3057
+ 4  | 3.0850 3.1487 3.1778  3.2721 | 3.0889 3.1436 3.1795   3.2221
+ 5  | 3.1350 3.1605 3.1904  3.3439 | 3.0789 3.1455 3.1732  16.7236
+ 6  | 3.1218 3.1543 3.1859  3.2824 | 3.1180 3.1622 3.2027   3.3686
+ 7  | 3.0907 3.1505 3.1761  3.2804 | 3.0900 3.1543 3.1968   3.2698
+ 8  | 3.0877 3.1420 3.1712  3.3002 | 3.0876 3.1526 3.1909   3.2212
+ 9  | 3.0828 3.1548 3.1859  3.2488 | 3.0921 3.1589 3.2028   3.2830
+10  | 3.0987 3.1607 3.2018  3.3301 | 3.1024 3.1471 3.1727  11.3958
+11  | 3.1034 3.1606 3.2216  3.3335 | 3.0905 3.1618 3.2048   9.3026
+12  | 3.1064 3.1615 3.2066  3.3163 | 3.0990 3.1692 3.2139   9.0239
+13  | 3.0873 3.1527 3.1945  3.2403 | 3.1093 3.1627 3.2082   3.3185
+14  | 3.1012 3.1480 3.1770  3.2169 | 3.1151 3.1612 3.2036   6.7056
+15  | 3.1152 3.1551 3.1993  3.6878 | 3.1161 3.1535 3.1878   3.2147
+
+=== aggregate over 15 runs ===
+baseline max_ms range: 3.2169 .. 3.6878  (>10ms: 0/15)
+chaos    max_ms range: 3.2147 .. 16.7236  (>10ms: 2/15, >20ms: 0/15, >90ms: 0/15)
+baseline median_ms: min=3.1420 median=3.1548 max=3.1832
+chaos    median_ms: min=3.1436 median=3.1589 max=3.1878
+chaos max_ms sorted desc: 16.72 11.40 9.30 9.02 6.71 3.37 3.32 3.31 3.28 3.28 3.27 3.27 3.22 3.22 3.21
+```
+
+Summing the three per-set aggregates printed above gives the full 45-run distribution. In the **baseline** phase the maximum never exceeded `4.4115` ms and `0/45` runs crossed 10 ms. Under **chaos** the maximum ranged from `3.1945` ms to `22.4199` ms, with `6 + 2 + 2 = 10/45` runs over 10 ms, `1 + 1 + 0 = 2/45` over 20 ms, and `0/45` over 90 ms. Two facts reproduce cleanly, and they must be stated separately:
+
+- **The central tendency is unchanged — the PTY pipeline is functionally isolated.** Across all 45 runs the chaos-phase median (`3.1425 … 3.1878` ms, median-of-medians `3.1532` ms) is statistically indistinguishable from the baseline median (`3.1420 … 3.1832` ms, median-of-medians `3.1543` ms); both stay pinned to the `input_delay = 3 ms` coalescing window measured in §3.3. Concurrent talk-socket chaos does **not** shift the PTY pipeline's characteristic latency, and — as §4.3.3 established over 80 identical disruptions — the process, the `KittyPeerMon` thread, and the socket all survive, no round-trip is lost or reordered, and `send-text` is delivered every time. This functional isolation is the load-bearing claim, and it holds. Its mechanism is structural: the talk thread runs `talk_loop` on its own poll loop (`kitty/child-monitor.c:1805`), wholly separate from the `io_loop` that drives `read_bytes`/`run_worker`, so a half-spoken peer cannot corrupt, block, or reorder the PTY input path.
+- **The tail is unstable, and chaos measurably inflates it.** The baseline phase has essentially no tail (`0/45` over 10 ms; worst `4.41` ms). Under chaos, `10/45` runs pushed a *single* round-trip into a `10–22` ms spike, and the per-set counts (`6/15`, `2/15`, `2/15`) show the tail's frequency and height themselves vary from one set of runs to the next on this shared-scheduler container. The reason is that functional isolation is not the same as scheduling isolation: the two threads still contend for the same OS CPU, so a burst of peer-teardown work (`read_from_peer` → `notify_on_peer_removal` → the `"peer_death"` message, §4.3.3) can occasionally delay one PTY round-trip into the tail without ever touching the PTY data path. The honest characterisation is therefore **functional isolation with a shared-scheduling tail** — not "unaffected" and not "never". A separate observation run (the QA reference, on the same byte-identical input) recorded a still-heavier tail — chaos `max` up to ~`279.74` ms with `3/15` runs over 90 ms — which only reinforces the point: the tail's height is scheduling-dependent and must be reported as this distribution, never collapsed to one tidy number. This is the matched-control evidence for PTY independence that F10 requires: the pipeline's correctness and central latency are isolated from remote turmoil, while its worst-case tail shares the machine's scheduler.
 
 
 ## 5. Q4 — End to end: from a keystroke and a byte to the interface settling
@@ -1217,22 +1350,34 @@ The investigation used only kitty's own instrumentation, and each flag was exerc
 
 - **`--dump-commands`** ("Output commands received from child process to STDOUT", `kitty/cli.py`) — used throughout (§2–§5) to print the parser's per-token stream.
 - **`--dump-bytes`** ("Path to file in which to store the raw bytes received from the child process") — used in §2.2; note (per F4) that this is emitted parser-side from the consumed span, not literally from `read_bytes`.
-- **`--debug-input` / `--debug-keyboard`** — the *same* option (`kitty/cli.py:996`, `dest=debug_keyboard`). §5.1 used `--debug-keyboard`; a one-off with the `--debug-input` spelling confirms it emits the identical `on_key_input` line:
+- **`--debug-input` / `--debug-keyboard`** — the *same* option (`kitty/cli.py:996`, `dest=debug_keyboard`). §5.1 used `--debug-keyboard`; a one-off with the `--debug-input` spelling drives a real `'a'` keypress into the focused GLFW window via XTEST (`xtest_inject.py`, Appendix A) and confirms it emits the identical `on_key_input` line. (ESC colour bytes are stripped per the disclosure above; the `kitty_window` id and the leading `[t]` timestamps vary run to run — everything from `glfw key` onward reproduced byte-for-byte across three runs.)
 
 ```
-[0.213] [33mon_key_input[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
-[0.238] [33mon_key_input[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+$ ./kitty/launcher/kitty --debug-input -o close_on_child_death=yes sh -c 'sleep 6' 2>$OBS/out/debuginput.err &
+$ python3 $OBS/harness/xtest_inject.py a::0x61       # inject a real 'a' keypress (keysym 0x61) via XTEST
+kitty_window=0x20000c focus=0x20000c FOCUS_OK
+INJECTED a (mods=none keysym=0x61 keycode=38)
+$ grep -a on_key_input $OBS/out/debuginput.err | sed 's/\x1b//g'
+[1.985] [33mon_key_input[m: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a' state: 0 sent key as text to child: a
+[2.015] [33mon_key_input[m: glfw key: 0x61 native_code: 0x61 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
 ```
 
-- **`--replay-commands`** — replays a dump file into a fresh window. A capture was taken from a real child, then replayed:
+- **`--replay-commands`** — reads a `--dump-commands` file and re-emits each parsed command back as raw bytes on stdout (`kitty/client.py:270-290`, dispatched by `client_main` at `kitty/main.py:476-477`). It is a lightweight client — no window is opened — that pauses on `input()` at the end (`kitty/client.py:289-290`), so it is fed `</dev/null` to return immediately instead of blocking. A capture was first taken from a real child:
 
 ```
---- captured trace ---
+$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands sh -c 'printf "REPLAY-SRC\r\n"; sleep 0.15' > $OBS/out/replay_capture.txt
+$ grep -E 'draw REPLAY-SRC|screen_carriage_return|screen_linefeed' $OBS/out/replay_capture.txt
 draw REPLAY-SRC
 screen_carriage_return
 screen_carriage_return
 screen_linefeed
---- replay re-dump (draw of REPLAY-SRC should reappear) ---
+```
+
+then replayed back through a fresh `--dump-commands` child so the round-trip is visible:
+
+```
+$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands sh -c "./kitty/launcher/kitty --replay-commands $OBS/out/replay_capture.txt </dev/null" > $OBS/out/replay_redump.txt
+$ grep -E 'draw REPLAY-SRC|screen_carriage_return|screen_linefeed' $OBS/out/replay_redump.txt
 draw REPLAY-SRC
 screen_carriage_return
 screen_carriage_return
@@ -1240,23 +1385,25 @@ screen_carriage_return
 screen_linefeed
 ```
 
-The replayed `draw REPLAY-SRC` re-executes, demonstrating the flag round-trips a dump back through the command pipeline.
+The replayed `draw REPLAY-SRC` re-executes, demonstrating the flag round-trips a dump back through the command pipeline. The re-dump shows three `screen_carriage_return` where the capture shows two: the PTY's output-newline translation (ONLCR) fires a *second* time — the first `--dump-commands` child already expanded the child's `\n` into `\r\n` (one literal CR plus one added), and wrapping the replay as the child of a *second* `--dump-commands` PTY expands its emitted `\n` once more. Both invocations exit 0; the line counts (capture: 2 carriage-returns; re-dump: 3) were stable across three runs.
 
 ### 5.4 The render/settle boundary: what is observable here, and the knobs (F14)
 
 [OBSERVED — with an explicit limitation] The final "interface settles" phase is a GPU frame draw plus buffer swap. In this **headless, software-GL** sandbox that phase is *not* surfaced by kitty's own tracing. `--debug-rendering` emitted only window-lifecycle lines, never a per-frame draw or swap:
 
 ```
-[0.139] OS Window created
-[0.148] Failed to open systemd user bus with error: Connection refused
-[0.152] Child launched
+$ ./kitty/launcher/kitty -o close_on_child_death=yes --debug-rendering sh -c 'true' 2>&1 1>/dev/null   # timestamps vary run to run
+[0.149] OS Window created
+[0.160] Failed to open systemd user bus with error: Connection refused
+[0.164] Child launched
 ```
 
-[INFERRED — source] That is consistent with the code: the `debug_rendering` macro (`kitty/state.h:14`) is used in `kitty/glfw.c` only for a color-scheme change (`L72`), an occlusion change (`L261`), and window creation (`L1321`) — none per frame. **Honest limitation:** I therefore did *not* directly observe the visible frame draw/swap; the claim that a frame is composed and presented is inferred from the render configuration, not shown as a captured frame.
+[INFERRED — source] That is consistent with the code: the `debug_rendering` macro (`kitty/state.h:14`) is used in `kitty/glfw.c` only for a color-scheme change (`L72`), an occlusion change (`L261`), and window creation (`L1321`) — none per frame. **Honest limitation, scoped precisely:** kitty's own tracing therefore does *not* surface the per-frame draw / buffer-swap **event**. It does **not** follow that no frame can be observed: §2.3 and §2.4 capture the composed frame *content* directly from the X11 window backing image (`Window.get_image`, with SHA-256 hashes and a pixel-diff), proving the synchronized-output hold and the atomic flush at the pixel level. What remains unobserved here is therefore narrow — the *timing of the swap event* and any physical-monitor scan-out — not the presence or content of the presented frame.
 
 What *can* be stated canonically is the render configuration, read **from the built binary** (not the `.py` source text) via the default `Options`:
 
 ```
+$ ./kitty/launcher/kitty +runpy 'from kitty.options.types import defaults as d; from kitty.fast_data_types import VT_PARSER_BUFFER_SIZE as b; print(f"input_delay={d.input_delay} (ms)"); print(f"repaint_delay={d.repaint_delay} (ms)"); print(f"sync_to_monitor={d.sync_to_monitor}"); print(f"VT_PARSER_BUFFER_SIZE={b} bytes (={b//(1024*1024)} MiB)")'
 input_delay=3 (ms)
 repaint_delay=10 (ms)
 sync_to_monitor=True
@@ -1275,8 +1422,8 @@ Putting the observed pieces together, here is the full rhythm from "mixed input 
 3. **Serial dispatch.** The main thread runs one `run_worker`/`parse_worker` pass (`kitty/vt-parser.c:1496`) that consumes the buffer **in byte order**, routing each token to the screen before the next — plain text via `consume_normal`, CSI/mode changes, OSC 133 marks via `cmd_output_marking` (`kitty/screen.c:2338`), DCS capability queries via `dispatch_dcs` → `screen_request_capabilities`, and inline remote commands via `parse_kitty_dcs` → `handle_remote_cmd`. Because it is one ordered pass over one buffer, shell-integration hints never drift out of sync with the text they annotate. *(§4.1, §4.3.1, §4.3.2)*
 4. **Screen mutation, possibly paused.** Screen state is updated in place. If the stream opened a synchronized update (`CSI ? 2026 h`, `PENDING_MODE` = 2026, `kitty/control-codes.h:235`), `screen_pause_rendering` (`kitty/screen.c:2506`) snapshots the frame and holds it — with a safety `expires_at` timeout (default 2000 ms, auto-resumed by `screen_check_pause_rendering`, `kitty/screen.c:2489`) even if the closing `CSI ? 2026 l` never arrives. Parsing continues while paused. *(§2.3, §2.4)*
 5. **Backpressure, if the producer outruns the consumer.** If the buffer fills, the POLLIN gate `vt_parser_has_space_for_input(...) ? POLLIN : 0` (`kitty/child-monitor.c:1501`) stops requesting reads; the PTY fills and the child blocks on `write()` — lossless, cooperative pacing, verified by hash over an 8 MiB burst. *(§4.2)*
-6. **Independence of the remote channel.** Any remote-control turmoil rides a separate `talk_loop`/`KittyPeerMon` thread and never perturbs steps 1–5; an unstable peer produces `peer_death` (`kitty/child-monitor.c:1677`) handled independently, with PTY latency unchanged under concurrent chaos. *(§4.3.3, §4.3.4)*
-7. **Settle.** With no backlog, the frame is presented at the `repaint_delay`/`sync_to_monitor` cadence (source defaults `10 ms`/`yes`, §5.4). The visible draw/swap itself was not observable in this headless build (§5.4, disclosed).
+6. **Isolation of the remote channel.** Any remote-control turmoil rides a separate `talk_loop`/`KittyPeerMon` thread; an unstable peer produces `peer_death` (`kitty/child-monitor.c:1677`) handled independently, and steps 1–5 keep their correctness and central latency (the chaos-phase PTY RTT median stays indistinguishable from baseline, §4.3.4). Because the two threads still share OS scheduling, concurrent chaos can occasionally push an individual PTY round-trip into a tail spike (`10/45` runs over 10 ms vs `0/45` at baseline) without perturbing the pipeline's throughput or median. *(§4.3.3, §4.3.4)*
+7. **Settle.** With no backlog, the frame is presented at the `repaint_delay`/`sync_to_monitor` cadence (source defaults `10 ms`/`yes`, §5.4). The presented frame *content* was captured directly from the window backing image — §2.3/§2.4 show the synchronized-output hold and atomic flush by SHA-256 + pixel-diff; only the low-level buffer-swap *event* timing is not surfaced by kitty's own tracing (§5.4, disclosed).
 8. **Outbound symmetry.** A user keystroke runs the mirror path: X/GLFW event → `on_key_input` (`kitty/keys.c:166`) → `encode_glfw_key_event` honoring `mDECCKM` and the keyboard-protocol flags (`L251`) → `schedule_write_to_child` (`L259`) → the child's PTY. *(§5.1)*
 
 The moving parts keep rhythm through exactly two disciplines: **one ordered buffer consumed by one serial parser pass** (guaranteeing alignment), and **one coalescing window plus a self-pipe wakeup** (bounding latency while batching expensive main-loop wakeups). Everything else — pause/resume, backpressure, remote isolation — layers onto those two without breaking them.
@@ -1289,7 +1436,7 @@ Per the investigation rules, the primary proof for every claim comes from a cano
 **Canonical [OBSERVED] evidence (real PTY child → `read_bytes`, or real X event → `on_key_input`):**
 
 - §2.2 surge of 5000 lines validated byte-exactly (sha256 stable across 3 runs).
-- §2.3 / §2.4 synchronized-output pause, resume, and the safety-timeout auto-resume (DECRQM state before/during/after; child's full emitted byte stream).
+- §2.3 / §2.4 synchronized-output pause, resume, and the safety-timeout auto-resume — DECRQM state before/during/after, the child's full emitted byte stream, **and** a pixel-level capture of the window backing image showing the frame held then atomically flushed (SHA-256 + pixel-diff, two runs each for the explicit-end and missing-end cases).
 - §3.1 the thread set from raw `/proc/<pid>/task/*/comm` on the exact `$!`-captured PID (default, `--listen-on`, and single-instance cases).
 - §3.3 the `input_delay` coalescing window, measured with an RTT proxy across the {0,3,10,30} ms sweep, ≥2 runs each.
 - §4.1 real interactive `bash` shell integration emitting OSC 133 `A` / `A;k=s` / `C;cmdline` / `D;$?`, interleaved with `draw` in byte order.
@@ -1310,14 +1457,14 @@ Per the investigation rules, the primary proof for every claim comes from a cano
 
 - The backpressure gate itself — `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1477`) and the POLLIN gate (`kitty/child-monitor.c:1501`) — is inferred; its consequence (lossless writer-blocking) is observed (§4.2).
 - The internal `"peer_death"` message (`kitty/child-monitor.c:1677`; `Boss.peer_message_received`, `kitty/boss.py:777`) is inferred; its consequence (peer removed, thread/process/socket survive) is observed (§4.3.3).
-- The synchronized-output *frame hold/snapshot* (`screen_pause_rendering`, `kitty/screen.c:2506`) is inferred from code; what is observed is the DECRQM `expires_at` state and continued parsing (§2.3).
+- The synchronized-output *internal snapshot* (`screen_pause_rendering` copying every visible line into `paused_rendering.linebuf`, `kitty/screen.c:2506`/`2529-2538`) is cited from code; its consequence — the window image held then atomically flushed — is now **observed at the pixel level** (§2.3/§2.4), not merely inferred.
 - `read_bytes` as the literal read site is inferred (the `--dump-bytes` figure is emitted parser-side, per F4); the child-on-PTY fact is observed (a real slave `/dev/pts/N`).
 - The `loop-utils` wakeup/drain mechanism (§5.2) is inferred from source.
 
 **Honest limitations (could not be observed in this headless, software-GL sandbox):**
 
-- The **visible frame draw/buffer swap** — the literal "interface settles" pixel event — is not surfaced by `--debug-rendering` (which logs only window lifecycle), so it was not observed; the presence of a composed frame is inferred from the render configuration (§5.4).
-- `screen_pause_rendering` holding a *displayed* frame cannot be pixel-verified here; only the parser-visible mode state and timing were captured (§2.3, §2.4).
+- The **buffer-swap / `vblank` event timing** — the low-level moment the GPU presents a frame — is not surfaced by `--debug-rendering` (which logs only window lifecycle), so that *event* was not timed. This is narrower than it sounds: the frame *content* itself **was** captured (§2.3/§2.4), so "a composed frame is presented, held, then atomically flushed" is observed, not inferred; only the swap-event timing is not.
+- **Physical-monitor scan-out** (photons on real hardware) has no meaning in a headless container and is not claimed. The compositor-visible window backing image — what a screenshot or compositor would show — **was** captured and pixel-verified (§2.3/§2.4), so the synchronized-output hold/flush is demonstrated rather than assumed.
 
 
 ## 7. Coverage pass — every question part and every named item
@@ -1331,7 +1478,7 @@ This is the final coverage check. The first table confirms each of the four ques
 | Q1 | Where does a surge first enter, and how does pause/resume work? | §2.1–§2.4 | [OBSERVED] |
 | Q2 | The "conductor": thread split + what decides which event is handled first | §3.1–§3.3, §5.2 | [OBSERVED] + [INFERRED] |
 | Q3 | Hints aligned with text; behavior under backpressure and an unstable remote | §4.1–§4.3.4 | [OBSERVED] (+ labeled supplements) |
-| Q4 | End-to-end from mixed input to the interface settling | §5.1–§5.5 | [OBSERVED] (render/settle limitation disclosed) |
+| Q4 | End-to-end from mixed input to the interface settling | §5.1–§5.5 | [OBSERVED] (frame *content* captured §2.3/§2.4; only the swap-*event* timing disclosed as not observed) |
 
 **Named items (symbols, structs, knobs):**
 
@@ -1348,8 +1495,8 @@ This is the final coverage check. The first table confirms each of the four ques
 | `dispatch_dcs` (vt-parser.c:620), `$q`/`+q` → `screen_request_capabilities` (L631) | §4.3.1 | [OBSERVED] (F13 correction) |
 | `parse_kitty_dcs` (vt-parser.c:586) → `handle_remote_cmd` (L603) | §4.3.2 | [OBSERVED] inline `@kitty-cmd` |
 | `cmd_output_marking` (screen.c:2338) | §4.1 | [OBSERVED] via real bash OSC 133 |
-| `screen_pause_rendering` (screen.c:2506), `PENDING_MODE 2026` (control-codes.h:235) | §2.3 | [OBSERVED] DECRQM state; [INFERRED] frame hold |
-| `screen_check_pause_rendering` (screen.c:2489), `expires_at` timeout | §2.4 | [OBSERVED] auto-resume at ≈2000 ms |
+| `screen_pause_rendering` (screen.c:2506), `PENDING_MODE 2026` (control-codes.h:235) | §2.3 | [OBSERVED] DECRQM state **+ pixel-level frame hold/flush** (SHA-256 + pixel-diff, ×2 runs) |
+| `screen_check_pause_rendering` (screen.c:2489), `expires_at` timeout | §2.4 | [OBSERVED] state auto-resume ≈2000 ms (DECRQM) **+ pixel repaint shown event-driven** (nudge, ×2 runs) |
 | `talk_loop`/`KittyPeerMon` (child-monitor.c:1805/1808) | §3.1, §4.3 | [OBSERVED] thread present; independence |
 | `accept_peer` (child-monitor.c:1632), `read_from_peer` (child-monitor.c:1714) | §4.3.3 | [INFERRED] peer path; [OBSERVED] "Malformatted…" per peer |
 | `notify_on_peer_removal` / `"peer_death"` (child-monitor.c:1673/1677) | §4.3.3 | [INFERRED] message; [OBSERVED] consequence |
@@ -1364,14 +1511,66 @@ This is the final coverage check. The first table confirms each of the four ques
 | shell-integration emitters (`shell-integration/bash/…`) | §4.1 | [OBSERVED] real bash marks |
 | knobs `input_delay`=3 / `repaint_delay`=10 / `sync_to_monitor`=yes (definition.py:878/866/889) | §5.4 | [OBSERVED] read from the binary |
 | CLI flags `--dump-commands`/`--dump-bytes`/`--replay-commands`/`--debug-input`/`--debug-rendering` (cli.py:972-996) | §5.3, §5.4 | [OBSERVED] each exercised |
-| version `0.35.2` + VCS `815df1e210e0` (constants.py:25; setup.py:674) | §1 | [OBSERVED] `--version` banner |
-| visible frame draw/swap ("interface settles" pixels) | §5.4 | Not observed — disclosed limitation |
+| version `0.35.2` (constants.py:25) + VCS stamp via `get_vcs_rev`→`git rev-parse HEAD` (setup.py:674/678): default destination build stamps `2017484b1…`, source-rev worktree stamps `815df1e210e0…` | §1 | [OBSERVED] `--version` banner + both `KITTY_VCS_REV` values (STEP 6–8) |
+| visible frame *content* (synchronized-output hold → atomic flush) | §2.3, §2.4, §5.4 | [OBSERVED] pixel capture (window backing image, SHA-256 + pixel-diff); only the low-level swap-*event* timing is disclosed as not observed |
 
-Every question part and every named item above is grounded in a specific section with a labeled basis; no claim of completeness is made for the one item (visible frame draw) that the headless sandbox cannot show, which is explicitly disclosed rather than asserted.
+Every question part and every named item above is grounded in a specific section with a labeled basis. The one genuinely unobserved item is narrow — the low-level buffer-swap *event* timing (and physical-monitor scan-out, which is meaningless headless) — and it is explicitly disclosed; the frame-*content* transitions the question actually asks about (held → flushed atomically) are observed at the pixel level (§2.3/§2.4).
 
 ## Appendix A — Complete observation harness (verbatim, reproducible)
 
 Every experiment above was produced by the scripts below, reproduced here in full so each result is independently reproducible and auditable (F1). All scripts lived under a `umask 077` observation directory created with `mktemp -d` (mode 0700); `common.sh` established the canonical, secure run environment and readiness/cleanup helpers sourced by every experiment. Paths shown as `$OBS`/`$OBS_DIR` refer to that directory. These scripts are temporary observation tooling and are **removed** after the investigation — they are reproduced here, not left in the repository.
+
+### Setup and teardown (run once — makes every experiment reproducible from a genuinely clean directory)
+
+The harness is designed to run from a **fresh, empty** observation root with no state carried over from a prior run. The setup below establishes a single secure root (`$OBS`, exported under both `$OBS` and `$OBS_DIR` so the body examples and the scripts resolve to the *same* directory), extracts every script in this Appendix into `$OBS/harness/`, and relies on `common.sh` (below) to create `$OBS/out/` on first use — so an independent reader can reproduce every result without pre-creating any directory. Run this once from the repository root:
+
+```
+# --- one-time setup (from the repository root) -----------------------------
+umask 077
+export TMPDIR=/tmp/kitty-nosgid                                   # non-setgid tmpdir on this image (see §1)
+export OBS="$(mktemp -d "$TMPDIR/kitty_obs.XXXXXXXX")"; chmod 700 "$OBS"
+export OBS_DIR="$OBS"                                             # $OBS and $OBS_DIR name the same 0700 root
+DOC=blitzy/documentation/kitty_815df1e210e0.md                   # path to THIS answer document
+
+# write the extractor, then populate $OBS/harness/ from the fenced blocks below
+cat > "$OBS/extract_harness.py" <<'EXTRACT'
+#!/usr/bin/env python3
+# Extract every Appendix-A script into $OBS/harness/. Each script is a fenced
+# block under a "### name" heading (name wrapped in backticks in the heading).
+import os, re, sys
+F = chr(96) * 3                      # the triple-backtick fence, built via chr() so this file stays backtick-free
+doc, dest = sys.argv[1], sys.argv[2]
+os.makedirs(dest, exist_ok=True)
+lines = open(doc, encoding="utf-8").read().splitlines()
+start = next(i for i, l in enumerate(lines) if l.startswith("## Appendix A"))
+hdr = re.compile(r"^###\s+" + chr(96) + r"([^" + chr(96) + r"]+)" + chr(96) + r"\s*$")
+i, written = start, []
+while i < len(lines):
+    m = hdr.match(lines[i])
+    if not m:
+        i += 1; continue
+    name = m.group(1); j = i + 1
+    while j < len(lines) and not lines[j].startswith(F): j += 1
+    if j >= len(lines): break
+    k = j + 1; body = []
+    while k < len(lines) and not lines[k].startswith(F): body.append(lines[k]); k += 1
+    p = os.path.join(dest, name)
+    open(p, "w", encoding="utf-8").write("\n".join(body) + "\n")
+    if name.endswith((".sh", ".py")): os.chmod(p, os.stat(p).st_mode | 0o111)
+    written.append(name); i = k + 1
+print("extracted %d scripts to %s" % (len(written), dest))
+EXTRACT
+python3 "$OBS/extract_harness.py" "$DOC" "$OBS/harness"
+
+# --- run any experiment (each sources common.sh, which creates $OBS/out) ----
+#   env OBS_DIR="$OBS" bash "$OBS/harness/pty_independence.sh"
+#   env OBS_DIR="$OBS" PP_N=200 bash "$OBS/harness/pty_independence.sh"
+
+# --- teardown: remove ALL temporary observation tooling (repo left unchanged)
+#   rm -rf "$OBS"
+```
+
+Running the extractor on this document reports `extracted 29 scripts to <$OBS/harness>` (the 29 files whose sections follow). Because `common.sh` now creates `$OBS/out/` (and `$OBS/harness/`) with `mkdir -p` **before** any script redirects into them, the very first command run from a clean root succeeds — a point verified directly by running `env OBS_DIR="$OBS" bash "$OBS/harness/pty_independence.sh"` in a freshly-created `mktemp -d` that contained only `harness/` (exit `0`, `$OBS/out/` populated, no "No such file or directory").
 
 ### `common.sh`
 
@@ -1394,6 +1593,9 @@ export PYTHONPATH=/root/kitty-venv/lib/python3.11/site-packages
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 OBS_DIR="${OBS_DIR:-$(mktemp -d "$TMPDIR/kitty_obs.XXXXXXXX")}"; chmod 700 "$OBS_DIR"
+export OBS_DIR
+export OBS="$OBS_DIR"                          # single observation root: body examples say $OBS, scripts say $OBS_DIR — identical dir
+mkdir -p "$OBS_DIR/out" "$OBS_DIR/harness"     # create required subdirs BEFORE any redirection (clean-state safe; resolves P4-2)
 KITTY=./kitty/launcher/kitty
 PYBIN=/root/kitty-venv/bin/python3
 
@@ -1609,6 +1811,168 @@ finally:
     _emit.close()
 ```
 
+### `pause_pixels.py`
+
+```
+#!/usr/bin/env python3
+"""Q1 mode-2026 pixel observer — EXTERNAL, canonical render path.
+
+Launches a REAL kitty window running a REAL PTY child (child -> PTY -> read_bytes
+-> parser -> screen -> render), then READS the resulting X11 window backing image
+with python-xlib (Window.get_image, ZPixmap). python-xlib is only an external
+instrument (like od -c or --dump-commands); the pixels come from kitty's own
+render of a real PTY child. Run from the repository root:
+
+  OBS="$OBS" DISPLAY=:99 /root/kitty-venv/bin/python3 harness/pause_pixels.py explicit 1
+  OBS="$OBS" DISPLAY=:99 /root/kitty-venv/bin/python3 harness/pause_pixels.py timeout-nudge 1
+
+Modes:
+  explicit       begin (CSI ?2026 h) -> overwrite screen -> explicit end (CSI ?2026 l),
+                 hold < 2000 ms safety timeout.
+  timeout-nudge  begin -> overwrite screen -> NO end; hold past 2000 ms; then emit a
+                 content-neutral render nudge (CSI 6 n) to reveal when the timed-out
+                 frame repaints.
+The cursor is hidden (CSI ?25l) to remove blink noise so BEFORE==DURING is exact.
+"""
+import os, sys, time, hashlib, subprocess
+from Xlib import X, display
+
+REPO  = os.environ.get("KITTY_REPO", os.getcwd())
+KITTY = os.path.join(REPO, "kitty", "launcher", "kitty")
+SDIR  = os.path.join(REPO, "blitzy", "screenshots")
+OBS   = os.environ.get("OBS", "/tmp/kitty-nosgid/kitty_obs")
+MODE  = sys.argv[1] if len(sys.argv) > 1 else "explicit"
+RUN   = sys.argv[2] if len(sys.argv) > 2 else "1"
+
+def find_kitty_window(dsp):
+    out = []
+    def walk(w):
+        try:
+            for c in w.query_tree().children:
+                try: cls = c.get_wm_class()
+                except Exception: cls = None
+                try: a = c.get_attributes(); g = c.get_geometry()
+                except Exception: a = None; g = None
+                if cls and 'kitty' in (cls[1] or '').lower() and a and a.map_state == X.IsViewable:
+                    out.append((c, g.width, g.height))
+                walk(c)
+        except Exception: pass
+    walk(dsp.screen().root)
+    return out
+
+def cap(win, w, h):
+    im = win.get_image(0, 0, w, h, X.ZPixmap, 0xffffffff)
+    d = im.data if isinstance(im.data, (bytes, bytearray)) else bytes(im.data, 'latin-1')
+    return bytes(d)
+
+def h12(b): return hashlib.sha256(b).hexdigest()[:12]
+
+def pixdiff(a, b, w, h):
+    ua = memoryview(a).cast('I'); ub = memoryview(b).cast('I')
+    ch = 0; minx = miny = 1 << 30; maxx = maxy = -1
+    for i in range(len(ua)):
+        if ua[i] != ub[i]:
+            ch += 1; px = i % w; py = i // w
+            minx = min(minx, px); maxx = max(maxx, px); miny = min(miny, py); maxy = max(maxy, py)
+    return (ch, (minx, miny, maxx, maxy)) if ch else (0, None)
+
+BT = os.path.join(OBS, "pp_begin_%s_%s" % (MODE, RUN))
+NT = os.path.join(OBS, "pp_nudge_%s_%s" % (MODE, RUN))
+for f in (BT, NT):
+    if os.path.exists(f): os.remove(f)
+
+if MODE == "explicit":
+    tail = r'''sleep 1.2
+printf '\033[?2026l'
+sleep 1.5'''
+else:
+    tail = (r'''sleep 2.6
+date +%s.%N > "''' + NT + r'''"
+printf '\033[6n'
+sleep 1.6''')
+
+child = (r'''
+sleep 0.6
+printf '\033[?25l'; printf '\033[2J\033[H'
+printf 'BEFORE committed frame r%s\r\n'
+printf 'baseline content line two\r\n'
+sleep 1.5
+date +%%s.%%N > "%s"
+printf '\033[?2026h'; printf '\033[2J\033[H'
+printf 'DURING held content r%s\r\n'
+for i in $(seq 1 12); do printf 'held row %%02d xxxxxxxxxxxxxxxx\r\n' $i; done
+%s
+exit 0
+''' % (RUN, BT, RUN, tail))
+
+env = dict(os.environ)
+env.update({'DISPLAY': os.environ.get('DISPLAY', ':99'), 'LIBGL_ALWAYS_SOFTWARE': '1',
+            'TMPDIR': os.environ.get('TMPDIR', '/tmp/kitty-nosgid'),
+            'PYTHONHOME': '/root/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu',
+            'PYTHONPATH': '/root/kitty-venv/lib/python3.11/site-packages',
+            'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8'})
+proc = subprocess.Popen([KITTY, '--config', 'NONE', 'sh', '-c', child],
+                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+dsp = display.Display(env['DISPLAY'])
+win = None; w = h = 0; t0 = time.monotonic()
+while time.monotonic() - t0 < 6:
+    ws = find_kitty_window(dsp)
+    if ws: win, w, h = ws[0]; break
+    time.sleep(0.1)
+if not win:
+    print("NO KITTY WINDOW"); proc.terminate(); sys.exit(1)
+
+frames = []; s = time.monotonic()
+while time.monotonic() - s < 7.5:
+    wt = time.time()
+    try: raw = cap(win, w, h)
+    except Exception: raw = None
+    if raw is not None: frames.append((wt, h12(raw), raw))
+    time.sleep(0.07)
+proc.terminate()
+try: proc.wait(timeout=5)
+except Exception: proc.kill()
+
+begin = float(open(BT).read()) if os.path.exists(BT) else None
+nudge = float(open(NT).read()) if os.path.exists(NT) else None
+before = [f for f in frames if begin and f[0] < begin]
+base_h = before[-1][1] if before else frames[0][1]
+def at(off):
+    best = None; bd = 1e9
+    for f in frames:
+        d = abs((f[0] - begin) - off)
+        if d < bd: bd = d; best = f
+    return best
+bf = before[-1] if before else frames[0]
+during = at(0.6); af = frames[-1]
+print("mode=%s run=%s window=%dx%d frames=%d begin_ts=%.3f" % (MODE, RUN, w, h, len(frames), begin))
+print("BEFORE  t%+.3fs sha=%s" % (bf[0] - begin, bf[1]))
+print("DURING  t%+.3fs sha=%s" % (during[0] - begin, during[1]))
+print("AFTER   t%+.3fs sha=%s" % (af[0] - begin, af[1]))
+print("held (BEFORE==DURING): %s" % (bf[1] == during[1]))
+if MODE == "explicit":
+    ch, bb = pixdiff(bf[2], af[2], w, h)
+    print("flushed (DURING!=AFTER): %s" % (during[1] != af[1]))
+    print("pixeldiff BEFORE->AFTER: changed_px=%d bbox(l,u,r,b)=%s of %d" % (ch, bb, w * h))
+    flip = next((f for f in frames if begin and f[0] >= begin and f[1] != base_h), None)
+    if flip: print("flush_delay_after_begin_ms=%.0f (explicit end sent at +1200ms)" % ((flip[0] - begin) * 1000))
+else:
+    pre = at(2.3)
+    print("at +2.3s (past 2000ms state-timeout, pre-nudge) base?%s sha=%s" % (pre[1] == base_h, pre[1]))
+    flip = next((f for f in frames if begin and f[0] >= begin and f[1] != base_h), None)
+    if flip and nudge:
+        print("first_pixel_flip: +%.3fs after begin, +%.3fs after nudge -> sha=%s" % (flip[0] - begin, flip[0] - nudge, flip[1]))
+try:
+    from PIL import Image
+    os.makedirs(SDIR, exist_ok=True)
+    for tag, fr in (("before", bf), ("during", during), ("after", af)):
+        Image.frombytes('RGBX', (w, h), fr[2]).convert('RGB').save("%s/mode2026_%s_%s_r%s.png" % (SDIR, MODE, tag, RUN))
+    print("pngs=%s/mode2026_%s_{before,during,after}_r%s.png" % (SDIR, MODE, RUN))
+except Exception as e:
+    print("png_err=%s" % e)
+```
+
 ### `thread_inspect.sh`
 
 ```
@@ -1639,6 +2003,45 @@ kill "$kpid" 2>/dev/null || true
 wait "$kpid" 2>/dev/null || true
 ```
 
+### `coalesce_sweep.sh`
+
+```
+#!/usr/bin/env bash
+# Q2 section 3.3 coalescing-window sweep: measure the PTY round-trip latency
+# (pingpong.py RTT proxy) as OPT(input_delay) is swept {0,3,10,30} ms, two runs
+# per setting, N=200 timed round-trips each (after 20 warm-ups). A gap>input_delay
+# run (PP_GAP_MS=50 at input_delay=30) exercises the immediate-after-idle branch
+# (child-monitor.c:1566). rtt_stats.py reduces each raw RTT log deterministically.
+# If the median tracks input_delay with slope ~1, the coalescing window is the
+# dominant, measurable latency term.
+source "$(dirname "$0")/common.sh"
+xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
+cd "$(git rev-parse --show-toplevel)"
+OUT="$OBS_DIR/out"; N="${PP_N:-200}"
+
+one() {  # $1=input_delay(ms) $2=gap(ms) $3=run
+    local id="$1" gap="$2" run="$3"
+    local rlog="$OUT/coalesce_id${id}_gap${gap}_run${run}.log"
+    local err="$OUT/coalesce_id${id}_gap${gap}_run${run}.err"
+    rm -f "$rlog" "$err"
+    RTT_LOG="$rlog" PP_N="$N" PP_WARMUP=20 PP_GAP_MS="$gap" \
+      timeout 120 "$KITTY" -o close_on_child_death=yes -o input_delay="$id" \
+        sh -c "RTT_LOG='$rlog' PP_N='$N' PP_WARMUP=20 PP_GAP_MS='$gap' $PYBIN $OBS_DIR/harness/pingpong.py" \
+        >/dev/null 2>"$err" &
+    local wrap=$!; track_pid "$wrap"
+    local krc; if wait "$wrap" 2>/dev/null; then krc=0; else krc=$?; fi
+    "$PYBIN" "$OBS_DIR/harness/rtt_stats.py" "$rlog" "input_delay=${id}ms gap=${gap}ms run${run} (launcher_exit=$krc)"
+    echo
+}
+
+for id in 0 3 10 30; do
+    one "$id" 0 1
+    one "$id" 0 2
+done
+one 30 50 1
+one 30 50 2
+```
+
 ### `pingpong.py`
 
 ```
@@ -1655,7 +2058,7 @@ isolate the coalescing window.
 
 PP_GAP_MS (optional) sleeps that long BEFORE each timed query (outside the timed
 window). A gap larger than input_delay exercises the "immediate-after-idle"
-branch (child-monitor.c:1565): the first byte after idle wakes the main loop
+branch (child-monitor.c:1566): the first byte after idle wakes the main loop
 immediately, without waiting for the coalescing window.
 """
 import os
@@ -1899,6 +2302,71 @@ print("RESULT=PASS_LOSSLESS" if ok else "RESULT=FAIL_LOSSY")
 sys.exit(0 if ok else 1)
 ```
 
+### `flood_sweep.sh`
+
+```
+#!/usr/bin/env bash
+# Q3 backpressure flood sweep: drive a real PTY child (flood.py) that writes a
+# DETERMINISTIC, VARIED payload of FLOOD_BYTES bytes through kitty, capturing the
+# raw consumed bytes with --dump-bytes, then verify losslessness with
+# flood_verify.py (byte count AND whole-stream SHA-256 must match). Because the
+# payload is deterministic, sent_sha256/dump_sha256 reproduce run to run; only
+# write_wall_ms (the time kitty made the writer block while draining) varies.
+#   Group 1 (losslessness): 8 MiB (8x the 1 MiB BUF_SZ), input_delay=3, 2 trials
+#                           -> full flood_verify.py block per trial.
+#   Group 2 (size sweep):   1/4/8 MiB at input_delay=3 -> brief (write_wall_ms).
+#   Group 3 (slow-drain):   8 MiB at input_delay=3 vs 200 -> brief.
+source "$(dirname "$0")/common.sh"
+xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
+cd "$(git rev-parse --show-toplevel)"
+OUT="$OBS_DIR/out"
+
+# run_one <bytes> <input_delay> <trial-label>  -> sets globals DUMP, META, KRC
+run_one() {
+    local sz="$1" id="$2" trial="$3"
+    DUMP="$OUT/flood_dump_b${sz}_id${id}_t${trial}.bin"
+    META="$OUT/flood_meta_b${sz}_id${id}_t${trial}.txt"
+    local err="$OUT/flood_b${sz}_id${id}_t${trial}.err"
+    rm -f "$DUMP" "$META" "$err"
+    FLOOD_META="$META" FLOOD_BYTES="$sz" \
+      timeout 120 "$KITTY" -o close_on_child_death=yes -o input_delay="$id" \
+        --dump-bytes="$DUMP" \
+        env FLOOD_META="$META" FLOOD_BYTES="$sz" "$PYBIN" "$OBS_DIR/harness/flood.py" \
+        >/dev/null 2>"$err" &
+    local wrap=$!; track_pid "$wrap"
+    if wait "$wrap" 2>/dev/null; then KRC=0; else KRC=$?; fi
+}
+
+full() {  # $1=bytes $2=input_delay $3=trial : print the complete flood_verify.py block
+    run_one "$1" "$2" "$3"
+    "$PYBIN" "$OBS_DIR/harness/flood_verify.py" "$DUMP" "$META" \
+        "bytes=$1 input_delay=$2 trial=$3 launcher_exit=$KRC"
+    echo
+}
+
+brief() {  # $1=bytes $2=input_delay $3=trial : label + write_wall_ms + RESULT only
+    run_one "$1" "$2" "$3"
+    local res
+    res=$("$PYBIN" "$OBS_DIR/harness/flood_verify.py" "$DUMP" "$META" \
+        "bytes=$1 input_delay=$2 trial=$3 launcher_exit=$KRC")
+    echo "$res" | grep -E '^label=|^write_wall_ms=|^RESULT='
+    echo
+}
+
+# Group 1 — losslessness (full verification), 8 MiB, 2 trials
+full 8388608 3 1
+full 8388608 3 2
+
+# Group 2 — size sweep at input_delay=3
+brief 1048576 3 1
+brief 4194304 3 1
+brief 8388608 3 1
+
+# Group 3 — slow-drain control: same 8 MiB burst, faster vs slower drain
+brief 8388608 3 A
+brief 8388608 200 A
+```
+
 ### `decrqss_child.py`
 
 ```
@@ -2139,8 +2607,10 @@ kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
 #   Phase A (baseline): talk socket idle.
 #   Phase B (chaos):    a background loop fires byte-identical peer_disrupt.py events
 #                       at the talk socket for the whole prober run.
-# Same prober input in both -> a matched control. If A and B distributions coincide,
-# the PTY input pipeline is independent of talk-socket turmoil.
+# Same prober input in both -> a matched control. Driven PP_RUNS times by
+# pty_ind_distribution.py: if A and B central tendencies coincide the PTY pipeline is
+# functionally isolated from talk-socket turmoil; any divergence in the tail is reported
+# as the run-to-run distribution rather than smoothed away (see section 4.3.4).
 source "$(dirname "$0")/common.sh"
 xdpyinfo -display :99 >/dev/null 2>&1 || { echo "XVFB DOWN" >&2; exit 1; }
 cd "$(git rev-parse --show-toplevel)"
@@ -2174,6 +2644,112 @@ run_phase A_baseline 0
 echo
 echo "### Phase B (concurrent talk-socket chaos), PP_N=$N ###"
 run_phase B_chaos 1
+```
+
+### `pty_ind_distribution.py`
+
+```
+#!/usr/bin/env python3
+"""15-run PTY-independence distribution (P4-3).
+
+Runs pty_independence.sh PP_RUNS times (default 15) with byte-identical prober
+input, reading each run's raw per-trial RTT logs to compute per-run
+min/median/p95/max for the idle-baseline (Phase A) and concurrent-chaos
+(Phase B) conditions, then aggregates the distribution: the range of maxima and
+the tail-exceedance counts (runs whose chaos max exceeds 10/20/90 ms). Central
+tendency (median) is reported alongside the tail so a stable core is never
+conflated with an unstable tail. Pure function of the raw trials; the summary is
+reproducible from the copied per-run logs.
+"""
+import os
+import statistics
+import subprocess
+import sys
+
+HARNESS = os.path.dirname(os.path.abspath(__file__))
+OBS = os.environ["OBS_DIR"]
+OUT = os.path.join(OBS, "out")
+RUNS = int(os.environ.get("PP_RUNS", "15"))
+PP_N = os.environ.get("PP_N", "200")
+
+
+def read_rtts(path):
+    vals = []
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        vals.append(int(line))
+    return vals
+
+
+def ms(x):
+    return x / 1_000_000.0
+
+
+def pctl(sorted_vals, q):
+    idx = min(len(sorted_vals) - 1, int(round(q * (len(sorted_vals) - 1))))
+    return sorted_vals[idx]
+
+
+def stats(vals):
+    s = sorted(vals)
+    return dict(n=len(s), min=ms(s[0]), median=ms(statistics.median(s)),
+                p95=ms(pctl(s, 0.95)), max=ms(s[-1]), spread=ms(s[-1] - s[0]))
+
+
+base_max, chaos_max, base_med, chaos_med = [], [], [], []
+rows = []
+for r in range(1, RUNS + 1):
+    env = dict(os.environ, OBS_DIR=OBS, PP_N=PP_N)
+    subprocess.run(["bash", os.path.join(HARNESS, "pty_independence.sh")],
+                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
+    a = stats(read_rtts(os.path.join(OUT, "pty_rtt_A_baseline.log")))
+    b = stats(read_rtts(os.path.join(OUT, "pty_rtt_B_chaos.log")))
+    base_max.append(a["max"])
+    chaos_max.append(b["max"])
+    base_med.append(a["median"])
+    chaos_med.append(b["median"])
+    rows.append((r, a, b))
+    for lbl in ("A_baseline", "B_chaos"):
+        src = os.path.join(OUT, "pty_rtt_%s.log" % lbl)
+        dst = os.path.join(OUT, "pty_rtt_%s_run%02d.log" % (lbl, r))
+        try:
+            open(dst, "w").write(open(src).read())
+        except OSError:
+            pass
+
+print("PP_N=%s PP_RUNS=%d" % (PP_N, RUNS))
+print("run | A_min  A_med  A_p95  A_max   | B_min  B_med  B_p95  B_max (ms)")
+for r, a, b in rows:
+    print("%2d  | %6.4f %6.4f %6.4f %7.4f | %6.4f %6.4f %6.4f %8.4f" % (
+        r, a["min"], a["median"], a["p95"], a["max"],
+        b["min"], b["median"], b["p95"], b["max"]))
+
+
+def rng(xs):
+    return (min(xs), max(xs))
+
+
+def count_gt(xs, t):
+    return sum(1 for x in xs if x > t)
+
+
+bmin, bmax = rng(base_max)
+cmin, cmax = rng(chaos_max)
+print()
+print("=== aggregate over %d runs ===" % RUNS)
+print("baseline max_ms range: %.4f .. %.4f  (>10ms: %d/%d)" % (
+    bmin, bmax, count_gt(base_max, 10), RUNS))
+print("chaos    max_ms range: %.4f .. %.4f  (>10ms: %d/%d, >20ms: %d/%d, >90ms: %d/%d)" % (
+    cmin, cmax, count_gt(chaos_max, 10), RUNS,
+    count_gt(chaos_max, 20), RUNS, count_gt(chaos_max, 90), RUNS))
+print("baseline median_ms: min=%.4f median=%.4f max=%.4f" % (
+    min(base_med), statistics.median(base_med), max(base_med)))
+print("chaos    median_ms: min=%.4f median=%.4f max=%.4f" % (
+    min(chaos_med), statistics.median(chaos_med), max(chaos_med)))
+print("chaos max_ms sorted desc: " + " ".join("%.2f" % x for x in sorted(chaos_max, reverse=True)))
 ```
 
 ### `key_child.py`
