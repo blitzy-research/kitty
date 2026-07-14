@@ -119,9 +119,9 @@ kitty 0.35.2 created by Kovid Goyal
 For symbolized native frames (Part 3 stacks, Part 4 close-race, Part 5 thread inventory) the **debug** build was used; for the I/O-loop timing measurement (Part 6) the **event-loop-instrumented debug** build was used. Both build cleanly:
 
 ```console
-$ docker exec kitty-setup-verify bash -lc 'cd /app && python3 setup.py build --debug --verbose >"$HR/log/build_debug.log" 2>&1; echo "DEBUG_EXIT=$?"; grep -c -- "-g " "$HR/log/build_debug.log"'
+$ docker exec kitty-setup-verify bash -lc 'cd /app && python3 setup.py build --debug --verbose >"$HR/log/build_debug.log" 2>&1; echo "DEBUG_EXIT=$?"; grep -c -- "-g3" "$HR/log/build_debug.log"'
 DEBUG_EXIT=0
-127
+126
 $ docker exec kitty-setup-verify bash -lc 'cd /app && python3 setup.py build --debug --extra-logging event-loop --verbose >"$HR/log/build_eventloop.log" 2>&1; echo "EVENTLOOP_EXIT=$?"; grep -c -- "DDEBUG_EVENT_LOOP" "$HR/log/build_eventloop.log"'
 EVENTLOOP_EXIT=0
 120
@@ -159,6 +159,21 @@ $ cat /tmp/kqna_env_setup.sh
 set -euo pipefail
 umask 077                                   # every file/dir created 0700/0600 by default
 
+# 0) Failure-only self-cleanup. If the bootstrap fails BEFORE it is ready, remove the
+#    private harness tree and kill the Xvfb we spawned so a failed run leaks nothing.
+#    On SUCCESS (ENV_READY=1) the tree + Xvfb are intentionally LEFT running for the
+#    later drivers (this is a bootstrap; its resources must outlive it).
+ENV_READY=0
+cleanup() {
+  local rc=$?
+  if [ "$ENV_READY" != 1 ]; then
+    [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" 2>/dev/null || true
+    [ -n "${HR:-}" ] && rm -rf "$HR" 2>/dev/null || true
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
 # 1) One private harness root; reject symlink; verify ownership+mode (CWE-367 safe).
 HR="$(mktemp -d "${TMPDIR:-/tmp}/kitty-qna.XXXXXXXXXX")"
 [ -L "$HR" ] && { echo "FATAL: harness root is a symlink"; exit 1; }
@@ -169,8 +184,9 @@ chmod 700 "$HR"
 export XDG_RUNTIME_DIR="$HR/xdg"; mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$HR/ev" "$HR/bin" "$HR/log"        # evidence, helper scripts, raw logs
 
-# 3) Authenticated Xvfb (xauth MIT-MAGIC-COOKIE-1, NO -ac), software GL, on :99.
-export DISPLAY=":99"
+# 3) Authenticated Xvfb (xauth MIT-MAGIC-COOKIE-1, NO -ac), software GL. The display
+#    number is parameterized (default :99) so parallel harnesses can each own a display.
+export DISPLAY=":${DISPLAY_NUM:-99}"
 export XAUTHORITY="$HR/Xauthority"; : > "$XAUTHORITY"; chmod 600 "$XAUTHORITY"
 COOKIE="$(python3 -c 'import secrets;print(secrets.token_hex(16))')"
 xauth -f "$XAUTHORITY" add "$DISPLAY" . "$COOKIE" >/dev/null 2>&1
@@ -188,7 +204,18 @@ for _ in $(seq 1 50); do
 done
 [ "$ready" = 1 ] || { echo "FATAL: Xvfb $DISPLAY not ready"; cat "$HR/log/xvfb.log"; exit 1; }
 
+# 4b) Verify the display is served by the Xvfb WE started (not a pre-existing "squatter"
+#     already occupying this display number, which would make readiness falsely pass
+#     while our own Xvfb has already exited): our PID must be a live, non-zombie Xvfb.
+#     ps is allowed to fail (|| true) so a gone PID does not trip set -e/pipefail before
+#     the explicit guard below can report it; spaces are stripped via parameter expansion.
+xstat="$(ps -o stat= -p "$XVFB_PID" 2>/dev/null || true)"; xstat="${xstat// /}"
+xcomm="$(ps -o comm= -p "$XVFB_PID" 2>/dev/null || true)"; xcomm="${xcomm// /}"
+{ [ -n "$xstat" ] && [ "${xstat#Z}" = "$xstat" ] && [ "$xcomm" = "Xvfb" ]; } \
+  || { echo "FATAL: display $DISPLAY not served by our live Xvfb (PID $XVFB_PID) — already in use?"; exit 1; }
+
 # 5) Record env for later docker exec calls + teardown (root-owned, container-private).
+ENV_READY=1                                  # past this point the bootstrap has succeeded
 { echo "HR=$HR"; echo "DISPLAY=$DISPLAY"; echo "XAUTHORITY=$XAUTHORITY";
   echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"; echo "XVFB_PID=$XVFB_PID"; } > /root/.kqna_env
 echo "HARNESS_ROOT=$HR"
@@ -204,6 +231,27 @@ DISPLAY=:99  XAUTHORITY=/tmp/kitty-qna.ZXuOylNP8q/Xauthority  XDG_RUNTIME_DIR=/t
 ```
 
 For this run the harness root is `/tmp/kitty-qna.ZXuOylNP8q` and the Xvfb PID is `13983`. **Process-safety rules obeyed throughout** (F-18): every spawned process PID is captured with `$!`; before any signal the target's owner and its `/proc/$pid/exe` symlink are validated; PIDs are always quoted; `gdb` runs in `-batch` with a `timeout`; core dumps are disabled (`ulimit -c 0`) before any `SIGABRT`; and teardown (Part 7) kills only the exact recorded PIDs.
+
+The bootstrap is additionally **fail-safe and parallel-safe** (F-18). An `EXIT` trap (§0) removes the private tree and kills the spawned Xvfb on any failure *before* readiness; `ENV_READY=1` (§5) is the success gate, so a bootstrap that succeeds intentionally leaves both the tree and the Xvfb running for the later drivers (a bootstrap's resources must outlive it). The display number is parameterized (`DISPLAY_NUM`, default `:99`, §3) so concurrent harnesses can each own a display, and a post-readiness guard (§4b) rejects a display that turns out to be served by a *pre-existing* server rather than by the Xvfb we spawned (readiness alone can be satisfied by a squatter). These two failure guards were exercised by fault injection against the **exact** script published above (extracted from this document with `sed -n '154,223p'`, so the tested bytes are the published bytes), confirming a clean non-zero exit and **zero leaked harness trees** in each case (`before=after`; the single persistent tree is the successful `:99` session, correctly neither removed nor duplicated):
+
+```console
+$ DOC=blitzy/documentation/kitty_815df1e210e0.md
+$ sed -n '154,223p' "$DOC" > /tmp/kqna_pub.sh; chmod +x /tmp/kqna_pub.sh
+$ bash -n /tmp/kqna_pub.sh && echo SYNTAX_OK
+SYNTAX_OK
+$ # FAULT A: stub Xvfb that exits immediately, forcing the bounded readiness poll to time out
+$ printf '%s\n' '#!/bin/sh' 'exit 0' >/tmp/faultbin/Xvfb; chmod +x /tmp/faultbin/Xvfb
+$ before=$(ls -d /tmp/kitty-qna.* | wc -l)
+$ PATH=/tmp/faultbin:$PATH DISPLAY_NUM=208 /tmp/kqna_pub.sh; echo "EXIT=$? ; harness_trees before=$before after=$(ls -d /tmp/kitty-qna.* | wc -l)"
+FATAL: Xvfb :208 not ready
+EXIT=1 ; harness_trees before=1 after=1
+$ # FAULT B: a real squatter already owns :207, so our own Xvfb on :207 cannot start
+$ setsid Xvfb :207 -ac -screen 0 640x480x24 >/tmp/squatter207.log 2>&1 &
+$ before=$(ls -d /tmp/kitty-qna.* | wc -l)
+$ DISPLAY_NUM=207 /tmp/kqna_pub.sh; echo "EXIT=$? ; harness_trees before=$before after=$(ls -d /tmp/kitty-qna.* | wc -l)"
+FATAL: display :207 not served by our live Xvfb (PID 68777) — already in use?
+EXIT=1 ; harness_trees before=1 after=1
+```
 
 ### 0.6 Canonical launch pattern and input injection (provenance labelling)
 
@@ -833,6 +881,8 @@ echo "RUN=$RUNID KPID=$KPID WID=$WID delivered_hex=$rx"
 
 **Direct answer.** A keystroke's journey is: the **external GLFW X11 backend** sees the raw X event *first* (`_glfwDispatchX11Events` → `processEvent`); the **external XKB layer** translates the hardware keycode into a keysym/glfw-key (`glfw_xkb_handle_key_event`); GLFW then invokes Kitty's **C** callback `key_callback` [kitty/glfw.c:L439], which calls `on_key_input` [kitty/keys.c:L166]; `on_key_input` selects the **target window** as `active_window()` [kitty/keys.c:L106], offers the event to the **Python** shortcut layer, and — if not consumed — encodes the bytes and calls `schedule_write_to_child` [kitty/child-monitor.c:L372], which only **queues** the bytes and wakes the I/O thread (all on the **main thread**). The bytes are **actually written to the child's PTY** later, on a **separate I/O thread**, by `write_to_child` [kitty/child-monitor.c:L1443] driven by `io_loop` [kitty/child-monitor.c:L1481]. Everything below is captured with gdb launching Kitty **as a child** (attach-by-PID is blocked under `ptrace_scope=1`; see Part 3), against the symbolized debug build.
 
+**Driver-wrapper convention.** The Part-2 drivers invoked below — `p2_sched.sh`, `p2_bytes.sh`, `p2_deliver.sh` — are thin *launch-and-drive* wrappers built to the one uniform skeleton that is published **in full** for `p1_stability.sh` (§1.7), `p3_fh.sh` (§3.4), and `p4_close_gdb.sh` / `p4_oswin_close.sh` (§4.4): create a private `$HR/ev/$RUNID` directory and a `--session` recorder child; `setsid`-launch the **canonical** `kitty/launcher/kitty --config NONE … sh` (the gdb drivers wrap it as `gdb -x <command-file> --args kitty/launcher/kitty …`, so gdb is the parent — attach-by-PID being blocked); `sleep`, focus the window with `xdotool`, inject that scenario's keys; then extract the recorder's exact PTY bytes and the gdb / `--debug-keyboard` log. The three differ from that skeleton in only two respects: **(a)** their instrumentation — `p2_sched.sh` and `p2_deliver.sh` use gdb command files whose breakpoints are published here (`g_sched_deliver.gdb` breaks on `schedule_write_to_child` [kitty/child-monitor.c:L372] and `write_to_child` [kitty/child-monitor.c:L1443]; `p2_deliver.sh` reuses the latter breakpoint to count PTY writes), whereas `p2_bytes.sh` uses `--debug-keyboard` rather than gdb — and **(b)** the keys injected (`k`; `a`/`Return`/`Ctrl+A`/`Up`; `Z`). Each driver's command file (where it uses one) and its **complete, unedited output** are shown at the point of use below; `g_sched_deliver.gdb` is additionally re-run later with a fresh run id (`P3gdb`) to demonstrate command→output reproducibility (F-03).
+
 ### 2.1 The complete ingress call path (one runtime backtrace)
 
 A single keystroke (`k`, injected into the focused window) produces this backtrace at `schedule_write_to_child`. It is the whole ingress path in one stack, top (innermost) to bottom (outermost). The gdb command file (published in full) and the correlated child byte:
@@ -1228,7 +1278,7 @@ decoded: b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' total 40 bytes
 
 ### 3.3 Tier 2b — gdb launch-as-child: the active handler AND the delivery thread
 
-gdb is made the **parent** (via the `--args kitty/launcher/kitty` form). Breakpoints on `child-monitor.c:372` (schedule, main thread) and `child-monitor.c:1443` (deliver, I/O thread) capture the two-thread handoff for a single keystroke. The gdb command file `g_sched_deliver.gdb` and driver `p2_sched.sh` are published in §2.3. To prove **command→output reproducibility** (F-03), the *same* published driver is re-run here with a Part-3 run id (`P3gdb`):
+gdb is made the **parent** (via the `--args kitty/launcher/kitty` form). Breakpoints on `child-monitor.c:372` (schedule, main thread) and `child-monitor.c:1443` (deliver, I/O thread) capture the two-thread handoff for a single keystroke. The gdb command file `g_sched_deliver.gdb` is published in full in §2.1 (its two breakpoints capture the schedule→deliver handoff), and `p2_sched.sh` is the thin launch-and-drive wrapper described in Part 2's driver-wrapper convention above. To prove **command→output reproducibility** (F-03), the *same* driver is re-run here with a Part-3 run id (`P3gdb`):
 
 ```console
 $ cd /app; bash "$HR/bin/p2_sched.sh" P3gdb
@@ -1317,7 +1367,7 @@ KEXE="$(readlink /proc/$KPID/exe 2>/dev/null || true)"
 echo "target kitty launcher: PID=$KPID exe=$KEXE"
 [ "$KEXE" = "/app/kitty/launcher/kitty" ] || { echo "REFUSING: PID $KPID is not the launcher"; exit 1; }
 echo "=== FH_REGISTERED marker (sitecustomize ran INSIDE the launcher interpreter) ==="
-grep -a "FH_REGISTERED pid=$KPID" "$D/kitty.log" || echo "(marker missing for launcher pid)"
+grep -aE "FH_REGISTERED sig=[0-9]+ pid=$KPID" "$D/kitty.log" || echo "(marker missing for launcher pid)"
 RTMIN="$(python3 -c "import signal;print(int(signal.SIGRTMIN))")"
 DUMP="$D/fh_${KPID}.txt"
 echo "=== BEFORE dump: launcher process state ==="; ps -o pid,stat,cmd -p "$KPID" | tail -1
@@ -1332,7 +1382,7 @@ sleep 1
 echo "=== recorder RX after dump (input still delivered) ==="; grep -a "^RX" "$REC" || echo "(none)"
 echo "=== FULL faulthandler dump (verbatim) dump=$DUMP ==="
 cat "$DUMP" 2>/dev/null || echo "(no dump file)"
-echo "=== thread count in dump ==="; grep -ac "^Thread 0x" "$DUMP" 2>/dev/null || echo 0
+echo "=== thread count in dump ==="; grep -acE "^(Current thread|Thread) 0x" "$DUMP" 2>/dev/null || echo 0
 echo "RUN $RUNID done"
 ```
 
@@ -1342,7 +1392,7 @@ Command and complete output:
 $ cd /app; bash "$HR/bin/p3_fh.sh" P3fh
 target kitty launcher: PID=28695 exe=/app/kitty/launcher/kitty
 === FH_REGISTERED marker (sitecustomize ran INSIDE the launcher interpreter) ===
-(marker missing for launcher pid)
+FH_REGISTERED sig=34 pid=28695 dump=/tmp/kitty-qna.ZXuOylNP8q/ev/P3fh/fh_28695.txt
 === BEFORE dump: launcher process state ===
   28695 Ssl  kitty/launcher/kitty --config NONE --session /tmp/kitty-qna.ZXuOylNP8q/ev/P3fh/session.conf sh
 --- kill -34 28695  (trigger NON-FATAL all-thread Python dump) ---
@@ -1361,10 +1411,12 @@ Current thread 0x00007a3960317740 (most recent call first):
   File "/app/kitty/launcher/../../__main__.py", line 7 in <module>
   File "<frozen runpy>", line 88 in _run_code
   File "<frozen runpy>", line 198 in _run_module_as_main
+=== thread count in dump ===
+1
 RUN P3fh done
 ```
 
-(The `FH_REGISTERED` stderr marker does not reach `kitty.log` because the launcher reconfigures stderr during startup; registration is nonetheless proven by the existence of the PID-named dump file `fh_28695.txt` and by the successful `SIGRTMIN`-triggered dump.)
+(The `FH_REGISTERED sig=… pid=… dump=…` marker is written by `sitecustomize` at interpreter start-up — before Kitty initialises its own logging — so the launch redirection (`2>&1`) captures it as the **first line** of `kitty.log`, directly proving the hook ran **inside** the launcher's embedded interpreter. The `sig=34` field matches the `kill -34` shown above (`SIGRTMIN` = 34 on this platform), and registration is further corroborated by the PID-named dump file `fh_28695.txt` and the successful `SIGRTMIN`-triggered dump. The two `grep` patterns are format-exact against what the tool actually emits: `FH_REGISTERED sig=[0-9]+ pid=$KPID` matches the marker's real `sig=… pid=…` shape (a bare `FH_REGISTERED pid=` would not, because `sig=…` precedes `pid=…`), and `^(Current thread|Thread) 0x` counts faulthandler's per-thread headers — the crashing/current thread is emitted as `Current thread 0x…`, so the dump's single Python-managed thread is correctly reported as `1`. Both corrected patterns match exactly the marker line and the dump text shown above.)
 
 **Narrowed claim (this is the correction the review required).** faulthandler shows the **Python-level traceback of Python-managed threads only**. In this run that is exactly **one** thread — `Current thread 0x00007a3960317740` — whose deepest frame is `_run_app` at [kitty/main.py:L234]. It **stops at the Python→C boundary** and shows **no native frames**, and the pure-C `ChildMonitor` I/O thread — the thread that actually performs `write_to_child` (proven on **thread 67** in Tier 2b, base = libc `clone`) — **does not appear at all**, because it holds no CPython thread state. The dump is **non-fatal** (registered via `faulthandler.register`, not the fatal `enable`-on-`SIGABRT` path): PID 28695 was `Ssl` both before and after, and a post-dump keystroke `z` (`0x7a`) was still delivered.
 
@@ -1640,6 +1692,7 @@ run
 Driver — type a burst `x y z` into `W_A` and *immediately* close it, racing to leave bytes queued:
 
 ```bash
+# $HR/bin/p4_close_gdb.sh
 #!/usr/bin/env bash
 # P4close_gdb [F-09]: under gdb (launch-as-child), close the active window and capture:
 #  (1) mark_child_for_close (MAIN thread, from Python close_window) sets needs_removal
@@ -1766,6 +1819,7 @@ run
 ```
 
 ```bash
+# $HR/bin/p4_oswin_close.sh
 #!/usr/bin/env bash
 # P4oswin_close [F-09]: distinguish OS-WINDOW teardown from per-child PTY fd removal.
 # Single window; closing it triggers the OS-window close path on the MAIN thread:
