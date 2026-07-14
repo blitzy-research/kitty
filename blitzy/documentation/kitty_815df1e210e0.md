@@ -1784,7 +1784,6 @@ Observed — `read_ok` (3 packets, payload `clip5522payload`, mime `text/plain`)
 ```text
 SCENARIO=read_ok
 RAW_BYTES_LEN=131
-RAW_HEX_FIRST400=1b5d353532323b747970653d726561643a7374617475733d4f4b1b5c1b5d353532323b747970653d726561643a7374617475733d444154413a6d696d653d64475634644339776247467062673d3d3b59327870634455314d6a4a7759586c736232466b1b5c1b5d353532323b747970653d726561643a7374617475733d444f4e451b5c
 RESPONSE_PACKETS=3
   PKT: 5522;type=read:status=OK
   PKT: 5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;Y2xpcDU1MjJwYXlsb2Fk
@@ -1797,7 +1796,6 @@ STATUSES=['OK', 'DATA', 'DONE']
 ```text
 SCENARIO=read_targets
 RAW_BYTES_LEN=115
-RAW_HEX_FIRST400=1b5d353532323b747970653d726561643a7374617475733d4f4b1b5c1b5d353532323b747970653d726561643a7374617475733d444154413a6d696d653d4c673d3d3b64475634644339776247467062676f3d1b5c1b5d353532323b747970653d726561643a7374617475733d444f4e451b5c
 RESPONSE_PACKETS=3
   PKT: 5522;type=read:status=OK
   PKT: 5522;type=read:status=DATA:mime=Lg==;dGV4dC9wbGFpbgo=
@@ -1962,7 +1960,6 @@ Every OSC 5522 status is enumerated below. Statuses reachable through the canoni
 ```text
 SCENARIO=write_done
 RAW_BYTES_LEN=31
-RAW_HEX_FIRST400=1b5d353532323b747970653d77726974653a7374617475733d444f4e451b5c
 RESPONSE_PACKETS=1
   PKT: 5522;type=write:status=DONE
 STATUSES=['DONE']
@@ -1973,7 +1970,6 @@ STATUSES=['DONE']
 ```text
 SCENARIO=write_eperm
 RAW_BYTES_LEN=32
-RAW_HEX_FIRST400=1b5d353532323b747970653d77726974653a7374617475733d455045524d1b5c
 RESPONSE_PACKETS=1
   PKT: 5522;type=write:status=EPERM
 STATUSES=['EPERM']
@@ -1984,7 +1980,6 @@ STATUSES=['EPERM']
 ```text
 SCENARIO=write_einval
 RAW_BYTES_LEN=33
-RAW_HEX_FIRST400=1b5d353532323b747970653d77726974653a7374617475733d45494e56414c1b5c
 RESPONSE_PACKETS=1
   PKT: 5522;type=write:status=EINVAL
 STATUSES=['EINVAL']
@@ -2020,7 +2015,6 @@ binascii.Error: Invalid base64-encoded string: number of data characters (9) can
 ```text
 SCENARIO=write_primary
 RAW_BYTES_LEN=31
-RAW_HEX_FIRST400=1b5d353532323b747970653d77726974653a7374617475733d444f4e451b5c
 RESPONSE_PACKETS=1
   PKT: 5522;type=write:status=DONE
 STATUSES=['DONE']
@@ -2031,7 +2025,6 @@ STATUSES=['DONE']
 ```text
 SCENARIO=read_eperm
 RAW_BYTES_LEN=31
-RAW_HEX_FIRST400=1b5d353532323b747970653d726561643a7374617475733d455045524d1b5c
 RESPONSE_PACKETS=1
   PKT: 5522;type=read:status=EPERM
 STATUSES=['EPERM']
@@ -2926,7 +2919,7 @@ setup: hb.count=120000; pager_ring_bytes_used=16777216
 
 In every batch and both process runs the increase **`delivery_delta = delivery − baseline` equals the measured `scan_only` median**. When the MAIN thread is free the OSC 52 is dispatched in **~0.001 ms**; behind a scan it waits **~61 ms** (`as_text`) or **~74 ms** (`as_ansi`). The event is **never lost** (`clipboard_control` fires exactly once, `assert cb.n==1`, the moment the scan returns). This is the direct proof that a ready event waits ≈ the full scan because parse/dispatch and the scan share the one GIL‑holding MAIN thread.
 
-**Live serialization proof (canonical, gdb on a running kitty).** To confirm this structurally on the real binary, a live kitty was launched with a 200,000‑line scrollback (`cat` of a big file), `gdb` armed a breakpoint on `as_text_generic`, and a **canonical remote `get-text --extent=all`** (which routes through `as_text_non_visual`→`as_text_generic`, `kitty/window.py:376`) triggered the scan. The break fired; `info threads` shows the scan is on the **MAIN thread while every other thread is parked**. Complete, unedited (the 32 idle Mesa `llvmpipe` GL‑pool threads in `futex_wait` are elided as `… [30 more "kitty" GL-pool threads in __futex_abstimed_wait_common64] …`):
+**Live serialization proof (canonical, gdb on a running kitty).** To confirm this structurally on the real binary, a live kitty was launched at **default** scrollback (`scrollback_lines=2000`) and fed a 200,000‑line file by `cat` — so only its **last ~2,000 lines** are retained and scanned (the `get-text --extent=all` below returns **80,817 chars**, ≈2,000 lines; the earlier ~198,000 lines overflow the default ring and are evicted), `gdb` armed a breakpoint on `as_text_generic`, and a **canonical remote `get-text --extent=all`** (which routes through `as_text_non_visual`→`as_text_generic`, `kitty/window.py:376`) triggered the scan. The break fired; `info threads` shows the scan is on the **MAIN thread while every other thread is parked**. Complete, unedited (the 32 idle Mesa `llvmpipe` GL‑pool threads in `futex_wait` are elided as `… [30 more "kitty" GL-pool threads in __futex_abstimed_wait_common64] …`):
 
 ```text
 KITTY_CORE_PID=9154
