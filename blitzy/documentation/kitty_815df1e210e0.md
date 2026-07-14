@@ -2732,8 +2732,8 @@ The reason is at the launcher level (**C**), *before* any Python starts:
 (**L354**) sees `+kitten icat`, and because `icat` is a *wrapped* kitten
 (`is_wrapped_kitten()` at L333, matching the compiled `WRAPPED_KITTENS` list), it calls
 `exec_kitten()` (L340) which does `execv(".../kitten", …)` at **L348** — replacing the process image
-with the Go binary. Python is only reached later, via `run_embedded()` at **L463**
-(`Py_InitializeFromConfig` at L211), which this path never gets to. This **refutes** the AAP §0.3.3
+with the Go binary. Python is only reached later, via the `run_embedded()` call at **L464**
+(L463 builds the `RunData` argument; `Py_InitializeFromConfig` at L211), which this path never gets to. This **refutes** the AAP §0.3.3
 guess that `kitty +kitten icat` runs the Python module `kittens.icat.main`; that module is now only a
 **shim** (see below). By contrast, a *non-wrapped* kitten such as `broadcast` is **not** delegated and
 *does* run under Python (observed below).
@@ -3020,9 +3020,12 @@ breakpoint on `draw_cells` confirms it. The remaining **65 worker threads are th
 pool** (`libgallium`), not Kitty code. Counted across all 68 stacks, **exactly 3 contain
 `fast_data_types.so`** (the main thread + `KittyChildMon` + `KittyPeerMon`) and **66 contain
 `libgallium`** — the empirical basis for §1's corrected claim. Five complementary inspection methods
-were used; **two were blocked** (`/proc/<tid>/stack` and `eu-stack`'s frame unwind) and their errors
-are shown verbatim, after which `gdb` (via `CAP_SYS_PTRACE`) and `py-spy` still give full stack/symbol
-visibility — exactly the "if something is blocked, show the error and use another method" situation the
+were used; **exactly one is genuinely blocked** (`/proc/<tid>/stack`, which needs the absent
+`CAP_SYS_ADMIN`); its error is shown verbatim, and the other four — `py-spy` (Method 1), `gdb`
+(Method 2), the deterministic `draw_cells` breakpoint (Method 3), and `eu-stack` (Method 5) — all
+give full stack/symbol visibility. (`eu-stack` needed one operational fix: neutralizing an offline
+`debuginfod` network lookup that otherwise stalls it; see Method 5.) This is exactly the "if
+something is blocked, show the error and use another method" situation the
 prompt anticipates.
 
 **[OBSERVED — load context]** Every attach below was taken while a documented load was running: a
@@ -4009,9 +4012,8 @@ us *correct a common misreading*:
 
 **[OBSERVED]** The ptrace-free kernel stack interface was attempted first as the least-invasive
 option. It is **blocked** in this container — reading `/proc/<tid>/stack` requires `CAP_SYS_ADMIN`,
-which the container does not grant (it grants `CAP_SYS_PTRACE` + `seccomp=unconfined`, enough for
-`gdb`/`py-spy`, but not `/proc/stack`, and — as Method 5 shows — not `eu-stack`'s frame unwind
-either). The exact error, captured verbatim for the three named Kitty C threads:
+which the container does not grant (it grants `CAP_SYS_PTRACE` + `seccomp=unconfined`, enough for `gdb`/`py-spy` and (as Method 5 shows) `eu-stack` too, but **not** the `CAP_SYS_ADMIN`
+that `/proc/<tid>/stack` requires). The exact error, captured verbatim for the three named Kitty C threads:
 
 ```
 $ cat /proc/181113/task/181113/stack /proc/181113/task/181181/stack /proc/181113/task/181180/stack
@@ -4029,170 +4031,836 @@ This is exactly the "if something is blocked, show the error and use another met
 working alternatives that *do* give real stack/symbol visibility are `gdb` (Method 2/3) and `py-spy`
 (Method 1).
 
-### Method 5 — `eu-stack -p 181113` — frame unwind **BLOCKED** (error shown verbatim; second blocked tool)
+### Method 5 — `eu-stack -p <main>` — **WORKS**: full symbolic unwind of all 68 threads (exit 0)
 
-**[OBSERVED]** `eu-stack` (elfutils) is an independent, ptrace-based unwinder. In this environment it
-**attaches and enumerates all 68 threads** (so thread discovery works and the TID list independently
-corroborates §5's census, `181113` + `181115`–`181181`), **but its per-thread DWARF frame unwind is
-refused**: every thread reports `eu-stack: dwfl_thread_getframes tid <n>: Operation not permitted`, and
-it ends with `eu-stack: Couldn't show any frames.` This is the kernel `yama` `ptrace_scope=1` policy
-blocking the deeper per-thread `PTRACE_GETREGSET`/frame walk that `eu-stack` performs (the
-`ptrace_scope=0` mitigation is unavailable here — `/proc/sys/kernel/yama/ptrace_scope` is read-only in
-the container). `gdb` succeeds where `eu-stack` does not because it is granted `CAP_SYS_PTRACE` and uses
-a different attach path. The **complete, unedited** 138-line output (all 68 TIDs) is embedded below:
+**[OBSERVED — focused re-capture]** Per the "unless stated otherwise" clause in the Conventions
+section, this single method was re-captured in a fresh, identically-configured session: the original
+`181113` session had already been torn down when `eu-stack` was re-examined. The re-capture uses the
+**same canonical build, same container (`kitty_dev`), and same headless `Xvfb :99` + software-GL
+setup**; only the PID differs — the live main process here is **PID `440958`** (68 threads,
+`comm=kitty`, `exe=/app/kitty/launcher/kitty`), with remote control enabled exactly as in §4. Every
+line below is real captured output from that process.
 
-<details>
-<summary><b>Complete `eu-stack -p 181113` — all 68 TIDs, frame unwind blocked, 138 lines (click to expand)</b></summary>
+**Direct answer.** `eu-stack` is **not** blocked in this container. It attaches and produces a
+**complete, symbolic, per-thread frame unwind of all 68 threads, exit code 0.** This *corrects* an
+earlier version of this section that reported `eu-stack`'s unwind as refused by `yama`
+`ptrace_scope=1` — no such refusal occurs. `eu-stack` is granted the same `CAP_SYS_PTRACE` that lets
+`gdb`/`py-spy` attach, and `ptrace_scope` gates the *attach*, not the post-attach register/frame walk;
+once attached, the DWARF unwind succeeds. The only real obstacle is unrelated to permissions: the
+container ships `DEBUGINFOD_URLS=https://debuginfod.ubuntu.com`, and with no outbound network
+`eu-stack` stalls trying to fetch debug info. Clearing that variable (`DEBUGINFOD_URLS=`) makes it work
+immediately.
+
+**Environment (verbatim).**
 
 ```
-$ eu-stack -p 181113
-PID 181113 - process
-TID 181113:
-eu-stack: dwfl_thread_getframes tid 181113: Operation not permitted
-TID 181115:
-eu-stack: dwfl_thread_getframes tid 181115: Operation not permitted
-TID 181116:
-eu-stack: dwfl_thread_getframes tid 181116: Operation not permitted
-TID 181117:
-eu-stack: dwfl_thread_getframes tid 181117: Operation not permitted
-TID 181118:
-eu-stack: dwfl_thread_getframes tid 181118: Operation not permitted
-TID 181119:
-eu-stack: dwfl_thread_getframes tid 181119: Operation not permitted
-TID 181120:
-eu-stack: dwfl_thread_getframes tid 181120: Operation not permitted
-TID 181121:
-eu-stack: dwfl_thread_getframes tid 181121: Operation not permitted
-TID 181122:
-eu-stack: dwfl_thread_getframes tid 181122: Operation not permitted
-TID 181123:
-eu-stack: dwfl_thread_getframes tid 181123: Operation not permitted
-TID 181124:
-eu-stack: dwfl_thread_getframes tid 181124: Operation not permitted
-TID 181125:
-eu-stack: dwfl_thread_getframes tid 181125: Operation not permitted
-TID 181126:
-eu-stack: dwfl_thread_getframes tid 181126: Operation not permitted
-TID 181127:
-eu-stack: dwfl_thread_getframes tid 181127: Operation not permitted
-TID 181128:
-eu-stack: dwfl_thread_getframes tid 181128: Operation not permitted
-TID 181129:
-eu-stack: dwfl_thread_getframes tid 181129: Operation not permitted
-TID 181130:
-eu-stack: dwfl_thread_getframes tid 181130: Operation not permitted
-TID 181131:
-eu-stack: dwfl_thread_getframes tid 181131: Operation not permitted
-TID 181132:
-eu-stack: dwfl_thread_getframes tid 181132: Operation not permitted
-TID 181133:
-eu-stack: dwfl_thread_getframes tid 181133: Operation not permitted
-TID 181134:
-eu-stack: dwfl_thread_getframes tid 181134: Operation not permitted
-TID 181135:
-eu-stack: dwfl_thread_getframes tid 181135: Operation not permitted
-TID 181136:
-eu-stack: dwfl_thread_getframes tid 181136: Operation not permitted
-TID 181137:
-eu-stack: dwfl_thread_getframes tid 181137: Operation not permitted
-TID 181138:
-eu-stack: dwfl_thread_getframes tid 181138: Operation not permitted
-TID 181139:
-eu-stack: dwfl_thread_getframes tid 181139: Operation not permitted
-TID 181140:
-eu-stack: dwfl_thread_getframes tid 181140: Operation not permitted
-TID 181141:
-eu-stack: dwfl_thread_getframes tid 181141: Operation not permitted
-TID 181142:
-eu-stack: dwfl_thread_getframes tid 181142: Operation not permitted
-TID 181143:
-eu-stack: dwfl_thread_getframes tid 181143: Operation not permitted
-TID 181144:
-eu-stack: dwfl_thread_getframes tid 181144: Operation not permitted
-TID 181145:
-eu-stack: dwfl_thread_getframes tid 181145: Operation not permitted
-TID 181146:
-eu-stack: dwfl_thread_getframes tid 181146: Operation not permitted
-TID 181147:
-eu-stack: dwfl_thread_getframes tid 181147: Operation not permitted
-TID 181148:
-eu-stack: dwfl_thread_getframes tid 181148: Operation not permitted
-TID 181149:
-eu-stack: dwfl_thread_getframes tid 181149: Operation not permitted
-TID 181150:
-eu-stack: dwfl_thread_getframes tid 181150: Operation not permitted
-TID 181151:
-eu-stack: dwfl_thread_getframes tid 181151: Operation not permitted
-TID 181152:
-eu-stack: dwfl_thread_getframes tid 181152: Operation not permitted
-TID 181153:
-eu-stack: dwfl_thread_getframes tid 181153: Operation not permitted
-TID 181154:
-eu-stack: dwfl_thread_getframes tid 181154: Operation not permitted
-TID 181155:
-eu-stack: dwfl_thread_getframes tid 181155: Operation not permitted
-TID 181156:
-eu-stack: dwfl_thread_getframes tid 181156: Operation not permitted
-TID 181157:
-eu-stack: dwfl_thread_getframes tid 181157: Operation not permitted
-TID 181158:
-eu-stack: dwfl_thread_getframes tid 181158: Operation not permitted
-TID 181159:
-eu-stack: dwfl_thread_getframes tid 181159: Operation not permitted
-TID 181160:
-eu-stack: dwfl_thread_getframes tid 181160: Operation not permitted
-TID 181161:
-eu-stack: dwfl_thread_getframes tid 181161: Operation not permitted
-TID 181162:
-eu-stack: dwfl_thread_getframes tid 181162: Operation not permitted
-TID 181163:
-eu-stack: dwfl_thread_getframes tid 181163: Operation not permitted
-TID 181164:
-eu-stack: dwfl_thread_getframes tid 181164: Operation not permitted
-TID 181165:
-eu-stack: dwfl_thread_getframes tid 181165: Operation not permitted
-TID 181166:
-eu-stack: dwfl_thread_getframes tid 181166: Operation not permitted
-TID 181167:
-eu-stack: dwfl_thread_getframes tid 181167: Operation not permitted
-TID 181168:
-eu-stack: dwfl_thread_getframes tid 181168: Operation not permitted
-TID 181169:
-eu-stack: dwfl_thread_getframes tid 181169: Operation not permitted
-TID 181170:
-eu-stack: dwfl_thread_getframes tid 181170: Operation not permitted
-TID 181171:
-eu-stack: dwfl_thread_getframes tid 181171: Operation not permitted
-TID 181172:
-eu-stack: dwfl_thread_getframes tid 181172: Operation not permitted
-TID 181173:
-eu-stack: dwfl_thread_getframes tid 181173: Operation not permitted
-TID 181174:
-eu-stack: dwfl_thread_getframes tid 181174: Operation not permitted
-TID 181175:
-eu-stack: dwfl_thread_getframes tid 181175: Operation not permitted
-TID 181176:
-eu-stack: dwfl_thread_getframes tid 181176: Operation not permitted
-TID 181177:
-eu-stack: dwfl_thread_getframes tid 181177: Operation not permitted
-TID 181178:
-eu-stack: dwfl_thread_getframes tid 181178: Operation not permitted
-TID 181179:
-eu-stack: dwfl_thread_getframes tid 181179: Operation not permitted
-TID 181180:
-eu-stack: dwfl_thread_getframes tid 181180: Operation not permitted
-TID 181181:
-eu-stack: dwfl_thread_getframes tid 181181: Operation not permitted
-eu-stack: Couldn't show any frames.
+$ eu-stack --version
+eu-stack (elfutils) 0.190
+Copyright (C) 2023 The elfutils developers <http://elfutils.org/>.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+$ cat /proc/sys/kernel/yama/ptrace_scope
+1
+$ grep -E "^Seccomp:" /proc/self/status
+Seccomp:	0
+$ grep -E "^CapEff:" /proc/self/status
+CapEff:	00000000a80c25fb
+# 0x...a80c25fb -> CAP_SYS_PTRACE (bit 19) PRESENT, CAP_SYS_ADMIN (bit 21) ABSENT
+$ echo "$DEBUGINFOD_URLS"
+https://debuginfod.ubuntu.com 
+```
+
+**Step 1 — the naive invocation stalls on `debuginfod`, not on ptrace.** Run plainly, `eu-stack`
+emits nothing and is eventually killed by the timeout wrapper (exit 143) — there is no permission
+error at all:
+
+```
+$ timeout --preserve-status 120 eu-stack -p 440958 ; echo "exit=$?"
+exit=143
+```
+
+`strace` shows precisely why: `eu-stack` resolves `debuginfod.ubuntu.com` over DNS (the query name is
+visible in the full capture below), then blocks on the never-completing HTTPS connect
+(`poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)`, repeated) until it is signalled — a pure
+network wait with no bearing on stack access. Key lines:
+
+```
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = ? ERESTART_RESTARTBLOCK (Interrupted by signal)
+441918 --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER, si_pid=441914, si_uid=0} ---
+441918 +++ killed by SIGTERM +++
+```
+
+The complete 121-line `strace` capture is embedded below:
+
+<details>
+<summary><b>Complete `strace -f -e trace=network,poll,connect eu-stack -p 440958` — 121 lines (click to expand)</b></summary>
+
+```
+$ timeout --preserve-status 12 strace -f -e trace=network,poll,connect eu-stack -p 440958
+441918 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_TRAPPED, si_pid=440958, si_uid=0, si_status=SIGSTOP, si_utime=35 /* 0.35 s */, si_stime=7 /* 0.07 s */} ---
+441918 socket(AF_INET6, SOCK_DGRAM, IPPROTO_IP) = 13
+441918 poll([{fd=13, events=POLLIN}], 1, 1 <unfinished ...>
+441919 socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 15
+441919 connect(15, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+441919 socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 15
+441919 connect(15, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4 <unfinished ...>
+441918 <... poll resumed>)              = 0 (Timeout)
+441919 <... setsockopt resumed>)        = 0
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16) = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0 <unfinished ...>
+441918 poll([{fd=13, events=POLLIN}], 1, 2 <unfinished ...>
+441919 <... poll resumed>)              = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\25\262\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=65}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=65}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="jL\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=65}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=65}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "jL\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 158
+441919 poll([{fd=15, events=POLLIN}], 1, 4998) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\25\262\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 158
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4) = 0
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16) = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0) = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="W\330\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=57}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=57}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\274\336\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=57}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=57}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\274\336\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 150
+441919 poll([{fd=15, events=POLLIN}], 1, 4999) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "W\330\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 150
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4) = 0
+441918 <... poll resumed>)              = 0 (Timeout)
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16 <unfinished ...>
+441918 poll([{fd=13, events=POLLIN}], 1, 4 <unfinished ...>
+441919 <... connect resumed>)           = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0) = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\336\265\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=53}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=53}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\217\264\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=53}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=53}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\336\265\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 146
+441919 poll([{fd=15, events=POLLIN}], 1, 4999) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\217\264\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 146
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4) = 0
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16) = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0) = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\324}\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=85}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=85}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\237c\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=85}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=85}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\237c\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 179
+441919 poll([{fd=15, events=POLLIN}], 1, 4997) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\324}\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 179
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4) = 0
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16) = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0) = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="Y}\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=71}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=71}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\177s\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=71}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=71}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000 <unfinished ...>
+441918 <... poll resumed>)              = 0 (Timeout)
+441918 poll([{fd=13, events=POLLIN}], 1, 8 <unfinished ...>
+441919 <... poll resumed>)              = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "Y}\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 160
+441919 poll([{fd=15, events=POLLIN}], 1, 4997) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\177s\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 160
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4) = 0
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16) = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0) = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="J\342\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=55}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=55}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\301\343\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=55}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=55}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\301\343\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 144
+441919 poll([{fd=15, events=POLLIN}], 1, 4998) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "J\342\201\203\0\1\0\0\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 144
+441919 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 15
+441919 setsockopt(15, SOL_IP, IP_RECVERR, [1], 4) = 0
+441919 connect(15, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, 16) = 0
+441919 poll([{fd=15, events=POLLOUT}], 1, 0) = 1 ([{fd=15, revents=POLLOUT}])
+441919 sendmmsg(15, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\377\f\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=39}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=39}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\274\17\1\0\0\1\0\0\0\0\0\0\ndebuginfod\6ubuntu\3c"..., iov_len=39}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=39}], 2, MSG_NOSIGNAL) = 2
+441919 poll([{fd=15, events=POLLIN}], 1, 5000 <unfinished ...>
+441918 <... poll resumed>)              = 0 (Timeout)
+441918 poll([{fd=13, events=POLLIN}], 1, 16) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLIN}], 1, 32) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLIN}], 1, 64) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLIN}], 1, 129 <unfinished ...>
+441919 <... poll resumed>)              = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\377\f\201\200\0\1\0\2\0\0\0\0\ndebuginfod\6ubuntu\3c"..., 2048, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 112
+441919 poll([{fd=15, events=POLLIN}], 1, 4781) = 1 ([{fd=15, revents=POLLIN}])
+441919 recvfrom(15, "\274\17\201\200\0\1\0\1\0\1\0\0\ndebuginfod\6ubuntu\3c"..., 65536, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("34.118.224.10")}, [28 => 16]) = 147
+441918 <... poll resumed>)              = 1 ([{fd=13, revents=POLLIN}])
+441919 +++ exited with 0 +++
+441918 socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 13
+441918 setsockopt(13, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+441918 connect(13, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("91.189.92.252")}, 16) = -1 EINPROGRESS (Operation now in progress)
+441918 getsockname(13, {sa_family=AF_INET, sin_port=htons(40598), sin_addr=inet_addr("172.17.0.2")}, [128 => 16]) = 0
+441918 poll([{fd=13, events=POLLOUT}], 1, 24) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 26) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLPRI|POLLOUT|POLLWRNORM}], 1, 0) = 0 (Timeout)
+441918 poll([{fd=13, events=POLLOUT}], 1, 1000) = ? ERESTART_RESTARTBLOCK (Interrupted by signal)
+441918 --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER, si_pid=441914, si_uid=0} ---
+441918 +++ killed by SIGTERM +++
 ```
 </details>
 
-So of the two ptrace-free / independent tools, **both are blocked** (`/proc/<tid>/stack` at the read
-step, `eu-stack` at the frame-unwind step), and their exact errors are shown above. Real stack and
-symbol visibility is nevertheless achieved through `py-spy` (Method 1, Python view), `gdb` (Method 2,
-all 68 native stacks; Method 3, the deterministic `draw_cells` breakpoint), and `nm` (symbol offsets in
-`fast_data_types.so`) — satisfying O6's requirement that a blocked tool be met with a working
-alternative.
+A single-threaded `sleep` target behaves identically — it stalls with `debuginfod` enabled and, with
+it cleared, unwinds cleanly — confirming the tool itself is healthy and the stall is purely the
+network lookup:
+
+```
+$ DEBUGINFOD_URLS= eu-stack -p <sleep-pid>
+PID 441242 - process
+TID 441242:
+#0  0x00007b7bbee23a7a clock_nanosleep
+#1  0x00007b7bbee30a27 __nanosleep
+#2  0x0000596a87902a7f
+#3  0x00007b7bbed611ca
+#4  0x00007b7bbed6128b __libc_start_main
+#5  0x0000596a87902ba5
+```
+
+**Step 2 — clear the lookup and `eu-stack` unwinds every thread (exit 0).** `DEBUGINFOD_URLS= eu-stack
+-p 440958` returns **exit 0** with **555 lines** covering **all 68 TIDs** and **486 frame lines** — a
+full symbolic cross-layer unwind. It independently corroborates §5's 68-thread census and §8's `gdb`
+finding that the Kitty C threads are exactly the **main thread**, **`KittyChildMon`** (`io_loop`), and
+**`KittyPeerMon`** (`talk_loop`), the other 65 being the Mesa software-GL worker pool. The three
+meaningful stacks (the main thread abridged between frames #2 and #18; the two service threads shown in
+full; the complete unedited output is in the collapsible block below):
+
+```
+$ DEBUGINFOD_URLS= timeout --preserve-status 120 eu-stack -p 440958 ; echo "exit=$?"
+PID 440958 - process
+TID 440958:                              # main thread: GLFW event loop -> embedded Python
+#0  0x000078f5a8c0b4cd __poll
+#1  0x000078f5a700b87f glfwRunMainLoop
+#2  0x000078f5a7ff1cfc main_loop.lto_priv.0
+#3 .. #17                                (Python eval frames; see full capture below)
+#18 0x000078f5a902839c Py_RunMain
+#19 0x000055e539b6f0ed main
+#20 0x000078f5a8b1a1ca
+#21 0x000078f5a8b1a28b __libc_start_main
+#22 0x000055e539b6f505 _start
+TID 441026:                              # KittyPeerMon: remote-control peer thread -> talk_loop
+#0  0x000078f5a8c0b4cd __poll
+#1  0x000078f5a7ff6e62 talk_loop
+#2  0x000078f5a8b8caa4
+#3  0x000078f5a8c19c3c
+TID 441027:                              # KittyChildMon: PTY I/O thread -> io_loop
+#0  0x000078f5a8c0b4cd __poll
+#1  0x000078f5a7ff3125 io_loop
+#2  0x000078f5a8b8caa4
+#3  0x000078f5a8c19c3c
+exit=0
+```
+
+The main thread's unwind is `eu-stack`'s independent confirmation of §8's `gdb` finding: the native
+event loop (`__poll` <- `glfwRunMainLoop` <- `main_loop.lto_priv.0`, all in `fast_data_types.so` /
+`glfw-x11.so`) sits above the embedded-Python startup frames (`Py_RunMain` <- `main` <-
+`__libc_start_main`), so Python launched the process and then handed the thread to the C/GLFW loop.
+`io_loop` and `talk_loop` are the two named C service threads, grounded at `kitty/child-monitor.c:1489`
+(`KittyChildMon`) and `kitty/child-monitor.c:1808` (`KittyPeerMon`). The 65 remaining threads are the
+Mesa `libgallium` worker pool, each parked in `pthread_cond_wait`. The **complete, unedited** 555-line
+output (all 68 TIDs, preceded by the exact command) is embedded below:
+
+<details>
+<summary><b>Complete `DEBUGINFOD_URLS= eu-stack -p 440958` — all 68 TIDs, full symbolic unwind, 555 lines, exit 0 (click to expand)</b></summary>
+
+```
+$ DEBUGINFOD_URLS= eu-stack -p 440958
+PID 440958 - process
+TID 440958:
+#0  0x000078f5a8c0b4cd __poll
+#1  0x000078f5a700b87f glfwRunMainLoop
+#2  0x000078f5a7ff1cfc main_loop.lto_priv.0
+#3  0x000078f5a8e92ce2
+#4  0x000078f5a8e84b2c PyObject_Vectorcall
+#5  0x000078f5a8e1f5ee _PyEval_EvalFrameDefault
+#6  0x000078f5a8e86580 _PyObject_FastCallDictTstate
+#7  0x000078f5a8e867ee _PyObject_Call_Prepend
+#8  0x000078f5a8f05075
+#9  0x000078f5a8e847df _PyObject_MakeTpCall
+#10 0x000078f5a8e1f5ee _PyEval_EvalFrameDefault
+#11 0x000078f5a8fa291f PyEval_EvalCode
+#12 0x000078f5a8f9e8b0
+#13 0x000078f5a8ee1adc
+#14 0x000078f5a8e84b2c PyObject_Vectorcall
+#15 0x000078f5a8e1f5ee _PyEval_EvalFrameDefault
+#16 0x000078f5a9027242
+#17 0x000078f5a9027da3
+#18 0x000078f5a902839c Py_RunMain
+#19 0x000055e539b6f0ed main
+#20 0x000078f5a8b1a1ca
+#21 0x000078f5a8b1a28b __libc_start_main
+#22 0x000055e539b6f505 _start
+TID 440961:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440962:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440963:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440964:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440965:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440966:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440967:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440968:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440969:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440970:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440971:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440972:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440973:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440974:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440975:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440976:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440977:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440978:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440979:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440980:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440981:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440982:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440983:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440984:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440985:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440986:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440987:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440988:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440989:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440990:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440991:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440992:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48afbc3
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440993:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440994:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440995:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440996:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440997:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440998:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 440999:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441000:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441001:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441002:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441003:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441004:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441005:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441006:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441007:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441008:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441009:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441010:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441011:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441012:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441013:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441014:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441015:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441016:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441017:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441018:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441019:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441020:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441021:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441022:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441023:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441024:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a48ac04b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441025:
+#0  0x000078f5a8b88d71
+#1  0x000078f5a8b8b7ed pthread_cond_wait
+#2  0x000078f5a421040d
+#3  0x000078f5a41eed0b
+#4  0x000078f5a421033c
+#5  0x000078f5a8b8caa4
+#6  0x000078f5a8c19c3c
+TID 441026:
+#0  0x000078f5a8c0b4cd __poll
+#1  0x000078f5a7ff6e62 talk_loop
+#2  0x000078f5a8b8caa4
+#3  0x000078f5a8c19c3c
+TID 441027:
+#0  0x000078f5a8c0b4cd __poll
+#1  0x000078f5a7ff3125 io_loop
+#2  0x000078f5a8b8caa4
+#3  0x000078f5a8c19c3c
+```
+</details>
+
+**Stability.** The working capture was taken **twice at idle and once under** the same
+`kitten __benchmark__ --render` load used elsewhere in §8; all three runs are **byte-identical**
+(555 lines / 68 TIDs / 486 frame lines / 13506 bytes), and under load the main thread's top frames are
+unchanged (`__poll` <- `glfwRunMainLoop` <- `main_loop.lto_priv.0`) — consistent with the main thread
+resting in the GLFW poll between render passes.
+
+So of the five inspection methods, **exactly one is genuinely blocked** — `/proc/<tid>/stack`
+(Method 4), which requires the absent `CAP_SYS_ADMIN`, and whose exact error is shown above. The other
+four give real stack/symbol visibility: `py-spy` (Method 1, the Python view), `gdb` (Method 2, all 68
+native stacks; Method 3, the deterministic `draw_cells` breakpoint), and `eu-stack` (Method 5, an
+independent full DWARF unwind of all 68 threads), with `nm` supplying symbol offsets in
+`fast_data_types.so`. One blocked tool, met with four working alternatives, is exactly O6's "if
+something is blocked, show the error and use another method" requirement.
 
 ### Debugger discipline — guarded identity, bounded runtime, guaranteed detach
 
