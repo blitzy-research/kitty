@@ -1157,7 +1157,59 @@ The document's earlier claim that large payloads are chunked at a *fixed 256 KiB
 
 **Sub-case A — 800 KB payload fits in one buffer and dispatches complete.** An 800 000-byte base64 payload (600 000 raw bytes) terminated by BEL fits inside the 1 MiB buffer, so `accumulate_st_terminated_esc_code` (`kitty/vt-parser.c:393`) finds the terminator and dispatches it **complete**:
 
-Parsed: `dispatches=1`, `codes=[52]`, `payload_lens=[800002]`, reconstructed 600000 bytes `sha256=c10a80d17dd6e73730f2c68e9cc956c544632a60c1526e40ef8a0a7b3029345d`. No partial chunk — confirming the *generous* complete-dispatch path.
+*Script `o1_chunk_800k.sh` (sha256 `9ec42bb689163f6987d2a5c4d31d58fa820650662adad1b252674acf6d437416`):*
+
+```bash
+#!/bin/bash
+set -u
+cd /app
+export DISPLAY=:99 LANG=C.UTF-8 LC_ALL=C.UTF-8
+OBS=/tmp/obs/out; mkdir -p "$OBS"
+# 600,000 raw bytes (divisible by 3 -> exactly 800,000 base64 bytes, no "=" padding),
+# < 1 MiB BUF_SZ so it dispatches COMPLETE in a single dispatch_osc.
+python3 - <<'PY'
+import base64,hashlib
+patt=b"kittyClipboard800KWriteTest_0123456789ABCDEF"   # 44-byte deterministic pattern
+n=600000
+raw=(patt*(n//len(patt)+1))[:n]
+open("/tmp/obs/out/chunk800k_raw.bin","wb").write(raw)
+b64=base64.standard_b64encode(raw)
+open("/tmp/obs/out/chunk800k_b64.txt","wb").write(b64)
+print("raw_bytes=%d raw_sha256=%s"%(len(raw),hashlib.sha256(raw).hexdigest()))
+print("b64_bytes=%d osc_escape_bytes=%d BUF_SZ=1048576 MAX_ESC=262144"%(len(b64),len(b64)+8))
+PY
+cat > /tmp/obs/scripts/o1_chunk800k_child.sh <<'CH'
+#!/bin/sh
+{ printf '\033]52;c;'; cat /tmp/obs/out/chunk800k_b64.txt; printf '\007'; }
+sleep 0.6
+CH
+chmod +x /tmp/obs/scripts/o1_chunk800k_child.sh
+timeout 60 ./kitty/launcher/kitty --dump-commands --config NONE -o close_on_child_death=yes \
+  -o clipboard_control="write-clipboard write-primary read-clipboard read-primary" \
+  sh /tmp/obs/scripts/o1_chunk800k_child.sh >"$OBS/o1_chunk_dump.raw" 2>"$OBS/o1_chunk_dump.err"
+echo "kitty_exit=$?"
+```
+
+**Observed output** (emitter; identical across two runs):
+
+```text
+raw_bytes=600000 raw_sha256=821dc432cbfc7da4fc0b5572db13431567d85c5e548c9dcf286f4b8d36afb639
+b64_bytes=800000 osc_escape_bytes=800008 BUF_SZ=1048576 MAX_ESC=262144
+kitty_exit=0
+```
+
+Parsed with the shared `parse_chunks.py` (presented below in this section) reading `o1_chunk_dump.raw` (label `CHUNK 800KB`), **stable byte-for-byte across two identical runs**:
+
+```text
+=== CHUNK 800KB (/tmp/obs/out/o1_chunk_dump.raw) ===
+dispatches=1
+codes=[52]
+payload_lens=[800002]
+reconstructed_raw_bytes=600000
+reconstructed_sha256=821dc432cbfc7da4fc0b5572db13431567d85c5e548c9dcf286f4b8d36afb639
+```
+
+Parsed: `dispatches=1`, `codes=[52]`, `payload_lens=[800002]`, reconstructed 600000 bytes `sha256=821dc432cbfc7da4fc0b5572db13431567d85c5e548c9dcf286f4b8d36afb639` — equal to the emitter's `raw_sha256` above, so the C→Python round trip is byte-for-byte exact. No partial chunk — confirming the *generous* complete-dispatch path.
 
 **Sub-case B — 3 MiB payload exceeds the buffer and is delivered as partial chunks.** The emitter writes a 4 194 304-byte base64 payload (3 145 728 raw bytes):
 
@@ -2098,7 +2150,7 @@ kittens/clipboard/read.go:236:	case "EBUSY":
 | Artifact | Bytes | sha256 |
 |---|---|---|
 | small "hello" reconstruction | 5 | `2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824` |
-| 800 KB payload (raw) | 600 000 | `c10a80d17dd6e73730f2c68e9cc956c544632a60c1526e40ef8a0a7b3029345d` |
+| 800 KB payload (raw) | 600 000 | `821dc432cbfc7da4fc0b5572db13431567d85c5e548c9dcf286f4b8d36afb639` |
 | 3 MiB payload (raw, original) | 3 145 728 | `18805ee540e3771c619995a381a6b091558d96fb7159e2a3f8fbacef321ddbd3` |
 | 3 MiB reconstruction, run 1 | 3 145 728 | `18805ee540e3771c619995a381a6b091558d96fb7159e2a3f8fbacef321ddbd3` |
 | 3 MiB reconstruction, run 2 | 3 145 728 | `18805ee540e3771c619995a381a6b091558d96fb7159e2a3f8fbacef321ddbd3` |
@@ -3116,11 +3168,11 @@ setup: hb.count=120000; pager_ring_bytes_used=16777216
 
 In every batch and both process runs the increase **`delivery_delta = delivery − baseline` equals the measured `scan_only` median**. When the MAIN thread is free the OSC 52 is dispatched in **~0.001 ms**; behind a scan it waits **~61 ms** (`as_text`) or **~74 ms** (`as_ansi`). The event is **never lost** (`clipboard_control` fires exactly once, `assert cb.n==1`, the moment the scan returns). This is the direct proof that a ready event waits ≈ the full scan because parse/dispatch and the scan share the one GIL‑holding MAIN thread.
 
-**Live serialization proof (canonical, gdb on a running kitty).** To confirm this structurally on the real binary, a live kitty was launched at **default** scrollback (`scrollback_lines=2000`) and fed a 200,000‑line file by `cat` — so only its **last ~2,000 lines** are retained and scanned (the `get-text --extent=all` below returns **80,817 chars**, ≈2,000 lines; the earlier ~198,000 lines overflow the default ring and are evicted), `gdb` armed a breakpoint on `as_text_generic`, and a **canonical remote `get-text --extent=all`** (which routes through `as_text_non_visual`→`as_text_generic`, `kitty/window.py:376`) triggered the scan. The break fired; `info threads` shows the scan is on the **MAIN thread while every other thread is parked**. Complete, unedited (the 32 idle Mesa `llvmpipe` GL‑pool threads in `futex_wait` are elided as `… [30 more "kitty" GL-pool threads in __futex_abstimed_wait_common64] …`):
+**Live serialization proof (canonical, gdb on a running kitty).** To confirm this structurally on the real binary, a live kitty was launched at **default** scrollback (`scrollback_lines=2000`) and fed a 200,000‑line file by `cat` — so only its **last ~2,000 lines** are retained and scanned (the `get-text --extent=all` below returns **14,146 chars** across **2,021 lines** — the retained numbers 197,980–200,000, each 6 digits; the earlier ~198,000 lines overflow the default ring and are evicted), `gdb` armed a breakpoint on `as_text_generic`, and a **canonical remote `get-text --extent=all`** (which routes through `as_text_non_visual`→`as_text_generic`, `kitty/window.py:376`) triggered the scan. The break fired; `info threads` shows the scan is on the **MAIN thread while every other thread is parked**. Complete, unedited (the 32 idle Mesa `llvmpipe` GL‑pool threads in `futex_wait` are elided as `… [30 more "kitty" GL-pool threads in __futex_abstimed_wait_common64] …`):
 
 ```text
 KITTY_CORE_PID=9154
-gettext_chars=80817
+gettext_chars=14146
 
 Thread 1 "kitty" hit Breakpoint 1, 0x0000782c7aa2cb60 in as_text_generic () from /app/kitty/.../fast_data_types.so
 ==== BREAK HIT: as_text_generic (a scrollback scan is executing) ====
@@ -3132,7 +3184,7 @@ Thread 1 "kitty" hit Breakpoint 1, 0x0000782c7aa2cb60 in as_text_generic () from
   … [30 more "kitty" GL-pool threads in __futex_abstimed_wait_common64] …
 ```
 
-**Reading it.** The MAIN thread (LWP 9154, `Thread 1 "kitty"`) is stopped **inside `as_text_generic`** — the scrollback scan, which produced **80,817 chars** of `get-text` output. Simultaneously **`KittyChildMon` (LWP 9221) is blocked in `__poll` on `children_fds`** (the I/O thread runs no Python), `KittyPeerMon` is in `poll`, and `kitty:disk$0` (the **Mesa/Gallium `util_queue`** software-GL shader-disk-cache worker — a headless-container artifact, **not** kitty's disk cache; §3.4) is in `futex_wait`. Because `clipboard_control` runs on this **same** MAIN thread under the GIL, it **cannot execute while `as_text_generic` occupies MAIN** — the pending event is necessarily serialized behind the scan. This is the canonical structural counterpart to the timing proof above. **OBSERVED.**
+**Reading it.** The MAIN thread (LWP 9154, `Thread 1 "kitty"`) is stopped **inside `as_text_generic`** — the scrollback scan, which produced **14,146 chars** of `get-text` output (the retained ~2,021 scrollback lines). Simultaneously **`KittyChildMon` (LWP 9221) is blocked in `__poll` on `children_fds`** (the I/O thread runs no Python), `KittyPeerMon` is in `poll`, and `kitty:disk$0` (the **Mesa/Gallium `util_queue`** software-GL shader-disk-cache worker — a headless-container artifact, **not** kitty's disk cache; §3.4) is in `futex_wait`. Because `clipboard_control` runs on this **same** MAIN thread under the GIL, it **cannot execute while `as_text_generic` occupies MAIN** — the pending event is necessarily serialized behind the scan. This is the canonical structural counterpart to the timing proof above. **OBSERVED.**
 
 The script that produced this capture (diagnostic container; `gdb`/PTRACE; §2.1/§9.1; the traced kitty is byte-identical to the canonical build; the `gdb` addresses, TIDs and PIDs above are a representative run). *Script `o3_gdb_scan.sh` (sha256 `632068409ec1e42fe56c73a8740f679f885624684bf68f1b312e829a5282b3b8`):*
 
@@ -5011,6 +5063,7 @@ Every probe used in this document is reproduced **in full** inline in the sectio
 |---|---|---|---|
 | §2 | `kitty_tests.sh` | canonical | run `./test.py` suite on the canonical build |
 | §4 | `o1_small_child.sh` | canonical | small (<256 KiB) OSC 52 write through a real PTY |
+| §4 | `o1_chunk_800k.sh`, `o1_chunk800k_child.sh` | canonical | 800 KB write fits one buffer → single **complete** dispatch (sub-case A) |
 | §4 | `o1_chunk_big.sh`, `o1_bigchild.sh` | canonical | >256 KiB write → partial-OSC-52 chunking |
 | §4 | `o1_rollover.sh`, `o1_roll_child.sh` | canonical | >16 MiB write → `BytesIO`→on-disk rollover (strace/`/proc/fd`) |
 | §4 | `o1_roundtrip.sh`, `o1_rt_child.sh` | canonical | OSC 52 write then read-back integrity check |
