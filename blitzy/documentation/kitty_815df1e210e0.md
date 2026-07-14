@@ -7,7 +7,7 @@
 | Canonical environment | Docker image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0` (alias of `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`) |
 | Toolchain (observed) | Go 1.23.4, Python 3.12.3, OpenSSH_9.6p1, gcc 13.3.0, `kitten`/`kitty` 0.35.2 |
 | Nature | Onboarding / knowledge-transfer investigation of an existing subsystem. No source file was modified; this document is the only artifact produced. |
-| Evidence policy | Every behavioral claim carries complete, unedited output captured from the real code paths, plus an exact `file:line` reference at `815df1e21`. Values are labelled **[Observed]** (captured from a shown run) or **[Inferred/code-grounded]** (read from the source at the cited line when a signal could not be captured headless). |
+| Evidence policy | Every behavioral claim carries the output captured from the real code paths, plus an exact `file:line` reference at `815df1e21`. Output is reproduced complete and unedited **except for two explicitly-marked, disclosed classes of edit**: (a) **security redaction** of live one-time credentials — every 64-hex password is shown as `<PW:64-hex>` and every `@kitty-ssh`/`@kitty-ask` DCS Base64 payload (which decodes to a live-format credential) is marked *redacted*; and (b) **brevity elision** of a few verbose, non-salient blobs — very large Base64 script/tarball payloads shown as `<encoded …>`/`<unwrap>` placeholders, a long build log shown as its `last 25 lines`, and a few gzip `sha256` digests shown truncated (`31c45510d4f23242…`). Each such elision is marked inline at the point it occurs; nothing is truncated *before* a salient banner/value. Values are labelled **[Observed]** (captured from a shown run) or **[Inferred/code-grounded]** (read from the source at the cited line when a signal could not be captured headless). |
 | Credential redaction | Every one-time password shown in any capture came from an ephemeral shared-memory object that was destroyed (unlinked) during the run that produced it; those 64-hex values are redacted here as `<PW:64-hex>` and are not usable. |
 
 This document answers nine questions: how the SSH kitten (1) sets up a secure session and shares connections, (2) passes credentials through shared memory and generates the remote bootstrap, (3) builds and ships the shell-integration archive, (4) tracks connection state, (5) decides on connection reuse, (6) encodes its bootstrap per shell, (7) executes end-to-end, (8) keeps the shared-memory channel secure, and (9) communicates over the TTY during setup.
@@ -18,9 +18,10 @@ This document answers nine questions: how the SSH kitten (1) sets up a secure se
 - **Canonical environment.** All building and running was done inside the pinned Docker image named in the metadata table, at `/app`, exactly as a normal user would build kitty. The exact `docker run`, build, version, and invocation commands are shown with their complete output.
 - **The canonical entry point is Go, not Python.** The Python `main()` refuses direct execution (proven below), so behavior is exercised through the compiled `kitten` binary.
 - **Observation vehicles (all auditable, all outside the repository).** (1) The in-tree Go unit tests `go test ./kittens/ssh/`, which call the real unexported functions. (2) The in-tree Python integration suite `./test.py --module ssh`, whose PTY framework drives the *real* `kittens.ssh.utils.get_ssh_data()` responder against a *real* bootstrap the *real* kitten produced.
-  (3) Temporary helper scripts kept only under the container path `/obs/helpers` (bind-mounted to the host, never written into the repository): a PATH-first `ssh` shim that logs the exact argv the kitten assembled and then either delegates to the real `ssh` or exits without connecting; a PTY harness that gives the kitten a real controlling terminal;
+  (3) Temporary helper scripts kept only under the container path `/obs/helpers` (bind-mounted to the host, never written into the repository): a **PATH-first, transparent `ssh` argv-logging shim** — it records the exact argument vector the kitten assembled and then `exec`s the real `/usr/bin/ssh` with that same argv, so it changes nothing about how the kitten builds the command; a PTY harness that gives the kitten a real controlling terminal;
   and small Python drivers that invoke the real `get_ssh_data()` and `get_connection_data()`. The full source of each helper is embedded in the relevant section.
   All helpers live outside the source tree and the tree is left byte-for-byte unchanged (verified in the final section).
+- **What an argv capture does and does not prove (provenance honesty, P-1).** The shim's log is the kitten's *genuine, fully-assembled* `ssh` argv — that command is built entirely by the kitten *before* `ssh` is `exec`'d (see `run_ssh` [kittens/ssh/main.go:753]), so an argv capture is a faithful observation of **what the kitten hands to OpenSSH** (the `-o ControlMaster*` options, the `-t`, the `exec <interpreter> -c <unwrap> <encoded>` remote command). It is **not**, by itself, evidence of a *completed network session*: after logging, the shim `exec`s the real `ssh`, which in the argv-capture runs proceeds to a deliberately-unresolvable demo host and stops at name resolution (`Could not resolve hostname …`, shown in the relevant sections) — i.e. the real OpenSSH client genuinely ran, but no remote login occurred on those runs. Claims about the *completed* request↔response handshake and the remote bootstrap executing are therefore grounded separately in the local PTY integration suite (`./test.py --module ssh`, which drives the real `get_ssh_data()` responder against the real bootstrap) and in code-reading of the remote scripts — and the network far side is explicitly labelled **[Inferred/code-grounded]** and its coverage rows marked partial.
 - **Honest scope of observation.** A full production round-trip — a real kitty **GUI** terminal acting as the DCS responder over a real network `ssh` to a separate host — is not observable in this headless container. Where a boundary could not be exercised end-to-end I lead with that limitation, label the boundary **[Inferred/code-grounded]**, and mark the affected coverage rows partial rather than complete (see Q7 and the Coverage Matrix).
 - **Historical read-only note (disclosed, not hidden).** An earlier iteration of this investigation created a temporary Go test *inside* the source tree and later deleted it. That was a methodology violation of the read-only rule. This iteration does **not** do that: every observation vehicle is either an in-tree test that already exists at `815df1e21` or a helper under `/obs` outside the repository. The final section proves the tracked tree is unchanged.
 
@@ -67,6 +68,8 @@ fast_data_types OK: True
 ```
 
 OpenSSH is `9.6p1` — **≥ 8.4**, so the proactive (zero-round-trip) data-request path is the default here; this is important for Q7 and Q9. The `kitty.fast_data_types` C extension imports successfully, which is what makes the Python side (`kitty.shm`, the responder) usable at all.
+
+> **Environmental note (P4-I1, informational only).** The canonical image pins `OpenSSH_9.6p1 Ubuntu-3ubuntu13.12` — a client version that predates several later upstream OpenSSH advisories (e.g. the 2024 `regreSSHion`/CVE-2024-6387 server-side class and subsequent client fixes). This is purely an attribute of the *pinned observation environment*; it does not affect any behavior documented here (every relevant path is gated only on the `≥ 8.4` capability, which `9.6p1` satisfies), and **no dependency was introduced, upgraded, or changed** — this task is read-only. The current authoring container reproduces the same behaviors on `OpenSSH_10.0p2`; both are `≥ 8.4`, so the proactive-path conclusions hold identically. OpenSSH version selection is out of scope for this investigation.
 
 ### Loopback `sshd` for connection-reuse observation **[Observed]**
 
@@ -380,7 +383,7 @@ the kitten layers connection **sharing** and the bootstrap channel on top of it.
 
 ### The assembled `ssh` argv, captured from a real run **[Observed]**
 
-Method: a PATH-first `ssh` shim (full source in Q7 and Q9) records the exact argv the kitten assembled, then exits `0` without connecting. `utils.FindExe("ssh")` [kittens/ssh/utils.go:23] (inside `var SSHExe` [kittens/ssh/utils.go:22]) resolves the shim because it is first on `PATH`. Default config, `kitten ssh 127.0.0.1`, `KITTY_PID=999999` (`/obs/cap/argv_default.log`):
+Method: a PATH-first, **transparent** `ssh` shim (full source in Q7 and Q9) records the exact argv the kitten assembled and then `exec`s the real `/usr/bin/ssh` with that same argv — it changes nothing about how the kitten builds the command, and because the kitten assembles the whole vector *before* `ssh` is `exec`'d (`run_ssh` [kittens/ssh/main.go:753]), the logged vector is a faithful record of exactly what the kitten hands OpenSSH (see the methodology note "What an argv capture does and does not prove"). `utils.FindExe("ssh")` [kittens/ssh/utils.go:23] (inside `var SSHExe` [kittens/ssh/utils.go:22]) resolves the shim because it is first on `PATH`. Default config, `kitten ssh 127.0.0.1`, `KITTY_PID=999999` (`/obs/cap/argv_default.log`; re-running this exact capture with the transparent shim reproduces the identical 20-element vector below and the real `/usr/bin/ssh` then genuinely runs — against a host with no listening `sshd` it stops at `ssh: connect to host 127.0.0.1 port 22: Connection refused`, stable across two runs, confirming the shim did not merely exit):
 
 ```text
 === OBS_SSH_ARGV_BEGIN pid=23659 ts=2026-07-13T23:01:44Z ===
@@ -474,7 +477,7 @@ Same invocation with `--kitten interpreter=python3` (`/obs/cap/argv_py.log`): ev
 argv[16]=python3
 ```
 
-i.e. `cd.rcmd`'s interpreter is now `python3` [kittens/ssh/main.go:508]. `get_remote_command()` sets `cd.script_type = "py"` when the interpreter basename contains `python` [kittens/ssh/main.go:511-518], which also selects the Python bootstrap and the Base64 wrapper (Q6).
+i.e. `cd.rcmd`'s interpreter is now `python3` [kittens/ssh/main.go:508]. `get_remote_command()` sets `cd.script_type = "py"` when the interpreter basename contains `python` [kittens/ssh/main.go:511-518], which also selects the Python bootstrap and the Base64 wrapper (Q6). Note that `interpreter=python3` combined with an **explicit remote command** (e.g. `kitten ssh host true`) additionally exercises the `EXEC_CMD` encoding path, which has a padding-related failure for most commands — see the dedicated subsection under Q6 ("Explicit remote command (`EXEC_CMD`)…").
 
 ### Config defaults that govern this section **[Observed, from the option schema]**
 
@@ -490,6 +493,39 @@ $ grep -nE "opt\('(interpreter|share_connections|askpass|remote_kitty|forward_re
 ```
 
 So by default `interpreter=sh` [kittens/ssh/main.py:87], `share_connections=yes` [kittens/ssh/main.py:183], and `askpass=unless-set` [kittens/ssh/main.py:192] — the exact combination exercised in the default capture above.
+
+#### How `share_connections` (a `to_bool` option) parses its value — only `y`/`yes`/`true` enable sharing; any other non-empty value silently disables it **[Observed]**
+
+`share_connections` is an `option_type='to_bool'` option [kittens/ssh/main.py:183]. The generated Go config parses it through `StringToBool`, whose entire definition is:
+
+```text
+$ sed -n "27,30p" tools/config/api.go
+func StringToBool(x string) bool {
+	x = strings.ToLower(x)
+	return x == "y" || x == "yes" || x == "true"
+}
+```
+
+So the value is lower-cased and accepted as *true* **only** for the three literals `y`, `yes`, `true` [tools/config/api.go:27-30]. Every other non-empty value evaluates to *false* — and does so **silently**: there is no "invalid boolean" diagnostic, the kitten proceeds with exit-path behavior as if sharing were explicitly disabled, and `connection_sharing_args()` is never invoked. I confirmed this against the **real** `kitten ssh` entry point by writing an `ssh.conf` per value and capturing the assembled `ssh` argv through a PATH-injected `ssh` shim that logs the exact argument vector the kitten built and then execs the real `/usr/bin/ssh` (which fails at DNS for the deliberately-unresolvable `.invalid` host — visible as `Could not resolve hostname`, confirming the real ssh ran). The presence or absence of `-o ControlMaster=auto` in that argv is the observable:
+
+```text
+$ # for each value V: printf 'share_connections V\n' > $CFG/ssh.conf ; KITTY_CONFIG_DIRECTORY=$CFG kitten ssh no-such-host.blitzy.invalid   (argv captured via logging ssh shim)
+yes      (StringToBool=true ) -> ControlMaster lines=1 ; ControlPath=/root/.cache/kitty/run/kssh-551462-%C
+y        (StringToBool=true ) -> ControlMaster lines=1 ; ControlPath=/root/.cache/kitty/run/kssh-551462-%C
+true     (StringToBool=true ) -> ControlMaster lines=1 ; ControlPath=/root/.cache/kitty/run/kssh-551462-%C
+maybe    (StringToBool=false) -> ControlMaster lines=0 ; <no ControlPath>
+no       (StringToBool=false) -> ControlMaster lines=0 ; <no ControlPath>
+empty    (warn + default)     -> ControlMaster lines=1 ; ControlPath=/root/.cache/kitty/run/kssh-551462-%C
+```
+
+The stderr for `maybe` carried **no** configuration warning — only the DCS request bytes and the real ssh's `Could not resolve hostname no-such-host.blitzy.invalid` — i.e. `share_connections maybe` silently disabled multiplexing. Results were identical across two runs (`yes`→1, `maybe`→0, `empty`→1). The **empty**-value case is different and is *not* handled by `StringToBool` at all: an empty value fails the config parser's key/value split first, producing a visible diagnostic and leaving the compiled default (`yes`) in force:
+
+```text
+$ printf 'share_connections \n' > $CFG/ssh.conf ; kitten ssh ...   (stderr)
+Ignoring bad config line: ssh.conf:1 with error: Invalid config line: "share_connections "
+```
+
+**Direct answer:** the plain-reading expectation that "any truthy-looking value enables sharing" is false — only `y`, `yes`, `true` (case-insensitively) enable it; a typo or an unexpected word such as `maybe` disables sharing with no error, whereas a completely empty value is reported as a bad config line and the default (`yes`) is retained. This is a general property of every `to_bool` ssh.conf option (`share_connections`, `forward_remote_control` [kittens/ssh/main.py:212]), because they all route through the same `StringToBool` [tools/config/api.go:27-30].
 
 ---
 
@@ -667,7 +703,7 @@ func add_cloned_env(val string) (ans map[string]string, err error) {
 }
 ```
 
-`create_shared_memory(env, 'ksse-')` [kittens/ssh/utils.py:154] is the creator; `add_cloned_env()` [kittens/ssh/main.go:87] (called from `parse_kitten_args` when `key == "clone_env"` [kittens/ssh/main.go:104-105]) is the reader. Both directions enforce the same two checks — owner match and `0o600` — together with unlink-on-read, but with reader-specific *ordering*: the Python responder unlinks first then checks, whereas the Go reader checks first then unlinks, so only the Python side removes a *rejected* object (detailed under Q8's unlink-ordering subsection). Flow A's reader is in Python [kittens/ssh/utils.py:100-113] and Flow B's reader is in Go [kittens/ssh/main.go:72-85]. The in-tree `TestCloneEnv` [kittens/ssh/main_test.go:25] exercises Flow B and passes (see preamble). These are **not** a symmetric pair: opposite creators, opposite readers, different prefixes (`kssh-` vs `ksse-`), different payloads, different purposes.
+`create_shared_memory(env, 'ksse-')` [kittens/ssh/utils.py:154] is the creator; `add_cloned_env()` [kittens/ssh/main.go:87] (called from `parse_kitten_args` when `key == "clone_env"` [kittens/ssh/main.go:104-105]) is the reader. Both directions perform unlink-on-read and a `0o600` permission check, but they are **not** symmetric on ownership or ordering: the Python responder verifies owner *and* `0o600` and unlinks first, whereas the Go reader checks first then unlinks and verifies **only** `0o600` at runtime — its owner-verification branch is unreachable dead code because the `s.Sys().(unix.Stat_t)` value-type assertion never succeeds (the runtime type is `*syscall.Stat_t`; proven under Q8's unlink-ordering / dead-branch subsection). Consequently only the Python side removes a *rejected* object, and only the Python side actually enforces ownership. Flow A's reader is in Python [kittens/ssh/utils.py:100-113] and Flow B's reader is in Go [kittens/ssh/main.go:72-85]. The in-tree `TestCloneEnv` [kittens/ssh/main_test.go:25] exercises Flow B and passes (see preamble). These are **not** a symmetric pair: opposite creators, opposite readers, different prefixes (`kssh-` vs `ksse-`), different payloads, different purposes.
 
 ---
 
@@ -1240,9 +1276,82 @@ decoded first line: '#!/usr/bin/env python'
 `base64(decoded) == encoded : True` confirms the Python path is a straight, lossless Base64 wrap; the decoded payload is the Python bootstrap (`#!/usr/bin/env python`, the `shell-integration/ssh/bootstrap.py` selected by `script_type=="py"` at [kittens/ssh/main.go:481]).
 
 **Reasoning.** The wrapper exists because `sshd` joins all trailing arguments with spaces and passes them to the user's login shell via `-c`, and that shell may have non-POSIX quoting (the code comment at [kittens/ssh/main.go:487-494]). By reducing the remote command to `interpreter -c <fixed unwrap> <opaque encoded blob>`, only the tiny unwrap string needs to be shell-safe.
-The `sh` variant avoids depending on a remote `base64` binary (which may not exist until the tarball is extracted) by substituting four bytes that (a) cannot appear literally inside a single-quoted string (`'`, `\`) and (b) trip up `tcsh` specifically (`\n`, `!`), mapping each to an unused control byte that `tr` trivially reverses — a self-contained, dependency-free decoder. The `py` variant,
+The `sh` variant avoids depending on a remote `base64` binary (which may not exist until the tarball is extracted) by substituting four bytes that (a) cannot appear literally inside a single-quoted string (`'`, `\`) and (b) trip up `tcsh` specifically (`\n`, `!`), mapping each to an unused control byte that `tr` trivially reverses. It is *not*, however, a fully self-contained or dependency-free decoder: the unwrap is `eval "$(echo "$0" | tr \v\f\r\b \047\134\n\041)"` [kittens/ssh/main.go:506], so it **depends on the remote `tr` binary** — it trades a dependency on `base64` for a dependency on `tr` (both are near-universal POSIX utilities, but neither is guaranteed). `echo` is a shell built-in and needs no PATH, but `tr` is an external command. I verified the dependency by running the exact unwrap decode step against a payload encoded with the identical `strings.NewReplacer` mapping from [kittens/ssh/main.go:505], first with `tr` available and then with `PATH` emptied so the external `tr` is unresolvable:
+
+```text
+# [A] tr present — decode step reconstructs the original payload losslessly
+$ sh -c 'printf "%s" "$0" | tr \v\f\r\b \047\134\n\041' "<encoded>"
+decoded inner == original payload: True   # "echo 'RAN!'\nexit 0\n"
+
+# [B] tr ABSENT (PATH="") — same decode step
+$ /bin/sh -c 'PATH=""; export PATH; printf "%s" "$0" | tr \v\f\r\b \047\134\n\041' "<encoded>"
+sh: 1: tr: not found                      # pipeline exit=127, decoded output EMPTY
+
+# [C] full unwrap  eval "$(echo "$0" | tr ...)"  with tr ABSENT — bootstrap does NOT run
+$ /bin/sh -c 'PATH=""; export PATH; eval "$(echo "$0" | tr \v\f\r\b \047\134\n\041)"' "<encoded 'echo BOOTSTRAP_EXECUTED'>"
+sh: 1: tr: not found                      # command substitution is empty -> eval runs nothing; marker never prints
+```
+
+Results were identical across two runs. So on a remote host lacking `tr`, the `sh`-path unwrap fails with `tr: not found`, the command substitution yields nothing, and the embedded bootstrap is never reconstructed or executed. (This is the pre-tarball unwrap stage; separately, the extracted `bootstrap.sh` also relies on `tr`, `tar`, and a base64 implementation for later stages [shell-integration/ssh/bootstrap.sh:55-73], and explicitly `die`s if `base64`/`tar` are absent — but the very first unwrap step already needs `tr`.) The `py` variant,
 when the user's interpreter is Python,
-can rely on the always-present `base64` module and so uses the simpler encoding.
+can rely on the always-present `base64` module and so uses the simpler encoding — it depends on a working Python interpreter instead.
+
+### A *second*, inner encoding: the explicit remote command (`EXEC_CMD`) — and a padding mismatch on the `py` path **[Observed]**
+
+Everything above concerns the *outer* encoding of the whole bootstrap script. When the user passes an **explicit remote command** (`kitten ssh host <cmd…>`, i.e. `len(cd.remote_args) > 0` [kittens/ssh/main.go:428]), a *second*, inner encoding is produced by `prepare_exec_cmd()` and substituted into the bootstrap at the `EXEC_CMD` placeholder. The two interpreters diverge here, and — unlike the outer encoding — the `py` inner path uses an **unpadded** Base64:
+
+```text
+$ sed -n "391,402p" kittens/ssh/main.go
+func prepare_exec_cmd(cd *connection_data) string {
+	// ssh simply concatenates multiple commands using a space see
+	// line 1129 of ssh.c and on the remote side sshd.c runs the
+	// concatenated command as shell -c cmd
+	if cd.script_type == "py" {
+		return base64.RawStdEncoding.EncodeToString(utils.UnsafeStringToBytes(strings.Join(cd.remote_args, " ")))
+	}
+	args := make([]string, len(cd.remote_args))
+	for i, arg := range cd.remote_args {
+		args[i] = strings.ReplaceAll(arg, "'", "'\"'\"'")
+	}
+	return "unset KITTY_SHELL_INTEGRATION; exec \"$login_shell\" -c '" + strings.Join(args, " ") + "'"
+}
+```
+
+- **`sh` path:** the command is *not* Base64 at all — it is emitted as a literal `unset KITTY_SHELL_INTEGRATION; exec "$login_shell" -c '<cmd>'` [kittens/ssh/main.go:402]. No decoding, no padding concern.
+- **`py` path:** the command is `base64.RawStdEncoding.EncodeToString(...)` [kittens/ssh/main.go:396] — the **Raw** (unpadded) Std encoding. But the remote `bootstrap.py` decodes it with `base64.standard_b64decode`, which **requires** correct `=` padding:
+
+```text
+$ sed -n "306,310p" shell-integration/ssh/bootstrap.py
+    exec_cmd = b'EXEC_CMD'
+    if exec_cmd:
+        os.environ.pop('KITTY_SHELL_INTEGRATION', None)
+        cmd = base64.standard_b64decode(exec_cmd).decode('utf-8')
+        os.execlp(login_shell, os.path.basename(login_shell), '-c', cmd)
+```
+
+Standard Base64 pads the output to a multiple of 4 characters; `RawStdEncoding` omits that padding. `standard_b64decode` rejects an unpadded string unless its length already happens to be a multiple of 4 — which occurs exactly when the command's byte length is a multiple of 3. I verified this end-to-end through the **real** `kitten ssh` entry point (interpreter `python3`, an explicit command), capturing the actual `encoded_script` argv the kitten produced, decoding that outer blob to recover the real substituted `exec_cmd = b'<B1>'`, and then feeding that captured `B1` to the *exact* `base64.standard_b64decode` call from `bootstrap.py:309`:
+
+```text
+$ python3 /obs/f2gb/extract_and_decode.py   # B1 values below are extracted from real kitten-produced argv
+cmd        | bytelen | len%3 | B1 (exec_cmd, from REAL kitten) | padded? | standard_b64decode(B1)
+-------------------------------------------------------------------------------------------------------------------
+pwd        |       3 |     0 | cHdk                            | no      | OK -> 'pwd'
+true       |       4 |     1 | dHJ1ZQ                          | no      | binascii.Error: Incorrect padding
+id         |       2 |     2 | aWQ                             | no      | binascii.Error: Incorrect padding
+echo OK    |       7 |     1 | ZWNobyBPSw                      | no      | binascii.Error: Incorrect padding
+```
+
+Results were identical across two runs. So on the `py` path an explicit remote command fails at the remote decode with `binascii.Error: Incorrect padding` for **any** command whose byte length is not a multiple of 3 (the common case — `true`, `id`, `echo OK` all fail; only length-multiple-of-3 commands like `pwd` succeed). The **full cross-product** of interpreter × command, all observed:
+
+| interpreter | explicit command? | `EXEC_CMD` value | remote decode | outcome |
+|-------------|-------------------|------------------|---------------|---------|
+| `sh` | no | empty (placeholder → `""`) | n/a | login shell, no command |
+| `sh` | yes (`true`) | literal `…exec "$login_shell" -c 'true'` (no base64) | n/a | **OK** — command runs |
+| `python3` | no | empty (`exec_cmd = b''`, `if exec_cmd:` false → decode skipped) | not reached | **OK** — login shell |
+| `python3` | yes, len % 3 == 0 (`pwd`) | `cHdk` (unpadded, but len already % 4 == 0) | `standard_b64decode` OK | **OK** |
+| `python3` | yes, len % 3 != 0 (`true`/`id`/`echo OK`) | unpadded, length not % 4 | `binascii.Error: Incorrect padding` | **FAILS** |
+
+**Direct answer:** the character-substitution / Base64 wrapping for the *whole script* is correct on both paths (the outer `py` encoding uses padded `base64.StdEncoding` [kittens/ssh/main.go:498], which is why it decodes cleanly), but the *inner* explicit-command encoding on the `py` path uses `base64.RawStdEncoding` (unpadded, main.go:396) against a `standard_b64decode` (padding-required, bootstrap.py:309) — a mismatch that breaks `python3`-interpreter sessions carrying an explicit remote command unless the command's byte length is a multiple of 3. The `sh` path is unaffected because it does not Base64-encode the command at all. *(Observed behavior of the code as it stands at commit `815df1e21`; this task is read-only and makes no source change — see the Cleanup & Integrity / scope note.)*
 
 ---
 
@@ -1414,7 +1523,7 @@ OK
 
 The 8 tests (`test_basic_pty_operations`, `test_ssh_bootstrap_with_different_launchers`, `test_ssh_connection_data`, `test_ssh_copy`, `test_ssh_env_vars`, `test_ssh_leading_data`, `test_ssh_login_shell_detection`, `test_ssh_shell_integration`) pass on both runs (stable). **What is not observed:** the request/response traversing a real network `ssh` connection and a real kitty GUI terminal acting as the DCS responder — that far side is inferred from the code above. Coverage requirement R7 is therefore marked **partial** in the coverage matrix.
 
-**Reasoning.** The design front-loads all package preparation locally (tarball + shm password) so that by the time `ssh` runs, the only thing that must cross the wire is a Base64 blob pulled over the already-authenticated TTY; the request direction (proactive vs remote-asks) is a pure latency optimisation keyed on OpenSSH capability, and both directions converge on the identical `get_data → untar → exec_login_shell` remote sequence.
+**Reasoning.** The design front-loads all package preparation locally (tarball + shm password) so that by the time `ssh` runs, the only thing that must cross the wire is a Base64 blob pulled over the already-authenticated TTY; the request direction (proactive vs remote-asks) is a pure latency optimisation keyed on OpenSSH capability, and both directions converge on the identical `get_data → untar → exec_login_shell` remote sequence. (If the user passed an **explicit remote command**, the final step is the `EXEC_CMD` branch [shell-integration/ssh/bootstrap.py:307-310, shell-integration/ssh/bootstrap.sh:159] instead of `exec_login_shell`; on the `python3` interpreter that branch carries the unpadded-Base64 caveat documented under Q6, which fails the remote decode for commands whose byte length is not a multiple of 3.)
 
 ---
 
@@ -1423,7 +1532,7 @@ The 8 tests (`test_basic_pty_operations`, `test_ssh_bootstrap_with_different_lau
 
 **Direct answer:** Six concrete mechanisms combine, all confined to the local host's POSIX shared memory (`/dev/shm`): **(1)** the object is created with `os.O_CREAT | os.O_EXCL` [kitty/shm.py:62] so creation fails if the name already exists (no clobbering/hijack); **(2)** the mode is owner-only `0o600` (`stat.S_IREAD | stat.S_IWRITE`) [kitty/shm.py:51];
 **(3)** the name is **randomly generated** in a 30-try loop [kitty/shm.py:69-77]; **(4)** the password is a fresh, **cryptographically-random one-time** token — `pw = TokenHex()` = 32 bytes from `crypto/rand` → 64 hex chars [tools/utils/secrets/tokens.go:14-34]; **(5)** the Python responder (the primary `kssh-*` credential reader) **unlinks the object first**, before reading,
-so the credential is single-use and the window is minimal [kittens/ssh/utils.py:106] — the Go clone-env reader re-verifies first and then unlinks (reader-specific ordering detailed below); **(6)** the reader **re-verifies owner and permissions** on the already-opened descriptor and refuses on mismatch [kittens/ssh/utils.py:107-111, kittens/ssh/main.go:75-81]. The Base64 tarball and the sh character-substitution (Q3/Q6) are **encodings for a text TTY,
+so the credential is single-use and the window is minimal [kittens/ssh/utils.py:106] — the Go clone-env reader re-verifies first and then unlinks (reader-specific ordering detailed below); **(6)** the reader **re-verifies permissions (`0o600`) and — in the Python responder only — owner** on the already-opened descriptor and refuses on mismatch. The two readers are **not** symmetric here: the Python `kssh-*` responder enforces *both* owner and `0o600` [kittens/ssh/utils.py:107-111], whereas the Go `ksse-*` clone-env reader effectively enforces **only** `0o600` — its owner-verification branch is unreachable dead code at runtime because the `s.Sys().(unix.Stat_t)` type assertion never succeeds (proven below) [kittens/ssh/main.go:74-81]. The Base64 tarball and the sh character-substitution (Q3/Q6) are **encodings for a text TTY,
 not confidentiality or integrity** mechanisms — confidentiality of the wire comes from ssh's own transport encryption,
 and of the credential from the `0o600` object.
 
@@ -1551,7 +1660,7 @@ func ReadWithSizeAndUnlink(name string, file_callback ...func(fs.FileInfo) error
 	}
 ```
 
-The `file_callback` loop invokes the owner/`0o600` check at [tools/utils/shm/shm.go:153] and `return nil, err` fires at [tools/utils/shm/shm.go:155] the instant it fails — one statement *before* the `defer func() { mmap.Close(); mmap.Unlink() }` is registered at [tools/utils/shm/shm.go:159-162]. So the Go reader unlinks **only on the success path**; a rejected object is left in place.
+The `file_callback` loop invokes the callback at [tools/utils/shm/shm.go:153] and `return nil, err` fires at [tools/utils/shm/shm.go:155] the instant it fails — one statement *before* the `defer func() { mmap.Close(); mmap.Unlink() }` is registered at [tools/utils/shm/shm.go:159-162]. So the Go reader unlinks **only on the success path**; a rejected object is left in place.
 
 Verified at runtime by driving the **real** functions against a fresh object per case (temporary harnesses that link/import the production packages), in the canonical image as `obsuser` (uid 1001). The Go clone-env reader harness compiles the real `shm.ReadWithSizeAndUnlink` together with the verbatim owner/`0o600` callback from [kittens/ssh/main.go:74-83]; it unlinks on success but **not** on a permission rejection:
 
@@ -1582,7 +1691,56 @@ read_data_from_shared_memory -> REJECTED: ValueError: Incorrect permissions on p
 object present AFTER read = False  => unlinked
 ```
 
-(The object suffix is random per run; the `present AFTER` result is stable across runs — Go rejection = still present, Python rejection = unlinked.) **On the success path both readers unlink** (Go's `defer` fires once the callback passes; Python unlinks first, unconditionally), so a legitimate one-time credential is single-use in *both* readers — no regression to the real credential flow. The readers diverge **only** for a rejected object (wrong owner or wrong permissions — already anomalous or tampered): the Python responder removes it, whereas the Go clone-env reader leaves it behind (still owner-only `0o600`, in the creating user's own `/dev/shm`, unreadable by the reader that just refused it, and not replayable). The primary `kssh-*` password payload is in any case additionally destroyed by the kitten's own `defer { data_shm.Close(); data_shm.Unlink() }` [kittens/ssh/main.go:600-605] regardless of reader outcome, so the credential channel is single-use end-to-end.
+(The object suffix is random per run; the `present AFTER` result is stable across runs — Go rejection = still present, Python rejection = unlinked.) **On the success path both readers unlink** (Go's `defer` fires once the callback passes; Python unlinks first, unconditionally), so a legitimate one-time credential is single-use in *both* readers — no regression to the real credential flow. The readers diverge for a rejected object — already anomalous or tampered — but note (per the dead-branch finding above) that the two readers do not even agree on *what* is rejected: the Python responder rejects both wrong owner and wrong permissions and removes the object; the Go clone-env reader rejects **only** wrong permissions (its owner check is inert) and, on that permission rejection, leaves the object behind (still owner-only `0o600`, in the creating user's own `/dev/shm`, unreadable by the reader that just refused it, and not replayable). The primary `kssh-*` password payload is in any case additionally destroyed by the kitten's own `defer { data_shm.Close(); data_shm.Unlink() }` [kittens/ssh/main.go:600-605] regardless of reader outcome, so the credential channel is single-use end-to-end.
+
+### The Go reader's owner-verification branch is unreachable dead code — only `0o600` is actually enforced **[Observed]**
+
+A second, sharper asymmetry sits *inside* the Go callback and does not exist on the Python side: the Go clone-env reader **does not actually verify ownership at runtime**. The callback guards the owner comparison behind a **value**-type assertion — `if stat, ok := s.Sys().(unix.Stat_t); ok { ... }` [kittens/ssh/main.go:74]. On Linux, `mmap.Stat()` ultimately calls `(*os.File).Stat()` [tools/utils/shm/shm.go:148 → tools/utils/shm/shm_syscall.go:93 / shm_fs.go:67], and `os.FileInfo.Sys()` for a real file returns a **pointer**, `*syscall.Stat_t`, never the value type `unix.Stat_t`. The assertion therefore always yields `ok == false`, the owner comparison is skipped, and the *only* check the Go reader actually performs is `s.Mode().Perm() != 0o600` [kittens/ssh/main.go:79]. The owner branch is dead code at runtime.
+
+This was proven by driving the **real** `os.File.Stat()`/`Sys()` and the **real** `shm.ReadWithSizeAndUnlink` with the verbatim callback copied from [kittens/ssh/main.go:74-83], first in the current container and then reproduced identically in the canonical image (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`) as `obsuser` (uid 1001). Complete output:
+
+```text
+$ /tmp/qa_verify/f2bin
+reader process: uid=0 gid=0
+
+=== PART 1: dynamic type of os/shm FileInfo.Sys() ===
+os.File.Stat().Sys() dynamic type: *syscall.Stat_t
+assert .(unix.Stat_t)    [what main.go:74 does] -> ok=false
+assert .(*syscall.Stat_t) [actual runtime type]  -> ok=true
+assert .(*unix.Stat_t)                           -> ok=false
+assert .(syscall.Stat_t)                         -> ok=false
+
+=== PART 2: real shm.ReadWithSizeAndUnlink + verbatim main.go callback ===
+
+--- success: mode 0o600, owner=self ---
+object /dev/shm/ksse-qaf2-W4YNQP5ZOLBJK present before = true
+read -> OK (payload returned)
+object present AFTER = false
+
+--- rejection candidate: mode 0o644 (wrong permissions) ---
+object /dev/shm/ksse-qaf2-ZY2OWWA7CEJBM present before = true
+read -> REJECTED: "Incorrect permissions on SHM file"
+object present AFTER = true
+
+--- rejection candidate: mode 0o600 but owner uid=1001 (reader uid=0) ---
+object /dev/shm/ksse-qaf2-MWT5P64EWBP64 present before = true
+read -> OK (payload returned)  <== owner check did NOT fire
+object present AFTER = false
+```
+
+The dynamic type of `Sys()` is `*syscall.Stat_t`, so the `.(unix.Stat_t)` assertion returns `ok=false`; the foreign-owner object with correct `0o600` is **accepted** (`read -> OK (payload returned)  <== owner check did NOT fire`) rather than rejected, while only the wrong-permission object is refused. Contrast the Python `kssh-*` responder, which reads `shm.stats.st_uid` directly [kittens/ssh/utils.py:107] with no type assertion and correctly rejects the same foreign-owner object:
+
+```text
+$ PYTHONPATH=<repo> python3 /tmp/qa_verify/f2_py.py
+reader euid=0 egid=0
+
+--- Python reader, wrong owner: mode 0o600, owner uid=1001 (reader euid=0) ---
+object /dev/shm//kssh-qaf2py-b29db7ee5021716916ccf15cdfde9a6a691ccb621e3bac0e5111ccd5a447bec5 present before = True
+read -> REJECTED: ValueError: Incorrect owner on pwfile: uid=1001 gid=1001
+object present AFTER = False
+```
+
+Both results were stable across two consecutive runs (only the random `/dev/shm` object suffix varies between runs) and reproduced identically in the canonical image. **Net effect:** the Python responder (the credential-bearing `kssh-*` reader) enforces *both* owner and `0o600`; the Go clone-env `ksse-*` reader enforces *only* `0o600`. This does not weaken the primary credential channel — the `kssh-*` password payload is read by the effective Python responder — and the `ksse-*` clone-env object it does affect is still `O_EXCL`-created, owner-only `0o600`, and confined to the creating user's own `/dev/shm`, so exploiting the inert owner check would require another local user to pre-create a `0o600` object under the exact random name this reader opens, which the ownership/permission model of `/dev/shm` entries already constrains. It is nonetheless an accurate description of the code: the Go owner check is inert. *(This is a description of observed behavior only; per the read-only scope of this task no source change is made — see the Scope / read-only note.)*
 
 ### All five rejection branches, live **[Observed]**
 
@@ -1620,7 +1778,7 @@ GONE (unlinked by reader)
 | **clone-env** | `ksse-` | Python `set_env_in_cmdline` → `create_shared_memory` [kittens/ssh/utils.py:154] | Go `add_cloned_env` → `read_data_from_shared_memory` [kittens/ssh/main.go:72,87] | pass a cloned local environment into the kitten |
 | **askpass** | `askpass-*` | Go `RunSSHAskpass` [kittens/ssh/askpass.go:55] | kitty core (via the `@kitty-ask` DCS [kittens/ssh/askpass.go:30]) | relay an ssh password/confirm prompt to the kitty UI |
 
-The **payload** and **clone-env** flows run in **opposite directions** (Go→Python vs Python→Go) with different prefixes; both enforce unlink-on-read (on the success path) + owner + `0o600`, differing only in *ordering* on the rejection path — the Python responder unlinks a rejected object, the Go clone-env reader does not (see the unlink-ordering subsection under Q8). The **askpass** flow is a third, separate object used only when ssh needs to prompt.
+The **payload** and **clone-env** flows run in **opposite directions** (Go→Python vs Python→Go) with different prefixes; both enforce unlink-on-read (on the success path) + `0o600`, but they differ on ownership and ordering: the Python responder verifies **owner + `0o600`** and unlinks a rejected object, whereas the Go clone-env reader verifies **only `0o600`** at runtime (its owner branch is inert dead code) and does not unlink a rejected object (see the unlink-ordering / dead-branch subsection under Q8). The **askpass** flow is a third, separate object used only when ssh needs to prompt.
 
 ### Trust boundary and threat table (M-9)
 
@@ -1631,9 +1789,9 @@ The trust boundary is the **local user account**: everything on the local host r
 | Disclosure to *other local users* | `0o600` owner-only + unpredictable random name + `O_EXCL` create [kitty/shm.py:51,62,69-77] | none material for cross-user |
 | A *same-UID* process reading the object | one-time pw + unlink-on-read narrows the window; owner/perm re-check | **no defense against a same-UID attacker** — same-UID is inside the trust boundary |
 | Replay / credential reuse | one-time `TokenHex` per run + unlink-on-read (object gone after first read) | none material |
-| Attacker plants a look-alike object | owner re-verification (`st_uid==euid`) rejects it | observed: `Incorrect owner on pwfile` |
+| Attacker plants a look-alike object | **Python responder (`kssh-*` credential):** owner re-verification (`st_uid==euid`) rejects it. **Go clone-env reader (`ksse-*`):** owner check is inert (dead-branch, Q8) — defense rests on `O_EXCL` create + `0o600` + unpredictable random name | observed: Python rejects with `Incorrect owner on pwfile`; Go **accepts** a foreign-owner `0o600` object (Q8 dead-branch harness) |
 | Wrong-permission object | `mode==0o600` re-check rejects it | observed: `Incorrect permissions on pwfile: 0o644` |
-| TOCTOU (swap between create and read) | the Python responder `unlink()`s first, then checks owner/perm on the **already-open** descriptor [kittens/ssh/utils.py:106-111] (the Go reader checks the already-open descriptor first, then unlinks — Q8) | small create→read window exists, but checks bind to the opened fd, not a re-lookup |
+| TOCTOU (swap between create and read) | the Python responder `unlink()`s first, then checks owner/perm on the **already-open** descriptor [kittens/ssh/utils.py:106-111] (the Go clone-env reader checks the already-open descriptor's **permissions only** first — its owner check is inert — then unlinks on success — Q8) | small create→read window exists, but checks bind to the opened fd, not a re-lookup |
 | Integrity / tampering of payload | owner-only perms; ssh transport integrity on the wire | **no cryptographic MAC** on the shm object — relies on `0o600` |
 | Malformed request probing | parse fails before any shm read [kittens/ssh/utils.py:120-126] | object not even opened; benign |
 | Abnormal-exit residue | deferred `Unlink` on normal exit [kittens/ssh/main.go:600-605] | if the kitten is `kill -9`'d, the object lingers until reboot/manual unlink (this very task produced such residue during earlier runs; see the Cleanup & Integrity section) |
@@ -1866,14 +2024,14 @@ This matrix is built from the verified evidence above, not from aspiration. Two 
 
 | # | User question (restated) | Section | Key named items answered | Primary evidence artifact | Status |
 |---|--------------------------|---------|--------------------------|---------------------------|--------|
-| R1 | Secure session + connection sharing | Q1 | `connection_sharing_args`, `-t`, `ControlMaster=auto`, `ControlPath`, `ControlPersist=yes`, `ServerAliveInterval/CountMax`, `TCPKeepAlive=no` | `argv_default.log`, `argv_shareno.log` | **Answered** |
+| R1 | Secure session + connection sharing | Q1 | `connection_sharing_args`, `-t`, `ControlMaster=auto`, `ControlPath`, `ControlPersist=yes`, `ServerAliveInterval/CountMax`, `TCPKeepAlive=no`, `share_connections` value parsing (`StringToBool`: only `y`/`yes`/`true`; other non-empty silently disables; empty warns+default) | `argv_default.log`, `argv_shareno.log`, `share_connections` cross-product (yes/y/true/maybe/no/empty) | **Answered** |
 | R2 | Shared-memory credentials + bootstrap generation | Q2 | `0o600` `kssh-*` shm, `secrets.TokenHex`, `bootstrap_script`, `make_tarfile`, conditional secret embed (C-4b) | `payload_default.json`, shm sleep-snapshot | **Answered** |
 | R3 | Archive build + transport | Q3 | `make_tarfile`, gzip/PAX, Base64, terminfo, shell-integration, `remote_kitty` binaries | tarball variants (`cap/10`), gzip determinism (`cap/11`) | **Answered** |
 | R4 | Connection data structure / state | Q4 | `connection_data` struct (16 fields), `SSHConnectionData` (5 fields), `handle_remote_file` consumer | `cap/12_connection_data.txt` | **Answered** |
 | R5 | Connection reuse (ControlMaster) | Q5 | `master_is_functional`, `ssh -O check`, `need_to_request_data`, `close_shared_ssh_connections` | lifecycle transcript `cap/06`, `-O check` probe | **Answered** |
-| R6 | Per-shell bootstrap encoding | Q6 | `wrap_bootstrap_script`, `'`→VT / `\`→FF / `\n`→CR / `!`→BS, `tr` reversal, Base64 (python) | encoding round-trip `cap/13b` | **Answered** |
+| R6 | Per-shell bootstrap encoding | Q6 | `wrap_bootstrap_script`, `'`→VT / `\`→FF / `\n`→CR / `!`→BS, `tr` reversal (sh-path unwrap depends on remote `tr`, not dependency-free), Base64 (python); inner `EXEC_CMD` encoding (`prepare_exec_cmd`: `sh` literal vs `py` `RawStdEncoding`) and the unpadded-vs-`standard_b64decode` padding mismatch | encoding round-trip `cap/13b`, real-kitten `EXEC_CMD` decode cross-product (pwd/true/id/echo OK), `tr`-present-vs-absent unwrap reproduction | **Answered** |
 | R7 | End-to-end trace | Q7 | ordered `run_ssh` stages, proactive vs remote-asks, `c.Start()`-before-DCS, remote extraction, `exec_login_shell` | `./test.py --module ssh` 8/8 local E2E | **Answered — partial E2E** |
-| R8 | Shared-memory security | Q8 | `O_CREAT\|O_EXCL`, `0o600`, random name, one-time pw, unlink-on-read (reader-specific ordering: Python unlinks first, Go checks first), owner/perm re-verify, threat table | 5 rejection branches `cap/14`, owner-mismatch `cap/14b`, Go vs Python unlink-on-rejection harness | **Answered** |
+| R8 | Shared-memory security | Q8 | `O_CREAT\|O_EXCL`, `0o600`, random name, one-time pw, unlink-on-read (reader-specific ordering: Python unlinks first, Go checks first), reader-asymmetric re-verify (Python `kssh-*` enforces owner + `0o600`; Go `ksse-*` enforces `0o600` only — owner branch is unreachable dead code), threat table | 5 rejection branches `cap/14`, owner-mismatch `cap/14b`, Go-vs-Python unlink-on-rejection harness, Go type-assertion dead-branch harness (`f2bin`/`f2_py`) | **Answered** |
 | R9 | Terminal↔remote DCS communication | Q9 | `@kitty-ssh` DCS, `KITTY_DATA_START`/`OK`/`KITTY_DATA_END`, 254-byte chunking, five decoders + failure, ≥8.4 gate | `dcs_default.raw`, `dcs_remotereq.raw`, `get_ssh_data_success.raw` | **Answered — protocol observed locally; production network round-trip inferred** |
 
 ### Named-mechanism coverage (each answered explicitly, by name)
@@ -1886,6 +2044,8 @@ This matrix is built from the verified evidence above, not from aspiration. Two 
 | `bootstrap.sh` / `bootstrap.py` | Q2, Q3, Q7, Q9 |
 | `bootstrap-utils.sh` (sh-only, M-5) | Q3, Q7 |
 | character substitutions (`'`→VT, `\`→FF, `\n`→CR, `!`→BS) | Q6 |
+| `EXEC_CMD` explicit-command encoding (`prepare_exec_cmd`, `RawStdEncoding` vs `standard_b64decode` padding) | Q6, Q7 |
+| `share_connections` value parsing (`StringToBool`; `to_bool` options) | Q1 |
 | `connection_data` struct | Q4, Q7 |
 | `SSHConnectionData` descriptor | Q4 |
 | `master_is_functional` / `ssh -O check` | Q5 |
@@ -1976,6 +2136,6 @@ Cross-referencing the Build & Environment preamble: `$CacheDir/openssh-is-new-en
 
 ### Helper inventory (kept outside the repository)
 
-All observation helpers live at `/obs/helpers` (canonical container) and `/tmp` (host), never in the repo: `ssh_shim/ssh`, `pty_harness.py`, `obs_get_ssh_data.py`, `obs_get_connection_data.py`, `obs_snapshot_shm.py`, `obs_tarball.py`, `obs_encoding.py`, `obs_make_shm.py`, `obs_owner_reject.py`, `controlmaster_lifecycle.sh`, `snap_variant.sh`, `run_dump.sh`, and the capture outputs under `/obs/cap`. They may be retained for audit but are not part of the deliverable and never entered the source tree — the git-status proof above is the authoritative statement that the repository is unchanged except for this document.
+All observation helpers live at `/obs/helpers` (canonical container) and `/tmp` (host), never in the repo: `ssh_shim/ssh`, `pty_harness.py`, `obs_get_ssh_data.py`, `obs_get_connection_data.py`, `obs_snapshot_shm.py`, `obs_tarball.py`, `obs_encoding.py`, `obs_make_shm.py`, `obs_owner_reject.py`, `controlmaster_lifecycle.sh`, `snap_variant.sh`, `run_dump.sh`, and the capture outputs under `/obs/cap`. Per the read-only rule they are **temporary observation scaffolding, not part of the deliverable**, and were **removed after their output was captured** — none ever entered the source tree, and the transient helper/harness directories used for this round of verification (e.g. the `/tmp` Go/Python harnesses) are deleted in this same cleanup pass. Their full source is embedded inline in the relevant sections above, so the evidence remains auditable from this document alone without retaining the files. The git-status proof above is the authoritative statement that the repository is unchanged except for this document.
 
 ---
