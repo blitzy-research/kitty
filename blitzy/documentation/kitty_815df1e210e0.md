@@ -908,7 +908,7 @@ Two facts follow directly. First, there are **two distinct contexts** (temp `…
 
 ```mermaid
 graph TD
-    A["main() orchestration<br/>kitty/main.py:L524 (calls init_glfw L514, then run_app L518)"] --> B["init_glfw() / platform backend selected<br/>kitty/main.py:L95 (called at L514) — X11 observed / Wayland inferred"]
+    A["main()/_main() orchestration<br/>kitty/main.py:main() L524 calls _main() L441,<br/>which calls init_glfw L514, then run_app L518"] --> B["init_glfw() / platform backend selected<br/>kitty/main.py:L95 (called at L514) — X11 observed / Wayland inferred"]
     B --> RUN["AppRunner.__call__ (run_app, L518)<br/>set_font_family(opts) L251<br/>(FontConfig face resolution)"]
     RUN --> C["Temp probe window created (640x480)<br/>GLFW transiently binds+clears temp ctx to probe GL_VERSION<br/>kitty/glfw.c:L1198; glfw/context.c:L195,L398"]
     C --> D["Query content scale / DPI (=1.0 -> 96)<br/>kitty/glfw.c:L1200, L811/L816/L822/L824"]
@@ -931,7 +931,7 @@ graph TD
 
 ### 5.3 Component connections (who calls whom, canonical from‑source path)
 
-`kitty/launcher/main.c:int main() L439` → `run_embedded() L177` (called at `L464`) → `Py_RunMain() L216` → repo `__main__.py:L5-7` → `kitty/entry_points.py:main() L183` → falls through to `kitty_main()` at `kitty/entry_points.py:L194-195` → `kitty/main.py:main() L524` → `init_glfw() L95` → `AppRunner.__call__` (`set_font_family` `L251`) → `_run_app() L202` → `create_os_window() L221` (drives `kitty/glfw.c` window/context/metrics) → `Boss(...) L226` → `boss.start(...) L227` → (`--debug-font-fallback`) `dump_font_debug() L229`.
+`kitty/launcher/main.c:int main() L439` → `run_embedded() L177` (called at `L464`) → `Py_RunMain() L216` → repo `__main__.py:L5-7` → `kitty/entry_points.py:main() L183` → falls through to `kitty_main()` at `kitty/entry_points.py:L194-195` → `kitty/main.py:main() L524` → `_main() L441` (which calls `init_glfw()` at `L514` and `run_app` at `L518`) → `init_glfw() L95` → `AppRunner.__call__` (`set_font_family` `L251`) → `_run_app() L202` → `create_os_window() L221` (drives `kitty/glfw.c` window/context/metrics) → `Boss(...) L226` → `boss.start(...) L227` → (`--debug-font-fallback`) `dump_font_debug() L229`.
 
 
 ---
