@@ -2,7 +2,7 @@
 
 **Source tree:** branch `kitty_815df1e210e0`, source code at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` ("Wire up applying of font config") — this is the citation baseline for every `file:line` below. This answer document is added on top of that source in commit `b04bc45a8`. All binaries were built from this tree and report themselves as `kitty 0.35.2`.
 
-**Scope note.** This document answers, with runtime‑grounded evidence, how the kitty terminal emulator behaves when a large amount of terminal **graphics** data (kitty graphics‑protocol APC escape codes, `ESC _ G … ESC \`) arrives faster than the terminal can comfortably process and respond to it — on both the **input (read)** side and the **output (write/response)** side — where those decisions live in the source, and how they surface at runtime. Every behavioural claim below sits next to the **exact command** that produced it and the **complete, unedited output** of a run I executed, with `file:line` references into this checkout. Claims are explicitly labelled **OBSERVED** (captured from a real run) or **INFERRED** (grounded in code that I could not surface as a runtime value). Every observation was driven through kitty's **canonical entry point** — a real PTY feeding the native I/O loop and VT parser, or the real `vt_parser` → `screen_handle_graphics_command` → `graphics.c` chain in‑process — never the remote‑control interface or a debug injection hook. The source repository was left byte‑for‑byte unchanged; the only new artifact is this file. See section **(f)** for the full observed‑vs‑inferred ledger, the exact build/invocation commands with their exit statuses, the scale used, and the ≥2‑run stability confirmations.
+**Scope note.** This document answers, with runtime‑grounded evidence, how the kitty terminal emulator behaves when a large amount of terminal **graphics** data (kitty graphics‑protocol APC escape codes, `ESC _ G … ESC \`) arrives faster than the terminal can comfortably process and respond to it — on both the **input (read)** side and the **output (write/response)** side — where those decisions live in the source, and how they surface at runtime. Every behavioural claim below sits next to the **exact command** that produced it and the **complete, unedited output** of a run I executed — or, where the raw stream is enormous (e.g. a multi‑million‑line `strace`), the exact command plus the specific **verbatim** lines that carry the signal together with the counts I extracted from the full capture — with `file:line` references into this checkout. Claims are explicitly labelled **OBSERVED** (captured from a real run) or **INFERRED** (grounded in code that I could not surface as a runtime value). Every observation was driven through kitty's **canonical entry point** — a real PTY feeding the native I/O loop and VT parser, or the real `vt_parser` → `screen_handle_graphics_command` → `graphics.c` chain in‑process — never the remote‑control interface or a debug injection hook. The source repository was left byte‑for‑byte unchanged; the only new artifact is this file. See section **(f)** for the full observed‑vs‑inferred ledger, the exact build/invocation commands with their exit statuses, the scale used, and the ≥2‑run stability confirmations.
 
 **One‑sentence answer.** kitty does **not** grow an unbounded buffer and it does **not** "throttle" in any rate‑limiting sense; on the input side it **pauses reading** by de‑arming the child's `POLLIN` once a fixed **1 MiB** (`1048576`‑byte) parser buffer fills — letting ordinary OS PTY backpressure block the producer — and on the output side it uses a non‑blocking, `EAGAIN`‑aware drain that **retains** unwritten response bytes for the next `POLLOUT`, with a **100 MiB** (`104857600`‑byte) hard cap that drops (and logs) anything beyond it; graphics‑specific pressure additionally shows up as **oldest‑image eviction** under a **320 MiB** (`335544320`‑byte) storage quota and as protocol **`;ENOSPC` / `;EINVAL` / `;ENODATA`** responses.
 
@@ -49,7 +49,7 @@ No instrumented or byte‑dump build was used for any observed value. The `strac
   ```c
   children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;
   ```
-  When the predicate is false, the child fd's requested `events` is set to `0` (POLLIN cleared). The very next line, `kitty/child-monitor.c:L1503`, ORs `POLLOUT` back in **only if** `write_buf_used > 0`, so more precisely kitty **de‑arms `POLLIN` while preserving any `POLLOUT` interest** — it stops reading that child without giving up the ability to flush queued responses.
+  When the predicate is false, the child fd's requested `events` is set to `0` (POLLIN cleared). Two lines later — after `kitty/child-monitor.c:L1502` takes the write lock (`screen_mutex(lock, write)`) — `kitty/child-monitor.c:L1503` ORs `POLLOUT` back in **only if** `write_buf_used > 0`, so more precisely kitty **de‑arms `POLLIN` while preserving any `POLLOUT` interest** — it stops reading that child without giving up the ability to flush queued responses.
 - The actual ingestion happens in `read_bytes` (`kitty/child-monitor.c:L1337`), which asks the parser for a write buffer sized `BUF_SZ - (read.sz + write.pending)` (`vt_parser_create_write_buffer`, `kitty/vt-parser.c:L1451-L1458`), `read()`s into it, and commits the length back to the parser.
 
 **The batching modifier (the "slow down a little" that is *not* a pause).** Within the 1 MiB budget, kitty deliberately *batches* input rather than dispatching every chunk immediately, governed by `input_delay` (default **3 ms**, `kitty/options/definition.py:L878`). The parse worker flushes early when a flush is forced, when `input_delay` has elapsed, **or** when the buffer is nearly full — `kitty/vt-parser.c:L1425`:
@@ -76,6 +76,11 @@ def log(m):
         f.write(m + '\n'); f.flush()
 
 def main():
+    # Reject a nonsensical duration up front (fail loud, non-zero) rather than silently
+    # "succeeding" with zero work: the flood needs a strictly positive DURATION.
+    if DURATION <= 0:
+        sys.stderr.write('invalid DURATION=%r (need DURATION>0 seconds)\n' % DURATION)
+        sys.exit(2)
     log('# OBJ-1 child pid=%d' % os.getpid())
     old = None
     try:
@@ -134,54 +139,89 @@ timeout 30 strace -tt -p "$TID" -e trace=poll,read -o "$STRACE"   # exit status:
 ```
 `fd=8` is the child PTY; `fd=6`/`fd=7` are the two `EXTRA_FDS` (wakeup + signal) fds (`EXTRA_FDS==2`, `kitty/child-monitor.c:L35`).
 
-**Child progress log, run 1 (complete, unedited).** The child’s single `os.write()` stalls grow as kitty periodically pauses reading:
+**Child progress log, both runs (complete, verbatim).** The child's single `os.write()` takes progressively longer and occasionally stalls (>50 ms) as kitty periodically pauses reading while it drains the parser. Run 1:
 ```
-# OBJ-1 child pid=105110
+# OBJ-1 child pid=493900
 # stdin set to raw mode
 # per-command bytes=40034 (quiet=2 => no responses)
 # attach window: sleeping 5s for strace to attach
 # FLOOD start duration=20.0s
-# t= 1.02s cmds=866 max_write=50.5ms stalls>50ms=1
-# t= 2.02s cmds=1790 max_write=50.5ms stalls>50ms=1
-# t= 3.03s cmds=2639 max_write=50.5ms stalls>50ms=1
-# t= 4.03s cmds=3542 max_write=50.5ms stalls>50ms=1
-# t= 5.03s cmds=4509 max_write=50.5ms stalls>50ms=1
-# t= 6.03s cmds=5454 max_write=50.5ms stalls>50ms=1
-# t= 7.03s cmds=6390 max_write=50.5ms stalls>50ms=1
-# t= 8.03s cmds=7370 max_write=50.5ms stalls>50ms=1
-# t= 9.03s cmds=8256 max_write=50.5ms stalls>50ms=1
-# t=10.03s cmds=9087 max_write=50.5ms stalls>50ms=1
-# t=11.03s cmds=9893 max_write=50.5ms stalls>50ms=1
-# t=12.03s cmds=10689 max_write=62.7ms stalls>50ms=2
-# t=13.03s cmds=11506 max_write=62.7ms stalls>50ms=2
-# t=14.03s cmds=12364 max_write=62.7ms stalls>50ms=2
-# t=15.03s cmds=13149 max_write=62.7ms stalls>50ms=3
-# t=16.03s cmds=13969 max_write=62.7ms stalls>50ms=3
-# t=17.03s cmds=14784 max_write=62.7ms stalls>50ms=3
-# t=18.03s cmds=15591 max_write=62.7ms stalls>50ms=3
-# t=19.03s cmds=16420 max_write=62.7ms stalls>50ms=3
-# FLOOD done cmds=17207 elapsed=20.01s max_single_write=62.7ms stalls>50ms=3
+# t= 1.03s cmds=885 max_write=42.0ms stalls>50ms=0
+# t= 2.03s cmds=1787 max_write=42.0ms stalls>50ms=0
+# t= 3.03s cmds=2681 max_write=50.2ms stalls>50ms=1
+# t= 4.03s cmds=3476 max_write=50.2ms stalls>50ms=1
+# t= 5.03s cmds=4314 max_write=50.2ms stalls>50ms=1
+# t= 6.04s cmds=5147 max_write=50.2ms stalls>50ms=1
+# t= 7.04s cmds=6020 max_write=50.2ms stalls>50ms=1
+# t= 8.04s cmds=6845 max_write=50.2ms stalls>50ms=1
+# t= 9.04s cmds=7664 max_write=50.2ms stalls>50ms=1
+# t=10.04s cmds=8505 max_write=50.2ms stalls>50ms=1
+# t=11.04s cmds=9356 max_write=50.2ms stalls>50ms=1
+# t=12.04s cmds=10224 max_write=50.2ms stalls>50ms=1
+# t=13.04s cmds=11046 max_write=50.2ms stalls>50ms=1
+# t=14.04s cmds=11862 max_write=50.2ms stalls>50ms=1
+# t=15.04s cmds=12675 max_write=50.2ms stalls>50ms=1
+# t=16.04s cmds=13543 max_write=50.2ms stalls>50ms=1
+# t=17.04s cmds=14356 max_write=50.2ms stalls>50ms=1
+# t=18.04s cmds=15126 max_write=50.2ms stalls>50ms=1
+# t=19.04s cmds=15966 max_write=50.2ms stalls>50ms=1
+# FLOOD done cmds=16799 elapsed=20.03s max_single_write=50.2ms stalls>50ms=1
+# OBJ-1 child exiting
+```
+Run 2:
+```
+# OBJ-1 child pid=494288
+# stdin set to raw mode
+# per-command bytes=40034 (quiet=2 => no responses)
+# attach window: sleeping 5s for strace to attach
+# FLOOD start duration=20.0s
+# t= 1.00s cmds=816 max_write=42.0ms stalls>50ms=0
+# t= 2.00s cmds=1646 max_write=42.0ms stalls>50ms=0
+# t= 3.00s cmds=2454 max_write=42.6ms stalls>50ms=0
+# t= 4.00s cmds=3258 max_write=43.3ms stalls>50ms=0
+# t= 5.00s cmds=4082 max_write=49.7ms stalls>50ms=0
+# t= 6.00s cmds=4934 max_write=49.7ms stalls>50ms=0
+# t= 7.00s cmds=5788 max_write=49.7ms stalls>50ms=0
+# t= 8.00s cmds=6627 max_write=49.7ms stalls>50ms=0
+# t= 9.00s cmds=7468 max_write=49.7ms stalls>50ms=0
+# t=10.00s cmds=8328 max_write=49.7ms stalls>50ms=0
+# t=11.00s cmds=9191 max_write=49.7ms stalls>50ms=0
+# t=12.00s cmds=10067 max_write=49.7ms stalls>50ms=0
+# t=13.01s cmds=10950 max_write=49.7ms stalls>50ms=0
+# t=14.01s cmds=11813 max_write=49.7ms stalls>50ms=0
+# t=15.01s cmds=12689 max_write=49.7ms stalls>50ms=0
+# t=16.01s cmds=13551 max_write=49.7ms stalls>50ms=0
+# t=17.01s cmds=14427 max_write=49.7ms stalls>50ms=0
+# t=18.01s cmds=15273 max_write=49.7ms stalls>50ms=0
+# t=19.01s cmds=16127 max_write=49.7ms stalls>50ms=0
+# FLOOD done cmds=17025 elapsed=20.00s max_single_write=49.7ms stalls>50ms=0
 # OBJ-1 child exiting
 ```
 
-**The `POLLIN` de‑arm, captured verbatim from `strace` (run 1).** The `read()` count argument is the *free* parser space kitty offered (`BUF_SZ - (read.sz + write.pending)`), so the parser occupancy at that instant is `1048576 - count`:
+**The `POLLIN` de‑arm, captured verbatim from `strace` (both runs).** The `read()` count argument is the *free* parser space kitty offered (`BUF_SZ - (read.sz + write.pending)`), so the parser occupancy at that instant is `1048576 - count`. Run 1 (smallest free‑space seen = `3117`):
 ```
-18:29:49.293662 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 1) = 1 ([{fd=8, revents=POLLIN}])
-18:29:49.293692 read(8, "FhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYW"..., 1500) = 1500
-18:29:49.293722 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 1) = 0 (Timeout)
+04:05:08.328994 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 2) = 1 ([{fd=8, revents=POLLIN}])
+04:05:08.329033 read(8, "WFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhY"..., 3117) = 3117
+04:05:08.329067 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 2) = 0 (Timeout)
 ```
-The `read(8, …, 1500)` shows only **1500 bytes** of free parser space remained, i.e. occupancy `= 1048576 - 1500 = 1,047,076` bytes (**99.86 %** of `BUF_SZ`). The next `poll()` immediately drops that fd’s requested `events` from `POLLIN` to `0` — the read pause of `kitty/child-monitor.c:L1501` firing because `vt_parser_has_space_for_input()` returned false (`kitty/vt-parser.c:L1477-L1481`). `POLLOUT` is absent here (not `POLLIN|POLLOUT`) purely because `q=2` kept `write_buf` empty (`kitty/child-monitor.c:L1503`).
+Run 2 (smallest free‑space seen = `171`, i.e. even closer to full):
+```
+04:05:49.225528 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 0) = 1 ([{fd=8, revents=POLLIN}])
+04:05:49.225555 read(8, "hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWF"..., 171) = 171
+04:05:49.225584 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 0) = 0 (Timeout)
+```
+The `read(8, …, 3117)` (run 1) shows only **3117 bytes** of free parser space remained, i.e. occupancy `= 1048576 - 3117 = 1,045,459` bytes (**99.70 %** of `BUF_SZ`); run 2 came within **171 bytes** → occupancy `1,048,405` bytes (**99.98 %**). In each case the next `poll()` immediately drops that fd’s requested `events` from `POLLIN` to `0` — the read pause of `kitty/child-monitor.c:L1501` firing because `vt_parser_has_space_for_input()` returned false (`kitty/vt-parser.c:L1477-L1481`). `POLLOUT` is absent here (not `POLLIN|POLLOUT`) purely because `q=2` kept `write_buf` empty (`kitty/child-monitor.c:L1503`).
 
 **Stability (2 independent runs, default build).**
 
 | Run | Min `read()` free‑space count | ⇒ Max parser occupancy | % of `BUF_SZ` | `POLLIN`→`0` de‑arms | Child max single `write()` | stalls > 50 ms |
 |-----|------------------------------|------------------------|---------------|----------------------|----------------------------|----------------|
-| 1 | 1500 | **1,047,076 B** | 99.86 % | 5 | 62.7 ms | 3 |
-| 2 | 755 | **1,047,821 B** | 99.93 % | 42 | 111.6 ms | 5 |
+| 1 | 3117 | **1,045,459 B** | 99.70 % | 24 | 50.2 ms | 1 |
+| 2 | 171 | **1,048,405 B** | 99.98 % | 31 | 49.7 ms | 0 |
 
-Both runs put the parser within ~1500 bytes of the exact `BUF_SZ` (`1048576`) and both show the `POLLIN`→`0` de‑arm. (In an OBJ‑2 write‑pressure run the same de‑arm appeared as `POLLIN|POLLOUT` → `POLLOUT`, i.e. `POLLIN` cleared while `POLLOUT` preserved — the precise wording above.)
+Both runs drove the parser to within `3117` (run 1) / `171` (run 2) bytes of the exact `BUF_SZ` (`1048576`) and both show the `POLLIN`→`0` de‑arm firing repeatedly (24 / 31 times). The de‑arm *count* is not a fixed magnitude (it depends on how often the buffer refills during the 20 s flood), but the *near‑full occupancy at the moment of de‑arm* is stable across runs. (In an OBJ‑2 write‑pressure run the same de‑arm appeared as `POLLIN|POLLOUT` → `POLLOUT`, i.e. `POLLIN` cleared while `POLLOUT` preserved — the precise wording above.)
 
-**Bottom line for (a).** kitty answers a flood by **pausing the read** (de‑arming `POLLIN`, `kitty/child-monitor.c:L1501`) once the fixed **1 MiB** buffer (`kitty/vt-parser.c:L18`) is full (`kitty/vt-parser.c:L1477-L1481`), and by **batching within `input_delay`** (`kitty/options/definition.py:L878`, bypassed near‑full at `kitty/vt-parser.c:L1425`). It never buffers unboundedly and never rate‑limits; the "slow down" is the producer being blocked by ordinary PTY backpressure. *OBSERVED:* the parser occupancy (≈ `1.047 MB` ≈ `BUF_SZ`, from the `read()` count argument), the `POLLIN`→`0` de‑arm, and the child’s `write()` stalls (producer blocking). *INFERRED:* the exact internal `read.sz` scalar is **not** emitted by any built‑in printout — `kitty/child-monitor.c:L1500` is a **commented‑out** `printf` of a field named `screen->read_buf_sz` that **does not exist** on `Screen` (`kitty/screen.h:L115` declares only `write_buf_sz`/`write_buf_used`), so it could not print `read.sz` even if enabled; occupancy is therefore derived from the `read()` syscall argument, and the causal link *occupancy ≥ BUF_SZ ⇒ `POLLIN` cleared* is read from the source and corroborated by the observed "read‑just‑before‑de‑arm".
+**Bottom line for (a).** kitty answers a flood by **pausing the read** (de‑arming `POLLIN`, `kitty/child-monitor.c:L1501`) once the fixed **1 MiB** buffer (`kitty/vt-parser.c:L18`) is full (`kitty/vt-parser.c:L1477-L1481`), and by **batching within `input_delay`** (`kitty/options/definition.py:L878`, bypassed near‑full at `kitty/vt-parser.c:L1425`). It never buffers unboundedly and never rate‑limits; the "slow down" is the producer being blocked by ordinary PTY backpressure. *OBSERVED:* the parser occupancy (≈ `1.045`–`1.048 MB` ≈ `BUF_SZ`, from the `read()` count argument), the `POLLIN`→`0` de‑arm (24 / 31 times across the two runs), and the child’s `write()` slowdowns to ≈ 50 ms (producer blocking). *INFERRED:* the exact internal `read.sz` scalar is **not** emitted by any built‑in printout — `kitty/child-monitor.c:L1500` is a **commented‑out** `printf` of a field named `screen->read_buf_sz` that **does not exist** on `Screen` (`kitty/screen.h:L115` declares only `write_buf_sz`/`write_buf_used`), so it could not print `read.sz` even if enabled; occupancy is therefore derived from the `read()` syscall argument, and the causal link *occupancy ≥ BUF_SZ ⇒ `POLLIN` cleared* is read from the source and corroborated by the observed "read‑just‑before‑de‑arm".
 
 ---
 
@@ -190,7 +230,7 @@ Both runs put the parser within ~1500 bytes of the exact `BUF_SZ` (`1048576`) an
 **What kitty does.** kitty's responses to the child (graphics‑protocol `;OK`/error replies, etc.) are appended to a **per‑child, in‑process write buffer** (`screen->write_buf`, grown with `PyMem_RawRealloc`). The I/O loop only asks for writability (`POLLOUT`) when that buffer is non‑empty, and it drains it with a **non‑blocking, `EAGAIN`‑aware** loop: it `write()`s as much as the kernel accepts and, the instant the kernel says "would block" (`EAGAIN`/`EWOULDBLOCK`), it **stops and keeps the un‑written bytes** for the next `POLLOUT`, `memmove`‑ing them to the front of the buffer. So under output pressure kitty neither blocks its whole event loop nor discards responses — it **holds them and retries**. There is exactly one guardrail against a truly pathological, never‑reading child: a **100 MiB hard cap** on the write buffer, beyond which the newly generated response bytes are **dropped with an error log**. (The child‑side fd is non‑blocking by construction — `kitty/child.py:L345`, `os.set_blocking(self.child_fd, False)` — which is what makes `write()` return `EAGAIN` instead of blocking.)
 
 **Where the decision lives.**
-- The drain loop — `kitty/child-monitor.c:L1443-L1479` (`write_to_child`), unedited:
+- The drain loop — `kitty/child-monitor.c:L1443-L1479` (`write_to_child`), verbatim (every source token is byte‑for‑byte; the only additions are the three inline `// <-` annotations, added for readability):
   ```c
   write_to_child(int fd, Screen *screen) {
       size_t written = 0;
@@ -294,6 +334,12 @@ def main():
     if CMDTYPE not in ('ok', 'einval'):
         sys.stderr.write('unknown CMDTYPE %r (expected ok|einval)\n' % CMDTYPE)
         sys.exit(2)
+    # Reject a nonsensical scale up front (fail loud, non-zero) rather than silently doing
+    # zero work: control/retention/eagain need N>0; cap ignores N and floods forever (N>=0).
+    if N < 0 or (MODE != 'cap' and N <= 0):
+        sys.stderr.write('invalid N=%d for mode %r (need N>0 for control/retention/eagain; '
+                         'N>=0 for cap)\n' % (N, MODE))
+        sys.exit(2)
     log('# OBJ-2 child pid=%d mode=%s N=%d' % (os.getpid(), MODE, N))
     old = None
     try:
@@ -303,12 +349,13 @@ def main():
         except Exception as e:
             log('# raw mode unavailable: %r' % e)
         if CMDTYPE == 'einval':
-            # Declare a 100x100 RGB image (expects 30000 bytes) but send only 3 bytes:
-            # kitty rejects with a long EINVAL "Image dimensions ... do not match data size"
-            # response (~85 bytes) -> accumulates write_buf ~8x faster than the 11-byte OK.
+            # This command sets BOTH i and I, so the graphics manager rejects it with the
+            # 86-byte reply ";EINVAL:Must not specify both image id and image number"
+            # (finish_command_response, graphics.c:L759-L782) -> write_buf accumulates ~8x
+            # faster than the 11-byte ;OK, so the 100 MiB cap is reached sooner.
             px  = base64.standard_b64encode(b'\x00\x00\x00').decode('ascii')
             cmd = ('\033_Gi=123456,I=123456,p=123456,a=t,s=9999,v=9999,f=24;' + px + '\033\\').encode('ascii')
-            log('# per-command bytes=%d (non-quiet dimension-mismatch => ~80-byte ENODATA response)' % len(cmd))
+            log('# per-command bytes=%d (non-quiet, both i and I => 86-byte ;EINVAL "Must not specify both image id and image number" response)' % len(cmd))
         else:
             px  = base64.standard_b64encode(b'\x00\x00\x00').decode('ascii')
             cmd = ('\033_Gi=2,a=t,s=1,v=1,f=24;' + px + '\033\\').encode('ascii')
@@ -377,30 +424,89 @@ if __name__ == '__main__':
 Exact commands (reproducible; exit statuses shown):
 ```bash
 export PATH="$PATH:/usr/local/go/bin"; export LANG=C.UTF-8 LC_ALL=C.UTF-8 LIBGL_ALWAYS_SOFTWARE=1
-LAUNCH='timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" ./kitty/launcher/kitty --config NONE -o confirm_os_window_close=0'
-$LAUNCH python3 obj2_child.py "$LOG" retention 50000            # exit status: 0
-$LAUNCH python3 obj2_child.py "$LOG" control   50000            # exit status: 0
-$LAUNCH python3 obj2_child.py "$LOG" eagain    60000            # exit status: 0
-# EAGAIN also traced on the io-loop thread:
+# LAUNCH MUST be a bash ARRAY, not a scalar string: the -s value "-screen 0 1280x800x24"
+# contains spaces, so an unquoted scalar `$LAUNCH` word-splits it and xvfb-run aborts with
+# `/usr/bin/xvfb-run: 200: 0: not found` (reproduced under "Failed attempts" after (b.4)).
+LAUNCH=(timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" ./kitty/launcher/kitty --config NONE -o confirm_os_window_close=0)
+"${LAUNCH[@]}" python3 obj2_child.py "$LOG" retention 50000     # launcher exit status: 0
+"${LAUNCH[@]}" python3 obj2_child.py "$LOG" control   50000     # launcher exit status: 0
+"${LAUNCH[@]}" python3 obj2_child.py "$LOG" eagain    60000     # launcher exit status: 0
+# EAGAIN also traced on the io-loop thread (strace the KittyChildMon TID):
 timeout 55 strace -tt -p "$TID" -e trace=write -o "$STRACE"     # exit status: 0
-$LAUNCH python3 obj2_child.py "$LOG" cap 0 einval               # driver SIGKILLs on first cap log
+# cap is ALWAYS run via the bounded driver below (never bare, else it floods without limit):
+bash cap_driver.sh "$WS" 1                                      # driver SIGKILLs its OWN kitty on 1st cap log
 ```
 
-The `cap`‑mode **driver** referenced on the last line is this small wrapper — it launches the cap child, blocks until the **first** 100 MiB cap log appears on kitty's stderr, then `SIGKILL`s **only** the kitty PID (letting `xvfb-run` run its own cleanup, so no `Xvfb` is orphaned), keeping the run bounded. It reaps by specific PID and never uses `pkill`:
+The `cap`‑mode **driver** (`cap_driver.sh`) referenced on the last line is this wrapper. It (i) **pre‑creates** the watched files so `grep` cannot race the first write, (ii) launches the cap child under its own `timeout 90` wrapper via the `LAUNCH` **array**, (iii) resolves the kitty PID **strictly as a descendant of its own wrapper** through a `pgrep -P` walk — never `pgrep -x kitty | head`, which could select an unrelated kitty — (iv) blocks, bounded by its own `DEADLINE`, until the **first** 100 MiB cap log appears on kitty's stderr, then (v) `SIGKILL`s **only** that one spawned kitty PID (a `trap … EXIT` guarantees the same specific‑PID reap on any early exit), letting `xvfb-run` run its own cleanup so no `Xvfb` is orphaned, and (vi) prints a PASS/FAIL marker because the launcher masks the child's own exit code:
 ```bash
-ERR="$WS/cap.stderr"
-$LAUNCH python3 obj2_child.py "$LOG" cap 0 einval >/dev/null 2>"$ERR" &
-WRAP=$!
-tail -n +1 -f "$ERR" | grep -q -m1 'Too much data being sent to child'  # block until 1st cap log
-kill -KILL "$(pgrep -x kitty | head -1)" 2>/dev/null   # SIGKILL the specific kitty pid only
-wait "$WRAP" 2>/dev/null                               # xvfb-run cleans up Xvfb; reap the wrapper
-grep -m1 'Too much data being sent to child' "$ERR"    # -> the (b.4) cap log line
-```
-Re‑running this fresh reproduced the (b.4) cap log (`id=1`, `t≈30s`): run 1 `[30.030]`, run 2 `[30.011]` — corroborating the `[30.038]`/`[30.230]` in (b.4) — and bounded the output to a few hundred cap lines (`524`/`549` here; the exact count is only a function of detect‑then‑`SIGKILL` latency, cf. the `60`/`47` first captured in (b.4)), versus `7,417,872` for an unbounded run. No `kitty`/`Xvfb` process was left behind.
+#!/bin/bash
+# cap_driver.sh <WS> <RUN> — bounded, stop-after-first-signal, kills ONLY its own kitty.
+set -u
+WS="$1"; RUN="$2"
+cd "$WS/src"
+export PATH="$PATH:/usr/local/go/bin"; export LANG=C.UTF-8 LC_ALL=C.UTF-8 LIBGL_ALWAYS_SOFTWARE=1
+LAUNCH=(timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" ./kitty/launcher/kitty --config NONE -o confirm_os_window_close=0)
+LOG="$WS/out/cap_run$RUN.log"; ERR="$WS/out/cap_run$RUN.stderr"
+: > "$LOG"; : > "$ERR"                         # pre-create BOTH watched files (no tail/grep race)
 
-**(b.1) Retention — before / during / after.** The child bursts 50,000 commands **without reading**, so kitty's `;OK` replies accumulate in `screen->write_buf`; it then drains and counts. Complete child log (run 1, unedited):
+# Launch the cap child under OUR wrapper; route kitty's stdout+stderr into $ERR.
+"${LAUNCH[@]}" python3 obj2_child.py "$LOG" cap 0 einval >>"$ERR" 2>>"$ERR" &
+WRAP=$!
+
+# Resolve the kitty PID strictly as a descendant of OUR wrapper (never `pgrep -x kitty | head`):
+kitty_pid() {
+  local q=("$WRAP") p c
+  while ((${#q[@]})); do
+    p=${q[0]}; q=("${q[@]:1}")
+    for c in $(pgrep -P "$p" 2>/dev/null); do
+      [ "$(cat /proc/$c/comm 2>/dev/null)" = kitty ] && { echo "$c"; return 0; }
+      q+=("$c")
+    done
+  done
+  return 1
+}
+KP=""; for _ in $(seq 1 100); do KP=$(kitty_pid) && [ -n "$KP" ] && break; sleep 0.1; done
+echo "  spawned kitty pid=$KP (descendant of wrapper $WRAP)"
+
+# Own safety timeout + cleanup trap: on ANY exit path, SIGKILL exactly our kitty and reap.
+cleanup() { [ -n "${KP:-}" ] && kill -KILL "$KP" 2>/dev/null; wait "$WRAP" 2>/dev/null; }
+trap cleanup EXIT
+
+# Block (bounded by our own deadline) until the FIRST cap log appears on kitty's stderr.
+DEADLINE=$((SECONDS+80)); HIT=0
+until grep -q 'Too much data being sent to child' "$ERR"; do
+  if [ $SECONDS -ge $DEADLINE ]; then echo "  TIMEOUT waiting for cap log"; break; fi
+  if ! kill -0 "$WRAP" 2>/dev/null; then echo "  wrapper exited before cap log"; break; fi
+  sleep 0.2
+done
+grep -q 'Too much data being sent to child' "$ERR" && HIT=1
+
+kill -KILL "$KP" 2>/dev/null                   # SIGKILL exactly the spawned kitty PID
+wait "$WRAP" 2>/dev/null
+trap - EXIT
+
+# Child PASS-marker (launcher masks the child exit code, so assert on the captured signal):
+CAPLINES=$(grep -c 'Too much data being sent to child' "$ERR")
+if [ "$HIT" = 1 ]; then
+  echo "  RESULT: PASS (cap log observed; ${CAPLINES} cap line(s) before teardown)"
+  echo "  FIRST-CAP-LINE: $(grep -m1 'Too much data being sent to child' "$ERR")"
+else
+  echo "  RESULT: FAIL (no cap log captured)"
+fi
 ```
-# OBJ-2 child pid=109351 mode=retention N=50000
+Re‑running this driver fresh reproduced the (b.4) cap log (`id=1`, onset `t≈30s`) stably across two runs — run 1 first cap line `[30.115]`, run 2 `[30.233]`. The *number* of cap lines emitted before the `SIGKILL` lands is **teardown‑timing‑dependent, not a stable magnitude**: run 1 saw `4551` lines across the `[30.115]→[30.216]` window (~101 ms), run 2 saw `6595` across `[30.233]→[30.385]` (~152 ms) — i.e. ~45k identical drop‑logs per second (one per dropped command); left unbounded the log grows without limit, which is exactly why the driver stops on the *first* line. A **safety proof** (`cap_safety_proof.sh`) started a *decoy* kitty first so it was the oldest kitty on the host — precisely what the discarded `pgrep -x kitty | head -1` would have selected (decoy pid `485782` in run 1, `486299` in run 2) — and confirmed the driver killed only its **own** spawned kitty (pid `485886` / `486338`, each a descendant of its own wrapper) while the **decoy survived both runs** (`SAFETY: PASS`). No `kitty`/`Xvfb` process was left behind.
+
+**(b.1) Retention — before / during / after.** The child bursts 50,000 commands **without reading**, so kitty's `;OK` replies accumulate in `screen->write_buf`; it then drains and counts. Complete child logs, **both runs, verbatim**:
+```
+# OBJ-2 child pid=481922 mode=retention N=50000
+# stdin set to raw mode
+# per-command bytes=30 (non-quiet => 11-byte ;OK response each)
+# RETENTION burst done sent=50000; write_buf accumulated during stall
+# RETENTION sent=50000 received_OK=50000 (equal => all retained/delivered)
+# OBJ-2 child exiting mode=retention
+```
+```
+# OBJ-2 child pid=482010 mode=retention N=50000
 # stdin set to raw mode
 # per-command bytes=30 (non-quiet => 11-byte ;OK response each)
 # RETENTION burst done sent=50000; write_buf accumulated during stall
@@ -410,52 +516,103 @@ Re‑running this fresh reproduced the (b.4) cap log (`id=1`, `t≈30s`): run 1 
 - **Before:** `write_buf_used = 0`.
 - **During:** child not reading → `write_buf` grows and holds the replies (retained via the `memmove` at `L1474`; 0 dropped, far under the 100 MiB cap).
 - **After:** child drains → `received_OK == sent == 50000`, nothing lost.
-- **Stability:** run 1 `50000/50000`; run 2 `50000/50000`.
+- **Stability:** run 1 `50000/50000` (pid 481922); run 2 `50000/50000` (pid 482010).
 
-**(b.2) Control — draining removes all backpressure (baseline).** The *same* command stream but with a continuously draining reader: every reply flows through cleanly, `50000/50000`, run 1 and run 2 — confirming accumulation is caused by the **non‑draining reader**, not by response volume per se.
+**(b.2) Control — draining removes all backpressure (baseline).** The *same* command stream but with a continuously draining reader: every reply flows through cleanly, `50000/50000`, run 1 and run 2 — confirming accumulation is caused by the **non‑draining reader**, not by response volume per se. Complete child logs, **both runs, verbatim**:
 ```
-# OBJ-2 child pid=109535 mode=control N=50000
+# OBJ-2 child pid=482355 mode=control N=50000
+# stdin set to raw mode
+# per-command bytes=30 (non-quiet => 11-byte ;OK response each)
+# CONTROL sent=50000 received_OK=50000
+# OBJ-2 child exiting mode=control
+```
+```
+# OBJ-2 child pid=482443 mode=control N=50000
+# stdin set to raw mode
+# per-command bytes=30 (non-quiet => 11-byte ;OK response each)
 # CONTROL sent=50000 received_OK=50000
 # OBJ-2 child exiting mode=control
 ```
 
-**(b.3) The `EAGAIN` retain step, surfaced at the syscall level via `strace`.** The child bursts 60,000 commands without reading, then drip‑reads only 128 bytes every 30 ms, so `write_to_child` must push a large `write_buf` through a nearly‑full tty and repeatedly hits `EAGAIN`. Verbatim `strace` of the `KittyChildMon` thread, first drain cycle (run 1):
+**(b.3) The `EAGAIN` retain step, surfaced at the syscall level via `strace`.** The child bursts 60,000 commands without reading, then drip‑reads only 128 bytes every 30 ms, so `write_to_child` must push a large `write_buf` through a nearly‑full tty and repeatedly hits `EAGAIN`. Verbatim `strace` of the `KittyChildMon` thread — the first drain cycle of **both runs** (the partial write, then the `write()` of the remainder that returns `EAGAIN`):
 ```
-18:34:37.564006 write(8, "\33_Gi=2;OK\33\\\33_Gi=2;OK\33\\\33_Gi=2;OK\33"..., 382415) = 3584
-18:34:37.564100 write(8, "\33\\\33_Gi=2;OK\33\\\33_Gi=2;OK\33\\\33_Gi=2;O"..., 378831) = -1 EAGAIN (Resource temporarily unavailable)
+# run 1
+03:37:55.488977 write(8, "\33_Gi=2;OK\33\\\33_Gi=2;OK\33\\\33_Gi=2;OK\33"..., 382789) = 3584
+03:37:55.489072 write(8, "\33\\\33_Gi=2;OK\33\\\33_Gi=2;OK\33\\\33_Gi=2;O"..., 379205) = -1 EAGAIN (Resource temporarily unavailable)
 ```
-Two things are proven here, directly and without inference:
+```
+# run 2
+03:38:35.908609 write(8, "\33_Gi=2;OK\33\\\33_Gi=2;OK\33\\\33_Gi=2;OK\33"..., 383273) = 3584
+03:38:35.908675 write(8, "\33\\\33_Gi=2;OK\33\\\33_Gi=2;OK\33\\\33_Gi=2;O"..., 379689) = -1 EAGAIN (Resource temporarily unavailable)
+```
+Several things are proven here, directly and without inference:
 - **It is `EAGAIN`, not `EINTR`.** `strace` prints the exact errno `EAGAIN (Resource temporarily unavailable)`, so this is the `L1463` `break`‑and‑retain branch, *not* the `L1462` `EINTR continue` branch. (This resolves the earlier ambiguity of a bare "`Wrote: -1 bytes`" print, which cannot tell the two apart.)
 - **The buffered bytes are real graphics `;OK` responses** (`\33_Gi=2;OK\33\\` repeated), not device‑attribute queries.
-- **`write_buf_used`, observed exactly.** On the *first* iteration of a drain cycle `written == 0`, so the `write()` size argument **equals `write_buf_used`** at that instant. Observed: **run 1 = `382,415` bytes**, **run 2 = `387,706` bytes** (largest size‑before‑`EAGAIN` in run 1 = `628,447` bytes). Both runs recorded **12** `write()`→`EAGAIN` events. This is a defensible, *observed* `write_buf_used` — it is **not** the whole burst; most of the 50k/60k responses had already drained or not yet been generated.
+- **`write_buf_used`, observed exactly.** The first `write()` of a drain cycle starts from buffer offset 0, so its size argument **equals `write_buf_used`** at that instant; the kernel accepts only `3584` bytes and the very next `write()` of the remainder gets `EAGAIN` — self‑consistent, since `382789 − 3584 = 379205` (run 1) and `383273 − 3584 = 379689` (run 2), exactly the `EAGAIN` size args above. Observed first‑cycle `write_buf_used`: **run 1 = `382,789` bytes**, **run 2 = `383,273` bytes**. As kitty keeps generating `;OK` replies faster than the 128 B/30 ms drip drains them, `write_buf_used` climbs across successive cycles to an observed **peak of `630,713` bytes (run 1) / `634,682` bytes (run 2)** before receding. Both runs recorded exactly **12** `write()`→`EAGAIN` events (out of `317` / `261` total `fd=8` writes). This is a defensible, *observed* `write_buf_used` — it is **not** the whole burst; most of the 60k responses had already drained or not yet been generated.
 
-**(b.4) The 100 MiB cap fires — bounded, stop‑after‑first‑signal.** To reach the cap in bounded time I flooded a **non‑quiet graphics** command that yields a larger error reply: `ESC _ G i=123456,I=123456,p=123456,a=t,s=9999,v=9999,f=24;<base64>ESC \`. Because it sets both `i` and `I`, the graphics manager rejects it with the **86‑byte** reply `\x1b_Gi=123456,I=123456,p=123456;EINVAL:Must not specify both image id and image number\x1b\\` (built by the same `finish_command_response`, `kitty/graphics.c:L759-L782`; captured verbatim in section (d)). This is still a fully canonical graphics‑protocol response — just ~8× larger than `;OK`, so `write_buf` reaches the cap sooner. The child never reads; the driver watches kitty's stderr and **`SIGKILL`s on the first cap log**, so the run is tightly bounded. Complete child send‑progress log (run 1, ~45k cmds/s throttle):
+**(b.4) The 100 MiB cap fires — bounded, stop‑after‑first‑signal.** To reach the cap in bounded time I flooded a **non‑quiet graphics** command that yields a larger error reply: `ESC _ G i=123456,I=123456,p=123456,a=t,s=9999,v=9999,f=24;<base64>ESC \`. Because it sets both `i` and `I`, the graphics manager rejects it with the **86‑byte** reply `\x1b_Gi=123456,I=123456,p=123456;EINVAL:Must not specify both image id and image number\x1b\\` (built by the same `finish_command_response`, `kitty/graphics.c:L759-L782`; captured verbatim in section (d)). This is still a fully canonical graphics‑protocol response — just ~8× larger than `;OK`, so `write_buf` reaches the cap sooner. The child never reads; the driver watches kitty's stderr and **`SIGKILL`s on the first cap log**, so the run is tightly bounded. Complete child send‑progress logs, **both runs, verbatim** (~45k cmds/s throttle):
 ```
-# OBJ-2 child pid=111714 mode=cap N=0
+# OBJ-2 child pid=485969 mode=cap N=0
 # stdin set to raw mode
-# per-command bytes=59 (non-quiet dimension-mismatch => ~80-byte ENODATA response)
+# per-command bytes=59 (non-quiet, both i and I => 86-byte ;EINVAL "Must not specify both image id and image number" response)
 # CAP flood start (never reading; driver watches stderr for the cap log)
-# CAP t=2.0s sent=91000 rate=45495/s
-# CAP t=4.0s sent=182500 rate=45501/s
-# CAP t=6.0s sent=274000 rate=45571/s
-# CAP t=8.0s sent=364500 rate=45487/s
-# CAP t=10.0s sent=455500 rate=45442/s
-# CAP t=12.0s sent=547000 rate=45490/s
-# CAP t=14.0s sent=638500 rate=45512/s
-# CAP t=16.0s sent=728500 rate=45425/s
-# CAP t=18.0s sent=820000 rate=45443/s
-# CAP t=20.1s sent=910500 rate=45405/s
-# CAP t=22.1s sent=1002000 rate=45424/s
-# CAP t=24.1s sent=1093000 rate=45416/s
-# CAP t=26.1s sent=1184000 rate=45418/s
+# CAP t=2.0s sent=91000 rate=45338/s
+# CAP t=4.0s sent=182000 rate=45379/s
+# CAP t=6.0s sent=272000 rate=45249/s
+# CAP t=8.0s sent=363000 rate=45264/s
+# CAP t=10.0s sent=453500 rate=45251/s
+# CAP t=12.0s sent=544500 rate=45254/s
+# CAP t=14.0s sent=635500 rate=45265/s
+# CAP t=16.0s sent=726500 rate=45274/s
+# CAP t=18.1s sent=817500 rate=45277/s
+# CAP t=20.1s sent=908500 rate=45295/s
+# CAP t=22.1s sent=999500 rate=45291/s
+# CAP t=24.1s sent=1090500 rate=45300/s
+# CAP t=26.1s sent=1181000 rate=45285/s
 ```
-Verbatim first cap log line from kitty (run 1); the leading `[t]` is kitty's own elapsed‑seconds stamp:
 ```
-[30.038] Too much data being sent to child with id: 1, ignoring it
+# OBJ-2 child pid=486486 mode=cap N=0
+# stdin set to raw mode
+# per-command bytes=59 (non-quiet, both i and I => 86-byte ;EINVAL "Must not specify both image id and image number" response)
+# CAP flood start (never reading; driver watches stderr for the cap log)
+# CAP t=2.0s sent=90500 rate=45144/s
+# CAP t=4.0s sent=180500 rate=45061/s
+# CAP t=6.0s sent=271000 rate=45074/s
+# CAP t=8.0s sent=362000 rate=45172/s
+# CAP t=10.0s sent=453500 rate=45246/s
+# CAP t=12.0s sent=544500 rate=45250/s
+# CAP t=14.0s sent=635500 rate=45251/s
+# CAP t=16.0s sent=726000 rate=45234/s
+# CAP t=18.1s sent=816500 rate=45210/s
+# CAP t=20.1s sent=906500 rate=45183/s
+# CAP t=22.1s sent=996500 rate=45156/s
+# CAP t=24.1s sent=1087000 rate=45155/s
+# CAP t=26.1s sent=1177500 rate=45159/s
 ```
-This is the `log_error` at `kitty/child-monitor.c:L341-L344`, firing when `write_buf_used + sz > 104857600`. **Stability:** run 1 first cap log at `t=[30.038]s`; run 2 at `t=[30.230]s`; both `id=1`. Because the driver kills on first detection, only **60** (run 1) / **47** (run 2) cap lines were emitted before teardown — versus an earlier *uncontrolled* run that emitted `7,417,872` lines; the bounded probe is the safe, publishable version.
+Verbatim first cap log line from kitty, **both runs**; the leading `[t]` is kitty's own elapsed‑seconds stamp:
+```
+[30.115] Too much data being sent to child with id: 1, ignoring it
+```
+```
+[30.233] Too much data being sent to child with id: 1, ignoring it
+```
+This is the `log_error` at `kitty/child-monitor.c:L341-L344`, firing when `write_buf_used + sz > 104857600`. **Stability:** the *onset* is stable — run 1 first cap log at `t=[30.115]s`, run 2 at `t=[30.233]s`, both `id=1`. It matches the child's own progress: ~1.18M commands sent by `t=26.1s`, and `104857600 / 86 ≈ 1,218,809` 86‑byte replies needed to reach the cap. The *number* of cap lines before teardown is **not** a stable magnitude — it is purely a function of detect‑then‑`SIGKILL` latency (run 1 `4551` lines, run 2 `6595`, emitted at ~45k/s across the `~101`/`~152` ms window before the kill lands); left unbounded the log grows without limit, which is exactly why the driver stops on the **first** line (see "Failed attempts" below).
 
-**Bottom line for (b).** Under output pressure kitty performs a **non‑blocking, `EAGAIN`‑aware drain** (`kitty/child-monitor.c:L1443-L1479`) that **retains** un‑written responses for the next `POLLOUT` (`memmove` at `L1474`; `POLLOUT` armed only when buffered, `L1503`) — observed delivering all `50000/50000` responses intact after a stall, with an observed instantaneous `write_buf_used` of `382,415`/`387,706` bytes at the point of `EAGAIN`. Its sole limit is a **100 MiB** (`104857600`‑byte) hard cap that **drops with a log line** (`L341-L344`) — observed firing verbatim once the reader stalls. Every byte moved was a real graphics‑protocol response.
+**Bottom line for (b).** Under output pressure kitty performs a **non‑blocking, `EAGAIN`‑aware drain** (`kitty/child-monitor.c:L1443-L1479`) that **retains** un‑written responses for the next `POLLOUT` (`memmove` at `L1474`; `POLLOUT` armed only when buffered, `L1503`) — observed delivering all `50000/50000` responses intact after a stall, with an observed first‑cycle `write_buf_used` of `382,789`/`383,273` bytes (peaking at `630,713`/`634,682` bytes) at the point of `EAGAIN`. Its sole limit is a **100 MiB** (`104857600`‑byte) hard cap that **drops with a log line** (`L341-L344`) — observed firing verbatim at `t≈30s` once the reader stalls. Every byte moved was a real graphics‑protocol response.
+
+**Failed attempts (disclosed, with real captured output).** Two approaches were tried and rejected before arriving at the bounded, array‑based driver above; both are shown so the published commands are honestly reproducible:
+
+1. **The originally‑drafted launch as a *scalar* `$LAUNCH` string fails outright.** Running the scalar form `LAUNCH='timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" …'` and then `$LAUNCH python3 obj2_child.py …` word‑splits the quoted `-s "-screen 0 1280x800x24"` value, so `xvfb-run` receives a broken argument. Verbatim result:
+```
+$ $LAUNCH python3 obj2_child.py "$LOG" control 10
+/usr/bin/xvfb-run: 200: 0: not found
+$ echo $?
+1
+```
+The child log was **never created** — the child never ran. This is exactly why the published `LAUNCH` is a bash **array** expanded as `"${LAUNCH[@]}"`, which preserves `-s "-screen 0 1280x800x24"` as a single argument.
+
+2. **An *unbounded* cap run floods the log without limit.** Killing on anything other than the first cap line (or not killing promptly) lets the identical drop‑log repeat at the full drop rate. Even the bounded driver, which reacts within ~100–150 ms, still captured `4551` (run 1) and `6595` (run 2) identical cap lines in that sliver — a measured ~45k lines/second — so an uncontrolled run grows without limit until force‑killed. The cap‑line *count* is therefore a teardown‑latency artifact, **not** a stable magnitude; the stable, reproducible facts are the `t≈30s` onset and the exact message text.
+
 
 ---
 
@@ -499,7 +656,7 @@ graph TD
 | Dispatch | Handle cmd, emit response | `kitty/screen.c:L1047-L1051` | `grman_handle_command(...)`; `if (response) write_escape_code_to_child(self, ESC_APC, response);` |
 | Response framing (prefix) | APC introducer | `kitty/screen.c:L970-L971` | `case ESC_APC: *prefix = "\033_";` |
 | Response framing (suffix) | APC/ST terminator | `kitty/screen.c:L956` | `*suffix = "\033\\";` (top of `get_prefix_and_suffix_for_escape_code`, `L955`) |
-| Response routing | escape → write path | `kitty/screen.c:L958-L1000` | `write_escape_code_to_child`: prefix+payload+suffix → `write_to_child`/`schedule_write_to_child` |
+| Response routing | escape → write path | `kitty/screen.c:L979-L996` | `write_escape_code_to_child` (return type `bool`, `L978`): builds prefix+payload+suffix via `get_prefix_and_suffix_for_escape_code` (`L955-L976`) → `schedule_write_to_child`/`write_to_child` |
 | Storage quota | 320 MiB per‑buffer limit | `kitty/graphics.c:L25`, init `L78` | `#define DEFAULT_STORAGE_LIMIT 320u*(1024u*1024u)` = `335544320`; `self->storage_limit = DEFAULT_STORAGE_LIMIT` |
 | Quota eviction | trim unreferenced, then oldest‑first | `kitty/graphics.c:L290-L299` | `remove_images(…trim_predicate…)` (`L292`); `HASH_SORT(oldest_img_first)`; `while (used_storage > limit) remove_image(...)` (`L295-L297`) |
 | Quota trigger | invoked when over limit | `kitty/graphics.c:L2184` | `if (self->used_storage > self->storage_limit) apply_storage_quota(...)` |
@@ -623,7 +780,10 @@ t, s = mk()
 gl = send_command(s, 'a=t,f=24,s=4,v=3,i=1,I=1', b'A'*36)
 print("7a graphics-level (i and I) wtcbuf =", repr(gl))
 # 7b parser-level: malformed control block -> REPORT_ERROR to stderr, NO protocol response.
-# 'a=t,zz=5' : 'zz' is an invalid key -> "Malformed GraphicsCommand control block, invalid key"
+# 'a=t,zz=5' : the FIRST 'z' (0x7a) IS a valid graphics key (z_index; parse-graphics-command.h:L42,
+#   handled at `case z_index:` L127). The SECOND 'z' then fails the "=" check, so the parser reports
+#   "no = after key, found: 0x7a instead" (parse-graphics-command.h:L158) -- NOT the "invalid key
+#   character" branch (L149). The observed [PARSE ERROR] on stderr below confirms this exactly.
 t, s = mk()
 sys.stdout.write("7b parser-level malformed APC 'a=t,zz=5' -> feeding now\n"); sys.stdout.flush()
 sys.stderr.write("---PARSE-ERROR-CAPTURE-START---\n"); sys.stderr.flush()
@@ -632,6 +792,15 @@ sys.stderr.write("---PARSE-ERROR-CAPTURE-END---\n"); sys.stderr.flush()
 print("7b parser-level wtcbuf =", repr(pl), " (empty => no protocol response; see stderr for [PARSE ERROR])")
 
 banner("DONE-A1")
+
+# Clean, deterministic shutdown: flush our own stdout/stderr, then exit immediately.
+# Without this, CPython's normal interpreter teardown finalizes the fast_data_types
+# C-extension while helper threads are still unwinding and prints a benign,
+# kitty-unrelated "ImportError: sys.meta_path is None, Python is likely shutting down"
+# to stderr AFTER our output. os._exit(0) exits right after the flush so the captured
+# stderr contains ONLY kitty's own [PARSE ERROR] line and is complete + deterministic.
+sys.stdout.flush(); sys.stderr.flush()
+os._exit(0)
 ```
 
 Exact command (reproducible; exit status shown):
@@ -640,7 +809,7 @@ export LANG=C.UTF-8 LC_ALL=C.UTF-8
 cd "$WS/src"                                  # $WS = default build workspace (see (f))
 PYTHONPATH="$WS/src" python3 "$WS/pathA_probe.py"        # exit status: 0
 ```
-The output below is **verbatim**. The `stdout` block (the graphics‑protocol response bytes) was **byte‑identical across two runs** (`diff` of the two `stdout` captures was empty); the sole exception is the `stderr` `[PARSE ERROR]` line shown after it (section 7b), whose leading `[t]` **elapsed‑seconds stamp** varies between runs while the message text itself is identical (annotated below).
+The output below is **verbatim**. The `stdout` block (the graphics‑protocol response bytes) was **byte‑identical across two runs** (`diff` of the two `stdout` captures was empty); the only run‑to‑run variation is the leading `[t]` **elapsed‑seconds stamp** on the `stderr` `[PARSE ERROR]` line shown after it (section 7b), while its message text is identical (annotated below). The probe deliberately ends with `sys.stdout.flush(); sys.stderr.flush(); os._exit(0)` so its **complete** stderr is captured deterministically — see the note below the stderr block for exactly what that clean exit suppresses and why it is required for the "complete stderr" claim to hold.
 
 **Complete, unedited output of `pathA_probe.py`:**
 ```
@@ -685,11 +854,27 @@ q=2  ERR-path wtcbuf=b''
 ========== DONE-A1 ==========
 ```
 
-And the parser‑level error, captured on **stderr** during section 7b (verbatim):
+And the parser‑level error, captured on **stderr** during section 7b. Because the probe exits via `os._exit(0)` after flushing (see the disclosure note below), the following is the probe's **complete** stderr stream — the entire contents, nothing omitted — and it is exactly three lines: the two capture markers the probe writes itself, and kitty's own `[PARSE ERROR]` line between them. Both fresh runs, verbatim:
+
+Run 1 — complete stderr:
 ```
-[0.060] [PARSE ERROR] Malformed GraphicsCommand control block, no = after key, found: 0x7a instead
+---PARSE-ERROR-CAPTURE-START---
+[0.049] [PARSE ERROR] Malformed GraphicsCommand control block, no = after key, found: 0x7a instead
+---PARSE-ERROR-CAPTURE-END---
 ```
-Unlike the `stdout` block above, this `stderr` line is **not** byte‑identical across runs: only its **message text** is stable, while the leading `[t]` is kitty's own **elapsed‑seconds stamp** and therefore varies. The message is emitted by `REPORT_ERROR` (`kitty/parse-graphics-command.h:L158`) through the canonical routing macro `log_error(ERROR_PREFIX " " __VA_ARGS__)` (`kitty/vt-parser.c:L125`, with `ERROR_PREFIX = "[PARSE ERROR]"` at `kitty/data-types.h:L70`); the `[t]` prefix is prepended by `log_error` itself (`fprintf(stderr, "[%.3f] ", monotonic_t_to_s_double(monotonic()))`, `kitty/logging.c:L56`) — the same elapsed‑seconds stamp seen on the cap log in (b.4). Fresh two‑run reproduction: run 1 `[0.137]`, run 2 `[0.051]` (the `[0.060]` above is the value captured when this document's output was first recorded); the message text after the stamp was identical in both runs.
+Run 2 — complete stderr:
+```
+---PARSE-ERROR-CAPTURE-START---
+[0.046] [PARSE ERROR] Malformed GraphicsCommand control block, no = after key, found: 0x7a instead
+---PARSE-ERROR-CAPTURE-END---
+```
+The only run‑to‑run difference is the leading `[t]` **elapsed‑seconds stamp** on the `[PARSE ERROR]` line (`0.049` vs `0.046`); the message text after the stamp is byte‑identical. The message is emitted by `REPORT_ERROR` (`kitty/parse-graphics-command.h:L158`) through the canonical routing macro `log_error(ERROR_PREFIX " " __VA_ARGS__)` (`kitty/vt-parser.c:L125`, with `ERROR_PREFIX = "[PARSE ERROR]"` at `kitty/data-types.h:L70`); the `[t]` prefix is prepended by `log_error` itself (`fprintf(stderr, "[%.3f] ", monotonic_t_to_s_double(monotonic()))`, `kitty/logging.c:L56`) — the same elapsed‑seconds stamp seen on the cap log in (b.4).
+
+**Full disclosure — the one benign line suppressed by `os._exit(0)`.** Without the terminating `sys.stdout.flush(); sys.stderr.flush(); os._exit(0)`, CPython's normal interpreter teardown finalizes the `fast_data_types` C‑extension while helper threads are still unwinding, and appends exactly one more line to stderr *after* the `---PARSE-ERROR-CAPTURE-END---` marker:
+```
+ImportError: sys.meta_path is None, Python is likely shutting down
+```
+This line is **benign and kitty‑unrelated**: it is a well‑known CPython interpreter‑shutdown artifact (a late `import` attempted during finalization), it carries **no** `[t]` stamp, it is **not** a graphics‑protocol signal, and it appears identically on every run. It was verified deterministically across two runs of the probe *without* the clean exit — the complete stderr in that case is the three lines above **plus** this `ImportError`, while `stdout` stayed byte‑identical to the clean‑exit runs. Adding `os._exit(0)` (which exits immediately after flushing, bypassing interpreter finalization) removes it, so the stderr shown above is both **complete** and free of shutdown noise; the exit status remains `0`. It is disclosed here rather than silently dropped so the "complete stderr" claim is exact.
 
 **Reading the output.**
 - **(d.1) 320 MiB storage quota (OBSERVED, default config).** `grman.storage_limit = 335544320` = exactly `320 * 1024 * 1024` (`DEFAULT_STORAGE_LIMIT`, `kitty/graphics.c:L25`); the animation frame cache is `5×` that = `1677721600` (1600 MiB) (`kitty/graphics.c:L1570`).
@@ -863,10 +1048,10 @@ kitty's response to pressure is a **mix**: the flow‑control adaptations on the
 
 | Adaptation | Silent or visible? | What the client/operator sees | Where | Evidence |
 |-----------|--------------------|-------------------------------|-------|----------|
-| Read pause (de‑arm `POLLIN`) | **Silent** | Nothing protocol‑level — the child's `write()` just blocks (OS backpressure) | `child-monitor.c:L1501`, `vt-parser.c:L1477-L1481` | (a): occupancy ≈ `1,047,076`/`1,047,821` B, `POLLIN`→`0`, child stalls |
+| Read pause (de‑arm `POLLIN`) | **Silent** | Nothing protocol‑level — the child's `write()` just blocks (OS backpressure) | `child-monitor.c:L1501`, `vt-parser.c:L1477-L1481` | (a): occupancy `1,045,459`/`1,048,405` B (99.70 %/99.98 % of `BUF_SZ`), `POLLIN`→`0`, child stalls |
 | `input_delay` batching (3 ms) | **Silent** | Nothing — input is coalesced within 3 ms, bypassed when nearly full | `options/definition.py:L878`, `vt-parser.c:L1425` | (a): batched drain per stall |
 | `repaint_delay` render coalescing (10 ms) | **Silent** | Nothing — repaints are coalesced (~100 FPS), skipped when input is pending | `options/definition.py:L866` | code‑grounded (see note) |
-| Write‑buffer retention (`EAGAIN` → keep bytes) | **Silent** | Nothing — responses are delivered later, intact | `child-monitor.c:L1443-L1479` (`memmove` `L1474`) | (b.1): `50000/50000`; (b.3): `write()`→`EAGAIN`, `write_buf_used`=`382,415` B |
+| Write‑buffer retention (`EAGAIN` → keep bytes) | **Silent** | Nothing — responses are delivered later, intact | `child-monitor.c:L1443-L1479` (`memmove` `L1474`) | (b.1): `50000/50000`; (b.3): `write()`→`EAGAIN`, first‑cycle `write_buf_used`=`382,789`/`383,273` B |
 | 100 MiB write‑buffer cap | **Visible (operator)** | An error **log line**; the offending responses are dropped | `child-monitor.c:L341-L344` | (b.4): `Too much data being sent to child with id: 1, ignoring it` |
 | `;EINVAL` / `;ENODATA` / `;ENOSPC` responses | **Visible (client)** | An error reply in the APC stream | `graphics.c:L759-L782`, `L646/L651/L1570-L1573` | (d.3)/(d.4)/(d.5) |
 | Storage‑quota eviction (320 MiB) | **Visible (client)** | Previously‑loaded images silently **vanish** (deleted to make room) | `graphics.c:L25`, `L290-L299`, `L2184` | (d.8): `image_count` `1280 → 2`, oldest gone |
@@ -898,19 +1083,19 @@ kitty's response to pressure is a **mix**: the flow‑control adaptations on the
 - **Path B exit status — the launcher masks the child.** Under Path B the probe runs *inside* kitty, and the `kitty` launcher **exits `0` regardless of the child's exit code**; the `exit status: 0` annotated on the Path B commands above is therefore kitty's, not the child's. Path B success is judged from the child **LOG contents** (e.g. `RETENTION sent=50000 received_OK=50000`, the `FLOOD done …` line), not the launcher's exit code. Run **standalone** (outside the launcher) each probe instead exits **non‑zero** on invalid input: an unrecognised `MODE`/`CMDTYPE` in `obj2_child.py` exits `2`, and a non‑numeric `N`/`DURATION` exits `1`.
 
 **Scale and stability (≥2 runs each).**
-- OBJ‑1 read pause: two 20 s floods; max parser occupancy `1,047,076` B and `1,047,821` B (both ≈ `BUF_SZ` = `1048576`); `POLLIN`→`0` de‑arm observed in both.
+- OBJ‑1 read pause: two 20 s floods; max parser occupancy `1,045,459` B and `1,048,405` B (99.70 % / 99.98 % of `BUF_SZ` = `1048576`); `POLLIN`→`0` de‑arm observed in both.
 - OBJ‑2 retention: `50000/50000` responses delivered, runs 1 and 2.
 - OBJ‑2 control: `50000/50000`, runs 1 and 2 (0 drops with a draining reader).
-- OBJ‑2 EAGAIN: `12` `write()`→`EAGAIN` events per run; `write_buf_used` = `382,415` B (run 1) / `387,706` B (run 2).
+- OBJ‑2 EAGAIN: `12` `write()`→`EAGAIN` events per run; first‑cycle `write_buf_used` = `382,789` B (run 1) / `383,273` B (run 2) (peak `630,713`/`634,682` B).
 - OBJ‑2 100 MiB cap: first `Too much data …` log at `t=[30.038]s` (run 1) / `t=[30.230]s` (run 2); both `id=1`; threshold `104857600` bytes.
 - Path A: byte‑identical across two runs for the response bytes, the quiet boundary, both eviction branches, the real‑scale `1280 → 2` collapse (at exactly `335544320` B), and the frame‑cache `;ENOSPC` on the 9th frame.
 
 **Observed vs inferred.**
-- **OBSERVED:** the `320 MiB` quota magnitude (`335544320`) and `5×` frame cache (`1677721600`); the `;OK`, `;ENODATA`, `;EINVAL`, `;ENOSPC` response bytes; the quiet‑flag boundary; both eviction branches and the real‑scale `1280 → 2` collapse at exactly `335544320` B; the parser‑level `[PARSE ERROR]` vs graphics‑level `;EINVAL` split; the read‑pause parser occupancy (`≈ 1.047 MB`, from the `read()` count argument) and the `POLLIN`→`0` de‑arm; the child `write()` stalls; the `write()`→`EAGAIN` errno with real graphics `;OK` bytes in flight and the instantaneous `write_buf_used` (`382,415`/`387,706` B); the `100 MiB` `Too much data …` drop log (verbatim, `id=1`); and retention/control equalities.
+- **OBSERVED:** the `320 MiB` quota magnitude (`335544320`) and `5×` frame cache (`1677721600`); the `;OK`, `;ENODATA`, `;EINVAL`, `;ENOSPC` response bytes; the quiet‑flag boundary; both eviction branches and the real‑scale `1280 → 2` collapse at exactly `335544320` B; the parser‑level `[PARSE ERROR]` vs graphics‑level `;EINVAL` split; the read‑pause parser occupancy (`≈ 1.045–1.048 MB`, from the `read()` count argument) and the `POLLIN`→`0` de‑arm; the child `write()` slowdowns (to ≈50 ms); the `write()`→`EAGAIN` errno with real graphics `;OK` bytes in flight and the instantaneous first‑cycle `write_buf_used` (`382,789`/`383,273` B); the `100 MiB` `Too much data …` drop log (verbatim, `id=1`); and retention/control equalities.
 - **INFERRED (code‑grounded, labelled):** the exact internal `read.sz` scalar at the pause (the only printout, `kitty/child-monitor.c:L1500`, is commented out **and** references a nonexistent `Screen` field `read_buf_sz` (`kitty/screen.h:L115`), so occupancy is derived from the `read()` syscall argument, not a variable dump); and the `repaint_delay` render‑coalescing row in (e).
 - **Non‑canonical labelling:** none of the observed values came from the remote‑control interface or a debug injection hook. `strace` and the in‑process `kitty_tests` harness observe the *real* canonical code paths. The one deliberate scale reduction — lowering `storage_limit` to reach the frame‑cache `;ENOSPC`/LRU branches quickly — is labelled at each use, and the affected magnitude (the `320 MiB` default) is separately confirmed unreduced.
 
-**Safety and temporary‑artifact handling.** Every probe is bounded and self‑cleaning: an isolated `mktemp -d` workspace outside the checkout; `timeout` wrappers on all launches; raw‑tty restore and try/finally cleanup in each child; **stop‑after‑first‑signal** for the 100 MiB cap run (`SIGKILL` on the first cap log — 60/47 lines, not the `7,417,872` of an uncontrolled run); and specific‑PID reaping (never `pkill`). Process state was verified clean (no leftover `kitty`/`Xvfb`) after every run.
+**Safety and temporary‑artifact handling.** Every probe is bounded and self‑cleaning: an isolated `mktemp -d` workspace outside the checkout; `timeout` wrappers on all launches; raw‑tty restore and try/finally cleanup in each child; **stop‑after‑first‑signal** for the 100 MiB cap run (`SIGKILL` on the *first* cap log — even so, the bounded driver captured `4551` (run 1) / `6595` (run 2) identical cap lines in the ~100–150 ms detect‑then‑kill window, which is a teardown‑latency artifact, **not** a stable magnitude, whereas an uncontrolled run grows without limit); and **specific‑PID reaping** — the driver `SIGKILL`s only the one kitty PID it resolved as a descendant of its own `timeout`/`xvfb-run` wrapper (via a `pgrep -P` walk), never `pkill` and never `pgrep -x kitty | head`; a decoy‑kitty safety proof (`cap_safety_proof.sh`) confirmed the unrelated decoy survived while only the spawned kitty was reaped. Process state was verified clean (no leftover `kitty`/`Xvfb`) after every run.
 
 **Coverage of the original question.**
 - *"buffer, pause, or slow things down"* → **pause** (de‑arm `POLLIN`, `child-monitor.c:L1501`, once the fixed **1 MiB** buffer `vt-parser.c:L18` fills `vt-parser.c:L1477-L1481`) plus **batching** (`input_delay` 3 ms, `options/definition.py:L878`, bypassed near‑full `vt-parser.c:L1425`); **no** unbounded buffering — §(a).
