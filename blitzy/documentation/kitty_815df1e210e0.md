@@ -82,7 +82,10 @@ kitty/tools/cmd/completion
 ```
 
 The build was incremental (the image ships pre-built at this commit), so only the C GLFW backend
-and the Go tool/kitten binaries relink. The generated root package lives at repository-root
+and the Go tool/kitten binaries relink. This captured output is from the **first** invocation in a
+freshly-started container; a second consecutive `python3 setup.py` on the already-built tree is a
+**no-op** — exit 0 with no output [OBSERVED] — so this block is illustrative of a from-scratch relink
+rather than reproducible verbatim on an incremental re-run. The generated root package lives at repository-root
 `constants_generated.go` (Go package `kitty`), and the `go:embed` target is
 `tools/tui/shell_integration/data_generated.bin` ([tools/tui/shell_integration/data.go:19]).
 
@@ -301,7 +304,7 @@ synchronized update delimited by `ESC[?2026h … ESC[?2026l` (terminal "pending 
 emitted by Kitty's `escape_code` for `PENDING_UPDATE` at [tools/tui/loop/terminal-state.go:71]).
 `--final` renders the cumulative final screen; `--list` lists frames and whether each carried 24-bit
 truecolor SGR (i.e. syntax highlighting); `--frame N`/`--all` render frames in isolation. (Colors are
-stripped for the plain-text `--final`/`--frame` views; a separate helper `sgruns.py`, shown in Q8,
+stripped for the plain-text `--final`/`--frame` views; a separate helper `sgruns.py`, listed below and used in Q8,
 extracts background-color runs when color matters.)
 
 ```python
@@ -430,6 +433,131 @@ for idx, keys in enumerate(chunks):
 print("ACTION_COUNTS=%s" % dict(counts))
 ```
 
+**`sgruns.py`** — reconstructs the screen (same cursor model as `vtframes.py`) while tracking each
+cell's truecolor *background* (`SGR 48:2:R:G:B`), then prints the background-color runs of the row
+containing a given word, skipping the numeric line-number gutters and stripping the line-background
+column fill so only the real cell text remains:
+
+```python
+#!/usr/bin/env python3
+# sgruns.py <raw_capture> <word>  [OBSERVED helper]
+# Reconstructs the VT screen (same cursor model as vtframes.py) while tracking the
+# truecolor *background* (SGR 48:2:R:G:B) of every cell, then prints the background-color
+# runs of the single screen row that contains <word>. Line-number gutters (a run whose
+# text is just digits) delimit the left/right halves of the side-by-side view; the
+# trailing column-fill painted in the line background is stripped from the last run of
+# each half so only the real cell text is shown.
+import sys, re, os
+ROWS = int(os.environ.get("DK_ROWS", "50"))
+COLS = int(os.environ.get("DK_COLS", "220"))
+raw  = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+word = sys.argv[2]
+
+def parse_sgr(params):
+    ops = []
+    for g in (params.split(";") if params else ["0"]):
+        parts = g.split(":")
+        head = parts[0]
+        if head in ("", "0"):
+            ops.append(("reset", None))
+        elif head == "49":
+            ops.append(("bg", None))
+        elif head == "48" and len(parts) >= 2 and parts[1] == "2":
+            nums = [p for p in parts[2:] if p != ""]
+            if len(nums) >= 3:
+                ops.append(("bg", (nums[-3], nums[-2], nums[-1])))
+    return ops
+
+def apply(seg):
+    grid = [[(" ", None) for _ in range(COLS)] for _ in range(ROWS)]
+    cr = cc = 0
+    curbg = None
+    clampr = lambda r: max(0, min(ROWS - 1, r))
+    clampc = lambda c: max(0, min(COLS - 1, c))
+    i, n = 0, len(seg)
+    while i < n:
+        ch = seg[i]
+        if ch == "\x1b":
+            m = re.match(r"\x1b\][^\x07]*\x07", seg[i:])                 # OSC
+            if m: i += m.end(); continue
+            m = re.match(r"\x1b[PX^_].*?\x1b\\", seg[i:], re.S)          # DCS/APC/PM/SOS
+            if m: i += m.end(); continue
+            m = re.match(r"\x1b\[([0-9;:?]*)([@-~])", seg[i:])           # CSI
+            if m:
+                params, fin = m.group(1), m.group(2)
+                if fin == "m":
+                    for kind, val in parse_sgr(params):
+                        if kind == "reset": curbg = None
+                        else: curbg = val
+                else:
+                    nums = [int(x) for x in re.split("[;:]", params) if x.isdigit()]
+                    if fin in "Hf":
+                        r = (nums[0] - 1) if len(nums) >= 1 else 0
+                        c = (nums[1] - 1) if len(nums) >= 2 else 0
+                        cr, cc = clampr(r), clampc(c)
+                    elif fin == "A": cr = clampr(cr - (nums[0] if nums else 1))
+                    elif fin == "B": cr = clampr(cr + (nums[0] if nums else 1))
+                    elif fin == "C": cc = clampc(cc + (nums[0] if nums else 1))
+                    elif fin == "D": cc = clampc(cc - (nums[0] if nums else 1))
+                    elif fin == "G": cc = clampc((nums[0] - 1) if nums else 0)
+                    elif fin == "d": cr = clampr((nums[0] - 1) if nums else 0)
+                    elif fin == "K":
+                        md = nums[0] if nums else 0
+                        rng = range(cc, COLS) if md == 0 else (range(0, cc + 1) if md == 1 else range(COLS))
+                        for c in rng: grid[cr][c] = (" ", curbg)
+                    elif fin == "J":
+                        md = nums[0] if nums else 0
+                        if md == 0:
+                            for c in range(cc, COLS): grid[cr][c] = (" ", None)
+                            for r in range(cr + 1, ROWS):
+                                for c in range(COLS): grid[r][c] = (" ", None)
+                i += m.end(); continue
+            i += 2; continue
+        if ch == "\r": cc = 0; i += 1; continue
+        if ch == "\n": cr = clampr(cr + 1); cc = 0; i += 1; continue
+        if ch == "\t": cc = clampc((cc // 8 + 1) * 8); i += 1; continue
+        if ch == "\x08": cc = clampc(cc - 1); i += 1; continue
+        if ch == "\x07": i += 1; continue
+        if ord(ch) >= 32:
+            grid[cr][cc] = (ch, curbg); cc += 1
+            if cc >= COLS: cc = COLS - 1
+        i += 1
+    return grid
+
+grid = apply(raw)
+row = next((r for r in range(ROWS) if word in "".join(c for c, _ in grid[r])), None)
+if row is None:
+    sys.stderr.write("word %r not found on any row\n" % word); sys.exit(1)
+
+# Coalesce the row into (bg, text) runs.
+runs = []
+for ch, bg in grid[row]:
+    if runs and runs[-1][0] == bg:
+        runs[-1][1] += ch
+    else:
+        runs.append([bg, ch])
+
+# Split into halves on numeric line-number gutters; strip trailing column-fill
+# from the last run of each half; emit only real background-color runs.
+segment, out = [], []
+def flush(seg):
+    if not seg:
+        return
+    seg[-1][1] = seg[-1][1].rstrip(" ")   # drop the line-background column fill
+    for bg, txt in seg:
+        if bg is not None and txt != "":
+            out.append((bg, txt))
+for bg, txt in runs:
+    if txt.strip().isdigit():             # line-number gutter delimits a half
+        flush(segment); segment = []
+    else:
+        segment.append([bg, txt])
+flush(segment)
+
+for bg, txt in out:
+    print("bg=('rgb','%s','%s','%s') text=%r" % (bg[0], bg[1], bg[2], txt))
+```
+
 ### Fixtures at a glance
 
 | Fixture | Purpose | Left → Right |
@@ -457,7 +585,7 @@ stage. Even when the bytes are identical, a difference in file **mode** still re
 [kittens/diff/collect.go:260] (which uses `filepath.WalkDir`) to gather each side's relative paths
 into a `Set`, filtered by the `allowed`/`ignore_name` glob test [kittens/diff/collect.go:230]. It
 then computes `common_names = left_names.Intersect(right_names)` [kittens/diff/collect.go:306]. Each
-common name becomes a change via `add_change` [kittens/diff/collect.go:317]; if the two files have
+common name becomes a change via `add_change` [kittens/diff/collect.go:317-319]; if the two files have
 identical content it is still emitted when `os.Stat().Mode()` differs
 [kittens/diff/collect.go:321-327]. Left-only names become removals and right-only names become
 additions [kittens/diff/collect.go:332-333].
@@ -617,7 +745,7 @@ behavior the rename detector is designed to avoid when the content genuinely dif
 **Answer.** The kitten derives everything a file needs through a **layered, read-once pipeline**, and
 memoizes each layer in its own per-path cache keyed by file path:
 
-1. **raw bytes** — `data_for_path` reads each file exactly once [kittens/diff/collect.go:64];
+1. **raw bytes** — `data_for_path` reads each file exactly once [kittens/diff/collect.go:65];
 2. **hash** — `hash_for_path` (MD5, for rename detection) [kittens/diff/collect.go:106];
 3. **sanitized lines** — `lines_for_path` (tabs replaced, etc.) [kittens/diff/collect.go:138];
 4. **highlighted lines** — `highlighted_lines_for_path` [kittens/diff/collect.go:148], which returns
@@ -632,7 +760,7 @@ even the bounded ones are *insertion-order*, not textbook LRU. This is visible d
 `LRUCache` source [OBSERVED, source read]:
 
 ```console
-$ sed -n '24,72p' tools/utils/cache.go
+$ sed -n '25,72p' tools/utils/cache.go
 ```
 ```go
 func (self *LRUCache[K, V]) Get(key K) (ans V, found bool) {
@@ -700,12 +828,12 @@ Mapping the diff kitten's caches to their writer:
 
 | Cache | Populated via | Bounded? |
 |---|---|---|
-| `data` (raw bytes) | `GetOrCreate` [collect.go:64] | bounded (4096, insertion-order) |
+| `data` (raw bytes) | `GetOrCreate` [collect.go:65] | bounded (4096, insertion-order) |
 | `size` | `GetOrCreate` | bounded (4096, insertion-order) |
 | `hash` (MD5) | `GetOrCreate` [collect.go:106] | bounded (4096, insertion-order) |
 | `lines` (sanitized) | `GetOrCreate` [collect.go:138] | bounded (4096, insertion-order) |
 | `mimetypes` | `MustGetOrCreate` [collect.go:51] | **unbounded** |
-| `is_text` | `MustGetOrCreate` [collect.go:85] | **unbounded** |
+| `is_text` | `MustGetOrCreate` [collect.go:86] | **unbounded** |
 | `highlighted_lines` | `Set` [highlight.go:224] | **unbounded + racy** |
 
 So the accurate statement is: **4 of the 7 caches are bounded (to 4096, in insertion order); 2 are
@@ -753,12 +881,12 @@ set of files: computing the diffs, syntax-highlighting the text files, and loadi
 run on background goroutines that push results back to the main thread, which re-renders as each
 result arrives. Processing 60 files at once completes with all 60 diffs present.
 
-**Mechanism (`file:line`).** `Handler.initialize` [kittens/diff/ui.go:113] creates the buffered
-`async_results` channel (capacity 32) [kittens/diff/ui.go:133] and starts a goroutine that runs
-`create_collection` [kittens/diff/collect.go:296]. When collection finishes, `on_wakeup`
-[kittens/diff/ui.go:160] drains the channel and `handle_async_result` hits the `COLLECTION` case,
+**Mechanism (`file:line`).** `Handler.initialize` [kittens/diff/ui.go:114] creates the buffered
+`async_results` channel (capacity 32) [kittens/diff/ui.go:132] and starts a goroutine that runs
+`create_collection` [kittens/diff/collect.go:371]. When collection finishes, `on_wakeup`
+[kittens/diff/ui.go:161] drains the channel and `handle_async_result` hits the `COLLECTION` case,
 which fans out — **in this fixed launch order** — `generate_diff`, `highlight_all`, and
-`load_all_images` [kittens/diff/ui.go:246-249]. Their *completion* order is **not** fixed: three
+`load_all_images` [kittens/diff/ui.go:246-251]. Their *completion* order is **not** fixed: three
 independent goroutine groups push to `async_results` as they finish, and the main thread
 re-renders on each `DIFF`/`HIGHLIGHT`/`IMAGE` result [kittens/diff/ui.go:271-273].
 
@@ -811,7 +939,7 @@ A short excerpt of the reconstructed screen (files appear in sorted order — `m
 **Cause → effect.** The single `COLLECTION` result triggers the three fan-outs; each processes the
 whole file set and streams results back, so "many files at once" is handled by *concurrent batch
 processing with incremental re-render*, not one-file-at-a-time. Launch order is deterministic
-(diff → highlight → images, [ui.go:246-249]); completion order is not (see the frame-count variation
+(diff → highlight → images, [ui.go:246-251]); completion order is not (see the frame-count variation
 under full parallelism in Q5).
 
 ---
@@ -988,12 +1116,12 @@ the parallel text diff** and are rendered specially: a binary file shows a one-l
 size summary (no line-by-line diff); an image shows its dimensions and size and is drawn via the Kitty
 Graphics Protocol.
 
-**Mechanism (`file:line`).** `is_image` keys off an `image/` MIME prefix [kittens/diff/collect.go:81];
-`is_path_text` returns false for images, `/dev/null`, or non-UTF-8 content [kittens/diff/collect.go:85].
+**Mechanism (`file:line`).** `is_image` keys off an `image/` MIME prefix [kittens/diff/collect.go:82];
+`is_path_text` returns false for images, `/dev/null`, or non-UTF-8 content [kittens/diff/collect.go:86].
 `generate_diff` only diffs a pair when both sides are text [kittens/diff/ui.go:147]. Rendering
 dispatches by type [kittens/diff/render.go:696-745] to `binary_lines` [kittens/diff/render.go:446] or
 `image_lines` [kittens/diff/render.go:333]; `image_lines` reports dimensions and a human-readable size
-[kittens/diff/render.go:341-347]. Images are loaded by `load_all_images` [kittens/diff/ui.go:187] via
+[kittens/diff/render.go:341-347]. Images are loaded by `load_all_images` [kittens/diff/ui.go:190] via
 `ImageCollection.LoadAll` [kittens/diff/ui.go:206] and placed with `PlaceImageSubRect`
 [kittens/diff/ui.go:320].
 
@@ -1086,14 +1214,15 @@ transmit (`a=t`, [collection.go:394]) or display (`a=p`, [collection.go:178]) ch
    [kittens/diff/main.go:24]), applies `set_diff_command`, initializes the caches (`init_caches`
    [kittens/diff/main.go:114]), creates the Chroma formatters, and starts the event loop with a
    `Handler` [kittens/diff/main.go:143-163].
-2. **`Handler.initialize`** [kittens/diff/ui.go:113] creates the `async_results` channel (32)
-   [kittens/diff/ui.go:133] and launches `create_collection` on a goroutine; the first paint is the
+2. **`Handler.initialize`** [kittens/diff/ui.go:114] creates the `async_results` channel (32)
+   [kittens/diff/ui.go:132] and launches `create_collection` on a goroutine; the first paint is the
    **"Calculating diff, please wait…"** progress screen [kittens/diff/ui.go:340-352].
-3. **`create_collection`** [kittens/diff/collect.go:296] walks both trees, intersects relative paths
+3. **`create_collection`** [kittens/diff/collect.go:371] — via `collect_files`
+   [kittens/diff/collect.go:296] for directory inputs — walks both trees, intersects relative paths
    (Q1), classifies diffs/adds/removals and mode-only changes, and runs rename detection (Q2). It
    posts a single `COLLECTION` result and wakes the main thread.
 4. **`handle_async_result` → COLLECTION** fans out (fixed order) `generate_diff`, `highlight_all`,
-   `load_all_images` [kittens/diff/ui.go:246-249] (Q4).
+   `load_all_images` [kittens/diff/ui.go:246-251] (Q4).
 5. Diffs are computed (builtin anchored diff, or git/diff — Q8); text files are highlighted in
    parallel (Q5); images are queried/loaded (Q6). Each completion posts a `DIFF`/`HIGHLIGHT`/`IMAGE`
    result and the screen **re-renders** [kittens/diff/ui.go:271-273] — the mechanism behind the
@@ -1107,16 +1236,16 @@ The runtime-flow diagram:
 flowchart TD
     A["kitty +kitten diff LEFT RIGHT (main.go:102)"] --> B["load_config / init_caches / formatters (main.go:24,114)"]
     B --> C["Handler + loop.Run (main.go:143-163)"]
-    C --> D["Handler.initialize: async_results chan(32) (ui.go:113,133)"]
+    C --> D["Handler.initialize: async_results chan(32) (ui.go:114,132)"]
     D --> E["draw progress: 'Calculating diff, please wait...' (ui.go:340-352)"]
-    D --> F["goroutine create_collection (collect.go:296)"]
+    D --> F["goroutine create_collection (collect.go:371)"]
     F --> G["walk both dirs -> relative-name Sets (collect.go:260)"]
     G --> H["Intersect -> diff / add / removal / mode-change (collect.go:306-333)"]
     H --> I["MD5 + content re-check -> rename (collect.go:334-364)"]
     I --> J["COLLECTION result -> handle_async_result (ui.go:246)"]
-    J --> K["generate_diff (ui.go:141)"]
+    J --> K["generate_diff (ui.go:142)"]
     J --> L["highlight_all text-only (ui.go:180)"]
-    J --> M["load_all_images (ui.go:187)"]
+    J --> M["load_all_images (ui.go:190)"]
     K --> N["re-render on DIFF/HIGHLIGHT/IMAGE (ui.go:271-273)"]
     L --> N
     M --> N
@@ -1127,12 +1256,12 @@ Their exact defaults, from the source [OBSERVED, source read]:
 
 ```console
 $ grep -nE "opt\('(\+?)(num_context_lines|diff_cmd|ignore_name|syntax_aliases|pygments_style|replace_tab_by)" kittens/diff/main.py
-29:opt('syntax_aliases', 'pyj:py pyi:py recipe:py', ...
-37:opt('num_context_lines', '3', option_type='positive_int', ...
-41:opt('diff_cmd', 'auto', ...
-52:opt('replace_tab_by', '\x20\x20\x20\x20', option_type='python_string', ...
+29:opt('syntax_aliases', 'pyj:py pyi:py recipe:py', ctype='strdict_ _:', option_type='syntax_aliases',
+37:opt('num_context_lines', '3', option_type='positive_int',
+41:opt('diff_cmd', 'auto',
+52:opt('replace_tab_by', '\\x20\\x20\\x20\\x20', option_type='python_string',
 56:opt('+ignore_name', '', ctype='string',
-74:opt('pygments_style', 'default', ...
+74:opt('pygments_style', 'default',
 ```
 
 - `num_context_lines` default **3** [kittens/diff/main.py:37]; `diff_cmd` default **auto**
@@ -1198,7 +1327,7 @@ is emphasized. The caching layer keeps this fast because the raw bytes, lines, a
 each diff are read/derived **once** and reused (Q3).
 
 **Backend selection (`file:line`).** `GIT_DIFF` and `DIFF_DIFF` command templates are
-[kittens/diff/patch.go:20-21]; `find_differ` [kittens/diff/patch.go:34-42] probes `git --help` first,
+[kittens/diff/patch.go:21-22]; `find_differ` [kittens/diff/patch.go:34-42] probes `git --help` first,
 then `diff --help`, else builtin; `set_diff_command` [kittens/diff/patch.go:44-62] maps the config
 value. `run_diff` uses the in-process `Diff()` when `len(diff_cmd)==0` and otherwise execs the
 external command with `_CONTEXT_` substituted [kittens/diff/patch.go:294-327].
@@ -1285,7 +1414,7 @@ length of a changed line, leaving the differing **middle**; it is applied by `Ch
 [kittens/diff/patch.go:101-107] **only** for a *balanced* replace chunk (equal removed/added counts).
 Fixture **F8** exercises it: left `the quick brown fox` → right `the quick red fox` (common prefix
 `"the quick "` = 10, common suffix `" fox"` = 4, middle `brown`→`red`). Extracting the background-color
-runs of the changed line with `sgruns.py` [OBSERVED]:
+runs of the changed row (removed line first, then added) with `sgruns.py` [OBSERVED]:
 
 ```console
 $ printf 'the quick brown fox\n' > /tmp/dk_fixtures/F8/left/line.txt
@@ -1294,12 +1423,12 @@ $ ./kitty/launcher/kitty +kitten diff -o diff_cmd=builtin /tmp/dk_fixtures/F8/le
 $ python3 /tmp/dk_harness/sgruns.py /tmp/dk_captures/F8_builtin.raw brown
 ```
 ```text
-bg=('rgb','255','238','240') text='the quick '     # removed-line background (common prefix)
-bg=('rgb','253','184','192') text='brown'           # EMPHASIS: the differing middle only
-bg=('rgb','255','238','240') text=' fox'            # removed-line background (common suffix)
-bg=('rgb','230','255','237') text='the quick '     # added-line background (common prefix)
-bg=('rgb','172','242','189') text='red'             # EMPHASIS: the differing middle only
-bg=('rgb','230','255','237') text=' fox'            # added-line background (common suffix)
+bg=('rgb','255','238','240') text='the quick '
+bg=('rgb','253','184','192') text='brown'
+bg=('rgb','255','238','240') text=' fox'
+bg=('rgb','230','255','237') text='the quick '
+bg=('rgb','172','242','189') text='red'
+bg=('rgb','230','255','237') text=' fox'
 ```
 
 Only the differing middle (`brown` / `red`) gets the darker *emphasis* background
@@ -1329,11 +1458,11 @@ entry point versus what is inferred from source.
 |---|---|---|---|---|
 | Q1 | Directory pairing | F1, F1b | `collect_files` [collect.go:296]; `Intersect` [collect.go:306]; mode compare [collect.go:321-327] | Pairing by relative-path intersection, mode-only change, add/remove/absent-identical: **all observed** |
 | Q2 | Rename recognition | F2 (rename), F3 (counter-case) | rename block [collect.go:334-364]; `hash_for_path` [collect.go:106]; content re-check [collect.go:351-353] | Hash-match→content-recheck→rename **observed**; body-text absence **observed** (grep=0); early-return cause **inferred** [render.go:99-100] |
-| Q3 | Caching pipeline & efficiency | F1 (`--list` frames) + `cache.go` source | caches [collect.go:19-26]; `Get/Set/GetOrCreate/MustGetOrCreate` [cache.go:24-72] | Layered read-once pipeline, progress-then-rerender frames **observed**; per-cache boundedness read from source; **plain-first content ordering not observed** on this fast host (inferred) |
-| Q4 | Many files at once | F4 ×2 (60 files) | fan-out [ui.go:246-249]; `async_results` [ui.go:133] | 60/60 diffs, fixed launch order **observed**; completion-order nondeterminism **observed** (frame-count variation, Q5) |
-| Q5 | Parallel highlighting safety | F4 under `-race` ×2; 30 plain runs; `runtime` probe | `Context.Parallel` [utils/images/utils.go:27-52]; `Set` [cache.go:32-36]; filter [ui.go:180] | Per-index hand-off (no duplicated work) from source; **data race observed** under `-race`; **fatal crash observed** (24/30, probabilistic); NumCPU=128 observed (non-canonical probe) |
-| Q6 | Binary & images | F5 (binary), F6 (images) | `is_path_text` [collect.go:85]; `binary_lines` [render.go:446]; `image_lines` [render.go:333]; graphics `a=q` [graphics/collection.go:192] | Binary summary, image dimensions/size, `a=q` capability queries + `a=d` deletes **observed**; transmit/display pixels **inferred** (unanswerable query headlessly) |
-| Q7 | End-to-end trace + config | F1/F4 (trace), F7 (`--context`), F9 (`ignore_name`) | `main` [main.go:102]; `initialize` [ui.go:113]; option defs [main.py:29-74] | Trace stages, progress screen, `num_context_lines` 3→1 via `-U` flag, empty `ignore_name` default **all observed** |
+| Q3 | Caching pipeline & efficiency | F1 (`--list` frames) + `cache.go` source | caches [collect.go:20-26]; `Get/Set/GetOrCreate/MustGetOrCreate` [cache.go:25-72] | Layered read-once pipeline, progress-then-rerender frames **observed**; per-cache boundedness read from source; **plain-first content ordering not observed** on this fast host (inferred) |
+| Q4 | Many files at once | F4 ×2 (60 files) | fan-out [ui.go:246-251]; `async_results` [ui.go:132] | 60/60 diffs, fixed launch order **observed**; completion-order nondeterminism **observed** (frame-count variation, Q5) |
+| Q5 | Parallel highlighting safety | F4 under `-race` ×2; 30 plain runs; `runtime` probe | `Context.Parallel` [tools/utils/images/utils.go:27-52]; `Set` [cache.go:32-36]; filter [ui.go:180] | Per-index hand-off (no duplicated work) from source; **data race observed** under `-race`; **fatal crash observed** (24/30, probabilistic); NumCPU=128 observed (non-canonical probe) |
+| Q6 | Binary & images | F5 (binary), F6 (images) | `is_path_text` [collect.go:86]; `binary_lines` [render.go:446]; `image_lines` [render.go:333]; graphics `a=q` [graphics/collection.go:192] | Binary summary, image dimensions/size, `a=q` capability queries + `a=d` deletes **observed**; transmit/display pixels **inferred** (unanswerable query headlessly) |
+| Q7 | End-to-end trace + config | F1/F4 (trace), F7 (`--context`), F9 (`ignore_name`) | `main` [main.go:102]; `initialize` [ui.go:114]; option defs [main.py:29-74] | Trace stages, progress screen, `num_context_lines` 3→1 via `-U` flag, empty `ignore_name` default **all observed** |
 | Q8 | Matching regions + differ modes | F7 ×4 modes + shims, F8 (center) | `Diff`/`tgs` [diff.go:49,192]; `find_differ` [patch.go:34-42]; `changed_center` [patch.go:86-99] | Which backend each mode execs and **auto→git** **observed** (shim log); intra-line center emphasis **observed** (SGR); anchored/patience/O(n log n) **web-validated** |
 
 **Named-item coverage:** `diff` / `add` / `removal` / `rename` / mode-only change (Q1, Q2);
@@ -1378,13 +1507,15 @@ $ docker exec kitty-diff-env bash -lc 'cd /app && git status --porcelain'      #
 ```
 
 **Destination repository status.** Exactly one file is added relative to the destination baseline —
-this document:
+this document — and it is **committed** (tracked), so its presence is stable regardless of
+authoring/commit timing and a post-commit working tree is clean:
 
 ```console
-$ git -C <destination-repo> status --porcelain
-?? blitzy/documentation/kitty_815df1e210e0.md
+$ git -C <destination-repo> ls-files -- blitzy/documentation/
+blitzy/documentation/kitty_815df1e210e0.md
+$ git -C <destination-repo> status --porcelain -- blitzy/documentation/   # after commit: empty
 ```
 
 (The two statuses are reported separately on purpose: the *source* checkout used for investigation
-stays empty, and the *destination* repo gains exactly this one new file.)
+stays empty, and the *destination* repo gains exactly this one new tracked file.)
 
