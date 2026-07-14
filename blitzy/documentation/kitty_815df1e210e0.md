@@ -915,8 +915,8 @@ Remote control is a genuine security boundary: whatever can send a command gains
 | `no` / `n` / `false` (**default**) | "Remote control is completely disabled." No socket is ever created (§4.3). | none |
 | `yes` / `y` / `true` | "Remote control requests are always accepted." **No authentication** on either transport. | full, unauthenticated |
 | `password` | "Remote control requests received over both the TTY device and the socket are confirmed based on passwords" (`remote_control_password`). | password‑gated on both |
-| `socket-only` | "Requests received over a socket are accepted unconditionally. Requests received over the TTY are denied." | socket callers only |
-| `socket` | "Requests received over a socket are accepted unconditionally. Requests received over the TTY are confirmed based on password." | socket unconditional; TTY password‑gated |
+| `socket-only` | "Remote control requests received over a socket are accepted unconditionally. Requests received over the TTY are denied." | socket callers only |
+| `socket` | "Remote control requests received over a socket are accepted unconditionally. Requests received over the TTY are confirmed based on password." | socket unconditional; TTY password‑gated |
 
 **Least‑privilege guidance (derived from the above):** the `yes` used throughout §4‑§6 is appropriate **only** for disposable, isolated instances like this container. For real use: prefer `socket-only` when only trusted local processes with filesystem access to the socket should drive kitty (this also **blocks** the DCS‑over‑TTY path, so a program merely printing escape codes into your terminal cannot control it); use `password`/`socket` with a `remote_control_password` when the TTY path is needed; keep the socket a `unix:` path with restrictive permissions and **avoid `tcp:`** unless the port is firewalled, because a TCP listener is reachable by anything that can connect.
 
@@ -932,7 +932,7 @@ if not window_has_remote_control and not is_fd_peer:
         return {'ok': False, 'error': 'Remote control is allowed over a socket only'}
 ```
 
-It then computes `allowed_unconditionally` (`boss.py:623-628`): true when `allow_remote_control == 'y'` (`:624`), or the caller is a socket peer and the mode is `socket`/`socket-only` (`:625`), or a per‑window/per‑fd password check passes (`:626-627`). Otherwise per‑command permission falls to `is_cmd_allowed` (`boss.py:633`) and, for password mode, `PasswordAuthorizer` (`kitty/remote_control.py:134,177`). Because our runs used `allow_remote_control=yes`, the `:624` `== 'y'` branch is what admitted every `ls` above — no password path was taken.
+It then computes `allowed_unconditionally` (`boss.py:623-628`): true when `allow_remote_control == 'y'` (`:624`), or the caller is a socket peer and the mode is `socket`/`socket-only` (`:625`), or a per‑window/per‑fd password check passes (`:626-627`). Otherwise per‑command permission falls to `is_cmd_allowed` (the module-level dispatcher, `kitty/remote_control.py:177`, invoked at `boss.py:633`) and, for password mode, `PasswordAuthorizer` (`kitty/remote_control.py:134`; its `is_cmd_allowed` method at `:147`). Because our runs used `allow_remote_control=yes`, the `:624` `== 'y'` branch is what admitted every `ls` above — no password path was taken.
 
 ### 7.3 Encryption scheme (INFERRED‑from‑spec — NOT exercised)
 
@@ -945,7 +945,7 @@ The plaintext `kitten @ ls` runs above are **not** encrypted: the real socket re
 This task **does not** add a command (AAP §0.5.2); this section only *equips* you, grounded in how `ls` is built. A new command follows the exact `ls` pattern — but note the **asymmetry between the two sides**: the **Python server** discovers your command automatically, whereas the **Go `kitten` client** needs a *generated* file and a **rebuild**.
 
 **1. Author the Python command module — `kitty/rc/<name>.py`** defining `class <Name>(RemoteCommand)` (base class in `kitty/rc/base.py`), implementing the two halves that `ls` demonstrates:
-   - **client‑request builder** `message_to_kitty(self, global_opts, opts, args)` — builds the request payload. `ls` returns `{'all_env_vars', 'match', 'match_tab'}` (`kitty/rc/ls.py:45`).
+   - **client‑request builder** `message_to_kitty(self, global_opts, opts, args)` — builds the request payload. `ls` returns `{'all_env_vars', 'match', 'match_tab'}` (`kitty/rc/ls.py:45-46`: `def message_to_kitty` at `:45`, `return` dict at `:46`).
    - **server‑side handler** `response_from_kitty(self, boss, window, payload_get)` — does the work and returns data. `ls` calls `boss.list_os_windows(...)` (`:57`) and returns `json.dumps(data, indent=2, sort_keys=True)` (`:76`). A JSON‑string data field is fine.
    - end the module with a singleton instance, as `ls` does: `ls = LS()` (`kitty/rc/ls.py:79`).
 
