@@ -667,7 +667,7 @@ func add_cloned_env(val string) (ans map[string]string, err error) {
 }
 ```
 
-`create_shared_memory(env, 'ksse-')` [kittens/ssh/utils.py:154] is the creator; `add_cloned_env()` [kittens/ssh/main.go:87] (called from `parse_kitten_args` when `key == "clone_env"` [kittens/ssh/main.go:104-105]) is the reader. Both directions share the same reader implementation shape — an owner-and-`0o600` check followed by unlink-on-read — but Flow A's reader is in Python [kittens/ssh/utils.py:100-113] and Flow B's reader is in Go [kittens/ssh/main.go:72-85]. The in-tree `TestCloneEnv` [kittens/ssh/main_test.go:25] exercises Flow B and passes (see preamble). These are **not** a symmetric pair: opposite creators, opposite readers, different prefixes (`kssh-` vs `ksse-`), different payloads, different purposes.
+`create_shared_memory(env, 'ksse-')` [kittens/ssh/utils.py:154] is the creator; `add_cloned_env()` [kittens/ssh/main.go:87] (called from `parse_kitten_args` when `key == "clone_env"` [kittens/ssh/main.go:104-105]) is the reader. Both directions enforce the same two checks — owner match and `0o600` — together with unlink-on-read, but with reader-specific *ordering*: the Python responder unlinks first then checks, whereas the Go reader checks first then unlinks, so only the Python side removes a *rejected* object (detailed under Q8's unlink-ordering subsection). Flow A's reader is in Python [kittens/ssh/utils.py:100-113] and Flow B's reader is in Go [kittens/ssh/main.go:72-85]. The in-tree `TestCloneEnv` [kittens/ssh/main_test.go:25] exercises Flow B and passes (see preamble). These are **not** a symmetric pair: opposite creators, opposite readers, different prefixes (`kssh-` vs `ksse-`), different payloads, different purposes.
 
 ---
 
@@ -1422,8 +1422,8 @@ The 8 tests (`test_basic_pty_operations`, `test_ssh_bootstrap_with_different_lau
 ## Q8. How does the shared-memory piece keep things secure?
 
 **Direct answer:** Six concrete mechanisms combine, all confined to the local host's POSIX shared memory (`/dev/shm`): **(1)** the object is created with `os.O_CREAT | os.O_EXCL` [kitty/shm.py:62] so creation fails if the name already exists (no clobbering/hijack); **(2)** the mode is owner-only `0o600` (`stat.S_IREAD | stat.S_IWRITE`) [kitty/shm.py:51];
-**(3)** the name is **randomly generated** in a 30-try loop [kitty/shm.py:69-77]; **(4)** the password is a fresh, **cryptographically-random one-time** token — `pw = TokenHex()` = 32 bytes from `crypto/rand` → 64 hex chars [tools/utils/secrets/tokens.go:14-34]; **(5)** the reader **unlinks the object first**, before reading,
-so it is single-use and the window is minimal [kittens/ssh/utils.py:106]; **(6)** the reader then **re-verifies owner and permissions** on the already-opened descriptor and refuses on mismatch [kittens/ssh/utils.py:107-111, kittens/ssh/main.go:75-81]. The Base64 tarball and the sh character-substitution (Q3/Q6) are **encodings for a text TTY,
+**(3)** the name is **randomly generated** in a 30-try loop [kitty/shm.py:69-77]; **(4)** the password is a fresh, **cryptographically-random one-time** token — `pw = TokenHex()` = 32 bytes from `crypto/rand` → 64 hex chars [tools/utils/secrets/tokens.go:14-34]; **(5)** the Python responder (the primary `kssh-*` credential reader) **unlinks the object first**, before reading,
+so the credential is single-use and the window is minimal [kittens/ssh/utils.py:106] — the Go clone-env reader re-verifies first and then unlinks (reader-specific ordering detailed below); **(6)** the reader **re-verifies owner and permissions** on the already-opened descriptor and refuses on mismatch [kittens/ssh/utils.py:107-111, kittens/ssh/main.go:75-81]. The Base64 tarball and the sh character-substitution (Q3/Q6) are **encodings for a text TTY,
 not confidentiality or integrity** mechanisms — confidentiality of the wire comes from ssh's own transport encryption,
 and of the credential from the `0o600` object.
 
@@ -1481,7 +1481,7 @@ func TokenHex(nbytes ...int) (string, error) {
 
 `rand` here is `crypto/rand` (the import at the top of the file), i.e. a CSPRNG; 32 bytes hex-encoded is the 64-hex-char `pw` observed in the live shm payload (Q2, `pw_len=64`). A new token is drawn per invocation, so it is single-use.
 
-### Unlink-first, then owner + permission re-verification — in *both* readers **[Observed]**
+### Unlink-on-read + owner/permission re-verification — reader-specific ordering (the two readers are *not* symmetric on the rejection path) **[Observed]**
 
 Python responder side (reads the `kssh-*` payload):
 
@@ -1517,7 +1517,72 @@ func read_data_from_shared_memory(shm_name string) ([]byte, error) {
 }
 ```
 
-`shm.unlink()` is the **first** statement [kittens/ssh/utils.py:106]; the Go path uses `shm.ReadWithSizeAndUnlink` [kittens/ssh/main.go:73], which unlinks as part of the read. Both then enforce `uid/gid == euid/egid` and `mode == 0o600` before returning the data.
+**Direct answer: the two readers are *not* symmetric on the rejection path.** The Python responder is genuinely *unlink-first*; the Go clone-env reader is *check-first*. The difference is invisible on the success path (both unlink) and only becomes observable when verification fails.
+
+- **Python responder (`kssh-*` payload).** `shm.unlink()` is the literal **first** statement inside the `with` block [kittens/ssh/utils.py:106], executed *before* the owner check [kittens/ssh/utils.py:107-108] and the permission check [kittens/ssh/utils.py:110-111]. The object is therefore destroyed **even when verification fails**.
+- **Go clone-env reader (`ksse-*` object).** `read_data_from_shared_memory` [kittens/ssh/main.go:72-85] hands an owner/`0o600` callback to `shm.ReadWithSizeAndUnlink`, and inside that function the callback runs **first**; on failure it returns *before* the deferred `Unlink` is ever registered:
+
+```text
+$ sed -n "142,166p" tools/utils/shm/shm.go
+func ReadWithSizeAndUnlink(name string, file_callback ...func(fs.FileInfo) error) ([]byte, error) {
+	mmap, err := Open(name, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(file_callback) > 0 {
+		s, err := mmap.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to stat SHM file with error: %w", err)
+		}
+		for _, f := range file_callback {
+			err = f(s)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	defer func() {
+		mmap.Close()
+		_ = mmap.Unlink()
+	}()
+	slice, err := ReadWithSize(mmap, 0)
+	if err != nil {
+		return nil, err
+	}
+```
+
+The `file_callback` loop invokes the owner/`0o600` check at [tools/utils/shm/shm.go:153] and `return nil, err` fires at [tools/utils/shm/shm.go:155] the instant it fails — one statement *before* the `defer func() { mmap.Close(); mmap.Unlink() }` is registered at [tools/utils/shm/shm.go:159-162]. So the Go reader unlinks **only on the success path**; a rejected object is left in place.
+
+Verified at runtime by driving the **real** functions against a fresh object per case (temporary harnesses that link/import the production packages), in the canonical image as `obsuser` (uid 1001). The Go clone-env reader harness compiles the real `shm.ReadWithSizeAndUnlink` together with the verbatim owner/`0o600` callback from [kittens/ssh/main.go:74-83]; it unlinks on success but **not** on a permission rejection:
+
+```text
+$ runuser -u obsuser -- /home/obsuser/obs/go_focused_bin
+GO clone-env reader (uid=1001): shm.ReadWithSizeAndUnlink + main.go owner/0o600 callback
+
+--- success: mode 0o600 ---
+object: /dev/shm/ksse-obs-337EPRCMKPKDQ (mode 0600), present before read = true
+read_data_from_shared_memory -> OK (payload returned)
+object present AFTER read = false  => unlinked
+
+--- rejection: mode 0o644 (wrong permissions) ---
+object: /dev/shm/ksse-obs-CPMPFUL3SUU3Y (mode 0644), present before read = true
+read_data_from_shared_memory -> REJECTED: "Incorrect permissions on SHM file"
+object present AFTER read = true  => NOT unlinked
+```
+
+The Python payload responder harness calls the real `read_data_from_shared_memory` [kittens/ssh/utils.py:100-112]; on the *identical* wrong-permission input it **does** unlink the rejected object:
+
+```text
+$ runuser -u obsuser -- env PYTHONPATH=/app python3 /home/obsuser/obs/py_focused.py
+PYTHON payload reader (euid=1001): read_data_from_shared_memory
+
+--- rejection: mode 0o644 (wrong permissions) ---
+object: /dev/shm/kssh-obs-33ee8ecf294bff38180882c74ac8f042ba69ba84aeea89d017bb3809659bcf40 (mode 0o644), present before read = True
+read_data_from_shared_memory -> REJECTED: ValueError: Incorrect permissions on pwfile: 0o644
+object present AFTER read = False  => unlinked
+```
+
+(The object suffix is random per run; the `present AFTER` result is stable across runs — Go rejection = still present, Python rejection = unlinked.) **On the success path both readers unlink** (Go's `defer` fires once the callback passes; Python unlinks first, unconditionally), so a legitimate one-time credential is single-use in *both* readers — no regression to the real credential flow. The readers diverge **only** for a rejected object (wrong owner or wrong permissions — already anomalous or tampered): the Python responder removes it, whereas the Go clone-env reader leaves it behind (still owner-only `0o600`, in the creating user's own `/dev/shm`, unreadable by the reader that just refused it, and not replayable). The primary `kssh-*` password payload is in any case additionally destroyed by the kitten's own `defer { data_shm.Close(); data_shm.Unlink() }` [kittens/ssh/main.go:600-605] regardless of reader outcome, so the credential channel is single-use end-to-end.
 
 ### All five rejection branches, live **[Observed]**
 
@@ -1555,7 +1620,7 @@ GONE (unlinked by reader)
 | **clone-env** | `ksse-` | Python `set_env_in_cmdline` → `create_shared_memory` [kittens/ssh/utils.py:154] | Go `add_cloned_env` → `read_data_from_shared_memory` [kittens/ssh/main.go:72,87] | pass a cloned local environment into the kitten |
 | **askpass** | `askpass-*` | Go `RunSSHAskpass` [kittens/ssh/askpass.go:55] | kitty core (via the `@kitty-ask` DCS [kittens/ssh/askpass.go:30]) | relay an ssh password/confirm prompt to the kitty UI |
 
-The **payload** and **clone-env** flows run in **opposite directions** (Go→Python vs Python→Go) with different prefixes; both enforce unlink-on-read + owner + `0o600`. The **askpass** flow is a third, separate object used only when ssh needs to prompt.
+The **payload** and **clone-env** flows run in **opposite directions** (Go→Python vs Python→Go) with different prefixes; both enforce unlink-on-read (on the success path) + owner + `0o600`, differing only in *ordering* on the rejection path — the Python responder unlinks a rejected object, the Go clone-env reader does not (see the unlink-ordering subsection under Q8). The **askpass** flow is a third, separate object used only when ssh needs to prompt.
 
 ### Trust boundary and threat table (M-9)
 
@@ -1568,7 +1633,7 @@ The trust boundary is the **local user account**: everything on the local host r
 | Replay / credential reuse | one-time `TokenHex` per run + unlink-on-read (object gone after first read) | none material |
 | Attacker plants a look-alike object | owner re-verification (`st_uid==euid`) rejects it | observed: `Incorrect owner on pwfile` |
 | Wrong-permission object | `mode==0o600` re-check rejects it | observed: `Incorrect permissions on pwfile: 0o644` |
-| TOCTOU (swap between create and read) | reader `unlink()`s first, then checks owner/perm on the **already-open** descriptor [kittens/ssh/utils.py:106-111] | small create→read window exists, but checks bind to the opened fd, not a re-lookup |
+| TOCTOU (swap between create and read) | the Python responder `unlink()`s first, then checks owner/perm on the **already-open** descriptor [kittens/ssh/utils.py:106-111] (the Go reader checks the already-open descriptor first, then unlinks — Q8) | small create→read window exists, but checks bind to the opened fd, not a re-lookup |
 | Integrity / tampering of payload | owner-only perms; ssh transport integrity on the wire | **no cryptographic MAC** on the shm object — relies on `0o600` |
 | Malformed request probing | parse fails before any shm read [kittens/ssh/utils.py:120-126] | object not even opened; benign |
 | Abnormal-exit residue | deferred `Unlink` on normal exit [kittens/ssh/main.go:600-605] | if the kitten is `kill -9`'d, the object lingers until reboot/manual unlink (this very task produced such residue during earlier runs; see the Cleanup & Integrity section) |
@@ -1808,7 +1873,7 @@ This matrix is built from the verified evidence above, not from aspiration. Two 
 | R5 | Connection reuse (ControlMaster) | Q5 | `master_is_functional`, `ssh -O check`, `need_to_request_data`, `close_shared_ssh_connections` | lifecycle transcript `cap/06`, `-O check` probe | **Answered** |
 | R6 | Per-shell bootstrap encoding | Q6 | `wrap_bootstrap_script`, `'`→VT / `\`→FF / `\n`→CR / `!`→BS, `tr` reversal, Base64 (python) | encoding round-trip `cap/13b` | **Answered** |
 | R7 | End-to-end trace | Q7 | ordered `run_ssh` stages, proactive vs remote-asks, `c.Start()`-before-DCS, remote extraction, `exec_login_shell` | `./test.py --module ssh` 8/8 local E2E | **Answered — partial E2E** |
-| R8 | Shared-memory security | Q8 | `O_CREAT\|O_EXCL`, `0o600`, random name, one-time pw, unlink-first, owner/perm re-verify, threat table | 5 rejection branches `cap/14`, owner-mismatch `cap/14b` | **Answered** |
+| R8 | Shared-memory security | Q8 | `O_CREAT\|O_EXCL`, `0o600`, random name, one-time pw, unlink-on-read (reader-specific ordering: Python unlinks first, Go checks first), owner/perm re-verify, threat table | 5 rejection branches `cap/14`, owner-mismatch `cap/14b`, Go vs Python unlink-on-rejection harness | **Answered** |
 | R9 | Terminal↔remote DCS communication | Q9 | `@kitty-ssh` DCS, `KITTY_DATA_START`/`OK`/`KITTY_DATA_END`, 254-byte chunking, five decoders + failure, ≥8.4 gate | `dcs_default.raw`, `dcs_remotereq.raw`, `get_ssh_data_success.raw` | **Answered — protocol observed locally; production network round-trip inferred** |
 
 ### Named-mechanism coverage (each answered explicitly, by name)
