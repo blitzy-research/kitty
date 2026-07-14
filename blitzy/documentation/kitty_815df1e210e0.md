@@ -258,30 +258,57 @@ What this proves, precisely:
 
 A well-behaved application always sends `CSI ? 2026 l`. A crashed or disconnected one might not. kitty guards against a permanently frozen display with a timeout: `screen_check_pause_rendering` auto-resumes when the timer expires (`if (self->paused_rendering.expires_at && now > self->paused_rendering.expires_at) screen_pause_rendering(self, false, 0);`, `kitty/screen.c:2489-2491`), and the default timeout is **2000 ms** (`if (for_in_ms <= 0) for_in_ms = 2000;`, `kitty/screen.c:2521`).
 
-**[OBSERVED] — begin a synchronized update and *never* end it; poll DECRQM ~every 500 ms (two independent runs, ~3.5 s each):**
+**[OBSERVED] — begin a synchronized update and *never* end it; poll DECRQM ~every 500 ms (two independent runs, ~3.5 s each). RUN 1 shows the complete, unfiltered `--dump-commands` trace; RUN 2 shows the same experiment *illustratively* filtered to just the `draw` events (note the explicit `grep '^draw'` in its command) so the timing flip is easy to compare across runs:**
 
 ```
-$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands env EMIT_LOG=$OBS/out/q1_timeout_emit_r1.bin python3 harness/pause_timeout_probe.py   # RUN 1
+$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands env EMIT_LOG=$OBS/out/q1_timeout_emit_r1.bin python3 harness/pause_timeout_probe.py   # RUN 1 (complete, unfiltered)
+screen_set_mode 2026 1
+report_mode_status 2026 1
 draw T=0003ms DECRQM_REPLY=<ESC>[?2026;1$y
-draw T=0506ms DECRQM_REPLY=<ESC>[?2026;1$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
+draw T=0507ms DECRQM_REPLY=<ESC>[?2026;1$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
 draw T=1010ms DECRQM_REPLY=<ESC>[?2026;1$y
-draw T=1513ms DECRQM_REPLY=<ESC>[?2026;1$y
-draw T=2019ms DECRQM_REPLY=<ESC>[?2026;2$y
-draw T=2523ms DECRQM_REPLY=<ESC>[?2026;2$y
-draw T=3026ms DECRQM_REPLY=<ESC>[?2026;2$y
-draw T=3530ms DECRQM_REPLY=<ESC>[?2026;2$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
+draw T=1514ms DECRQM_REPLY=<ESC>[?2026;1$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
+draw T=2020ms DECRQM_REPLY=<ESC>[?2026;2$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
+draw T=2524ms DECRQM_REPLY=<ESC>[?2026;2$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
+draw T=3027ms DECRQM_REPLY=<ESC>[?2026;2$y
+screen_carriage_return
+screen_linefeed
+report_mode_status 2026 1
+draw T=3531ms DECRQM_REPLY=<ESC>[?2026;2$y
+screen_carriage_return
+screen_linefeed
 ```
 
+The RUN 1 block above is the **complete, unfiltered** `--dump-commands` stdout — 33 events. Its whole-file class breakdown is `screen_set_mode 2026 1`×1, `report_mode_status 2026 1`×8, `draw`×8, `screen_carriage_return`×8, `screen_linefeed`×8, and — the authoritative check that **no** "end" was parsed — `screen_reset_mode`×0. Each ~500 ms poll contributes one `report_mode_status` (the DECRQM reply) followed by the `draw` line and its `\r\n`: exactly one `screen_carriage_return` + one `screen_linefeed`, because the probe puts the tty in raw mode (`tty.setraw`), so `ONLCR` is off and the `\r\n` is **not** doubled — contrast §2.1's cooked-mode child, where `\r\n` became `\r\r\n` (two `screen_carriage_return`). The command additionally writes one benign `Failed to open systemd user bus … Connection refused` line to *stderr* (the headless-container diagnostic noted in §2.1/§5.4), which is not part of this stdout trace. Only the `draw` lines carry the DECRQM `;1`→`;2` flip, so RUN 2 is shown filtered to those:
+
 ```
-$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands env EMIT_LOG=$OBS/out/q1_timeout_emit_r2.bin python3 harness/pause_timeout_probe.py   # RUN 2
+$ ./kitty/launcher/kitty -o close_on_child_death=yes --dump-commands env EMIT_LOG=$OBS/out/q1_timeout_emit_r2.bin python3 harness/pause_timeout_probe.py | grep '^draw'   # RUN 2 (illustrative: draw events only)
 draw T=0003ms DECRQM_REPLY=<ESC>[?2026;1$y
-draw T=0506ms DECRQM_REPLY=<ESC>[?2026;1$y
+draw T=0507ms DECRQM_REPLY=<ESC>[?2026;1$y
 draw T=1010ms DECRQM_REPLY=<ESC>[?2026;1$y
-draw T=1513ms DECRQM_REPLY=<ESC>[?2026;1$y
+draw T=1514ms DECRQM_REPLY=<ESC>[?2026;1$y
 draw T=2020ms DECRQM_REPLY=<ESC>[?2026;2$y
 draw T=2524ms DECRQM_REPLY=<ESC>[?2026;2$y
-draw T=3027ms DECRQM_REPLY=<ESC>[?2026;2$y
-draw T=3533ms DECRQM_REPLY=<ESC>[?2026;2$y
+draw T=3028ms DECRQM_REPLY=<ESC>[?2026;2$y
+draw T=3531ms DECRQM_REPLY=<ESC>[?2026;2$y
 ```
 
 **[OBSERVED] — proof the child never sent the "end", so the resume was the timeout (counted over the whole emitted byte stream):**
@@ -293,7 +320,7 @@ contains CSI?2026h (begin): 1
 contains CSI?2026l (end)  : 0
 ```
 
-Across both runs the pause flag holds at `1` through `T=1513 ms` and has flipped to `2` by `T≈2019–2020 ms` — i.e. the display auto-resumed between 1.5 s and 2.0 s, matching the 2000 ms default. The parser trace for these runs contains exactly one `screen_set_mode 2026 1` and **zero** `screen_reset_mode` events, and the byte-stream count above shows `begin = 1, end = 0`: the child never sent `CSI ? 2026 l`, so the resume was produced solely by `screen_check_pause_rendering` firing on `expires_at`. The two runs agree to within 1 ms at the flip (`2019` vs `2020`), so this is a stable timeout, not jitter.
+Across both runs the pause flag holds at `1` through `T=1514 ms` and has flipped to `2` by `T=2020 ms` — i.e. the display auto-resumed between 1.5 s and 2.0 s, matching the 2000 ms default. The complete RUN 1 trace above contains exactly one `screen_set_mode 2026 1` and **zero** `screen_reset_mode` events (see its class breakdown), and the byte-stream count above shows `begin = 1, end = 0`: the child never sent `CSI ? 2026 l`, so the resume was produced solely by `screen_check_pause_rendering` firing on `expires_at`. The two runs agree at the flip to the millisecond (`2020` vs `2020`) and differ by at most 1 ms elsewhere (`3027` vs `3028`), so this is a stable timeout, not jitter.
 
 
 ---
