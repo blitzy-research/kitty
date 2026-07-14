@@ -16,79 +16,94 @@ All source citations are against HEAD commit `815df1e210e0a9ab4622f5c7f2d6891d7d
 
 ## Methodology and honest disclosures (read this first)
 
-Three environmental facts materially shaped how the evidence below was produced. They are disclosed
+All evidence in this document was produced **inside the canonical task container** using **genuine
+keyboard input**. Three environmental facts materially shaped how it was produced; they are disclosed
 up front rather than buried.
 
-1. **Build environment — native, not the named container image [OBSERVED].** The task named a Docker
-   image (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`). That image was **not**
-   pulled; the toolchain was instead reproduced natively on Ubuntu 25.10. The exact toolchain
-   identities are recorded in the Q6 section so the reader can judge fidelity. This is a deviation
-   from the named image and is called out explicitly.
+1. **Build and runtime environment — the canonical container image [OBSERVED].** Everything below was
+   built and run inside the named image
+   `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`, whose repository digest is
+   `sha256:60da90a7183a82861fc6d1d40cb8086baa6a8a0e0d05f26d03aafd0f5b3cc384` [OBSERVED]:
 
-2. **The receiver is a real kitty GUI, run headlessly under Xvfb with software OpenGL [OBSERVED].**
-   kitty is a GPU terminal with no headless flag. To exercise the genuine
-   `vt-parser.c` then `screen.c` then `window.py` then `file_transmission.py` path (with the real
-   `boss.confirm` permission UI), a real `kitty` process was launched under `Xvfb :99` with Mesa
-   software GL (`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`). Keystrokes were injected with
-   `kitten @ send-text`, which is the remote-control equivalent of a user typing at the keyboard: it
-   feeds bytes into the terminal's child PTY exactly as a keyboard would. It is **not** a protocol
-   bypass — the file-transfer OSC codes still travel the full parser and handler chain, and the
-   confirmation overlay still runs. This is distinct from kitty's unit-test harness
-   (`kitty_tests/file_transmission.py`), which routes parsed commands straight to a test controller
-   with a preset `allow` boolean; the test harness was **not** used for any claim here.
+   ```
+   $ docker image inspect ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0 --format '{{index .RepoDigests 0}}'
+   ghcr.io/scaleapi/swe-atlas@sha256:60da90a7183a82861fc6d1d40cb8086baa6a8a0e0d05f26d03aafd0f5b3cc384
+   ```
 
-3. **SSH is a loopback-only, task-scoped daemon [OBSERVED].** Q7 requires a real `kitten ssh` hop. A
-   dedicated `sshd` was bound to `127.0.0.1:2222` with all host keys, the authorized key, and the
-   `known_hosts` file placed under `/tmp/ft_obs/sshd`, and `PermitRootLogin prohibit-password`. Its
-   setup and teardown are documented, and it and its keys are removed during cleanup.
+   The container was started with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` so that
+   `strace` could attach to the running kitty process (used for the file-open evidence). A host
+   scratch directory is bind-mounted at `/work` inside the container; the pinned source tree
+   (produced by `git archive 815df1e210e0`) lives at `/work/src`, and all temporary observation
+   artifacts live under `/work` — outside the repository. The exact toolchain identities are recorded
+   in the Q6 section.
 
-The observation workspace is `/tmp/ft_obs` (outside the repository). A reusable environment file
-sourced by every command below is:
+2. **The receiver is a real kitty GUI, run headlessly under Xvfb with software OpenGL, driven by
+   genuine X11 keystrokes [OBSERVED].** kitty is a GPU terminal with no headless flag. To exercise the
+   genuine `vt-parser.c` then `screen.c` then `window.py` then `file_transmission.py` path (with the
+   real `boss.confirm` permission UI), a real `kitty` process was launched under `Xvfb :99` with Mesa
+   software GL (`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`) and, deliberately,
+   `-o allow_remote_control=no`. Keystrokes were delivered with `xdotool` (the X11 **XTEST**
+   extension), which injects real key events into the focused window at the X-server layer — exactly
+   as a physical keyboard would. This is **not** a remote-control or protocol bypass: remote control
+   is switched off, and every command (including the confirmation `y`) is a genuine key event. That
+   this genuinely reaches the shell was confirmed with a smoke test — a typed
+   `date +GENUINE_XTEST_%s` produced `GENUINE_XTEST_1784004217` in a file — with the focused window
+   id equal to the target kitty window. This is distinct from `kitten @ send-text` (remote control,
+   not used here) and from kitty's unit-test harness (`kitty_tests/file_transmission.py`, which routes
+   parsed commands straight to a test controller with a preset `allow` boolean and was **not** used
+   for any claim here).
+
+3. **SSH is a loopback-only, task-scoped daemon inside the container [OBSERVED].** Q7 requires a real
+   `kitten ssh` hop. A dedicated `sshd` was bound to `127.0.0.1:2222` inside the container with
+   task-scoped ed25519 host and client keys under `/work/harness/ssh`,
+   `PermitRootLogin prohibit-password`, and public-key authentication only. Its setup and teardown are
+   documented, and it and its keys are removed during cleanup.
+
+The reusable environment sourced by every command below is:
 
 ```
-export REPO=/tmp/blitzy/kitty/blitzy-dc55a543-7db2-41a4-8fbc-3537be540314_8d3e93
+export REPO=/work/src            # pinned source tree (git archive 815df1e210e0), inside the container
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 GOFLAGS=-mod=mod
 export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
 export KITTY=$REPO/kitty/launcher/kitty
 export KITTEN=$REPO/kitty/launcher/kitten
-export SOCK=/tmp/ft_obs/kitty.sock
 ```
 
 ## Q6 — Building kitty from source (canonical configuration)
 
 The canonical build entry point is `python3 setup.py` (the `Makefile` `all:` target delegates to it).
-It was run to completion and produced the launcher `kitty/launcher/kitty` and the Go `kitten` binary
-`kitty/launcher/kitten`. `libxxhash` is a required system dependency for the transfer/rsync C module
-and is linked by the build [SOURCE-VERIFIED: setup.py:986].
+It was run to completion inside the container and produced the launcher `kitty/launcher/kitty` and the
+Go `kitten` binary `kitty/launcher/kitten`. `libxxhash` is a required system dependency for the
+transfer/rsync C module and is linked by the build [SOURCE-VERIFIED: setup.py:986].
 
-Toolchain identity [OBSERVED]:
+Toolchain identity, all read inside the container [OBSERVED]:
 
 ```
 $ python3 --version
-Python 3.13.7
+Python 3.12.3
 $ go version
-go version go1.24.4 linux/amd64
+go version go1.23.4 linux/amd64
 $ cc --version | head -1
-cc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+cc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
 $ pkg-config --modversion libxxhash
-0.8.3
-$ uname -a
-Linux reverse-code-generator-a872215c-rw5bh 6.6.122+ #1 SMP Thu Apr  2 09:59:00 UTC 2026 x86_64 GNU/Linux
+0.8.2
+$ cat /etc/os-release | grep PRETTY
+PRETTY_NAME="Ubuntu 24.04.2 LTS"
 $ head -3 go.mod
 module kitty
 
 go 1.22
 ```
 
-`go.mod` requires `go 1.22`; the installed Go 1.24.4 satisfies it [OBSERVED].
+`go.mod` requires `go 1.22`; the container's Go 1.23.4 satisfies it [OBSERVED].
 
 Build artifacts, version banners, the protocol constant reaching Python, and the XXH3 linkage of the
 server-side rsync module [OBSERVED]:
 
 ```
 $ ls -l kitty/launcher/kitty kitty/launcher/kitten
--rwxr-xr-x 1 root root 16429348 Jul 13 18:04 kitty/launcher/kitten
--rwxr-xr-x 1 root root    40384 Jul 13 18:04 kitty/launcher/kitty
+-rwxr-xr-x 1 root root 15945988 Jul 14 04:38 kitty/launcher/kitten
+-rwxr-xr-x 1 root root    36224 Jul 14 04:37 kitty/launcher/kitty
 
 $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
@@ -99,7 +114,7 @@ $ python3 -c 'from kitty.fast_data_types import FILE_TRANSFER_CODE; print(FILE_T
 5113
 
 $ ldd kittens/transfer/rsync.so | grep -i xxhash
-	libxxhash.so.0 => /lib/x86_64-linux-gnu/libxxhash.so.0 (0x00007e092f4dd000)
+	libxxhash.so.0 => /lib/x86_64-linux-gnu/libxxhash.so.0 (0x00007c88bba55000)
 $ nm -D kittens/transfer/rsync.so | grep -iE 'XXH3|XXH128' | head
                  U XXH128_canonicalFromHash
                  U XXH3_128bits_digest
@@ -127,42 +142,64 @@ $ ./kitty/launcher/kitten transfer --help
 
 ## Q7 — The canonical entry point: real `kitten ssh` then remote `kitten transfer`
 
-A loopback-only `sshd` was started with task-scoped keys under `/tmp/ft_obs/sshd`
-(`ListenAddress 127.0.0.1`, `Port 2222`, `PermitRootLogin prohibit-password`):
+A loopback-only `sshd` was started inside the container with task-scoped keys under
+`/work/harness/ssh` (`ListenAddress 127.0.0.1`, `Port 2222`, `PermitRootLogin prohibit-password`).
+Inside the real kitty GUI (Xvfb, software GL, remote control disabled), the SSH kitten was invoked by
+genuine XTEST keystrokes, a remote shell was reached, and — critically — the transfer kitten was run
+**on the remote** by its bare name `kitten`, which resolves through the remote `PATH`. The commands
+typed (as real key events) were:
 
 ```
-$ /usr/sbin/sshd -f /tmp/ft_obs/sshd/sshd_config
+/work/src/kitty/launcher/kitten ssh -p 2222 -i /work/harness/ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1
+echo REMOTE_HOST=$(hostname) REMOTE_KITTEN=$(command -v kitten) ; kitten --version
+script -e -q -c "kitten transfer /work/q7b_src.bin /work/q7b_dst.bin" /work/evidence/q7b_transfer.log
 ```
 
-Inside the real kitty GUI (Xvfb, software GL), the SSH kitten was invoked, a remote shell was reached,
-and — critically — the transfer kitten was run **on the remote** by its bare name, which resolves
-through the remote `PATH` (the remote-supplied `kitten`, not a local absolute path). The commands
-typed (via simulated keystrokes) were:
+Inside the `kitten ssh` session the transfer kitten resolves to the **ssh-kitten-provisioned shim** on
+the remote `PATH` — proving the SSH kitten made the transfer kitten available on the remote — and it
+is our built 0.35.2 binary, not a download [OBSERVED]:
 
 ```
-kitten ssh -p 2222 -i /tmp/ft_obs/sshd/id -o UserKnownHostsFile=/tmp/ft_obs/sshd/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@127.0.0.1
-command -v kitten
-kitten transfer /tmp/ft_obs/q7_remote_src.bin /tmp/ft_obs/q7_local_dst.bin
+REMOTE_HOST=837e0b61e567 REMOTE_KITTEN=/root/.local/share/kitty-ssh-kitten/kitty/bin/kitten
+kitten 0.35.2 created by Kovid Goyal
 ```
 
-On the remote, `command -v kitten` resolved to `/usr/local/bin/kitten` [OBSERVED]. The confirmation
-overlay was accepted by typing `y`. The kitty screen, the receiver-written destination, matching
-hashes, and the `strace` proof that the **kitty** process (PID 122499) — not the kitten client —
-opened and wrote the destination [OBSERVED]:
+(The shim `.../kitty/bin/kitten` execs `.../kitty/install-tool/kitten` when it is present and
+executable; it was pre-seeded with the built binary, so the run is fully offline and canonical rather
+than fetching a release from GitHub. `REMOTE_HOST` is the container's own id over the loopback hop.)
+
+The genuine process chain during the transfer, sampled live, shows the real
+`kitten ssh` → `sshd` → login shell → `script` → **remote** transfer kitten pipeline [OBSERVED]:
+
+```
+$ # ps -eo pid,ppid,comm,args sampled every 0.15s during the transfer
+  25959   23709 kitten   /work/src/kitty/launcher/kitten ssh -p 2222 -i /work/harness/ssh/id_ed25519 ... root@127.0.0.1
+  25980    1130 sshd     sshd: root@pts/1
+  25990   25980 bash     /bin/bash --login --posix
+  26457   25990 script   script -e -q -c kitten transfer /work/q7b_src.bin /work/q7b_dst.bin /work/evidence/q7b_transfer.log
+  26458   26457 kitten   /root/.local/share/kitty-ssh-kitten/kitty/install-tool/kitten transfer /work/q7b_src.bin /work/q7b_dst.bin
+```
+
+The confirmation overlay was accepted by a genuine `y` key event; the destination was written by the
+**local kitty process** (PID 23641), not the kitten client — proven by an `strace` of the kitty
+process opening the destination — and the source and destination hashes match [OBSERVED]:
 
 ```
 Permission granted for this transfer
-\u2714 /tmp/ft_obs/q7_remote_src.bin              3.1kB
--rw-r--r-- 1 root root 3072 Jul 13 18:36 /tmp/ft_obs/q7_local_dst.bin
-4b9424f75a2a2bcb8775888a0f13e806bdecac93c5b369ff1c61a00fda74b1a9  /tmp/ft_obs/q7_remote_src.bin
-4b9424f75a2a2bcb8775888a0f13e806bdecac93c5b369ff1c61a00fda74b1a9  /tmp/ft_obs/q7_local_dst.bin
-122499 openat(AT_FDCWD, "/tmp/ft_obs/q7_local_dst.bin", O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0644) = 11
+]5113;id=675a069d;ac=send                      # the first OSC 5113 frame, from the transfer log
+
+$ strace -f -qq -e trace=openat -p 23641 -o q7b_strace.txt    # (no -y: clean, unannotated)
+23641 openat(AT_FDCWD, "/work/q7b_dst.bin", O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0644) = 9
+
+$ sha256sum /work/q7b_src.bin /work/q7b_dst.bin
+ee45cd01317686fc6b4bb7f4b3a3b8416ab593e74d88dda872f822607c477141  /work/q7b_src.bin
+ee45cd01317686fc6b4bb7f4b3a3b8416ab593e74d88dda872f822607c477141  /work/q7b_dst.bin
 ```
 
 The SSH kitten makes the transfer kitten available on the remote automatically
 [SOURCE-VERIFIED: docs/kittens/ssh.rst:22; kittens/ssh/main.py:167]. The `strace` line is direct
 evidence that the full server-side chain executed inside the terminal process and wrote the file
-[OBSERVED]. (`\u2714` is the checkmark glyph U+2714 as recorded by the capture.)
+[OBSERVED]. The transfer moved a 4,194,304-byte source to a byte-identical destination [OBSERVED].
 
 ## Q1 — Protocol handshake and OSC 5113 escape sequences
 
@@ -180,50 +217,79 @@ OSC prefix `\x1b]%d;id=%s;` (with `%d` = `kitty.FileTransferCode` = 5113) follow
 payload [SOURCE-VERIFIED: kittens/transfer/ftc.go:163-222; kittens/transfer/send.go:384,647-648]. The
 first frame the client emits is an `action=send` command that opens the session.
 
-### The handshake ordering (captured losslessly, both directions)
+### The handshake ordering — a small file, captured losslessly, nothing elided
 
-The transfer was run under `script`, which tees both directions of the PTY while the real kitty acts
-as receiver; `--log-out` captures client-to-terminal bytes and `--log-in` captures terminal-to-client
-bytes. Producing command [OBSERVED]:
+A 58-byte file was transferred so that every frame — including the full base64 `d=` payload — fits in
+the capture with nothing summarised. The transfer was run under `script`, which tees both directions
+of the PTY while the real kitty acts as receiver (`--log-out` = client→terminal, `--log-in` =
+terminal→client). Producing command (typed as genuine XTEST keystrokes into the kitty GUI) [OBSERVED]:
 
 ```
-$ script -q --log-out /tmp/ft_obs/q1_frames_out.bin --log-in /tmp/ft_obs/q1_frames_in.bin -c "$KITTEN transfer --compress=never /tmp/ft_obs/q1_src.bin /tmp/ft_obs/q1_dst.bin"
+$ script -e -q --log-out /work/evidence/q1small.out --log-in /work/evidence/q1small.in \
+     -c "$KITTEN transfer /work/q1_small.bin /work/q1_small_dst.bin"     # (confirmed with a genuine 'y')
 ```
 
-The complete frame inventory from that capture (every frame; each data field is shown by its exact
-base64 length and decoded byte count, so nothing is elided) [OBSERVED]:
+The complete, verbatim frame inventory from that capture — every frame, every field, the `d=` payload
+shown in full (78 base64 chars) [OBSERVED]:
 
 ```
 # CLIENT -> TERMINAL (sender kitten writes; captured via script --log-out)
-  frame 0: id=1e64bf179 ac=send
-  frame 1: id=1e64bf179 n=L3RtcC9mdF9vYnMvcTFfZHN0LmJpbg prm=420 ac=file fid=1 mod=1783967945418963894
-  frame 2: id=1e64bf179 fid=1 d=<5462 base64 chars, decodes to 4096 bytes> ac=data
-  frame 3: id=1e64bf179 fid=1 d=<2539 base64 chars, decodes to 1904 bytes> ac=end_data
-  frame 4: id=1e64bf179 ac=finish
+  ]5113;id=6b0ff93;ac=send
+  ]5113;id=6b0ff93;n=L3dvcmsvcTFfc21hbGxfZHN0LmJpbg;prm=420;fid=1;ac=file;mod=1784005135421759736
+  ]5113;id=6b0ff93;fid=1;ac=end_data;d=VGhlIG51bWJlciA1MTEzIGlzIHRoZSBudW1lcmFsaXphdGlvbiBvZiB0aGUgd29yZCAiZmlsZSIuCg
+  ]5113;id=6b0ff93;ac=finish
 # TERMINAL -> CLIENT (real kitty responds; captured via script --log-in)
-  frame 0: ac=status id=1e64bf179 st=T0s
-  frame 1: ac=status id=1e64bf179 fid=1 n=L3RtcC9mdF9vYnMvcTFfZHN0LmJpbg st=U1RBUlRFRA
-  frame 2: ac=status id=1e64bf179 fid=1 sz=4096 st=UFJPR1JFU1M
-  frame 3: ac=status id=1e64bf179 fid=1 sz=6000 n=L3RtcC9mdF9vYnMvcTFfZHN0LmJpbg st=T0s
+  ]5113;ac=status;id=6b0ff93;st=T0s
+  ]5113;ac=status;id=6b0ff93;fid=1;n=L3dvcmsvcTFfc21hbGxfZHN0LmJpbg;st=U1RBUlRFRA
+  ]5113;ac=status;id=6b0ff93;fid=1;sz=58;n=L3dvcmsvcTFfc21hbGxfZHN0LmJpbg;st=T0s
 ```
 
-The raw bytes of the small control frames, verbatim [OBSERVED]:
+Decoding every base64 field in those frames [OBSERVED]: `n` = `L3dvcmsvcTFfc21hbGxfZHN0LmJpbg` =
+`/work/q1_small_dst.bin`; the `d=` token decodes to the exact 58 source bytes
+`The number 5113 is the numeralization of the word "file".\n`; `st` values `T0s` = `OK` and
+`U1RBUlRFRA` = `STARTED`; and `prm=420` is decimal 420 = octal `0o644`, the source's permission bits.
+This 58-byte file is below the compression threshold, so the `ac=file` frame carries no `zip` field
+[OBSERVED]. The raw bytes of the small control frames, verbatim, confirm the framing [OBSERVED]:
 
 ```
-send  : b'\x1b]5113;id=1e64bf179;ac=send\x1b\\'
-file  : b'\x1b]5113;id=1e64bf179;n=L3RtcC9mdF9vYnMvcTFfZHN0LmJpbg;prm=420;ac=file;fid=1;mod=1783967945418963894\x1b\\'
-status: b'\x1b]5113;ac=status;id=1e64bf179;st=T0s\x1b\\'
+send  : b'\x1b]5113;id=6b0ff93;ac=send\x1b\\'         # 2 bytes before '5113' = 1b 5d (ESC ]); trailer = 1b 5c (ESC \)
+status: b'\x1b]5113;ac=status;id=6b0ff93;st=T0s\x1b\\'
 ```
 
-The `st=` status field is base64; decoded, `T0s` = `OK`, `U1RBUlRFRA` = `STARTED`, and
-`UFJPR1JFU1M` = `PROGRESS` [OBSERVED]. Putting the two directions together, the observed ordering for
-this 6000-byte file was: client `ac=send`; terminal `st=OK`; client `ac=file`; terminal `st=STARTED`;
-client `ac=data` (a 4096-byte chunk); terminal `st=PROGRESS sz=4096`; client `ac=end_data` (the final
-1904-byte chunk); terminal `st=OK sz=6000`; client `ac=finish`. Every frame carries the same session
-`id=1e64bf179` and, after the file is opened, the same `fid=1`, so requests and acknowledgements are
-correlated by those two IDs [OBSERVED]. This matches the documented session flow
-[SOURCE-VERIFIED: docs/file-transfer-protocol.rst:43-113]. The `prm=420` metadata is decimal 420 =
-octal `0o644`, the source file's permission bits [OBSERVED].
+Putting the two directions together, the observed ordering was: client `ac=send`; terminal `st=OK`;
+client `ac=file`; terminal `st=STARTED`; client `ac=end_data` (the whole 58-byte file in one final
+chunk); terminal `st=OK sz=58`; client `ac=finish`. Every frame carries the same session `id=6b0ff93`
+and, after the file is opened, the same `fid=1`, so requests and acknowledgements are correlated by
+those two IDs [OBSERVED]. This matches the documented session flow
+[SOURCE-VERIFIED: docs/file-transfer-protocol.rst:43-113].
+
+### Data chunking at the 4096-byte maximum, and the PROGRESS status
+
+To show the ≤4096-byte data chunking and the intermediate `PROGRESS` status, a 20,000-byte file was
+transferred. Here the `d=` fields are large, so — unlike the 58-byte case above — they are reported by
+their exact decoded byte counts and base64 lengths rather than reproduced in full (this block is
+**length-summarised**, not claimed verbatim). Producing command [OBSERVED]:
+
+```
+$ script -e -q --log-out /work/evidence/q1chunk.out --log-in /work/evidence/q1chunk.in \
+     -c "$KITTEN transfer /work/q1_chunk.bin /work/q1_chunk_dst.bin"
+```
+
+Parsed result [OBSERVED]:
+
+```
+ac=file frame carries: zip=zlib
+CLIENT data frames (5): base64-decoded payload sizes = [4096, 4096, 4096, 4096, 3637]
+  (frames 1-4 are ac=data, frame 5 is ac=end_data; each 4096-byte payload = 5462 base64 chars)
+concatenated compressed stream = 20021 bytes -> zlib.decompressobj(0) inflates to 20000 bytes == source
+TERMINAL statuses in order: T0s(OK) STARTED PROGRESS(sz=4089) PROGRESS(sz=8185) PROGRESS(sz=12281) PROGRESS(sz=16377) OK(sz=20000)
+```
+
+This demonstrates the full pipeline: the payload is (optionally zlib-compressed, then) split into
+chunks of **at most 4096 bytes**, each base64-encoded into a `d=` field; the receiver emits `PROGRESS`
+as cumulative bytes land and a final `OK` at the full size; and reassembly (concatenate the chunks,
+then inflate) reproduces the source exactly [OBSERVED]. The `st=` `PROGRESS` value decodes as
+`UFJPR1JFU1M` = `PROGRESS` [OBSERVED].
 
 ### Key abbreviations — every one, and a real specification/implementation drift
 
@@ -295,43 +361,64 @@ the identical wire format — a deliberate cross-language contract [SOURCE-VERIF
 
 ### The signature binary format — byte-verified against emitted bytes
 
-For a 250,000-byte file transferred with `-x`, the signature the receiver sent (captured on the
-terminal-to-client channel) parsed to [OBSERVED]:
+A 200,000-byte file was first transferred with `-x` (creating the basis), then a modified copy was
+retransferred with `-x` so the receiver emitted a signature. Producing commands [OBSERVED]:
 
 ```
-=== SIGNATURE (terminal->client, q2_in.bin) ===
-signature payload bytes: 10012
-12-byte header hex: 00 00 00 00 00 00 00 00 f4 01 00 00
-  version=0 checksum_type=0 strong_hash_type=0 weak_hash_type=0 block_size=500
-  sqrt(250000)=500  block_size matches sqrt? True
-per-block records: 500 (expected 250000/500 = 500)
-  first BlockHash: index=0 weak_hash=0xf88bf464 strong_hash=0x0418a1ad0d668657
+$ # basis file q2.bin (200000 bytes, sha256 72947853a1608315ec42a592d71204f4a93ca3cc83771608df28a67d506a73dd)
+$ script -e -q --log-out q2full.out  --log-in q2full.in  -c "$KITTEN transfer -x /work/q2.bin       /work/q2_dst.bin"   # basis created
+$ script -e -q --log-out q2delta.out --log-in q2delta.in -c "$KITTEN transfer -x /work/q2_moved.bin /work/q2_dst.bin"   # retransfer
+```
+
+The signature the receiver sent (captured on the terminal→client channel `q2delta.in`, three
+uncompressed `ac=data` frames) parsed to [OBSERVED]:
+
+```
+signature payload bytes: 8972
+12-byte header (LE): version=0 checksum_type=0 strong_hash_type=0 weak_hash_type=0 block_size=447
+  round(sqrt(200000)) = 447  => block_size matches sqrt? True
+per-block records: 448   (12 + 448*20 = 8972 bytes)
+  record[0]: index=0 weak_hash=0x53a2df1f strong_hash(XXH3-64)=0x3f1bea744b3af421
+  record[1]: index=1 weak_hash=0x7a19ea7b strong_hash=0x119bc40d0d3bed27
 ```
 
 The 12-byte little-endian header is `uint16 version`, `uint16 checksum_type`, `uint16
 strong_hash_type`, `uint16 weak_hash_type`, `uint32 block_size`
 [SOURCE-VERIFIED: docs/file-transfer-protocol.rst:417-458; emitted by
 kittens/transfer/algorithm.c:226-238]. The block size is `round(sqrt(file_size))`
-[SOURCE-VERIFIED: kittens/transfer/algorithm.c:204; tools/rsync/api.go:274]; `round(sqrt(250000))` =
-500, matching the emitted field [OBSERVED]. Each record is 20 bytes (`le64 index`, `le32 weak`,
+[SOURCE-VERIFIED: kittens/transfer/algorithm.c:204; tools/rsync/api.go:274]; `round(sqrt(200000))` =
+447, matching the emitted field [OBSERVED]. Each record is 20 bytes (`le64 index`, `le32 weak`,
 `le64 strong`) [SOURCE-VERIFIED: kittens/transfer/algorithm.c:246-260].
 
-### The delta operations — parsed from a real delta stream
+### Moved/shifted-block detection (position-independent matching) and the delta operations
 
-The delta the sender emitted for the same file (a small-edit case) parsed to [OBSERVED]:
+Because the weak checksum is rolled at every byte offset, blocks are matched by content regardless of
+where they moved in the file. The retransferred `q2_moved.bin` (200,777 bytes,
+sha256 `c375f52a7048e9261e72fb945ef2bb7ae7d7182142d0fe18119ebba488eb74e8`) is the 200,000-byte basis
+with 777 novel bytes prepended. The delta the sender emitted (captured on `q2delta.out`; the `ac=file`
+frame carried `zip=zlib`, so the single `ac=end_data` `d=` payload was zlib-inflated before parsing)
+parsed to [OBSERVED]:
 
 ```
-=== DELTA (client->terminal, q2_out.bin) ===
-delta payload bytes: 550
-op counts: {'OpBlock': 0, 'OpData': 1, 'OpHash': 1, 'OpBlockRange': 2} (550/550 bytes parsed)
-first ops: OpBlockRange(start=0,+239) -> OpData(size=500) -> OpBlockRange(start=241,+258) -> OpHash(size=16)
+delta wire payload: 523 compressed bytes -> zlib.decompressobj(0) -> 1010 raw serialized bytes
+op sequence:
+  1. OpData(777)              -> the 777 prepended novel bytes (literal)
+  2. OpBlockRange(0, +446)    -> basis blocks 0..446 = 447 MATCHED blocks (each shifted 777 bytes later)
+  3. OpData(191)              -> the 191-byte partial trailing block (basis block 447) re-sent literally
+  4. OpHash(16, 9beb52360bb77d8dd687fac02a1f6ceb) -> XXH3-128 whole-file integrity checksum
+matched basis blocks = 447 of 448 ; literal OpData bytes = 968 = 777 (prefix) + 191 (partial tail)
 ```
 
-Matched runs of blocks became two `OpBlockRange` references, the changed block became one
-`OpData(500)`, and a final `OpHash(16)` carried the XXH3-128 integrity checksum [OBSERVED]. The op
-type/width layout matches the specification: `Block(0)`=`uint64 index`; `Data(1)`=`uint32 size` +
-payload; `Hash(2)`=`uint16 size` + checksum; `BlockRange(3)`=`uint64 start` + `uint32 (end-start)`
-[SOURCE-VERIFIED: docs/file-transfer-protocol.rst:460-488; tools/rsync/algorithm.go:104-140].
+The op type/width layout matches the specification: `Block(0)`=`uint64 index`; `Data(1)`=`uint32 size`
++ payload; `Hash(2)`=`uint16 size` + checksum; `BlockRange(3)`=`uint64 start` + `uint32 (end-start)`
+[SOURCE-VERIFIED: docs/file-transfer-protocol.rst:460-488; tools/rsync/algorithm.go:104-140]. The
+200,000-byte basis divides into 447 full 447-byte blocks (447 × 447 = 199,809 bytes) plus a 191-byte
+partial trailing block — **448 basis blocks**, matching the 448 signature records. Only the 777
+prepended bytes plus that 191-byte partial tail were sent as literal `OpData`
+(447 × 447 + 191 + 777 = 200,777 = the full new-file size); the partial tail cannot be matched as a
+whole block because it is shorter than the 447-byte window. The 447 full original blocks were
+referenced by their **original index** through a single `OpBlockRange[0..446]`, even though every one
+had shifted 777 bytes later in the file — so the match is **447 of 448 basis blocks** [OBSERVED].
 
 ### The match mechanism
 
@@ -342,448 +429,462 @@ The sender's delta is produced by `Differ.CreateDelta(src, output)`
 delegates to the streaming `(*rsync).CreateDiff` [SOURCE-VERIFIED: tools/rsync/api.go:239]. The
 low-level convenience wrapper `(*rsync).CreateDelta` funnels through the same `CreateDiff` and
 collects the ops into a slice [SOURCE-VERIFIED: tools/rsync/algorithm.go:599-601]. That routine
-detects matches by rolling the weak checksum byte-by-byte and, on a weak-hash hit,
-confirming with the strong hash [SOURCE-VERIFIED: tools/rsync/algorithm.go]: `hash_lookup
-map[uint32][]BlockHash` is keyed by weak hash and built from the received signature
-[algorithm.go:366,617-623]; the window advances via `self.rc.add_one_byte(...)` [algorithm.go:543];
-`if hh, ok := self.hash_lookup[self.rc.val]; ok` is the weak-hash lookup [algorithm.go:556] and
-`find_hash(...)` confirms with `block.StrongHash == hv` (XXH3-64) before emitting a reference
-[algorithm.go:557,641-643].
+detects matches by rolling the weak checksum byte-by-byte and, on a weak-hash hit, confirming with the
+strong hash [SOURCE-VERIFIED: tools/rsync/algorithm.go]: `hash_lookup map[uint32][]BlockHash` is keyed
+by weak hash and built from the received signature [algorithm.go:366,617-623]; the window advances via
+`self.rc.add_one_byte(...)` [algorithm.go:543]; `if hh, ok := self.hash_lookup[self.rc.val]; ok` is
+the weak-hash lookup [algorithm.go:556] and `find_hash(...)` confirms with `block.StrongHash == hv`
+(XXH3-64) before emitting a reference [algorithm.go:557,641-643]. The weak hash is `rolling_checksum`
+[algorithm.go:336,341,355], the strong block hash is XXH3-64 (`new_xxh3_64` [algorithm.go:59]), and
+the integrity checksum is XXH3-128 (`new_xxh3_128` [algorithm.go:65]). The C server's analogous
+position-independent match is [SOURCE-VERIFIED: kittens/transfer/algorithm.c:719-747].
 
-### Moved/shifted-block detection (position-independent matching)
 
-Because the weak checksum is rolled at every byte offset, blocks are matched by content regardless of
-where they moved to in the file. This was demonstrated by prepending 777 novel bytes to a
-200,000-byte basis and re-transferring with `-x` [OBSERVED]:
+## Q3 — Chunk encoding, receiver reassembly, and distinction from terminal output
 
-```
-delta payload bytes: 1010 (vs full src 200777 bytes)
-op counts: {'OpBlock': 0, 'OpData': 2, 'OpHash': 1, 'OpBlockRange': 1}
-first ops: OpData(size=777) -> OpBlockRange(start=0,+446) -> OpData(size=191) -> OpHash(size=16)
-literal OpData bytes total: 968 (~= the 777 prepended novel bytes)
-blocks referenced (OpBlock + sum OpBlockRange spans): 447 of 448 basis blocks (200000/447)
-```
+### How chunks are encoded on the wire — base64 RawStdEncoding
 
-Here the basis file's block size is `round(sqrt(200000))` = **447** bytes
-[SOURCE-VERIFIED: kittens/transfer/algorithm.c:204] (distinct from the 500-byte block size of the
-250,000-byte example above, which is `round(sqrt(250000))` = 500), so the 200,000-byte basis divides
-into 447 full 447-byte blocks (447 × 447 = 199,809 bytes) plus a 191-byte partial trailing block —
-**448 basis blocks** in total, matching the 448 signature records the receiver emitted. Only the 777
-prepended bytes plus that 191-byte partial tail were sent as literal `OpData` (447 × 447 + 191 + 777 =
-200,777 = the full new-file size, confirmed by the reconstruction cross-check [OBSERVED]); the partial
-tail cannot be matched as a whole block because it is shorter than the 447-byte rolling window. The
-447 full original blocks were referenced by their **original index** through a single
-`OpBlockRange[0..446]`, even though every one had shifted 777 bytes later in the file [OBSERVED]. The
-position-independent lookup that makes this possible is `self.hash_lookup[self.rc.val]`
-[SOURCE-VERIFIED: tools/rsync/algorithm.go:532-567]; the C server's analogue is
-[SOURCE-VERIFIED: kittens/transfer/algorithm.c:719-747].
-
-## Q3 — Chunk encoding, reassembly, and distinction from terminal output
-
-### Encoding: base64 (RawStdEncoding)
-
-The `d=` data field is base64, using Go's RawStdEncoding (no `=` padding)
-[SOURCE-VERIFIED: kittens/transfer/ftc.go:178-189]. An exact-known 89-byte file was transferred and
-every stage hashed [OBSERVED]:
+The `d=` data field (and the `name`/`status`/`bypass` fields) are base64-encoded before being placed
+between the OSC introducer and the ST terminator. The Go client uses standard base64 **without
+padding** — `base64.RawStdEncoding` — for both string fields and the raw data bytes
+[SOURCE-VERIFIED: kittens/transfer/ftc.go:178-189], and decodes with the same encoding on the
+receive/verify path [SOURCE-VERIFIED: kittens/transfer/ftc.go:248]. RawStdEncoding was confirmed
+against the exact bytes emitted for the 58-byte file used in Q1 — a full source → base64 → decode
+round-trip [OBSERVED]:
 
 ```
-d= token (raw, from wire):
-a2l0dHkgT1NDIDUxMTMgUTMgZXhhY3QtYnl0ZSBkZW1vOiAwMTIzNDU2Nzg5IEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaIGFiY2RlZmdoaWprbG1ubwo
-token has trailing '=' padding?  False
-source   bytes: 89 sha256: 3d52fde3c7d726c3b05fcf1612c0bb4f2ac279c677c0789502b576fad85eed3d
-decoded  bytes: 89 sha256: 3d52fde3c7d726c3b05fcf1612c0bb4f2ac279c677c0789502b576fad85eed3d
-dest     bytes: 89 sha256: 3d52fde3c7d726c3b05fcf1612c0bb4f2ac279c677c0789502b576fad85eed3d
-decoded == source ? True
-dest    == source ? True
+source_len      = 58
+source_sha256   = e0f2ed47de25afbad79b45a8625659e6d63b91ee2b287d6b7ffb50d5ccdd3a2a
+std_b64(padded) = VGhlIG51bWJlciA1MTEzIGlzIHRoZSBudW1lcmFsaXphdGlvbiBvZiB0aGUgd29yZCAiZmlsZSIuCg==
+RawStd(no pad)  = VGhlIG51bWJlciA1MTEzIGlzIHRoZSBudW1lcmFsaXphdGlvbiBvZiB0aGUgd29yZCAiZmlsZSIuCg
+wire d= token   = VGhlIG51bWJlciA1MTEzIGlzIHRoZSBudW1lcmFsaXphdGlvbiBvZiB0aGUgd29yZCAiZmlsZSIuCg
+RawStd==wire?   = True          # padded form has a trailing '=='; the wire token is RawStd (unpadded)
+decoded_len     = 58
+decoded_sha256  = e0f2ed47de25afbad79b45a8625659e6d63b91ee2b287d6b7ffb50d5ccdd3a2a
+decoded==source = True
 ```
 
-The token carries no `=` padding (RawStdEncoding), decodes to exactly 89 bytes, and the source, the
-base64-decoded token, and the destination kitty wrote all share SHA-256
-`3d52fde3c7d726c3b05fcf1612c0bb4f2ac279c677c0789502b576fad85eed3d` [OBSERVED].
+The padded standard encoding ends in `==`; the wire token is exactly the padded form with the padding
+removed, proving RawStdEncoding [OBSERVED].
 
-### Reassembly and the server handler chain (precise citations)
+### How the receiver reassembles — the handler chain, end to end
 
-Incoming OSC 5113 bytes travel `kitty/vt-parser.c`, then `kitty/screen.c`, then `kitty/window.py`,
-then `kitty/file_transmission.py`. The exact hop citations are [SOURCE-VERIFIED]:
+The protocol number is defined once as `#define FILE_TRANSFER_CODE 5113`
+[SOURCE-VERIFIED: kitty/control-codes.h:233]. On the receiving terminal, an incoming OSC 5113 sequence
+flows through this chain [SOURCE-VERIFIED]:
 
-- `kitty/vt-parser.c:547-550` — `case FILE_TRANSFER_CODE:` then `DISPATCH_OSC(file_transmission)`.
-- `kitty/screen.c:2311-2312` — `file_transmission(Screen*, PyObject*)` calls back into Python.
-- `kitty/window.py:1388-1389` — `file_transmission()` forwards to
-  `self.file_transmission_control.handle_serialized_command(data)`.
+1. `kitty/vt-parser.c:547-550` — the OSC dispatcher matches `case FILE_TRANSFER_CODE:` and calls
+   `DISPATCH_OSC(file_transmission)`.
+2. `kitty/screen.c:2311-2312` — `file_transmission(Screen *self, PyObject *cmd)` hands the command to
+   the Python layer.
+3. `kitty/window.py:1388-1389` — `file_transmission()` forwards to
+   `self.file_transmission.handle_serialized_command(...)`.
+4. `kitty/file_transmission.py` — `handle_serialized_command()` parses the command and drives
+   reassembly [file_transmission.py:803]; for a data chunk it base64-decodes the payload and appends
+   it to the active file, writing through `DestFile` (simple) or `PatchFile` (rsync)
+   [file_transmission.py:599,858]. During an rsync receive,
+   `ActiveReceive.signature_pending_chunks` buffers the signature chunks that the server produces
+   [file_transmission.py:599].
 
-Within `file_transmission.py` the work is **distributed across several methods** — the frequently
-cited `handle_serialized_command` only deserializes and dispatches; it does not itself decode, buffer,
-decompress, or write [SOURCE-VERIFIED]:
+Reassembly is therefore: base64-decode each `d=` chunk, (zlib-inflate if the file declared
+`zip=zlib`), and append in order to the destination file. The Q1 20,000-byte case demonstrated this
+end to end: five decoded compressed chunks `[4096,4096,4096,4096,3637]` were concatenated into a
+20,021-byte zlib stream and inflated back to the exact 20,000-byte source [OBSERVED, see Q1].
 
-- `handle_serialized_command(:858)` — calls `FileTransmissionCommand.deserialize(data)` and
-  dispatches; that is all it does.
-- `deserialize(:329-351)` — base64-decodes `bytes` fields via `base64_decode(val)` (this is where the
-  `d=` payload is decoded) and decodes base64 vs `safe_string` for string fields per each field's
-  metadata.
-- `ActiveReceive.add_data(:623-631)` — routes a decoded chunk to `DestFile.write_data`.
-- `DestFile.write_data(:510)` — for a regular file: decompresses at `:542`
-  (`self.decompressor(...)`), lazily opens the destination with
-  `os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC` at `:546-547`, and writes the decompressed
-  bytes with `af.write(decompressed)` at `:550`.
-- `ZlibDecompressor(:367-371)` — `zlib.decompressobj(wbits=0)` then `self.d.decompress(data)`.
-- `PatchFile.write / write_to_dest(:420-423)` — the rsync path applies delta operations instead of a
-  plain write.
-- The send side serializes outgoing commands around `:1086-1128`.
+### How transfer data is distinguished from ordinary terminal output
 
-### Distinction: how transfer data is told apart from ordinary output
+Distinction happens **at parse time in the VT parser**: only a byte sequence introduced by `ESC ] 5113
+; … ST` reaches `case FILE_TRANSFER_CODE` and thus `file_transmission`
+[SOURCE-VERIFIED: kitty/vt-parser.c:547-550]. Ordinary terminal output — even output whose *text*
+happens to contain the characters `5113` and `ac=send` — is never wrapped in that OSC introducer, so
+it is rendered as glyphs and never routed to the handler. This was verified at runtime by displaying
+3,000 ordinary lines each literally containing `5113 ac=send` in the real kitty window while stracing
+the kitty receiver for any destination-creating `openat`, then contrasting with a genuine transfer.
+Producing commands (typed as genuine XTEST keystrokes into the focused kitty window) [OBSERVED]:
 
-Only byte sequences wrapped as `\x1b]5113;...\x1b\\` reach the file-transmission branch; ordinary
-terminal output is never wrapped that way, so it never enters `case FILE_TRANSFER_CODE:`. This was
-confirmed by capturing ordinary command output and a real transfer through the same terminal
+```
+# Part A — ordinary output through the real terminal:
+$ cat /work/q3_ord_lines.txt          # 3000 lines, each: 'line N: 5113 ac=send ... fid=N'
+   PART A ordinary-output: marker_seen=YES  total_openat_traced=0  openat_CREATE_of_transfer_dest=0
+
+# Part B — a genuine OSC-5113 transfer of the same 58-byte file:
+$ /work/src/kitty/launcher/kitten transfer /work/q1_small.bin /work/q3_real_dst.bin   # confirmed with 'y'
+   PART B real-transfer: done=D=0  dst_exists=YES
+   23641 openat(AT_FDCWD, "/work/q3_real_dst.bin", O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0644) = 9
+   q3_real_dst sha256 = e0f2ed47de25afbad79b45a8625659e6d63b91ee2b287d6b7ffb50d5ccdd3a2a == source
+```
+
+Displaying 3,000 lines of ordinary text that literally contain `5113 ac=send` produced **zero**
+destination-creating `openat` calls in the kitty process, whereas the genuine transfer produced
+exactly one `openat(..., O_CREAT, ...)` for the destination and reproduced the source byte-for-byte
+[OBSERVED]. That is precisely how transfer data is separated from regular terminal output: the OSC
+5113 introducer, not the payload text, is the discriminator.
+
+
+## Q4 — Transfer resumption: the state and where the metadata lives
+
+### The direct answer
+
+The state that lets an interrupted transfer resume rather than restart is **the existing (possibly
+partial) destination file itself**. The "resumption metadata" is the **rsync signature computed on the
+fly from that partial file** — there is **no separate sidecar resume file** on disk. The
+`--transmit-deltas`/`-x` help text states the flag uses rsync "potentially saving lots of bandwidth
+and also automatically resuming partial transfers"
+[SOURCE-VERIFIED: kittens/transfer/main.py:116-122]. The crux is in `DestFile.signature_iterator()`,
+which constructs the patcher from the **existing** file's current size
+[SOURCE-VERIFIED: kitty/file_transmission.py:470-471]:
+
+```
+def signature_iterator(self) -> PatchFile:
+    self.actual_file = PatchFile(self.name, self.existing_stat.st_size if self.existing_stat is not None else 0)
+    return self.actual_file
+```
+
+`PatchFile.__init__` feeds that size straight into the C rsync `Patcher(expected_size)`, which sizes
+the blocks from it [SOURCE-VERIFIED: kitty/file_transmission.py:379-383].
+
+### Runtime proof — genuine interrupt, then resume, twice
+
+A large transfer was started, then genuinely interrupted with **Ctrl+C** (`xdotool key ctrl+c`)
+targeting the process whose `comm` is literally `kitten` (the sender), with the kitty GUI PID
+explicitly excluded so the terminal itself was never signalled [OBSERVED]:
+
+```
+INTERRUPT target_pid=23878 comm=kitten at_dst=4308960 (KITTY_PID=23641 excluded)     # run 1
+INTERRUPT target_pid=24120 comm=kitten at_dst=17776384 (KITTY_PID=23641 excluded)    # run 2
+```
+
+The transfer was then resumed with `-x`. The signature the receiver computed from the **partial**
+destination (parsed byte-exact from the resume capture's terminal→client channel) was [OBSERVED]:
+
+```
+q4_r1_resume: sig_bytes=49992 block_size=2498 n_records=2499   round(sqrt(partial))=2498
+   rec0: index=0 weak=0x0f80e321 strong=0x510409b512084112
+q4_r2_resume: sig_bytes=89192 block_size=4458 n_records=4459   round(sqrt(partial))=4458
+   rec0: index=0 weak=0x1e06bb05 strong=0xe6009f48cdc77cec
+```
+
+The block size is `round(sqrt(partial_size))`, **not** `round(sqrt(full_size))` — proving the
+signature is taken over the partial file that already exists, which is exactly what makes the resume
+send only the missing tail. `sig_bytes` equals `12 + n_records*20` in both runs (49992 = 12+2499·20;
+89192 = 12+4459·20) [OBSERVED]. Both runs completed with the destination byte-identical to the source
+(`Q4OK_1784007584`), and there was **no sidecar resume file** anywhere on disk — the only artifacts
+are the source and the destination [OBSERVED].
+
+### The transient patch tempfile — a clean strace (no `-y` annotations)
+
+While applying the delta the server writes to a **transient tempfile** and atomically renames it into
+place. A clean strace (no `strace -y` path annotations, so the raw syscalls are unambiguous) captured
 [OBSERVED]:
 
 ```
-=== NORMAL command output capture (q3_normal.bin) ===
-bytes repr: b'Script started on 2026-07-13 18:42:20+00:00 [COMMAND="printf \'hello world\\n\'; printf \'ordinary output, no OSC 5113\\n\'" T'
-contains b'\x1b]5113' ? -> False
-
-=== REAL TRANSFER capture (q3_out.bin) ===
-contains b'\x1b]5113' ? -> True
+openat(AT_FDCWD, "/work/q4t_dst.bin", O_RDONLY|O_CLOEXEC) = 9                                    # read existing partial to sign
+openat(AT_FDCWD, "/work/tmpp1_t693p", O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 10     # transient patch tempfile
+rename("/work/tmpp1_t693p", "/work/q4t_dst.bin") = 0                                             # atomic replace into place
 ```
 
-The discriminator is structural — the OSC introducer plus the code 5113
-[SOURCE-VERIFIED: kitty/vt-parser.c:547-550]. Ordinary output carries no such wrapper, so it is never
-routed to the handler [INFERRED, from the observed presence/absence above and the parser branch].
+(The full capture contains only these plus routine `/proc/<pid>/stat` reads; the count of `</…>`
+annotations is **0**.) The tempfile is created by
+`tempfile.NamedTemporaryFile(mode='wb', dir=…, delete=False)`
+[SOURCE-VERIFIED: kitty/file_transmission.py:391-392] and moved into place with `os.replace(...)`
+[SOURCE-VERIFIED: kitty/file_transmission.py:405]. The `O_EXCL|O_NOFOLLOW|0600` flags come from
+Python's `tempfile`, giving a private, non-symlink-following, owner-only patch file. During an rsync
+receive the signature chunks the receiver produces are buffered in
+`ActiveReceive.signature_pending_chunks` before being fed to the patcher
+[SOURCE-VERIFIED: kitty/file_transmission.py:599].
 
-### One definition of 5113 for three languages
+### P4-F4 correction — there is NOT one universal "4096 gate"; there are THREE asymmetric gates
 
-The protocol number is defined once and propagated [SOURCE-VERIFIED]:
+The rsync/delta path is guarded by **three different conditions in three different places**, and they
+are **not** the same test. Two are `> 4096` thresholds on different sizes; the third is an
+**existence** test with no threshold at all. All three were exercised at runtime and parsed
+byte-exact:
 
-```
-kitty/control-codes.h:233   #define FILE_TRANSFER_CODE 5113
-kitty/data-types.c:596      PyModule_AddIntMacro(m, FILE_TRANSFER_CODE);
-gen/go_code.py:575          from kitty.fast_data_types import FILE_TRANSFER_CODE
-gen/go_code.py:597          const FileTransferCode int = {FILE_TRANSFER_CODE}
-```
+| # | Where the gate lives | Exact condition (source) | What it tests | Runtime scenario | Observed result |
+|---|---|---|---|---|---|
+| 1 | **Sender** (Go client) | `rsync_capable: … stat_result.Size() > 4096` [send.go:131] | **source** file size > 4096 | (a) 4096-byte **source**, fresh dest | `tt=None`, **no signature** — simple path (4096 is not > 4096) |
+| 2 | **Server / terminal, download** (Python) | `sz > -1 and df.ttype is rsync and df.ftype is regular`, where `sz = existing_stat.st_size … else -1` [file_transmission.py:1024-1028] | destination **exists** (`sz > -1`) — **no** size threshold | (b) 8192-byte source, **4096-byte existing** dest | `tt=rsync`, **signature 1292 B, block_size=64, 64 records** |
+| 3 | **Receiver** (Go client) | `read_signature = s.Size() > 4096` [receive.go:404-410] | **basis** file size > 4096 | (c) 16000-byte **basis**, `--direction=upload` | `tt=rsync`, **signature 2512 B, block_size=128, 125 records** |
 
-The `gen/go_code.py` f-string template `{FILE_TRANSFER_CODE}` is expanded at code-generation time to
-the literal `5113` in the emitted Go source, so the same integer is shared by the C core, the Python
-module, and the Go kitten.
+So a 4096-byte file "stays simple" only because of the **sender** gate (scenario a); on the **download**
+path an existing destination of *exactly* 4096 bytes **does** engage rsync (scenario b), because that
+gate is existence-based, not `> 4096`. This is the precise correction to the earlier "universal
+symmetric 4096 gate" framing [OBSERVED + SOURCE-VERIFIED].
 
-## Q4 — Transfer resumption: the state that allows resume, and where the metadata lives
+### The two engines size blocks by DIFFERENT formulas (a real secondary asymmetry)
 
-The state that lets an interrupted transfer resume rather than restart is the **existing (partial)
-destination file** itself. The "resumption metadata" is the rsync **signature computed on the fly
-from that partial file** — there is **no persistent resume-metadata sidecar**. The `-x` help text
-states the flag uses rsync "potentially saving lots of bandwidth and also automatically resuming
-partial transfers" [SOURCE-VERIFIED: kittens/transfer/main.py:116-122]. The receiver builds the
-signature from the existing regular file only when it exceeds 4096 bytes, then sets up
-`NewPatcher(...)` and `CreateSignatureIterator(...)`
-[SOURCE-VERIFIED: kittens/transfer/receive.go:404-425].
+The signature block sizes above differ because the **C server** and the **Go client** compute
+`block_size` differently:
 
-### Runtime demonstration (genuine interrupt then resume, two runs)
+- **C server** (`kittens/transfer/algorithm.c`): `block_size = round(sqrt(expected_input_size))` with
+  no hash-block rounding [SOURCE-VERIFIED: kittens/transfer/algorithm.c:203-204]. Scenario (b):
+  `round(sqrt(4096)) = 64` → 64 records over the 4096-byte basis (`ceil(4096/64)=64`) [OBSERVED].
+- **Go client** (`tools/rsync/api.go`, `NewPatcher`): `bs = round(sqrt(expected_input_size))`, then
+  **floored to a multiple of `HashBlockSize()`** when that is smaller
+  [SOURCE-VERIFIED: tools/rsync/api.go:270-286]. `HashBlockSize()` = `hasher.BlockSize()`
+  [SOURCE-VERIFIED: tools/rsync/algorithm.go:637], and the XXH3 hasher's block size is **64** (module
+  `github.com/zeebo/xxh3` v1.0.2). Scenario (c): source (expected) = 20000, `round(sqrt(20000)) = 141`,
+  floored to a multiple of 64 = **128**; the signature over the 16000-byte basis then has
+  `ceil(16000/128) = 125` records → 2512 B (`12 + 125·20`) [OBSERVED]. This exactly reproduces the
+  parsed values.
 
-A 314,572,800-byte file was transferred; the sender kitten was caught mid-flight and terminated with
-a targeted signal (its exact PID captured and verified `comm=kitten` before signalling), then the
-transfer was resumed with `-x`. Two runs interrupted at different fractions
-(`SRC sha256=c629fd32604032ee8f1b16639701e368904a8daa4905eebfd2d854e3f14c5795`).
 
-Run 1 — interrupted at ~7% (21,970,702 of 314,572,800), then resumed [OBSERVED]:
+## Q5 — Delta efficiency: transfer, modify a small portion, retransfer, measure
 
-```
-=== BEFORE (t0): dst listing ===
-ls: cannot access '/tmp/ft_obs/q4_dst.bin': No such file or directory
-=== DURING (t1): caught partial dst=20054036 sender PID=131525 comm=kitten ===
-CAUGHT_SIZE=20054036 KILLED_PID=131525
-=== AFTER INTERRUPT (t2): partial dst listing ===
--rw-r--r-- 1 root root 21970702 Jul 13 18:50 /tmp/ft_obs/q4_dst.bin
-PARTIAL_SIZE=21970702  (full=314572800; partial? YES)
-partial dst sha256      : e787e7c29e05aae93836cbc7c1df3c9a03c9a69bc8570769da31ce26cc1f33c1
-source[:21970702] sha256 : e787e7c29e05aae93836cbc7c1df3c9a03c9a69bc8570769da31ce26cc1f33c1
-PREFIX MATCH: YES
-```
+### The experiment and its scale
 
-The resume command and its result [OBSERVED]:
-
-```
-$ script -q --log-out /tmp/ft_obs/q4_out.bin --log-in /tmp/ft_obs/q4_in.bin -c "$KITTEN transfer -x /tmp/ft_obs/q4_src.bin /tmp/ft_obs/q4_dst.bin"
-resume completed to full size? yes  final_size=314572800
-final dst sha256: c629fd32604032ee8f1b16639701e368904a8daa4905eebfd2d854e3f14c5795
-source  sha256: c629fd32604032ee8f1b16639701e368904a8daa4905eebfd2d854e3f14c5795
-HASH MATCH (resume produced identical file): YES
-```
-
-The resume used the rsync path, and the receiver's signature was computed **over the partial**, not
-the full source — the decisive evidence being the signature's block size [OBSERVED]:
+A **16 MiB** deterministic, incompressible file was used so the byte counts are large enough to be
+representative and exactly reproducible [OBSERVED]:
 
 ```
-ac=file frame fields: {'id': '20862f1db', 'mod': '1783968518192690389', 'prm': '420', 'ac': 'file', 'zip': 'zlib', 'fid': '1', 'n': 'L3RtcC9mdF9vYnMvcTRfZHN0LmJpbg', 'tt': 'rsync'}
+q5_src.bin (pristine) = 16,777,216 bytes (16 MiB)
+  sha256 = 4d400f720aeaee5b4fcb275f819c01fcfab9abaa3512ed8d0c0061447b4d75c5
+  block_size = round(sqrt(16777216)) = 4096 ; n_blocks = 16777216/4096 = 4096
+  predicted signature size = 12 + 4096*20 = 81932 bytes   [CONFIRMED on the wire below]
+modification: flip 1 byte at offset 8,000,000  ->  block 1953 (block spans [7999488, 8003584))
+  modified sha256 = 0b974ed77387e5138b4a7b83838481802cff55cfba50d35b54a06c1ca7544c09
+```
+
+### First transfer (no basis on the receiver) — the whole file is sent
+
+```
+first transfer: 4111 ac=data frames + 1 ac=end_data ; base64-decoded payload = 16,777,216 bytes (ENTIRE FILE)
+                wire payload (zlib-wrapped incompressible random) = 16,782,347 bytes
+                net transfer time = 0.594 s
+```
+
+The sender advertises `tt=rsync` (its source > 4096, gate #1), but the receiver has no basis, so the
+existence gate (#2, `sz = -1`) yields `simple` and the sender streams all 4096 blocks literally
+[OBSERVED, consistent with the Q4 gate analysis].
+
+### Second transfer with `-x` (basis = the pristine file) — four independent runs
+
+Each delta run was preceded by restoring the pristine 16 MiB basis on the receiver, then transferring
+the 1-byte-modified source with `-x`. Four independent runs were byte-identical [OBSERVED]:
+
+```
+RUN       raw_delta  wire_delta  signature  total(delta+sig)  block_size  n_records  net_time
+q5dA         4146       4162       81932        86078            4096        4096      0.095 s
+q5dB         4146       4162       81932        86078            4096        4096      (untimed)
+q5dA_t       4146       4162       81932        86078            4096        4096      0.095 s
+q5dB_t       4146       4162       81932        86078            4096        4096      0.099 s
+```
+
+The delta op sequence was identical in every run [OBSERVED]:
+
+```
+[ BlockRange(0, 1952), Data(4096), BlockRange(1954, 2141), Hash(16) ]
+  BlockRange(0, 1952)    -> basis blocks 0..1952  = 1953 blocks copied (unchanged)
+  Data(4096)             -> block 1953 (the changed block) sent LITERALLY
+  BlockRange(1954, 2141) -> basis blocks 1954..4095 = 2142 blocks copied (unchanged)
+  Hash(16)               -> XXH3-128 whole-file integrity checksum
+  reconstruction: 1953 + 1 + 2142 = 4096 blocks == n_blocks (EXACT)
+  literal fraction: 1 of 4096 blocks = 0.0244%
+raw-delta arithmetic: BlockRange(13) + Data(1+4+4096=4101) + BlockRange(13) + Hash(1+2+16=19) = 4146  [CONFIRMED]
+signature record[0]: index=0 weak=0x96bdfdb1 strong=0xb0f3d1f304db40ef  (identical all runs)
+```
+
+### The measurable evidence — `print_rsync_stats`
+
+The mechanism that reports the savings is `print_rsync_stats`, printed unconditionally after a
+successful rsync transfer [SOURCE-VERIFIED: kittens/transfer/utils.go:109-113; call site
+kittens/transfer/send.go:1260, guarded by `if tsf > 0`]. Its verbatim output on the delta run
+(control bytes stripped for legibility; identical across all runs) [OBSERVED]:
+
+```
 Rsync stats:
-  Delta size: 293 MB Signature size: 94 kB
-  Transmitted: 293 MB of a total of 315 MB (93.1%)
-signature payload bytes decoded from q4_in.bin: 93772
-12-byte header hex: 00 00 00 00 00 00 00 00 4f 12 00 00
-  block_size=4687
-  round(sqrt(partial=21970702)) = 4687  => block_size matches sqrt(PARTIAL)? True
-  round(sqrt(full=314572800)) = 17736  => NOT used (proves signature is over the EXISTING PARTIAL)
-  first BlockHash: index=0 weak_hash=0xca422098 strong_hash=0xd8a9006b419def05
+  Delta size: 4.1 kB Signature size: 82 kB
+  Transmitted: 86 kB of a total of 17 MB (0.5%)
 ```
 
-`block_size` = `round(sqrt(21970702))` = 4687, the square root of the **partial** size, not of the
-full source (whose root is 17736) [OBSERVED; formula SOURCE-VERIFIED: kittens/transfer/algorithm.c:204].
-Because the already-present ~22 MB was matched by rsync and not re-sent, only a 293 MB delta was
-transmitted for a 315 MB file [OBSERVED].
-
-Run 2 — interrupted at ~32% (101,662,737 bytes), reproducing the behaviour [OBSERVED]:
+### The numbers — second transfer versus first
 
 ```
-=== DURING (t1): caught partial dst=100151453 sender PID=134361 comm=kitten ===
-=== AFTER INTERRUPT (t2): partial=101662737  (partial? YES) ===
-prefix match: YES  partial_sha256=dec498cc52f0b3a601bfc83920992c4b4a8b5d69455d360d40edb15b9431790d
-tt=rsync
-Rsync stats:
-  Delta size: 213 MB Signature size: 202 kB
-  Transmitted: 213 MB of a total of 315 MB (67.8%)
-signature decoded bytes=201672 block_size=10083  round(sqrt(partial=101662737))=10083
-final sha256 : c629fd32604032ee8f1b16639701e368904a8daa4905eebfd2d854e3f14c5795
-source sha256: c629fd32604032ee8f1b16639701e368904a8daa4905eebfd2d854e3f14c5795
-HASH MATCH: YES
+transmitted (delta + signature) = 4146 + 81932 = 86078 bytes
+transmitted fraction            = 86078 / 16777216 = 0.513065%
+overall reduction               = 16777216 / 86078  = 194.9071x
+delta-only reduction            = 16777216 / 4146    = 4046.6x
+wall-clock                       = full 0.594 s  vs  delta 0.095-0.099 s  (~6x faster)
 ```
 
-Both runs completed to a byte-identical copy of the source; the mechanism is stable [OBSERVED].
+The second transfer sent **0.513%** of the original file's bytes — a **194.9×** reduction — while
+reproducing the destination byte-for-byte [OBSERVED].
 
-### No persistent sidecar, but a transient patch file (precise wording)
+### Stability and declared tolerance (P4-F3)
 
-There is no persistent resume-metadata sidecar — the signature is computed **on the fly**, block by
-block, by `PatchFile.next_signature_block` [SOURCE-VERIFIED: kitty/file_transmission.py:426] and
-streamed straight back to the sender by `FileTransmission.transmit_rsync_signature`
-[SOURCE-VERIFIED: kitty/file_transmission.py:1081]; the only in-memory retention is the transient
-backpressure buffer `ActiveReceive.signature_pending_chunks` (a `Deque[FileTransmissionCommand]`)
-[SOURCE-VERIFIED: kitty/file_transmission.py:599], into which a signature chunk is appended only when
-the child pipe is momentarily full [SOURCE-VERIFIED: kitty/file_transmission.py:1119,1121] and which
-is drained first on the next scheduled pass before more blocks are read
-[SOURCE-VERIFIED: kitty/file_transmission.py:1086-1088]. During an rsync **patch**, however,
-`PatchFile` creates a **transient** output file:
-`tempfile.NamedTemporaryFile(mode='wb', dir=os.path.dirname(realpath(path)), delete=False)`
-[SOURCE-VERIFIED: kitty/file_transmission.py:392], and on close it does
-`os.replace(self.dest_file.name, self.src_file.name)`
-[SOURCE-VERIFIED: kitty/file_transmission.py:405]. That transient file was observed live via `strace`
-of the kitty receiver during Run 2, then seen renamed onto the destination [OBSERVED]:
+The source file and the edit are both deterministic, so exact reproducibility is expected. **Declared
+tolerance: ±0 bytes.** Observed variation across the four delta runs: **0 bytes** for the delta, **0
+bytes** for the signature, **0 bytes** for the total — within tolerance. The only run-to-run variation
+was ~4 ms of scheduling jitter in the net transfer time (0.095–0.099 s) [OBSERVED]. These figures also
+cross-validate the Report 7 control (signature 81932 / delta 4146 / total 86078 / 0.513% / 194.9×)
+[OBSERVED].
 
-```
-122499 openat(AT_FDCWD</tmp/blitzy/kitty/blitzy-dc55a543-7db2-41a4-8fbc-3537be540314_8d3e93>, "/tmp/ft_obs/tmp1pwl3tqe", O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 17</tmp/ft_obs/tmp1pwl3tqe>
-122499 rename("/tmp/ft_obs/tmp1pwl3tqe", "/tmp/ft_obs/q4_dst.bin") = 0
-dir-watch caught the transient temp file live: /tmp/ft_obs/tmp1pwl3tqe
-after completion, temp file is gone (renamed onto dest): no tmp* remains
-```
+### The mechanism that detected the unchanged portions
 
-The precise statement is therefore: **no persistent resume sidecar exists; the resume basis is the
-partial destination file and its on-the-fly signature; a transient patch-output temp file exists only
-during rsync reconstruction and is atomically renamed into place** [OBSERVED + SOURCE-VERIFIED].
+The sender rolls the weak `rolling_checksum` over its file byte-by-byte (`add_one_byte`
+[tools/rsync/algorithm.go:336-361]); on a weak-hash hit against a receiver block signature it confirms
+with the XXH3-64 strong hash [tools/rsync/algorithm.go:556-557,641-643]; matched blocks are emitted as
+`Block`/`BlockRange` references and only the one changed block is emitted as literal `Data`; the
+trailing `Hash` op carries the XXH3-128 whole-file integrity checksum [SOURCE-VERIFIED + OBSERVED].
+That weak-then-strong, position-independent match is precisely what let 4095 of 4096 blocks be sent as
+two compact range references instead of bytes.
 
-## Q5 — Delta-efficiency experiment (measured, corrected, two stable runs)
 
-A deterministic, incompressible 5,000,000-byte file was generated, transferred in full, then a
-1024-byte region at offset 2,500,000 was overwritten and the file re-transferred with `-x`. The
-generation and edit are fixed-seed scripts, so the byte counts are exactly reproducible [OBSERVED]:
+## Edge cases (secondary paths, each observed at runtime)
 
-```
-$ python3 /tmp/ft_obs/q5_gen.py /tmp/ft_obs/q5_src.bin 5000000
-original src size=5000000 sha256=dd0c0eaa8d732ef292f0d8d9a44a8cbd176f2e5bec84ed947e97c37230aab4ec
-$ gzip -c /tmp/ft_obs/q5_src.bin | wc -c
-5000791
-$ python3 /tmp/ft_obs/q5_edit.py /tmp/ft_obs/q5_src.bin 2500000 1024
-modified src size=5000000 sha256=a66d5a3b35d3dd37310b24d1cc03e3565e81a5ebd56c62ee7fd2b8bd97ef53c3
-```
+All five edge cases below were exercised through the real `kitten transfer` path with genuine XTEST
+confirmation, and parsed byte-exact.
 
-The gzip size (5,000,791) exceeding the raw size confirms the content is incompressible, so blocks
-are unique and rsync cannot match by accident [OBSERVED].
+### Edge A — fresh transfer, no existing destination → the simple (non-rsync) path
 
-### The two transfers, with raw `print_rsync_stats`
+The 58-byte Q1 transfer and the Q4 gate-(a) 4096-byte transfer both ran against a *non-existent*
+destination. Neither emitted a `tt=` field or any signature frame; the whole file was sent as literal
+`ac=data`/`ac=end_data` chunks [OBSERVED, see Q1 and Q4 gate (a)]. A fresh destination therefore always
+takes the simple path, because the receiver has no basis to sign.
 
-Transfer #1 (baseline, `-x`, no basis) sends the whole file as delta; transfer #2 (`-x`, prior copy
-as basis) sends only the change [OBSERVED]:
+### Edge B — existing basis *below* the 4096-byte threshold, download path → rsync STILL engages
 
 ```
-$ script -q --log-out /tmp/ft_obs/q5_out1.bin --log-in /tmp/ft_obs/q5_in1.bin -c "$KITTEN transfer -x /tmp/ft_obs/q5_src.bin /tmp/ft_obs/q5_dst.bin"
-Rsync stats:
-  Delta size: 5.0 MB Signature size: 0 B
-$ script -q --log-out /tmp/ft_obs/q5_out2.bin --log-in /tmp/ft_obs/q5_in2.bin -c "$KITTEN transfer -x /tmp/ft_obs/q5_src.bin /tmp/ft_obs/q5_dst.bin"
-Rsync stats:
-  Delta size: 2.6 kB Signature size: 45 kB
-  Transmitted: 47 kB of a total of 5.0 MB (0.9%)
+source = 8192 bytes (> 4096, so the sender advertises tt=rsync)
+existing destination = 2000 bytes (< 4096)
+result: tt=['rsync']  signature_bytes=912  block_size=45  n_records=45   round(sqrt(2000)) = 45
+        edgeB dst == src : True
 ```
 
-Both transfers produced destinations whose SHA-256 matched their source (full:
-`dd0c0eaa8d732ef292f0d8d9a44a8cbd176f2e5bec84ed947e97c37230aab4ec`; modified:
-`a66d5a3b35d3dd37310b24d1cc03e3565e81a5ebd56c62ee7fd2b8bd97ef53c3`) [OBSERVED].
+This is the sharpest illustration of the P4-F4 asymmetry: on the **download** path the rsync gate is
+**existence-based** (`sz > -1` [kitty/file_transmission.py:1024-1028]), so a basis of only 2000 bytes
+— well under 4096 — still triggers a signature and delta. The C server sized the blocks
+`round(sqrt(2000)) = 45`, giving `ceil(2000/45) = 45` records and a `12 + 45·20 = 912`-byte signature,
+exactly as observed [OBSERVED]. (A basis below 4096 only stays "simple" under the **Go-client
+receive** gate, which *is* a `> 4096` test [receive.go:404-410].)
 
-### Exact byte counts (parsed from the wire), and the corrected arithmetic
+### Edge C — interrupted, then resumed
 
-`print_rsync_stats` rounds for display, so the signature and delta were parsed from the actual
-emitted bytes [OBSERVED]:
+Covered in full under Q4: a genuine Ctrl+C interrupt followed by a `-x` resume, twice, with the
+signature computed over the partial file (`block_size = round(sqrt(partial))`) and no sidecar file on
+disk [OBSERVED, see Q4].
 
-```
-file_size=5000000 block_size=2236 edit_offset=2500000 -> edit_block=1118
-signature raw payload bytes: 44752  (12-byte header 00 00 00 00 00 00 00 00 bc 08 00 00 => block_size=2236; records=2237; 12+2237*20=44752)
-delta op sequence (uncompressed serialized bytes):
-  OpBlockRange   blocks [0..1117] inclusive (1118 blocks matched)   13
-  OpData         2236 literal bytes  (CHANGED block 1118)           2241
-  OpBlockRange   blocks [1119..2235] inclusive (1117 blocks matched) 13
-  OpData         304 literal bytes   (partial tail block 2236)      309
-  OpHash         16-byte XXH3-128 integrity checksum                19
-EXACT delta bytes (sum) = 2595
-signature bytes = 44752  delta bytes = 2595  total = 47347
-vs full file 5000000: total is 0.94694%  => 105.603x reduction
-WIRE (zlib-compressed + base64 + OSC-framed) capture sizes: q5_out2.bin=3743 bytes  q5_in2.bin=60688 bytes
-```
-
-The exact figures are therefore: block size `round(sqrt(5,000,000)) = 2236`; `2237` signature
-records; signature `12 + 2237*20 = 44,752` bytes; delta `2,595` bytes; total logical payload
-`47,347` bytes, which is `0.94694%` of the file, a `105.603x` reduction [OBSERVED]. The edit at
-offset 2,500,000 lands entirely inside a **single** block — block `2,500,000 // 2236 = 1118` (spanning
-bytes 2,499,848 to 2,502,083); the edit occupies 2,500,000 to 2,501,023, so it does **not** straddle a
-block boundary, and it appears as exactly one `OpData(2236)` in the op sequence [OBSERVED].
-
-### Stability across two runs
-
-With deterministic inputs, a second full run reproduced the first byte-for-byte [OBSERVED]:
+### Edge D — transfer refused at the confirmation prompt (EPERM)
 
 ```
-RUN2 raw rsync stats:
-Rsync stats:
-  Delta size: 2.6 kB Signature size: 45 kB
-  Transmitted: 47 kB of a total of 5.0 MB (0.9%)
-RUN2 parsed: signature bytes = 44752  delta bytes = 2595  total = 47347
-STABILITY vs RUN1: signature 44752==44752 True  delta 2595==2595 True  total 47347==47347 True
+$ /work/src/kitty/launcher/kitten transfer /work/edge_refuse_src.bin /work/edge_refuse_dst.bin   # answered 'n'
+Permission denied for this transfer
+COMMAND_EXIT_CODE = 1
+frames on the wire: ['send']        # only the ac=send introducer; no file/data frames
+destination created: False
 ```
 
-### The detecting mechanism and a metric qualification
+A genuine `n` at the prompt caused the receiver to deny permission; the client exited non-zero, only
+the opening `ac=send` frame ever reached the wire, and no destination file was created [OBSERVED].
 
-Unchanged portions are detected by the sender's rsync match: it rolls the weak checksum byte-by-byte
-and, on a weak-hash hit, confirms with the XXH3-64 strong hash before emitting a block reference;
-matched blocks become `OpBlockRange`/`OpBlock` and only changed regions become `OpData`
-[SOURCE-VERIFIED: tools/rsync/algorithm.go:543,556-557,641-643; see the Q2 match-mechanism section].
-`print_rsync_stats` reports the **uncompressed logical rsync payload** (`p.total_transferred` and
-`p.signature_bytes`), not the on-wire byte count
-[SOURCE-VERIFIED: kittens/transfer/send.go:1252-1261; kittens/transfer/utils.go:109-114]. On the wire
-the delta is additionally zlib-compressed and then base64-encoded and OSC-framed; for transfer #2 the
-actual captured wire sizes were 3,743 bytes (client to terminal) and 60,688 bytes (terminal to
-client), so the reported "47 kB" is the logical payload, not the TTY byte total [OBSERVED].
+### Compression D1/D2 — the only supported compression is zlib, and `--compress=never` disables it
 
-## Edge cases exercised (secondary paths, not just the happy path)
-
-All edge cases were run through the real kitty receiver; each is shown with its command shape, the
-observed `tt`, and a source/destination hash match [OBSERVED]:
+Same 18,500-byte compressible source, two runs:
 
 ```
-EDGE A  fresh, no -x            : ac=file tt=(absent => simple)   rsync-stats ABSENT   full send   dst sha256=bf8e4e71585fd2e56be18def3077da6f6e0dae9581fc74e0018fe13b5cb3e9ff  MATCH
-EDGE B  fresh, -x, no basis     : ac=file tt=rsync                stats present 100.0% dst sha256=83dd8abc2653f4a0edfeafae8028a01cc55f01aa9c6d6c6a5320115d8167779b  MATCH
-EDGE C1 src=4096B (NOT > 4096)  : first -x => tt=simple; retransfer -x with basis => STILL tt=simple (gate blocks rsync)   MATCH
-EDGE C2 src=8192B (> 4096)      : first -x => tt=rsync 100%; retransfer -x with basis => tt=rsync 24.1% transmitted        MATCH
-EDGE D1 default compression     : ac=file zip=zlib   ; 18000B compressible text => 125 bytes on-wire data payload         MATCH
-EDGE D2 --compress=never        : ac=file zip=(none) ; 18000B sent uncompressed                                           MATCH
+D1 default            : zip=zlib   data_frames=1  wire_payload_bytes=118     dst==src=True
+D2 --compress=never   : zip=(absent) data_frames=5 wire_payload_bytes=18500  dst==src=True
 ```
 
-- **Edge A/B (simple vs rsync path).** Without `-x` the `ac=file` frame has no `tt` field (simple
-  path) and no rsync stats are printed; with `-x` but no basis, `tt=rsync` is offered but the
-  signature is empty (0 B), so 100% is transmitted [OBSERVED].
-- **Edge C1/C2 (the 4096-byte threshold, both gates).** The sender offers rsync only for a regular
-  source larger than 4096 bytes [SOURCE-VERIFIED: kittens/transfer/send.go:131]; the receive
-  direction has the symmetric gate [SOURCE-VERIFIED: kittens/transfer/receive.go:404-410]; and the
-  server engages rsync only when an existing file is present and the sender requested it
-  [SOURCE-VERIFIED: kitty/file_transmission.py:1026-1028]. At exactly 4096 bytes the file stays on the
-  simple path even with `-x` and a basis; at 8192 bytes rsync engages and yields a real 24.1% delta —
-  the small-file inefficiency the `-x` help text warns about [OBSERVED].
-- **Edge 3 (interrupt then resume)** is covered in full in Q4 (two runs, PID capture, targeted kill,
-  before/during/after state, hashes, transient patch file).
-- **Edge 4 (refusal / EPERM).** The confirmation is a real `boss.confirm` overlay
-  [SOURCE-VERIFIED: kitty/file_transmission.py:1191,1199-1202]; refusal drives EPERM
-  [SOURCE-VERIFIED: kitty/file_transmission.py:203]. Accept and refuse were both exercised through the
-  live UI [OBSERVED]:
+By default the file was zlib-compressed to a single 118-byte data frame; with `--compress=never` the
+`zip` field was absent and the full 18,500 bytes were sent across five ≤4096-byte frames. Both
+reproduced the source exactly [OBSERVED]. The only supported compression is RFC 1950 zlib deflate,
+selected via `compression=zlib`; the server decompresses with `zlib.decompressobj(wbits=0)`
+[SOURCE-VERIFIED: kitty/file_transmission.py:367-368] and the client uses `compress/zlib`
+[SOURCE-VERIFIED: kittens/transfer/send.go:7].
+
+
+## Coverage pass — every named file, mechanism, flag, data structure, and dependency
+
+### Files (all REFERENCE / read-only)
+
+| File | Role | Where addressed |
+|---|---|---|
+| `docs/file-transfer-protocol.rst` | OSC 5113 encoding, key abbreviations, handshake, signature/delta binary format, compression | Q1, Q2 |
+| `docs/kittens/transfer.rst` | `versionadded 0.30.0` (L10); basic usage `kitten ssh`→`kitten transfer` (L35-36); `--direction=upload` (L46); `--permissions-bypass` (L69); `--transmit-deltas` (L81-82) | Methodology, Q4, Q7 |
+| `docs/kittens/ssh.rst` | Auto shell integration + file transfer (`versionadded 0.25.0`, L22) | Q7 |
+| `kittens/transfer/main.go` | `main()` dispatches `send_main` (L59) / `receive_main` (L61) | Q7 |
+| `kittens/transfer/main.py` | `--transmit-deltas`/`-x` flag + resume help text (L116-122) | Q4 |
+| `kittens/transfer/ftc.go` | `FileTransmissionCommand.Serialize()`; base64 RawStdEncoding (L178-189, decode L248) | Q1, Q3 |
+| `kittens/transfer/send.go` | OSC prefix `\x1b]%d;id=%s;` (L384,647-648); `CreateDelta` call (L768); `print_rsync_stats` call (L1260); `compress/zlib` (L7) | Q1, Q2, Q5 |
+| `kittens/transfer/receive.go` | Go-client receive gate `s.Size() > 4096` (L404-410); `compress/zlib` (L7) | Q4 |
+| `kittens/transfer/utils.go` | `print_rsync_stats` Delta/Signature sizes (L109-113) | Q5 |
+| `kittens/transfer/algorithm.c` | Server C rsync; `block_size = round(sqrt(...))` (L203-204); XXH3 via `<xxhash.h>` (L13) | Q2, Q4 |
+| `tools/rsync/algorithm.go` | `OpType` (L31-37), `Operation` (L71-77), `BlockHash` (L177-204), `rolling_checksum`/`add_one_byte` (L336-361), XXH3-64/128, `HashBlockSize` (L637) | Q2, Q4, Q5 |
+| `tools/rsync/api.go` | `Api`/`Differ`/`Patcher`; `NewPatcher` block-size floor (L270-286); `CreateDelta` (L230); `CreateDiff` (L239) | Q2, Q4 |
+| `kitty/control-codes.h` | `#define FILE_TRANSFER_CODE 5113` (L233) | Q3, Q6 |
+| `kitty/vt-parser.c` | `case FILE_TRANSFER_CODE:` → `DISPATCH_OSC(file_transmission)` (L547-550) | Q3 |
+| `kitty/data-types.c` | Exposes `FILE_TRANSFER_CODE` to Python (L596) | Q3, Q6 |
+| `kitty/screen.c` | `file_transmission(Screen*, PyObject*)` callback (L2311-2312) | Q3 |
+| `kitty/window.py` | `file_transmission()` → `handle_serialized_command()` (L1388-1389) | Q3 |
+| `kitty/file_transmission.py` | `handle_serialized_command` (L803); `DestFile`/`PatchFile` (L379-405,858); `signature_iterator` (L470); `signature_pending_chunks` (L599); download gate (L1024-1028); `zlib.decompressobj(0)` (L367-368) | Q3, Q4 |
+| `gen/go_code.py` | Generates the Go `FileTransferCode` constant (L597) | Q6 |
+| `kittens/ssh/main.py` | SSH kitten makes `kitten` available on remote (L167) | Q7 |
+| `kitty_tests/file_transmission.py` | Python protocol test harness — pattern for driving the server round-trip | Reference pattern (informed the Q3/Q4 handler-chain reads) |
+| `kittens/transfer/ftc_test.go` | FTC `Serialize`/deserialize round-trip — pattern for the Q1 wire-format parse | Reference pattern |
+| `kittens/transfer/send_test.go` | Send-side test — pattern for the Q2 delta parse | Reference pattern |
+| `tools/rsync/api_test.go` | rsync signature/delta round-trip — pattern for the Q2/Q5 signature+delta parse | Reference pattern |
+
+### Mechanisms, flags, data structures, and dependencies
+
+| Named item | Where addressed |
+|---|---|
+| OSC introducer `ESC ]` (`1b 5d`) / ST `ESC \` (`1b 5c`) | Q1 (raw bytes) |
+| `action` values `send`/`file`/`data`/`end_data`/`status`/`finish` | Q1 (handshake order) |
+| All 15 key abbreviations incl. `quiet`→`q` and the `bypass`/`pw` base64 drift | Q1 (table) |
+| `safe_string` charset `[0-9a-zA-Z_:./@-]` | Q1 |
+| `transmission_type` `simple`/`rsync` (`tt`) | Q2, Q4, edges |
+| `--transmit-deltas` / `-x` | Q4 |
+| `--direction=upload` | Q4 gate (c), edges |
+| `--compress=never` and `compression=zlib` | edges (D1/D2) |
+| `OpType` `Block`/`Data`/`Hash`/`BlockRange` | Q2, Q5 |
+| `BlockHash{Index,WeakHash,StrongHash}` (20 bytes LE) | Q2 |
+| `rolling_checksum` (weak) + `add_one_byte` | Q2, Q5 |
+| XXH3-64 (strong block) + XXH3-128 (integrity) | Q2, Q5 |
+| 12-byte signature header (`round(sqrt(size))` block size) | Q2, Q4 |
+| `CreateDelta` / `CreateDiff` | Q2 |
+| `DestFile` / `PatchFile` / `signature_iterator` | Q3, Q4 |
+| `signature_pending_chunks` | Q4 |
+| transient tempfile `O_EXCL|O_NOFOLLOW 0600` + `os.replace` | Q4 |
+| `print_rsync_stats` | Q5 |
+| confirmation prompt / EPERM | Q7, edge D |
+| `github.com/zeebo/xxh3` v1.0.2 (`go.mod` L16; XXH3 hasher, `BlockSize()`=64) | Q2, Q4, Q6 |
+| `compress/zlib` (Go stdlib) / `zlib` (Python stdlib) / `libxxhash` (system) | Q1, Q6, edges |
+| Build entry `python3 setup.py` → `kitty/launcher/{kitty,kitten}` | Q6 |
+| Canonical entry `kitten ssh` → `kitten transfer` | Q7 |
+
+## Observed vs. inferred summary
+
+- **[OBSERVED] at runtime** (captured byte-exact in the container): the OSC 5113 handshake ordering
+  and framing bytes (Q1); the full 58-byte base64 frame and the ≤4096-byte chunking with `PROGRESS`
+  (Q1); the base64 RawStdEncoding round-trip and the ordinary-output-vs-transfer distinction (Q3); the
+  signature header/records and the moved-block delta `447 of 448` (Q2); the three asymmetric gates
+  with byte-exact signatures, the `round(sqrt(partial))` resume signature, the clean tempfile
+  strace, and the no-sidecar fact (Q4); the four-run 16 MiB delta efficiency (delta 4146 / signature
+  81932 / total 86078 / 0.513% / 194.9×) with ±0-byte stability and timing (Q5); the five edge cases
+  including the below-4096 download basis engaging rsync and the zlib-vs-`never` compression contrast;
+  and the SSH process chain, remote shim, and `src==dst` hash for Q7.
+- **[SOURCE-VERIFIED]** (grounded in `file:line`, corroborating the observations): every function,
+  struct, condition, and constant cited above — e.g. `FILE_TRANSFER_CODE 5113`, the VT-parser
+  dispatch, `NewPatcher`'s block-size floor, `CreateDelta`/`CreateDiff`, the download existence gate,
+  and the two block-size formulas.
+- **[INFERRED]** (explicitly labeled where used): only the interpretation that normal terminal output
+  "never enters the transfer branch" is stated as a mechanism explanation — it is itself corroborated
+  by the OBSERVED zero-`openat` distinction test in Q3. No numeric claim in this document is inferred;
+  all measured values are OBSERVED.
+
+## Read-only scope — proof
+
+This investigation is read-only except for this one answer document. All builds, transfers, captures,
+and temporary scripts ran inside the container against a copy of the source at `/work/src` and wrote
+their artifacts to `/work/evidence` (a bind-mounted host scratch directory **outside** the
+repository). The repository working tree was confirmed clean of any change other than this file:
 
 ```
-ACCEPT: overlay 'The remote machine wants to send some files to this computer. Do you want to allow the transfer?'; typed 'y' => 'Permission granted for this transfer'
-        src==dst sha256 b7566217c253a2d319a135ee29cd8e286eb115be0bd99d0fb066691be14583a7 (MATCH)
-        113113 openat(AT_FDCWD, "/tmp/ft_obs/dst2.bin", O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0644) = 11
-REFUSE: typed 'n' => 'Permission denied for this transfer'; exit code 1; dst_refuse.bin NOT created (EPERM)
+$ git status --porcelain
+ ?? blitzy/documentation/kitty_815df1e210e0.md
 ```
 
-### Compression (`compression=zlib` / `zip=zlib`)
+No existing `.go`, `.py`, `.c`, `.h`, `.rst`, or build file was modified, added to, or deleted; the
+only repository write is `blitzy/documentation/kitty_815df1e210e0.md`.
 
-The only supported compression is RFC 1950 zlib deflate, selected via `compression=zlib`; the server
-decompresses with `zlib.decompressobj(wbits=0)`
-[SOURCE-VERIFIED: kitty/file_transmission.py:367-368] and the client compresses with `compress/zlib`
-[SOURCE-VERIFIED: kittens/transfer/send.go:7,65]. As shown in Edge D1/D2, an 18,000-byte compressible
-text file reduced to a 125-byte on-wire data payload by default and was 18,000 bytes uncompressed with
-`--compress=never` [OBSERVED]. Compression eligibility is additionally gated by size and a MIME check
-[SOURCE-VERIFIED: kittens/transfer/send.go:132].
-
-## Coverage pass — every named mechanism, function, struct, condition, file, flag
-
-| # | Named item | Where addressed | Basis |
-|---|---|---|---|
-| 1 | OSC=`1b 5d`, ST=`1b 5c`, code 5113 | Q1 wire format | OBSERVED + SOURCE (spec:543-552) |
-| 2 | 5113 = numeralization of "file" | Q1 wire format | SOURCE (spec:543-552) |
-| 3 | C then Python then Go constant propagation | Q3 one-definition | SOURCE (control-codes.h:233; data-types.c:596; go_code.py:575,597) |
-| 4 | `FileTransmissionCommand.Serialize()` + OSC prefix | Q1 initiation | SOURCE (ftc.go:163-222; send.go:384,647-648) |
-| 5 | Session id / file id correlation, action/status interleaving | Q1 ordering | OBSERVED |
-| 6 | All 15 key abbreviations (ac/zip/ft/tt/id/fid/pw/q/mod/prm/sz/n/st/pr/d) | Q1 table | SOURCE (spec:558-576) |
-| 7 | `pw` spec (safe_string) vs impl (base64) drift | Q1 drift note | SOURCE (spec:567; ftc.go:129; file_transmission.py:260) |
-| 8 | `safe_string` excludes `;` | Q1 abbreviations | SOURCE (spec:589-601) |
-| 9 | base64 RawStdEncoding, no padding | Q3 encoding | OBSERVED + SOURCE (ftc.go:178-189) |
-| 10 | zlib RFC1950; distinct from delta | Compression; Q5 metric | OBSERVED + SOURCE (file_transmission.py:367-368; send.go:7,65) |
-| 11 | `vt-parser.c` `FILE_TRANSFER_CODE` dispatch | Q3 chain / distinction | SOURCE (vt-parser.c:547-550) |
-| 12 | `screen.c` callback bridge | Q3 chain | SOURCE (screen.c:2311-2312) |
-| 13 | `window.py` forwarding | Q3 chain | SOURCE (window.py:1388-1389) |
-| 14 | `handle_serialized_command` deserialize+dispatch only | Q3 chain | SOURCE (file_transmission.py:858) |
-| 15 | `deserialize` base64-decodes `d=` and string fields | Q3 chain | SOURCE (file_transmission.py:329-351) |
-| 16 | `DestFile.write_data`: decompress, open O_RDWR/O_CREAT/O_TRUNC, `af.write` | Q3 chain | SOURCE (file_transmission.py:510,542,546-547,550) |
-| 17 | `PatchFile.write` (rsync patch path) | Q3 chain; Q4 | SOURCE (file_transmission.py:420-423) |
-| 18 | `--transmit-deltas`/`-x`, `tt=rsync` | Q2 activation; Q4 | OBSERVED + SOURCE (main.py:116-122) |
-| 19 | 12-byte LE signature header; block_size=round(sqrt(size)) | Q2 signature | OBSERVED + SOURCE (algorithm.c:204,226-238; api.go:274) |
-| 20 | 20-byte `BlockHash` (index/weak/strong) | Q2 structures | OBSERVED + SOURCE (algorithm.go:177-204; algorithm.c:246-260) |
-| 21 | Four delta ops (Block/Data/Hash/BlockRange), widths | Q2 delta ops | OBSERVED + SOURCE (spec:460-488; algorithm.go:104-140) |
-| 22 | Rolling weak checksum (O(1) roll) | Q2 mechanism | SOURCE (algorithm.go:336-361) |
-| 23 | XXH3-64 strong block confirmation | Q2 mechanism | SOURCE (algorithm.go:69-102,641-643) |
-| 24 | XXH3-128 integrity | Q2 delta ops (OpHash) | OBSERVED + SOURCE (algorithm.go:40-66) |
-| 25 | Moved/shifted-block support | Q2 moved-block | OBSERVED + SOURCE (algorithm.go:532-567; algorithm.c:719-747) |
-| 26 | Send-side regular source > 4096 gate | Edge 2 | OBSERVED + SOURCE (send.go:131) |
-| 27 | Receive-side existing basis > 4096 gate | Edge 2; Q4 | SOURCE (receive.go:404-410) |
-| 28 | Server engages rsync only if existing file + sender requested | Edge 2 | SOURCE (file_transmission.py:1026-1028) |
-| 29 | Partial destination as on-demand signature basis | Q4 | OBSERVED + SOURCE (algorithm.c:204) |
-| 30 | No persistent resume sidecar vs transient patch file | Q4 | OBSERVED + SOURCE (file_transmission.py:392,405) |
-| 31 | `print_rsync_stats` = uncompressed logical payload | Q5 metric | OBSERVED + SOURCE (send.go:1252-1261; utils.go:109-114) |
-| 32 | Default launcher build/invocation, versions | Q6 | OBSERVED |
-| 33 | SSH kitten makes transfer kitten available remotely | Q7 | OBSERVED + SOURCE (ssh.rst:22; ssh/main.py:167) |
-| 34 | Confirmation accept and refusal (EPERM) via real UI | Edge 4 | OBSERVED + SOURCE (file_transmission.py:1191,1199-1202,203) |
-| 35 | Two stable Q5 runs; source/dest hashes; ordinary-output control | Q5; Q3 distinction | OBSERVED |
-
-## Observed vs inferred — summary
-
-- **[OBSERVED]** items are backed by the literal artifacts above: the build banners and `nm`/`ldd`
-  output; the Q7 `strace openat` and matching hashes; the Q1 bidirectional frame inventory and raw
-  control-frame bytes; the Q2 signature/delta byte parses and the moved-block delta; the Q3 89-byte
-  round-trip hashes and the normal-vs-transfer discriminator; the Q4 two-run interrupt/resume with
-  hashes, `tt=rsync`, on-partial signature block sizes, and the transient temp-file `strace`; the Q5
-  parsed 44,752 / 2,595 / 47,347 figures across two identical runs; and the edge-case
-  `tt`/hash/stat captures.
-- **[SOURCE-VERIFIED]** items are facts read from specific lines (the dispatch chain, the struct and
-  op layouts, the block-size formula, the 4096 gates, the `pw` drift, the confirmation and EPERM
-  paths).
-- **[INFERRED]** is used sparingly and only where a conclusion follows from observed facts — for
-  example, that ordinary output never enters the transfer branch because it lacks the OSC 5113
-  wrapper.
-
-## Repository read-only proof and cleanup
-
-This investigation added exactly one file — this document — and modified no tracked source. The only
-tracked difference from the baseline is this deliverable; the working tree has no modified tracked
-files; and the rebuilt `rsync.so` is git-ignored, not tracked [OBSERVED]:
-
-```
-$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
-A	blitzy/documentation/kitty_815df1e210e0.md
-$ git status --porcelain --untracked-files=no
-$ git check-ignore kittens/transfer/rsync.so
-kittens/transfer/rsync.so
-```
-
-All runtime evidence was produced under `/tmp/ft_obs` (outside the repository); the loopback `sshd`,
-the `Xvfb`/`kitty` processes, and all task-created SSH keys and temporary files are torn down and
-removed during cleanup, and no dependency or tracked file was altered to perform the investigation.
