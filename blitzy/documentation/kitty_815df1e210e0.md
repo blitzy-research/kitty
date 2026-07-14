@@ -124,7 +124,8 @@ $ grep -n -E '^read_bytes\(|vt_parser_create_write_buffer\(screen|len = read\(fd
 871:render(monotonic_t now, bool input_read) {
 1337:read_bytes(int fd, Screen *screen) {
 1341:    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
-1345:            len = read(fd, buf, available_buffer_space);
+1345:        len = read(fd, buf, available_buffer_space);
+1349:            vt_parser_commit_write(screen->vt_parser, 0);
 1354:    vt_parser_commit_write(screen->vt_parser, len);
 
 $ grep -n -E '^run_worker\(|^parse_worker\(' kitty/vt-parser.c
@@ -507,16 +508,18 @@ The reason the build and runtime use CPython 3.11 is an **ABI** constraint, not 
 [exit: 0]
 ```
 
-The `.so` is linked against `libpython3.11.so.1.0` (the link line in Appendix B ends with `-lpython3.11`), so the module can only be loaded by a CPython 3.11 interpreter whose C-ABI it was compiled against. The project's *declared* Python support is a floor with no ceiling:
+The `.so` is linked against `libpython3.11.so.1.0` (the link line in Appendix B includes `-lpython3.11`), so the module can only be loaded by a CPython 3.11 interpreter whose C-ABI it was compiled against. The project's *declared* Python support is a floor with no ceiling:
 
 ```text
 ### CMD: grep -n 'requires-python' pyproject.toml
 2:requires-python = ">=3.8"
 
 ### CMD: grep -nE 'pyver|python-version' .github/workflows/ci.yml
+14:        name: Linux (python=${{ matrix.pyver }} cc=${{ matrix.cc }} sanitize=${{ matrix.sanitize }})
 26:                      pyver: "3.8"
 30:                      pyver: "3.10"
 34:                      pyver: "3.9"
+52:          - name: Set up Python ${{ matrix.pyver }}
 55:              python-version: ${{ matrix.pyver }}
 85:              python-version: "3.11"
 170:              python-version: "3.10"
@@ -668,7 +671,7 @@ In one sentence: **kitty is a C+GPU performance core, orchestrated by a thin Pyt
 | Go toolchain | `go1.24.4 linux/amd64` (`/usr/bin/go`) |
 | C compiler | `gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0` |
 | Shared Python lib | `/opt/python3.11/lib/libpython3.11.so.1.0` (ABI target of the built `.so`) |
-| Git branch | `blitzy-5c1e066c-992b-4bf9-8d37-696eb3c895bd`, HEAD `d5f2b18b1` |
+| Git branch | `blitzy-5c1e066c-992b-4bf9-8d37-696eb3c895bd`; authored at HEAD `d5f2b18b1` (see `git log` for any subsequent documentation-only fix commits) |
 | Repo cleanliness | tracked tree clean except the created document; `0` ignored, `0` untracked (Appendix E) |
 | Env discipline | `PYTHONDONTWRITEBYTECODE=1` set for all direct Python runs so no `.pyc`/`__pycache__` is written into the tree |
 
@@ -692,7 +695,7 @@ Updating Go generated files...
 BUILD_EXIT=0
 ```
 
-The link line ends with `-lpython3.11`, which is why the resulting `.so` declares `NEEDED libpython3.11.so.1.0` (Q3). The build emits three native outputs — `kitty/fast_data_types.so`, the Go `kitty/launcher/kitten`, and the C `kitty/launcher/kitty` — all git-ignored.
+The link line includes `-lpython3.11` (mid-line, before the final `-o build/kitty/fast_data_types.so`), which is why the resulting `.so` declares `NEEDED libpython3.11.so.1.0` (Q3). The build emits three native outputs — `kitty/fast_data_types.so`, the Go `kitty/launcher/kitten`, and the C `kitty/launcher/kitty` — all git-ignored.
 
 **Determinism.** Building twice produced a byte-identical extension:
 
@@ -792,7 +795,7 @@ ls: cannot access 'build': No such file or directory
 - **No existing source file was modified, added, or deleted.** The only write to the tree is `blitzy/documentation/kitty_815df1e210e0.md` (this document), which the AAP designates as the sole deliverable.
 - **No build product remains.** `0` ignored and `0` untracked entries; the `.so`, both launchers, and `build/` are absent.
 - **Temporary observation scripts and `/tmp/evidence/` live outside the repository** and are removed at task end; `PYTHONDONTWRITEBYTECODE=1` ensured no stray `.pyc`/`__pycache__` was written during Python runs.
-- When built, the extension's md5 is `b255c0013972634549f91312ae799a0f` (deterministic across rebuilds); this hash identifies the artifact observed in Q1/Q3/Q4 and Appendix B and is recorded here for reproducibility, not because the artifact is retained.
+- When built, the extension's md5 is `b255c0013972634549f91312ae799a0f` (deterministic across rebuilds in this environment; the exact value is environment-specific because the build uses `-march=native` and embeds the absolute build path); this hash identifies the artifact observed in Q1/Q3/Q4 and Appendix B and is recorded here for reproducibility, not because the artifact is retained.
 
 This certification describes the **actual final state** verified with the commands above — it does not assert that the tree was never touched, but that it has been returned to a clean, artifact-free baseline plus the one intended document.
 
