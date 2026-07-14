@@ -47,20 +47,20 @@ $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
 
-- **Linked shaping/rasterization libraries.** `ldd kitty/fast_data_types.so` shows HarfBuzz and FreeType are **direct** shared‑library dependencies, while FontConfig and OpenGL are loaded **at runtime via `dlopen`** — FontConfig through the `_KITTY_FONTCONFIG_LIBRARY` path wired in `setup.py` [setup.py:L551], GL through the `glad`/`gl-wrapper` loader. Versions come from `pkg-config`:
+- **Linked shaping/rasterization libraries.** `ldd kitty/fast_data_types.so` shows HarfBuzz is the sole **direct** shared‑library dependency (FreeType and graphite2 appear only transitively, pulled in through HarfBuzz — `readelf -d` lists just `[libharfbuzz.so.0]` among the font libraries as `DT_NEEDED`, and `setup.py` adds only `pkg_config('harfbuzz', '--libs')` [setup.py:L637]), while FontConfig and OpenGL are loaded **at runtime via `dlopen`** — FontConfig through the `_KITTY_FONTCONFIG_LIBRARY` path wired in `setup.py` [setup.py:L551], GL through the `glad`/`gl-wrapper` loader. Versions come from `pkg-config`:
 
 ```text
 $ ldd kitty/fast_data_types.so | grep -iE 'harfbuzz|freetype|graphite'
-	libharfbuzz.so.0 => /lib/x86_64-linux-gnu/libharfbuzz.so.0
-	libgraphite2.so.3 => /lib/x86_64-linux-gnu/libgraphite2.so.3
-	libfreetype.so.6 => /lib/x86_64-linux-gnu/libfreetype.so.6
+	libharfbuzz.so.0 => /lib/x86_64-linux-gnu/libharfbuzz.so.0 (0x00007da3b9819000)
+	libfreetype.so.6 => /lib/x86_64-linux-gnu/libfreetype.so.6 (0x00007da3b8e3e000)
+	libgraphite2.so.3 => /lib/x86_64-linux-gnu/libgraphite2.so.3 (0x00007da3b8cbf000)
 $ pkg-config --modversion harfbuzz freetype2 fontconfig
 10.2.0
 26.2.20
 2.15.0
 ```
 
-  This resolves the manifest discrepancy noted in the plan — `setup.py` enforces only `harfbuzz >= 1.5` [setup.py:L609] while `docs/build.rst` lists `>= 2.2.0`; the binary actually uses HarfBuzz **10.2.0**, satisfying both. (`26.2.20` is FreeType's libtool interface version — the FreeType 2.13.x series; FontConfig is **2.15.0**.)
+  The library set, order, and paths shown are stable across runs; only the trailing `(0x…)` values differ on each invocation — they are ASLR‑randomized load addresses and are the sole non‑reproducible part of this block. This resolves the manifest discrepancy noted in the plan — `setup.py` enforces only `harfbuzz >= 1.5` [setup.py:L609] while `docs/build.rst` lists `>= 2.2.0`; the binary actually uses HarfBuzz **10.2.0**, satisfying both. (`26.2.20` is FreeType's libtool interface version — the FreeType 2.13.x series; FontConfig is **2.15.0**.)
 
 ### 2.3 Headless OpenGL context and the renderer (Linux / Mesa llvmpipe / GLX)
 
@@ -284,7 +284,7 @@ These calls **only fill the global `hb_features[]` templates**; they attach noth
 **Cause → effect.** By default a face's feature list is exactly **one** entry, `-calt`; the `-liga`/`-dlig` disable‑templates are added **only** for faces whose PostScript name begins `NimbusMonoPS-` (kitty's bundled default family), and any user `font_features` are parsed and stored per‑face instead. At shape time the list is passed to `hb_shape`, but the **trailing `-calt` is dropped whenever ligatures are *enabled***:
 
 ```c
-// kitty/fonts.c:810-812
+// kitty/fonts.c:811-813
     size_t num_features = fobj->num_ffs_hb_features;
     if (num_features && !disable_ligature) num_features--;  // the last feature is always -calt
     hb_shape(font, harfbuzz_buffer, fobj->ffs_hb_features, num_features);
