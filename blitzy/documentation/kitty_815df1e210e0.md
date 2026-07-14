@@ -795,7 +795,7 @@ ls: cannot access 'build': No such file or directory
 - **No existing source file was modified, added, or deleted.** The only write to the tree is `blitzy/documentation/kitty_815df1e210e0.md` (this document), which the AAP designates as the sole deliverable.
 - **No build product remains.** `0` ignored and `0` untracked entries; the `.so`, both launchers, and `build/` are absent.
 - **Temporary observation scripts and `/tmp/evidence/` live outside the repository** and are removed at task end; `PYTHONDONTWRITEBYTECODE=1` ensured no stray `.pyc`/`__pycache__` was written during Python runs.
-- When built, the extension's md5 is `b255c0013972634549f91312ae799a0f` (deterministic across rebuilds in this environment; the exact value is environment-specific because the build uses `-march=native` and embeds the absolute build path); this hash identifies the artifact observed in Q1/Q3/Q4 and Appendix B and is recorded here for reproducibility, not because the artifact is retained.
+- When built, the extension's md5 is `b255c0013972634549f91312ae799a0f` (deterministic across rebuilds in this environment; the exact value is environment-specific because the build uses `-march=native`, so the emitted machine code is tuned to the build CPU's microarchitecture — the build itself is path-independent, producing a byte-identical `.so` regardless of the build directory); this hash identifies the artifact observed in Q1/Q3/Q4 and Appendix B and is recorded here for reproducibility, not because the artifact is retained.
 
 This certification describes the **actual final state** verified with the commands above — it does not assert that the tree was never touched, but that it has been returned to a clean, artifact-free baseline plus the one intended document.
 
