@@ -2,11 +2,11 @@
 
 ## 1. Summary and direct answers
 
-**Direct answer.** kitty runs a **multi-threaded core but a single-threaded Python layer**. Raw bytes from a child process are read on a dedicated **I/O thread** (`KittyChildMon`, `kitty/child-monitor.c:1489`) that never touches the Python C-API; all VT parsing, all C→Python callbacks, and all expensive operations such as scrollback scans run on **one main thread** while it holds the **CPython Global Interpreter Lock (GIL)** (§3). When a clipboard escape (OSC 52, or the extended OSC 5522) arrives, the parser wraps its **internal 1 MiB buffer** (`BUF_SZ`, `kitty/vt-parser.c:18`) in a **zero-copy, read-only `memoryview`** (created by `PyMemoryView_FromMemory` with the `PyBUF_READ` flag, `kitty/vt-parser.c:461`) and hands that view to `Window.clipboard_control` through a C→Python `CALLBACK` (`kitty/screen.c:87,2305`). The Python clipboard manager then **copies the bytes it needs out of that transient view into owned Python objects** — a `WriteRequest` backed by a `Tempfile` that begins as an in-memory `io.BytesIO` and rolls over to an on-disk `TemporaryFile` at 16 MiB (`kitty/clipboard.py:237`) — so the alias never outlives the synchronous callback (§4, §8). Because every Python statement runs on the one GIL-holding main thread, an expensive main-thread operation (e.g. scanning a large scrollback) **delays but never loses** event delivery: the I/O thread keeps buffering raw child bytes — subject to POLLIN backpressure once the 1 MiB buffer is full (`kitty/child-monitor.c:1501`) — the whole time, and the queued events are delivered in order the moment the main thread is free again (§5, §7). Timing and concurrency therefore matter at exactly two places — the **parser mutex** guarding the single-producer/single-consumer buffer (`kitty/vt-parser.c:205,1421`) and the **GIL** serializing the main thread — while object ownership matters at the **RAII-scoped lifetime of the `memoryview`**. The only genuine hazard is a *C-level* one: retaining that view until the parser **reuses** its 1 MiB buffer, which then exposes **stale/overwritten bytes** rather than freed memory (the buffer allocation itself lives until parser teardown in `free_vt_parser`, `kitty/vt-parser.c:1508-1513`). kitty avoids it by copying out during the synchronous callback. It is **not** a Python-level data race, because the GIL serializes all Python execution (§8, §9).
+**Direct answer.** kitty runs a **multi-threaded core but a single-threaded Python layer**. Raw bytes from a child process are read on a dedicated **I/O thread** (`KittyChildMon`, `kitty/child-monitor.c:1489`) that never touches the Python C-API; all VT parsing, all C→Python callbacks, and all expensive operations such as scrollback scans run on **one main thread** while it holds the **CPython Global Interpreter Lock (GIL)** (§3). When a clipboard escape (OSC 52, or the extended OSC 5522) arrives, the parser wraps its **internal 1 MiB buffer** (`BUF_SZ`, `kitty/vt-parser.c:18`) in a **zero-copy, read-only `memoryview`** (created by `PyMemoryView_FromMemory` with the `PyBUF_READ` flag, `kitty/vt-parser.c:461`) and hands that view to `Window.clipboard_control` through a C→Python `CALLBACK` (`kitty/screen.c:87,2305`). The Python clipboard manager then **copies the bytes it needs out of that transient view into owned Python objects** — a `WriteRequest` backed by a `Tempfile` that begins as an in-memory `io.BytesIO` and rolls over to an on-disk `TemporaryFile` at 16 MiB (`kitty/clipboard.py:237`) — so the alias never outlives the synchronous callback (§4, §8). Because every Python statement runs on the one GIL-holding main thread, an expensive main-thread operation (e.g. scanning a large scrollback) **delays but never loses** event delivery: the I/O thread keeps buffering raw child bytes — subject to POLLIN backpressure once the 1 MiB buffer is full (`kitty/child-monitor.c:1501`) — the whole time, and the queued events are delivered in order the moment the main thread is free again (§5, §7). Timing and concurrency therefore matter at exactly two places — the **parser mutex** guarding the single-producer/single-consumer buffer (`kitty/vt-parser.c:206,1421`) and the **GIL** serializing the main thread — while object ownership matters at the **RAII-scoped lifetime of the `memoryview`**. The only genuine hazard is a *C-level* one: retaining that view until the parser **reuses** its 1 MiB buffer, which then exposes **stale/overwritten bytes** rather than freed memory (the buffer allocation itself lives until parser teardown in `free_vt_parser`, `kitty/vt-parser.c:1508-1513`). kitty avoids it by copying out during the synchronous callback. It is **not** a Python-level data race, because the GIL serializes all Python execution (§8, §9).
 
 **Direct answers, per objective (each backed by captured runtime output in the cited section):**
 
-- **O1 — the clipboard C→Python transfer, small and very large (§4).** A single OSC 52 write under the 256 KiB `MAX_ESCAPE_CODE_LENGTH` (`kitty/vt-parser.c:21`) is delivered in **one** `dispatch_osc` call; a larger payload is split into **partial-OSC-52 chunks** (dispatch code **`-52`** for every partial and **`+52`** for the final), which the Python `WriteRequest` reassembles. Crossing 16 MiB flips the `Tempfile` from `io.BytesIO` to an on-disk `TemporaryFile`, observed directly via `/proc/<pid>/fd`. The default `clipboard_max_size=512` is **double-scaled** to an effective ≈512 **TiB** threshold (`kitty/clipboard.py:321`), so the truncation guard is unreachable under the default configuration (a CWE-400-class exposure); a positive control with a tiny limit shows the guard firing and the exact retained-byte overshoot. Read paths (legacy OSC 52 `?` and extended OSC 5522), the MIME listing, and the `read-clipboard-ask` accept/deny prompts are all exercised, and the full read/write status ledger is captured.
+- **O1 — the clipboard C→Python transfer, small and very large (§4).** A clipboard write that fits within the parser's **1 MiB `BUF_SZ` buffer** (`kitty/vt-parser.c:18`) is delivered in **one** `dispatch_osc` call — observed even for payloads well past the 256 KiB `MAX_ESCAPE_CODE_LENGTH` (`kitty/vt-parser.c:21`) (e.g. a 600 KB write still dispatches whole); a payload large enough to fill the buffer before the parser runs is split into **partial-OSC-52 chunks** (dispatch code **`-52`** for every partial and **`+52`** for the final), the **first chunk arriving at ≈1 MiB** — the boundary is **buffer-bounded, not a fixed 256 KiB** — which the Python `WriteRequest` reassembles. `MAX_ESCAPE_CODE_LENGTH` (256 KiB) is only the *minimum* unterminated length an escape must exceed before the *first* partial flush is permitted (§4.2). Crossing 16 MiB flips the `Tempfile` from `io.BytesIO` to an on-disk `TemporaryFile`, observed directly via `/proc/<pid>/fd`. The default `clipboard_max_size=512` is **double-scaled** to an effective ≈512 **TiB** threshold (`kitty/clipboard.py:321`), so the truncation guard is unreachable under the default configuration (a CWE-400-class exposure); a positive control with a tiny limit shows the guard firing and the exact retained-byte overshoot. Read paths (legacy OSC 52 `?` and extended OSC 5522), the MIME listing, and the `read-clipboard-ask` accept/deny prompts are all exercised, and the full read/write status ledger is captured.
 
 - **O2 — behavior in practice when other parts of the system are busy (§5).** PTY reading is decoupled from parsing: the I/O thread fills the shared buffer while the main thread parses under the GIL, coalescing bursts on the default **3 ms `input_delay`** gate (`kitty/options/definition.py:878`) — proven causally by contrasting `input_delay` at 0/3/25 ms. When the 1 MiB buffer fills, kitty toggles **POLLIN off/on** (captured as `events=POLLIN`↔`events=0` transitions in a `poll()` strace). Under a heavy flood the canonical event-delivery latency (measured with a DSR query, timing source `CLOCK_MONOTONIC`) rises above the ≈3.3 ms idle baseline, reported as a **distribution across ≥2 runs**, never as a single number.
 
@@ -927,7 +927,7 @@ warning: 29	../sysdeps/unix/sysv/linux/poll.c: No such file or directory
 
 Reading these two stacks:
 
-- **MAIN (Thread 1, `"kitty"`)** is blocked in `__GI_ppoll(fds=<_glfw+133552>, nfds=2)` inside `glfwRunMainLoop` (`glfw-x11.so`) → `main_loop.lto_priv` (`fast_data_types.so`) → Python eval frames → `Py_RunMain` → `main`. This is the GLFW/GUI event loop; it is a Python-embedding thread and holds the GIL whenever it runs. The main tick is `process_global_state` [kitty/child-monitor.c:1222], which calls `parse_input` [kitty/child-monitor.c:451]. *(observed stack; call-site file:line from source)*
+- **MAIN (Thread 1, `"kitty"`)** is blocked in `__GI_ppoll(fds=<_glfw+133552>, nfds=2)` inside `glfwRunMainLoop` (`glfw-x11.so`) → `main_loop.lto_priv` (`fast_data_types.so`) → Python eval frames → `Py_RunMain` → `main`. This is the GLFW/GUI event loop; it is a Python-embedding thread and holds the GIL whenever it runs. The main tick is `process_global_state` [kitty/child-monitor.c:1224], which calls `parse_input` [kitty/child-monitor.c:451]. *(observed stack; call-site file:line from source)*
 - **KittyChildMon (Thread 2)** is blocked in `__GI___poll(fds=<children_fds>, nfds=3, timeout=-1)` inside `io_loop` (`fast_data_types.so`) → `start_thread` → `clone3`. This is the dedicated PTY I/O thread created in `child-monitor.c` (thread named at [kitty/child-monitor.c:1489]); its whole job is to `poll` child FDs and read their bytes into the shared parser buffer. It runs **no Python**. *(observed stack; name/creation file:line from source)*
 
 The symbol names `io_loop`, `main_loop`, `children_fds`, and `_glfw` are the real production symbols resolved out of `fast_data_types.so` / `glfw-x11.so` — i.e. this is kitty's own code, not a test harness. *(observed)*
@@ -1018,11 +1018,11 @@ Classifying every row of that table:
 |---|---|---|---|
 | 1 | `kitty` | `ppoll` (GLFW loop) | **kitty MAIN thread** — parse + Python + render (holds GIL) |
 | 2 | `KittyChildMon` | `poll` on `children_fds` | **kitty PTY I/O thread** (child-monitor.c:1489) |
-| 3 | `kitty:disk$0` | `futex` wait | disk-cache worker thread (kitty/disk-cache.c) — idle |
+| 3 | `kitty:disk$0` | `futex` wait | **Mesa/Gallium software-GL** shader-disk-cache worker (`util_queue`, frames in `libgallium-*.so`) — a headless-container artifact, **not** kitty's own disk cache (see §3.4) |
 | 4–35 (32) | `kitty` | `futex` wait | Mesa/GL helper pool (software-GL, this container) |
 | 36–67 (32) | `llvmpipe-0..31` | `futex` wait | Mesa **llvmpipe** software rasterizer pool |
 
-**Critical caveat (observed + inferred):** the **64** `futex`-blocked threads in rows 4–67 are **Mesa software-OpenGL artifacts of this headless container** (the `llvmpipe` software rasterizer and its worker pool, from `libgallium-*.so`), **not** part of kitty's own concurrency design. On a normal GPU-backed desktop these do not exist. They are irrelevant to the clipboard/parser data path and are called out here so they are never mistaken for kitty threads. *(the count is observed; the attribution to Mesa llvmpipe is inferred from the thread names and the `libgallium` frames in the raw backtrace capture)*
+**Critical caveat (observed + inferred):** the **65** `futex`-blocked threads in rows 3–67 are **Mesa software-OpenGL artifacts of this headless container** (the `llvmpipe` software rasterizer and its worker pool, *plus* the `kitty:disk$0` `util_queue` shader-disk-cache worker in row 3 — all with frames in `libgallium-*.so`), **not** part of kitty's own concurrency design. On a normal GPU-backed desktop these do not exist. They are irrelevant to the clipboard/parser data path and are called out here so they are never mistaken for kitty threads. In particular, `kitty:disk$0` is Mesa's disk shader-cache thread named by its `util_queue` `<progname>:disk$<N>` convention — it must **not** be confused with kitty's own `DiskCacheWrite` thread, which is absent at idle (§3.4). *(the count is observed; the attribution to Mesa is inferred from the thread names and the `libgallium` frames in the raw backtrace capture — for `kitty:disk$0` a targeted `thread apply … bt` shows frames #5–#7 in `/lib/x86_64-linux-gnu/libgallium-25.2.8-0ubuntu0.24.04.2.so`)*
 
 ### 3.3 Kernel `/proc` wchan cross-check
 
@@ -1042,9 +1042,9 @@ tid=137 comm=KittyChildMon wchan=do_sys_poll      # PTY I/O thread (blocked in p
 
 ### 3.4 Conditional and transient threads
 
-Three further threads exist only under specific conditions and are therefore **not** in the idle table above except the disk worker; each is named in source: *(file:line observed in source; runtime presence labeled per item)*
+Three further threads exist only under specific conditions and are therefore **not** in the idle table above; each is named in source: *(file:line observed in source; runtime presence labeled per item)*
 
-- **`kitty:disk$0`** — the disk-cache write worker, created in `kitty/disk-cache.c` (thread body around [kitty/disk-cache.c:342]). It **is** present at idle (Thread 3 above), parked on a futex waiting for work. Its interaction with readers/shutdown is examined in §9. *(presence observed)*
+- **kitty's own `DiskCacheWrite`** — the disk-cache write worker whose loop body sets its name via `set_thread_name("DiskCacheWrite")` [kitty/disk-cache.c:342]. It is created **lazily, not at startup**: `ensure_state` [kitty/disk-cache.c:376] runs `pthread_create(&self->write_thread, NULL, write_loop, self)` [kitty/disk-cache.c:397] only on the first disk-cache use (`add_to_disk_cache` [kitty/disk-cache.c:488] / `read_from_disk_cache` [kitty/disk-cache.c:591]). In the idle `--config NONE` instance above, no image or disk-cache use has occurred, so a thread census finds **`DiskCacheWrite_count_idle=0`** — it is **absent**. It is **not** the `kitty:disk$0` thread in the idle table: that thread is a Mesa/Gallium `util_queue` shader-disk-cache worker (frames in `libgallium-*.so`; §3.2 caveat), a headless-container artifact. kitty's real `DiskCacheWrite`, driven under load, is examined in §9.2. *(absence at idle observed; lazy-creation chain source-grounded at disk-cache.c:342/376/397; real-thread behavior in §9.2)*
 - **`KittyPeerMon`** — the remote-control peer monitor [kitty/child-monitor.c:1808], started only when a control socket is configured (`listen_on`/`--listen-on`). It is **absent** in the default `--config NONE` instance above, which is why it does not appear in the table. *(absence observed in the default instance; creation file:line from source)*
 - **`KittyWriteStdin`** — a **transient** worker [kitty/child-monitor.c:967], spawned per bulk write-to-child and exiting when that write completes; it is not a persistent thread and so is not expected in an idle snapshot. *(inferred from the source lifecycle; not exercised in this idle capture)*
 
@@ -1348,7 +1348,7 @@ cat "$OBS/rt_big.result" 2>/dev/null
 
 ### 4.3 Very large write — in-memory→on-disk backing-store transition (findings 30, 31, Major M4)
 
-Python accumulates the decoded payload in a `Tempfile` (`kitty/clipboard.py:24`) that starts as an in-memory `io.BytesIO` and **rolls over to an on-disk temporary file** once it would exceed `rollover_size = 16 * 1024 * 1024` (16 MiB) — `kitty/clipboard.py:237`. The rollover copies the accumulated bytes out of the `BytesIO` via `getvalue()` into the file-backed store (`kitty/clipboard.py:32`, `rollover_if_needed`). This is a **backing-store transition** (RAM `BytesIO` → file descriptor that the OS may keep in page cache), **not** data "leaving RAM."
+Python accumulates the decoded payload in a `Tempfile` (`kitty/clipboard.py:26`) that starts as an in-memory `io.BytesIO` and **rolls over to an on-disk temporary file** once it would exceed `rollover_size = 16 * 1024 * 1024` (16 MiB) — `kitty/clipboard.py:237`. The rollover copies the accumulated bytes out of the `BytesIO` via `getvalue()` into the file-backed store (`kitty/clipboard.py:32`, `rollover_if_needed`). This is a **backing-store transition** (RAM `BytesIO` → file descriptor that the OS may keep in page cache), **not** data "leaving RAM."
 
 A 20 MiB raw payload (27 962 028 base64 bytes) is fed while tracing file syscalls:
 
@@ -1698,7 +1698,7 @@ The raw hex `1b5d35323b633b6247566e59574e354e544a795a57466b1b5c` decodes as `ESC
 
 **Extended OSC 5522 read** returns a 3-packet sequence `OK` → `DATA:mime=<b64-mime>;<b64-payload>` → `DONE` (`ReadRequest.encode_response`, `kitty/clipboard.py:207`; statuses emitted at `:476`, `:499`). The harness below drives OSC 5522 through a raw-mode PTY child and records the decoded packets to a file (the child's stderr *is* the PTY, so results are written to a side file):
 
-*Script `osc5522_harness.py` (sha256 `255d5ca1f7ad219379b893a1d869ebc9913feba0cbac154e5294727d6b178760`):*
+*Script `osc5522_harness.py` (sha256 `dec6eb1d97c74c15fb18055af46369a535a3a905755f9cbc420c0b4478300e62`):*
 
 ```python
 #!/usr/bin/env python3
@@ -1736,7 +1736,9 @@ def main():
         elif scen=='write_eperm':
             emit(b'\x1b]5522;type=write\x1b\\')
         elif scen=='write_einval':
-            emit(b'\x1b]5522;type=write\x1b\\'); emit(b'\x1b]5522;type=wdata:mime='+b64('text/plain').encode()+b';@@@notb64@@@\x1b\\'); emit(b'\x1b]5522;type=wdata\x1b\\')
+            emit(b'\x1b]5522;type=write\x1b\\'); emit(b'\x1b]5522;type=wdata:mime='+b64('text/plain').encode()+b';@notb64xyz@@\x1b\\'); emit(b'\x1b]5522;type=wdata\x1b\\')
+        elif scen=='write_primary':
+            emit(b'\x1b]5522;type=write:loc=primary\x1b\\'); emit(b'\x1b]5522;type=wdata:mime='+b64('text/plain').encode()+b';'+b64('hello-5522-write').encode()+b'\x1b\\'); emit(b'\x1b]5522;type=wdata\x1b\\')
         buf=read_responses(to)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -2089,7 +2091,7 @@ All O1 scripts are embedded above with their sha256; all captured outputs are sh
 
 From the Threading section (gdb-proven): PTY bytes are read by the **`KittyChildMon`** I/O thread into the single shared 1 MiB parser buffer, but **parsing, all Python dispatch (including `clipboard_control`), screen mutation, and rendering run on the MAIN thread under the GIL**. The I/O thread never runs Python. Three code mechanisms govern behavior under load:
 
-- **POLLIN backpressure** — `kitty/child-monitor.c:1501`: `children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;`. On every io_loop iteration the child fd's read-interest is set to `POLLIN` **only if** the parser has buffer space, else `0`. `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1478`) returns `self->read.sz + self->write.pending < BUF_SZ` — so the instant POLLIN is cleared, occupancy has reached `BUF_SZ` (1 MiB).
+- **POLLIN backpressure** — `kitty/child-monitor.c:1501`: `children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;`. On every io_loop iteration the child fd's read-interest is set to `POLLIN` **only if** the parser has buffer space, else `0`. `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1477`) returns `self->read.sz + self->write.pending < BUF_SZ` — so the instant POLLIN is cleared, occupancy has reached `BUF_SZ` (1 MiB).
 - **`input_delay` coalescing** — `kitty/child-monitor.c:1508-1511`: when wakeups are pending, `poll(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(OPT(input_delay) - elapsed))` — the io_loop waits up to `input_delay` (default 3 ms) collecting more input before waking MAIN. The MAIN-side gate (`kitty/vt-parser.c:1425`) consumes only if `flush || time_since_new_input >= OPT(input_delay) || self->read.sz + 16*1024 > BUF_SZ`.
 - **Lock hand-off** — `kitty/vt-parser.c:1417-1445`: `run_worker` takes the parser mutex, promotes `self->read.sz += self->write.pending` **under the lock**, then runs `consume_input` **with the lock released** (so the I/O thread can keep filling `write.pending`), then re-promotes under the lock. Reads on the I/O side (`kitty/child-monitor.c:1337` `read_bytes`) reserve the write buffer under the lock (`vt_parser_create_write_buffer`), `read()` **outside** the lock, then `vt_parser_commit_write` under the lock.
 
@@ -2201,7 +2203,7 @@ MAX_ABSORBED_BETWEEN_STALLS_BYTES=1050368 (~PTY buf + parser buf)
 MAX_ABSORBED_MIB=1.002
 ```
 
-Both runs sustain ~106–109 MiB/s (~320–327 MiB in 3 s). The child is **blocked ~65 % of the run** on backpressure (1286 / 2150 EAGAIN stalls), and the **maximum bytes absorbed between two stalls is 1 050 624 / 1 050 368 bytes = 1.002 MiB in both runs** — kitty's 1 MiB `BUF_SZ` parser buffer (`kitty/vt-parser.c:18`) plus a small PTY-kernel-buffer margin. This is the direct, stable magnitude of the buffered window and the first proof of finding 57. The io_loop poll() thread that services this is `KittyChildMon` (see O2.3 strace, tid 5381).
+Both runs sustain ~106–109 MiB/s (~320–327 MiB in 3 s). The child is **blocked ~65 % of the run** on backpressure (1286 / 2150 EAGAIN stalls), and the **maximum bytes absorbed between two stalls is 1 050 624 / 1 050 368 bytes = 1.002 MiB in both runs** — kitty's 1 MiB `BUF_SZ` parser buffer (`kitty/vt-parser.c:18`) plus a small PTY-kernel-buffer margin. This is the direct, stable magnitude of the buffered window and the first proof of finding 57. The io_loop poll() thread that services this is `KittyChildMon` (see the O2.3 strace, where its per-run strace tid polls `children_fds`).
 
 ### 5.2 The default 3 ms `input_delay` coalescing gate (finding 56)
 
@@ -2431,27 +2433,26 @@ if toggle_fds:
 PYEOF
 ```
 
-**Observed — the direct POLLIN disable→re-enable transition on fd 8 (tid 5381 = `KittyChildMon`), with `input_delay`-bounded timeouts:**
+**Observed — the genuine, contiguous `o2_pollin.sh` output for one representative run (of eight repeats; see the distribution below). It captures the fd 8 `POLLIN`→disabled→re-enabled transition on the `KittyChildMon` io_loop thread (here strace tid 90 — the thread that polls `children_fds`=[fd6, fd7, fd8]), with the small finite `poll()` timeouts (`3, 0` / `3, 1`) bounded by the 3 ms `input_delay`:**
 
 ```text
-# io_loop thread (tid 5381 = KittyChildMon) poll() on children_fds=[fd6 wakeup, fd7 signal, fd8 child-PTY-master]
-# child PTY master = fd 8; POLLIN on fd8 is gated by vt_parser_has_space_for_input (vt-parser.c:1478)
+=== strace size ===
+31296 /tmp/obs/out/pollin_strace.raw
 
-5381  22:14:26.686495 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, -1 <unfinished ...>
-[first POLLIN-DISABLED sample]
-5381  22:14:26.732213 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 1) = 0 (Timeout)
-[a POLLIN-ENABLED sample]
-5381  22:14:26.686495 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, -1 <unfinished ...>
-[a POLLIN-DISABLED, input_delay-bounded timeout sample]
-5381  22:14:26.732213 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 1) = 0 (Timeout)
-[POLLIN re-enabled after disable]
-5381  22:14:26.721936 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 2) = 1 ([{fd=8, revents=POLLIN}])
+=== identify a child-PTY fd that toggles POLLIN<->0 in the io_loop poll() ===
+fds observed with events set: {'3': ['POLLIN', 'POLLIN|POLLOUT'], '6': ['POLLIN'], '7': ['POLLIN'], '8': ['0', 'POLLIN']}
+child fd(s) that toggle POLLIN<->0 (backpressure): ['8']
 
-# total fd=8 poll() samples and POLLIN<->0 transitions during the ~2s flood:
-  POLLIN-present samples=24562  POLLIN-disabled samples=130
+[POLLIN ENABLED  fd=8] 90    02:45:31.248517 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, -1) = 1 ([{fd=8, revents=POLLIN}])
+
+[POLLIN DISABLED fd=8] 90    02:45:31.397567 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=0}], 3, 0) = 0 (Timeout)
+
+[POLLIN RE-ENABLED fd=8] 90    02:45:31.399988 poll([{fd=6, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}], 3, 1) = 1 ([{fd=8, revents=POLLIN}])
+
+fd=8 state changes (POLLIN<->0) during flood: 14 ; poll() samples for this fd: 26894
 ```
 
-The post-processing (`o2_pollin.sh`) reported **44 `POLLIN`↔`0` state changes** for fd 8 over the flood, with 24 073 poll() samples. Because `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1478`) is `read.sz + write.pending < BUF_SZ`, each `events=0` sample is a moment when occupancy **equals `BUF_SZ` = 1 MiB** — i.e. the near/full occupancy is captured directly at the disable edge, and corroborated by the 1.002 MiB max-absorbed measurement in O2.1. When POLLIN is cleared, kitty stops `read()`-ing the master; the PTY kernel buffer fills and the child's `write()` gets `EAGAIN` (the backpressure stalls counted in O2.1). Note the `3, 1` and `3, 2` timeout arguments in the poll() lines above — the io_loop is simultaneously honoring the `input_delay` gate (finding 56) while backpressured.
+The post-processing (`o2_pollin.sh`) reported **14 `POLLIN`↔`0` state changes** for fd 8 in the run above, with **26 894** `poll()` samples for that fd. The transition count is timing-dependent: repeating the identical unchanged flood **eight** times yielded **{0, 2, 14, 14, 18, 30, 34, 60}** state changes (with **20 871–28 950** `poll()` samples per run), because whether the 2 s flood pushes occupancy to exactly `BUF_SZ` at the instant a `poll()` samples fd 8 depends on scheduler timing — but the *behavior* (fd 8's `events` clearing to `0` when the buffer is full, then returning to `POLLIN` once drained) reproduced in every run that filled. Because `vt_parser_has_space_for_input` (`kitty/vt-parser.c:1477`) is `read.sz + write.pending < BUF_SZ`, each `events=0` sample is a moment when occupancy **equals `BUF_SZ` = 1 MiB** — i.e. the near/full occupancy is captured directly at the disable edge, and corroborated by the 1.002 MiB max-absorbed measurement in O2.1. When POLLIN is cleared, kitty stops `read()`-ing the master; the PTY kernel buffer fills and the child's `write()` gets `EAGAIN` (the backpressure stalls counted in O2.1). Note the `3, 0` and `3, 1` timeout arguments in the poll() lines above — the io_loop is simultaneously honoring the `input_delay` gate (finding 56) while backpressured (both timeouts are well within the 3 ms `input_delay` bound).
 
 ### 5.4 Canonical latency distribution and configuration basis (findings 58, 59; M8, M20)
 
@@ -2564,7 +2565,7 @@ UNDER_LOAD_ALL_MS=3.872, 4.300, 4.347, 4.387, 4.395, 4.415, 4.462, 4.518, 4.522,
 | run 1 | 3.346 ms | 4.777 ms | 7.152 ms |
 | run 2 | 3.273 ms | 4.782 ms | 7.469 ms |
 
-Under a ~275 MiB/3 s flood, delivery latency rises from ~3.3 ms (idle) to ~4.8 ms median (up to ~7.5 ms), stable across both runs. **Conclusion (observed, code-grounded):** because parse → Python dispatch → screen mutation → render are serialized on the MAIN thread under the GIL (`kitty/child-monitor.c:1222` main tick → `:451` `parse_input` → `kitty/vt-parser.c:1417` `run_worker`), a query/event queued behind a large parse backlog is delivered late. The delay is **bounded**, not unbounded: the 1 MiB buffer cap plus POLLIN backpressure (O2.3) limit how much unparsed input can sit ahead of any event, so the under-load latency rose only ~1.5 ms at the median rather than growing without limit. The I/O thread meanwhile keeps filling the buffer independently — it is never blocked on Python — which is why backpressure (not data loss) is the failure mode when MAIN falls behind.
+Under a ~275 MiB/3 s flood, delivery latency rises from ~3.3 ms (idle) to ~4.8 ms median (up to ~7.5 ms), stable across both runs. **Conclusion (observed, code-grounded):** because parse → Python dispatch → screen mutation → render are serialized on the MAIN thread under the GIL (`kitty/child-monitor.c:1224` main tick → `:451` `parse_input` → `kitty/vt-parser.c:1417` `run_worker`), a query/event queued behind a large parse backlog is delivered late. The delay is **bounded**, not unbounded: the 1 MiB buffer cap plus POLLIN backpressure (O2.3) limit how much unparsed input can sit ahead of any event, so the under-load latency rose only ~1.5 ms at the median rather than growing without limit. The I/O thread meanwhile keeps filling the buffer independently — it is never blocked on Python — which is why backpressure (not data loss) is the failure mode when MAIN falls behind.
 
 Kitten event latency (finding 61) — the separate kitten *process* boundary — is measured in the Kitten-Boundary section; it is deliberately **not** generalized from this core-process number.
 
@@ -2941,7 +2942,7 @@ Thread 1 "kitty" hit Breakpoint 1, 0x0000782c7aa2cb60 in as_text_generic () from
   … [30 more "kitty" GL-pool threads in __futex_abstimed_wait_common64] …
 ```
 
-**Reading it.** The MAIN thread (LWP 9154, `Thread 1 "kitty"`) is stopped **inside `as_text_generic`** — the scrollback scan, which produced **80,817 chars** of `get-text` output. Simultaneously **`KittyChildMon` (LWP 9221) is blocked in `__poll` on `children_fds`** (the I/O thread runs no Python), `KittyPeerMon` is in `poll`, and `kitty:disk$0` (the disk‑cache writer) is in `futex_wait`. Because `clipboard_control` runs on this **same** MAIN thread under the GIL, it **cannot execute while `as_text_generic` occupies MAIN** — the pending event is necessarily serialized behind the scan. This is the canonical structural counterpart to the timing proof above. **OBSERVED.**
+**Reading it.** The MAIN thread (LWP 9154, `Thread 1 "kitty"`) is stopped **inside `as_text_generic`** — the scrollback scan, which produced **80,817 chars** of `get-text` output. Simultaneously **`KittyChildMon` (LWP 9221) is blocked in `__poll` on `children_fds`** (the I/O thread runs no Python), `KittyPeerMon` is in `poll`, and `kitty:disk$0` (the **Mesa/Gallium `util_queue`** software-GL shader-disk-cache worker — a headless-container artifact, **not** kitty's disk cache; §3.4) is in `futex_wait`. Because `clipboard_control` runs on this **same** MAIN thread under the GIL, it **cannot execute while `as_text_generic` occupies MAIN** — the pending event is necessarily serialized behind the scan. This is the canonical structural counterpart to the timing proof above. **OBSERVED.**
 
 ### 7.3 Why even a callback‑driven scan does not yield (GIL‑hold classification)
 
@@ -2994,7 +2995,7 @@ A scan **reads** this segmented storage and does not alter it; scrollback RAM gr
 
 ### 7.6 Pager-history stores raw bytes (not compressed) and is OFF by default (corrects M11/68; finding 72)
 
-The pager history is a byte **ring buffer that stores UTF‑8/ANSI bytes directly — there is no compression**. `pagerhist_write_bytes` (`kitty/history.c:218`) does a plain `ringbuf_memcpy_into(ph->ringbuf, buf, sz)`; a grep of the entire `kitty/history.c` for `zlib|lz4|deflate|compress|snappy` returns **nothing**:
+The pager history is a byte **ring buffer that stores UTF‑8/ANSI bytes directly — there is no compression**. `pagerhist_write_bytes` (`kitty/history.c:219`) does a plain `ringbuf_memcpy_into(ph->ringbuf, buf, sz)`; a grep of the entire `kitty/history.c` for `zlib|lz4|deflate|compress|snappy` returns **nothing**:
 
 ```text
 $ grep -naiE "zlib|lz4|deflate|inflate|compress|snappy" /app/kitty/history.c
@@ -3042,7 +3043,7 @@ The background `DiskCacheWrite` thread (`kitty/disk-cache.c:342`) backs the **gr
 | Scan transient = 4.58 MiB net / 11.9 MiB peak Python object | OBSERVED | §7.4 tracemalloc |
 | RSS +~4.9 MiB during, released after | OBSERVED | §7.4 smaps before/during/after |
 | Persistent scrollback = 5,251,072 B/2048-line segment (ratio 1.00) | OBSERVED | §7.5 RSS steps |
-| Pager stores raw bytes, no compression, off by default | OBSERVED | §7.6 grep + `history.c:218` + `options:406` |
+| Pager stores raw bytes, no compression, off by default | OBSERVED | §7.6 grep + `history.c:219` + `options:406` |
 | Pager ring saturates at 16 MiB = 209,715 lines on eviction | OBSERVED | §7.6 eviction run |
 | Line counts reconcile (fed/stored/evicted/ring) | OBSERVED | §7.7 table |
 | Disk cache is graphics, not scrollback | OBSERVED + INFERRED | §7.8 |
@@ -3206,7 +3207,7 @@ Reading the output. At **STOP A**, `$1 = 1` is the held mutex and `$2 = 11056` i
 
 ### 8.2 The C→Python callback is synchronous on MAIN, and every other thread is parked
 
-To show nothing runs concurrently with the callback, a companion linked run (`o4_lock_gdb.raw`) dumps `info threads` at the moment `clipboard_control` is entered. Only the MAIN thread is in `clipboard_control`; `KittyChildMon` is parked in `poll()` on `children_fds`, `kitty:disk$0` is parked in a futex, and the 64 GL software-rasteriser pool threads (`llvmpipe-*` plus unnamed `kitty` pool threads, a headless Mesa/Xvfb artifact) are all in `__futex_abstimed_wait_common64`:
+To show nothing runs concurrently with the callback, a companion linked run (`o4_lock_gdb.raw`) dumps `info threads` at the moment `clipboard_control` is entered. Only the MAIN thread is in `clipboard_control`; `KittyChildMon` is parked in `poll()` on `children_fds`, and the 65 GL software-rasteriser pool threads (`llvmpipe-*`, unnamed `kitty` pool threads, and the `kitty:disk$0` `util_queue` shader-disk-cache worker — all a headless Mesa/Xvfb artifact, frames in `libgallium-*.so`; §3.4) are all in `__futex_abstimed_wait_common64`:
 
 ```
 =========== STOP1 clipboard_control (OSC52_A) : SYNCHRONOUS CALLBACK STACK on MAIN ===========
@@ -3281,7 +3282,7 @@ To show nothing runs concurrently with the callback, a companion linked run (`o4
   67   Thread 0x7ffee67fc6c0 (LWP 10821) "KittyChildMon" 0x00007ffff76184fd in __GI___poll (fds=fds@entry=0x7ffff6af6a80 <children_fds>, nfds=3, timeout=timeout@entry=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
 ```
 
-So at the instant the clipboard callback runs, 66 of 67 threads are blocked and the callback owns the process. *(inferred)* On a real GPU the ~64 `llvmpipe`/pool threads would not exist; they are a software-GL artifact and do not affect the serialisation conclusion — the functionally relevant threads (`KittyChildMon`, `kitty:disk$0`) are demonstrably idle.
+So at the instant the clipboard callback runs, 66 of 67 threads are blocked and the callback owns the process. *(inferred)* On a real GPU the ~65 `llvmpipe`/pool threads would not exist — including `kitty:disk$0`, which is itself one of those Mesa `util_queue` software-GL threads (§3.4), not a kitty thread; they are a software-GL artifact and do not affect the serialisation conclusion — the only functionally relevant kitty thread besides MAIN, `KittyChildMon`, is demonstrably idle (parked in `poll()`).
 
 ### 8.3 The boundary memoryview has three distinct lifetimes (corrects C3 / S1)
 
@@ -4458,7 +4459,7 @@ The report's single genuine object-lifetime hazard — a Python-retained `memory
 | **O2** event delivery while MAIN busy | §5.5 | under-load DSR distribution vs baseline |
 | **Kitten** separate-process boundary (PTY/pipe, own event loop) | §6.0-§6.4 | distinct kitten PIDs; `kittens/tui/loop.py:246,261`; `kittens.c:94,104` |
 | **Kitten** measured round-trip latency | §6.2 | ≈3.3 ms, N≥2 |
-| **O3** scan paths named (`as_text`/`text_for_range`/`unicode_in_range`/`as_text_generic`) | §7.1 | `screen.c:3486,3035,3054`; `line.c:874` |
+| **O3** scan paths named (`as_text`/`text_for_range`/`unicode_in_range`/`as_text_generic`) | §7.1 | `screen.c:3486,3035,3057`; `line.c:874` |
 | **O3** scan → event delivery delay (≈ full scan) | §7.2 | gdb-synchronized enqueue; N≥2 |
 | **O3** why a callback-driven scan does not yield (GIL) | §7.3 | `child-monitor.c` main loop; GIL fact |
 | **O3** scan → memory (allocation profile + PID-tied smaps) | §7.4 | before/during/after `/proc/<pid>/smaps` |
@@ -4484,7 +4485,7 @@ The report's single genuine object-lifetime hazard — a Python-retained `memory
 | `WriteRequest` / `rollover_size` (16 MiB) / `clipboard_max_size` (512) | §4.3, §4.4 | `clipboard.py:237,247,321` |
 | `KittyChildMon` / `KittyPeerMon` / `KittyWriteStdin` / `DiskCacheWrite` | §3 | `child-monitor.c:1489,1808,967`; `disk-cache.c:342` |
 | history RAM segments / pager-history ring | §7.5, §7.6 | `history.c:18` |
-| parser mutex / `run_worker` / `consume_input` / `free_vt_parser` | §8.1, §8.3 | `vt-parser.c:205,1417,1432,1508` |
+| parser mutex / `run_worker` / `consume_input` / `free_vt_parser` | §8.1, §8.3 | `vt-parser.c:206,1417,1432,1508` |
 | GIL serialization of the main thread | §3.5, §8.2 | thread topology + `tp_name` capture |
 
 ### 10.2 Consolidated observed/inferred ledger
