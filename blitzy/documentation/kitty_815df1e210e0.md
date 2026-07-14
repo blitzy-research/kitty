@@ -355,7 +355,7 @@ the identical wire format — a deliberate cross-language contract [SOURCE-VERIF
   20 bytes serialized little-endian: `index@0`, `weak@8`, `strong@12` [algorithm.go:177-204].
 - `rolling_checksum` is the weak rsync hash; `full()` computes it in O(n) and `add_one_byte()` rolls
   the window one byte forward in O(1) [algorithm.go:336-361]. The strong block hash is XXH3-64 and the
-  whole-file integrity checksum is XXH3-128 [algorithm.go:40-66,69-102].
+  whole-file integrity checksum is XXH3-128 [algorithm.go:59,65].
 - `Api`/`Patcher` hold the block list and drive signature/delta/patch
   [SOURCE-VERIFIED: tools/rsync/api.go:47-230,270-282].
 
@@ -475,14 +475,14 @@ flows through this chain [SOURCE-VERIFIED]:
 
 1. `kitty/vt-parser.c:547-550` — the OSC dispatcher matches `case FILE_TRANSFER_CODE:` and calls
    `DISPATCH_OSC(file_transmission)`.
-2. `kitty/screen.c:2311-2312` — `file_transmission(Screen *self, PyObject *cmd)` hands the command to
+2. `kitty/screen.c:2311-2312` — `file_transmission(Screen *self, PyObject *data)` hands the command to
    the Python layer.
 3. `kitty/window.py:1388-1389` — `file_transmission()` forwards to
-   `self.file_transmission.handle_serialized_command(...)`.
+   `self.file_transmission_control.handle_serialized_command(...)`.
 4. `kitty/file_transmission.py` — `handle_serialized_command()` parses the command and drives
-   reassembly [file_transmission.py:803]; for a data chunk it base64-decodes the payload and appends
+   reassembly [file_transmission.py:858]; for a data chunk it base64-decodes the payload and appends
    it to the active file, writing through `DestFile` (simple) or `PatchFile` (rsync)
-   [file_transmission.py:599,858]. During an rsync receive,
+   [file_transmission.py:341,510,423]. During an rsync receive,
    `ActiveReceive.signature_pending_chunks` buffers the signature chunks that the server produces
    [file_transmission.py:599].
 
@@ -817,7 +817,7 @@ selected via `compression=zlib`; the server decompresses with `zlib.decompressob
 | `kitty/data-types.c` | Exposes `FILE_TRANSFER_CODE` to Python (L596) | Q3, Q6 |
 | `kitty/screen.c` | `file_transmission(Screen*, PyObject*)` callback (L2311-2312) | Q3 |
 | `kitty/window.py` | `file_transmission()` → `handle_serialized_command()` (L1388-1389) | Q3 |
-| `kitty/file_transmission.py` | `handle_serialized_command` (L803); `DestFile`/`PatchFile` (L379-405,858); `signature_iterator` (L470); `signature_pending_chunks` (L599); download gate (L1024-1028); `zlib.decompressobj(0)` (L367-368) | Q3, Q4 |
+| `kitty/file_transmission.py` | `handle_serialized_command` (L858); `DestFile`/`PatchFile` (L379-405,858); `signature_iterator` (L470); `signature_pending_chunks` (L599); download gate (L1024-1028); `zlib.decompressobj(0)` (L367-368) | Q3, Q4 |
 | `gen/go_code.py` | Generates the Go `FileTransferCode` constant (L597) | Q6 |
 | `kittens/ssh/main.py` | SSH kitten makes `kitten` available on remote (L167) | Q7 |
 | `kitty_tests/file_transmission.py` | Python protocol test harness — pattern for driving the server round-trip | Reference pattern (informed the Q3/Q4 handler-chain reads) |
