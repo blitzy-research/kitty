@@ -199,7 +199,7 @@ Feeding bytes here is exactly what a program writing to the terminal does: the b
 
 ### 1e. Observation script `obs.py` (complete; kept OUTSIDE the repo tree)
 
-Every Q1–Q4 and §6.1–§6.4 output block below is emitted by this one script; each block cites the `obs.py` function that produced it. Control-sequence replies (DSR/CPR) are captured from the child-write buffer `Callbacks.wtcbuf` — the sink of `Callbacks.write` (`self.wtcbuf += bytes(data)`, `kitty_tests/__init__.py:L50-L51`; initialized `self.wtcbuf = b''` at `kitty_tests/__init__.py:L96`). Cell text is read back with `line[x]` (→ `text_at`/`cell_as_unicode`, `kitty/line.c:L193`/`L200`), cell width with `line.width(x)`, and the cursor via `screen.cursor.x`/`.y`.
+Every Q1–Q4 and §6.1–§6.4 output block below is the verbatim standard output of this one script; the sole presentational change is that each function's opening `===`-delimited banner line is rendered as the Markdown section heading above its block rather than repeated inside it. Each block cites the `obs.py` function that produced it. Control-sequence replies (DSR/CPR) are captured from the child-write buffer `Callbacks.wtcbuf` — the sink of `Callbacks.write` (`self.wtcbuf += bytes(data)`, `kitty_tests/__init__.py:L50-L51`; initialized `self.wtcbuf = b''` at `kitty_tests/__init__.py:L96`). Cell text is read back with `line[x]` (→ `text_at`/`cell_as_unicode`, `kitty/line.c:L193`/`L200`), cell width with `line.width(x)`, and the cursor via `screen.cursor.x`/`.y`.
 
 ```python
 #!/usr/bin/env python3
@@ -596,11 +596,11 @@ Command: `make_screen(cols=5)`, `feed(s, 'e')`, then feed each of `U+0300 U+0301
 
 Command: on 1- and 5-column screens, feed `U+2716` then VS16 `U+FE0F`; separately feed `U+1F600` then VS15 `U+FE0E`; query with `cpr(s, c)`. Produced by `obs.py`: `edge_variation_selectors()`.
 
+In the block below, the first two output lines show **VS16** (`U+FE0F`) promoting the narrow base `U+2716` from width 1 to width 2 (on 1- and 5-column screens); the third line shows **VS15** (`U+FE0E`) demoting the wide base `U+1F600` from width 2 to width 1.
+
 ```
-# VS16 promotes narrow emoji base U+2716 (width 1) to width 2:
   cols=1: after U+2716 cell0='✖' w=1 cursor.x=1 ; after +VS16 cell0='✖️' [U+2716 U+FE0F] w=2 cursor.x=1 ; ESC[6n->ESC[1;1R
   cols=5: after U+2716 cell0='✖' w=1 cursor.x=1 ; after +VS16 cell0='✖️' [U+2716 U+FE0F] w=2 cursor.x=2 ; ESC[6n->ESC[1;3R
-# VS15 demotes wide emoji base U+1F600 (width 2) to width 1:
   cols=5: after U+1F600 cell0='😀' w=2 cursor.x=2 ; after +VS15 cell0='😀︎' [U+1F600 U+FE0E] w=1 cursor.x=1
 ```
 
