@@ -2718,23 +2718,20 @@ ext2/ext3
 
 ## Read-only compliance — the source repository is unchanged
 
-Per the MainRule, no existing file in the source repository was modified; the **only** repository change is the authoring of this one deliverable document. The evidence below is shown **unfiltered** (no directory filter, all untracked files shown). The `git diff --name-status` from the pre-deliverable baseline (`HEAD~1` = `815df1e210e0…`, the branch-point commit) to the current working tree lists exactly one path — the deliverable — proving **no tracked source file changed**:
+Per the MainRule, no existing file in the source repository was modified; the **only** repository change is the authoring of this one deliverable document. This document was committed on top of the pre-deliverable **branch-point** across more than one reconciliation commit; because a committed document cannot embed its own final commit hash, all evidence below is anchored on the **stable, permanent branch-point commit** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (an ancestor of `HEAD`), never on a volatile relative ref such as `HEAD~1`. The `git diff --name-status` from that branch-point to the current `HEAD` lists exactly one path — the deliverable — proving **no tracked source file changed** (evidence shown **unfiltered**: all untracked files, no directory filter):
 
 ```text
-$ git rev-parse HEAD
-a084d77163e09f72e5238267eafdfa63468e8e64
-
-$ # Baseline = parent of the commit that first added the deliverable (pre-deliverable source state):
-$ git rev-parse HEAD~1
+$ # Stable pre-deliverable baseline = the branch-point commit (permanent hash, an ancestor of HEAD):
+$ git rev-parse 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 
-$ # Every path that differs between the pre-deliverable baseline and the current working tree:
-$ git diff --name-status HEAD~1 -- .
-A	blitzy/documentation/kitty_815df1e210e0.md
+$ # Confirm the branch-point is the pre-deliverable source state (an ancestor of the current HEAD):
+$ git merge-base --is-ancestor 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD && echo "ancestor: yes"
+ancestor: yes
 
-$ # Full, UNFILTERED working-tree status (all untracked shown; no directory filter):
-$ git status --porcelain --untracked-files=all
- M blitzy/documentation/kitty_815df1e210e0.md
+$ # Every tracked path that differs between the branch-point and the current HEAD:
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
+A	blitzy/documentation/kitty_815df1e210e0.md
 
 $ # The six build artifacts are git-ignored, so building leaves tracked state clean:
 $ git check-ignore -v kitty/fast_data_types.so kittens/transfer/rsync.so kitty/glfw-x11.so kitty/glfw-wayland.so kitty/launcher/kitty kitty/launcher/kitten
@@ -2748,9 +2745,9 @@ $ git check-ignore -v kitty/fast_data_types.so kittens/transfer/rsync.so kitty/g
 
 Notes on why this is a complete accounting (no concealment):
 
-- **Only the deliverable differs from baseline.** `git diff --name-status HEAD~1 -- .` returns a single line, `A blitzy/documentation/kitty_815df1e210e0.md`. No `.py`, `.c`, `.m`, `.go`, or configuration file appears. (This is a *tracked-state* claim, not a "byte-for-byte" claim: building the project necessarily writes ignored artifacts to disk, so a literal byte-for-byte assertion about the whole tree would be false — instead, no *tracked* file other than the deliverable is changed.)
-- **The six build artifacts are git-ignored.** `git check-ignore -v` shows `kitty/fast_data_types.so`, `kittens/transfer/rsync.so`, `kitty/glfw-x11.so`, `kitty/glfw-wayland.so` matched by `.gitignore:1` (`*.so`) and both launchers (`kitty/launcher/kitty`, `kitty/launcher/kitten`) matched by `.gitignore:18` (`/kitty/launcher/kitt*`). That is why building the project — a prerequisite for the whole investigation — leaves tracked repository state clean, and why the status above shows no artifact entries.
-- **All observation scripts and sandboxes lived outside the repository.** The load probe (`/tmp/kitty_qa_logs/load_probe.py`), the enumeration/evidence logs (`/tmp/kitty_qa_logs/…`), and the cascade sandboxes (`/tmp/kitty_qa_sandbox.*`, created via `mktemp -d`) were all created under `/tmp`, never inside the working tree. The cascade experiments (Q4) mutated only a *temporary copy* of the built tree, restored each moved `.so`, and deleted the copy (see the Tier teardown logs). No temporary file was ever written into the repository, so none can appear in the status above.
+- **Only the deliverable differs from baseline.** `git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD` returns a single line, `A blitzy/documentation/kitty_815df1e210e0.md`. No `.py`, `.c`, `.m`, `.go`, or configuration file appears. (This is a *tracked-state* claim, not a "byte-for-byte" claim: building the project necessarily writes ignored artifacts to disk, so a literal byte-for-byte assertion about the whole tree would be false — instead, no *tracked* file other than the deliverable is changed.)
+- **The six build artifacts are git-ignored.** `git check-ignore -v` shows `kitty/fast_data_types.so`, `kittens/transfer/rsync.so`, `kitty/glfw-x11.so`, `kitty/glfw-wayland.so` matched by `.gitignore:1` (`*.so`) and both launchers (`kitty/launcher/kitty`, `kitty/launcher/kitten`) matched by `.gitignore:18` (`/kitty/launcher/kitt*`). That is why building the project — a prerequisite for the whole investigation — leaves tracked repository state clean, and why the working-tree status shown in the final block below has no artifact entries.
+- **All observation scripts and sandboxes lived outside the repository.** The load probe (`/tmp/kitty_qa_logs/load_probe.py`), the enumeration/evidence logs (`/tmp/kitty_qa_logs/…`), and the cascade sandboxes (`/tmp/kitty_qa_sandbox.*`, created via `mktemp -d`) were all created under `/tmp`, never inside the working tree. The cascade experiments (Q4) mutated only a *temporary copy* of the built tree, restored each moved `.so`, and deleted the copy (see the Tier teardown logs). No temporary file was ever written into the repository, so none can appear in that clean working-tree status.
 
 **Final post-commit state (observed).** After this deliverable was committed, the working tree is clean and the only change from the pre-deliverable baseline is the addition of this one document:
 
@@ -2761,7 +2758,7 @@ $ echo "clean == the command above printed no lines"
 clean == the command above printed no lines
 
 $ # From the pre-deliverable baseline to HEAD, the ONE and only change is the deliverable being added:
-$ git diff --name-status HEAD~1 HEAD
+$ git diff --name-status 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
 A	blitzy/documentation/kitty_815df1e210e0.md
 ```
 
