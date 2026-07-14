@@ -596,7 +596,7 @@ Verbatim first cap log line from kitty, **both runs**; the leading `[t]` is kitt
 ```
 [30.233] Too much data being sent to child with id: 1, ignoring it
 ```
-This is the `log_error` at `kitty/child-monitor.c:L341-L344`, firing when `write_buf_used + sz > 104857600`. **Stability:** the *onset* is stable — run 1 first cap log at `t=[30.115]s`, run 2 at `t=[30.233]s`, both `id=1`. It matches the child's own progress: ~1.18M commands sent by `t=26.1s`, and `104857600 / 86 ≈ 1,218,809` 86‑byte replies needed to reach the cap. The *number* of cap lines before teardown is **not** a stable magnitude — it is purely a function of detect‑then‑`SIGKILL` latency (run 1 `4551` lines, run 2 `6595`, emitted at ~45k/s across the `~101`/`~152` ms window before the kill lands); left unbounded the log grows without limit, which is exactly why the driver stops on the **first** line (see "Failed attempts" below).
+This is the `log_error` at `kitty/child-monitor.c:L341-L344`, firing when `write_buf_used + sz > 104857600`. **Stability:** the *onset* is stable — run 1 first cap log at `t=[30.115]s`, run 2 at `t=[30.233]s`, both `id=1`. It matches the child's own progress: ~1.18M commands sent by `t=26.1s`, and `104857600 / 86 ≈ 1,219,274` 86‑byte replies needed to reach the cap. The *number* of cap lines before teardown is **not** a stable magnitude — it is purely a function of detect‑then‑`SIGKILL` latency (run 1 `4551` lines, run 2 `6595`, emitted at ~45k/s across the `~101`/`~152` ms window before the kill lands); left unbounded the log grows without limit, which is exactly why the driver stops on the **first** line (see "Failed attempts" below).
 
 **Bottom line for (b).** Under output pressure kitty performs a **non‑blocking, `EAGAIN`‑aware drain** (`kitty/child-monitor.c:L1443-L1479`) that **retains** un‑written responses for the next `POLLOUT` (`memmove` at `L1474`; `POLLOUT` armed only when buffered, `L1503`) — observed delivering all `50000/50000` responses intact after a stall, with an observed first‑cycle `write_buf_used` of `382,789`/`383,273` bytes (peaking at `630,713`/`634,682` bytes) at the point of `EAGAIN`. Its sole limit is a **100 MiB** (`104857600`‑byte) hard cap that **drops with a log line** (`L341-L344`) — observed firing verbatim at `t≈30s` once the reader stalls. Every byte moved was a real graphics‑protocol response.
 
@@ -1087,7 +1087,7 @@ kitty's response to pressure is a **mix**: the flow‑control adaptations on the
 - OBJ‑2 retention: `50000/50000` responses delivered, runs 1 and 2.
 - OBJ‑2 control: `50000/50000`, runs 1 and 2 (0 drops with a draining reader).
 - OBJ‑2 EAGAIN: `12` `write()`→`EAGAIN` events per run; first‑cycle `write_buf_used` = `382,789` B (run 1) / `383,273` B (run 2) (peak `630,713`/`634,682` B).
-- OBJ‑2 100 MiB cap: first `Too much data …` log at `t=[30.038]s` (run 1) / `t=[30.230]s` (run 2); both `id=1`; threshold `104857600` bytes.
+- OBJ‑2 100 MiB cap: first `Too much data …` log at `t=[30.115]s` (run 1) / `t=[30.233]s` (run 2); both `id=1`; threshold `104857600` bytes.
 - Path A: byte‑identical across two runs for the response bytes, the quiet boundary, both eviction branches, the real‑scale `1280 → 2` collapse (at exactly `335544320` B), and the frame‑cache `;ENOSPC` on the 9th frame.
 
 **Observed vs inferred.**
