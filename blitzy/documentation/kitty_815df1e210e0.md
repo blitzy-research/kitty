@@ -94,7 +94,7 @@ the investigation produces different ids, discovered via the reproducible blocks
 
 **Environment adjustments (disclosed).** To let `strace` attach to a running process in the container,
 the kernel setting `kernel.yama.ptrace_scope` was read (original value **`0`**) before tracing. It was
-restored to the hardened value `1` at the end of the investigation; the before/after proof and the
+set to the hardened value `1` at the end of the investigation; the before/after proof and the
 full cleanup (removal of all temporary logs/scripts, teardown of kitty/Xvfb/tracers, and confirmation
 that the repository contains only this document) are shown in **Appendix D**.
 
@@ -523,7 +523,7 @@ four. Even the largest `echo` read fills a negligible fraction of the buffer.
 **Direct answer.** The reading mechanism is unchanged — the same `read_bytes()` path on the same master
 fd `8` — but the *cadence* changes dramatically: instead of a handful of tiny reads, kitty performs
 **tens of thousands of reads per run at roughly 6,500–7,000 reads per second**, each returning a small
-chunk (**median ≈ 1.1 KiB, mean ≈ 1.4 KiB**, ranging from 1 byte up to ≈ 19.7 KiB). It does **not**
+chunk (**median ≈ 1.1 KiB, mean ≈ 1.4 KiB**, ranging from 1 byte up to ≈ 19.2 KiB). It does **not**
 coalesce the stream into one large read: even though every `read()` still requests up to ~1 MiB, the
 kernel returns only what the line discipline currently holds, which is far less than 1 MiB.
 
@@ -634,7 +634,7 @@ individual reads depends on run-to-run scheduling — as expected for an emergen
 ### Per-read size: measured distribution, and why each read is small
 
 The **measured** per-read size across runs is: **min 1 byte, median ≈ 1.1 KiB, mean ≈ 1.4 KiB,
-max ≈ 19.7 KiB**. Relative to the ~1 MiB request:
+max ≈ 19.2 KiB**. Relative to the ~1 MiB request:
 
 - the **median** read (~1,143 B) is `1048576 / 1143 ≈ 917×` smaller — about **2.96 orders of
   magnitude** below the 1 MiB buffer (i.e. just under three orders);
@@ -649,7 +649,7 @@ cap** enforced anywhere in kitty's code — `read_bytes()` always offers the ker
 `(inferred from code: kitty/child-monitor.c:L1345)`; the returned count is simply *whatever the N_TTY
 line discipline has buffered at that instant* (per the Linux kernel TTY documentation, a tty read
 "returns whatever characters it has buffered up for the user"). That the largest observed reads reach
-≈ 19.7 KiB is itself direct evidence against a "few KiB" ceiling. The per-read amount is an **emergent**
+≈ 19.2 KiB is itself direct evidence against a "few KiB" ceiling. The per-read amount is an **emergent**
 quantity set by the race between the producer (`yes` writing the slave) and the consumer (kitty draining
 the master), modulated by:
 
@@ -878,7 +878,7 @@ two-level: `consume_normal()` separates **decoded non-ESC input** (to `screen_dr
 | Q1 | Build & launch | `CI=true python3 setup.py --ignore-compiler-warnings` → exit 0, `kitty 0.35.2`; launched as user `ubuntu` (uid 1000) under headless `Xvfb`; kitty PID `82052` |
 | Q2 | Spawned shell | `/bin/bash --posix`, PID `82119`, **direct** child of kitty; connected via PTY slave `/dev/pts/0` |
 | Q3 | `echo test123` reads | `poll()` then `read()` on the master **fd 8**; **16** reads; each requests up to **1 MiB** (`BUF_SZ`); returns `12×1 + 11 + 47 + 114 + 433 = 617` bytes |
-| Q4 | `yes hello` reads | same `read_bytes()`/fd 8 path; **~6,500–7,000 reads/s**, median **≈ 1.1 KiB**, max **≈ 19.7 KiB** (never approaches 1 MiB); stable across 3 runs |
+| Q4 | `yes hello` reads | same `read_bytes()`/fd 8 path; **~6,500–7,000 reads/s**, median **≈ 1.1 KiB**, max **≈ 19.2 KiB** (never approaches 1 MiB); stable across 3 runs |
 | Q5 | Master fd number | **`8`** → `/dev/pts/ptmx` |
 | Q6 | Reader / parser functions | reader **`read_bytes()`** `[kitty/child-monitor.c:L1337]`; parser **`consume_input()` → `consume_normal()`** `[kitty/vt-parser.c:L1367, L230]` |
 
@@ -934,7 +934,7 @@ python3 "$PROBE/analyze.py" "$PROBE/yes1.strace"
 - **Observation tools:** `strace` (syscall trace), `xdotool` (real keystroke injection + window discovery),
   `xprop` (window ownership), `xxd`, `ps`, `/proc` — none are project dependencies; no source or manifest
   was changed.
-- **`ptrace_scope`:** read as `0` before tracing (allows `strace -p`), restored to `1` afterwards
+- **`ptrace_scope`:** read as `0` before tracing (allows `strace -p`), set to `1` afterwards
   (Appendix D).
 
 
@@ -972,17 +972,17 @@ git status --ignored --porcelain | grep -c '^!!'   # count of ignored build arti
 A pre-clean dry-run (`git clean -ndX`) was checked first and confirmed it targeted **only** git-ignored
 build output — nothing under `blitzy/` and no tracked file.
 
-**`kernel.yama.ptrace_scope` restored to the hardened value:**
+**`kernel.yama.ptrace_scope` set to the hardened value:**
 
 ```bash
-cat /proc/sys/kernel/yama/ptrace_scope        # before restore
+cat /proc/sys/kernel/yama/ptrace_scope        # before change
 sysctl -w kernel.yama.ptrace_scope=1
-cat /proc/sys/kernel/yama/ptrace_scope        # after restore
+cat /proc/sys/kernel/yama/ptrace_scope        # after change
 ```
 
 ```
 0     # original value (read before tracing; allowed strace -p to attach)
-1     # restored afterwards — container left MORE hardened than found
+1     # set afterwards — container left MORE hardened than found
 ```
 
 **Temporary artifacts deleted:** the observation directory `/tmp/kitty_pty_probe` (raw `*.strace`
