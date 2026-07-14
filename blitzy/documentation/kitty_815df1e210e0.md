@@ -109,7 +109,7 @@ Output **[observed]**:
 
 === git provenance (anchored to the immutable pinned commit) ===
 destination/review branch:        blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7
-current branch HEAD (varies):     db9bbddeb0de105a7586119924309ab2c8df48b7
+current branch HEAD (varies):     65e7964ec9ee9510f802841599a2a758faade066
 pinned source commit under study: 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 pinned commit subject:            Wire up applying of font config
 pinned is an ancestor of HEAD:    YES (invariant)
@@ -159,18 +159,45 @@ Command (run at the repository root):
 set -o pipefail
 rm -rf build kitty/fast_data_types.so          # remove ONLY git-ignored C build artifacts
 CI=true python3 setup.py build --verbose > /tmp/build.txt 2>&1
-echo "BUILD_EXIT=$?"
+rc=$?                                           # capture the CANONICAL build status IMMEDIATELY,
+echo "BUILD_EXIT=$rc"                           #   before any later command can overwrite $?
 echo "lines: $(wc -l < /tmp/build.txt)  bytes: $(wc -c < /tmp/build.txt)"
 echo "sha256: $(sha256sum /tmp/build.txt | cut -d' ' -f1)"
+if [ "$rc" -ne 0 ]; then                        # a FAILED build must fail this block — never mask it
+  echo "BUILD FAILED (rc=$rc) — tail of transcript:"; tail -n 20 /tmp/build.txt
+  exit "$rc"                                     # stop here; do NOT run the artifact/import checks
+fi
 grep -ni 'warning:\|error:' /tmp/build.txt || echo 'NONE (zero warnings/errors)'
+exit "$rc"                                       # explicit final status (0 on the canonical clean build)
 ```
 
-The complete, unedited transcript follows. All 85 compile lines carry the identical strict
-warning/error flag set shown above; the preamble (lines 1–6) records the Wayland auto-disable, and the
-final lines link `fast_data_types.so`, `glfw-x11.so`, the `kitty` launcher, and the Go `kitten`
-launcher.
+This block is written to be run as a script: it captures the build's own exit status into `rc` the
+instant the compiler returns, echoes a four-line summary, and — critically — **`exit "$rc"` so a broken
+build makes the whole block exit non-zero** instead of being masked by the later `grep`/`echo`. The
+artifact and import verification (shown further below) is reached **only when `rc == 0`**. The block's
+literal stdout on the canonical clean build is exactly the four summary lines below.
 
-Output **[observed]**:
+Output **[observed]** — the literal four-line stdout of the command block above:
+
+```text
+BUILD_EXIT=0
+lines: 103  bytes: 58948
+sha256: 2d520aa5fa79303cabe89177acd6465a2f65b6d5f89feae43489501eb5129a4c
+NONE (zero warnings/errors)
+```
+
+The full compile transcript itself was redirected to `/tmp/build.txt`; it is **not** part of the
+four-line summary above. View the complete, unedited transcript with an explicit `cat`:
+
+```bash
+cat /tmp/build.txt
+```
+
+All 85 `-c` compile lines carry the identical strict warning/error flag set shown above; the preamble
+(lines 1–6) records the Wayland auto-disable, and the final lines link `fast_data_types.so`,
+`glfw-x11.so`, the `kitty` launcher, and the Go `kitten` launcher.
+
+Output **[observed]** — the complete, unedited contents of `/tmp/build.txt`:
 
 ```text
 Package wayland-protocols was not found in the pkg-config search path.
@@ -210,7 +237,7 @@ gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-
 gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/disk-cache.c -o build/fast_data_types-kitty-disk-cache.c.o
 gcc -MMD -DNDEBUG -D_GLFW_X11 -D_GLFW_BUILD_DLL -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/glx_context.c -o build/glfw-x11-glfw-glx_context.c.o
 gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/line-buf.c -o build/fast_data_types-kitty-line-buf.c.o
-gcc -MMD -DNDEBUG -DKITTY_VCS_REV="3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f" -DWRAPPED_KITTENS="ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
+gcc -MMD -DNDEBUG -DKITTY_VCS_REV="65e7964ec9ee9510f802841599a2a758faade066" -DWRAPPED_KITTENS="ask clipboard diff hints hyperlinked_grep icat query_terminal show_key ssh themes transfer unicode_input" -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/data-types.c -o build/fast_data_types-kitty-data-types.c.o
 gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/colors.c -o build/fast_data_types-kitty-colors.c.o
 gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/history.c -o build/fast_data_types-kitty-history.c.o
 gcc -MMD -DNDEBUG -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -pthread -I/usr/include/libpng16 -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/harfbuzz -I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -I/usr/include/python3.13 -c kitty/keys.c -o build/fast_data_types-kitty-keys.c.o
@@ -275,8 +302,7 @@ gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-pr
 gcc -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -Ikitty -I/usr/include/python3.13 -Wall -O3 -shared -flto build/rsync-kittens-transfer-algorithm.c.o -lxxhash -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -o build/kittens/transfer/rsync.so
 gcc build/kitty-launcher-main.o build/kitty-launcher-single-instance.o -ldl -lm -L/usr/lib/x86_64-linux-gnu -lpython3.13 -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions -o kitty/launcher/kitty
 Updating Go generated files...
-kitty/tools/cmd
-/usr/bin/go build -v -ldflags '-X kitty.VCSRevision=3e8e1ae1b1ec026e8a27f83bf6474817ade3a93f -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464/tools/cmd
+/usr/bin/go build -v -ldflags '-X kitty.VCSRevision=65e7964ec9ee9510f802841599a2a758faade066 -s -w' -o kitty/launcher/kitten /tmp/blitzy/kitty/blitzy-03f51806-b79e-4da1-b1c1-47a97745c4c7_c64464/tools/cmd
 ```
 
 Build summary **[observed]**: `BUILD_EXIT=0`, and the `grep` for `warning:`/`error:` returned
@@ -288,19 +314,21 @@ deliberately *not* used as a reproducibility anchor**:
 
 - the `KITTY_VCS_REV="…"` field on the `kitty/data-types.c` compile line and the matching
   `-X kitty.VCSRevision=…` field on the Go `kitten` build line both record the **checkout's git HEAD
-  at build time**. (This transcript was captured at an earlier documentation commit on the branch, so
-  those fields show that build-time HEAD — `3e8e1ae1b…` — not the current branch HEAD.)
+  at build time**. (This transcript was captured at the current build-time HEAD `65e7964ec9…`. Because
+  committing any further revision of this document advances HEAD, a later rebuild embeds that later
+  HEAD instead — so this field is *expected to drift* and is deliberately not an anchor.)
 - the `go build -v` progress line(s) printed under `Updating Go generated files…` depend on the **Go
   build-cache** warmth: a warm cache prints fewer package lines than a cold one.
 
 Because of the embedded `KITTY_VCS_REV`, the raw `sha256` of the **whole transcript** *and* the raw
 `sha256` of `kitty/fast_data_types.so` are only reproducible **at a fixed checkout**, not across
 commits — rebuilding at `815df1e21…` versus a later documentation commit changes only the embedded
-40-hex revision. (For the record, the whole-transcript `sha256` of the capture above was
-`841d09404c5d0e29f39ee985401d19cc49ad7a22e2fe1f36b9d75c235bc7ca11` at 104 lines *at capture time*; a
-fresh clean rebuild on a warm Go cache yields a different whole-transcript hash and 103 lines — as
-expected, and precisely why that hash is not used as an anchor.) The **stable, reproducible anchors** —
-the values a normal re-runner should actually check — are:
+40-hex revision. (For the record, the whole-transcript `sha256` of the capture shown above is
+`2d520aa5fa79303cabe89177acd6465a2f65b6d5f89feae43489501eb5129a4c` at 103 lines; two consecutive clean
+rebuilds at the current HEAD reproduced that value byte-for-byte, but rebuilding after HEAD advances —
+or on a cold Go cache — changes the whole-transcript hash, which is exactly why it is not used as an
+anchor.) The **stable, reproducible anchors** — the values a normal re-runner should actually check —
+are:
 
 1. `BUILD_EXIT=0`;
 2. zero `warning:`/`error:` lines (the `-Werror` guarantee);
@@ -327,20 +355,29 @@ above once masked):
 6921c2615358aa6551b95feeb8b48241c19a662f883847216dc4369579bc1a06  -
 ```
 
-That normalized hash matches byte-for-byte between the transcript shown above (captured at an earlier
-commit) and a fresh clean rebuild at the current HEAD, confirming the **90 `gcc` compile/link commands
-are invariant**; only the embedded revision and the Go-cache progress line differ between runs.
+That normalized hash matches byte-for-byte between the transcript shown above and a fresh clean rebuild
+at the current HEAD, confirming the **90 `gcc` compile/link commands are invariant**; only the embedded
+revision and the Go-cache progress line differ between runs.
 
-Post-build verification **[observed]**:
+Post-build verification **[observed]** (each command is shown with its literal output; `stat -c` is
+used instead of `ls -l` so the line carries no volatile timestamp and reproduces exactly):
 
 ```text
-$ ls -l kitty/fast_data_types.so
--rwxr-xr-x 1 root root 1253792 kitty/fast_data_types.so
+$ stat -c '%A %U %G %s %n' kitty/fast_data_types.so
+-rwxr-xr-x root root 1253792 kitty/fast_data_types.so
 $ PYTHONPATH="$(pwd)" python3 -c "import kitty.fast_data_types as f; from kitty_tests import Callbacks; c=Callbacks(); s=f.Screen(c,5,40,5,10,20,0,c); print('import OK; flags =', s.current_key_encoding_flags(), '; toggle_alt_screen present =', hasattr(s,'toggle_alt_screen'))"
 import OK; flags = 0 ; toggle_alt_screen present = True
 $ git status --porcelain
-(empty — all build outputs are git-ignored, so the working tree stays clean)
 ```
+
+The `stat` line reports mode/owner/group/size/name (`-rwxr-xr-x root root 1253792
+kitty/fast_data_types.so`) — the artifact size `1253792` bytes is the stable anchor from item (4)
+above. The Python one-liner imports the freshly built extension and prints
+`import OK; flags = 0 ; toggle_alt_screen present = True`, confirming both the sanity flag value and the
+presence of `toggle_alt_screen`. The final `git status --porcelain` command emits **zero bytes** (no
+output line follows it inside the fence above): in the committed, delivered state the working tree is
+clean because every build output (`kitty/fast_data_types.so`, `kitty/glfw-x11.so`, `build/`, and the
+launchers) is git-ignored, so rebuilding never dirties the tracked tree.
 
 ### 1.3 Wayland auto-disable and why it is irrelevant here
 
@@ -1274,15 +1311,29 @@ convention, so the whole set is portable and does not depend on the current work
 ```bash
 set -o pipefail
 repo="${1:-$(git rev-parse --show-toplevel)}"   # portable: repo root from $1, else auto-detect via git
+: "${R:?set R to the directory holding the seven obj*.sh scripts}"  # fail loudly if the script dir is unset
 SCRIPTS="obj1_roundtrip obj2_exhaustion obj3_pop_reset obj4_ctrlshifta obj4b_contrast obj5_leakage obj6_modes"
-run_all() { for s in $SCRIPTS; do bash "$R/$s.sh" "$repo"; done; }
-run_all > run1.txt 2>&1; echo "run1 rc=$?"
-run_all > run2.txt 2>&1; echo "run2 rc=$?"
+run_all() {                                     # run each script; STOP and return the FIRST non-zero status
+  local s rc
+  for s in $SCRIPTS; do
+    bash "$R/$s.sh" "$repo" || { rc=$?; echo "CHILD FAILED: $s.sh (rc=$rc)" >&2; return "$rc"; }
+  done
+  return 0
+}
+run_all > run1.txt 2>&1; r1=$?; echo "run1 rc=$r1"   # SAVE each run's status; do not discard $?
+run_all > run2.txt 2>&1; r2=$?; echo "run2 rc=$r2"
 echo "run1 sha256: $(sha256sum run1.txt | cut -d' ' -f1)"
 echo "run2 sha256: $(sha256sum run2.txt | cut -d' ' -f1)"
-cmp -s run1.txt run2.txt && echo "cmp: IDENTICAL (byte-for-byte)" || { echo "cmp: DIFFER"; cmp run1.txt run2.txt; }
+if [ "$r1" -ne 0 ] || [ "$r2" -ne 0 ]; then         # ENFORCE: any failed child fails the whole runner
+  echo "FATAL: a script exited non-zero (r1=$r1 r2=$r2)" >&2; exit 1
+fi
+if ! cmp -s run1.txt run2.txt; then                  # ENFORCE: genuine run-to-run drift is fatal
+  echo "cmp: DIFFER"; cmp run1.txt run2.txt; echo "FATAL: run1 and run2 are not byte-identical" >&2; exit 1
+fi
+echo "cmp: IDENTICAL (byte-for-byte)"
 echo "run1 final-main: $(grep 'flags on MAIN' run1.txt)"
 echo "run2 final-main: $(grep 'flags on MAIN' run2.txt)"
+exit 0
 ```
 
 Output **[observed]**:
@@ -1302,6 +1353,17 @@ Both runs produce the identical sha256
 byte-for-byte identical; the round-trip result (main active flags = `1`) is stable across both runs.
 **[observed]**
 
+The runner is written so that this conclusion is trustworthy rather than accidental: `run_all` stops
+at and returns the **first** non-zero child status (it does not silently continue and report only the
+last script's status); both run statuses `r1`/`r2` are saved and any non-zero value forces `exit 1`;
+and a `cmp` mismatch — i.e. genuine run-to-run drift — is fatal (`exit 1`). The leading
+`: "${R:?…}"` guard also aborts immediately if the script directory is unset. Consequently the
+`run1 rc=0` / `run2 rc=0` / `cmp: IDENTICAL` output above, together with the runner's own zero exit
+status, can occur **only** when all seven scripts succeeded on both runs and the two runs were
+byte-identical; a missing script, a failing child, or any drift makes the whole runner exit non-zero
+(this fail-loud behavior is exercised directly in the adversarial checks recorded during this
+investigation).
+
 ## 12. Cleanup and final repository state
 
 This investigation is read-only with respect to the source tree; the sole repository change is this
@@ -1317,7 +1379,9 @@ Cleanup and final-state verification:
 
 ```bash
 set -o pipefail
-rm -rf /tmp/kbd_evidence                 # remove the out-of-tree capture directory
+# No fixed shared path is deleted: every script used a PRIVATE `mktemp -d .../kbdobs.XXXXXXXX`
+# directory and removed it via its own EXIT trap, so cleanup only needs to *verify* none leaked
+# (deleting a fixed path such as /tmp/kbd_evidence would be unsafe — it was never created here).
 ls -d /tmp/kbdobs.* 2>/dev/null || echo "no private mktemp dirs remain (trap-removed)"
 find . -path ./.git -prune -o \( -name 'blitzy_adhoc_test_*' -o -name 'kbdobs.*' \) -print
 echo "--- working tree state (deliverable committed; tree clean) ---"
