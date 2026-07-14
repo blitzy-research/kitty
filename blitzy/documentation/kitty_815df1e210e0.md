@@ -85,8 +85,8 @@ canonical build paths** (§0.2.3): the headline `./dev.sh build`, and the system
 this pinned commit: `./dev.sh build` **fails deterministically** (exit 1, reproducibly — root
 cause below), while `python3 setup.py build --verbose` **succeeds** (exit 0, bit-reproducibly).
 The project's own setup instructions match this: they designate the system-library path as the
-one that produced the container's ready-to-run `/app` and that CI uses, with `./dev.sh build`
-listed as the alternate. Under the strict **read-only** rule the `./dev.sh build` failure
+canonical one — the path CI uses and that produced the container's ready-to-run pre-built
+binary — with `./dev.sh build` listed as the alternate. Under the strict **read-only** rule the `./dev.sh build` failure
 **cannot be repaired** — its obstacle lives in kitty's *vendored* GLFW source (`glfw/wl_window.c`),
 which may not be edited, and re-pinning `./dev.sh`'s downloaded dependency bundle is likewise a
 source/definition change that is out of scope. The `./dev.sh build` failure is therefore
@@ -128,15 +128,15 @@ A clean `python3 setup.py build` against the container's **system** `wayland-pro
 **both** GLFW backends — `kitty/glfw-x11.so` and `kitty/glfw-wayland.so` — its `wayland-scanner`
 reading the system `/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml`, with **zero**
 `wl_window.c` errors (the complete 214-line `--verbose` log contains no `error:` line). This is
-the **system-library path** the project's setup instructions identify as the one that produced
-the container's ready-to-run `/app` and that CI uses — i.e. the **second of the two canonical
-build paths the AAP documents** (§0.2.3) — so it is the **canonical build used here** and the
+the **system-library path** the project's setup instructions identify as canonical — the path
+CI uses and that produced the container's ready-to-run pre-built binary — i.e. the **second of
+the two canonical build paths the AAP documents** (§0.2.3) — so it is the **canonical build used here** and the
 source of `$SCRATCH/clean815/kitty/launcher/kitty`. (The AAP's headline `./dev.sh build`, by
 contrast, cannot produce a binary at all in this environment — see the root-cause below — so it
 is not usable as the source of build values under the read-only rule.) Both its artifact hashes
 are bit-reproducible across two independent clean clones (launcher `8311dadd…3fc24c`;
-C-extension `fast_data_types.so` `582933cf…22e8`); the launcher hash additionally equals the
-pre-built `/app` binary's (the `/app` `.so` differs only because it was compiled earlier). The
+C-extension `fast_data_types.so` `582933cf…22e8`), so the version/VCS values reported here rest
+on a deterministic, independently-reproducible build rather than any single machine's artifact. The
 successful launcher link and stamps are, verbatim from the `--verbose` log:
 
 ```
@@ -158,10 +158,18 @@ own defaults) then promote the unhandled-enum warning to a fatal error. `compile
 the too-new bundled protocols hard-fails rather than skipping gracefully. The failure is
 therefore specific to `./dev.sh build`'s own bundled 1.45 protocols — it is **not**
 method-independent, and it is **not** caused by the container's system libraries. The build
-proceeds normally (it downloads the bundle, then generates protocols and compiles) up to
-`[3/122] Compiling [wayland] glfw/wl_window.c`, where it stops. The complete failing tail —
-the four compiler errors (one per unhandled state) and the exit — is, verbatim (routine
-progress steps `[1/122]`–`[2/122]` elided):
+proceeds normally (it downloads the bundle, then generates protocols and compiles): the
+failing file `glfw/wl_window.c` is **dispatched at `[3/122]`**, but because the compile runs
+in **parallel** the remaining steps `[4/122]`–`[122/122]` are dispatched too, and the build
+then fails as a whole because that step-3 file errored under `-Werror`. The decisive failing
+lines — the four compiler errors (one per unhandled state) and the exit — are shown below. So
+the errors sit next to the dispatch line that names the file, the block joins the real
+`[3/122] Compiling [wayland] glfw/wl_window.c ...` line to the error tail; the *only*
+modification is eliding the interleaved parallel progress lines that separate them in the raw
+log (`[1/122]`–`[2/122]` before it, `[4/122]`–`[122/122]` after it) and, between `cc1:` and
+`The following build command failed:`, a trailing ` done` / re-echoed `Compiling [wayland]
+glfw/wl_window.c ...` / verbose `gcc … -c glfw/wl_window.c …` line. Every quoted line is
+verbatim:
 
 ```
 [3/122] Compiling [wayland] glfw/wl_window.c ...
@@ -177,8 +185,13 @@ The following build command failed: /root/qa_reverify/devsh/dependencies/linux-a
 exit status 1
 ```
 
-This tail is byte-identical across the two runs (the error region hashes the same on both),
-and `./dev.sh build` returns `exit 1` (~12.4 s / 12.7 s) each time. Note the failing command
+The error region (the four `error:` lines through `exit status 1`) is byte-identical across
+the two runs (it hashes the same on both); the surrounding parallel progress lines vary in
+interleaving order between runs, as expected of a parallel build, and are the elided material
+noted above. `./dev.sh build` returns `exit 1` every time; the wall-clock to the failure is a
+few seconds and depends on parallelism, system load and the `go` build cache (≈12 s on the
+originally-authored runs, ≈3 s on a warm-`go`-cache re-verification) — only the exit code and
+the error region are invariant, and both reproduced on every run. Note the failing command
 is `dependencies/linux-amd64/bin/python setup.py develop` — `./dev.sh` runs `setup.py` under
 its **own bundled** Python against its **own bundled** 1.45 protocols, which is what makes its
 outcome differ from a direct system `python3 setup.py build`.
@@ -801,11 +814,13 @@ and wired up is proven by the child's output being read back and drawn on screen
 
 `Child.fork` (`child.py:276`) calls the native `spawn()` (`kitty/child.c:81`), which
 `fork()`s (`:97`). In the child branch it calls `PyOS_AfterFork_Child()` (`:102`), `chdir(cwd)`
-(`:121`), `setsid()` to start a new session (`:123`, `exit_on_err` if it returns −1), opens the
-slave by name and makes it the controlling terminal with `ioctl(TIOCSCTTY)` (`:127-129`), and
+(`:122`), `setsid()` to start a new session (`:123`, `exit_on_err` if it returns −1), opens the
+slave by name (`safe_open`, `:126`) and makes it the controlling terminal with
+`ioctl(TIOCSCTTY)` (`:129`; the range `:126-129` covers open→check→`TIOCSCTTY`), and
 finally `execvp(exe, argv)` (`:159`) to become the shell. The parent branch calls
 `PyOS_AfterFork_Parent()` (`:174/182`). `mark_terminal_ready` (`child.py:362`) is called (from
-`window.py:867`) just before the `Child launched` line.
+`window.py:866`, immediately before `child_is_launched = True` at `:867`) just before the
+`Child launched` line (`:871`).
 
 **These syscalls were captured directly at runtime.** The real launcher was run under
 `strace -ff` (following forks and the exec), with a child that records its own controlling
@@ -829,7 +844,7 @@ openat(AT_FDCWD, "/dev/ptmx", O_RDWR)   = 8
 ```
 
 and the **child** file (pid `105141`) contains the exact controlling-TTY handshake from
-`child.c`, in source order (`setsid` `:123` → open slave `:127` → `TIOCSCTTY` `:129` → `execvp`
+`child.c`, in source order (`setsid` `:123` → open slave `:126` → `TIOCSCTTY` `:129` → `execvp`
 `:159`), verbatim:
 
 ```
@@ -883,9 +898,9 @@ $KITTY_BIN /nonexistent_program_zzz_47447
 
 `execvp` fails, and the child runs the fallback: it writes to its stderr (which is the PTY
 slave, so the text is drawn on the terminal, not on kitty's own stderr)
-`"Failed to launch child: " + exe` (`child.c:161-163`) and
-`"\nWith error: " + strerror(errno)` (`child.c:164-165`), then `execlp`s the kitten with
-`__hold_till_enter__` (`child.c:166-167`) to keep the window open. The live window
+`"Failed to launch child: "` (`child.c:162`) + `exe` (`:163`) and
+`"\nWith error: "` (`:164`) + `strerror(errno)` (`:165`) + `"\n"` (`:166`), then `execlp`s the
+kitten with `__hold_till_enter__` (`child.c:167`) to keep the window open. The live window
 (screenshot, 640×400) shows exactly this, on black:
 
 ```
