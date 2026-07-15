@@ -1417,6 +1417,7 @@ Fixture **F8** exercises it: left `the quick brown fox` → right `the quick red
 runs of the changed row (removed line first, then added) with `sgruns.py` [OBSERVED]:
 
 ```console
+$ mkdir -p /tmp/dk_fixtures/F8/left /tmp/dk_fixtures/F8/right
 $ printf 'the quick brown fox\n' > /tmp/dk_fixtures/F8/left/line.txt
 $ printf 'the quick red fox\n'   > /tmp/dk_fixtures/F8/right/line.txt
 $ ./kitty/launcher/kitty +kitten diff -o diff_cmd=builtin /tmp/dk_fixtures/F8/left /tmp/dk_fixtures/F8/right   # captured to F8_builtin.raw
