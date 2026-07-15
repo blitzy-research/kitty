@@ -57,7 +57,7 @@ The canonical full build is attempted first:
 $ CI=true python3 setup.py build ; echo "exit=$?"
 ```
 
-In this environment it **fails (exit 1)**, but only in the **out-of-scope** GLFW Wayland windowing backend — the kitty C core and every file the answer depends on compile cleanly first. Complete, unedited tail of the failing build (the 122 core/3rdparty compile steps finish, then the windowing step errors):
+In this environment it **fails (exit 1)**, but only in the **out-of-scope** GLFW Wayland windowing backend — the kitty C core and every file the answer depends on compile without error. This build queues **122 parallel compile steps** for this checkout; the `[n/122]` lines are start-of-compile announcements emitted in descending source-size order and include the out-of-scope GLFW `[wayland]`/`[x11]` windowing translation units (e.g. `[3/122] Compiling [wayland] glfw/wl_window.c ...`) alongside the C core — so 122 is the *full* build's translation-unit count, not a tally of core files alone. The `glfw/wl_window.c` `-Werror=switch` failure is reported only after the final `[122/122]` start line. Complete, unedited tail of the failing build (from the last `[122/122]` announcement through the captured `exit=1`):
 
 ```
 [122/122] Compiling kitty/gl-wrapper.c ...
@@ -69,6 +69,9 @@ glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAIN
 glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_TOP’ not handled in switch [-Werror=switch]
 glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM’ not handled in switch [-Werror=switch]
 cc1: all warnings being treated as errors
+ done
+Compiling [wayland] glfw/wl_window.c ...
+gcc -MMD -DNDEBUG -D_GLFW_WAYLAND -D_GLFW_BUILD_DLL -DHAS_MEMFD_CREATE -Wextra -Wfloat-conversion -Wno-missing-field-initializers -Wall -Wstrict-prototypes -std=c11 -pedantic-errors -Werror -O3 -fwrapv -fstack-protector-strong -pipe -fvisibility=hidden -fno-plt -fPIC -D_FORTIFY_SOURCE=2 -flto -fcf-protection=full -march=native -mtune=native -fPIC -pthread -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -c glfw/wl_window.c -o build/glfw-wayland-glfw-wl_window.c.o
 exit=1
 ```
 
@@ -99,9 +102,10 @@ with setup.CompilationDatabase(args.incremental) as cdb:
 print("BUILD_FDT_DONE")
 ```
 
-Run it (exit status captured):
+Run it from a clean object cache (exit status captured). The failed `setup.py build` above already populated `build/` with the extension's object files, so `CompilationDatabase.build_all()` would otherwise skip the compile steps and emit only `[1/1] Linking … / done / BUILD_FDT_DONE`; removing the gitignored `build/` directory first makes the full `[1/62] … [62/62]` compile sequence reproduce exactly as shown below:
 
 ```
+$ rm -rf build/    # failed full build populated build/; clear the gitignored cache to show the full compile
 $ REPO="$KITTY_REPO" CI=true timeout 600 python3 build_fdt.py ; echo "exit=$?"
 [1/62] Compiling kitty/screen.c ...
 [2/62] Compiling kitty/unicode-data.c ...
@@ -172,7 +176,7 @@ BUILD_FDT_DONE
 exit=0
 ```
 
-This compiles exactly **62 C files** (`[1/62]` … `[62/62]`; 49 kitty-core + 13 third-party translation units, determined by the source tree and therefore version-independent) and links `kitty/fast_data_types.so` (~1.2 MB). Build outputs are covered by `.gitignore` (`*.so` at `.gitignore:L1`, `/build/` at `.gitignore:L14`), so they never alter tracked repository state.
+This compiles exactly **62 C files** (`[1/62]` … `[62/62]`; 49 kitty-core + 13 third-party translation units, as queued by `setup.py` for the `fast_data_types` extension in this checkout/configuration (kitty 0.35.2 @ commit `815df1e210e0`) — the exact count is specific to this source tree and build configuration, not a universal constant) and links `kitty/fast_data_types.so` (~1.2 MB). Build outputs are covered by `.gitignore` (`*.so` at `.gitignore:L1`, `/build/` at `.gitignore:L14`), so they never alter tracked repository state.
 
 Import verification — exact command and its complete output:
 
