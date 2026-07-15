@@ -233,7 +233,7 @@ The default launcher the build produced is `kitty/launcher/kitty`; in the image 
 `/app/kitty/launcher/kitty`. To keep a single, self-terminating instance while driving the kitten
 under Xvfb, kitty is launched with a child program (see the runnable harness in §12), rather than
 as a bare blocking GUI. No non-default configuration affects the kitten's write path — this is
-demonstrated in §8.4 by repeating the `Enter` write with the host kitty using its **default**
+demonstrated in §8.5 by repeating the `Enter` write with the host kitty using its **default**
 config.
 
 ### 3.4 Web-search corroboration of the canonical build
@@ -889,6 +889,16 @@ selection is active **after a restart**, not merely that the file can be re-read
 > printed `[0.180]` and `[0.194]`). Only the four face lines and their resolved paths are the stable
 > evidence — the timestamp is not.
 
+> **On the active-font readout vs. the dispositive evidence (rigor note):** in this image kitty's
+> default monospaced family already resolves to **DejaVu Sans Mono** (§6.2), so the `Text fonts:`
+> lines above coincide with what an *unconfigured* kitty would also pick — that readout **alone**
+> therefore does not, by itself, separate "parsed the persisted block" from "fell back to the
+> default." The persistence verdict does **not** rest on that readout. The dispositive evidence is
+> the on-disk sentinel-delimited block that `Enter` writes (§8.1–§8.3) together with the fresh
+> process reading **that exact file** at startup — shown here by the restart config SHA-256
+> `336b3aaee0…` being the unchanged persisted hash — and the startup parse path traced in §10.
+> Those hold regardless of which family is the host default.
+
 ### 8.5 Enter under the host kitty's DEFAULT config (canonical-configuration check)
 
 To confirm the persistence is not an artifact of the harness launching the host kitty with
@@ -1244,7 +1254,7 @@ writes to the **same** directory the host kitty reads — both grounded in sourc
 - `kitty/config.py:L163-L184` — `load_config` reads and parses the config file(s) into `Options`.
 
 So a freshly-started kitty parses `kitty.conf` (including the `# BEGIN_KITTY_FONTS` block) into its
-options — which is exactly what §8.3 observed at runtime.
+options — which is exactly what §8.4 observed at runtime.
 
 **Config-directory inheritance (so isolation is honored end-to-end):**
 
@@ -1494,8 +1504,8 @@ deleting `$WORK` — a fresh instance is launched under the **same** `$KITTY_CON
 - The real running kitten's listing / faces / final panes under `DISPLAY=:99` (screenshots viewed
   and transcribed). (§6.2, §7.1)
 - **Enter** write: BEFORE/AFTER bytes + SHA-256, `.bak`, `ls -la`, exit 0, empty STDOUT; clean-slate
-  create with no `.bak`; idempotent re-run. (§8.1, §8.2, §8.5)
-- **Restart**: a fresh kitty loads the four persisted faces as active fonts. (§8.3)
+  create with no `.bak`; idempotent re-run. (§8.1, §8.2, §8.6)
+- **Restart**: a fresh kitty loads the four persisted faces as active fonts. (§8.4)
 - **Esc / s·S / Ctrl+C (key) / Ctrl+C (signal)**: each executed; exit/STDOUT/STDERR and unchanged
   config hashes captured. (§9)
 
