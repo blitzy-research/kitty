@@ -43,7 +43,7 @@ Python 3.13.7
 OpenSSH_10.0p2 Ubuntu-5ubuntu5.4, OpenSSL 3.5.3 16 Sep 2025
 zsh 5.9 (x86_64-ubuntu-linux-gnu)
 fish, version 4.0.6
-GNU bash, version 5.2.37(1)-release
+GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
 tar (GNU tar) 1.35
 base64 (uutils coreutils) 0.2.2
 tr (uutils coreutils) 0.2.2
@@ -1332,8 +1332,10 @@ $ printf ''                 | ./kitty/launcher/kitten __pytest__ ssh 'echo UNTAR
    cmd (rcmd) = ['exec', 'sh', '-c', '<unwrap-eval>', '<encoded bootstrap, 5278 bytes>']   # 5 elements
 $ printf 'interpreter python3' | ./kitty/launcher/kitten __pytest__ ssh 'echo UNTAR_DONE'  # python
    shm_name = kssh-108508-VD6FZSISISTW6
-   cmd (rcmd) = ['exec', 'python3', '-c', 'import base64, sys; eval(compile(base64.standard_b64decode(sys.argv[-1]), "bootstrap.py", "exec"))', '<encoded bootstrap, 13580 bytes>']  # 5 elements
+   cmd (rcmd) = ['exec', 'python3', '-c', "import base64, sys; eval(compile(base64.standard_b64decode(sys.argv[-1]), 'bootstrap.py', 'exec'))", '<encoded bootstrap, 13580 bytes>']  # 5 elements
 ```
+
+The Python `cmd[3]` above is shown **byte-for-byte as emitted**: it begins and ends with a **literal double-quote** and uses **single-quotes** inside (`'bootstrap.py'`, `'exec'`) — 100 bytes, byte-identical to the raw Go literal at [`kittens/ssh/main.go`:L499] and to the full form in §7.1. (The outer double-quotes are part of the emitted bytes — they serve as the remote shell's quoting for `python3 -c` — not list delimiters.)
 
 The remaining fields are fixed by the hook and therefore observed as: `request_id="testing"`, `request_data=true`, `echo_on=true`, `username="testuser"`, `hostname_for_match="host.test"`, `test_script="echo UNTAR_DONE"`, `remote_args=[]`, `dont_create_shm=false`, `script_type="sh"`/`"py"`. In a non-test run `request_id` instead takes the `KITTY_PID-KITTY_WINDOW_ID` form (e.g. `55002-7`, seen in the fresh-path capture in §2.5). The `replacements` map's sensitive entries observed live were `REQUEST_ID=testing`, `PASSWORD_FILENAME=kssh-108091-7MUZEN7V3YSLW`, `DATA_PASSWORD=<64-hex>`; the full decoded `bootstrap_script` is shown in §3.3.
 
@@ -1498,7 +1500,7 @@ decoded bytes 10184
 $ cmp py.dec py_bootstrap_decoded.py && echo IDENTICAL
 ```
 
-Observed: `cmd[4]` is **13580 base64 characters** → **10184 bytes** → **319 lines** beginning `#!/usr/bin/env python`, **byte-identical** to the independently-captured `bootstrap.py`. No substitution table is involved; base64 is self-describing and any byte round-trips.
+Observed: `cmd[4]` is **13580 base64 characters** → **10184 bytes** → **318 lines** beginning `#!/usr/bin/env python`, **byte-identical** to the independently-captured `bootstrap.py`. No substitution table is involved; base64 is self-describing and any byte round-trips.
 
 ### 7.5 Coverage across launchers — and the fish case
 
