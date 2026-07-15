@@ -1258,13 +1258,13 @@ C4-post-2s     dt_from_pause=+3.000 resp=b'\x1b[?2026;2$y'
 
 ```
 rm -rf /tmp/kitty_obs        # remove all harness scripts + *.log/*.txt scratch
-git status --porcelain       # run from the repository root
+git status --porcelain --untracked-files=all   # run from the repository root
 ```
 
-  After cleanup, `git status --porcelain` reports **only** this document — the investigation added, modified, or deleted nothing else under the repository:
+  After cleanup, `git status --porcelain --untracked-files=all` reports **only** this document (untracked, since the investigation *creates* it) — the investigation added, modified, or deleted nothing else under the repository:
 
 ```
- M blitzy/documentation/kitty_815df1e210e0.md
+?? blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 ---
@@ -1963,10 +1963,10 @@ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 PYTHONPATH=. \
 # /tmp/kitty_obs/graphics_f11_overdim.py   [non-canonical in-process]
 # Over-dimension response id is STATE-DEPENDENT. The transmit reply is built from
 # self->currently_loading.start_command (graphics.c:2177/:2180), and the over-dim
-# ABRT (:695) fires BEFORE initialize_load_data (:715) sets start_command=*g and
+# ABRT (:695) fires BEFORE initialize_load_data (called :716) assigns start_command=*g (:634) and
 # BEFORE :717 sets start_command.id=iid. free_load_data (:103) does not clear
 # start_command, so an over-dim reply inherits whatever id the LAST command that
-# reached :633 (start_command=*g) left behind. Fresh Screen per case group.
+# reached :634 (start_command=*g) left behind. Fresh Screen per case group.
 import sys
 from kitty.fast_data_types import Screen
 from kitty_tests import Callbacks, parse_bytes, BaseTest
@@ -1984,7 +1984,7 @@ ZERODIM = '\x1b_Ga=t,f=24,s=0,v=1,i=%d,q=0;/wAA\x1b\\'
 # A: fresh over-dim with id -> start_command.id still 0 (ABRT before it is set) -> :765 gate -> empty
 c, s = fresh()
 print("A fresh over-dim i=1 ONLY cmd            -> %r   (start_command.id=0 -> :765 gate -> empty)" % send(c, s, OVERDIM_ID % 1))
-# C: zero-dim i=1 sets start_command.id=1 (fails AFTER :633); then over-dim i=1 reuses it
+# C: zero-dim i=1 sets start_command.id=1 (fails AFTER :634); then over-dim i=1 reuses it
 c, s = fresh()
 print("C zero-dim i=1 (fails AFTER :634 sets start_command.id=1) -> %r" % send(c, s, ZERODIM % 1))
 print("C then over-dim i=1 (ABRT :695 before :634; reuses start_command.id=1) -> %r" % send(c, s, OVERDIM_ID % 1))
@@ -2075,4 +2075,3 @@ END { print "TOTAL_OVERFLOW_OCCURRENCES=" count }
 
 - **Setup:** Xvfb lifecycle with PID capture + `trap` cleanup, and the readiness wait, are in §1 (top). Build A / Build B commands are §1.1 / §1.2.
 - **Teardown (idempotent):** a single `rm -rf /tmp/kitty_obs` removes **all** scripts and scratch logs; because the directory is entirely outside the repository this cannot touch tracked files. Verify with `git status --porcelain` (see §9): it lists only this document. Re-running the `rm` on an already-clean tree is a no-op (idempotent).
-
