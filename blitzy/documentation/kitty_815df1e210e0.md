@@ -5,31 +5,37 @@
 
 ## Methodology and environment
 
-- **Run-first discipline.** Each answer leads with a direct conclusion, then shows the **exact command**, its **complete, unedited output**, and an explicit **`[exit: N]`** status; then the repository-relative **`file:line` + named symbol** evidence; then the cause-and-effect rationale. Anything not directly observed is explicitly prefixed **`Inferred:`**.
+- **Run-first discipline.** Each answer leads with a direct conclusion, then shows the **exact command**, its **complete, unedited output**, and an explicit **`[exit: N]`** status; then the repository-relative **`file:line` + named symbol** evidence; then the cause-and-effect rationale. Anything not directly observed is explicitly prefixed **`Inferred:`**. Every answer/reproduction command block (Q1–Q4 and the appendices) is reproduced complete and unedited; the only condensations are two clearly-marked presentations in Appendix B — the canonical build transcript, whose repetitive per-translation-unit compile lines are elided at an explicitly marked point (its compiler identification, complete final link line, Go build line, and exit status are shown verbatim), and the present→absent→present transition, shown as a condensed step list (each step's command, key outcome, and `[exit: N]`) whose full verbatim tracebacks are the ones already shown in Q3/Q4.
 - **Canonical paths only.** Failures are reproduced through the real entry points — the repository-root `__main__.py` and a standalone kitten via `kittens.runner` — never through a debug hook, mock, fallback, or synthetic stand-in.
 - **Read-only, and left clean.** The only file this task creates or modifies is this Markdown document. To observe post-build behavior, kitty was built canonically (Appendix B); **all build products were then removed**, so the working tree is left with no build, native, generated, or cache artifacts (verified in Appendix E: `0` ignored entries). No tracked source file was modified, and nothing under `/app` was accessed.
 - **Two states, both observed.** Because the Q3/Q4 failures are triggered by the **absence** of the compiled extension `kitty/fast_data_types.so`, this document documents both: the **post-build** state (`.so` present — kitty runs and creates a real GPU context), captured during the build window; and the **clean / pre-build** state (`.so` absent — the repository's final state), in which the failures reproduce **directly**, with no manipulation. Appendix B additionally captures both states around a single build artifact inside one interruption-safe transition with md5 verification.
 
-**Observed environment (final clean state):**
+**Observed environment (host, final clean state):**
 
 ```console
 $ git rev-parse --show-toplevel
 /tmp/blitzy/kitty/blitzy-5c1e066c-992b-4bf9-8d37-696eb3c895bd_c8c770
+[exit: 0]
 
 $ git branch --show-current
 blitzy-5c1e066c-992b-4bf9-8d37-696eb3c895bd
+[exit: 0]
 
 $ /opt/kitty311-venv/bin/python3 --version
 Python 3.11.15
+[exit: 0]
 
 $ /usr/bin/python3 --version
 Python 3.13.7
+[exit: 0]
 
 $ ls -la kitty/fast_data_types*
 -rw-r--r-- 1 root root 35795 Jul 14 18:52 kitty/fast_data_types.pyi
+[exit: 0]
 
 $ ls kitty/__main__.py 2>&1
 ls: cannot access 'kitty/__main__.py': No such file or directory
+[exit: 2]
 ```
 
 Three facts shape everything that follows:
@@ -37,6 +43,38 @@ Three facts shape everything that follows:
 1. **The importable native extension `kitty/fast_data_types.so` is produced only by the build.** In the final clean state only its **type stub** `kitty/fast_data_types.pyi` (35,795 bytes) is present — and a `.pyi` file is **not importable Python code**; it only describes types for static analysis. There is no `kitty/fast_data_types.py` fallback. The canonical build that produces the `.so` is shown in Appendix B.
 2. **The canonical interpreter is the virtualenv `python3` at `/opt/kitty311-venv/bin/python3` (CPython 3.11.15).** This is the interpreter the extension is built for: the built `.so` links against `libpython3.11.so.1.0` (`readelf` evidence in Q3). The system `python3` is 3.13.7. kitty declares only a version **floor** (`requires-python = ">=3.8"`), not a ceiling; the 3.11 venv is used here because the compiled `.so` is ABI-bound to `libpython3.11` (see Q3 and Synthesis for the correct compatibility framing).
 3. **`kitty/__main__.py` does not exist**, which is why `python3 -m kitty` fails *differently* from running the repository-root `__main__.py` (Q3).
+
+### Build provenance — the supplied image vs. the canonical host toolchain
+
+The "Observed environment" above is the **host** on which every answer in this document was reproduced. It is deliberately **not identical** to the **supplied container image**, and that difference is the reason CPython **3.11** — not the image's default 3.12 — is the canonical interpreter here. Both are recorded so the provenance is unambiguous.
+
+**The supplied image (provenance).** The project's build/run image is `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (also published as `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`). Its identity and *base* toolchain, observed directly:
+
+```text
+### CMD: IMG=andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # variable used by the commands below
+
+### CMD: docker image inspect "$IMG" --format 'ID={{.Id}}  WORKDIR={{.Config.WorkingDir}}'
+ID=sha256:c0824992ad0b274bc8738bf1365d336bf91dec97d726ec122e2d08eb9f053288  WORKDIR=/app
+[exit: 0]
+
+### CMD: docker image inspect "$IMG" --format '{{range .RepoDigests}}{{println .}}{{end}}'
+ghcr.io/scaleapi/swe-atlas@sha256:60da90a7183a82861fc6d1d40cb8086baa6a8a0e0d05f26d03aafd0f5b3cc384
+[exit: 0]
+
+### CMD: docker run --rm --entrypoint /bin/bash "$IMG" -lc '. /etc/os-release; echo "$PRETTY_NAME"; python3 --version; go version; gcc --version | head -1; test -x /opt/kitty311-venv/bin/python3 && echo "/opt/kitty311-venv: present" || echo "/opt/kitty311-venv: absent"'
+Ubuntu 24.04.2 LTS
+Python 3.12.3
+go version go1.23.4 linux/amd64
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
+/opt/kitty311-venv: absent
+[exit: 0]
+```
+
+So the base image ships **Ubuntu 24.04.2 / CPython 3.12.3 / Go 1.23.4 / gcc 13.3.0**, its working directory is `/app`, and it does **not** contain `/opt/kitty311-venv`.
+
+**The canonical host toolchain (what actually builds and runs kitty here).** On top of that image, the host filesystem is provisioned with the toolchain used throughout this document: **CPython 3.11.15** at `/opt/kitty311-venv/bin/python3`, **Go 1.24.4**, **gcc 15.2.0**, on **Ubuntu 25.10** (the "Observed environment" block above; full table in Appendix A). CPython **3.11** is used deliberately, not 3.12: it is the **highest Python version the project's own CI documents** (`.github/workflows/ci.yml:85` pins `python-version: "3.11"` — Q3), and building against it makes the compiled extension **ABI-bound to `libpython3.11.so.1.0`** (`readelf` evidence in Q3 and Appendix B). A build under the image's default 3.12 would instead emit a `libpython3.12`-bound `.so` that does not correspond to kitty's highest documented Python, so it is *not* the canonical artifact and is not used here.
+
+**How to read the evidence that follows.** Except for the three `docker …` commands just above — which observe the **supplied image** for provenance — every command and captured output in this document was produced on the **host** toolchain just described (the canonical build/run environment). The supplied image is the starting point; the host CPython-3.11 toolchain is where the answers are reproduced.
 
 ---
 
@@ -62,6 +100,7 @@ $ for run in 1 2; do echo "--- RUN $run ---"; for ext in c h py go glsl; do file
 .py   files=214  lines=62874
 .go   files=258  lines=56071
 .glsl files=13   lines=696
+[exit: 0]
 ```
 
 | Language | Files | Lines | Runtime role |
@@ -88,6 +127,7 @@ $ for run in 1 2; do echo "--- RUN $run ---"; for ext in c h py go glsl; do file
 .py   files=214  lines=62874
 .go   files=258  lines=56071
 .glsl files=13   lines=696
+[exit: 0]
 ```
 
 **Reconciliation (tracked vs. live during the build).** During the canonical build (Appendix B), *before* cleanup, the live on-disk tree additionally contained build-generated files, so the live count was higher — C 142 / 63,225; H 100 / 48,447; Go 338 / 69,151 (Python and GLSL unchanged). Differencing live-during-build against tracked (`grep -vxF` of the tracked list against the on-disk list) attributes the delta entirely to generated code, not hand-written source:
@@ -114,6 +154,7 @@ $ wc -l kitty/screen.c kitty/graphics.c kitty/child-monitor.c kitty/vt-parser.c 
      9 kitty/simd-string-128.c
      9 kitty/simd-string-256.c
  14170 total
+[exit: 0]
 ```
 
 Size is context, not a timing measurement. The runtime path is anchored to **named functions** (all line numbers repository-relative):
@@ -127,22 +168,27 @@ $ grep -n -E '^read_bytes\(|vt_parser_create_write_buffer\(screen|len = read\(fd
 1345:        len = read(fd, buf, available_buffer_space);
 1349:            vt_parser_commit_write(screen->vt_parser, 0);
 1354:    vt_parser_commit_write(screen->vt_parser, len);
+[exit: 0]
 
 $ grep -n -E '^run_worker\(|^parse_worker\(' kitty/vt-parser.c
 1417:run_worker(void *p, ParseData *pd, bool flush) {
 1496:parse_worker(void *p, ParseData *pd, bool flush) { run_worker(p, pd, flush); }
+[exit: 0]
 
 $ grep -n -E '^screen_draw_text\(|^draw_codepoint\(' kitty/screen.c
 866:screen_draw_text(Screen *self, const uint32_t *chars, size_t num_chars) {
 872:draw_codepoint(Screen *self, char_type ch) {
+[exit: 0]
 
 $ grep -n -E '^draw_cells_simple\(|^draw_cells_interleaved\(|^draw_cells\(' kitty/shaders.c
 577:draw_cells_simple(ssize_t vao_idx, Screen *screen, const CellRenderData *crd, bool is_semi_transparent) {
 868:draw_cells_interleaved(ssize_t vao_idx, Screen *screen, OSWindow *w, const CellRenderData *crd, const WindowLogoRenderData *wl) {
 1009:draw_cells(ssize_t vao_idx, const WindowRenderData *srd, OSWindow *os_window, bool is_active_window, bool is_tab_bar, bool is_single_window, Window *window) {
+[exit: 0]
 
 $ grep -n -E 'PyInit_fast_data_types' kitty/data-types.c
 525:PyInit_fast_data_types(void) {
+[exit: 0]
 ```
 
 Reading these symbols end-to-end gives the per-byte / per-frame path, entirely in C:
@@ -163,6 +209,7 @@ $ grep -n -E 'find_either_of_two_bytes_scalar\(|_impl\)\(.*= find_either_of_two_
 198:#define do_check() { has_sse4_2 = __builtin_cpu_supports("sse4.2") != 0; has_avx2 = __builtin_cpu_supports("avx2") != 0; }
 233:        find_either_of_two_bytes_impl = find_either_of_two_bytes_256;
 241:        if (find_either_of_two_bytes_impl == find_either_of_two_bytes_scalar) find_either_of_two_bytes_impl = find_either_of_two_bytes_128;
+[exit: 0]
 ```
 
 A scalar baseline (`simd-string.c:21`) is held behind a function pointer (`:28`); at startup `init_simd` (`:194`) probes the CPU with `__builtin_cpu_supports` (`:198`) and upgrades the pointer to the AVX2/256-bit (`:233`) or SSE4.2/128-bit (`:241`) implementation. The tiny `simd-string-128.c` / `simd-string-256.c` (9 lines each) are shims that compile the shared implementation at each vector width.
@@ -172,6 +219,7 @@ The native windowing/input layer is the bundled GLFW, itself C — X11 (`x11_*.c
 ```console
 $ git ls-files 'glfw/*.c' | wc -l
 31
+[exit: 0]
 ```
 
 ### The performance is observably GPU-backed
@@ -195,6 +243,7 @@ $ sed -n '1,3p' go.mod
 module kitty
 
 go 1.22
+[exit: 0]
 ```
 
 Go compiles to an independent executable (`kitty/launcher/kitten` — see Q4). It is not loaded into kitty's address space and carries no reference to the Python extension; it powers the command-line `kitten` tools. Its linkage is examined in Q4 (it is a *dynamically linked* ELF, not a static binary).
@@ -232,6 +281,7 @@ kitty/graphics_vertex.glsl
 kitty/linear2srgb.glsl
 kitty/tint_fragment.glsl
 kitty/tint_vertex.glsl
+[exit: 0]
 
 $ wc -l kitty/*.glsl
    22 kitty/alpha_blend.glsl
@@ -248,6 +298,7 @@ $ wc -l kitty/*.glsl
     6 kitty/tint_fragment.glsl
    18 kitty/tint_vertex.glsl
   696 total
+[exit: 0]
 ```
 
 All 13 files live under `kitty/` and total **696** lines.
@@ -268,6 +319,7 @@ kitty/cell_fragment.glsl:2:#pragma kitty_include_shader <linear2srgb.glsl>
 kitty/cell_fragment.glsl:3:#pragma kitty_include_shader <cell_defines.glsl>
 kitty/cell_vertex.glsl:2:#pragma kitty_include_shader <cell_defines.glsl>
 kitty/graphics_fragment.glsl:1:#pragma kitty_include_shader <alpha_blend.glsl>
+[exit: 0]
 ```
 
 `cell_defines.glsl`, `alpha_blend.glsl`, and `linear2srgb.glsl` are therefore `#include`-style fragments, not standalone GL programs. This is the observed correction to the planning note's looser "six program pairs" wording; the observed value — **5 pairs + 3 shared includes** — is used throughout.
@@ -296,6 +348,7 @@ $ grep -n -E 'from .fast_data_types import|GLSL_VERSION|compile_program|kitty_in
 199:        program_for('bgimage').compile(BGIMAGE_PROGRAM, allow_recompile)
 200:        program_for('tint').compile(TINT_PROGRAM, allow_recompile)
 204:load_shader_programs = LoadShaderPrograms()
+[exit: 0]
 ```
 
 - **`kitty/shaders.py:10`** opens a `from .fast_data_types import (…)` block — the loader pulls its program IDs and, crucially, its compiler **from the native C extension**.
@@ -312,6 +365,7 @@ $ grep -n -E 'compile_program\(PyObject|glCreateProgram\(\)|glLinkProgram\(progr
 1179:    program->id = glCreateProgram();
 1182:    glLinkProgram(program->id);
 1236:    M(compile_program, METH_VARARGS),
+[exit: 0]
 ```
 
 - **`kitty/shaders.c:1168`** defines `compile_program(PyObject *self, PyObject *args)` — the C function.
@@ -406,17 +460,21 @@ Each hop is a real, unconditional module-level import. The failing statement is 
 if __name__ == '__main__':
     from kitty.entry_points import main
     main()
+[exit: 0]
 
 ### CMD: sed -n '183p;194p' kitty/entry_points.py
 def main() -> None:
             from kitty.main import main as kitty_main
+[exit: 0]
 
 ### CMD: sed -n '11p' kitty/main.py
 from .borders import load_borders_program
+[exit: 0]
 
 ### CMD: sed -n '7,8p' kitty/borders.py
 from .fast_data_types import BORDERS_PROGRAM, add_borders_rect, get_options, init_borders_program, os_window_has_background_image
 from .shaders import program_for
+[exit: 0]
 ```
 
 - `__main__.py:7` calls `main()` (defined in `kitty/entry_points.py`). [`__main__.py:7`]
@@ -513,6 +571,7 @@ The `.so` is linked against `libpython3.11.so.1.0` (the link line in Appendix B 
 ```text
 ### CMD: grep -n 'requires-python' pyproject.toml
 2:requires-python = ">=3.8"
+[exit: 0]
 
 ### CMD: grep -nE 'pyver|python-version' .github/workflows/ci.yml
 14:        name: Linux (python=${{ matrix.pyver }} cc=${{ matrix.cc }} sanitize=${{ matrix.sanitize }})
@@ -523,9 +582,31 @@ The `.so` is linked against `libpython3.11.so.1.0` (the link line in Appendix B 
 55:              python-version: ${{ matrix.pyver }}
 85:              python-version: "3.11"
 170:              python-version: "3.10"
+[exit: 0]
 ```
 
-`pyproject.toml:2` declares `requires-python = ">=3.8"` — a minimum, with **no upper bound**. The CI matrix exercises 3.8, 3.9, 3.10, and 3.11 (`.github/workflows/ci.yml`). This environment uses the highest CI-documented version, **3.11.15**, and the extension is consequently ABI-bound to `libpython3.11.so.1.0`. *Inferred:* running the built `.so` under a different CPython minor (e.g., 3.13) would fail at load time because the extension resolves `libpython3.11.so.1.0` and uses the 3.11 C-API — but this document does **not** assert a "3.11 ceiling"; the correct statement is "≥ 3.8 floor, built against and ABI-bound to 3.11 here."
+`pyproject.toml:2` declares `requires-python = ">=3.8"` — a minimum, with **no upper bound**. The CI matrix exercises 3.8, 3.9, 3.10, and 3.11 (`.github/workflows/ci.yml`). This environment uses the highest CI-documented version, **3.11.15**, and the extension is consequently ABI-bound to `libpython3.11.so.1.0`. Running the built `.so` under a *different* CPython minor (e.g., 3.13) is unsupported and unsafe, and the **exact failure mode depends on the environment**:
+
+- **Load-time failure** when `libpython3.11.so.1.0` is not resolvable (e.g., the supplied base image, which ships only CPython 3.12): the dynamic loader cannot satisfy the hard `NEEDED` dependency, so the import aborts with `ImportError: libpython3.11.so.1.0: cannot open shared object file: No such file or directory`.
+- **Import-then-crash** when the 3.11 shared library *is* present alongside the mismatched interpreter (e.g., system CPython 3.13 with `/opt/python3.11/lib/libpython3.11.so.1.0` still on the loader path): the module **imports successfully** but a subsequent native call **crashes the process**, because two CPython runtimes are mapped into one address space. Observed directly — importing under `/usr/bin/python3` (3.13) returns `[exit: 0]`, but `from kitty.fast_data_types import wcswidth; wcswidth("kitty")` terminates with `Segmentation fault (core dumped)` `[exit: 139]`.
+
+The import-then-crash mode, captured against the built extension using the **system** CPython 3.13 interpreter (a deliberately mismatched minor) with the 3.11 shared library present on the loader path:
+
+```text
+### CMD: test -e /opt/python3.11/lib/libpython3.11.so.1.0 && echo PRESENT   # 3.11 shared lib is on the loader path
+PRESENT
+[exit: 0]
+
+### CMD: /usr/bin/python3 -c "import kitty.fast_data_types as f; print('IMPORT_OK', f.__file__.split('/')[-1])"   # system CPython 3.13.7, mismatched minor
+IMPORT_OK fast_data_types.so
+[exit: 0]
+
+### CMD: /usr/bin/python3 -c "from kitty.fast_data_types import wcswidth; print(wcswidth('kitty'))"   # first native call into the 3.11-ABI module
+Segmentation fault (core dumped)
+[exit: 139]
+```
+
+Either way, cross-minor reuse is not supported — but this document does **not** assert a "3.11 ceiling"; the correct statement is "≥ 3.8 floor, built against and ABI-bound to 3.11 here." *(Inferred, for the load-time mode: it follows from the confirmed `NEEDED libpython3.11.so.1.0` above; the import-then-crash mode was observed directly and captured in the block just above.)*
 
 ### Supporting orchestration observed
 
@@ -666,8 +747,10 @@ In one sentence: **kitty is a C+GPU performance core, orchestrated by a thin Pyt
 
 | Item | Value (observed) |
 |------|------------------|
-| OS | Ubuntu 25.10, `x86_64` |
-| Python interpreter | CPython **3.11.15** (`/opt/kitty311-venv/bin/python3`), the highest CI-documented minor |
+| Supplied image | `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0…` (a.k.a. `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`); ID `sha256:c0824992ad0b…`, digest `ghcr.io/scaleapi/swe-atlas@sha256:60da90a7183a…`, `WORKDIR=/app` — provenance only (see "Build provenance") |
+| Supplied image base toolchain | Ubuntu 24.04.2 / CPython 3.12.3 / Go 1.23.4 / gcc 13.3.0 (no `/opt/kitty311-venv`); the host CPython-3.11 toolchain below is provisioned on top of it and is the canonical build/run environment here |
+| OS (host) | Ubuntu 25.10, `x86_64` |
+| Python interpreter (host, canonical) | CPython **3.11.15** (`/opt/kitty311-venv/bin/python3`), the highest CI-documented minor |
 | Go toolchain | `go1.24.4 linux/amd64` (`/usr/bin/go`) |
 | C compiler | `gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0` |
 | Shared Python lib | `/opt/python3.11/lib/libpython3.11.so.1.0` (ABI target of the built `.so`) |
@@ -675,7 +758,7 @@ In one sentence: **kitty is a C+GPU performance core, orchestrated by a thin Pyt
 | Repo cleanliness | tracked tree clean except the created document; `0` ignored, `0` untracked (Appendix E) |
 | Env discipline | `PYTHONDONTWRITEBYTECODE=1` set for all direct Python runs so no `.pyc`/`__pycache__` is written into the tree |
 
-All commands in this document were run from the repository root shown above. Every behavioral block gives the exact command, its complete unedited output, and an explicit `[exit: N]`.
+All commands in this document were run from the repository root shown above, with two clearly-labeled exceptions: the three `docker …` commands in "Build provenance" (which observe the **supplied image**, not the working tree) and the deliberately mismatched-interpreter probe in Q3 (run against the built extension with the **system** CPython 3.13). Every answer/reproduction command block gives the exact command, its complete unedited output, and an explicit `[exit: N]`. Output is condensed in only two clearly-marked places, both in Appendix B: the canonical build transcript (its repetitive per-translation-unit compile lines are elided at an explicitly marked point, while the compiler identification, the complete final link line, the Go build line, and the exit status are shown verbatim), and the present→absent→present transition (presented as a step list of each command with its key outcome and `[exit: N]`, the full tracebacks being the ones shown verbatim in Q3/Q4).
 
 ---
 
@@ -695,13 +778,33 @@ Updating Go generated files...
 BUILD_EXIT=0
 ```
 
-The link line includes `-lpython3.11` (mid-line, before the final `-o build/kitty/fast_data_types.so`), which is why the resulting `.so` declares `NEEDED libpython3.11.so.1.0` (Q3). The build emits three native outputs — `kitty/fast_data_types.so`, the Go `kitty/launcher/kitten`, and the C `kitty/launcher/kitty` — all git-ignored.
+The link line includes `-lpython3.11` (mid-line, before the final `-o build/kitty/fast_data_types.so`), which is why the resulting `.so` declares `NEEDED libpython3.11.so.1.0` (Q3). The canonical build emits **six** native artifacts (all git-ignored) — four compiled `.so` shared objects plus two launcher binaries:
+
+```text
+### CMD: find kitty kittens -type f \( -name '*.so' -o -path '*/launcher/kitten' -o -path '*/launcher/kitty' \) | sort
+kittens/transfer/rsync.so
+kitty/fast_data_types.so
+kitty/glfw-wayland.so
+kitty/glfw-x11.so
+kitty/launcher/kitten
+kitty/launcher/kitty
+[exit: 0]
+```
+
+- **`kitty/fast_data_types.so`** — the main C extension / native bridge (the Q3/Q4 load-bearing dependency), ABI-bound to `libpython3.11.so.1.0`.
+- **`kitty/glfw-x11.so`** and **`kitty/glfw-wayland.so`** — the two bundled GLFW windowing backends (X11 and Wayland), each a separately-linked C shared object selected at runtime by the session type.
+- **`kittens/transfer/rsync.so`** — a C extension backing the `transfer` kitten.
+- **`kitty/launcher/kitten`** — the standalone **Go** binary (the CLI `kitten`; see Q4).
+- **`kitty/launcher/kitty`** — the **C** launcher executable (the canonical way to start kitty; see Q3).
+
+The transcript excerpt above shows only the `fast_data_types.so` link line and the Go `kitten` build line; the link lines for the two GLFW backends, `rsync.so`, and the C launcher are among the per-translation-unit compile/link lines elided at the marked point above.
 
 **Determinism.** Building twice produced a byte-identical extension:
 
 ```text
 ### CMD: md5sum kitty/fast_data_types.so   (both builds)
 b255c0013972634549f91312ae799a0f  kitty/fast_data_types.so
+[exit: 0]
 ```
 
 **Interruption-safe present→absent→present transition.** To observe the absent-state failures (Q3/Q4) against a built tree *without* leaving the tree altered, a `trap`-guarded script recorded the `.so` hash, moved it aside, ran every absent-state probe, then restored it and re-verified the hash. Before and after hashes match exactly:
@@ -803,20 +906,20 @@ This certification describes the **actual final state** verified with the comman
 
 ## Appendix F — External sources consulted
 
-Each source below is an authoritative or first-party reference; bare aggregator/blog domains were deliberately excluded. Access context: consulted during this investigation to corroborate the observed architecture; every architectural claim in this document is primarily backed by the in-repository `file:line` evidence above, with these sources as secondary corroboration.
+The sources below fall into two tiers, labeled in the **Type** column. **First-party / official** references — the kitty project's own documentation site (`sw.kovidgoyal.net`) and its GitHub source repository (`kovidgoyal/kitty`) — are published by the project itself and are the load-bearing external corroboration. **Secondary** references — DeepWiki and Wikipedia — are third-party summaries included only as supporting material, not as authority. Bare aggregator/blog domains were deliberately excluded. In every case the architectural claims in this document are primarily backed by the in-repository `file:line` evidence above; all of these external sources are corroboration only, with the secondary tier explicitly marked as such.
 
-| # | Source (title + link) | Corroborates |
-|---|------------------------|--------------|
-| 1 | [Overview — kitty](https://sw.kovidgoyal.net/kitty/overview/) (official docs) | Q1: the deliberate C-for-performance / Python-for-orchestration split; the GPU rendering model |
-| 2 | [kitty — Kovid's software projects](https://sw.kovidgoyal.net/kitty/) (official project home) | Q1/Q2: GPU-accelerated rendering, SIMD, threaded I/O |
-| 3 | [Developing builtin kittens](https://sw.kovidgoyal.net/kitty/kittens/developing-builtin-kittens/) (official docs) | Q4: kittens may be written in Python or Go; the Go tooling layer |
-| 4 | [Kittens — introduction](https://sw.kovidgoyal.net/kitty/kittens_intro/) (official docs) | Q4: kittens as programs that run inside kitty |
-| 5 | [kovidgoyal/kitty — DeepWiki](https://deepwiki.com/kovidgoyal/kitty) (architectural overview) | Q1/Q2: sprite-atlas + OpenGL-shader GPU pipeline; three-language structure |
-| 6 | [kitty (terminal emulator) — Wikipedia](https://en.wikipedia.org/wiki/Kitty_(terminal_emulator)) | Q1: general GPU-based terminal description and language mix |
-| 7 | [kovidgoyal/kitty — GitHub](https://github.com/kovidgoyal/kitty) (source repository) | Q1: "GPU based terminal emulator" project description |
+| # | Source (title + link) | Type | Corroborates |
+|---|------------------------|------|--------------|
+| 1 | [Overview — kitty](https://sw.kovidgoyal.net/kitty/overview/) | First-party (official docs) | Q1: the deliberate C-for-performance / Python-for-orchestration split; the GPU rendering model |
+| 2 | [kitty — Kovid's software projects](https://sw.kovidgoyal.net/kitty/) | First-party (official site) | Q1/Q2: GPU-accelerated rendering, SIMD, threaded I/O |
+| 3 | [Developing builtin kittens](https://sw.kovidgoyal.net/kitty/kittens/developing-builtin-kittens/) | First-party (official docs) | Q4: kittens may be written in Python or Go; the Go tooling layer |
+| 4 | [Kittens — introduction](https://sw.kovidgoyal.net/kitty/kittens_intro/) | First-party (official docs) | Q4: kittens as programs that run inside kitty |
+| 5 | [kovidgoyal/kitty — DeepWiki](https://deepwiki.com/kovidgoyal/kitty) | Secondary (third-party wiki) | Q1/Q2: sprite-atlas + OpenGL-shader GPU pipeline; three-language structure |
+| 6 | [kitty (terminal emulator) — Wikipedia](https://en.wikipedia.org/wiki/Kitty_(terminal_emulator)) | Secondary (community encyclopedia) | Q1: general GPU-based terminal description and language mix |
+| 7 | [kovidgoyal/kitty — GitHub](https://github.com/kovidgoyal/kitty) | First-party (source repository) | Q1: "GPU based terminal emulator" project description |
 
 **Claim-to-source mapping.** Q1's language-split and GPU-engine conclusions map to sources 1, 2, 5, 6, 7; Q2's sprite-atlas/shader pipeline maps to sources 1, 2, 5; Q4's Python-vs-Go kitten split maps to sources 3, 4. Q3 rests entirely on in-repository observation (no external source is needed to show the import failure).
 
 ---
 
-*End of document. All behavioral claims above are accompanied by the exact command, its complete unedited output, and an explicit exit code; every architectural claim carries a repository-relative `file:line` citation; and every non-observed conclusion is prefixed `Inferred:`.*
+*End of document. All behavioral claims above are accompanied by the exact command, its complete unedited output — condensed only in the two clearly-marked Appendix B presentations (the build transcript's explicitly-marked per-translation-unit compile-line elision, and the present→absent→present transition's step-list summary whose full tracebacks appear verbatim in Q3/Q4) — and an explicit exit code; every architectural claim carries a repository-relative `file:line` citation; and every non-observed conclusion is prefixed `Inferred:`.*
