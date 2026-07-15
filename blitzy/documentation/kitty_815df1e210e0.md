@@ -590,6 +590,8 @@ Run 2 — first-crossing line + total (stability, F7): `[5.581] Too much data be
 
 **Reading the evidence:** the **visible** overflow log (`kitty/child-monitor.c:342`) first fires at **t≈5.58–5.59 s** and then repeats **845,788 / 845,826** times in a 7 s run — two-run stable, and with **no rate-limiting** (every discarded enqueue logs). The message reads `id: 1` (the first child). This log appears on the **canonical** build (no debug macros), confirming it is canonical, not debug-gated.
 
+> **Portability note (magnitude vs. mechanism).** The **absolute occurrence count and the sub-second first-crossing timestamp are load-sensitive, host-dependent magnitudes**: they reflect a flood-vs-drain race over a fixed wall-clock window and therefore vary with host CPU speed and system load. The two runs above are internally stable for *this* host, but the count is **not** portable across hosts — reproductions on a busier/slower host legitimately cross later and log a different total (still hundreds of thousands, still `id: 1`, still en masse). What is **invariant** — and what this evidence establishes — is the *mechanism*: the strict `>` 100 MiB cap (`kitty/child-monitor.c:341`), the exact log string, the per-discarded-enqueue logging with **no rate-limiting**, and the child being **paced, not killed**. Treat the count/timing as environment characteristics, not fixed constants.
+
 > **Operational safety (F21).** This experiment is intentionally abusive: an earlier ~16 s probe produced **6,875,319** overflow lines totalling **458 MB** in a single log. Reproduce it **only** in a disposable, resource-bounded environment, and always bound it (short `timeout`, and a streaming counter/rolling-window capture as above) — never redirect the raw stream to disk unbounded.
 
 **F — slow-drain (observed, instrumented debug build).** To watch draining, the child enqueues 200,000 DA2 replies (2.6 MiB) then reads 4 KiB every 60 ms. Counts are of **returned** `revents` (what `poll()` returned), tallied over the whole run by `grep | sort | uniq -c` (a count, not the raw stream):
@@ -626,7 +628,7 @@ time.sleep(0.6)
 
 ```
 # DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 PYTHONPATH=. timeout 10 kitty/launcher/kitty --config NONE \
-#   -o confirm_os_window_close=0 python3 /tmp/kitty_obs/fill_eagain.py /tmp/kitty_obs/eagain_prog.txt 2>eagain_stderr.log
+#   -o confirm_os_window_close=0 python3 /tmp/kitty_obs/fill_eagain.py /tmp/kitty_obs/eagain_prog.txt 2>/tmp/kitty_obs/eagain_stderr.log
 # child result file:  first_read 4095
 ```
 
@@ -942,7 +944,7 @@ C4-post-2s     dt_from_pause=+3.000 resp=b'\x1b[?2026;2$y'
 
 **Stability (F7).** Every **timing/magnitude** condition was run at least twice with consistent results, and both runs are reported: E1 (FINAL totals table), E2 (freeze at a single value; ~2.8 s gap both runs), D (identical 5-line stderr), F (first-crossing ~5.58–5.59 s; 845,788 vs 845,826 occurrences), B1 (identical responses), F11 (identical per-case responses), C-part-2 (identical `;1$y`/`;2$y` bracketing). Where a value is not from the canonical build (T, F slow-drain, F EAGAIN) it is drawn from the instrumented build and labelled accordingly.
 
-**Exact commands.** Build A (canonical), Build B (instrumented), the headless run template, and the in-process harness template are listed verbatim in §1, and each evidence block above includes the exact command and inline child-script body that produced it.
+**Exact commands.** Build A (canonical), Build B (instrumented), the headless run template, and the in-process harness template are listed verbatim in §1, and each evidence block above includes the exact command that produced it. The three primary canonical harnesses are additionally given verbatim as **inline child-script bodies** — `flood_plain.py` (§2.2), and `fill_writebuf.py` and `fill_eagain.py` (§3.3). The remaining supplementary/non-canonical harnesses — `esc_boundaries.py` (Evidence D), `fill_slowdrain.py` (F slow-drain), `tiny_input.py` (Evidence T), `pending_child.py` (C-part-2), the graphics/pending in-process harnesses (`graphics_*.py`/`pending_*.py` for B1–B4, F11, C-part-1), and the `f_capture.awk` log filter — are described in prose next to their evidence rather than reproduced inline, and, where applicable, are **independently corroborated by passing repository tests**: `kitty_tests/graphics.py::test_graphics_quota_enforcement` (`graphics.py:1189`) reproduces the B2 storage-LRU and B3 5×-frame-cache claims, and the DECRQM `?2026$p` cases in `kitty_tests/parser.py` (`:456-465`) reproduce the pending-mode state transitions. A fresh investigator can therefore reproduce every canonical visible-sign claim from the inline bodies + commands, and the remaining supplementary claims via those repository tests.
 
 ---
 
