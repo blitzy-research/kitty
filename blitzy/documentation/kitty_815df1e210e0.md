@@ -206,7 +206,7 @@ $ ./kitty/launcher/kitty --debug-rendering -o confirm_os_window_close=0 sh -c 'e
 [0.203] GL version string: '4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1' Detected version: 4.5
 ```
 
-**Command and complete output (the SAME run with streams separated):**
+**Command and complete output (the same command, re-run with streams separated):**
 
 ```text
 $ ./kitty/launcher/kitty --debug-rendering ... 1>/tmp/k.out 2>/tmp/k.err
@@ -217,6 +217,8 @@ $ cat /tmp/k.err      # STDERR
 [0.263] Failed to open systemd user bus with error: No medium found
 [0.266] Child launched
 ```
+
+*(These two captures come from **two separate invocations** of the same kitty command, differing only in how the shell redirects its output: a single process cannot produce both a merged `2>&1` capture and a split `1>.../2>...` capture. The absolute monotonic timestamps therefore differ slightly between the two blocks (e.g. GL `0.203` in the merged block vs `0.183` in the separated one); what is identical -- and what the evidence establishes -- is the **stream routing** (GL -> stdout; the other three -> stderr) and the **true event order**. The merged block's out-of-order *appearance* is the buffering artifact dissected next.)*
 
 **Source authority.** The GL line uses `printf(...)` -> **stdout** `[kitty/gl.c:72]`. The other three use stderr: `OS Window created` via the `debug` macro (`#define debug debug_rendering` `[kitty/glfw.c:34]`) which routes to `fprintf(stderr, ...)` `[kitty/logging.c:56,61]`; the systemd line via `log_error(...)` `[kitty/systemd.c:87]` (same stderr path); and `Child launched` via `print(..., file=sys.stderr)` `[kitty/window.py:871]`.
 
