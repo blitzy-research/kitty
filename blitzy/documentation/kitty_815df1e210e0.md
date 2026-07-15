@@ -813,11 +813,11 @@ OUT-LINE-2
 OUT-LINE-3
 ```
 
-`get-text --extent=screen` — unedited output (the whole screen, for contrast: two setup prompts, the command line, its output, and the current prompt):
+`get-text --extent=screen` — output (the whole screen, for contrast: two setup prompts, the command line, its output, and the current prompt). **One field is normalized:** the shell's default-prompt **hostname** — an ephemeral, environment-specific infrastructure identifier with no behavioral relevance — is shown as `host`; every other byte is verbatim, including the working-directory path, which is genuine reproduction context (bound to `repo=`, §0.4):
 
 ```
-root@reverse-code-generator-cb697179-zhdvx:/tmp/blitzy/kitty/blitzy-05dd5e02-071e-4e0e-a941-87e19867a0f8_8fa74e# unset HISTCONTROL
-root@reverse-code-generator-cb697179-zhdvx:/tmp/blitzy/kitty/blitzy-05dd5e02-071e-4e0e-a941-87e19867a0f8_8fa74e# PS1='PROMPT$ '
+root@host:/tmp/blitzy/kitty/blitzy-05dd5e02-071e-4e0e-a941-87e19867a0f8_8fa74e# unset HISTCONTROL
+root@host:/tmp/blitzy/kitty/blitzy-05dd5e02-071e-4e0e-a941-87e19867a0f8_8fa74e# PS1='PROMPT$ '
 PROMPT$ printf "OUT-LINE-1\nOUT-LINE-2\nOUT-LINE-3\n"
 OUT-LINE-1
 OUT-LINE-2
