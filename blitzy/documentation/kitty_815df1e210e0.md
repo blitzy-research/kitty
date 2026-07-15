@@ -799,13 +799,15 @@ kitty/launcher/kitty
 
 The transcript excerpt above shows only the `fast_data_types.so` link line and the Go `kitten` build line; the link lines for the two GLFW backends, `rsync.so`, and the C launcher are among the per-translation-unit compile/link lines elided at the marked point above.
 
-**Determinism.** Building twice produced a byte-identical extension:
+**Determinism.** Building twice at the same commit produced a byte-identical extension:
 
 ```text
-### CMD: md5sum kitty/fast_data_types.so   (both builds)
+### CMD: md5sum kitty/fast_data_types.so   (both builds, at VCS rev d5f2b18b1)
 b255c0013972634549f91312ae799a0f  kitty/fast_data_types.so
 [exit: 0]
 ```
+
+This md5 is pinned to the exact commit, not merely to the environment: `kitty/data-types.c` — which defines `PyInit_fast_data_types` and is linked into the `.so` — is compiled with `-DKITTY_VCS_REV="<git rev>"` (`setup.py:726`, `get_source_specific_defines`), so the current git revision string is baked into the extension. The revision baked into the md5 above is the authoring commit `d5f2b18b1…`, the same revision shown in the Go build line's `-X kitty.VCSRevision=d5f2b18b133b19f69be07aa49af12d8b67c0d1f9` above; forcing `setup.py --vcs-rev=d5f2b18b133b19f69be07aa49af12d8b67c0d1f9` reproduces `b255c0013972634549f91312ae799a0f` exactly (confirmed on two consecutive builds). Rebuilding at a later commit (for example a subsequent documentation-only fix, which advances `HEAD`) embeds a different revision and therefore yields a different md5 — so "byte-identical" holds only when both the commit and the `-march=native` environment are held fixed. The kitten binary's `BuildID` (shown in the `file` output in Q4) is commit-pinned for the same reason: the Go binary embeds `VCSRevision` at link time.
 
 **Interruption-safe present→absent→present transition.** To observe the absent-state failures (Q3/Q4) against a built tree *without* leaving the tree altered, a `trap`-guarded script recorded the `.so` hash, moved it aside, ran every absent-state probe, then restored it and re-verified the hash. Before and after hashes match exactly:
 
@@ -898,7 +900,7 @@ ls: cannot access 'build': No such file or directory
 - **No existing source file was modified, added, or deleted.** The only write to the tree is `blitzy/documentation/kitty_815df1e210e0.md` (this document), which the AAP designates as the sole deliverable.
 - **No build product remains.** `0` ignored and `0` untracked entries; the `.so`, both launchers, and `build/` are absent.
 - **Temporary observation scripts and `/tmp/evidence/` live outside the repository** and are removed at task end; `PYTHONDONTWRITEBYTECODE=1` ensured no stray `.pyc`/`__pycache__` was written during Python runs.
-- When built, the extension's md5 is `b255c0013972634549f91312ae799a0f` (deterministic across rebuilds in this environment; the exact value is environment-specific because the build uses `-march=native`, so the emitted machine code is tuned to the build CPU's microarchitecture — the build itself is path-independent, producing a byte-identical `.so` regardless of the build directory); this hash identifies the artifact observed in Q1/Q3/Q4 and Appendix B and is recorded here for reproducibility, not because the artifact is retained.
+- When built, the extension's md5 is `b255c0013972634549f91312ae799a0f` (deterministic across rebuilds when the environment *and* the git commit are held fixed). The exact value is specific for two reasons: (1) the build uses `-march=native`, so the emitted machine code is tuned to the build CPU's microarchitecture; and (2) `kitty/data-types.c` — which defines `PyInit_fast_data_types` and is linked into the `.so` — is compiled with `-DKITTY_VCS_REV="<git rev>"` (`setup.py:726`), so the exact commit hash is baked into the extension. The value above is therefore pinned to the authoring commit `d5f2b18b1…` (the same revision embedded in the Go build line in Appendix B) and was reproduced exactly by forcing `setup.py --vcs-rev=d5f2b18b133b19f69be07aa49af12d8b67c0d1f9`. Rebuilding at any later commit (such as a subsequent documentation-only fix that advances `HEAD`) embeds a different revision and yields a different md5 — expected behavior, not a discrepancy. The build itself is path-independent, producing a byte-identical `.so` regardless of the build directory. This hash identifies the artifact observed in Q1/Q3/Q4 and Appendix B and is recorded for reproducibility, not because the artifact is retained.
 
 This certification describes the **actual final state** verified with the commands above — it does not assert that the tree was never touched, but that it has been returned to a clean, artifact-free baseline plus the one intended document.
 
