@@ -749,16 +749,16 @@ TID 11339 is the main `kitty` thread parked in `ppoll` inside `glfwRunMainLoop`,
 
 ## Q5 — What happens to input for a window that is unfocused or just closed?
 
-**Direct answer.** Input **strictly follows focus**, and the target is re-resolved on *every* event (Q1). An **unfocused but live** window receives **nothing** — bytes always go to whichever window is focused *now*. Input generated right after the focused window is **closed** is **re-routed to the new active window** (the survivor); the closed window's child is reaped and its output file is frozen. No bytes reach the dead child, none are lost, and there is no crash or error. This was verified across post-close injection offsets of **0, 10, 50, and 200 ms** (two runs each): the victim child is reaped within **~33 ms** of the close key, so at every tested offset the marker lands in the live survivor.
+**Direct answer.** Input **strictly follows focus**, and the target is re-resolved on *every* event (Q1). An **unfocused but live** window receives **nothing** — bytes always go to whichever window is focused *now*. Input generated right after the focused window is **closed** is **re-routed to the new active window** (the survivor); the closed window's child is reaped and its output file is frozen. No bytes reach the dead child, none are lost, and there is no crash or error. This was verified across post-close injection offsets of **0, 10, 50, and 200 ms** (two runs each): the victim child is reaped within **~33–35 ms** of the close key, so at every tested offset the marker lands in the live survivor.
 
-Two conditions are exercised: **(A)** an unfocused-but-*alive* window, and **(B)** a *just-closed* focused window at four timing offsets. The layout is one OS-window with two split children running the raw byte-logger `label.py` (each writes its stdin to `/kqna/win_<KITTY_WINDOW_ID>.txt`, truncating on start so reruns are idempotent). The last-added window (`KITTY_WINDOW_ID=2`, the "victim") starts focused; the first (`KITTY_WINDOW_ID=1`, the "survivor") does not. In the raw blocks below, control bytes are shown in caret notation (`^[` = ESC `0x1b`); every other byte is verbatim.
+Two conditions are exercised: **(A)** an unfocused-but-*alive* window, and **(B)** a *just-closed* focused window at four timing offsets. The layout is one OS-window with two split children running the raw byte-logger `label.py` (each writes its stdin to `/kqna/win_<KITTY_WINDOW_ID>.txt`, truncating on start so reruns are idempotent). In the canonical container the last-added split (`KITTY_WINDOW_ID=2`) starts focused and the first (`KITTY_WINDOW_ID=1`) does not — but the harness never assumes this: each script below **discovers** the focused/victim window at runtime (from which child the close reaps, or which split receives the first burst), so every trial is correct regardless of the environment's focus order. In the raw blocks below, control bytes are shown in caret notation (`^[` = ESC `0x1b`); every other byte is verbatim.
 
 **(A) Unfocused but live — input follows focus in both directions (observed).**
 
 ```text
 $ cat /kqna/q5.session
 launch --title survivor python3 /kqna/label.py
-launch --title victim   python3 /kqna/label.py
+launch --title victim python3 /kqna/label.py
 focus
 $ DISPLAY=:99 /kqna/run_q5_unfocused.sh
 === UNFOCUSED (live) TRIAL ===
@@ -769,15 +769,16 @@ key ctrl+shift+bracketleft
 sleep 200
 type FOCB
 xinj exit=0
---- win_1.txt  (id1 = survivor: unfocused during FOCA, focused during FOCB) ---
+--- discovered: initially-focused split=win_2 (received FOCA); other split=win_1 ---
+--- win_2.txt  (initially focused: FOCA here, NOT FOCB) ---
 0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
-0000020   =   8   6   5   2       K   I   T   T   Y   _   W   I   N   D
-0000040   O   W   _   I   D   =   1   ]  \n   F   O   C   B
-0000055
---- win_2.txt  (id2 = victim:   focused during FOCA, unfocused during FOCB) ---
-0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
-0000020   =   8   6   5   3       K   I   T   T   Y   _   W   I   N   D
+0000020   =   8   4   2   6       K   I   T   T   Y   _   W   I   N   D
 0000040   O   W   _   I   D   =   2   ]  \n   F   O   C   A
+0000055
+--- win_1.txt  (initially unfocused; gains focus after previous_window: FOCB here, NOT FOCA) ---
+0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
+0000020   =   8   4   2   5       K   I   T   T   Y   _   W   I   N   D
+0000040   O   W   _   I   D   =   1   ]  \n   F   O   C   B
 0000055
 --- debug-keyboard shortcut matches ---
 ^[[35mKeyPress^[[m matched action: previous_window, handled as shortcut
@@ -787,34 +788,34 @@ xinj exit=0
 
 **(B) Just-closed focused window — post-close timing matrix (observed).**
 
-`run_q5.sh <offset> <label>` closes the focused victim (`ctrl+shift+w` → `close_window`), waits `<offset>` ms, injects a unique printable marker `MRK<offset>`, and records the victim child's process state via `ps` at three points (before close, at marker-delivery, and +1 s) plus which child log received the marker. Two representative trials in full — the shortest and the longest offset:
+`run_q5.sh <offset> <label>` captures **both** split children's pids, injects `close_window` (`ctrl+shift+w`, which closes whichever split is focused), waits `<offset>` ms, then injects a unique printable marker `MRK<offset>`. It then **discovers** the victim as the child the close reaped and the survivor as the child still alive (via `kill -0`), and records `ps` state (both children alive before close; victim absent, survivor alive after a 1 s settle) plus which child log received the marker — so the trial is correct regardless of which split the environment focused. Two representative trials in full — the shortest and the longest offset:
 
 ```text
 $ DISPLAY=:99 /kqna/run_q5.sh 0 t0a
 === TRIAL label=t0a offset=0ms marker=MRK0 ===
-kitty pid=7367  survivor(win_1) child pid=7435  victim(win_2) child pid=7436
---- ps BEFORE close (victim pid=7436) ---
+kitty pid=8160  win_1 child pid=8228  win_2 child pid=8229
+--- ps BEFORE close (both split children alive) ---
     PID    PPID STAT COMMAND
-   7436    7367 Ss+  /usr/bin/python3 /kqna/label.py
+   8228    8160 Ss+  /usr/bin/python3 /kqna/label.py
+   8229    8160 Ss+  /usr/bin/python3 /kqna/label.py
 --- inject program (/kqna/q5_t0a.cmds) ---
 key ctrl+shift+w
 type MRK0
 xinj exit=0
---- ps IMMEDIATELY after marker delivered (victim pid=7436) ---
-(victim pid 7436: NO ROW — child already gone/reaped at marker time)
---- ps AFTER 1s settle (victim pid=7436) ---
-(victim pid 7436: NO ROW — child gone/reaped)
---- ps survivor (pid=7435) ---
+--- discovered: focused victim=win_2 (pid=8229, reaped)  survivor=win_1 (pid=8228, alive) ---
+--- ps victim (pid=8229) — expect NO ROW (reaped) ---
+(victim pid 8229: NO ROW — child gone/reaped)
+--- ps survivor (pid=8228) — expect alive ---
     PID    PPID STAT COMMAND
-   7435    7367 Ss+  /usr/bin/python3 /kqna/label.py
---- win_1.txt  SURVIVOR (expect banner + MRK0) ---
+   8228    8160 Ss+  /usr/bin/python3 /kqna/label.py
+--- SURVIVOR win_1.txt (expect banner + MRK0) ---
 0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
-0000020   =   7   4   3   5       K   I   T   T   Y   _   W   I   N   D
+0000020   =   8   2   2   8       K   I   T   T   Y   _   W   I   N   D
 0000040   O   W   _   I   D   =   1   ]  \n   M   R   K   0
 0000055
---- win_2.txt  VICTIM   (expect banner only, frozen) ---
+--- VICTIM   win_2.txt (expect banner only, frozen) ---
 0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
-0000020   =   7   4   3   6       K   I   T   T   Y   _   W   I   N   D
+0000020   =   8   2   2   9       K   I   T   T   Y   _   W   I   N   D
 0000040   O   W   _   I   D   =   2   ]  \n
 0000051
 --- debug-keyboard: shortcut matches ---
@@ -825,30 +826,30 @@ xinj exit=0
 ```text
 $ DISPLAY=:99 /kqna/run_q5.sh 200 t200a
 === TRIAL label=t200a offset=200ms marker=MRK200 ===
-kitty pid=7931  survivor(win_1) child pid=7999  victim(win_2) child pid=8000
---- ps BEFORE close (victim pid=8000) ---
+kitty pid=8253  win_1 child pid=8321  win_2 child pid=8322
+--- ps BEFORE close (both split children alive) ---
     PID    PPID STAT COMMAND
-   8000    7931 Ss+  /usr/bin/python3 /kqna/label.py
+   8321    8253 Ss+  /usr/bin/python3 /kqna/label.py
+   8322    8253 Ss+  /usr/bin/python3 /kqna/label.py
 --- inject program (/kqna/q5_t200a.cmds) ---
 key ctrl+shift+w
 sleep 200
 type MRK200
 xinj exit=0
---- ps IMMEDIATELY after marker delivered (victim pid=8000) ---
-(victim pid 8000: NO ROW — child already gone/reaped at marker time)
---- ps AFTER 1s settle (victim pid=8000) ---
-(victim pid 8000: NO ROW — child gone/reaped)
---- ps survivor (pid=7999) ---
+--- discovered: focused victim=win_2 (pid=8322, reaped)  survivor=win_1 (pid=8321, alive) ---
+--- ps victim (pid=8322) — expect NO ROW (reaped) ---
+(victim pid 8322: NO ROW — child gone/reaped)
+--- ps survivor (pid=8321) — expect alive ---
     PID    PPID STAT COMMAND
-   7999    7931 Ss+  /usr/bin/python3 /kqna/label.py
---- win_1.txt  SURVIVOR (expect banner + MRK200) ---
+   8321    8253 Ss+  /usr/bin/python3 /kqna/label.py
+--- SURVIVOR win_1.txt (expect banner + MRK200) ---
 0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
-0000020   =   7   9   9   9       K   I   T   T   Y   _   W   I   N   D
+0000020   =   8   3   2   1       K   I   T   T   Y   _   W   I   N   D
 0000040   O   W   _   I   D   =   1   ]  \n   M   R   K   2   0   0
 0000057
---- win_2.txt  VICTIM   (expect banner only, frozen) ---
+--- VICTIM   win_2.txt (expect banner only, frozen) ---
 0000000   [   c   h   i   l   d       s   t   a   r   t       p   i   d
-0000020   =   8   0   0   0       K   I   T   T   Y   _   W   I   N   D
+0000020   =   8   3   2   2       K   I   T   T   Y   _   W   I   N   D
 0000040   O   W   _   I   D   =   2   ]  \n
 0000051
 --- debug-keyboard: shortcut matches ---
@@ -858,30 +859,30 @@ xinj exit=0
 
 All eight trials (0/10/50/200 ms × 2) produced the same qualitative result. The table below is the verbatim per-trial `ps`/`od` signal (`Ss+` = the interactive foreground child; "no row" = the pid has no `ps` entry, i.e. reaped):
 
-| offset | run | victim BEFORE close | victim @ marker | victim @ +1 s | marker landed in | victim log |
-|--------|-----|---------------------|-----------------|---------------|------------------|------------|
-| 0 ms   | t0a  | `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK0`   | frozen (banner only) |
-| 0 ms   | t0b  | `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK0`   | frozen |
-| 10 ms  | t10a | `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK10`  | frozen |
-| 10 ms  | t10b | `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK10`  | frozen |
-| 50 ms  | t50a | `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK50`  | frozen |
-| 50 ms  | t50b | `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK50`  | frozen |
-| 200 ms | t200a| `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK200` | frozen |
-| 200 ms | t200b| `Ss+` alive | no row (reaped) | no row | survivor `win_1` = `MRK200` | frozen |
+| offset | run | victim BEFORE close | victim AFTER close (+1 s) | marker landed in | victim log (od) |
+|--------|-----|---------------------|--------------------------|------------------|-----------------|
+| 0 ms   | t0a  | `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK0`   | frozen (banner only, 41 B) |
+| 0 ms   | t0b  | `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK0`   | frozen (41 B) |
+| 10 ms  | t10a | `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK10`  | frozen (41 B) |
+| 10 ms  | t10b | `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK10`  | frozen (41 B) |
+| 50 ms  | t50a | `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK50`  | frozen (41 B) |
+| 50 ms  | t50b | `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK50`  | frozen (41 B) |
+| 200 ms | t200a| `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK200` | frozen (41 B) |
+| 200 ms | t200b| `Ss+` alive | no row (reaped) | survivor `win_1` = `MRK200` | frozen (41 B) |
 
 **Why the outcome is offset-invariant (measured, not assumed).** The victim child is reaped so quickly after the close key that it is already gone by marker-delivery at *every* offset. Measuring the reap latency directly (close-key send → victim pid absent), three runs:
 
 ```text
 $ DISPLAY=:99 /kqna/reap_time.sh r1 ; /kqna/reap_time.sh r2 ; /kqna/reap_time.sh r3
-=== REAP TIMING label=r1 victim pid=8746 ===
-victim gone after 33.0 ms (from close-key send to pid-absent)
-=== REAP TIMING label=r2 victim pid=8829 ===
-victim gone after 33.8 ms (from close-key send to pid-absent)
-=== REAP TIMING label=r3 victim pid=8912 ===
-victim gone after 34.3 ms (from close-key send to pid-absent)
+=== REAP TIMING label=r1  win_1 child pid=7956  win_2 child pid=7957 ===
+focused victim = win_2 (pid=7957); gone after 33.0 ms (from close-key send to pid-absent)
+=== REAP TIMING label=r2  win_1 child pid=8043  win_2 child pid=8044 ===
+focused victim = win_2 (pid=8044); gone after 33.3 ms (from close-key send to pid-absent)
+=== REAP TIMING label=r3  win_1 child pid=8130  win_2 child pid=8131 ===
+focused victim = win_2 (pid=8131); gone after 35.1 ms (from close-key send to pid-absent)
 ```
 
-Reap completes in **~33 ms** — smaller than the injection pacing of the six-event `ctrl+shift+w` combo itself (xinj paces ~6 ms/event ≈ 36 ms), before any offset is added. `close_window` calls `mark_for_close` (`kitty/child-monitor.c:568`), which sets `needs_removal` through `mark_child_for_close` (`kitty/child-monitor.c:541`, `:546`); the dedicated I/O thread performs the actual teardown when it observes `children[i].needs_removal` (`kitty/child-monitor.c:1317`), reaping the child and freezing its PTY. That is why even the 0 ms trial shows the victim already reaped at marker-time.
+Reap completes in **~33–35 ms** — smaller than the injection pacing of the six-event `ctrl+shift+w` combo itself (xinj paces ~6 ms/event ≈ 36 ms), before any offset is added. `close_window` calls `mark_for_close` (`kitty/child-monitor.c:568`), which sets `needs_removal` through `mark_child_for_close` (`kitty/child-monitor.c:541`, `:546`); the dedicated I/O thread performs the actual teardown when it observes `children[i].needs_removal` (`kitty/child-monitor.c:1317`), reaping the child and freezing its PTY. That is why even the 0 ms trial shows the victim already reaped at marker-time.
 
 **Observations (directly observed).**
 - **Unfocused (live):** an unfocused-but-alive window receives nothing; input follows focus in both directions (A).
@@ -1288,7 +1289,7 @@ while True:
     if not b: break
     now = time.monotonic()
     for by in b:
-        f.write(('%.6f %02x\n' % (now, by)).encode())
+        f.write(('RECV %.6f %02x\n' % (now, by)).encode())
 ```
 
 **`flood.py`** — bounded high-volume output producer (the Q7 background child; no unbounded loop; writes a throughput side-channel):
@@ -1312,7 +1313,7 @@ while n < maxlines:
 out.flush(); report()
 ```
 
-**`analyze_ts.py`** — reduces a `tslog.py` log to string / count / ordering / span / foreign-byte count (the Q7 reducer):
+**`analyze_ts.py`** — the **secondary** Q7 reducer: reduces a `tslog.py` `RECV` log to reconstructed string / count / ordering / span / foreign-byte count (an independent cross-check on burst completeness, order, and isolation; the **primary** per-event latency reducer is `pair_lat.py`, below — both consume the same `RECV <mono> <hex>` log):
 
 ```python
 #!/usr/bin/env python3
@@ -1327,8 +1328,8 @@ with open(path, 'r', errors='replace') as fh:
                 if tok.startswith('monotonic_resolution='): res = tok.split('=', 1)[1]
             continue
         parts = line.split()
-        if len(parts) != 2: continue
-        try: ts = float(parts[0]); by = int(parts[1], 16)
+        if len(parts) != 3 or parts[0] != 'RECV': continue
+        try: ts = float(parts[1]); by = int(parts[2], 16)
         except ValueError: continue
         if 0x20 <= by < 0x7f:
             ch = chr(by)
@@ -1462,7 +1463,7 @@ except KeyboardInterrupt:
     os._exit(0)
 ```
 
-**`pair_lat.py`** — Q7 reducer: pairs `xinj` `SEND` timestamps with `tslog.py` `RECV` timestamps in order and reports per-event latency, median, p95, ordering, and foreign-byte count; exits nonzero on any incomplete/misordered/foreign pairing (so a vacuous run cannot pass):
+**`pair_lat.py`** — the **primary** Q7 reducer (per-event input latency): pairs `xinj` `SEND` timestamps with `tslog.py` `RECV` timestamps in order and reports per-event latency, median, p95, ordering, and foreign-byte count; exits nonzero on any incomplete/misordered/foreign pairing (so a vacuous run cannot pass):
 
 ```python
 #!/usr/bin/env python3
@@ -2402,74 +2403,68 @@ echo "=== SEND log lines: $(wc -l < /kqna/send_${label}.log) (first 3) ==="; hea
 echo "=== RECV logs present ==="; ls -la /kqna/ts_*.txt 2>/dev/null
 ```
 
-**`run_q5.sh`** — Q5 post-close timing trial: builds the per-offset driver (close focused victim → wait `<offset>` ms → type marker), samples the victim child's `ps` state before/at-marker/+1 s, and reports which child log received the marker:
+**`run_q5.sh`** — Q5 post-close timing trial: injects `close_window` (which closes whichever split is focused) then, after `<offset>` ms, a unique marker; it does **not** hard-code a window id — it captures both children's pids and **discovers** the victim as the child the close reaped and the survivor as the child still alive, then reports which child log received the marker (so the trial is correct regardless of which split the environment focuses):
 
 ```bash
 #!/bin/bash
 # /kqna/run_q5.sh <offset_ms> <label>
 # Q5 post-close timing trial. Layout: two split children (label.py) in one OS
-# window; the LAST-added (KITTY_WINDOW_ID=2, "victim") is focused, the first
-# (KITTY_WINDOW_ID=1, "survivor") is not. We close the focused victim, wait
-# <offset_ms>, then inject a unique printable marker and observe (a) the victim
-# child's process state via ps and (b) which child log receives the marker.
+# window. Does NOT assume which split is focused: it captures BOTH children's
+# pids, injects close_window (ctrl+shift+w -> closes whichever is focused) then,
+# after <offset_ms>, a unique printable marker; then it DISCOVERS the victim as
+# the child the close reaped and the survivor as the child still alive, and shows
+# which child log received the marker.
 #   offset_ms : explicit sleep injected AFTER the close key, BEFORE the marker.
 #               (xinj also applies its own ~6ms/event pacing; offset 0 = no extra sleep.)
 set -u
 off="$1"; label="$2"; marker="MRK${off}"
 export DISPLAY=:99
 rm -f /kqna/win_1.txt /kqna/win_2.txt /kqna/kitty_q5_${label}.log
-# Build the per-trial injection program: close focused (victim) -> wait -> marker.
 cmds=/kqna/q5_${label}.cmds
 { echo "key ctrl+shift+w"; [ "$off" -gt 0 ] && echo "sleep ${off}"; echo "type ${marker}"; } > "$cmds"
-
 /work/kitty/launcher/kitty --config NONE --session /kqna/q5.session --debug-keyboard \
     >/kqna/kitty_q5_${label}.log 2>&1 &
 kpid=$!
 sleep 2.2
-# read child pids from the label.py banners
-vpid=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_2.txt 2>/dev/null | head -1)
-spid=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_1.txt 2>/dev/null | head -1)
+p1=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_1.txt 2>/dev/null | head -1)
+p2=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_2.txt 2>/dev/null | head -1)
 echo "=== TRIAL label=${label} offset=${off}ms marker=${marker} ==="
-echo "kitty pid=$kpid  survivor(win_1) child pid=$spid  victim(win_2) child pid=$vpid"
-echo "--- ps BEFORE close (victim pid=$vpid) ---"
-ps -o pid,ppid,stat,command -p "$vpid" 2>/dev/null || echo "(no such pid)"
-# Inject: close victim, wait offset, type marker
+echo "kitty pid=$kpid  win_1 child pid=$p1  win_2 child pid=$p2"
+echo "--- ps BEFORE close (both split children alive) ---"
+ps -o pid,ppid,stat,command -p "${p1},${p2}" 2>/dev/null || echo "(no such pids)"
 echo "--- inject program ($cmds) ---"; cat "$cmds"
 ./xinj < "$cmds"; echo "xinj exit=$?"
-echo "--- ps IMMEDIATELY after marker delivered (victim pid=$vpid) ---"
-if ps -o pid,ppid,stat,command -p "$vpid" >/tmp/psimm 2>/dev/null && [ -s /tmp/psimm ]; then
-  cat /tmp/psimm
-else
-  echo "(victim pid $vpid: NO ROW — child already gone/reaped at marker time)"
-fi
 sleep 1.0
-echo "--- ps AFTER 1s settle (victim pid=$vpid) ---"
-if ps -o pid,ppid,stat,command -p "$vpid" >/tmp/psout 2>/dev/null && [ -s /tmp/psout ]; then
-  cat /tmp/psout
-else
-  echo "(victim pid $vpid: NO ROW — child gone/reaped)"
-fi
-echo "--- ps survivor (pid=$spid) ---"
+# Discover victim = child the close reaped; survivor = the one still alive.
+a1=1; a2=1; kill -0 "$p1" 2>/dev/null || a1=0; kill -0 "$p2" 2>/dev/null || a2=0
+if [ "$a1" = 0 ] && [ "$a2" = 1 ]; then victim=win_1; vpid=$p1; survivor=win_2; spid=$p2
+elif [ "$a2" = 0 ] && [ "$a1" = 1 ]; then victim=win_2; vpid=$p2; survivor=win_1; spid=$p1
+else victim="?"; vpid="?"; survivor="?"; spid="?"; fi
+echo "--- discovered: focused victim=${victim} (pid=${vpid}, reaped)  survivor=${survivor} (pid=${spid}, alive) ---"
+echo "--- ps victim (pid=$vpid) — expect NO ROW (reaped) ---"
+if ps -o pid,ppid,stat,command -p "$vpid" >/tmp/psv 2>/dev/null && [ -s /tmp/psv ]; then cat /tmp/psv; else echo "(victim pid $vpid: NO ROW — child gone/reaped)"; fi
+echo "--- ps survivor (pid=$spid) — expect alive ---"
 ps -o pid,ppid,stat,command -p "$spid" 2>/dev/null || echo "(no such pid)"
-echo "--- win_1.txt  SURVIVOR (expect banner + ${marker}) ---"; od -c /kqna/win_1.txt 2>/dev/null
-echo "--- win_2.txt  VICTIM   (expect banner only, frozen) ---"; od -c /kqna/win_2.txt 2>/dev/null
+echo "--- SURVIVOR ${survivor}.txt (expect banner + ${marker}) ---"; od -c /kqna/${survivor}.txt 2>/dev/null
+echo "--- VICTIM   ${victim}.txt (expect banner only, frozen) ---"; od -c /kqna/${victim}.txt 2>/dev/null
 echo "--- debug-keyboard: shortcut matches ---"
 grep -a "matched action\|close_window\|handled as shortcut" /kqna/kitty_q5_${label}.log | head -8
 kill $kpid 2>/dev/null; sleep 0.4; kill -9 $kpid 2>/dev/null
-# snapshot per-trial logs
 cp -f /kqna/win_1.txt /kqna/q5_win1_${label}.txt 2>/dev/null
 cp -f /kqna/win_2.txt /kqna/q5_win2_${label}.txt 2>/dev/null
 echo "=== END TRIAL ${label} ==="
 ```
 
-**`run_q5_unfocused.sh`** — Q5 input-follows-focus on LIVE windows: type into the focused victim, switch focus to the survivor, type again — proving an unfocused-but-alive window receives nothing:
+**`run_q5_unfocused.sh`** — Q5 input-follows-focus on LIVE windows: type into the focused split, switch focus to the other split, type again — proving an unfocused-but-alive window receives nothing. It does **not** hard-code a window id: it **discovers** the initially-focused split as the one that received the first burst (`FOCA`):
 
 ```bash
 #!/bin/bash
 # /kqna/run_q5_unfocused.sh — input-follows-focus on LIVE (unclosed) windows.
-# victim(id2) starts focused. Type FOCA (must go to id2, NOT id1). Then switch
-# focus to survivor(id1) via previous_window, type FOCB (must go to id1; id2
-# unchanged). Demonstrates an unfocused-but-alive window receives nothing.
+# Does NOT assume which split starts focused: type FOCA (goes to whichever split
+# is focused), DISCOVER that split as the initially-focused window, switch focus
+# to the other split via previous_window, type FOCB (must go to the other split;
+# the first is unchanged). Demonstrates an unfocused-but-alive window receives
+# nothing.
 set -u
 export DISPLAY=:99
 rm -f /kqna/win_1.txt /kqna/win_2.txt /kqna/kitty_unfoc.log
@@ -2479,43 +2474,51 @@ kpid=$!; sleep 2.2
 { echo "type FOCA"; echo "sleep 200"; echo "key ctrl+shift+bracketleft"; echo "sleep 200"; echo "type FOCB"; } > /kqna/unfoc.cmds
 echo "=== UNFOCUSED (live) TRIAL ==="; echo "--- inject ---"; cat /kqna/unfoc.cmds
 ./xinj < /kqna/unfoc.cmds; echo "xinj exit=$?"; sleep 0.8
-echo "--- win_1.txt  (id1 = survivor: unfocused during FOCA, focused during FOCB) ---"; od -c /kqna/win_1.txt
-echo "--- win_2.txt  (id2 = victim:   focused during FOCA, unfocused during FOCB) ---"; od -c /kqna/win_2.txt
+# Discover which split was initially focused = the one that received FOCA.
+f1=$(grep -c FOCA /kqna/win_1.txt 2>/dev/null | head -1); f2=$(grep -c FOCA /kqna/win_2.txt 2>/dev/null | head -1)
+if [ "${f1:-0}" -gt 0 ]; then foc=win_1; oth=win_2; else foc=win_2; oth=win_1; fi
+echo "--- discovered: initially-focused split=${foc} (received FOCA); other split=${oth} ---"
+echo "--- ${foc}.txt  (initially focused: FOCA here, NOT FOCB) ---"; od -c /kqna/${foc}.txt
+echo "--- ${oth}.txt  (initially unfocused; gains focus after previous_window: FOCB here, NOT FOCA) ---"; od -c /kqna/${oth}.txt
 echo "--- debug-keyboard shortcut matches ---"; grep -a "matched action" /kqna/kitty_unfoc.log | head -4
 kill $kpid 2>/dev/null; sleep 0.3; kill -9 $kpid 2>/dev/null
 ```
 
-**`reap_time.sh`** — Q5 reap-latency probe: inject only the close key, then sample `ps` every ~2 ms until the victim pid leaves the process table (close-key → pid-absent):
+**`reap_time.sh`** — Q5 reap-latency probe: inject only the close key, then sample `ps` every ~2 ms until the reaped child leaves the process table (close-key → pid-absent). It does **not** hard-code a window id — it captures both children's pids and reports whichever one the close reaped (so it never mis-watches a window the environment did not focus):
 
 ```bash
 #!/bin/bash
 # /kqna/reap_time.sh <label>  — measure how long after close_window the focused
-# victim child (KITTY_WINDOW_ID=2) actually disappears from the process table.
-# Injects ONLY the close key, then samples ps every ~2ms until the pid is gone.
+# victim child actually leaves the process table. Does NOT assume which split is
+# focused: it captures BOTH children's pids, injects only the close key (which
+# closes whichever window is focused), then polls BOTH pids and reports which
+# child the close reaped and the elapsed time (close-key send -> pid absent).
 set -u
 label="$1"; export DISPLAY=:99
 rm -f /kqna/win_1.txt /kqna/win_2.txt /kqna/kitty_reap_${label}.log
 /work/kitty/launcher/kitty --config NONE --session /kqna/q5.session \
     >/kqna/kitty_reap_${label}.log 2>&1 &
 kpid=$!; sleep 2.2
-vpid=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_2.txt 2>/dev/null | head -1)
-echo "=== REAP TIMING label=${label} victim pid=$vpid ==="
+p1=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_1.txt 2>/dev/null | head -1)
+p2=$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' /kqna/win_2.txt 2>/dev/null | head -1)
+echo "=== REAP TIMING label=${label}  win_1 child pid=${p1}  win_2 child pid=${p2} ==="
 printf 'key ctrl+shift+w\n' > /kqna/reap_${label}.cmds
 t0=$(python3 -c 'import time;print(time.monotonic())')
 ./xinj < /kqna/reap_${label}.cmds >/dev/null 2>&1
-# sample until gone or 2s timeout
-gone=""
+gone=""; vic=""; vpid=""
 for i in $(seq 1 1000); do
-  if ! kill -0 "$vpid" 2>/dev/null; then
-    gone=$(python3 -c 'import time;print(time.monotonic())'); break
-  fi
+  a1=1; a2=1
+  kill -0 "$p1" 2>/dev/null || a1=0
+  kill -0 "$p2" 2>/dev/null || a2=0
+  if [ "$a1" = 0 ] && [ "$a2" = 1 ]; then vic=win_1; vpid=$p1; gone=$(python3 -c 'import time;print(time.monotonic())'); break; fi
+  if [ "$a2" = 0 ] && [ "$a1" = 1 ]; then vic=win_2; vpid=$p2; gone=$(python3 -c 'import time;print(time.monotonic())'); break; fi
   sleep 0.002
 done
 kill $kpid 2>/dev/null; sleep 0.3; kill -9 $kpid 2>/dev/null
 if [ -n "$gone" ]; then
-  python3 -c "print('victim gone after %.1f ms (from close-key send to pid-absent)'%(($gone-$t0)*1000))"
+  python3 -c "print('focused victim = %s (pid=%s); gone after %.1f ms (from close-key send to pid-absent)' % ('${vic}','${vpid}',(${gone}-${t0})*1000))"
 else
-  echo "victim still present after 2s (unexpected)"
+  echo "neither child reaped after 2 s (unexpected)"
 fi
 ```
 
@@ -2535,7 +2538,7 @@ fi
 - **Q2** — Two paths: Path A GLFW `window_focus_callback` (`kitty/glfw.c:515`) → `Boss.on_focus` (`kitty/boss.py:1651`) → `Screen.focus_changed` (`kitty/screen.c:4604`); Path B Python-only (`kitty/window_list.py:192`, `kitty/tabs.py:892`, `kitty/boss.py:913`). Evidence: S2a (9 paired `on_focus_change`), S2b (0 additional callbacks yet DECSET bytes). ✔
 - **Q3** — `on_key_input` (`kitty/keys.c:166`) → dispatch → `encode_glfw_key_event` (`kitty/key_encoding.c:414`) → `schedule_write_to_child(id)` (`kitty/child-monitor.c:372`); signal branch (`kitty/keys.c:256` → `kitty/child.py:481`). Evidence: A1/A2/A3 branch matrix + child bytes, C1/C2 Ctrl+C, S3/S3b scroll+resize. ✔
 - **Q4** — Blocked (EPERM) then remediated (container-scoped `CAP_SYS_PTRACE`); `py-spy` MainThread stack (`main.py:234`), gdb dispatch breakpoint (three layers), `KittyChildMon` `io_loop`; 67-thread inventory bounded to the run; 2-run stable. ✔
-- **Q5** — Input follows focus (unfocused-but-live gets nothing, both directions); post-close reroute to the live survivor; victim reaped via `mark_for_close` (`kitty/child-monitor.c:568`) → `needs_removal` (`:541`,`:1317`); low-level `found==false` drop (`kitty/child-monitor.c:369`) labelled inferred. Evidence: unfocused (A) bidirectional trial + post-close timing matrix at 0/10/50/200 ms (2 runs each, 8 trials) + direct reap-latency (~33 ms, 3 runs). ✔
+- **Q5** — Input follows focus (unfocused-but-live gets nothing, both directions); post-close reroute to the live survivor; victim reaped via `mark_for_close` (`kitty/child-monitor.c:568`) → `needs_removal` (`:541`,`:1317`); low-level `found==false` drop (`kitty/child-monitor.c:369`) labelled inferred. Evidence: unfocused (A) bidirectional trial + post-close timing matrix at 0/10/50/200 ms (2 runs each, 8 trials) + direct reap-latency (~33–35 ms, 3 runs). ✔
 - **Q6** — Attribution table (external `glfw-x11.so`/xkb; C `fast_data_types.so`; Python `libpython`); refutations A/B/C with backtrace + before/after thread inventory (67→67, processes 1→4). ✔
 - **Q7** — Writes POLLOUT-driven (`kitty/child-monitor.c:1503`,`:1539`); `input_delay` = output coalescing (`kitty/options/definition.py:878`, `kitty/child-monitor.c:445`); `repaint_delay` = render coalescing (`kitty/options/definition.py:866`, `kitty/child-monitor.c:874`); single serializing `io_loop` keyed by child id (`kitty/child-monitor.c:372`). Evidence: S4 paired per-event send→receive latency, quiet vs flood (median ~0.15→~1.1 ms, p95 ~0.22→~2.6 ms; ~7.5× median), ordering/isolation preserved (40/40 exact, 0 foreign), producer backpressure; quiet×2 + flood×2 + re-verify runs. ✔
 
