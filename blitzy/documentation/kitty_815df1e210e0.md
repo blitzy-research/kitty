@@ -18,7 +18,7 @@ This document answers five questions about how the [kitty](https://sw.kovidgoyal
 
 ### 0.1 Method: run-first, observe-then-write
 
-Every behavioral claim below is written **from directly observed runtime output** captured through the **real PTY path** — a genuine child process writing into a real pseudo-terminal that kitty reads. Each claim sits **beside the exact command that produced it and that command's unedited output**, and each *structural* claim (how the code is wired) carries a `file:line` citation to the code that manifests it.
+Behavioral claims below are grounded **in directly observed runtime output** captured through the **real PTY path** — a genuine child process writing into a real pseudo-terminal that kitty reads — **wherever the behavior is reachable in this environment**. Where a specific mechanism cannot be surfaced here (for example, internal per-tick counters with no `strace`/`ptrace` access, or an idle-only code path that nothing in the canonical build triggers), the claim is **explicitly labeled *inferred / code-derived*** at the point it appears and is enumerated in the Appendix B coverage pass; that code-derived set is deliberately narrow (five items) and each carries its reason. Each *observed* claim sits **beside the exact command that produced it and that command's unedited output**, and each *structural* claim (how the code is wired) carries a `file:line` citation to the code that manifests it.
 
 **What is deliberately NOT used as evidence.** The C unit-test hook `test_parse_written_data` [kitty/screen.c:4771-4772] and the Python `parse_bytes` harness [kitty_tests/parser.py:20] both feed bytes straight to the parser worker and **bypass the PTY read path**. They are therefore **non-canonical** for these questions and are never used as primary evidence; where a contrast value from them would appear, it is explicitly labeled *non-canonical*.
 
@@ -37,14 +37,32 @@ $ pkg-config --version
 1.8.1
 ```
 
-**Designated image — attempted, access denied, honest fallback.** The task nominates the Docker image `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (mirrored at `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`). It is private; a direct pull is denied:
+**Designated image — the GHCR mirror is accessible and builds kitty; only the Docker Hub alias is denied.** The task nominates the Docker image `andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, mirrored at `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0`. The Docker Hub alias is private and a direct pull is denied — but the **GHCR mirror pulls successfully**, so the designated image *is* available and was used to verify the build:
 
 ```
 $ docker pull andrewparkscaleai/coding-agent:kovidgoyal__kitty__815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 Error response from daemon: pull access denied for andrewparkscaleai/coding-agent, repository does not exist or may require 'docker login': denied: requested access to the resource is denied
+
+$ docker pull ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0
+Digest: sha256:60da90a7183a82861fc6d1d40cb8086baa6a8a0e0d05f26d03aafd0f5b3cc384
+Status: Image is up to date for ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0
 ```
 
-The build therefore runs directly against the environment's system libraries (a fully-supported, canonical `setup.py` build path — kitty ships no lockfile and builds from system `-dev` packages). This is disclosed here so no claim below depends on an unavailable image.
+The designated image is **Ubuntu 24.04.2 LTS** (Python 3.12.3, Go 1.23.4, GCC 13.3.0). Building kitty inside it with the canonical builder succeeds — confirming the pinned image builds the emulator exactly as specified:
+
+```
+$ mkdir -p /tmp/kitty_img_build && git archive HEAD | tar -x -C /tmp/kitty_img_build
+$ docker run --rm -v /tmp/kitty_img_build:/src --entrypoint /bin/sh \
+    ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_kovidgoyal_kitty_1.0 -lc \
+    'cd /src && python3 setup.py >/tmp/build.log 2>&1; echo "setup.py exit: $?"; \
+     ./kitty/launcher/kitty --version | head -1; \
+     test -f kitty/fast_data_types.so && echo "fast_data_types.so: built"'
+setup.py exit: 0
+kitty 0.35.2 created by Kovid Goyal
+fast_data_types.so: built
+```
+
+**Where each kind of evidence was gathered (disclosed for honesty).** The *build* is verified in the designated image above. The *GUI / PTY runtime* captures in this document — the pixel-level pause/resume observations in §1 and the live PTY experiments throughout — were run on the **host system-library build (Ubuntu 25.10)**, because the designated image ships no headless-X stack (`Xvfb: ABSENT`, `python-xlib: ABSENT`) and so cannot open a window out of the box. Both builds use the **identical** canonical builder (`python3 setup.py`, x11-only, strict `-Werror`), so no runtime claim below depends on a non-canonical build. kitty ships no lockfile and builds from system `-dev` packages — the supported path in both environments. (`python3 setup.py develop`, by contrast, fails identically in both with `KeyError: 'DEVELOP_ROOT'` [setup.py:1255]; the default `python3 setup.py` action is used, §0.3.)
 
 ### 0.3 Canonical build command and its output
 
@@ -68,7 +86,7 @@ Disabling building of wayland backend
 kitty/tools/cmd
 ```
 
-(An already-built tree recompiles incrementally, as above; a clean tree compiles the full source set. Wayland is auto-disabled because `wayland-protocols` is absent → x11-only, the canonical CI configuration on Ubuntu 25.10. Strict flags `-pedantic-errors -Werror -Wall -Wextra` stay on.) The launcher self-reports:
+(An already-built tree recompiles incrementally, as above; a clean tree compiles the full source set. Wayland is auto-disabled because `wayland-protocols` is absent → x11-only, the canonical CI configuration on the host build environment (Ubuntu 25.10; the designated image is Ubuntu 24.04.2 and builds via the same path, §0.2). Strict flags `-pedantic-errors -Werror -Wall -Wextra` stay on.) The launcher self-reports:
 
 ```
 $ ./kitty/launcher/kitty --version
@@ -216,7 +234,7 @@ Raw bytes cross the boundary in **`read_bytes()`** [kitty/child-monitor.c:1337],
 
 Per the source, `screen_pause_rendering()` does three things on **pause**: refuses if already paused (`if (self->paused_rendering.expires_at) return false;` [kitty/screen.c:2518]); arms a **2000 ms default timeout** (`if (for_in_ms <= 0) for_in_ms = 2000;` [kitty/screen.c:2521]; `expires_at = monotonic() + ms_to_monotonic_t(for_in_ms)` [kitty/screen.c:2522]); and copies the visible grid line-by-line into a separate snapshot linebuf along with the cursor, color profile, selections, and graphics [kitty/screen.c:2522-2543]. While paused, `screen_update_cell_data()` renders from that snapshot linebuf rather than the live grid [kitty/screen.c:2737-2760] — so the *displayed* frame is code-designed to stay frozen while the *live grid keeps mutating*. On **resume** it refuses if not paused (`if (!self->paused_rendering.expires_at) return false;` [kitty/screen.c:2508]), clears `expires_at` [kitty/screen.c:2509], and sets `self->is_dirty = true` [kitty/screen.c:2511] so the accumulated live grid is uploaded on the next render. A safety net, `screen_check_pause_rendering()` [kitty/screen.c:2489], force-resumes when `now > expires_at` [kitty/screen.c:2490] so a stalled application can never freeze the display forever.
 
-> **Scope of the runtime evidence (important).** The captures below use `--dump-commands`, which exposes the **parsed command stream** — it does **not** expose the GPU/display layer. So what is *directly observed* is that the parser keeps consuming input across a pause (the draws land between the pause and resume commands, in byte order). The display-side behavior — that the shown frame is the frozen snapshot, and that resume applies the accumulation as one frame with no half-drawn intermediate — is **code-derived** from `screen.c:2506-2543`, `screen.c:2737-2760`, and `screen.c:2511`, not captured as pixels (no framebuffer capture is available under headless software GL). Each such claim is labeled accordingly.
+> **Scope of the runtime evidence (important).** The `--dump-commands` captures below expose the **parsed command stream** — not the GPU/display layer — so *from them alone* what is directly observed is that the parser keeps consuming input across a pause (the draws land between the pause and resume commands, in byte order). The **display-side** behavior is captured **separately and directly** by sampling the real window framebuffer with `XGetImage` (a pixel-hash timeline) under the canonical X11 build — see **§1.4a**. Those pixel captures directly confirm that the shown frame stays *frozen* while the live grid mutates, and that resume applies the accumulation as a *single* frame; the underlying code path is `screen.c:2506-2543`, `screen.c:2737-2760`, and `screen.c:2511`. (Only the macOS-specific `on_pause` timeout variant remains source-derived — it cannot run on this Linux build.)
 
 ### 1.2 The entry point is zero-copy — the code that proves it
 
@@ -294,11 +312,12 @@ The interesting behavior is *transitional*, so the value is reported **before**,
 **Experiment Q1b — a large surge wrapped in DEC 2026.** The child (written to `$tmpdir/child_dec.sh`) sets mode 2026, writes 50 lines, then resets it:
 
 ```bash
-$ cat "$tmpdir/child_dec.sh"
+$ cat > "$tmpdir/child_dec.sh" <<'EOF'
 printf '\033[?2026h'                                # BSU — begin synchronized update
 for i in $(seq 1 50); do printf 'SURGE line %02d\n' "$i"; done
 printf '\033[?2026l'                                # ESU — end synchronized update
 printf 'AFTER-ESU visible line\n'
+EOF
 $ timeout 40 xvfb-run -a -s "-screen 0 1280x800x24" "$KITTY" --config NONE \
     -o close_on_child_death=yes --dump-commands sh "$tmpdir/child_dec.sh" 2>/dev/null
 ```
@@ -339,19 +358,248 @@ $ run | grep -nE 'screen_set_mode 2026|screen_reset_mode 2026|AFTER-ESU'
 ```
 
 - **BEFORE (observed):** the stream begins with `screen_set_mode 2026 1` at line 1 — before it, rendering is live (the code initializes `expires_at == 0`).
-- **DURING (observed at the command layer; display-side code-derived):** `screen_set_mode 2026 1` (DECSET `CSI?2026h`) calls `screen_pause_rendering(self, true, 0)` [kitty/screen.c:1175]. **All 50 `draw SURGE line NN` commands appear between line 1 and line 152, in byte order** — the *directly observed* fact is that the parser keeps consuming and mutating the live grid throughout the pause. That the *displayed* frame is meanwhile the frozen snapshot is **code-derived** (`expires_at` set at [kitty/screen.c:2522]; snapshot linebuf populated at [kitty/screen.c:2528-2543]; paused rendering reads it at [kitty/screen.c:2737-2760]), not visible in this stream.
-- **AFTER (observed at the command layer; single-frame atomicity code-derived):** `screen_reset_mode 2026 1` at line 152 (DECRST `CSI?2026l`) calls `screen_pause_rendering(self, false, 0)`, which sets `is_dirty = true` [kitty/screen.c:2511]; `draw AFTER-ESU visible line` then follows at line 153. That the accumulated 50-line grid is applied as *one* frame with no half-drawn intermediate is **code-derived** from the `is_dirty` upload path, not captured as pixels.
+- **DURING (observed — command layer *and* pixel capture, §1.4a):** `screen_set_mode 2026 1` (DECSET `CSI?2026h`) calls `screen_pause_rendering(self, true, 0)` [kitty/screen.c:1175]. **All 50 `draw SURGE line NN` commands appear between line 1 and line 152, in byte order** — the parser keeps consuming and mutating the live grid throughout the pause. That the *displayed* frame is meanwhile the frozen snapshot is **directly confirmed by the pixel-hash capture in §1.4a** (0 display transitions across the entire pause while ≥ 30 lines are drawn) and traced in code to the snapshot path (`expires_at` set at [kitty/screen.c:2522]; snapshot linebuf populated at [kitty/screen.c:2528-2543]; paused rendering reads it at [kitty/screen.c:2737-2760]).
+- **AFTER (observed — command layer *and* pixel capture, §1.4a):** `screen_reset_mode 2026 1` at line 152 (DECRST `CSI?2026l`) calls `screen_pause_rendering(self, false, 0)`, which sets `is_dirty = true` [kitty/screen.c:2511]; `draw AFTER-ESU visible line` then follows at line 153. That the accumulated grid is applied as *one* frame with no half-drawn intermediate is **directly confirmed by the pixel capture in §1.4a** (exactly one display transition on resume) and traced in code to the `is_dirty` upload path.
 
-**Cause → effect:** DECSET 2026 *causes* `screen_pause_rendering(true)` to set `expires_at` and take the snapshot [kitty/screen.c:2522-2543], which *causes* the render path to keep presenting the snapshot [kitty/screen.c:2737] while the parser keeps mutating the real grid (observed: the 50 interleaved draws); DECRST 2026 *causes* `is_dirty=true` [kitty/screen.c:2511], which *causes* the next `render()` to upload the whole accumulated grid at once (code-derived).
+**Cause → effect:** DECSET 2026 *causes* `screen_pause_rendering(true)` to set `expires_at` and take the snapshot [kitty/screen.c:2522-2543], which *causes* the render path to keep presenting the snapshot [kitty/screen.c:2737] while the parser keeps mutating the real grid (observed: the 50 interleaved draws); DECRST 2026 *causes* `is_dirty=true` [kitty/screen.c:2511], which *causes* the next `render()` to upload the whole accumulated grid at once (observed directly as a *single* on-resume display transition, §1.4a).
+
+### 1.4a Display-side proof — sampling the real framebuffer with `XGetImage`
+
+The `--dump-commands` stream above proves *parse-side* ordering. To observe the **display** side directly — does the shown frame actually freeze during the pause, and does resume apply as one frame? — the real kitty window is run under the canonical X11 build on `Xvfb` (software GL, `swrast`) and its framebuffer is sampled with `XGetImage`, reducing each capture to an MD5 pixel-hash. With `cursor_blink_interval=0` the static display is bit-stable (eight identical hashes), so any hash change is a genuine repaint. The capture harness is created up front in a private scratch directory so every block below runs verbatim; two reusable primitives — `capshot.py` (one `XGetImage` → md5) and `caploop.py` (a ~2 ms sampling loop writing `timestamp md5` rows) — are shared here and in §5.2a and attach to the `Xvfb :99` display of the canonical X11 build via `python-xlib`:
+
+```bash
+$ cd "$(mktemp -d "${TMPDIR:-/tmp}/kitty_f52.XXXXXX")"   # scratch dir; removed at cleanup (Appendix C)
+$ K="$repo/kitty/launcher/kitty"                         # absolute launcher ($repo from the §0.4 preamble; we cd'd out of it)
+$ cat > capshot.py <<'PY'
+import sys, hashlib
+from Xlib import display, X
+d = display.Display(':99')
+root = d.screen().root
+def find_kitty(win, depth=0):
+    res=[]
+    try:
+        for c in win.query_tree().children:
+            try:
+                g=c.get_geometry()
+                if g.width>=200 and g.height>=100:
+                    res.append((c,g))
+            except Exception: pass
+            res += find_kitty(c, depth+1)
+    except Exception: pass
+    return res
+wins = find_kitty(root)
+if not wins:
+    print("NO_WINDOW"); sys.exit(0)
+# pick the largest
+c,g = max(wins, key=lambda t: t[1].width*t[1].height)
+raw = c.get_image(0,0,g.width,g.height, X.ZPixmap, 0xffffffff)
+data = raw.data if isinstance(raw.data,(bytes,bytearray)) else bytes(raw.data)
+h = hashlib.md5(data).hexdigest()
+uniq = len(set(data[i] for i in range(0,len(data),997)))
+print("WIN %dx%d bytes=%d md5=%s sampled_unique_byte_values=%d" % (g.width,g.height,len(data),h,uniq))
+PY
+$ cat > caploop.py <<'PY'
+import sys, time, hashlib
+from Xlib import display, X
+dur=float(sys.argv[1]); out=sys.argv[2]
+d=display.Display(':99'); root=d.screen().root
+def find():
+    best=None
+    def rec(w):
+        nonlocal best
+        try:
+            for c in w.query_tree().children:
+                try:
+                    g=c.get_geometry()
+                    if g.width>=200 and g.height>=100:
+                        if best is None or g.width*g.height>best[1].width*best[1].height: best=(c,g)
+                except Exception: pass
+                rec(c)
+        except Exception: pass
+    rec(root); return best
+c,g=find()                          # one-shot: the window must already be mapped when this runs
+f=open(out,'w'); t0=time.time()
+while time.time()-t0<dur:
+    try:
+        raw=c.get_image(0,0,g.width,g.height,X.ZPixmap,0xffffffff)
+        data=raw.data if isinstance(raw.data,(bytes,bytearray)) else bytes(raw.data)
+        f.write("%.6f %s\n" % (time.time(), hashlib.md5(data).hexdigest()))
+    except Exception as e:
+        f.write("%.6f ERR\n" % time.time())   # window gone (kitty exited)
+    time.sleep(0.002)
+f.close()
+PY
+```
+
+**Static-stability control** — eight captures of an unchanging screen (blink disabled). The md5 *value* is environment-specific (window geometry and fonts); the invariant that matters is that all eight are **identical**, so any later change is a genuine repaint:
+
+```bash
+$ env DISPLAY=:99 "$K" --config NONE \
+      -o close_on_child_death=no -o cursor_blink_interval=0 \
+      sh -c 'printf "BASELINE-LINE\r\n"; sleep 6' >/dev/null 2>&1 &
+$ kpid=$!; sleep 4                                    # let the window map + settle before sampling
+$ for i in $(seq 1 8); do python3 capshot.py | grep -o 'md5=[0-9a-f]*'; sleep 0.2; done | sort | uniq -c
+      8 md5=f9e9457ecbaf694a45434f2c5f094b51
+$ kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+```
+
+The pause/resume child emits a BASELINE line, sends BSU (`\x1b[?2026h`), draws 30 `SURGE` lines *while paused*, holds ~1.2 s, then sends ESU (`\x1b[?2026l`); a capture loop samples the window md5 every ~2 ms and correlates transitions to the child's phase timestamps:
+
+```bash
+$ cat > pause_child.py <<'PY'
+import os, sys, time
+res = sys.argv[1]
+def log(t): open(res,'a').write("%s %.6f\n" % (t, time.time()))
+time.sleep(4.0)
+log("BASELINE"); os.write(1, b"BASELINE-LINE\r\n")
+time.sleep(0.8)
+log("PAUSE");    os.write(1, b"\x1b[?2026h")            # BSU (DEC 2026 begin)
+time.sleep(0.05)
+for i in range(30): os.write(1, b"SURGE-%02d\r\n" % i)  # drawn WHILE paused
+log("DREW_DURING_PAUSE")
+time.sleep(1.2)
+log("RESUME");   os.write(1, b"\x1b[?2026l")            # ESU (DEC 2026 end)
+time.sleep(1.5); log("DONE")
+PY
+$ cat > analyze_pause.py <<'PY'
+import sys
+caps, phases = sys.argv[1], sys.argv[2]
+ph = {p[0]: float(p[1]) for p in (ln.split() for ln in open(phases)) if len(p) == 2}
+rows = [(float(p[0]), p[1]) for p in (ln.split() for ln in open(caps)) if len(p) == 2 and p[1] != 'ERR']
+win = [h for t, h in rows if ph['PAUSE'] <= t <= ph['RESUME']]      # during-pause samples
+trans = sum(1 for i in range(1, len(win)) if win[i] != win[i-1])
+after = [(t, h) for t, h in rows if t >= ph['RESUME']]              # on-resume samples
+rtrans = sum(1 for i in range(1, len(after)) if after[i][1] != after[i-1][1])
+first = next(((after[i][0] - ph['RESUME']) * 1000.0
+              for i in range(1, len(after)) if after[i][1] != after[i-1][1]), -1)
+print("during-pause: distinct_hashes=%d over %d samples, transitions=%d  |  on-resume: transitions=%d, first-change=%.1f ms"
+      % (len(set(win)), len(win), trans, rtrans, first))
+PY
+$ # per run: launch kitty(pause_child) under Xvfb :99; attach caploop after the window maps; correlate
+$ env DISPLAY=:99 "$K" --config NONE \
+      -o close_on_child_death=no -o cursor_blink_interval=0 \
+      sh -c 'python3 pause_child.py phases.txt' &
+$ kpid=$!; sleep 1.5; python3 caploop.py 9.0 caps.txt    # attach after map; sample ~2 ms for 9 s
+$ kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+$ python3 analyze_pause.py caps.txt phases.txt           # derive summary from caps.txt + phases.txt
+during-pause: distinct_hashes=1 over 193 samples, transitions=0  |  on-resume: transitions=1, first-change=9.5 ms
+```
+
+The summary line is the analyzer's **derived** correlation of `caps.txt` (timestamp + md5) against `phases.txt` — not raw `caploop` output; **run 2** gave `first-change=14.6 ms`. Re-running the whole harness in a fresh scratch dir reproduces the same invariants: **1** distinct hash and **0** transitions during the pause, and **exactly one** transition on resume.
+
+**The display is frozen during the pause and applies atomically on resume — directly observed.** Across the entire ~1.2 s pause the window has exactly **one** distinct pixel-hash and **zero** transitions, even though 30 `SURGE` lines were parsed into the live grid in that window; on resume there is **exactly one** transition (9.5 ms / 14.6 ms after the ESU byte, ×2 — and 10.8/11.9 ms on the independent Phase-1 pair, i.e. 4 runs total). Saved framebuffers make it visible: the *before* and *during* PNGs are **byte-identical** (the surge is invisible while paused); only the *after* PNG shows the surge lines:
+
+```bash
+$ # Saved framebuffers: reuses the pause_child.py script created in the block above (here it
+$ # writes a fresh pngphases.txt); png_capture.py samples 3 PNGs via python-xlib + Pillow.
+$ cat > png_capture.py <<'PY'
+import sys, time, os
+from Xlib import display, X
+try:
+    from PIL import Image
+except Exception as e:
+    print("NO_PIL", e); sys.exit(2)
+res=sys.argv[1]; outdir=sys.argv[2]
+d=display.Display(':99'); root=d.screen().root
+def find():
+    best=None
+    def rec(w):
+        nonlocal best
+        try:
+            for c in w.query_tree().children:
+                try:
+                    g=c.get_geometry()
+                    if g.width>=200 and g.height>=100:
+                        if best is None or g.width*g.height>best[1].width*best[1].height: best=(c,g)
+                except Exception: pass
+                rec(c)
+        except Exception: pass
+    rec(root); return best
+# wait for window
+c=None
+for _ in range(200):
+    b=find()
+    if b: c,g=b; break
+    time.sleep(0.05)
+if not c: print("NO_WINDOW"); sys.exit(1)
+def save(name):
+    raw=c.get_image(0,0,g.width,g.height,X.ZPixmap,0xffffffff)
+    data=raw.data if isinstance(raw.data,(bytes,bytearray)) else bytes(raw.data)
+    img=Image.frombytes('RGB',(g.width,g.height),data,'raw','BGRX')
+    p=os.path.join(outdir,name); img.save(p)
+    print("SAVED %s %dx%d" % (p,g.width,g.height))
+def phases():
+    try: return {ln.split()[0] for ln in open(res)}
+    except Exception: return set()
+def wait_phase(name, timeout=12):
+    t0=time.time()
+    while time.time()-t0<timeout:
+        if name in phases(): return True
+        time.sleep(0.02)
+    return False
+wait_phase("BASELINE"); time.sleep(0.30); save("f5-2_pause_before_baseline.png")
+wait_phase("DREW_DURING_PAUSE"); time.sleep(0.60); save("f5-2_pause_during_frozen.png")  # surge drawn but paused
+wait_phase("RESUME"); time.sleep(0.60); save("f5-2_pause_after_resume.png")             # atomic apply
+PY
+$ rm -f pngphases.txt
+$ env DISPLAY=:99 "$K" --config NONE \
+      -o close_on_child_death=no -o cursor_blink_interval=0 \
+      sh -c 'python3 pause_child.py pngphases.txt' &
+$ kpid=$!; DISPLAY=:99 python3 png_capture.py pngphases.txt .   # capture at BASELINE / DREW_DURING_PAUSE / RESUME
+$ kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+$ md5sum f5-2_pause_before_baseline.png f5-2_pause_during_frozen.png f5-2_pause_after_resume.png
+70b1d3a33c8213903045b6e63f3ab213  f5-2_pause_before_baseline.png
+70b1d3a33c8213903045b6e63f3ab213  f5-2_pause_during_frozen.png     # byte-identical to BEFORE (frozen)
+1041790dbe07d0385d39c9e41405ddd0  f5-2_pause_after_resume.png      # SURGE-01..29 now shown (atomic apply)
+```
+
+(The exact md5 values are geometry/font/GL-dependent — the observed window is 900×540 px; only the **invariant** transfers across environments: *before* == *during* (frozen) while *after* differs (atomic), confirmed across ×2 reruns.)
+
+Removing the ESU entirely confirms the **2000 ms safety timeout** at the display layer: with no resume sent, the frozen frame force-resumes on its own ~1962 ms after the paused draw (≈ the 2000 ms armed at [kitty/screen.c:2521-2522], force-released by `screen_check_pause_rendering()` when `now > expires_at` [kitty/screen.c:2489-2490]), ×2:
+
+```bash
+$ cat > timeout_child.py <<'PY'
+import os, sys, time
+res=sys.argv[1]
+def log(t): open(res,'a').write("%s %.6f\n"%(t,time.time()))
+time.sleep(4.0)
+log("PAUSE"); os.write(1,b"\x1b[?2026h")
+time.sleep(0.05)
+for i in range(30): os.write(1,b"TO-%02d\r\n"%i)
+log("DREW")
+time.sleep(4.0)   # never send ESU; wait past the 2000ms safety timeout
+log("DONE")
+PY
+$ cat > analyze_timeout.py <<'PY'
+import sys
+caps, phases = sys.argv[1], sys.argv[2]
+ph = {p[0]: float(p[1]) for p in (ln.split() for ln in open(phases)) if len(p) == 2}
+rows = [(float(p[0]), p[1]) for p in (ln.split() for ln in open(caps)) if len(p) == 2 and p[1] != 'ERR']
+after = [(t, h) for t, h in rows if t >= ph['DREW']]
+first = next(((after[i][0] - ph['DREW']) * 1000.0
+              for i in range(1, len(after)) if after[i][1] != after[i-1][1]), -1)
+print("no ESU sent: first display change %.1f ms after content drawn-while-paused (~2000ms safety timeout)" % first)
+PY
+$ env DISPLAY=:99 "$K" --config NONE \
+      -o close_on_child_death=no -o cursor_blink_interval=0 \
+      sh -c 'python3 timeout_child.py phases.txt' &
+$ kpid=$!; sleep 1.5; python3 caploop.py 9.0 caps.txt
+$ kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+$ python3 analyze_timeout.py caps.txt phases.txt         # run 1 (run 2 gave 1962.6 ms)
+no ESU sent: first display change 1962.0 ms after content drawn-while-paused (~2000ms safety timeout)
+```
+
+**Cause → effect (now display-confirmed).** BSU *causes* `screen_pause_rendering(true)` to arm `expires_at` and snapshot the grid [kitty/screen.c:2521-2543]; the render path then presents that snapshot [kitty/screen.c:2737-2760] — *observed* as 0 display transitions while the grid mutates. ESU *causes* `is_dirty=true` [kitty/screen.c:2511] — *observed* as exactly one on-resume transition. Absent an ESU, `screen_check_pause_rendering()` force-resumes at the 2000 ms boundary [kitty/screen.c:2489-2490] — *observed* at ~1962 ms. (This method samples the *presented frame*; it does not expose per-frame GL driver internals, which are not needed to answer the pause/resume question. The pixel-hash timelines and the PNG captures are investigation artifacts, removed at cleanup like every other temporary capture; see Appendix C.)
 
 **Experiment Q1c — the legacy DCS path converges on the same function.** Same shape, using `DCS =1s ST` / `DCS =2s ST`:
 
 ```bash
-$ cat "$tmpdir/child_dcs.sh"
+$ cat > "$tmpdir/child_dcs.sh" <<'EOF'
 printf '\033P=1s\033\\'                    # legacy pause
 printf 'DCS line 1\n'; printf 'DCS line 2\n'
 printf '\033P=2s\033\\'                    # legacy resume
 printf 'after-dcs\n'
+EOF
 $ timeout 40 xvfb-run -a -s "-screen 0 1280x800x24" "$KITTY" --config NONE \
     -o close_on_child_death=yes --dump-commands sh "$tmpdir/child_dcs.sh" 2>/dev/null
 ```
@@ -475,7 +723,12 @@ $ timeout 30 xvfb-run -a -s "-screen 0 1280x800x24" "$KITTY" --config NONE \
 **Bracketed paste through the real PTY (observed).** The paste convention wraps pasted text in `ESC[200~ … ESC[201~` so applications can tell pasted input from typed input. Kitty's constants are `BRACKETED_PASTE (2004 << 5)` [kitty/modes.h:81 — corrected from the plan's `:80`], with `BRACKETED_PASTE_START "200~"` [kitty/modes.h:82] and `BRACKETED_PASTE_END "201~"` [kitty/modes.h:83]. To prove the wrapper actually reaches the child, the child puts its PTY slave in raw mode and saves whatever bytes arrive on stdin; the paste is delivered with the supported flag `send-text --bracketed-paste=enable` (an explicitly *non-keyboard* paste path):
 
 ```bash
-$ cat "$tmpdir/paste_child.py"
+source /tmp/kitty-venv/bin/activate
+export TMPDIR=/tmp/kitty-clean-tmp LANG=C.UTF-8 LC_ALL=C.UTF-8
+KITTY=./kitty/launcher/kitty
+
+d="$(mktemp -d)"; chmod 0700 "$d"; sock="$d/rc.sock"
+cat > "$d/paste_child.py" <<'PYEOF'
 import os, sys, tty, select
 out = sys.argv[1]
 try: tty.setraw(0)
@@ -488,9 +741,18 @@ while b'\x1b[201~' not in data and len(data) < 8192:
     if not chunk: break
     data += chunk
 open(out, 'wb').write(data)
-# launch (background, socket-only, PID-scoped teardown — see §0.4), child = python3 paste_child.py "$tmpdir/recv.bin"
-$ "$KITTY" @ --to "unix:$sock" send-text --bracketed-paste=enable 'PASTED-TEXT'
-$ od -A d -t x1z "$tmpdir/recv.bin"
+PYEOF
+timeout 30 xvfb-run -a -s "-screen 0 1280x800x24" \
+  "$KITTY" --config NONE -o allow_remote_control=socket-only --listen-on "unix:$sock" \
+  -o close_on_child_death=yes python3 "$d/paste_child.py" "$d/recv.bin" >/dev/null 2>&1 &
+launch_pid=$!
+trap 'kill "$launch_pid" 2>/dev/null; wait "$launch_pid" 2>/dev/null; rm -rf "$d"' EXIT  # abort-safe teardown
+for i in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
+sleep 2
+"$KITTY" @ --to "unix:$sock" send-text --bracketed-paste=enable 'PASTED-TEXT'
+wait "$launch_pid" 2>/dev/null                          # child writes recv.bin on ESC[201~, then kitty exits cleanly
+od -A d -t x1z "$d/recv.bin"
+rm -rf "$d"
 ```
 
 Unedited output — the exact bytes the child received on its stdin:
@@ -562,7 +824,7 @@ The pipeline threads are created in the monitor: `pthread_create(..., io_loop, .
 
 ### 2.3 The fixed per-tick order — the literal "who goes first"
 
-The **top-level** order lives in `process_global_state()`, reproduced verbatim (no elision) from [kitty/child-monitor.c:1224-1237]:
+The **top-level** order lives in `process_global_state()` [kitty/child-monitor.c:1224-1256]. Below is an **annotated excerpt of its dispatch core (lines 1224–1237)**: the inline `// :NNNN` and `←` markers are **added by this document** to map each statement to its source line and are *not* present in the source (the code text is otherwise byte-exact). The function continues past the excerpt at `:1238–1256` — `#ifdef __APPLE__` Cocoa handling, `report_reaped_pids()`, pending-close/quit handling, and the state-check-timer update — teardown/bookkeeping that lies outside the resize → parse → render ordering shown here:
 
 ```c
 process_global_state(void *data) {
@@ -670,7 +932,7 @@ They stay aligned because **all parsing and all screen mutation happen on one th
 
 Shell integration is injected by `modify_shell_environ()` [kitty/shell_integration.py:218]; for bash it sets `ENV` to `kitty.bash` and rewrites the child argv to `bash --posix` [kitty/shell_integration.py:134, :146] (confirmed at runtime below), so the script is sourced without touching the user's rcfile. The per-shell scripts (`shell-integration/bash/kitty.bash`, `zsh/kitty-integration`, `fish/vendor_conf.d/kitty-shell-integration.fish`) then emit the markers.
 
-**Which markers exist versus which kitty actually handles and emits — a critical distinction.** The public FTCS / OSC 133 convention defines `A` = prompt start, `B` = prompt end / command-input start, `C` = command-output start, `D;<exit>` = command finished. **Kitty implements only `A`, `C`, and `D` — there is no `case 'B'`** (verbatim switch below), and the bundled bash integration **emits only `A`/`C`/`D`** (plus kitty's own `k;…` region markers), never `B`:
+**Which markers exist versus which kitty actually handles and emits — a critical distinction.** The public FTCS / OSC 133 convention defines `A` = prompt start, `B` = prompt end / command-input start, `C` = command-output start, `D;<exit>` = command finished. **Kitty implements only `A`, `C`, and `D` — there is no `case 'B'`** (see the annotated `switch` excerpt below), and the bundled bash integration **emits only `A`/`C`/`D`** (plus kitty's own `k;…` region markers), never `B`:
 
 ```bash
 # which 133;<letter> markers the bundled bash integration actually emits:
@@ -685,7 +947,7 @@ grep -oE "133;[A-Za-z]" shell-integration/bash/kitty.bash | sort | uniq -c
 
 So `B` is a **public convention that kitty neither emits nor handles** in the exercised paths; a claim that a `B` marker was "observed" would be false. (`k=s`, carried on an `A` marker as `A;k=s`, selects the secondary/continuation prompt — §3.5; the `133;k` markers are a kitty-specific prompt-redraw-region extension, not the FTCS `A/B/C/D`.)
 
-On the parser side, `OSC 133` is dispatched in `dispatch_osc` [kitty/vt-parser.c:457], `case 133` [kitty/vt-parser.c:536], which calls `shell_prompt_marking(self->screen, (char*)buf + i)` [kitty/vt-parser.c:544]. The handler, reproduced **verbatim** (no elision) [kitty/screen.c:2328-2356], shows exactly three cases and where each writes per-line state:
+On the parser side, `OSC 133` is dispatched in `dispatch_osc` [kitty/vt-parser.c:457], `case 133` [kitty/vt-parser.c:536], which calls `shell_prompt_marking(self->screen, (char*)buf + i)` [kitty/vt-parser.c:544]. The handler is shown below as an **annotated excerpt of its complete body** [kitty/screen.c:2328-2356] — the inline `// :NNNN` markers are **added by this document** and are *not* present in the source (the code text is otherwise byte-exact and no `case` is omitted). It shows exactly three cases and where each writes per-line state:
 
 ```c
 shell_prompt_marking(Screen *self, char *buf) {
@@ -728,7 +990,7 @@ Two facts follow directly from this source:
 
 ### 3.3 Observed: markers interleaved in byte order with ordinary text
 
-A **real interactive bash** with shell integration active (kitty's default) is driven through the PTY and captured under `--dump-commands`. Two method notes make the capture faithful: (a) `--dump-commands` output is block-buffered to a file, so the child is exited cleanly with **Ctrl-D** (`\x04`) — `close_on_child_death=yes` then makes kitty flush and exit, leaving the full stream intact; (b) `send-text` here is **remote-control text injection through the child's PTY input** — it is *not* keyboard-encoded input (the keyboard-encoding stage is treated under Q1). Full, runnable harness:
+A **real interactive bash** with shell integration active (kitty's default) is driven through the PTY and captured under `--dump-commands`. Two method notes make the capture faithful: (a) `--dump-commands` output is block-buffered to a file, so the child is exited cleanly with **Ctrl-D** (`\x04`) — `close_on_child_death=yes` then makes kitty exit. This capture is faithful because the shell's output is emitted *before* the Ctrl-D and so is read in earlier I/O ticks; this is **not**, however, an unconditional guarantee — an *immediately-written tail* that races the child's exit can be discarded under `close_on_child_death=yes` (measured and scoped in §4.1a); (b) `send-text` here is **remote-control text injection through the child's PTY input** — it is *not* keyboard-encoded input (the keyboard-encoding stage is treated under Q1). Full, runnable harness:
 
 ```bash
 source /tmp/kitty-venv/bin/activate
@@ -796,13 +1058,26 @@ The markers land exactly where bash emitted them relative to the text, strictly 
 The strongest proof that `C` attaches to the *correct line* is to ask kitty which lines it considers "last command output" — a query answered entirely from the per-line `prompt_kind` tags via `find_cmd_output` [kitty/screen.c:3527]. Run a command whose output is three known lines, then — **while the session is still live** (the `get-text` calls must precede the Ctrl-D exit) — query both extents:
 
 ```bash
-# ... same launch as §3.3, then:
+source /tmp/kitty-venv/bin/activate
+export TMPDIR=/tmp/kitty-clean-tmp LANG=C.UTF-8 LC_ALL=C.UTF-8
+KITTY=./kitty/launcher/kitty
+
+d="$(mktemp -d)"; chmod 0700 "$d"; sock="$d/rc.sock"
+timeout 30 xvfb-run -a -s "-screen 0 1280x800x24" \
+  "$KITTY" --config NONE -o allow_remote_control=socket-only --listen-on "unix:$sock" \
+  --dump-commands -o close_on_child_death=yes bash -i >"$d/dump.log" 2>"$d/err.log" &
+launch_pid=$!
+trap 'kill "$launch_pid" 2>/dev/null; wait "$launch_pid" 2>/dev/null; rm -rf "$d"' EXIT  # abort-safe teardown
+for i in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
+sleep 2
+send() { "$KITTY" @ --to "unix:$sock" send-text "$1"; sleep 0.7; }
 send 'unset HISTCONTROL\r'
 send "PS1='PROMPT\$ '\r"
 send 'printf "OUT-LINE-1\\nOUT-LINE-2\\nOUT-LINE-3\\n"\r'
-"$KITTY" @ --to "unix:$sock" get-text --extent=last_cmd_output
+"$KITTY" @ --to "unix:$sock" get-text --extent=last_cmd_output   # queries run while the session is live
 "$KITTY" @ --to "unix:$sock" get-text --extent=screen
-send '\x04'; wait "$launch_pid"
+send '\x04'; wait "$launch_pid"                                  # Ctrl-D -> kitty exits cleanly
+rm -rf "$d"
 ```
 
 `get-text --extent=last_cmd_output` — unedited output (exactly the three output lines, nothing else):
@@ -829,15 +1104,29 @@ PROMPT$
 
 ### 3.5 Observed: the secondary (continuation) prompt
 
-Opening an unterminated quote forces bash to emit its PS2 continuation prompt, which shell integration marks with `A;k=s`. Driving `echo 'one` ⏎ `two'` ⏎ (same harness as §3.3):
+Opening an unterminated quote forces bash to emit its PS2 continuation prompt, which shell integration marks with `A;k=s`. Driving `echo 'one` ⏎ `two'` ⏎ using the same self-contained harness as §3.3 (repeated in full below so the block runs standalone):
 
 ```bash
+source /tmp/kitty-venv/bin/activate
+export TMPDIR=/tmp/kitty-clean-tmp LANG=C.UTF-8 LC_ALL=C.UTF-8
+KITTY=./kitty/launcher/kitty
+
+d="$(mktemp -d)"; chmod 0700 "$d"; sock="$d/rc.sock"
+timeout 30 xvfb-run -a -s "-screen 0 1280x800x24" \
+  "$KITTY" --config NONE -o allow_remote_control=socket-only --listen-on "unix:$sock" \
+  --dump-commands -o close_on_child_death=yes bash -i >"$d/dump.log" 2>"$d/err.log" &
+launch_pid=$!
+trap 'kill "$launch_pid" 2>/dev/null; wait "$launch_pid" 2>/dev/null; rm -rf "$d"' EXIT  # abort-safe teardown
+for i in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
+sleep 2
+send() { "$KITTY" @ --to "unix:$sock" send-text "$1"; sleep 0.7; }
 send 'unset HISTCONTROL\r'
 send "PS1='PROMPT\$ '\r"
 send "echo 'one\r"     # opens a single-quoted string -> bash shows PS2 continuation
 send "two'\r"          # closes the quote -> command runs
 send '\x04'; wait "$launch_pid"
 sed -n '59,96p' "$d/dump.log"   # the secondary-prompt cycle
+rm -rf "$d"
 ```
 
 Unedited dump slice for the continuation cycle:
@@ -895,7 +1184,7 @@ Parsing and mutation are single-writer and byte-ordered: `run_worker` [kitty/vt-
 
 ### 4.1 Direct answer
 
-Yes, behavior changes — but the change is a **readiness mask, not a drop**. When the shared 1 MiB buffer cannot accept more input, `vt_parser_has_space_for_input()` [kitty/vt-parser.c:1477] returns `false`, and the I/O loop stops asking the kernel for readable events on that child. Nothing is discarded; instead the PTY fills and the **child's own `write()` blocks** — OS-level flow control. When the main thread drains the buffer, space reopens and reads resume.
+Yes, behavior changes — but the change is a **readiness mask, not a drop**. When the shared 1 MiB buffer cannot accept more input, `vt_parser_has_space_for_input()` [kitty/vt-parser.c:1477] returns `false`, and the I/O loop stops asking the kernel for readable events on that child. Nothing is discarded; instead the PTY fills and the **child's own `write()` blocks** — OS-level flow control. When the main thread drains the buffer, space reopens and reads resume. (This lossless flow-control path is a *steady-state* property and is distinct from process **teardown**: a child that writes a final burst and exits in the *same* I/O tick under `close_on_child_death=yes` can have that unread tail discarded when its PTY fd is retired — a separate, measured effect scoped in §4.1a.)
 
 **Cause → effect chain:**
 1. Buffer saturates → `vt_parser_has_space_for_input()` returns `false` (`ans = self->read.sz + self->write.pending < BUF_SZ` [kitty/vt-parser.c:1481]).
@@ -904,6 +1193,29 @@ Yes, behavior changes — but the change is a **readiness mask, not a drop**. Wh
 4. The main thread parses and drains via `run_worker` (gate: `if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16*1024 > BUF_SZ)` [kitty/vt-parser.c:1425] — note it parses *immediately* when nearly full) → space reopens → POLLIN restored → the child's `write()` unblocks.
 
 The POLLOUT side (when *kitty* has data to send the child) is handled by `write_to_child` [kitty/child-monitor.c:1443] with `events |= write_buf_used ? POLLOUT : 0` [kitty/child-monitor.c:1503].
+
+### 4.1a A real loss path where backpressure meets teardown
+
+The flow-control path above is lossless *in steady state*, but there is a **distinct** path where a tail genuinely **is** discarded — it appears precisely where this backpressure meets an immediate process **teardown**. When a child writes a burst large enough to **saturate** the 1 MiB buffer and then exits in the *same* instant, `close_on_child_death=yes` can retire the child's PTY fd before the parser drains the buffer and re-reads the stranded tail. Reproduced through the real PTY (child writes `N` bytes of `A`, then a `\nAFTER-MARK\n` tail, then exits — optionally after a `delay`), stable across two runs per case:
+
+```
+$ # child: os.write(1, b'A'*N); os.write(1, b'\nAFTER-MARK\n'); then exit (optionally after `delay`)
+N=100      close=yes delay=0    : dump_bytes=114      expected=112      tail_present=yes
+N=65536    close=yes delay=0    : dump_bytes=65550    expected=65548    tail_present=yes
+N=1048576  close=yes delay=0    : dump_bytes=1048576  expected=1048588  tail_present=NO
+N=1048576  close=yes delay=0.30 : dump_bytes=1048590  expected=1048588  tail_present=yes
+N=1048576  close=no  delay=0    : dump_bytes=1048590  expected=1048588  tail_present=yes
+```
+
+The loss is **size-dependent**: at 100 B and 64 KiB the whole burst fits in one read into the buffer before the exit, so the tail is parsed; only the 1 MiB burst — which fills the buffer and triggers the POLLIN mask of §4.1 — leaves the tail stranded in the PTY, where the immediate `close_on_child_death=yes` teardown discards it. (`expected` is the raw bytes the child wrote; when the tail survives, the dump is `+2` because the PTY translates each of the tail's two `\n` to `\r\n` (`ONLCR`), so `1048590 = 1048588 + 2`. The lost 1 MiB case is *exactly* `1048576` — the newline-free body with the entire 12-byte tail missing.) Because `--dump-bytes` is emitted at **parse time** (`do_parse` invokes `dump_callback` [kitty/child-monitor.c:439-440] on bytes the parser actually consumed), a short dump means the tail was genuinely never read-and-parsed — not that a diagnostic file was merely flushed late. The **screen grid confirms it**: with `close_on_child_death=no`, the same immediately-written tail reaches the real screen, queried live via `kitty @ get-text` (×2):
+
+```
+$ kitty @ --to "$sock" get-text --extent=screen   # close=no; child writes tail then exits at once; window held
+[r1 close=no immediate-exit] grid has HEAD-MARK=1 AFTER-MARK=1
+[r2 close=no immediate-exit] grid has HEAD-MARK=1 AFTER-MARK=1
+```
+
+**Cause → effect.** On child death the main loop calls `reap_children(self, OPT(close_on_child_death))` [kitty/child-monitor.c:1526]; inside `reap_children` [kitty/child-monitor.c:1413], when the option is set it marks the child (`if (enable_close_on_child_death) mark_child_for_removal(...)` [kitty/child-monitor.c:1422, :1386]); `remove_children` [kitty/child-monitor.c:1313] (called from the I/O loop at :1493) then retires the fd. If that retirement lands before the last `read_bytes()` [kitty/child-monitor.c:1337] of the stranded tail, the tail is dropped. A ≥ 0.30 s gap between the final write and the exit, **or** `close_on_child_death=no` (drain to EOF), lets the drain-and-read complete and preserves the tail — both observed above. This is why the `--dump-commands` captures elsewhere in this document exit the child with **Ctrl-D after** the meaningful output (so that output is read in prior ticks), and it scopes the "readiness mask, not a drop" statement of §4.1 to the steady-state flow-control case.
 
 ### 4.2 The gate, in code
 
@@ -927,8 +1239,9 @@ children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT : 0);   
 
 The producer writes fixed 4096-byte chunks to `stdout` (fd 1 — the timed path) and writes its one-line summary to a **separate result file**, so the stats survive even when fd 1 is the PTY (whose output kitty consumes and renders rather than returning to the shell):
 
-```python
-# $work/producer.py   ($work = mktemp -d, mode 0700; child program, removed afterward)
+```bash
+$ work=$(mktemp -d "${TMPDIR:-/tmp}/kitty_q4.XXXXXX"); chmod 0700 "$work"   # $work holds the child programs; removed afterward
+$ cat > "$work/producer.py" <<'PYEOF'
 import os, sys, time
 total = int(sys.argv[1]) * 1024 * 1024       # MiB to write to fd 1
 resfile = sys.argv[2]                         # summary written here, not to the PTY
@@ -944,13 +1257,13 @@ line = ("MB=%d dt=%.4f max_write_us=%.1f slow=%d MBps=%.1f\n"
         % (total//(1024*1024), dt, mx*1e6, slow, (total/1e6)/dt))
 with open(resfile, "w") as f:
     f.write(line)
+PYEOF
 ```
 
-Every run below is bounded by `timeout`; the kitty runs use `close_on_child_death=yes` so kitty exits cleanly when the producer finishes, and only the spawned PID is torn down.
+Every run below is bounded by `timeout`; the kitty runs use `close_on_child_death=yes` so kitty exits cleanly when the producer finishes, and only the spawned PID is torn down. (These figures measure the producer's **write** throughput; per §4.1a, a final buffer-saturating tail written in the same instant as the producer's exit may be retired unparsed under `close_on_child_death=yes` — this does not affect the write-rate measurement, which is taken producer-side.)
 
 **BASELINE — no terminal (write to `/dev/null`), repeated 3× at each scale:**
 ```bash
-$ work=$(mktemp -d "${TMPDIR:-/tmp}/kitty_q4.XXXXXX"); chmod 0700 "$work"
 $ for r in 1 2 3; do timeout 60 python3 "$work/producer.py" 16 "$work/b16_$r.txt" >/dev/null; cat "$work/b16_$r.txt"; done
 MB=16 dt=0.0021 max_write_us=13.1 slow=0 MBps=7856.1
 MB=16 dt=0.0022 max_write_us=57.7 slow=0 MBps=7634.0
@@ -1198,7 +1511,7 @@ Three pacing timers give the pipeline its rhythm and let the interface settle:
 | `repaint_delay` | **10 ms** | [kitty/options/definition.py:866] | Throttles repaints to a ~10 ms cadence **only when idle**; the throttle is *bypassed* while there is pending input to process (§5.2). |
 | `resize_debounce_time` | **(0.1, 0.5) s** | [kitty/options/definition.py:1182] | Debounces live-resize redraw. `on_end` = **0.1 s** = `tuple[0]`; `on_pause` = **0.5 s** = `tuple[1]` [kitty/options/to-c.h:349-350] — platform-dependent roles in §5.2. |
 
-The default *values* are confirmed at runtime from the built binary — this establishes the configured numbers, **not** the timing behavior itself (the behavior is analyzed as cause → effect in §5.2, and where it cannot be directly instrumented in the canonical build it is labeled code-derived; see the observability note in §5.4). Stable across two runs:
+The default *values* are confirmed at runtime from the built binary — this establishes the configured numbers; the timing *behavior* is analyzed as cause → effect in §5.2 and, where it surfaces at the display, **measured directly** by controlled comparison in §5.2a (`input_delay` is directly observable; `repaint_delay`'s *idle* cadence is not reachable by output-driven capture and stays code-derived — see the observability note in §5.4). Stable across two runs:
 
 ```bash
 $ timeout 30 ./kitty/launcher/kitty +runpy 'from kitty.options.types import defaults as d; \
@@ -1231,6 +1544,93 @@ These match `opt('input_delay', '3', ...)` [kitty/options/definition.py:878], `o
   - **On OS-notification platforms (e.g. macOS)**, where the OS marks the start/end of a live resize (`live_resize.from_os_notification` [kitty/child-monitor.c:1049]): when the OS reports the resize is complete (`os_says_resize_complete` [kitty/child-monitor.c:1050]) the redraw is **immediate** and `on_end` (0.1 s) is *ignored*; while resizing is merely paused (not yet ended), `on_pause` = **0.5 s** is the redraw-after-pause debounce [kitty/child-monitor.c:1055].
   - **On other platforms (e.g. Linux/X11)**, only `on_end` = **0.1 s** is used [kitty/child-monitor.c:1062]: kitty redraws once no new resize event has arrived for 0.1 s, so it becomes "ready" quickly after the drag ends without continuously repainting (to save energy).
   A committed resize calls `resize_pty` [kitty/child-monitor.c:592] → `pty_resize` [kitty/child-monitor.c:577]; the Python side calls `boss.child_monitor.resize_pty(...)` [kitty/window.py:863] and sends `SIGWINCH` to the child [kitty/window.py:873].
+
+### 5.2a Directly measuring the timers — controlled comparisons
+
+Two of these timers can be exercised at the display layer with the same `XGetImage` pixel-hash method as §1.4a — reusing the `capshot.py` / `caploop.py` primitives created in the §1.4a prerequisite block — default value vs. an inflated control, which turns "code-derived" claims into measured ones *where the mechanism actually surfaces at the display*.
+
+**`input_delay` — directly observable.** After an idle period a child writes a single line and logs the write time; the capture loop records when the pixel-hash changes. The draw→display latency tracks `input_delay` almost exactly (median over 6 events per run, ×2 per setting):
+
+```bash
+$ cat > idle_draw_child.py <<'PY'
+import os, sys, time
+res=sys.argv[1]
+def log(tag): open(res,'a').write("%s %.6f\n" % (tag, time.time()))
+time.sleep(4.0)                 # settle + attach
+for rep in range(6):            # several idle->draw events
+    time.sleep(0.5)             # idle (>> input_delay) so the wakeup gate is "immediate"
+    log("DRAW%d" % rep)
+    os.write(1, b"\r\x1b[K" + ("LINE-%d-%09d" % (rep, int(time.time()*1e6)%10**9)).encode())
+time.sleep(1.0)
+log("DONE")
+PY
+$ cat > analyze_idle.py <<'PY'
+import sys, statistics
+caps, phases = sys.argv[1], sys.argv[2]
+draws=[float(p[1]) for p in (ln.split() for ln in open(phases)) if len(p)==2 and p[0].startswith('DRAW')]
+rows=[(float(p[0]),p[1]) for p in (ln.split() for ln in open(caps)) if len(p)==2 and p[1]!='ERR']
+lat=[]
+for dt in draws:                      # per DRAW event: first pixel change at/after the write
+    seg=[(t,h) for t,h in rows if t>=dt]
+    for i in range(1,len(seg)):
+        if seg[i][1]!=seg[i-1][1]: lat.append((seg[i][0]-dt)*1000.0); break
+print("draw->display median=%.2f ms  (per-event %.1f-%.1f, n=%d)" % (statistics.median(lat), min(lat), max(lat), len(lat)))
+PY
+$ # for each input_delay in {3,100}, x2 runs: launch kitty(idle_draw); sample; correlate (latency = display_change - DRAW)
+$ for D in 3 100; do for r in 1 2; do
+    env DISPLAY=:99 "$K" --config NONE -o close_on_child_death=no \
+        -o cursor_blink_interval=0 -o input_delay=$D \
+        sh -c "python3 idle_draw_child.py ph_${D}_$r.txt" & kpid=$!
+    sleep 1.5; python3 caploop.py 9.0 caps_${D}_$r.txt
+    kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+    printf 'input_delay=%-3s [run%s] ' "$D" "$r"; python3 analyze_idle.py caps_${D}_$r.txt ph_${D}_$r.txt
+  done; done
+input_delay=3   [run1] draw->display median=12.23 ms  (per-event 9.2-14.4, n=6)
+input_delay=3   [run2] draw->display median=11.94 ms  (per-event 8.4-13.3, n=6)
+input_delay=100 [run1] draw->display median=107.02 ms  (per-event 105.4-109.0, n=6)
+input_delay=100 [run2] draw->display median=109.02 ms  (per-event 108.0-110.3, n=6)
+```
+
+Raising `input_delay` from 3 ms to 100 ms raises the first-response latency by ~95 ms — matching the ~97 ms config delta. So the 3 ms coalescing window is a **directly observed** latency floor (the default's ~12 ms is that 3 ms plus fixed parse+render+X-server overhead), confirming the `run_worker` gate `time_since_new_input >= OPT(input_delay)` [kitty/vt-parser.c:1425] and the wakeup gate [kitty/child-monitor.c:1566].
+
+**`repaint_delay` — its throttle is bypassed under load, so its idle cadence is *not* output-observable.** Driving continuous output (a counter line rewritten every ~2 ms) and measuring the median interval between pixel-hash changes gives the **same** cadence regardless of `repaint_delay`, because the `if (!input_read && …)` gate [kitty/child-monitor.c:875] skips the throttle whenever input is pending:
+
+```bash
+$ cat > cont_child.py <<'PY'
+import os, sys, time
+end = time.monotonic() + 4.0
+i = 0
+while time.monotonic() < end:
+    os.write(1, b'\r\x1b[K' + ('COUNT %08d' % i).encode())  # rewrite same line -> pixel change
+    i += 1
+    time.sleep(0.002)
+os.write(1, b'\r\nCONT-DONE\n')
+sys.stdout.flush()
+PY
+$ cat > analyze_cont.py <<'PY'
+import sys, statistics
+rows=[(float(p[0]),p[1]) for p in (ln.split() for ln in open(sys.argv[1])) if len(p)==2 and p[1]!='ERR']
+ch=[rows[i][0] for i in range(1,len(rows)) if rows[i][1]!=rows[i-1][1]]   # timestamps of pixel changes
+iv=[(ch[i]-ch[i-1])*1000.0 for i in range(1,len(ch))]
+print("median_interval=%.2f ms  (n_changes=%d)" % (statistics.median(iv), len(ch)))
+PY
+$ # for each repaint_delay in {10,40,200}, x2 runs: drive continuous output; sample; measure median interval
+$ for D in 10 40 200; do for r in 1 2; do
+    env DISPLAY=:99 "$K" --config NONE -o close_on_child_death=no \
+        -o cursor_blink_interval=0 -o repaint_delay=$D sh -c 'python3 cont_child.py' & kpid=$!
+    sleep 1.2; python3 caploop.py 3.0 caps_c${D}_$r.txt
+    kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+    printf 'repaint_delay=%-3s [run%s] ' "$D" "$r"; python3 analyze_cont.py caps_c${D}_$r.txt
+  done; done
+repaint_delay=10  [run1] median_interval=7.04 ms  (n_changes=85)
+repaint_delay=10  [run2] median_interval=6.67 ms  (n_changes=88)
+repaint_delay=40  [run1] median_interval=6.43 ms  (n_changes=89)
+repaint_delay=40  [run2] median_interval=6.74 ms  (n_changes=89)
+repaint_delay=200 [run1] median_interval=6.90 ms  (n_changes=89)
+repaint_delay=200 [run2] median_interval=6.49 ms  (n_changes=88)
+```
+
+The cadence is flat (~6.5–7 ms) across a 20× change in `repaint_delay` — so the **bypass-under-load is itself directly observed**, while the 10 ms *idle* cadence it would otherwise impose is **not** reachable by output-driven capture (nothing in this build produces a non-input repaint to trigger it), so that one value stays code-derived from [kitty/child-monitor.c:874-876]. This is the honest split recorded in Appendix B.
 
 ### 5.3 Observed: the resize → SIGWINCH hand-off
 
@@ -1307,17 +1707,17 @@ screen_linefeed
 1. *(code-derived)* Bytes arrive and are read into the shared buffer by the I/O thread; the `WAKEUP` gate is designed to coalesce wakeups over `input_delay` (3 ms) [kitty/child-monitor.c:1566] so a burst is handed to the main thread together. The dump does not expose this coalescing; it is inferred from the gate.
 2. *(observed)* The main thread runs one tick in fixed order: `process_pending_resizes` → `parse_input` → `render` [kitty/child-monitor.c:1233-1237]. `parse_input` consumes the buffer **in byte order**, so ordinary text, the OSC 133 `A`/`C` markers, and the `2026` block land in the exact order emitted — which is precisely what the 18-line stream shows.
 3. *(observed set/reset; code-derived effect)* The dump shows `screen_set_mode 2026 1` … `screen_reset_mode 2026 1` bracketing the two `sync line` draws (observed). Per the code, the reset flips `is_dirty = true` [kitty/screen.c:2511] so the block is flushed together; that atomic-flush *effect* is code-derived, not shown by the dump.
-4. *(code-derived)* `render()` throttles to the `repaint_delay` (10 ms) cadence only when idle (`if (!input_read && …)` [kitty/child-monitor.c:875]) and **bypasses** the throttle while `input_read` is true — so a burst renders promptly. That the interface **settles** on `settled tail line` "with no half-drawn frame" is a *display* property of the paused-render mechanism; the command dump does not prove it, so it is labeled code-derived (§1 covers the pause snapshot directly).
+4. *(bypass observed §5.2a; idle cadence code-derived; settle display-confirmed §1.4a)* `render()` throttles to the `repaint_delay` (10 ms) cadence only when idle (`if (!input_read && …)` [kitty/child-monitor.c:875]) and **bypasses** the throttle while `input_read` is true — so a burst renders promptly. The bypass is **directly observed** (§5.2a: cadence stays flat across a 20× `repaint_delay` change); only the 10 ms *idle* cadence itself remains code-derived (nothing triggers a non-input repaint in this build). That the interface **settles** "with no half-drawn frame" is a *display* property now **directly confirmed** by the pixel capture of §1.4a (frozen pause frame, single atomic resume transition).
 
 **Determinism across runs.** The 18-line stream was byte-identical on both runs, so no distribution is needed for the *ordering*. For the *magnitude/timing* values reported elsewhere (§4.3 throughput, §1 2000 ms pause boundary, §5.3 SIGWINCH spacing), stability across ≥ 2 runs was likewise confirmed.
 
-> **Observability honesty note.** The per-tick and per-frame *counts and timings* of `input_delay`/`repaint_delay` are **not directly instrumentable in the canonical build**: `EVDBG` is `#ifdef DEBUG_EVENT_LOOP` (compiled out; §Q2), `--debug-rendering` emits no per-render/frame timestamps (only OS-window/child-launch/GL/SIGWINCH lines), and there is no runtime frame counter — and adding instrumentation is forbidden by the read-only mandate. What is **observed** here: the default timer *values* (from the binary, §5.1), the byte-order of the settle (§5.4), and the resize→SIGWINCH hand-off with real timestamps (§5.3). The 3 ms coalescing and 10 ms repaint *behaviors* themselves are **code-derived** from the cited gates, not measured.
+> **Observability honesty note.** Kitty's *internal* per-tick counters are not instrumentable in the canonical build (`EVDBG` is `#ifdef DEBUG_EVENT_LOOP`, compiled out (§Q2); `--debug-rendering` emits no per-frame timestamps — only OS-window/child-launch/GL/SIGWINCH lines; there is no runtime frame counter — and adding instrumentation is forbidden by the read-only mandate). But the *external* display effect **is** measurable by pixel-hash timing, and §5.2a does exactly that: the `input_delay` coalescing window is **directly observed** (3 ms → ~12 ms vs 100 ms → ~107 ms draw→display latency, ×2), and the `repaint_delay` throttle **bypass under load** is **directly observed** (flat cadence across a 20× change, ×2). What remains **code-derived** is only `repaint_delay`'s *idle* 10 ms cadence (no non-input repaint source exists in this build to trigger it) plus the internal per-tick counts. Also observed: the default timer *values* (§5.1), the byte-order of the settle (§5.4), the pause freeze / atomic resume as pixels (§1.4a), and the resize→SIGWINCH hand-off with real timestamps (§5.3).
 
 ---
 
 ## Appendix A — External conventions (framing only; observed code is the source of truth)
 
-These public conventions frame the narrative; every behavioral claim above rests on observed kitty output, not on these:
+These public conventions frame the narrative; the behavioral claims above rest on kitty's own observed output — or, for the narrow code-derived set enumerated in Appendix B, on its source — not on these external specifications:
 
 - **Synchronized output / DEC private mode 2026.** `CSI ? 2026 h` begins a synchronized update (BSU — batch output), `CSI ? 2026 l` ends it (ESU — apply atomically), so the viewer never sees a half-drawn screen. There is no cross-terminal consensus on a timeout, which is why kitty enforces its own (2000 ms, observed in §Q1). Kitty implements this via `PENDING_UPDATE (2026 << 5)` [kitty/modes.h:86].
 - **OSC 133 prompt marking (FTCS).** The public convention defines `A` = prompt start, `B` = prompt end / command start, `C` = command output start, `D;<exit>` = command finished, `k=s` = secondary prompt. **Kitty handles only `A`/`C`/`D` — there is no `case 'B'`** (§3.2): `A` and `C` are stored per line as `prompt_kind` [kitty/screen.c:2337, :2341], while `D` fires the `cmd_output_marking` callback with the exit status and stores no per-line tag.
@@ -1337,8 +1737,8 @@ Every sub-question and every named item, with its concrete value, the evidence t
 - [x] **DEC 2026 pause/resume** `case PENDING_MODE << 5` [kitty/screen.c:1174-1175]; `PENDING_UPDATE (2026<<5)` [kitty/modes.h:86] — *observed* `screen_set_mode/reset_mode 2026 1` (§1.4).
 - [x] **Legacy DCS `=1s`/`=2s`** [kitty/vt-parser.c:636-648] — *observed* `screen_start/stop_pending_mode` (§1.4), converges on `screen_pause_rendering`.
 - [x] **`screen_pause_rendering()`** [kitty/screen.c:2506]; resume `is_dirty=true` :2511; refuse-if-not-paused :2508; refuse-if-paused :2518 — *code + observed* (§1.4, §1.5).
-- [x] **2000 ms default timeout** [kitty/screen.c:2521-2522]; `screen_check_pause_rendering` force-resume [:2489-2490] — *observed* boundary (1.5 s no-error vs 2.5 s timeout, ×2) (§1.5).
-- [x] **Before / during / after** — *observed at the command layer*: `screen_set_mode 2026 1` at line 1 → all 50 `draw SURGE line NN` commands parse in byte order during the pause (lines 1–152) → `screen_reset_mode 2026 1` at line 152 then `draw AFTER-ESU visible line` at line 153. The display-side snapshot (`expires_at`, frozen linebuf) and the single atomic on-resume frame are **code-derived** [kitty/screen.c:2522-2543, :2737-2760, :2511], not captured as pixels (§1.4).
+- [x] **2000 ms default timeout** [kitty/screen.c:2521-2522]; `screen_check_pause_rendering` force-resume [:2489-2490] — *observed* boundary (1.5 s no-error vs 2.5 s timeout, ×2) (§1.5); **display-confirmed** force-resume at ~1962 ms with no ESU sent (pixel capture, §1.4a, ×2).
+- [x] **Before / during / after** — *observed at the command layer* (`screen_set_mode 2026 1` at line 1 → all 50 `draw SURGE line NN` commands parse in byte order during the pause → `screen_reset_mode 2026 1` at line 152 then `draw AFTER-ESU visible line` at line 153) **and at the display layer** via `XGetImage` pixel-hash (§1.4a): **0** display transitions during the pause, **exactly one** atomic transition on resume, and byte-identical before/during framebuffers. Code path [kitty/screen.c:2522-2543, :2737-2760, :2511].
 - [x] **Both refusal paths** (double-pause; late-resume) — *observed* error strings (§1.5).
 - [x] **Input side** `--debug-input` (glfw ingress) — *observed*; key-encoding stage labeled **inferred** (§1.6).
 - [x] **PTY fd origin** `openpty` [kitty/child.py:170], `Child.fork` [:276], `child_fd=master` [:338], `set_blocking(…,False)` [:345] — *code* (§1.2).
@@ -1380,7 +1780,7 @@ Every sub-question and every named item, with its concrete value, the evidence t
 - [x] **Actual output beside every claim; file:line for every structural claim** — throughout.
 - [x] **Timing rigor** — `input_delay` 3 ms, `repaint_delay` 10 ms, `resize_debounce_time` (0.1, 0.5) s, buffer 1 MiB, pause timeout 2000 ms; scale stated, stability confirmed across ≥ 2 runs (§Q1, §Q4, §Q5).
 - [x] **Corrected citations used** — `BRACKETED_PASTE` at [kitty/modes.h:81] (not :80); `test_parse_written_data` at [kitty/screen.c:4771-4772]; `add_child` at [kitty/boss.py:585]; `BUF_EXTRA` at [kitty/vt-parser.c:20] (not :19).
-- [x] **Code-derived (not directly observed) behavioral claims** — inferred from source and labeled inline where they appear, because the canonical headless build offers no non-mutating way to capture them (the software-GL framebuffer is not captured; `EVDBG` per-tick tracing is compile-gated out [kitty/child-monitor.c:29-33]; `ptrace_scope=3` and no `strace`). They are: (1) the key→escape **encoding** stage `glfw`→`keys.c`→`key_encoding.c` — only glfw ingress and an RC-injected bracketed paste were observed (§1.6); (2) the **display-side pause effects** — frozen snapshot, single atomic on-resume frame, no half-drawn intermediate [kitty/screen.c:2522-2543, :2737-2760, :2511] — only the command-stream continuation across the pause was observed (§1.4); (3) **parser-buffer saturation gating** under load — `has_space_for_input`→false [kitty/vt-parser.c:1481] and POLLIN masking [kitty/child-monitor.c:1501] — only generic producer `write()` backpressure was observed (§4.3); (4) the millisecond **timer effects** of `input_delay` 3 ms and `repaint_delay` 10 ms — the *values* are observed from the binary, but the per-tick batching/throttle behavior itself is code-derived (§5.1–§5.2); (5) **live-drag resize coalescing** on the `on_end`/`on_pause` debounce — only the committed-resize→SIGWINCH hand-off was observed (§5.3); (6) the **network-fault SSH degradation** profile — there is no SSH server in the container, and the real attempt failed with exit 255 (§4.4). Everything else is either a direct runtime observation or a structural fact cited to file:line.
+- [x] **Code-derived (not directly observed) behavioral claims** — inferred from source and labeled inline where they appear. This set is **narrower than an earlier draft**: the software-GL framebuffer *is* captured directly with `XGetImage` (§1.4a, §5.2a), so the display-side pause/resume and the `input_delay` window are now **observed**, not inferred. (`EVDBG` per-tick tracing is still compile-gated out [kitty/child-monitor.c:29-33], and there is no `strace`; those limit only *internal* counters.) What remains code-derived, with the reason: (1) the key→escape **encoding** stage `glfw`→`keys.c`→`key_encoding.c` — only glfw ingress and an RC-injected bracketed paste were observed (§1.6); (2) **parser-buffer saturation gating** — `has_space_for_input`→false [kitty/vt-parser.c:1481] and POLLIN masking [kitty/child-monitor.c:1501] — only generic producer `write()` backpressure plus the teardown-race tail loss of §4.1a were observed (§4.1, §4.3); (3) `repaint_delay`'s **idle 10 ms cadence** — the throttle *bypass under load* is observed (§5.2a), but nothing in this build produces a non-input repaint to exercise the idle path, so that value stays code-derived [kitty/child-monitor.c:874-876]; (4) **live-drag resize coalescing** on the `on_end`/`on_pause` debounce — only the committed-resize→SIGWINCH hand-off was observed (§5.3), and the macOS `on_pause` branch cannot run on this Linux build; (5) the **network-fault SSH degradation** profile — there is no SSH server in the container, and the real attempt failed with exit 255 (§4.4). **Moved to directly observed (previously code-derived):** the display-side pause freeze, the single atomic on-resume frame, and the 2000 ms force-resume (pixel-hash + PNG, §1.4a); the `input_delay` coalescing latency (§5.2a). Everything else is either a direct runtime observation or a structural fact cited to file:line.
 - [x] **Build reconciled honestly** — `python3 setup.py develop` fails (`KeyError: 'DEVELOP_ROOT'` [setup.py:1255]); canonical `python3 setup.py` build used, producing `kitty/launcher/kitty` (kitty 0.35.2) (§0.2).
 
 *All temporary observation scripts and captures lived in private `mktemp -d` directories (mode 0700, outside the repository) removed by each block's `trap`/`rm -rf`; the only change to the destination repository is this document — verified directly in Appendix C below.*
@@ -1391,11 +1791,13 @@ Every sub-question and every named item, with its concrete value, the evidence t
 
 The read-only mandate requires that the **only** change to the destination repository is this document, and that every temporary observation artifact is removed. Both are verified directly (base commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`, branch `blitzy-05dd5e02-071e-4e0e-a941-87e19867a0f8`).
 
-**1. Temporary workspaces removed.** Every experiment used a private `mktemp -d` directory (mode 0700) under `TMPDIR=/tmp/kitty-clean-tmp`, removed by its own `trap … EXIT` and an explicit `rm -rf`. Nothing remains:
+**1. Temporary workspaces removed.** Every experiment created its own private `mktemp -d` directory (mode 0700) under `TMPDIR=/tmp/kitty-clean-tmp` and removed **that exact path** — `rm -rf "$d"` / `"$work"` / `"$rc"` — from its own `trap … EXIT`. **No shared-directory wildcard is ever used**, so a co-tenant directory that merely shares a name prefix (e.g. an unrelated `kitty_*`) can never be caught by cleanup. The distinct `mktemp` prefixes these experiments used are `tmp.*` (the default template), `kitty_q4.*`, `kitty_rc.*`, `kitty_ttyrc.*`, `kitty_rz.*`, and `kitty_e2e.*`. This final step is a **read-only verification** — it *lists* and deletes nothing — confirming that each block's exact-path removal already left the workspace clean:
 
 ```bash
-$ rm -rf /tmp/kitty-clean-tmp/kitty_*        # idempotent; each block's trap has already fired
-$ ls -d /tmp/kitty-clean-tmp/kitty_* 2>/dev/null || echo "no leftover experiment dirs"
+$ find /tmp/kitty-clean-tmp -maxdepth 1 -type d \
+    \( -name 'tmp.*' -o -name 'kitty_q4.*' -o -name 'kitty_rc.*' \
+       -o -name 'kitty_ttyrc.*' -o -name 'kitty_rz.*' -o -name 'kitty_e2e.*' \) -print \
+  | grep . || echo "no leftover experiment dirs"
 no leftover experiment dirs
 ```
 
