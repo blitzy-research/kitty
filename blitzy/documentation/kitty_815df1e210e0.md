@@ -399,7 +399,7 @@ run_kitty() {
 }
 ```
 
-`gen_session.sh` emits a **splits-layout** tab of N windows, each launching a `sleep` with a **staggered** lifetime so windows die at different instants while the layout keeps resizing — the exact rapid create/resize/destroy burst the question is about (SHA-256 `08908143…`):
+`gen_session.sh` emits a **splits-layout** tab of N windows, each launching a `sleep` with a **staggered** lifetime so windows die at different instants while the layout keeps resizing — the exact rapid create/resize/destroy burst the question is about. It takes exactly two positional arguments — `<nwin>` (a positive integer) and `<base_life>` (a number of seconds) — and **fails fast (exit 2)** on a malformed argument so a typo cannot silently emit a degenerate session; the validation writes only to `stderr`, so for valid input the emitted session is byte-identical (SHA-256 `4efc76f16ce538fa5651e06e2eaf383e3f1414c8495b1dc812d2a27f1280b331`):
 
 ```sh
 #!/bin/sh
@@ -407,6 +407,10 @@ run_kitty() {
 # Emits a splits-layout tab of <nwin> windows; window i sleeps base_life*i-ish
 # (staggered) so windows die at different times while layout keeps resizing.
 nwin="$1"; life="$2"
+# Validate args and FAIL FAST (exit 2) so a typo cannot silently emit a degenerate
+# session. These checks write only to stderr, so valid output stays byte-identical.
+case "$nwin" in ''|*[!0-9]*) echo "gen_session.sh: nwin must be a positive integer" >&2; exit 2;; esac
+case "$life" in ''|*[!0-9.]*|*.*.*) echo "gen_session.sh: base_life must be a number" >&2; exit 2;; esac
 echo "layout splits"
 i=1
 while [ "$i" -le "$nwin" ]; do
@@ -417,11 +421,16 @@ while [ "$i" -le "$nwin" ]; do
 done
 ```
 
-`gen_session_q4b.sh` emits N windows that **busy-wait on a gate file**, so they can all be released simultaneously (by `touch`ing the gate) to *force* SIGCHLD coalescing (SHA-256 `079b7b26…`):
+`gen_session_q4b.sh` emits N windows that **busy-wait on a gate file**, so they can all be released simultaneously (by `touch`ing the gate) to *force* SIGCHLD coalescing. It takes `<nwin>` (a positive integer) and `<gate_path>`, and likewise fails fast (exit 2) on a malformed argument (SHA-256 `9b4c401c61cad67b40e46d62381d23895bd06faa7b1122cee799174548381fc3`):
 
 ```sh
 #!/bin/sh
+# gen_session_q4b.sh <nwin> <gate_path> > session
+# Emits <nwin> windows that busy-wait on a gate file so they can all be released
+# simultaneously (touch the gate) to force SIGCHLD coalescing.
 nwin="$1"; go="$2"
+case "$nwin" in ''|*[!0-9]*) echo "gen_session_q4b.sh: nwin must be a positive integer" >&2; exit 2;; esac
+[ -n "$go" ] || { echo "gen_session_q4b.sh: gate_path required" >&2; exit 2; }
 echo "layout splits"
 i=1
 while [ "$i" -le "$nwin" ]; do
@@ -430,28 +439,170 @@ while [ "$i" -le "$nwin" ]; do
 done
 ```
 
+The argument guard was exercised directly (bad arguments exit non-zero; the valid Q5 invocation still emits the byte-identical `q5.session`):
+
+```text
+$ gen_session.sh abc 0.05 >/dev/null ; echo "exit=$?"
+gen_session.sh: nwin must be a positive integer
+exit=2
+$ gen_session.sh 20 0.05 | sha256sum
+19cfee893e64542f7993c291c31c5cc085258f4a94c93f8c843e12f1677cd8c8  -
+```
+
 `child1.sh` (Q1) proves both **post-readiness exec** (its marker line is written only after the shell execs, which the kernel permits only after kitty closes the ready pipe) and **real SIGWINCH receipt** (a `trap … WINCH` handler appends a line when the kernel delivers `SIGWINCH`):
 
 ```sh
 #!/bin/sh
+# The observation directory is injected by the session (see the launch line below):
+#   launch --env KITTY_OBS_WORK="$WORK" sh "$WORK/child1.sh"
+# kitty execvp's this child, so it does NOT inherit the harness shell's $WORK;
+# the session passes it explicitly. Substitute your own path if running by hand.
+: "${KITTY_OBS_WORK:?set KITTY_OBS_WORK (e.g. via launch --env) to the observation work dir}"
 # Prove SIGWINCH RECEIPT: append a line every time the kernel delivers SIGWINCH.
-trap "echo WINCH_received uptime=$(cut -d\" \" -f1 /proc/uptime) >> /tmp/kittyobs.3sJcn70i/win1.winch" WINCH
+# Single-quoted trap body -> the $(...) is evaluated when the signal FIRES, so each
+# line's uptime is the real receipt instant (not the install instant).
+trap 'echo "WINCH_received uptime=$(cut -d" " -f1 /proc/uptime)" >> "$KITTY_OBS_WORK/win1.winch"' WINCH
 # Prove POST-READINESS EXEC: this line is written only after the shell execs,
 # which the kernel permits only after kitty closes the ready pipe (mark_terminal_ready).
-echo LAUNCHED_W1 uptime=$(cut -d\" \" -f1 /proc/uptime) > /tmp/kittyobs.3sJcn70i/win1.marker
+echo "LAUNCHED_W1 uptime=$(cut -d" " -f1 /proc/uptime)" > "$KITTY_OBS_WORK/win1.marker"
 # stay alive so we can be resized and closed
 while true; do sleep 1; done
+```
+
+The session line that launches it injects the work dir explicitly (kitty `execvp`'s the child, so it does not inherit the harness shell's environment — the value is supplied via `launch --env`, `kitty/launch.py:135`, and expanded from kitty's own environ, `kitty/session.py:162`):
+
+```text
+layout splits
+launch --env KITTY_OBS_WORK="$WORK" sh "$WORK/child1.sh"
+launch sh -c "sleep 3"
 ```
 
 `child_survivor5.sh` (Q3, default hold-open) starts a **backgrounded survivor in a new session** that ignores `HUP` and keeps writing to the inherited slave fd, so the window has a live writer after the foreground child exits:
 
 ```sh
 #!/bin/sh
+# Output dir injected via `launch --env KITTY_OBS_WORK="$WORK"` (see child1.sh note);
+# kitty execvp's this child so it does not inherit the harness shell's $WORK.
+: "${KITTY_OBS_WORK:?set KITTY_OBS_WORK to the observation work dir}"
 # Robust survivor: new session (escapes terminal-hangup SIGHUP to the fg pgroup),
 # ignores HUP anyway, keeps inherited fd1 (=slave) and writes to it continuously.
-setsid sh -c 'trap "" HUP; i=0; while [ $i -lt 80 ]; do echo "keepalive_$i"; echo "keepalive_$i" >> /tmp/kittyobs.3sJcn70i/survivor5.log; sleep 0.15; i=$((i+1)); done' 0<&0 1>&1 2>&1 &
+setsid sh -c 'trap "" HUP; i=0; while [ $i -lt 80 ]; do echo "keepalive_$i"; echo "keepalive_$i" >> "$KITTY_OBS_WORK/survivor5.log"; sleep 0.15; i=$((i+1)); done' 0<&0 1>&1 2>&1 &
 sleep 0.5   # give the survivor time to install its trap and start writing
 exit 0
+```
+
+`pty_probe.c` (used by Q2 and Q3 as an **isolated, non-canonical** probe) does not touch kitty at all: it opens its own PTY master/slave pairs and reproduces, in isolation, the exact `errno` the `TIOCSWINSZ` `ioctl` and the master `read()` return under each edge condition kitty tolerates (`EBADF`/`ENOTTY` on a stale fd; `EIO` versus data on a post-exit `read`). It is published in full so the errno values are auditable (SHA-256 `053747a5dc71f3c49f7fd9c3fdd7f6c862ff5f3bd1f23cb66e46f4e7b08377a0`; build `gcc -O2 -o pty_probe pty_probe.c -lutil`):
+
+```c
+/* pty_probe.c - ISOLATED, NON-CANONICAL probe of the kernel errno values that
+ * kitty's pty_resize()/PTY-read paths tolerate. It does NOT touch kitty; it opens
+ * its own PTY master/slave pairs and reproduces, in isolation, the exact errno the
+ * TIOCSWINSZ ioctl and the master read() return under each edge condition:
+ *   Test A - ioctl(TIOCSWINSZ): open master, master-after-child-exit, CLOSED fd (EBADF),
+ *            regular pipe fd (ENOTTY).
+ *   Test B - read(master) after the slave-side session leader exits, with and without a
+ *            surviving background writer (EIO vs data). B2 is made race-free: the leader
+ *            sets SIGHUP->SIG_IGN BEFORE forking the survivor (so the survivor inherits the
+ *            ignore and cannot be killed by the leader's hangup), and a readiness pipe makes
+ *            the parent read() only after the survivor holds+has-written the slave.
+ * Build:  gcc -O2 -o pty_probe pty_probe.c -lutil
+ * Run:    ./pty_probe
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <pty.h>            /* openpty (needs -lutil) */
+
+/* errno -> the parenthesised text kitty users see for the tolerated codes */
+static const char *etext(int e) {
+    switch (e) {
+        case EBADF:  return "(Bad file descriptor)";
+        case ENOTTY: return "(Inappropriate ioctl for device)";
+        case EIO:    return "(Input/output error)";
+        case 0:      return "(ok)";
+        default:     return "";
+    }
+}
+
+int main(void) {
+    struct winsize ws = { .ws_row = 24, .ws_col = 80, .ws_xpixel = 640, .ws_ypixel = 384 };
+    int r, e, st;
+
+    /* ---------------- Test A: ioctl(TIOCSWINSZ) error branches ---------------- */
+    int mfd, sfd;
+    if (openpty(&mfd, &sfd, NULL, NULL, NULL) < 0) { perror("openpty"); return 1; }
+
+    errno = 0; r = ioctl(mfd, TIOCSWINSZ, &ws); e = errno;
+    printf("A1 ioctl on OPEN master:            ret=%d errno=%d %s\n", r, r < 0 ? e : 0, r < 0 ? etext(e) : "(ok)");
+
+    pid_t pid = fork();
+    if (pid == 0) { setsid(); ioctl(sfd, TIOCSCTTY, 0); _exit(0); }   /* leader exits */
+    waitpid(pid, &st, 0);
+    errno = 0; r = ioctl(mfd, TIOCSWINSZ, &ws); e = errno;
+    printf("A2 ioctl on master AFTER child exit: ret=%d errno=%d %s\n", r, r < 0 ? e : 0, r < 0 ? etext(e) : "(ok)");
+
+    close(mfd); close(sfd);
+    errno = 0; r = ioctl(mfd, TIOCSWINSZ, &ws); e = errno;   /* fd now closed -> EBADF */
+    printf("A3 ioctl on CLOSED master fd:        ret=%d errno=%d %s  <- EBADF branch\n", r, e, etext(e));
+
+    int pp[2]; if (pipe(pp) != 0) { perror("pipe"); return 1; }
+    errno = 0; r = ioctl(pp[0], TIOCSWINSZ, &ws); e = errno; /* pipe is not a tty -> ENOTTY */
+    printf("A4 ioctl on a regular pipe fd:       ret=%d errno=%d %s  <- ENOTTY branch\n", r, e, etext(e));
+    close(pp[0]); close(pp[1]);
+
+    /* ---------------- Test B: read(master) after session-leader exit ---------------- */
+    printf("--- Test B: read(master) after session-leader exit ---\n");
+    char buf[256];
+
+    /* B1: sole leader exits, nothing else holds the slave -> master read == EIO */
+    {
+        int m, s; if (openpty(&m, &s, NULL, NULL, NULL) < 0) { perror("openpty"); return 1; }
+        pid_t p = fork();
+        if (p == 0) { setsid(); ioctl(s, TIOCSCTTY, 0); close(m); _exit(0); }
+        waitpid(p, &st, 0);
+        close(s);                                   /* drop our own slave handle */
+        do { errno = 0; r = read(m, buf, sizeof buf); e = errno; } while (r > 0);
+        printf("B1 sole session-leader exits, NO survivor holding slave:\n");
+        printf("    final read(master) ret=%d errno=%d %s\n", r, e, etext(e));
+        close(m);
+    }
+
+    /* B2: leader exits but a backgrounded survivor keeps the slave open and writes 3 bytes. */
+    {
+        int m, s; if (openpty(&m, &s, NULL, NULL, NULL) < 0) { perror("openpty"); return 1; }
+        int rdy[2]; if (pipe(rdy) != 0) { perror("pipe"); return 1; }
+        pid_t p = fork();
+        if (p == 0) {
+            setsid(); ioctl(s, TIOCSCTTY, 0);
+            signal(SIGHUP, SIG_IGN);            /* set in LEADER before fork -> survivor inherits SIG_IGN */
+            pid_t g = fork();
+            if (g == 0) {                       /* survivor: immune to the leader's hangup */
+                setsid();                       /* own session too, belt and braces */
+                close(m); close(rdy[0]);
+                (void)!write(s, "abc", 3);      /* put data on the slave */
+                (void)!write(rdy[1], "1", 1);   /* signal parent: holding + written */
+                sleep(5);                       /* keep the slave open well past the read */
+                _exit(0);
+            }
+            close(s); close(rdy[0]); close(rdy[1]);
+            _exit(0);                           /* leader exits immediately */
+        }
+        waitpid(p, &st, 0);
+        close(s); close(rdy[1]);                /* only the survivor holds slave + rdy write end */
+        (void)!read(rdy[0], buf, 1);            /* block until survivor is ready */
+        errno = 0; r = read(m, buf, sizeof buf); e = errno;
+        printf("B2 session-leader exits, BACKGROUND survivor still holds+writes slave:\n");
+        printf("    read(master) ret=%d errno=%d (data) (survivor output readable => window would stay open)\n", r, e);
+        close(m); close(rdy[0]);
+    }
+    return 0;
+}
 ```
 
 ### Canonical entry points: session file and mapped-key actions
@@ -459,7 +610,101 @@ exit 0
 Two canonical entry points were exercised (both are the real user-facing paths; neither is a remote-control bypass — `kitty @` was deliberately **not** used):
 
 - **Startup session file** (`kitty --session <file>`): the primary, deterministic driver used for all reproducible numbers below. A session's `launch` directive creates a window and immediately runs a command; `layout splits` forces per-window PTY resizes as windows are added and removed. This is the canonical scripted-create/resize/destroy path named first in the design.
-- **Mapped key actions**: to confirm the same code path is reached through real keyboard input, a tiny X `XTEST` injector (`xinject.c`, SHA-256 `33f11d921d61f8d088e7a4c4a832b679a7d47f35c194f37795a3df4ded447025`, published in `/obs_out/harness/`) synthesizes kitty's default shortcuts — `ctrl+shift+enter` (`new_window`) and `ctrl+shift+w` (`close_window`) — against the headless display. This was validated to open and close windows through the normal GLFW key path (not a bypass). The reproducible measurements use the session file because it is deterministic; the injector demonstrates the mapped-key equivalence.
+- **Mapped key actions**: to confirm the same code path is reached through real keyboard input, a tiny **X `XTEST` injector** synthesizes kitty's default shortcuts — `ctrl+shift+enter` (`new_window`) and `ctrl+shift+w` (`close_window`) — against the headless display, so the keys travel the normal X-server → GLFW input path (**not** a `kitty @` bypass). The canonical build image ships the *runtime* `libXtst.so.6` but **not** the `XTest.h` development header (no `libxtst-dev`), so a compiled C injector is not buildable as-is; the injector is therefore published in full as a **dependency-free `ctypes` script** that loads `libX11`/`libXtst` at runtime (SHA-256 `1ae6088bdc7bd54c685d3d8b33c9fc8f8e57af997a35c2aa3d28ad84ff771258`). It is short enough to publish in full so every synthesized key is auditable by reading:
+
+```python
+#!/usr/bin/env python3
+# xinject.py - dependency-free X11 XTEST key injector (no XTest.h / libxtst-dev needed).
+# Loads libX11 + libXtst at runtime via ctypes and synthesizes kitty's default
+# shortcuts through the REAL X input path (XTEST -> X server -> focused GLFW window),
+# exactly as a physical keypress would - NOT a remote-control bypass.
+#
+# Usage: python3 xinject.py <combo> [<combo> ...]
+#   combo = '+'-joined X keysym names, e.g. ctrl+shift+Return  ctrl+shift+w
+# On a bare Xvfb (no window manager) it first gives the kitty top-level window
+# input focus, so injected keys are actually delivered to kitty.
+import ctypes, ctypes.util, sys, time
+
+x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+xtst = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XDefaultRootWindow.restype = ctypes.c_ulong
+x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XStringToKeysym.restype = ctypes.c_ulong
+x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+x11.XFlush.argtypes = [ctypes.c_void_p]
+x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+x11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+
+ALIAS = {"ctrl": "Control_L", "control": "Control_L", "shift": "Shift_L",
+         "alt": "Alt_L", "enter": "Return", "return": "Return"}
+
+def focus_kitty(dpy):
+    # No WM on headless Xvfb: focus the last top-level child of the root window
+    # (the kitty GLFW window) so XTEST keys reach it. RevertToParent = 2.
+    root = x11.XDefaultRootWindow(dpy)
+    r = ctypes.c_ulong(); parent = ctypes.c_ulong()
+    kids = ctypes.POINTER(ctypes.c_ulong)(); n = ctypes.c_uint()
+    x11.XQueryTree(dpy, ctypes.c_ulong(root), ctypes.byref(r), ctypes.byref(parent),
+                   ctypes.byref(kids), ctypes.byref(n))
+    if n.value:
+        x11.XSetInputFocus(dpy, ctypes.c_ulong(kids[n.value - 1]), 2, 0)
+        x11.XFlush(dpy)
+
+def keycode(dpy, name):
+    ks = x11.XStringToKeysym(ALIAS.get(name.lower(), name).encode())
+    if ks == 0:
+        ks = x11.XStringToKeysym(name.encode())
+    kc = x11.XKeysymToKeycode(dpy, ks)
+    if kc == 0:
+        raise SystemExit(f"no keycode for {name!r} (keysym=0x{ks:x})")
+    return kc
+
+def send(dpy, combo):
+    kcs = [keycode(dpy, n) for n in combo.split("+")]
+    for kc in kcs:                      # press modifiers..key in order
+        xtst.XTestFakeKeyEvent(dpy, kc, 1, 0); x11.XFlush(dpy)
+    for kc in reversed(kcs):            # release in reverse
+        xtst.XTestFakeKeyEvent(dpy, kc, 0, 0); x11.XFlush(dpy)
+    x11.XSync(dpy, 0)
+
+def main():
+    dpy = x11.XOpenDisplay(None)
+    if not dpy:
+        raise SystemExit("cannot open DISPLAY")
+    focus_kitty(dpy)
+    for combo in sys.argv[1:]:
+        send(dpy, combo)
+        time.sleep(0.4)                 # let kitty react between combos
+    print("injected:", " ".join(sys.argv[1:]))
+
+if __name__ == "__main__":
+    main()
+```
+
+  Injecting the two canonical shortcuts against a running kitty (a one-window session so the emulator stays focused) drives the **same** GLFW key path the session file exercises. `new_window` creates a second child (the cumulative `Child launched` count goes `1` → `2`); `close_window` hangs the window up, and the **IO thread** reaps its child — proving both actions reached the real code path, not a bypass:
+
+```text
+$ ./kitty --config NONE --debug-rendering --session inj.session >dbg.log 2>&1 &   # 1 long-lived window
+$ grep -c "Child launched" dbg.log                       # before injection
+1
+$ python3 xinject.py ctrl+shift+Return                   # canonical new_window
+injected: ctrl+shift+Return
+$ grep -c "Child launched" dbg.log                       # after: a 2nd window was created
+2
+$ python3 xinject.py ctrl+shift+w                         # canonical close_window
+injected: ctrl+shift+w
+# the closed window's child (bash) is reaped on the IO thread via SIGHUP hangup (WIFSIGNALED=1):
+1910900.830874 tid=13504 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 13512  (WIFEXITED=0 status=-1 WIFSIGNALED=1)
+# kitty stays alive because window 1 persists; 0 exceptions in the debug log.
+```
+
+  The reproducible measurements below use the session file because it is deterministic; the injector demonstrates the mapped-key equivalence (same `Tab.new_window`/`close_window` entry points, reached from real key events).
 
 ### Fixed input corpus (hashed)
 
@@ -478,6 +723,28 @@ db01d3f11094c300560931160fead1103dad0d10960168d9f62e5eaa7b661c18  sessions/q3_no
 ```
 
 (`q2.session` and `q5.session` share a hash because Q5's divergence experiment reuses Q2's staggered-death corpus; `q1.session` and `q4dedup.session` likewise share the single-window corpus.)
+
+**Exactly how each session was produced (so the corpus is reproducible):**
+
+| Session(s) | Produced by | Reproducible? |
+|------------|-------------|---------------|
+| `q2.session`, `q5.session` (`19cfee89…`) | `gen_session.sh 20 0.05` | **Yes — byte-identical.** Verified: `gen_session.sh 20 0.05 \| sha256sum` → `19cfee89…` (re-run gives the same bytes). |
+| `q1.session`, `q4dedup.session` (`ca07aa62…`), `q4.session` (`b265620d…`), `q3_holdopen5.session` (`758d77b5…`), `q3_yes.session` (`946a9264…`), `q3_no.session` (`db01d3f1…`) | Fixed, hand-authored session files (not generator output — they carry per-scenario directives such as the Q3 option lines and the `child_survivor5.sh` launch) | **Yes** — static input files pinned by the manifest hash. |
+| `q4b.session` (`cf8c289d…`) | `gen_session_q4b.sh 16 "$WORK/gate_$$"` | **No — recorded instance only.** The second argument is a *volatile* per-run gate path (`$WORK` is a `mktemp -d` directory and `$$` is the harness PID), so the emitted bytes — and therefore the hash — differ every run. |
+
+The q4b non-reproducibility is by construction, not a defect — the generator writes the gate path literally into each `launch` line, so a different gate path yields different bytes. Demonstrated directly:
+
+```text
+$ gen_session_q4b.sh 16 "/tmp/kittyobs.AAAAAAAA/gate_11111" | sha256sum
+7dddf47ac008b35ffe036d96828981e3b37bb0e6b006d85700c54d84206684c7  -
+$ gen_session_q4b.sh 16 "/tmp/kittyobs.BBBBBBBB/gate_22222" | sha256sum
+10176701d73c47e760a34acadde5e7f1ae691aeaa9070cfe3582184b5c6dc368  -
+# same structure, different volatile gate path => different hash (cf8c289d… is one such instance).
+# Normalising the gate path makes it stable, confirming only that argument varies:
+$ gen_session_q4b.sh 16 "GATE" | sha256sum   # (run twice)
+ff1eeb3041d835fd82508cefc7cf1a83810db4f7ec34528551f9b7a34ae176b9  -
+ff1eeb3041d835fd82508cefc7cf1a83810db4f7ec34528551f9b7a34ae176b9  -
+```
 
 ---
 
@@ -529,18 +796,20 @@ With `--debug-rendering` enabled (the `boss.args.debug_rendering` gate at `kitty
 
 ```text
 $ grep -nE "Child launched|SIGWINCH sent to child" /obs_out/logs/q1_dbg.log
-3:[0.161] Child launched
-4:[4.300] SIGWINCH sent to child in window: 1 with size: (11, 70, 630, 198)
-5:[4.300] Child launched
+3:[0.159] Child launched
+4:[0.164] SIGWINCH sent to child in window: 1 with size: (22, 35, 315, 396)
+5:[0.164] Child launched
+6:[3.172] SIGWINCH sent to child in window: 1 with size: (22, 71, 639, 396)
 ```
 
-The shim shows the **first** `ioctl(TIOCSWINSZ)` on each kitty-side PTY master fd returns `0` (success) — one per window (fd 9 for window 1, later fd 10 for a second) — confirming the initial size push:
+The shim shows the **first** `ioctl(TIOCSWINSZ)` on each kitty-side PTY master fd returns `0` (success) — one per window (fd 10 for window 1, later fd 11 for a second) — confirming the initial size push (the fourth line is window 1 re-expanding to full width when window 2 exits at ~t+3 s):
 
 ```text
-$ grep -E "ioctl\(fd=(9|10), TIOCSWINSZ" /obs_out/logs/q1_shim.log | head -3
-1887676.514688 tid=7123 comm=kitty ioctl(fd=9, TIOCSWINSZ, {rows=22 cols=71 xpix=639 ypix=396}) = 0
-1887680.653130 tid=7123 comm=kitty ioctl(fd=9, TIOCSWINSZ, {rows=11 cols=70 xpix=630 ypix=198}) = 0
-1887680.653461 tid=7123 comm=kitty ioctl(fd=10, TIOCSWINSZ, {rows=11 cols=70 xpix=630 ypix=198}) = 0
+$ grep -E "ioctl\(fd=(10|11), TIOCSWINSZ" /obs_out/logs/q1_shim.log | head -4
+1910582.491762 tid=13232 comm=kitty ioctl(fd=10, TIOCSWINSZ, {rows=22 cols=71 xpix=639 ypix=396}) = 0
+1910582.496840 tid=13232 comm=kitty ioctl(fd=10, TIOCSWINSZ, {rows=22 cols=35 xpix=315 ypix=396}) = 0
+1910582.497103 tid=13232 comm=kitty ioctl(fd=11, TIOCSWINSZ, {rows=22 cols=35 xpix=315 ypix=396}) = 0
+1910585.505133 tid=13232 comm=kitty ioctl(fd=10, TIOCSWINSZ, {rows=22 cols=71 xpix=639 ypix=396}) = 0
 ```
 
 Both the resize `ioctl` and the initial launch happen on `comm=kitty` (the UI thread), consistent with the mechanism above.
@@ -548,12 +817,13 @@ Both the resize `ioctl` and the initial launch happen on `comm=kitty` (the UI th
 **Post-readiness exec and real SIGWINCH receipt.** The Q1 child (`child1.sh`) wrote its launch marker and its `WINCH` trap fired:
 
 ```text
-$ cat /tmp/kittyobs.3sJcn70i/win1.marker ; cat /tmp/kittyobs.3sJcn70i/win1.winch
-LAUNCHED_W1 uptime=1888661.54 236375823.55
-WINCH_received uptime=1888661.54 236375823.40
+$ cat "$KITTY_OBS_WORK/win1.marker" ; cat "$KITTY_OBS_WORK/win1.winch"
+LAUNCHED_W1 uptime=1910582.49
+WINCH_received uptime=1910582.49
+WINCH_received uptime=1910586.50
 ```
 
-The marker exists only because the shell `execvp`'d, which the kernel permits only after kitty closed the child-ready pipe — i.e. after the `Child launched` transition. The `WINCH_received` line proves the child's process actually **received** `SIGWINCH`, which the kernel raised as a consequence of kitty's `ioctl(TIOCSWINSZ)` — kitty never calls `kill(child, SIGWINCH)`.
+The marker exists only because the shell `execvp`'d, which the kernel permits only after kitty closed the child-ready pipe — i.e. after the `Child launched` transition. Each `WINCH_received` line proves the child's process actually **received** `SIGWINCH`, which the kernel raised as a consequence of kitty's `ioctl(TIOCSWINSZ)` — kitty never calls `kill(child, SIGWINCH)`. Because the trap body is single-quoted, its `$(cut -d" " -f1 /proc/uptime)` runs when the handler fires, so the uptimes mark real delivery instants: the two `WINCH_received` lines correspond to the two post-launch resizes of window 1 — the splits resize when window 2 is added, and window 1's re-expansion when window 2's `sleep 3` exits (~t+3 s, hence the later `1910586.50`) — matching the two `SIGWINCH sent to child in window: 1` debug lines above. (The child's `while true; do sleep 1; done` loop means a pending receipt is handled at the next `sleep` boundary, up to the 1 s granularity after the `ioctl`, so a delivery uptime can trail its corresponding `ioctl` timestamp slightly — e.g. the re-expansion `ioctl` at `1910585.50` is handled at `1910586.50`.)
 
 ### What this proves (cause → effect)
 
@@ -637,7 +907,7 @@ $ grep -A0 "WIFEXITED" /obs_out/logs/q2_shim.log | sed -n '1,4p'
 **Edge: EBADF / ENOTTY tolerance (isolated probe — labeled non-canonical trigger).** The canonical burst above did not itself force an `ioctl` onto an already-closed fd (kitty removes the fd from its poll set promptly), so the `EBADF`/`ENOTTY` branch [`kitty/child-monitor.c:581`] was exercised with a **separate, isolated C probe** (`pty_probe`, see harness) that opens a real PTY master, closes it, and then issues the same `ioctl`. This probe is **not** the canonical kitty path — it is labeled as such — and only serves to demonstrate the errno values the branch swallows:
 
 ```text
-$ sed -n '1,6p' /obs_out/logs/pty_probe.log
+$ ./pty_probe > /obs_out/logs/pty_probe.log ; sed -n '1,4p' /obs_out/logs/pty_probe.log
 A1 ioctl on OPEN master:            ret=0 errno=0 (ok)
 A2 ioctl on master AFTER child exit: ret=0 errno=0 (ok)
 A3 ioctl on CLOSED master fd:        ret=-1 errno=9 (Bad file descriptor)  <- EBADF branch
@@ -764,12 +1034,12 @@ The `getpgid(...) = -1 ESRCH` lines are `hangup` [`:1296-1297`] discovering the 
 The claim that a closed PTY yields `EIO` on the master `read` is narrowed to the **exact** condition under which it was observed, using the isolated `pty_probe` (labeled non-canonical, as in Q2). Two sub-cases were measured:
 
 ```text
-$ sed -n '8,13p' /obs_out/logs/pty_probe.log
+$ sed -n '5,9p' /obs_out/logs/pty_probe.log
 --- Test B: read(master) after session-leader exit ---
 B1 sole session-leader exits, NO survivor holding slave:
     final read(master) ret=-1 errno=5 (Input/output error)
 B2 session-leader exits, BACKGROUND survivor still holds+writes slave:
-    read(master) ret=3 errno=5 (data) (survivor output readable => window would stay open)
+    read(master) ret=3 errno=0 (data) (survivor output readable => window would stay open)
 ```
 
 - **B1** (the *only* condition that yields `EIO=5`): the sole session leader on the slave side exits and **nothing** holds the slave open → the master `read` returns `-1/EIO`. This is what the IO loop treats as PTY EOF and turns into `needs_removal` [`:1535`].
@@ -1134,7 +1404,7 @@ Diagnostic-count distribution over the 40 runs (this *is* the run-to-run inconsi
 
 Range **4–8**, mode **4** (35/40 ≈ 88 %). Aggregated over all 40 runs: `children count` at divergence ∈ `{15 ×4, 16 ×40, 17 ×55, 18 ×73}` (always `< 20`); `add queue` = `0` at every one of the **172** samples; stale ids seen = `{2 ×160, 3 ×9, 4 ×1, 5 ×2}`; exceptions = `0`. **The diagnostic count is therefore _not_ deterministic — it is the distribution tabulated above.** What *is* invariant across every run is the *safety envelope*: bounded diagnostics, `children count < 20`, `add queue == 0`, and zero exceptions. That invariant — not a fixed count — is the reconciliation guarantee the question is really about; the count, the specific stale ids, and the exact counts each diagnostic saw are precisely the run-to-run variation, reported rather than smoothed away.
 
-### Q4b coalescing — 2 runs of `q4b.session` (SHA-256 `cf8c289da8b819e278e7b0dba33d5b296d1f8bfdd69fc75f880ba530a5a30093`)
+### Q4b coalescing — 2 runs of `q4b.session` (SHA-256 `cf8c289da8b819e278e7b0dba33d5b296d1f8bfdd69fc75f880ba530a5a30093`, a recorded instance — see corpus note; the gate path is volatile so this hash is not byte-reproducible)
 
 | run_id | signalfd read-calls | SIGCHLD records | reaps | coalescing (records ≪ reaps)? |
 |--------|---------------------|-----------------|-------|-------------------------------|
