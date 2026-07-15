@@ -149,13 +149,28 @@ OpenGL context to run at all. A headless context is provided with Xvfb plus Mesa
 OpenGL (llvmpipe):
 
 ```sh
-# Fresh PRIVATE authenticated display: access control stays ON (no -ac), and the
-# server resets/exits normally on teardown (no -noreset). This line is excerpted
-# from the complete fail-fast, trap-guarded, two-run workflow in Appendix B.
+# Fresh PRIVATE authenticated display on a DYNAMICALLY chosen FREE number, so the
+# workflow never silently attaches to a pre-existing (possibly unauthenticated)
+# server. Access control stays ON (no -ac); the server resets/exits normally on
+# teardown (no -noreset). This is excerpted from the complete fail-closed,
+# trap-guarded, two-run workflow in Appendix B (which also asserts trace/render counts).
 export XAUTHORITY="$(mktemp /tmp/obs_kitty.xauth.XXXXXX)"
-xauth -f "$XAUTHORITY" add :99 . "$(mcookie)"
-Xvfb :99 -screen 0 1280x800x24 -auth "$XAUTHORITY" +extension GLX +render &
-export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+for n in $(seq 99 199); do                                   # first FREE display number
+  [ -e "/tmp/.X11-unix/X$n" ] || [ -e "/tmp/.X$n-lock" ] && continue   # in use -> skip
+  DISPLAY_NUM=":$n"; : > "$XAUTHORITY"
+  xauth -f "$XAUTHORITY" add "$DISPLAY_NUM" . "$(mcookie)" >/dev/null 2>&1 || continue
+  Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -auth "$XAUTHORITY" +extension GLX +render \
+    >/tmp/obs_kitty.xvfb.log 2>&1 &
+  XVFB_PID=$!                                                 # capture the PID we spawned
+  export DISPLAY="$DISPLAY_NUM" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+  for i in $(seq 1 50); do                                   # wait until OUR server answers
+    kill -0 "$XVFB_PID" 2>/dev/null || break                 # spawned server died -> next n
+    xdpyinfo >/dev/null 2>&1 && break; sleep 0.1
+  done
+  # Ownership proof: OUR server must be alive AND answering AND own the socket.
+  kill -0 "$XVFB_PID" 2>/dev/null && [ -S "/tmp/.X11-unix/X$n" ] && break
+  kill "$XVFB_PID" 2>/dev/null || true; wait "$XVFB_PID" 2>/dev/null || true
+done
 ```
 
 ### Launch commands (canonical, legacy default keyboard mode)
@@ -168,8 +183,17 @@ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
 ```
 
 `--config NONE` means no `kitty.conf` is read, so the observed behavior is canonical (the
-default *legacy* keyboard mode: `mDECCKM` and the key-encoding flags are unset). The child is a
-real `bash --norc --noprofile`, so the typed bytes are consumed and echoed by an actual shell.
+default *legacy* keyboard mode: `mDECCKM` and the key-encoding flags are unset). Kitty is
+*invoked* with `bash --norc --noprofile`, but because its default shell integration is enabled
+(`'disabled' not in opts.shell_integration`, `kitty/child.py:265-267`) it rewrites the child's
+argument vector before launching it: `modify_shell_environ` dispatches to `setup_bash_env`,
+which strips `--norc`/`--noprofile`, records their effect in the `KITTY_BASH_INJECT` environment
+variable (whose observed value includes `no-rc` and `no-profile`), points `ENV` at
+`shell-integration/bash/kitty.bash`, and inserts `--posix` (`kitty/shell_integration.py:70-146`).
+The **actual child argv is therefore `bash --posix`**, as observed at runtime in
+`/proc/<child-pid>/cmdline`, while the requested no-rc/no-profile semantics are preserved through
+those environment variables. Either way the child is a real, interactive `bash` on a PTY — not a
+synthetic sink — so the typed bytes are genuinely consumed and echoed by an actual shell.
 
 `--debug-input` is aliased `--debug-keyboard`; `--debug-rendering` is aliased `--debug-gl`
 (confirmed from `kitty --help`). The trace lines are emitted by `debug()` / `printf` calls
@@ -197,7 +221,7 @@ done
 [ -n "$WID" ] || { echo "no correlated kitty window"; kill "$KITTY_PID" 2>/dev/null; exit 1; }
 xdotool windowactivate --sync "$WID"; xdotool windowfocus --sync "$WID"
 for k in a b c Return ctrl+a shift+b; do xdotool key --window "$WID" "$k"; sleep 0.5; done
-# (Complete fail-fast / trap-teardown / two-run form: Appendix B.)
+# (Complete fail-closed / trap-teardown / two-run form, with count assertions: Appendix B.)
 ```
 
 Keys exercised: `a`, `b`, `c` (unmodified printable keys); `Enter` (a control key that produces
@@ -720,67 +744,93 @@ space, exactly as the binary emits them):
 
 ```sh
 #!/usr/bin/env bash
-# Complete, noninteractive, fail-fast, auditable capture of Kitty's input->display
-# debug traces. Run from the repository root. It builds the launcher, starts a
-# fresh PRIVATE authenticated display, captures every spawned PID, redirects all
-# trace output to named logs, discovers the Kitty window bounded AND correlated to
-# the launched PID, injects a fixed key set, runs the input capture TWICE, then
-# normalizes and compares with diff + md5sum. A trap tears down only the spawned
-# Xvfb/Kitty PIDs; cleanup is limited to one named temp dir.
-set -uo pipefail
+# Complete, noninteractive, FAIL-CLOSED, auditable capture of Kitty's input->display
+# debug traces. Run from the repository root. It builds the launcher, starts a fresh
+# PRIVATE authenticated display on a DYNAMICALLY chosen free number (never attaching to a
+# pre-existing server), captures every spawned PID, redirects all trace output to named
+# logs, discovers the Kitty window bounded AND correlated to the launched PID, injects a
+# fixed key set, runs the input capture TWICE, then normalizes and ASSERTS the exact
+# line/decision/render counts before comparing with diff + md5sum. Any failed build,
+# injection, count, render, or equality check terminates NON-ZERO and never prints
+# CAPTURE_DONE. A trap tears down ONLY the spawned Xvfb/Kitty PIDs (kill THEN reap with
+# wait, so no <defunct> survives a non-reaping PID 1) and removes ONLY one named temp dir.
+set -euo pipefail
 
-DISPLAY_NUM=":99"
 KITTY="$PWD/kitty/launcher/kitty"            # produced by the build step below
 KEYS=(a b c Return ctrl+a shift+b)           # fixed keys: unmodified + control + modifier
+
 WORK="$(mktemp -d /tmp/obs_kitty.XXXXXX)"    # named private scratch (removed by trap)
 STATUS="$WORK/status"; : > "$STATUS"
 log(){ echo "$*" | tee -a "$STATUS"; }
 
-# 0) Build the launcher from source in default configuration (canonical toolchain).
-#    go builds only the kitten CLI (off the input->display path); python3 is the
-#    canonical CPython 3.12.3 interpreter.
-export PATH=/usr/lib/go-1.22/bin:$PATH
-CI=true python3 setup.py build               # -> kitty/launcher/kitty  (kitty 0.35.2)
-
-# 1) Prerequisite checks (fail fast if any tool or the launcher is missing).
-for t in Xvfb xdotool xdpyinfo mcookie xauth; do
-  command -v "$t" >/dev/null 2>&1 || { log "PREREQ MISSING: $t"; exit 1; }
-done
-[ -x "$KITTY" ] || { log "PREREQ MISSING: $KITTY (build did not produce launcher)"; exit 1; }
-
-# 2) Fresh, PRIVATE, authenticated display. Access control stays ON (NO -ac): a
-#    per-run MIT-MAGIC-COOKIE restricts the display to this workflow. NO -noreset,
-#    so the server resets and exits normally when torn down.
-export XAUTHORITY="$WORK/xauth"; : > "$XAUTHORITY"
-xauth -f "$XAUTHORITY" add "$DISPLAY_NUM" . "$(mcookie)" >/dev/null 2>&1
-
-# 3) Trap-based teardown: kill ONLY the PIDs we spawn and remove ONLY our temp dir.
-XVFB_PID=""; KITTY_PID=""
+# Teardown installed IMMEDIATELY after the temp dir exists, so an interrupt at any later
+# point (even during the build) still cleans up. It kills THEN waits (reaps) each PID we
+# own, so no <defunct> Xvfb/Kitty can linger under a non-reaping PID 1, and removes only WORK.
+XVFB_PID=""; KITTY_PID=""; DISPLAY_NUM=""
 cleanup() {
-  [ -n "$KITTY_PID" ] && kill "$KITTY_PID" 2>/dev/null || true
-  [ -n "$XVFB_PID" ]  && kill "$XVFB_PID"  2>/dev/null || true
-  rm -rf "$WORK"
+  if [ -n "${KITTY_PID:-}" ]; then kill "$KITTY_PID" 2>/dev/null || true; wait "$KITTY_PID" 2>/dev/null || true; KITTY_PID=""; fi
+  if [ -n "${XVFB_PID:-}"  ]; then kill "$XVFB_PID"  2>/dev/null || true; wait "$XVFB_PID"  2>/dev/null || true; XVFB_PID="";  fi
+  [ -n "${WORK:-}" ] && rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
 
-Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -auth "$XAUTHORITY" +extension GLX +render \
-  >"$WORK/xvfb.log" 2>&1 &
-XVFB_PID=$!
-export DISPLAY="$DISPLAY_NUM" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
-for i in $(seq 1 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
-xdpyinfo >/dev/null 2>&1 || { log "Xvfb did not come up"; exit 1; }
-log "Xvfb up (pid $XVFB_PID)"
+# 0) Prerequisite tools, then build the launcher from source in default configuration
+#    (canonical toolchain). go builds only the kitten CLI (off the input->display path);
+#    python3 is the canonical CPython 3.12.3 interpreter. The build is checked explicitly
+#    (in addition to `set -e`) so a failed build stops here with a clear message.
+for t in Xvfb xdotool xdpyinfo mcookie xauth; do
+  command -v "$t" >/dev/null 2>&1 || { log "PREREQ MISSING: $t"; exit 1; }
+done
+export PATH=/usr/lib/go-1.22/bin:$PATH
+CI=true python3 setup.py build || { log "BUILD FAILED"; exit 1; }   # -> kitty/launcher/kitty (kitty 0.35.2)
+[ -x "$KITTY" ] || { log "PREREQ MISSING: $KITTY (build did not produce launcher)"; exit 1; }
 
-# 4) Bounded window discovery CORRELATED to the launched Kitty PID: accept only a
-#    window whose _NET_WM_PID (via getwindowpid) equals our launched PID, so a
-#    stale/unrelated window on a shared display can never be selected. Bails out if
-#    the launched Kitty dies (failure is never masked) and is time-bounded.
+# 1) Fresh, PRIVATE, authenticated display on a DYNAMICALLY chosen free number. We only
+#    consider a display number with NO existing socket or lock (so we can never silently
+#    attach to a pre-existing, possibly unauthenticated server), start OUR OWN server there
+#    with a per-run MIT-MAGIC-COOKIE (access control stays ON: no -ac), and accept it only
+#    after proving the server WE spawned is still alive AND answering AND owns the socket --
+#    xdpyinfo success alone is never treated as proof. NO -noreset, so the server
+#    resets/exits normally on teardown.
+XAUTHORITY="$WORK/xauth"; export XAUTHORITY
+start_private_xvfb() {
+  local n up i
+  for n in $(seq 99 199); do
+    if [ -e "/tmp/.X11-unix/X$n" ] || [ -e "/tmp/.X$n-lock" ]; then continue; fi  # display in use -> skip
+    DISPLAY_NUM=":$n"
+    : > "$XAUTHORITY"
+    xauth -f "$XAUTHORITY" add "$DISPLAY_NUM" . "$(mcookie)" >/dev/null 2>&1 || continue
+    Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -auth "$XAUTHORITY" +extension GLX +render \
+      >"$WORK/xvfb.log" 2>&1 &
+    XVFB_PID=$!
+    export DISPLAY="$DISPLAY_NUM" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+    up=""
+    for i in $(seq 1 50); do
+      kill -0 "$XVFB_PID" 2>/dev/null || break         # spawned server died (e.g. race) -> next
+      if xdpyinfo >/dev/null 2>&1; then up=1; break; fi
+      sleep 0.1
+    done
+    # Ownership proof: OUR server must still be alive AND answering AND own the socket.
+    if [ -n "$up" ] && kill -0 "$XVFB_PID" 2>/dev/null && [ -S "/tmp/.X11-unix/X$n" ]; then
+      log "Xvfb up on $DISPLAY_NUM (spawned pid $XVFB_PID; ownership verified)"
+      return 0
+    fi
+    kill "$XVFB_PID" 2>/dev/null || true; wait "$XVFB_PID" 2>/dev/null || true; XVFB_PID=""
+  done
+  return 1
+}
+start_private_xvfb || { log "FAIL: could not start a private Xvfb on any free display"; exit 1; }
+
+# 2) Bounded window discovery CORRELATED to the launched Kitty PID: accept only a window
+#    whose _NET_WM_PID (via getwindowpid) equals our launched PID, so a stale/unrelated
+#    window can never be selected. Bails out if the launched Kitty dies (failure never
+#    masked) and is time-bounded.
 find_window() {                               # $1 = launched Kitty PID
-  local pid="$1" wid wpid
+  local pid="$1" wid wpid i
   for i in $(seq 1 150); do                   # <= ~15s
     for wid in $(xdotool search --class kitty 2>/dev/null || true); do
       wpid=$(xdotool getwindowpid "$wid" 2>/dev/null || echo "")
-      [ "$wpid" = "$pid" ] && { echo "$wid"; return 0; }
+      if [ "$wpid" = "$pid" ]; then echo "$wid"; return 0; fi
     done
     kill -0 "$pid" 2>/dev/null || return 1    # launched Kitty died -> fail fast
     sleep 0.1
@@ -792,13 +842,17 @@ run_input() {                                 # $1 = log file
   "$KITTY" --debug-input --config NONE -o confirm_os_window_close=0 \
     bash --norc --noprofile >"$1" 2>&1 &
   KITTY_PID=$!
-  local WID; WID=$(find_window "$KITTY_PID") \
-    || { log "no correlated kitty window (input)"; kill "$KITTY_PID" 2>/dev/null; return 1; }
+  local WID k; WID=$(find_window "$KITTY_PID") \
+    || { log "no correlated kitty window (input)"; kill "$KITTY_PID" 2>/dev/null || true; return 1; }
   log "input  window=$WID correlated_to kitty_pid=$KITTY_PID"
   xdotool windowactivate --sync "$WID" >/dev/null 2>&1 || true
   xdotool windowfocus  --sync "$WID"   >/dev/null 2>&1 || true
   sleep 0.6
-  for k in "${KEYS[@]}"; do xdotool key --window "$WID" "$k"; sleep 0.5; done
+  # Every key injection is checked: a failed xdotool aborts the run (never a silent success).
+  for k in "${KEYS[@]}"; do
+    xdotool key --window "$WID" "$k" || { log "INJECT FAILED: $k"; kill "$KITTY_PID" 2>/dev/null || true; return 1; }
+    sleep 0.5
+  done
   sleep 0.6
   kill "$KITTY_PID" 2>/dev/null || true; wait "$KITTY_PID" 2>/dev/null || true; KITTY_PID=""
 }
@@ -808,7 +862,7 @@ run_render() {                                # $1 = log file
     bash --norc --noprofile >"$1" 2>&1 &
   KITTY_PID=$!
   local WID; WID=$(find_window "$KITTY_PID") \
-    || { log "no correlated kitty window (render)"; kill "$KITTY_PID" 2>/dev/null; return 1; }
+    || { log "no correlated kitty window (render)"; kill "$KITTY_PID" 2>/dev/null || true; return 1; }
   log "render window=$WID correlated_to kitty_pid=$KITTY_PID"
   sleep 1.2
   kill "$KITTY_PID" 2>/dev/null || true; wait "$KITTY_PID" 2>/dev/null || true; KITTY_PID=""
@@ -818,23 +872,48 @@ run_render() {                                # $1 = log file
 normalize(){ sed -E 's/\x1b\[[0-9;]*m//g; s/^\[[0-9]+\.[0-9]+\] //' "$1" \
              | grep -E '(xkb_keycode:|on_key_input:)'; }
 
-# 5) Two identical input runs + one render run, each into a named log.
+# 3) Two identical input runs + one render run, each into a named log.
 log "== RUN 1 (input) =="; run_input  "$WORK/input1.log" || { log "RUN1 FAILED";   exit 1; }
 log "== RUN 2 (input) =="; run_input  "$WORK/input2.log" || { log "RUN2 FAILED";   exit 1; }
 log "== RENDER =="       ; run_render "$WORK/render.log" || { log "RENDER FAILED"; exit 1; }
 
-# 6) Normalize and compare (auditable): diff must be empty and both MD5s equal.
-normalize "$WORK/input1.log" > "$WORK/norm1.txt"
-normalize "$WORK/input2.log" > "$WORK/norm2.txt"
-log "trace1 key-event lines: $(wc -l < "$WORK/norm1.txt")"   # expect 32
-log "trace2 key-event lines: $(wc -l < "$WORK/norm2.txt")"   # expect 32
-diff -u "$WORK/norm1.txt" "$WORK/norm2.txt" && log "DIFF: identical"
+# 4) Normalize, then ASSERT the exact structure BEFORE trusting the comparison. Empty or
+#    short logs (e.g. a failed capture) can otherwise compare "equal", so counts are
+#    enforced first: 32 key-event lines = 16 reception (xkb_keycode) + 16 processing
+#    (on_key_input) = 6 sent + 10 ignored decisions.
+normalize "$WORK/input1.log" > "$WORK/norm1.txt" || true
+normalize "$WORK/input2.log" > "$WORK/norm2.txt" || true
+n1=$(wc -l < "$WORK/norm1.txt"); n2=$(wc -l < "$WORK/norm2.txt")
+log "trace1 key-event lines: $n1   trace2 key-event lines: $n2"
+[ "$n1" -eq 32 ] || { log "FAIL: trace1 has $n1 key-event lines (expected 32)"; exit 1; }
+[ "$n2" -eq 32 ] || { log "FAIL: trace2 has $n2 key-event lines (expected 32)"; exit 1; }
+recv=$(grep -c 'xkb_keycode:'         "$WORK/norm1.txt" || true)
+proc=$(grep -c 'on_key_input:'        "$WORK/norm1.txt" || true)
+sent=$(grep -c 'to child:'            "$WORK/norm1.txt" || true)
+ign=$( grep -c 'ignoring as keyboard' "$WORK/norm1.txt" || true)
+log "reception=$recv processing=$proc sent=$sent ignored=$ign"
+[ "$recv" -eq 16 ] || { log "FAIL: reception lines=$recv (expected 16)";  exit 1; }
+[ "$proc" -eq 16 ] || { log "FAIL: processing lines=$proc (expected 16)"; exit 1; }
+[ "$sent" -eq 6 ]  || { log "FAIL: sent decisions=$sent (expected 6)";    exit 1; }
+[ "$ign"  -eq 10 ] || { log "FAIL: ignored decisions=$ign (expected 10)"; exit 1; }
+
+# 5) The two runs must be byte-identical (explicit failing check, not a silent &&).
+if ! diff -u "$WORK/norm1.txt" "$WORK/norm2.txt"; then
+  log "FAIL: the two normalized traces are NOT byte-identical"; exit 1
+fi
+log "DIFF: identical"
 md5sum "$WORK/norm1.txt" "$WORK/norm2.txt"
-sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/render.log" \
-  | grep -E 'GL version string:|OS Window created|Child launched'
-log "sent=$(grep -c 'to child:' "$WORK/norm1.txt")  ignored=$(grep -c 'ignoring as keyboard' "$WORK/norm1.txt")"
+
+# 6) The render leg must show the three lifecycle signals (each required).
+sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/render.log" > "$WORK/render.stripped"
+for sig in 'GL version string:' 'OS Window created' 'Child launched'; do
+  grep -qF "$sig" "$WORK/render.stripped" || { log "FAIL: missing render signal: $sig"; exit 1; }
+done
+grep -E 'GL version string:|OS Window created|Child launched' "$WORK/render.stripped" || true
+
+# 7) Only now, after every assertion passed, is the capture declared complete.
 log "CAPTURE_DONE"
-# Trap now fires: only the spawned Xvfb/Kitty PIDs are killed and only "$WORK" is removed.
+# Trap fires: the spawned Xvfb/Kitty PIDs are killed AND reaped, and only "$WORK" is removed.
 ```
 
 All observation scripts and logs were temporary and were removed after the investigation; the
