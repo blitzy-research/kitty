@@ -79,12 +79,16 @@ alongside the compiled `fast_data_types` C extension; that embedded interpreter 
 Python — runs every observation script below via `kitty +launch`.
 
 **Source commit.** These observations characterize the history/scrollback subsystem at the required
-source commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`). The acceptance
-checkout reports `git rev-parse HEAD` = `e6486adb6975d2c063659f6a17d6068bc55a157d`; the required commit
-is an **ancestor** of that HEAD, and the two trees are **byte-identical across the entire product**
-(`git diff 815df1e2..HEAD -- . ':(exclude)blitzy/**'` is empty — the only difference is this
-deliverable under `blitzy/`). Every cited `file:line` and every observed value therefore applies
-unchanged. The exact verification is shown in §12.
+source commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`). Provenance is
+anchored to that **immutable source commit**, not to a mutable `HEAD` hash: because this document is
+itself introduced by a commit, the `HEAD` seen when the delivered artifact is read is a **descendant**
+of the commit that was checked out while the campaign ran, so no fixed `HEAD` value embedded here would
+still match once this file is committed. What *does* reproduce on any checkout that contains this
+document are two stable facts, both shown in §12: the required commit is an **ancestor** of `HEAD`
+(`git merge-base --is-ancestor 815df1e2… HEAD` succeeds), and the product tree is **byte-identical** to
+it everywhere outside `blitzy/` (`git diff --name-only 815df1e2..HEAD -- . ':(exclude)blitzy/**'` is
+empty — the only difference is this deliverable). Every cited `file:line` and every observed value
+therefore applies unchanged.
 
 ### 2.2 Canonical build (and an unrelated build-warning caveat)
 
@@ -445,16 +449,21 @@ count==ynum ? True ; count never exceeded ynum ? True ; pager_bytes=0
   `dRSS_kB` = 5604, 10736, 15868, 21000, 26136, …, 50596 — i.e. **≈5132 kB per new segment**. The
   increment is *not* perfectly uniform: reading the `dRSS_kB` column as consecutive differences gives
   the gap sequence `5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` — eight full-segment gaps of
-  5132 kB, a **single 5136 kB step into the `count = 10240` boundary** (a one-page, ≈4 kB, first-touch
-  jitter, visible directly in the `dRSS_kB` column: `26136 − 21000 = 5136`), and a smaller **3932 kB
-  final step** because the tenth segment is only partially faulted (`20000 − 18432 = 1568` of its 2048
-  rows). The ≈5132 kB step matches the 5,251,072-byte (5128 KiB) per-segment `calloc` above (the small
-  excess is page-table and first-touch overhead). Every **structural value** (`count`, the
-  `1 → 2 → … → 10` segment progression, `count == ynum`, `pager_bytes = 0`) was **byte-identical across
-  both runs**, and so was the *gap sequence* above — including the 5136 kB outlier, which reproduced at
-  the same `count = 10240` boundary in both runs; what drifted was only the *absolute* `dRSS`, by ≈4 kB
-  (one page) run-to-run (RUN 2's first step read 5608 vs RUN 1's 5604), reflecting ordinary first-touch
-  / baseline-RSS noise, not any change in allocation behaviour. RSS is a process-wide figure and is
+  5132 kB, a **single ≈4 kB-larger 5136 kB step** (a one-page first-touch jitter; in this campaign's
+  runs it landed at the `count = 10240` boundary, visible directly in the `dRSS_kB` column:
+  `26136 − 21000 = 5136`), and a smaller **3932 kB final step** because the tenth segment is only
+  partially faulted (`20000 − 18432 = 1568` of its 2048 rows). The ≈5132 kB step matches the
+  5,251,072-byte (5128 KiB) per-segment `calloc` above (the small excess is page-table and first-touch
+  overhead). The **structural values** — `count`, the `1 → 2 → … → 10` segment progression,
+  `count == ynum`, `pager_bytes = 0`, the ≈5132 kB full-segment step, and the partial 3932 kB final
+  step — were **byte-identical across both runs** and reproduce across build sessions. The lone 5136 kB
+  step is different in kind: it is a single one-page (≈4 kB) first-touch / page-table artifact whose
+  *presence* is expected but whose *position* is **build-session-dependent**. Within one build it is
+  stable (both runs here placed it at `count = 10240`), but a separately compiled build session
+  observed the same one-page bump at a **different** boundary (`count = 6144`), so the outlier's
+  location is **not** a structural invariant. What else drifts is only the *absolute* `dRSS`, by ≈4 kB
+  (one page) run-to-run (RUN 2's first step read 5608 vs RUN 1's 5604), ordinary first-touch /
+  baseline-RSS noise, not any change in allocation behaviour. RSS is a process-wide figure and is
   used here as corroboration of the segmented store's growth, not as its exclusive measure (§8.4/§8.5
   give allocator-level attribution).
 - *After (saturate):* requesting 80,000 more lines pins `count` at `ynum = 20000` with `segments = 10`;
@@ -1816,7 +1825,12 @@ count= 20000 segments= 10
 exit=0
 ```
 
-Both runs completed with no SIGILL and produced identical profiles; the peak snapshot is #76 in both.
+Both runs completed with no SIGILL and produced identical profiles *within this build session*; the
+peak snapshot is `#76` in both. The exact peak-snapshot *index* is a Massif-internal sampling figure
+that varies across build sessions — a separately compiled build peaked at `#72` and this document's
+re-verification build at `#75` — so the snapshot number is **not** a structural invariant; what is
+structural is the allocation *attribution* at the peak (below), which reproduces byte-for-byte across
+all of those builds (§9).
 
 **Extraction (documented, reproducible).** Render the report and read the peak snapshot's summary row
 and allocation tree:
@@ -1859,9 +1873,14 @@ $ # the add_segment subtree (its two calloc call sites and their call chains):
 |     ->08.91% (5,251,072B) 0x5E9A1B3: new_screen_object (screen.c:130)
 ```
 
-**Reading the peak (#76).** Total heap at peak is **58,941,048 B**, which is useful heap
-**58,858,788 B (56.13 MiB)** plus `82,260 B` of allocator extra (peak-table row #76 above). Massif's
-allocation-tree percentages are computed against that total heap, and attribute it as follows:
+**Reading the peak.** Total heap at the peak snapshot (`#76` in this captured run) is **58,941,048 B**,
+which is useful heap **58,858,788 B (56.13 MiB)** plus `82,260 B` of allocator extra (peak-table
+row #76 above). *These process-wide heap totals, like the snapshot index, carry a small cross-session
+profiler wobble: this document's re-verification build reported peak `#75` with useful heap
+`58,858,824 B`, and a separately compiled build reported `#72` with `58,858,860 B` — a spread of only
+tens of bytes on a 56 MiB heap. They are Massif sampling figures, not structural invariants (§9).* What
+**is** structural — byte-for-byte identical across all of those builds — is the allocation *attribution*
+against the peak heap, which Massif's allocation-tree percentages compute as follows:
 - **89.09% (52,510,720 B) = `add_segment` (`history.c:25`)** — the entire segmented store, and exactly
   `10 × 5,251,072`, independently confirming the per-segment size of §3.1. It splits into two `calloc`
   call sites:
@@ -2018,11 +2037,11 @@ stable and where variance appeared and why.
 *character-for-character identical* between run 1 and run 2:
 - `units.py` — the raw-bytes-vs-MiB semantics (§5).
 - Scenario A — the saturation triple `count=20000, segments=10, pager_bytes=0`, the `1 → 2 → … → 10`
-  segment progression, and the per-segment RSS increment *sequence*
-  `5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` kB — ≈5132 kB per full segment, with one
-  reproducible 5136 kB step into the `count=10240` boundary and a partial 3932 kB final step — which
-  was itself byte-identical across both runs (§4). *(Only the absolute `dRSS` values, not this gap
-  sequence, drift run-to-run — see the RSS-noise note below.)*
+  segment progression, the ≈5132 kB per-full-segment RSS step, and the partial 3932 kB final step —
+  all byte-identical across both runs (§4). *(The gap sequence also contains one ≈4 kB-larger "5136 kB"
+  step; within this build both runs place it at the same boundary, but its position is a
+  build-session-dependent one-page first-touch jitter — not a structural invariant — and the absolute
+  `dRSS` values drift run-to-run, both covered in the RSS-noise note below.)*
 - Scenario B — the eviction hand-off byte counts `17/187/1887/18887` and the ~1220 kB
   construction-time RSS delta that corroborates the ~1 MiB initial ring reservation (§5).
 - Scenario C2 — the three *used*-byte thresholds at which the extend-cost spikes land,
@@ -2033,8 +2052,14 @@ stable and where variance appeared and why.
   wobble; the structural `pager_bytes` figures `140000 → 420000 → 980000` do not — see the RSS-noise
   note below.)*
 - `mallocinfo.py` — the segment and pager deltas (§8.5).
-- Massif — identical profiles, peak snapshot **#76** with useful heap `58,858,788 B` in both runs
-  (§8.4).
+- Massif — the allocation *attribution* at the peak: `add_segment` `89.09% = 52,510,720 B`, split into
+  `segment_for` `80.18% = 47,259,648 B` (the 9 lazy segments) and `create_historybuf`
+  `8.91% = 5,251,072 B` (the 1 construction-time segment) — byte-identical across both runs and
+  reproduced exactly on independently compiled builds (§8.4). *(The peak-snapshot **index** and the
+  process-wide heap **totals** are not structural: they carry a small cross-session profiler wobble —
+  `#76` / useful `58,858,788 B` in this captured run, `#75` / `58,858,824 B` on the re-verification
+  build, `#72` / `58,858,860 B` on a separate build — Massif sampling artifacts, not buffer behaviour;
+  see §8.4.)*
 
 **Reproducible in character, not to the microsecond (raw timing).** The per-line *timings* in
 Scenario C/C2 are wall-clock and therefore not bit-identical run to run, but their *structure* is
@@ -2062,21 +2087,29 @@ figures, so their *absolute* values carry a small run-to-run wobble (typically o
 baseline drift and first-touch page accounting. This showed up concretely in Scenario A, where run 1's
 first fill step read `5604 kB` and run 2's read `5608 kB`; in Scenario E's post-saturation steps
 (`51644/53044/54920` vs `51644/53048/54908`); and in Scenario B's Part 0 construction cost
-(`1308/1304 kB`). What is stable is the *increment sequence*, not a single uniform number: across
-Scenario A's nine full-segment boundaries the per-segment step was `5132 kB` at eight of them, with a
-single `5136 kB` step into `count=10240` and a partial `3932 kB` final step, and that whole sequence
-`5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` was byte-identical across both runs — the lone
-5136 outlier is a one-page first-touch jitter that reproduced, not evidence of uniform behaviour. The
-structural quantities layered on top of RSS (`count`, `segments`, `pager_bytes`) were byte-identical
-throughout. RSS is therefore used as corroboration of the two structures' growth, never as their
+(`1308/1304 kB`). What is stable across build sessions is the *shape* of the increment sequence, not a
+single uniform number: the per-full-segment step is `≈5132 kB` (matching the per-segment `calloc`) and
+the final partial step is `≈3932 kB`. The sequence also carries exactly one `≈4 kB`-larger step — a
+`5136 kB` value in place of `5132 kB` — which is a one-page first-touch / page-table artifact. Within a
+single build that outlier is stable (both runs here recorded it at `count=10240`, giving the identical
+sequence `5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` byte-for-byte), but its *position* is
+build-session-dependent: a separately compiled build session observed the same lone bump at a
+**different** boundary (`count=6144`). Its *presence* is expected; its *location* is not a structural
+invariant. The structural quantities layered on top of RSS (`count`, `segments`, `pager_bytes`) were
+byte-identical throughout. RSS is therefore used as corroboration of the two structures' growth, never as their
 exclusive measure — §8.4/§8.5 give the allocator-level attribution that does not depend on RSS.
 
-In short: every **structural** quantity (counts, segment totals, byte sizes, extend points, heap peak,
-and the per-segment RSS *increment sequence* — including its lone 5136 kB outlier) is exactly
-reproducible. Two things vary run-to-run, both
-benignly: raw microsecond timings (whose *shape* is reproducible and whose outliers were traced to a
-specific, demonstrable cause — Python's cyclic GC), and the *absolute* process-RSS figures (which wobble
-by about one page for the ordinary reasons above).
+In short: every **structural** quantity (counts, segment totals, byte sizes, extend points, the
+heap-peak *attribution* — `add_segment` `89.09% = 52,510,720 B`, split `80.18%`/`8.91%` — and the
+*shape* of the per-segment RSS increment sequence — its `≈5132 kB` per-full-segment step and
+`≈3932 kB` partial-final step) is exactly reproducible. Four things are not fixed, all benignly: raw
+microsecond timings (which vary run-to-run — their *shape* is reproducible and their outliers were
+traced to a specific, demonstrable cause, Python's cyclic GC); the *position* of the lone `≈4 kB`
+first-touch outlier within the RSS increment sequence (stable within a single build, but
+build-session-dependent — `count=10240` here, `count=6144` in a separately compiled build); the Massif
+peak-snapshot *index* and process-wide heap *totals* (which drift by a sampling artifact of tens of
+bytes across build sessions — `#76`/`#75`/`#72`, §8.4); and the *absolute* process-RSS figures (which
+wobble by about one page run-to-run for the ordinary reasons above).
 
 ## 10. Observed vs. inferred
 
@@ -2114,8 +2147,12 @@ such, with the reason it could not be observed directly and any indirect corrobo
   on the non-final rows — Scenario E, via `Line.last_char_has_wrapped_flag()`.
 - **Retention off vs. on.** Oldest line lost with the pager disabled vs. preserved (serialized) with it
   enabled — Scenario E.
-- **Total heap peak and its attribution.** Useful heap `58,858,788 B`; segmented store `89.09%` —
-  Massif (§8.4); corroborated process-wide by `malloc_info` (§8.5).
+- **Heap-peak attribution.** The segmented store is `89.09% = 52,510,720 B` of the peak heap
+  (`add_segment`, `history.c:25`), split `80.18%`/`8.91%` between the 9 lazily-added and 1
+  construction-time segments — Massif (§8.4), reproduced *exactly* across independently compiled build
+  sessions; corroborated process-wide by `malloc_info` (§8.5). *(The absolute peak-heap total — useful
+  `≈58.86 MiB` — is an observed but session-dependent profiler figure that drifts by tens of bytes
+  across builds, not a structural invariant; §8.4/§9.)*
 - **Build/tooling facts.** The default `-Werror` build failure, the Massif SIGILL location, and the
   corrected profiling build — §2.2, §8.4 (all with captured command output).
 
@@ -2264,27 +2301,35 @@ $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 ```
 
-**Commit provenance (acceptance checkout).** The observations characterize the required source commit
-`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. The acceptance checkout's `HEAD` is a **descendant** of it,
-and the product tree is **byte-identical** between the two (the only difference is this deliverable
-under `blitzy/`), so every cited `file:line` and observed value applies without change:
+**Commit provenance (delivered checkout).** The observations characterize the required source commit
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Because this document is added by its own commit, the
+delivered checkout's `HEAD` is a **descendant** of the required commit; rather than embed a mutable
+`HEAD` hash that would no longer match once this file is committed, provenance is verified by checks
+that reproduce on any checkout containing this document — the required commit is an ancestor of `HEAD`,
+the product tree is byte-identical to it everywhere outside `blitzy/`, and the entire base→`HEAD`
+difference is this one deliverable:
 
 ```text
 $ git merge-base --is-ancestor 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD && echo "REQ is an ancestor of HEAD"
 REQ is an ancestor of HEAD
-$ git rev-parse HEAD
-e6486adb6975d2c063659f6a17d6068bc55a157d
 $ git diff --name-only 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD -- . ':(exclude)blitzy/**'
 $ # (no output above — product tree byte-identical outside blitzy/)
+$ git diff --name-only 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD
+blitzy/documentation/kitty_815df1e210e0.md
 ```
 
-**Final cleanup and clean-tree check.** After authoring, the entire private workspace is removed and
-the repository is confirmed to contain exactly one change — this document:
+**Final cleanup and clean-tree check.** After authoring, the entire private workspace is removed. On
+the delivered artifact this document is committed, so the working tree is clean and the only change
+relative to the required source commit is this one file (the `git diff --name-only` above); during
+authoring, before that commit, the same `git status` instead shows this single file pending as a
+working-tree change:
 
 ```text
 $ rm -rf "$WORK"                       # removes all temp scripts + profiler output
-$ git status --porcelain
- M blitzy/documentation/kitty_815df1e210e0.md
+$ git status --porcelain               # delivered (committed) checkout: clean working tree
+$ #   (no output above — nothing uncommitted; the deliverable is committed)
+$ #   during authoring, before the commit, this same command instead prints the file pending:
+$ #     M blitzy/documentation/kitty_815df1e210e0.md
 ```
 
 No product source, header, test, configuration, build file, or vendored dependency is modified; no
