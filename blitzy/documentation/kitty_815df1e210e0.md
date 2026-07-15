@@ -43,7 +43,7 @@ Every behavioral claim is placed **next to** the unedited output that demonstrat
 
 - **Q4 (timing).** Asynchronous POSIX signals are **decoupled** from state mutation. On Linux (`HAS_SIGNAL_FD` defined), the handled signals (`INT HUP TERM CHLD USR1 USR2`) are **blocked** and routed to a **`signalfd`** created on the **main thread** [`kitty/loop-utils.c:42`]; the **IO thread** later `read`s that descriptor at a safe point in `read_signals` [`kitty/loop-utils.c:131`]. Cross-thread wakeups use an **`eventfd`** [`kitty/loop-utils.c:70`], not a pipe. (The classic self-pipe — `handle_signal` writing a byte [`kitty/loop-utils.c:15`] — is the `#ifndef HAS_SIGNAL_FD` **fallback** for platforms without `signalfd`; the `self_pipe` helper itself is `static inline` and compiled in *all* builds [`kitty/loop-utils.h:51-52`].) Coalescing happens at **two levels**: the kernel collapses many pending `SIGCHLD` into a few `signalfd_siginfo` records, and kitty then collapses *any* number of `SIGCHLD` records into a **single** `child_died` boolean [`kitty/child-monitor.c:1371`] that triggers **one** `reap_children` call per loop iteration [`kitty/child-monitor.c:1526`]. Rapid resizes are de-duplicated by the `last_reported_pty_size` gate [`kitty/window.py:861`] and debounced by `resize_debounce_time`; on Linux the `on_end = 0.1 s` number is used [`kitty/child-monitor.c:1062`]. Observed: 16 children dying together produced **2–3** signal records but **16** reaps; typing (non-resize) produced **0** extra `ioctl`s.
 
-- **Q5 (conflicting liveness views).** The UI thread's view (`WindowList.all_windows[]` [`kitty/window_list.py:147`], `Boss.window_id_map`) and the IO thread's view (`children[]` plus the staged add/remove queues and `reaped_pids[]`) can transiently disagree. All shared child state is mutated under one mutex, `children_lock` [`kitty/child-monitor.c:87`], via the `children_mutex(op)` macro [`kitty/child-monitor.c:76-77`]. Each IO-loop iteration reconciles by running **removal before addition** under that lock. The reconciliation is what lets a resize target an id the UI thinks is alive while the IO array is still catching up — observed as the diagnostic firing on a stale id (most often `id: 2`, but `id: 3`/`4`/`5` also appear) while the C `children count` *rises* through `{15, 16, 17, 18}` in the same ~20 ms window (adds draining even as a stale reference is dropped). The Python-side idempotent pop [`kitty/boss.py:881`] resolves the doubled-death view. Observed across **40** repeated runs of the same hashed input: the diagnostic count is **not** deterministic — it varies **4–8** (modally **4**, in 35/40 runs). What *is* invariant across every run is the safety envelope — `children count` always `< 20`, `add queue` always `0`, and **zero** `KeyError`/tracebacks (see *Distribution of outcomes*).
+- **Q5 (conflicting liveness views).** The UI thread's view (`WindowList.all_windows[]` [`kitty/window_list.py:147`], `Boss.window_id_map`) and the IO thread's view (`children[]` plus the staged add/remove queues) can transiently disagree. All shared child state is mutated under one mutex, `children_lock` [`kitty/child-monitor.c:87`], via the `children_mutex(op)` macro [`kitty/child-monitor.c:76-77`]. Each IO-loop iteration reconciles by running **removal before addition** under that lock. The reconciliation is what lets a resize target an id the UI thinks is alive while the IO array is still catching up — observed as the diagnostic firing on a stale id (most often `id: 2`, but `id: 3`/`4`/`5` also appear) while the C `children count` *rises* through `{15, 16, 17, 18}` in the same ~20 ms window (adds draining even as a stale reference is dropped). An ordinary window death is delivered **outside** the lock via the `death_notify` callback [`kitty/child-monitor.c:522`] → `Boss.on_child_death` [`kitty/boss.py:881`] → `tab.remove_window` → `WindowList.remove_window` [`kitty/window_list.py:373`]; the separate `reaped_pids[]` table feeds only the monitored-background-pid callback `on_monitored_pid_death` [`kitty/boss.py:2725`], **not** window death. The idempotent pop [`kitty/boss.py:883-885`] resolves the doubled-death view. Observed across **40** repeated runs of the same hashed input: the diagnostic count is **not** deterministic — it varies **4–8** (modally **4**, in 35/40 runs). What *is* invariant across every run is the safety envelope — `children count` always `< 20`, `add queue` always `0`, and **zero** `KeyError`/tracebacks (see *Distribution of outcomes*).
 
 ---
 
@@ -208,12 +208,12 @@ The shim reads exactly one environment variable (`SHIM_LOG`, the log path) and o
 
 ### `libshim.so` — full source, compile command, and hash
 
-The observer is small enough to publish in full so every logged fact is auditable. Its header documents that it changes no behavior. SHA-256 (v2, with the `eventfd`/`pipe2`/`pipe` hooks): `52906935033b7713d2f253f22b225e74f0ada630c3c5ed2becc6128aa45b1963`.
+The observer is small enough to publish in full so every logged fact is auditable. Its header documents that it changes no behavior. SHA-256 (v2, with the `eventfd`/`pipe2`/`pipe` hooks; trailing whitespace stripped): `190c16fb143a1f21ed81c8818b02cb7267d103de9292fa23b3e006f450df602a`.
 
 ```sh
 $ gcc -shared -fPIC -O2 -D_GNU_SOURCE -o "$WORK/libshim.so" "$WORK/shim.c" -ldl
 $ sha256sum "$WORK/shim.c"
-52906935033b7713d2f253f22b225e74f0ada630c3c5ed2becc6128aa45b1963  /tmp/kittyobs.3sJcn70i/shim.c
+190c16fb143a1f21ed81c8818b02cb7267d103de9292fa23b3e006f450df602a  /tmp/kittyobs.3sJcn70i/shim.c
 ```
 
 ```c
@@ -316,9 +316,9 @@ typedef ssize_t (*read_t)(int,void*,size_t);
 ssize_t read(int fd,void*buf,size_t cnt){
     static read_t real; if(!real) real=(read_t)dlsym(RTLD_NEXT,"read");
     if(is_signalfd(fd)){ ssize_t r=real(fd,buf,cnt); int e=errno; char h[160]; hdr(h,sizeof h);
-        if(r>0){ int nrec=(int)(r/(ssize_t)sizeof(struct signalfd_siginfo)); char recs[256]=""; 
+        if(r>0){ int nrec=(int)(r/(ssize_t)sizeof(struct signalfd_siginfo)); char recs[256]="";
             struct signalfd_siginfo*si=(struct signalfd_siginfo*)buf;
-            for(int i=0;i<nrec && i<8;i++){ int s=si[i].ssi_signo; const char*nm=s==SIGCHLD?"SIGCHLD":s==SIGINT?"SIGINT":s==SIGHUP?"SIGHUP":s==SIGTERM?"SIGTERM":s==SIGUSR1?"SIGUSR1":s==SIGUSR2?"SIGUSR2":"SIG?"; strncat(recs,nm,sizeof(recs)-strlen(recs)-1); strncat(recs," ",sizeof(recs)-strlen(recs)-1);} 
+            for(int i=0;i<nrec && i<8;i++){ int s=si[i].ssi_signo; const char*nm=s==SIGCHLD?"SIGCHLD":s==SIGINT?"SIGINT":s==SIGHUP?"SIGHUP":s==SIGTERM?"SIGTERM":s==SIGUSR1?"SIGUSR1":s==SIGUSR2?"SIGUSR2":"SIG?"; strncat(recs,nm,sizeof(recs)-strlen(recs)-1); strncat(recs," ",sizeof(recs)-strlen(recs)-1);}
             fprintf(logf,"%s read(signalfd=%d, count=%zu) = %zd  [%d signalfd_siginfo: %s]\n",h,fd,cnt,r,nrec,recs); }
         else fprintf(logf,"%s read(signalfd=%d, count=%zu) = %zd%s\n",h,fd,cnt,r, r<0?(e==EAGAIN?" EAGAIN(errno=11)":" ERR"):" EOF");
         errno=e; return r; }
@@ -377,10 +377,11 @@ int pipe(int pf[2]){
 
 ### Driver and session-generator scripts (full source, hashed)
 
-`lib.sh` is sourced by each scenario. Its `run_kitty` helper backgrounds kitty, captures the **exact** PID, sleeps for a fixed duration, then kills **only that PID** and records its exit status — never a broad `pkill` (SHA-256 `2d7d7696…`):
+`lib.sh` is sourced by each scenario. It enables `pipefail`, and its `run_kitty` helper backgrounds kitty, captures the **exact** PID into a **per-invocation** PID file (`$WORK/kpid.<run_id>`, so concurrent runs never race on a shared file), arms an `INT`/`TERM`/`EXIT` trap that kills **only that PID** (never a broad `pkill`), sleeps via a **trap-interruptible** backgrounded `sleep … & wait` (so an interrupt fires the trap immediately instead of after the sleep), then kills that PID, waits for it, and **returns** its exit status to the caller — the trailing `echo` no longer masks it (SHA-256 `69563603…`):
 
 ```sh
-# lib.sh — common harness helpers (sourced by each scenario). Safe: pipefail, quoted.
+# lib.sh — common harness helpers (sourced by each scenario). Safe: pipefail + quoted + exact-PID trap.
+set -o pipefail
 : "${WORK:?set WORK}"
 KITTY=/app/kitty/launcher/kitty
 export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
@@ -390,16 +391,18 @@ run_kitty() {
   local pre=""; [ "$shimlog" != "-" ] && pre="LD_PRELOAD=$WORK/libshim.so SHIM_LOG=$shimlog"
   env $pre "$KITTY" --config NONE "$@" >"$dbglog" 2>&1 &
   local kpid=$!
-  echo "$kpid" > "$WORK/last_kpid"
-  sleep "$dur"
+  echo "$kpid" > "$WORK/kpid.$rid"            # per-invocation PID file: concurrent runs never race on shared state
+  trap "kill $kpid 2>/dev/null || true" INT TERM EXIT   # interrupt kills exactly this child, never a stray kitty
+  sleep "$dur" & wait $!                        # backgrounded sleep + wait is trap-interruptible, so an interrupt fires the trap at once
   kill "$kpid" 2>/dev/null || true
-  # wait only for that pid; capture status
-  wait "$kpid" 2>/dev/null; local rc=$?
+  wait "$kpid" 2>/dev/null; local rc=$?         # wait only for that pid; capture its status
+  trap - INT TERM EXIT                          # disarm once this child is reaped
   echo "run_id=$rid kitty_pid=$kpid exit=$rc"
+  return "$rc"                                  # return kitty's status so callers see it (echo no longer masks it)
 }
 ```
 
-`gen_session.sh` emits a **splits-layout** tab of N windows, each launching a `sleep` with a **staggered** lifetime so windows die at different instants while the layout keeps resizing — the exact rapid create/resize/destroy burst the question is about. It takes exactly two positional arguments — `<nwin>` (a positive integer) and `<base_life>` (a number of seconds) — and **fails fast (exit 2)** on a malformed argument so a typo cannot silently emit a degenerate session; the validation writes only to `stderr`, so for valid input the emitted session is byte-identical (SHA-256 `4efc76f16ce538fa5651e06e2eaf383e3f1414c8495b1dc812d2a27f1280b331`):
+`gen_session.sh` emits a **splits-layout** tab of N windows, each launching a `sleep` with a **staggered** lifetime so windows die at different instants while the layout keeps resizing — the exact rapid create/resize/destroy burst the question is about. It takes exactly two positional arguments — `<nwin>` (a positive integer) and `<base_life>` (a number of seconds) — and **fails fast (exit 2)** on a malformed argument — a non-integer **or zero** window count, or a `base_life` that is not a number or carries no digit (e.g. `.`), and it also aborts if the per-window `awk` computation fails or yields empty — so a typo cannot silently emit a degenerate session; every guard writes only to `stderr`, so for valid input the emitted session is byte-identical (SHA-256 `322889f3fd7e4c49bee88b0523904a72c7f9a2c6ae54357b9b97f3ace2d98973`):
 
 ```sh
 #!/bin/sh
@@ -410,18 +413,21 @@ nwin="$1"; life="$2"
 # Validate args and FAIL FAST (exit 2) so a typo cannot silently emit a degenerate
 # session. These checks write only to stderr, so valid output stays byte-identical.
 case "$nwin" in ''|*[!0-9]*) echo "gen_session.sh: nwin must be a positive integer" >&2; exit 2;; esac
+[ "$nwin" -ge 1 ] || { echo "gen_session.sh: nwin must be >= 1 (got $nwin)" >&2; exit 2; }
 case "$life" in ''|*[!0-9.]*|*.*.*) echo "gen_session.sh: base_life must be a number" >&2; exit 2;; esac
+case "$life" in *[0-9]*) : ;; *) echo "gen_session.sh: base_life must contain a digit (got '$life')" >&2; exit 2;; esac
 echo "layout splits"
 i=1
 while [ "$i" -le "$nwin" ]; do
   # staggered lifetime: (i * life), so earlier windows die first
-  d=$(awk "BEGIN{printf \"%.3f\", $i*$life}")
+  d=$(awk "BEGIN{printf \"%.3f\", $i*$life}") || { echo "gen_session.sh: awk failed for base_life='$life'" >&2; exit 2; }
+  [ -n "$d" ] || { echo "gen_session.sh: awk produced no output for base_life='$life'" >&2; exit 2; }
   echo "launch sh -c \"sleep $d\""
   i=$((i+1))
 done
 ```
 
-`gen_session_q4b.sh` emits N windows that **busy-wait on a gate file**, so they can all be released simultaneously (by `touch`ing the gate) to *force* SIGCHLD coalescing. It takes `<nwin>` (a positive integer) and `<gate_path>`, and likewise fails fast (exit 2) on a malformed argument (SHA-256 `9b4c401c61cad67b40e46d62381d23895bd06faa7b1122cee799174548381fc3`):
+`gen_session_q4b.sh` emits N windows that **busy-wait on a gate file**, so they can all be released simultaneously (by `touch`ing the gate) to *force* SIGCHLD coalescing. It takes `<nwin>` (a positive integer) and `<gate_path>`, likewise fails fast (exit 2) on a non-integer **or zero** window count or an empty gate path, and **shell-quotes** the gate path into the emitted predicate so a path containing spaces or metacharacters stays a single literal argument (SHA-256 `4baa211e57e4be7c21c19ae66950b63cf8c2cc2ac09073b07eef05295abdbe80`):
 
 ```sh
 #!/bin/sh
@@ -430,23 +436,48 @@ done
 # simultaneously (touch the gate) to force SIGCHLD coalescing.
 nwin="$1"; go="$2"
 case "$nwin" in ''|*[!0-9]*) echo "gen_session_q4b.sh: nwin must be a positive integer" >&2; exit 2;; esac
+[ "$nwin" -ge 1 ] || { echo "gen_session_q4b.sh: nwin must be >= 1 (got $nwin)" >&2; exit 2; }
 [ -n "$go" ] || { echo "gen_session_q4b.sh: gate_path required" >&2; exit 2; }
+# Shell-quote the gate path so spaces/metacharacters are literal in the emitted
+# predicate (single-quote, escaping any embedded single quote via '\'').
+goq=$(printf "%s" "$go" | sed "s/'/'\\''/g")
 echo "layout splits"
 i=1
 while [ "$i" -le "$nwin" ]; do
-  echo "launch sh -c \"while [ ! -e $go ]; do : ; done\""
+  echo "launch sh -c \"while [ ! -e '$goq' ]; do : ; done\""
   i=$((i+1))
 done
 ```
 
-The argument guard was exercised directly (bad arguments exit non-zero; the valid Q5 invocation still emits the byte-identical `q5.session`):
+The argument guards were exercised directly — a non-integer, **zero**, or digit-less argument exits non-zero, while the valid Q5 invocation still emits the byte-identical `q5.session` (the guards write only to `stderr`, so valid output is unchanged):
 
 ```text
-$ gen_session.sh abc 0.05 >/dev/null ; echo "exit=$?"
+$ gen_session.sh abc 0.05 >/dev/null ; echo "exit=$?"      # non-integer window count
 gen_session.sh: nwin must be a positive integer
 exit=2
-$ gen_session.sh 20 0.05 | sha256sum
+$ gen_session.sh 0 0.05 >/dev/null ; echo "exit=$?"        # zero windows (degenerate)
+gen_session.sh: nwin must be >= 1 (got 0)
+exit=2
+$ gen_session.sh 20 . >/dev/null ; echo "exit=$?"          # base_life carries no digit
+gen_session.sh: base_life must contain a digit (got '.')
+exit=2
+$ gen_session.sh 20 0.05 | sha256sum                        # valid input: bytes unchanged by the guards
 19cfee893e64542f7993c291c31c5cc085258f4a94c93f8c843e12f1677cd8c8  -
+$ gen_session_q4b.sh 0 GATE >/dev/null ; echo "exit=$?"     # q4b: zero windows rejected too
+gen_session_q4b.sh: nwin must be >= 1 (got 0)
+exit=2
+```
+
+The `gen_session_q4b.sh` gate path is **shell-quoted** into the emitted predicate, so a path containing spaces stays a single literal argument instead of being split into two `test` operands. The generator emits a single-quoted path; the old unquoted form is shown for contrast — it mis-parses:
+
+```text
+$ gen_session_q4b.sh 1 "/tmp/qa gate" | tail -1            # NEW: gate path is shell-quoted
+launch sh -c "while [ ! -e '/tmp/qa gate' ]; do : ; done"
+$ sh -c "[ ! -e '/tmp/qa gate' ]" ; echo "exit=$?"         # quoted predicate, gate absent => ONE operand, clean
+exit=0
+$ sh -c "[ ! -e /tmp/qa gate ]" ; echo "exit=$?"           # OLD unquoted form: TWO operands => parse error
+sh: 1: [: /tmp/qa: unexpected operator
+exit=2
 ```
 
 `child1.sh` (Q1) proves both **post-readiness exec** (its marker line is written only after the shell execs, which the kernel permits only after kitty closes the ready pipe) and **real SIGWINCH receipt** (a `trap … WINCH` handler appends a line when the kernel delivers `SIGWINCH`):
@@ -687,21 +718,35 @@ if __name__ == "__main__":
     main()
 ```
 
-  Injecting the two canonical shortcuts against a running kitty (a one-window session so the emulator stays focused) drives the **same** GLFW key path the session file exercises. `new_window` creates a second child (the cumulative `Child launched` count goes `1` → `2`); `close_window` hangs the window up, and the **IO thread** reaps its child — proving both actions reached the real code path, not a bypass:
+  The injection scenario uses a **one-window** session (so the emulator keeps input focus on the bare, WM-less Xvfb). Its full, hashed contents:
 
 ```text
-$ ./kitty --config NONE --debug-rendering --session inj.session >dbg.log 2>&1 &   # 1 long-lived window
-$ grep -c "Child launched" dbg.log                       # before injection
+$ cat inj.session
+layout splits
+launch sh -c "while true; do sleep 1; done"
+$ sha256sum inj.session
+76bc771bcea63b1c998b6896cb79ec4a06e45722edc3fbf84460de718fa4a5c9  inj.session
+```
+
+  Injecting the two canonical shortcuts against a running kitty drives the **same** GLFW key path the session file exercises. `new_window` creates a second child (the cumulative `Child launched` count goes `1` → `2`); `close_window` hangs the window up, and the **IO thread** reaps its child — proving both actions reached the real code path, not a bypass. The launcher is the real executable `$KITTY` (`= /app/kitty/launcher/kitty`; the bare `./kitty` is a *directory* — invoking it fails with `./kitty: Is a directory`), and the `waitpid` line is captured by the published `LD_PRELOAD` shim because `strace` is blocked here (see *Why an LD_PRELOAD shim*):
+
+```text
+$ export SHIM_LOG=q1_shim.log
+$ LD_PRELOAD=libshim.so "$KITTY" --config NONE --debug-rendering --session inj.session >q1_dbg.log 2>&1 &   # 1 long-lived window
+$ grep -c "Child launched" q1_dbg.log                    # before injection
 1
 $ python3 xinject.py ctrl+shift+Return                   # canonical new_window
 injected: ctrl+shift+Return
-$ grep -c "Child launched" dbg.log                       # after: a 2nd window was created
+$ grep -c "Child launched" q1_dbg.log                    # after: a 2nd window was created
 2
 $ python3 xinject.py ctrl+shift+w                         # canonical close_window
 injected: ctrl+shift+w
-# the closed window's child (bash) is reaped on the IO thread via SIGHUP hangup (WIFSIGNALED=1):
-1910900.830874 tid=13504 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 13512  (WIFEXITED=0 status=-1 WIFSIGNALED=1)
-# kitty stays alive because window 1 persists; 0 exceptions in the debug log.
+# the closed window's child is reaped on the IO thread via SIGHUP hangup (WIFSIGNALED=1):
+$ grep KittyChildMon q1_shim.log | grep "WIFSIGNALED=1"
+1922254.619742 tid=635 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 646  (WIFEXITED=0 status=-1 WIFSIGNALED=1)
+# kitty stays alive because window 1 persists; 0 exceptions in the debug log:
+$ grep -c Traceback q1_dbg.log
+0
 ```
 
   The reproducible measurements below use the session file because it is deterministic; the injector demonstrates the mapped-key equivalence (same `Tab.new_window`/`close_window` entry points, reached from real key events).
@@ -714,7 +759,7 @@ Every session file is fixed and hashed so runs are reproducible (excerpt of `/ob
 ca07aa62603c4e5ed168669eacd3739824080017570ff3f207506c805383a8f2  sessions/q1.session
 19cfee893e64542f7993c291c31c5cc085258f4a94c93f8c843e12f1677cd8c8  sessions/q2.session
 b265620d5b8f6d7aa04b1897a7bd44ecd7a18fd754252022d254f0e74f543d5c  sessions/q4.session
-cf8c289da8b819e278e7b0dba33d5b296d1f8bfdd69fc75f880ba530a5a30093  sessions/q4b.session
+cb89b619fc30a6277cb59cd0fed6e64dab463809483da572b80dd747a1a155e1  sessions/q4b.session
 ca07aa62603c4e5ed168669eacd3739824080017570ff3f207506c805383a8f2  sessions/q4dedup.session
 758d77b5fd4a78b7b90e468535e8ea3d356d2bdd444c76152fe94bbd9fce2bff  sessions/q3_holdopen5.session
 946a92646318322b824ccfdfef933f9082e76387b0cf32804d695d9a9af39c5f  sessions/q3_yes.session
@@ -730,20 +775,20 @@ db01d3f11094c300560931160fead1103dad0d10960168d9f62e5eaa7b661c18  sessions/q3_no
 |------------|-------------|---------------|
 | `q2.session`, `q5.session` (`19cfee89…`) | `gen_session.sh 20 0.05` | **Yes — byte-identical.** Verified: `gen_session.sh 20 0.05 \| sha256sum` → `19cfee89…` (re-run gives the same bytes). |
 | `q1.session`, `q4dedup.session` (`ca07aa62…`), `q4.session` (`b265620d…`), `q3_holdopen5.session` (`758d77b5…`), `q3_yes.session` (`946a9264…`), `q3_no.session` (`db01d3f1…`) | Fixed, hand-authored session files (not generator output — they carry per-scenario directives such as the Q3 option lines and the `child_survivor5.sh` launch) | **Yes** — static input files pinned by the manifest hash. |
-| `q4b.session` (`cf8c289d…`) | `gen_session_q4b.sh 16 "$WORK/gate_$$"` | **No — recorded instance only.** The second argument is a *volatile* per-run gate path (`$WORK` is a `mktemp -d` directory and `$$` is the harness PID), so the emitted bytes — and therefore the hash — differ every run. |
+| `q4b.session` (`cb89b619…`) | `gen_session_q4b.sh 16 "$WORK/gate_$$"` | **No — recorded instance only.** The second argument is a *volatile* per-run gate path (`$WORK` is a `mktemp -d` directory and `$$` is the harness PID), so the emitted bytes — and therefore the hash — differ every run. |
 
 The q4b non-reproducibility is by construction, not a defect — the generator writes the gate path literally into each `launch` line, so a different gate path yields different bytes. Demonstrated directly:
 
 ```text
 $ gen_session_q4b.sh 16 "/tmp/kittyobs.AAAAAAAA/gate_11111" | sha256sum
-7dddf47ac008b35ffe036d96828981e3b37bb0e6b006d85700c54d84206684c7  -
+4b1f41db9e60f858bf8b2a8475f73083d1fcb20dc96386abab554acc770c53fb  -
 $ gen_session_q4b.sh 16 "/tmp/kittyobs.BBBBBBBB/gate_22222" | sha256sum
-10176701d73c47e760a34acadde5e7f1ae691aeaa9070cfe3582184b5c6dc368  -
-# same structure, different volatile gate path => different hash (cf8c289d… is one such instance).
+d8fbfc5674a14b4b3cf0f59cc3fa7279c71f882f50ee20a9712d75d1d06f4dd7  -
+# same structure, different volatile gate path => different hash (cb89b619… is one such instance).
 # Normalising the gate path makes it stable, confirming only that argument varies:
 $ gen_session_q4b.sh 16 "GATE" | sha256sum   # (run twice)
-ff1eeb3041d835fd82508cefc7cf1a83810db4f7ec34528551f9b7a34ae176b9  -
-ff1eeb3041d835fd82508cefc7cf1a83810db4f7ec34528551f9b7a34ae176b9  -
+773f25a7aae9d0224f0084b6a199845d78e7d9b3fc0479b448e0f2b48f2a6780  -
+773f25a7aae9d0224f0084b6a199845d78e7d9b3fc0479b448e0f2b48f2a6780  -
 ```
 
 ---
@@ -768,27 +813,41 @@ self.boss.add_child(window)
 
 3. The child process is forked with a PTY by `Child.fork` (`kitty/child.py`, via `fast_data_types.spawn`). Before the fork, `Child.fork` creates a **child-ready pipe** — `ready_read_fd, ready_write_fd = os.pipe()` [`kitty/child.py:283`] — whose read end is passed to the spawned process. The child's real command is `execvp`'d only **after** kitty closes the write end in `Child.mark_terminal_ready` [`kitty/child.py:362`]; until then the child blocks reading the pipe. This is the ordering that guarantees the window is fully wired before its command runs. **[INFERRED — source-only for the exact block-then-`execvp` handshake in the C spawn helper `kitty/child.c`; the resulting *ordering* (marker written only after `Child launched`) is directly observed below.]**
 
-4. The first PTY size is pushed by `Window.set_geometry` [`kitty/window.py:850`]. The gate compares the newly-computed size against the recorded one:
+4. `Window.set_geometry` [`kitty/window.py:850`] brings the window online in **two ordered stages on the very first layout pass** — first the **Screen** (the in-memory terminal grid), then the **PTY**. Both stages live in the same method; the verbatim body shows the `needs_layout` gate immediately above the PTY-size gate:
 
 ```python
-# kitty/window.py:861-874 (verbatim; the first-resize gate)
-if current_pty_size != self.last_reported_pty_size:
-    boss = get_boss()
-    boss.child_monitor.resize_pty(self.id, *current_pty_size)
-    self.last_resized_at = monotonic()
-    if not self.child_is_launched:
-        self.child.mark_terminal_ready()
-        self.child_is_launched = True
-        update_ime_position = True
-        if boss.args.debug_rendering:
-            now = monotonic()
-            print(f'[{now:.3f}] Child launched', file=sys.stderr)
-    elif boss.args.debug_rendering:
-        print(f'[{monotonic():.3f}] SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}', file=sys.stderr)
-    self.last_reported_pty_size = current_pty_size
+# kitty/window.py:850-874 (verbatim; Screen bring-online then PTY bring-online)
+def set_geometry(self, new_geometry: WindowGeometry) -> None:
+    if self.destroyed:
+        return
+    if self.needs_layout or new_geometry.xnum != self.screen.columns or new_geometry.ynum != self.screen.lines:
+        self.screen.resize(max(0, new_geometry.ynum), max(0, new_geometry.xnum))
+        self.needs_layout = False
+        call_watchers(weakref.ref(self), 'on_resize', {'old_geometry': self.geometry, 'new_geometry': new_geometry})
+    current_pty_size = (
+        self.screen.lines, self.screen.columns,
+        max(0, new_geometry.right - new_geometry.left), max(0, new_geometry.bottom - new_geometry.top))
+    update_ime_position = False
+    if current_pty_size != self.last_reported_pty_size:
+        boss = get_boss()
+        boss.child_monitor.resize_pty(self.id, *current_pty_size)
+        self.last_resized_at = monotonic()
+        if not self.child_is_launched:
+            self.child.mark_terminal_ready()
+            self.child_is_launched = True
+            update_ime_position = True
+            if boss.args.debug_rendering:
+                now = monotonic()
+                print(f'[{now:.3f}] Child launched', file=sys.stderr)
+        elif boss.args.debug_rendering:
+            print(f'[{monotonic():.3f}] SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}', file=sys.stderr)
+        self.last_reported_pty_size = current_pty_size
 ```
 
-Because `last_reported_pty_size` is initialized to the sentinel `(-1, -1, -1, -1)` [`kitty/window.py:579`] and `child_is_launched` to `False` [`kitty/window.py:578`], the **first** layout always satisfies the gate, always flips `child_is_launched`, and records the real size. `self.last_resized_at` [`kitty/window.py:562`] is stamped for the de-dup/debounce logic used in Q4.
+   - **Stage 1 — Screen comes online.** `needs_layout` is initialized to `True` in `Window.__init__` [`kitty/window.py:599`], and the `Screen` object is constructed at a placeholder `24 × 80` [`kitty/window.py:604`]. The first `set_geometry` therefore always enters the layout gate [`kitty/window.py:853`] (`if self.needs_layout or …`), calls `self.screen.resize(max(0, ynum), max(0, xnum))` [`kitty/window.py:854`] to size the real terminal grid to the window's cell geometry, then clears the flag with `self.needs_layout = False` [`kitty/window.py:855`] and fires the `on_resize` watchers. This is the **Screen half** of "bring online" — the emulator's grid (lines/columns, cursor, scrollback dimensions) is now the correct size.
+   - **Stage 2 — PTY comes online.** *Only after* the Screen is resized is `current_pty_size` computed **from the just-updated** `self.screen.lines`/`self.screen.columns` [`kitty/window.py:857-859`]; the size-equality gate [`kitty/window.py:861`] then fires exactly one `resize_pty` → `ioctl(TIOCSWINSZ)` [`kitty/window.py:863`], flips `child_is_launched` and calls `mark_terminal_ready` [`kitty/window.py:865-867`], and records the size [`kitty/window.py:874`].
+
+The ordering is the point: because `current_pty_size` is derived from `self.screen.lines/columns`, the Screen **must** be resized first, so the size the kernel is told via `ioctl(TIOCSWINSZ)` always matches the grid the emulator is actually rendering. Because `last_reported_pty_size` is initialized to the sentinel `(-1, -1, -1, -1)` [`kitty/window.py:579`] and `child_is_launched` to `False` [`kitty/window.py:578`], the **first** layout always satisfies **both** gates — screen-resize (because `needs_layout` is `True`) and PTY-push (because the sentinel never equals a real size). `self.last_resized_at` is stamped here [`kitty/window.py:864`] on **every** real resize, but it is **not** the de-dup/debounce field: it is read only by `on_activity_since_last_focus` [`kitty/window.py:1166`], which *suppresses tab-activity marking for 0.5 s after a resize* (a child redrawing in response to the resize must not be mistaken for new activity). The PTY **de-duplication** gate is `last_reported_pty_size` and the resize **debounce** is `resize_debounce_time` — both covered in Q4.
 
 ### Observed output (with producing commands)
 
@@ -828,6 +887,7 @@ The marker exists only because the shell `execvp`'d, which the kernel permits on
 ### What this proves (cause → effect)
 
 - The "add child before layout" ordering [`kitty/tabs.py:534-535`] guarantees a freshly-created window is already in kitty's bookkeeping (staged, then in `children[]`) when the first layout runs, so the first `resize_pty` has a target.
+- **Screen state comes online before PTY state.** The first reported PTY size is always a real layout-derived grid — `rows=22 cols=71` and `rows=22 cols=35` in the `ioctl` trace above, never the `24 × 80` placeholder the `Screen` was constructed with [`kitty/window.py:604`]. Since `current_pty_size` is read from `self.screen.lines/columns` [`kitty/window.py:857-859`], those non-placeholder values are runtime confirmation that the `needs_layout`→`screen.resize`→`needs_layout=False` step [`kitty/window.py:853-855`] (Stage 1) executed *before* the PTY push (Stage 2).
 - The sentinel + `child_is_launched` flag [`kitty/window.py:578-579`] make the **first** resize a guaranteed one-shot "bring online" event, distinct from later resizes.
 - The `ioctl(TIOCSWINSZ) = 0` → child's `WINCH_received` chain is the concrete demonstration that **the kernel**, not kitty, signals the child on resize.
 
@@ -837,7 +897,7 @@ The marker exists only because the shell `execvp`'d, which the kernel permits on
 
 ### Direct answer
 
-kitty **tolerates** stale window ids and stale/closed file descriptors rather than treating them as errors. A resize aimed at a vanished window walks **both** liveness collections (the live `children[]` and the not-yet-drained add-queue); if the id is in neither, it logs one specific non-fatal diagnostic and moves on. If the fd exists but is already closed, the resize `ioctl` failure (`EBADF`/`ENOTTY`) is swallowed. A *close* request that races a child still sitting in the add-queue is caught because the close scan also covers the add-queue. And on the Python side, a death delivered for a window that was already removed is a no-op. The result: rapid create/resize/destroy bursts produce diagnostics but **no exceptions and no corruption**.
+kitty **tolerates** stale window ids and stale/closed file descriptors rather than treating them as errors. A resize aimed at a vanished window walks **both** liveness collections (the live `children[]` and the not-yet-drained add-queue); if the id is in neither, it logs one specific non-fatal diagnostic and moves on. If the fd exists but is already closed, the resize `ioctl` failure (`EBADF`/`ENOTTY`) is swallowed. A *close* request that races a child still sitting in the add-queue is caught because the close scan also covers the add-queue. And on the Python side, a death delivered for a window that was already removed is a no-op. The result: rapid create/resize/destroy bursts produce diagnostics but **no exceptions and no corruption**. *(Evidence scope: of these tolerance paths, only the "id in neither collection → one diagnostic, no exception" branch was reproduced on this platform. The add-queue-hit, pending-add close, POLLNVAL, in-kitty `EBADF`/`ENOTTY`, and doubled-death paths are guaranteed by the source but were **not** triggered in 20 canonical runs — each is labeled **inferred / not reproduced** where it appears below, with attempt counts.)*
 
 ### Mechanism (with citations)
 
@@ -848,6 +908,8 @@ kitty **tolerates** stale window ids and stale/closed file descriptors rather th
 } else log_error("Failed to send resize signal to child with id: %lu (children count: %u) (add queue: %zu)", window_id, self->count, add_queue_count);
 ```
 
+   **[OBSERVED — the id-in-neither branch] / [INFERRED — the add-queue-hit branch].** Across **N = 20** canonical runs this diagnostic fired **86 times total** and **every one of the 86** reported `add queue: 0` (see *Attempt counts* below). So the branch actually exercised is the *id-in-neither-collection* branch [`:610`]: at the instant a resize targets a dead id, the add-queue is empty. The **positive** outcome of the dual scan — the id being *found* in the not-yet-drained add-queue [`:592`] and the resize succeeding against a still-staged child — was **never reproduced** on this platform and is stated here as **inferred from the source** (the scan visits the add-queue unconditionally; we simply never caught a window mid-stage at resize time).
+
 2. `pty_resize` [`kitty/child-monitor.c:577`] performs the `ioctl(TIOCSWINSZ)` and **tolerates** a closed fd:
 
 ```c
@@ -856,7 +918,9 @@ if (errno != EBADF && errno != ENOTTY) {
     // only a genuinely unexpected error is logged; EBADF/ENOTTY are swallowed
 ```
 
-3. `mark_child_for_close` [`kitty/child-monitor.c:541`] handles a close racing a still-staged child by scanning the add-queue as well as `children[]`, setting `needs_removal` on whichever collection holds the id ([`:546`] for `children[]`, [`:554`] for the add-queue).
+   **[INFERRED — not reproduced inside kitty].** The canonical burst **never** drove an `ioctl(TIOCSWINSZ)` onto an already-closed fd *inside kitty* (0 such events in the shim across all 20 runs), because kitty removes a dead child's fd from its poll set before a subsequent resize can target it. The two errno values this branch swallows (`EBADF`, `ENOTTY`) were characterized only by the **isolated `pty_probe`** C program (below) — that value is real but **non-canonical**; that kitty's `:581` branch would swallow them is **inferred** from the source, not observed executing in kitty.
+
+3. `mark_child_for_close` [`kitty/child-monitor.c:541`] handles a close racing a still-staged child by scanning the add-queue as well as `children[]`, setting `needs_removal` on whichever collection holds the id ([`:546`] for `children[]`, [`:554`] for the add-queue). **[OBSERVED — the `children[]` branch `:546`] / [INFERRED — the add-queue branch `:554`].** In the 20 runs, every window that was closed had already been drained into `children[]` (add queue measured `0` at every diagnostic), so the observed closes took the `children[]` branch; the *pending-add* close — a `close_window` reaching a child still sitting in the add-queue and setting `needs_removal` there [`:554`] — was **not reproduced** and is stated as **inferred from the source**.
 
 4. `Boss.on_child_death` [`kitty/boss.py:881`] is idempotent — it pops the id and returns immediately if the window is already gone:
 
@@ -868,6 +932,8 @@ def on_child_death(self, window_id: int) -> None:
     if window is None:
         return
 ```
+
+   **[OBSERVED — the safety outcome] / [INFERRED — the early-return actually firing].** What is directly observed is the *consequence*: **0** `KeyError`/traceback across all 20 runs (and the 40 Q5 runs). Whether the `window is None` early-return [`:884-885`] *itself fired* — i.e. whether a **doubled** death notification for one id actually arrived — cannot be distinguished from a single clean death in these logs (a single death also yields 0 exceptions). The idempotency therefore explains the observed zero-exception invariant but the doubled-delivery branch executing is **inferred from the source**, not separately observed.
 
 ### Observed output (with producing commands)
 
@@ -887,6 +953,26 @@ No Python exception accompanied any of them:
 $ grep -icE "Traceback|KeyError|Exception" /obs_out/logs/q2_dbg.log
 0
 ```
+
+**Attempt counts (N = 20 canonical runs of `q2.session`, `gen_session.sh 20 0.05`).** To separate *observed* from *inferred* branches, the same unchanged burst was run 20 times and every branch counted. The diagnostic **is** reproduced (86 times total); the *positive* dual-scan hit, the POLLNVAL path, and the in-kitty `EBADF`/`ENOTTY` swallow were reproduced **zero** times:
+
+```text
+$ for r in $(seq 1 20); do grep -c "Failed to send resize signal" q2runs/dbg_r$r.log; done | sort -n | uniq -c
+     17 4
+      3 6
+$ grep -oh "Failed to send resize signal" q2runs/dbg_r*.log | wc -l          # total diagnostics
+86
+$ grep -oh "add queue: [0-9]*" q2runs/dbg_r*.log | sort | uniq -c            # add-queue at EVERY diagnostic
+     86 add queue: 0
+$ grep -oh "POLLNVAL\|unexpectedly closed" q2runs/dbg_r*.log | wc -l         # POLLNVAL fd-closed path
+0
+$ grep -oh "EBADF\|ENOTTY\|Inappropriate ioctl" q2runs/dbg_r*.log | wc -l    # in-kitty ioctl error swallow
+0
+$ grep -ohiE "Traceback|KeyError|Exception" q2runs/dbg_r*.log | wc -l        # Python exceptions
+0
+```
+
+Reading this table: the count is **4 in 17 runs and 6 in 3 runs** (range **4–6**, mode **4** at 17/20 ≈ 85 % here; the wider **4–8** with mode 4 is the 40-run Q5 characterization in *Distribution of outcomes*). Because **all 86** diagnostics carried `add queue: 0`, the *add-queue-found* branch of the dual scan, the *pending-add* close, the *POLLNVAL* fd-closed path, and the in-kitty `EBADF`/`ENOTTY` swallow are each labeled **inferred / not reproduced** above — the only *observed* tolerance branch in the canonical burst is "id in neither collection → one diagnostic, no exception."
 
 **Reap terminator distribution.** The reap loop (Q3) ran and reaped all 20 children; the shim shows how each scan of the loop terminated — **19** iterations ended with `waitpid(-1, …) = 0` ("no zombie right now") and exactly **1** ended with `ECHILD` ("no children at all"). This corrects any impression that the loop *always* ends in `= 0`:
 
@@ -918,9 +1004,10 @@ A4 ioctl on a regular pipe fd:       ret=-1 errno=25 (Inappropriate ioctl for de
 
 ### What this proves (cause → effect)
 
-- The **dual scan** in `resize_pty` [`:592-611`] plus the **add-queue scan** in `mark_child_for_close` [`:541-556`] mean "the window vanished mid-reaction" is an explicitly handled state, not an error: the worst outcome is a logged diagnostic.
-- The `EBADF`/`ENOTTY` swallow [`:581`] means a resize losing the race with fd-close degrades to a no-op.
-- The idempotent pop in `on_child_death` [`kitty/boss.py:881`] means even a doubled death notification cannot corrupt the Python view — matching the observed **0** exceptions across the burst.
+- **[OBSERVED]** "The window vanished mid-reaction" is an explicitly handled state, not an error: across 20 runs the worst outcome was a **logged diagnostic** (86 of them) with **0** exceptions. The specific branch observed is the *id-in-neither-collection* else-branch of `resize_pty` [`:610`].
+- **[INFERRED — code-guaranteed, not reproduced here]** The *positive* halves of the same reconciliation — `resize_pty` finding the id in the not-yet-drained add-queue [`:592`], and `mark_child_for_close` setting `needs_removal` on an add-queue entry [`:554`] — are what would tolerate a window caught *mid-stage*. They are guaranteed by the source (both scans visit the add-queue unconditionally) but were **not** reproduced (add queue was `0` at all 86 diagnostics), so they are stated as inferred.
+- **[INFERRED — isolated probe only]** The `EBADF`/`ENOTTY` swallow [`:581`] means a resize losing the race with fd-close *would* degrade to a no-op. The errno values are real (from `pty_probe`), but the in-kitty branch was not observed executing (0 such `ioctl` errors in the burst).
+- **[OBSERVED consequence / INFERRED mechanism]** The idempotent pop in `on_child_death` [`kitty/boss.py:881`] explains the observed **0** exceptions across the burst; that a *doubled* death notification actually arrived and hit the `window is None` early-return [`:884-885`] is inferred from the source (a single clean death produces the same zero-exception result).
 
 ---
 
@@ -988,33 +1075,76 @@ The default value is `no` [`kitty/options/definition.py:2920`; resolved `close_o
 **Default (`close_on_child_death=no`) — window HELD OPEN.** The Q3 session launches a foreground child that spawns a **backgrounded survivor in a new session** (`child_survivor5.sh`) which keeps writing to the slave PTY, then the foreground child exits. kitty was left running for the duration and its debug log was checked for any window-close activity:
 
 ```text
-$ WORK=/tmp/kittyobs.3sJcn70i ; . "$WORK/lib.sh"
-$ run_kitty q3_holdopen5_r1 8 "$WORK/sh_r1" "$WORK/dbg_r1" -- --debug-rendering --session "$WORK/sessions/q3_holdopen5.session"
-run_id=q3_holdopen5_r1 kitty_pid=8231 exit=0        # exit=0 = kitty was killed by us at t=8s, i.e. it was STILL RUNNING
-$ grep -icE "close_window|closing window|Detaching" /obs_out/logs/q3_holdopen5_dbg_r1.log
+$ WORK=/scripts ; . "$WORK/lib.sh"
+$ : > "$WORK/survivor5.log"                          # MUST clear first: child_survivor5.sh APPENDS (>>)
+$ run_kitty q3_holdopen5 8 "$WORK/q3/shim_ceil.log" "$WORK/q3/dbg_ceil.log" -- --debug-rendering --session "$WORK/sessions/q3_holdopen5.session"
+run_id=q3_holdopen5 kitty_pid=6013 exit=0            # exit=0 = we killed kitty at t=8s => it was STILL RUNNING (held open)
+$ grep -icE "close_window|closing window|Detaching" "$WORK/q3/dbg_ceil.log"
 0
-$ wc -l /tmp/kittyobs.3sJcn70i/survivor5.log        # survivor kept writing to the slave the whole time
-127 survivor5.log
+$ wc -l < "$WORK/survivor5.log"                      # snapshot at the 8s kill instant (bounded <= 80)
+52
+$ sleep 8 ; wc -l < "$WORK/survivor5.log"            # detached survivor (setsid) finishes its bounded i<80 loop
+80
+$ grep -o "keepalive_[0-9]*" "$WORK/survivor5.log" | sort -t_ -k2 -n | tail -1
+keepalive_79
 ```
 
 The foreground child **was reaped** (so `SIGCHLD` fired and `reap_children` ran), yet **no** window-close occurred and the survivor kept producing output — exactly the documented "remain open as long as there are still processes outputting to the terminal" behavior. The reap itself, without force-removal, is visible in the shim:
 
 ```text
-$ grep -A1 "= 8242" /obs_out/logs/q3_holdopen5_shim_r1.log | head -2
-1888140.453703 tid=8241 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 8242  (WIFEXITED=1 status=0 WIFSIGNALED=0)
-1888140.453719 tid=8241 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = -1 ECHILD
+$ grep -A1 "WIFEXITED=1" "$WORK/q3/shim_ceil.log" | head -2
+1923540.474871 tid=6080 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 6081  (WIFEXITED=1 status=0 WIFSIGNALED=0)
+1923540.474886 tid=6080 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = -1 ECHILD
 ```
 
-**`close_on_child_death=yes` — window CLOSES on child exit.** The same shape of session run with the option enabled launched its child and terminated cleanly with no exception:
+**Why the count is `≤ 80`, never `127`.** The survivor's loop is bounded `i < 80` (`child_survivor5.sh`), so a **single** run can write **at most 80** lines; and because the survivor runs in its **own session** (`setsid`, ignoring `HUP`) it **outlives kitty** and always reaches that ceiling of exactly **80** (`keepalive_0 … keepalive_79`). The `52` above is merely the snapshot at the 8 s kill instant; left alone the detached survivor completes to `80`. A count **above** 80 is impossible for one run — it can only arise from **not clearing** the `>>`-appended log between runs. Re-running without clearing confirms exactly that (a full ceiling accumulates per run and index `0` duplicates):
 
 ```text
-$ run_kitty q3_yes 6 - "$WORK/dbg_yes" -- -o close_on_child_death=yes --debug-rendering --session "$WORK/sessions/q3_yes.session"
-$ grep -cE "Child launched" /obs_out/logs/q3_yes_dbg.log ; grep -icE "Traceback|KeyError" /obs_out/logs/q3_yes_dbg.log
-1
-0
+$ run_kitty q3_accum 8 "$WORK/q3/shim_accum.log" "$WORK/q3/dbg_accum.log" -- --debug-rendering --session "$WORK/sessions/q3_holdopen5.session"
+$ sleep 8 ; wc -l < "$WORK/survivor5.log"            # 2nd un-cleared run: a 2nd ceiling accumulates
+160
+$ grep -c "^keepalive_0$" "$WORK/survivor5.log"      # one per run => cross-run accumulation, not a single-run count
+2
 ```
 
-**Distinction from `--hold`.** `close_on_child_death` governs the *automatic* teardown decision on child exit for *normally launched* windows. It is **not** the same as `launch --hold` / the hold-mode window state, which deliberately keeps a window open *after* its child exits to show the exit status regardless of this option. The observations above are of the default automatic path, not hold mode.
+**`close_on_child_death=yes` — window CLOSES on child exit.** A sole child with nothing else holding the slave closes under *either* option value (the PTY reaches EOF), so to isolate the **option's** effect the **same survivor session** as above was run once with `=yes` and once with `=no`, polling kitty for a **natural** self-exit (its only window closing leaves no windows, so kitty exits on its own):
+
+```text
+# close_on_child_death=YES + survivor session: the reap force-closes the window DESPITE the survivor
+$ /app/kitty/launcher/kitty --config NONE -o close_on_child_death=yes --debug-rendering \
+    --session "$WORK/q3_yes_survivor.session" >"$WORK/q3/dbg_yes_surv.log" 2>&1 & KPID=$!
+$ # poll until kitty self-exits, then report elapsed + status:
+kitty EXITED NATURALLY after 0.81s  exit_status=0
+$ grep -c "Child launched" "$WORK/q3/dbg_yes_surv.log" ; grep -c "Traceback" "$WORK/q3/dbg_yes_surv.log"
+1
+0
+# SAME session with the default =no does NOT self-exit — window HELD OPEN:
+$ /app/kitty/launcher/kitty --config NONE -o close_on_child_death=no --debug-rendering \
+    --session "$WORK/q3_yes_survivor.session" >"$WORK/q3/dbg_no_surv.log" 2>&1 & KPID=$!
+default: kitty STILL RUNNING at 6s => HELD OPEN (expected); killing
+```
+
+Only the option differs between the two runs, so the natural exit at **0.81 s (status 0)** under `=yes` versus the **still-running-at-6 s** hold under `=no` is direct evidence that `close_on_child_death=yes` tears the window down **on child exit even when another process still holds the slave** — exactly the behavior the official docs describe.
+
+**Distinction from `--hold` (with runtime evidence).** `close_on_child_death` governs the *automatic* teardown decision on child exit for *normally launched* windows. It is **not** the same as `launch --hold`, which deliberately keeps a window open *after* its child exits — via a **different mechanism**: `--hold` [`kitty/launch.py:146`] causes the spawn path, when `self.hold` is set [`kitty/child.py:329`], to wrap the command through `cmdline_for_hold` [`kitty/utils.py:1192`], i.e. run it under `kitten run-shell … --env=KITTY_HOLD=1` [`kitty/utils.py:1202`] and then drop to an interactive shell. Both halves were observed at runtime:
+
+```text
+# (1) --hold keeps the window open after the command exits (kitty does NOT self-exit):
+$ printf 'launch --hold sh -c "sleep 0.2"\n' > "$WORK/q3_hold.session"
+$ /app/kitty/launcher/kitty --config NONE --debug-rendering --session "$WORK/q3_hold.session" & KPID=$!
+$ sleep 6 ; kill -0 "$KPID" 2>/dev/null && echo "kitty STILL RUNNING => window HELD OPEN by --hold"
+kitty STILL RUNNING => window HELD OPEN by --hold
+# (2) KITTY_HOLD=1 is present in the HELD interactive shell's environment
+#     (typed in through the REAL X input path, not a bypass):
+$ python3 xtype.py "env > $WORK/q3/held.txt"
+typed: env > /scripts/q3/held.txt
+$ grep -E "^KITTY_HOLD=|^KITTY_PID=|^KITTY_WINDOW_ID=" "$WORK/q3/held.txt"
+KITTY_PID=5818
+KITTY_HOLD=1
+KITTY_WINDOW_ID=1
+```
+
+The scope is precise: `KITTY_HOLD=1` is set for the **held interactive shell**, *not* for the wrapped command — the command's own environment (dumped the same way) carried `KITTY_PID`/`KITTY_WINDOW_ID` but **no** `KITTY_HOLD`, consistent with `run-shell` applying `--env` via `os.Setenv` before running the shell [`tools/cmd/run_shell/main.go:30-58`]. This hold path is **orthogonal** to `close_on_child_death`; the automatic-path observations above are not hold mode.
 
 ### Observed output — the `ESRCH` teardown race (direct evidence)
 
@@ -1101,9 +1231,9 @@ The IO thread drains the descriptor in `read_signals` [`kitty/loop-utils.c:131`]
 
 ```text
 $ grep -E "signalfd\(" /obs_out/logs/q4b_shim_r1.log | head -1
-1888537.051384 tid=8907 comm=kitty signalfd(fd=-1, mask=[INT HUP TERM CHLD USR1 USR2 ], flags=SFD_NONBLOCK|SFD_CLOEXEC|) = 8
+1928165.447061 tid=12296 comm=kitty signalfd(fd=-1, mask=[INT HUP TERM CHLD USR1 USR2 ], flags=SFD_NONBLOCK|SFD_CLOEXEC|) = 8
 $ grep -E "read\(signalfd=8" /obs_out/logs/q4b_shim_r1.log | head -1
-1888539.369496 tid=8974 comm=KittyChildMon read(signalfd=8, count=4096) = 256  [2 signalfd_siginfo: SIGCHLD SIGCHLD ]
+1928187.281541 tid=12370 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
 ```
 
 The mask `[INT HUP TERM CHLD USR1 USR2]` matches `KITTY_HANDLED_SIGNALS` exactly; the different `tid`/`comm` on creation vs read is the decoupling made visible (main thread arms it; IO thread drains it at a safe point).
@@ -1122,8 +1252,8 @@ The wakeup that nudges the IO loop uses an `eventfd`, created with `EFD_CLOEXEC 
 
 ```text
 $ grep -E "eventfd\(" /obs_out/logs/q4b_shim_r1.log
-1888536.954258 tid=8907 comm=kitty eventfd(initval=0, flags=0x80800) = 5
-1888537.051357 tid=8907 comm=kitty eventfd(initval=0, flags=0x80800) = 7
+1928165.348833 tid=12296 comm=kitty eventfd(initval=0, flags=0x80800) = 5
+1928165.447034 tid=12296 comm=kitty eventfd(initval=0, flags=0x80800) = 7
 ```
 
 **Observed — there is NO signal self-pipe on Linux.** The only `pipe2` calls are the per-child readiness pipes (`os.pipe()` from `kitty/child.py:283`), one per launched child, all with flags `0x80000` (`O_CLOEXEC`) — none is a signal pipe:
@@ -1150,30 +1280,31 @@ Level 1 (**kernel**): standard signals are not queued, so many `SIGCHLD` arrivin
 
 (There are two `handle_signal` functions and they must not be confused: `kitty/loop-utils.c:15` is the self-pipe **writer** for non-`signalfd` platforms; `kitty/child-monitor.c:1362` is the **`SignalSet` callback** used on all platforms to fold records into the boolean.)
 
-**Observed — 16 children dying together produce 2–3 signal records but 16 reaps.** Releasing 16 gate-blocked children simultaneously (`q4b.session`, SHA-256 `cf8c289d…`), the shim counts records and reaps directly. The correct coalescing metric is **records vs reaps** (not read-*calls* vs reaps): a single `read` returning 256 bytes carries **2** records (read *batching*), which is separate from *coalescing*.
+**Observed — 16 children dying together produce 2–3 signal records but 16 reaps.** Releasing 16 gate-blocked children simultaneously (`q4b.session`, SHA-256 `cb89b619…`), the shim counts records and reaps directly. The correct coalescing metric is **records vs reaps** (not read-*calls* vs reaps): a single `read` returning 256 bytes carries **2** records (read *batching*), which is separate from *coalescing*.
 
 Run r1:
 
 ```text
 $ grep -E "read\(signalfd" /obs_out/logs/q4b_shim_r1.log
-1888539.369496 tid=8974 comm=KittyChildMon read(signalfd=8, count=4096) = 256  [2 signalfd_siginfo: SIGCHLD SIGCHLD ]
-1888539.369538 tid=8974 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
+1928187.281541 tid=12370 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
+1928187.281590 tid=12370 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
+1928187.281601 tid=12370 comm=KittyChildMon read(signalfd=8, count=4096) = -1 EAGAIN(errno=11)
 $ grep -c "= [0-9]\+  (WIFEXITED" /obs_out/logs/q4b_shim_r1.log     # reaps
 16
 ```
 
-→ r1: **2 read-calls**, carrying **3 SIGCHLD records** total (2 + 1), for **16 reaps**. Run r2:
+→ r1: **2 read-calls**, carrying **2 SIGCHLD records** total (1 + 1), for **16 reaps**, then `EAGAIN` (the non-blocking drain hitting empty). Run r2:
 
 ```text
 $ grep -E "read\(signalfd" /obs_out/logs/q4b_shim_r2.log
-1888543.883611 tid=9071 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
-1888543.883655 tid=9071 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
-1888543.883666 tid=9071 comm=KittyChildMon read(signalfd=8, count=4096) = -1 EAGAIN(errno=11)
+1928231.409097 tid=12520 comm=KittyChildMon read(signalfd=8, count=4096) = 256  [2 signalfd_siginfo: SIGCHLD SIGCHLD ]
+1928231.409153 tid=12520 comm=KittyChildMon read(signalfd=8, count=4096) = 128  [1 signalfd_siginfo: SIGCHLD ]
+1928231.409170 tid=12520 comm=KittyChildMon read(signalfd=8, count=4096) = -1 EAGAIN(errno=11)
 $ grep -c "= [0-9]\+  (WIFEXITED" /obs_out/logs/q4b_shim_r2.log
 16
 ```
 
-→ r2: **2 read-calls**, **2 SIGCHLD records**, **16 reaps**, then `EAGAIN` (the non-blocking drain hitting empty). In both runs **records (2–3) ≪ reaps (16)** — genuine kernel coalescing — while the single `waitpid` loop turns each pass into as many reaps as there are zombies.
+→ r2: **2 read-calls**, **3 SIGCHLD records** (2 + 1), **16 reaps**, then `EAGAIN` (the non-blocking drain hitting empty). In both runs **records (2–3) ≪ reaps (16)** — genuine kernel coalescing — while the single `waitpid` loop turns each pass into as many reaps as there are zombies.
 
 ### Mechanism 4 — rapid-resize de-duplication and debounce
 
@@ -1207,6 +1338,62 @@ if (w->live_resize.from_os_notification) {   // macOS: OS sends start/end events
 
 Mapped to the resolved default `(0.1, 0.5)` [`kitty/options/types.py:568`] and the C struct field assignment `on_end = tuple[0]`, `on_pause = tuple[1]` [`kitty/options/to-c.h:349-350`]: **Linux uses `on_end = 0.1 s`** (the else branch, this platform), macOS uses `on_pause = 0.5 s` (the OS-notification branch). **[Platform note: the macOS `from_os_notification` branch is source-only here; the run-first observations are on Linux/X11, which takes the `on_end` else branch — labeled accordingly.]**
 
+**Observed — locating `on_end` empirically (offset-free, uninstrumented).** The `on_end = 0.1 s` value above is not merely read from source: it was measured against **stock** kitty (`--debug-rendering`, **no `LD_PRELOAD`**, default config) driven through the canonical `--session` entry point. Real X11 `ConfigureNotify` events were injected with `XResizeWindow` (ctypes `libX11`; under bare Xvfb there is no window manager, so the request reaches `framebuffer_size_callback` [`kitty/glfw.c:330`] directly, which stamps `last_resize_event_at = monotonic()` and bumps `num_of_resize_events` [`kitty/glfw.c:338,340`]), and kitty's own `SIGWINCH sent to child` debug line [`kitty/window.py:873`] was counted.
+
+A direct event→signal latency on **one** clock is impossible because kitty prints `[{monotonic():.3f}]`, and `monotonic()` subtracts `monotonic_start_time` [`kitty/monotonic.h:62,67`] (from `CLOCK_MONOTONIC_RAW` on Linux [`kitty/monotonic.h:91`]) — a **constant, unknown offset** versus any external injector clock. The measurement is therefore made **offset-free**: (a) count how many `SIGWINCH`s a burst of *N* resizes produces at varying cadence — the debounce collapses a burst into **one** `SIGWINCH` when the inter-event gap is **below** `on_end`, and yields **N** distinct ones **above** it; and (b) read the inter-`SIGWINCH` gaps, where the constant offset cancels in the delta. The cadence at which collapse turns into one-per-resize brackets `on_end`. Each row is a **fresh** kitty instance (clean attribution), repeated for two stable runs:
+
+```text
+$ python3 /scripts/q4_run.py 2      # fresh kitty per row; XResizeWindow injector; counts window.py:873
+run1 fast_5ms  dt=  5ms sent=20 same=False SIGWINCH_delta=1 tail=104.8ms gaps_ms=[-]
+run1 c_50ms    dt= 50ms sent=10 same=False SIGWINCH_delta=1 tail=108.7ms gaps_ms=[-]
+run1 c_90ms    dt= 90ms sent=8 same=False SIGWINCH_delta=1 tail=108.3ms gaps_ms=[-]
+run1 c_110ms   dt=110ms sent=8 same=False SIGWINCH_delta=8 tail=105.4ms gaps_ms=[109,109,109,112,110,110,110]
+run1 c_150ms   dt=150ms sent=6 same=False SIGWINCH_delta=6 tail=105.2ms gaps_ms=[151,148,152,151,150]
+run1 c_200ms   dt=200ms sent=5 same=False SIGWINCH_delta=5 tail=103.9ms gaps_ms=[201,199,205,194]
+run1 samesize  dt=200ms sent=5 same=True  SIGWINCH_delta=1 tail=n/a gaps_ms=[-]
+run2 fast_5ms  dt=  5ms sent=20 same=False SIGWINCH_delta=1 tail=109.8ms gaps_ms=[-]
+run2 c_50ms    dt= 50ms sent=10 same=False SIGWINCH_delta=1 tail=111.3ms gaps_ms=[-]
+run2 c_90ms    dt= 90ms sent=8 same=False SIGWINCH_delta=1 tail=108.2ms gaps_ms=[-]
+run2 c_110ms   dt=110ms sent=8 same=False SIGWINCH_delta=8 tail=105.1ms gaps_ms=[110,109,109,111,110,111,110]
+run2 c_150ms   dt=150ms sent=6 same=False SIGWINCH_delta=6 tail=105.3ms gaps_ms=[150,148,151,151,150]
+run2 c_200ms   dt=200ms sent=5 same=False SIGWINCH_delta=5 tail=103.8ms gaps_ms=[200,199,200,199]
+run2 samesize  dt=200ms sent=5 same=True  SIGWINCH_delta=1 tail=n/a gaps_ms=[-]
+```
+
+Distilled (identical across both runs):
+
+| injected cadence | resizes sent | `SIGWINCH` emitted | inter-`SIGWINCH` gap | reading |
+|---|---|---|---|---|
+| 5 ms burst (~95 ms total) | 20 | **1** | — | far below `on_end` → collapse |
+| 50 ms | 10 | **1** | — | below → collapse |
+| 90 ms | 8 | **1** | — | just below → collapse |
+| **110 ms** | 8 | **8** | ~110 ms | **just above → distinct** |
+| 150 ms | 6 | 6 | ~150 ms | above → distinct |
+| 200 ms | 5 | 5 | ~200 ms | above → distinct |
+| 200 ms, **identical size** | 5 | **1** | — | de-dup gate (below) |
+
+The collapse→distinct transition sits **between 90 ms (still 1) and 110 ms (already N)**, i.e. `on_end ≈ 0.1 s` — matching `OPT(resize_debounce_time).on_end` [`kitty/child-monitor.c:1062`] and the resolved default `(0.1, 0.5)`. Corroboratingly, the **end-to-end tail lag** (injector's own `CLOCK_MONOTONIC_RAW` at the last `XResizeWindow` → the `SIGWINCH` line observed) is **~104–111 ms in every row** — an upper bound on the internal debounce (it also includes X transit + IO-loop wake + stderr read), again ≈ 0.1 s. Above `on_end`, each resize is processed independently: the inter-`SIGWINCH` gaps track the injected cadence (110 → ~110, 150 → ~150, 200 → ~200 ms).
+
+The distinct case and the de-dup case are a controlled A/B — same cadence (200 ms), same count (5), same window; the only difference is whether the size changes. Five **distinct** sizes produce five `SIGWINCH`s:
+
+```text
+$ grep -nE "SIGWINCH sent to child" /tmp/kq.log       # 5 resizes @200ms, +60px each
+5:[4.163] SIGWINCH sent to child in window: 1 with size: (22, 66, 594, 396)
+6:[4.365] SIGWINCH sent to child in window: 1 with size: (25, 66, 594, 450)
+7:[4.564] SIGWINCH sent to child in window: 1 with size: (28, 66, 594, 504)
+8:[4.765] SIGWINCH sent to child in window: 1 with size: (32, 66, 594, 576)
+9:[4.965] SIGWINCH sent to child in window: 1 with size: (35, 66, 594, 630)
+```
+
+while five **identical** requests to the same size collapse to the single grid change, the four repeats suppressed by the `last_reported_pty_size` gate [`kitty/window.py:861`]:
+
+```text
+$ grep -nE "SIGWINCH sent to child" /tmp/kq2.log      # 5 resizes @200ms, all 600x400
+5:[4.162] SIGWINCH sent to child in window: 1 with size: (22, 66, 594, 396)
+```
+
+**Observed source discrepancy (documented, not changed — read-only scope).** The comment beside the else branch reads *"if more than one resize event has occurred, wait at least 0.2 secs before repainting"* [`kitty/child-monitor.c:1063-1065`], but the code actually waits `OPT(resize_debounce_time).on_end` [`kitty/child-monitor.c:1062`] = **0.1 s** at the default. The table settles it empirically: resizes become distinct at a **110 ms** cadence (not 200 ms), so the effective debounce is ~0.1 s — the comment's "0.2 secs" is stale relative to the code.
+
 ### What this proves (cause → effect)
 
 - Blocking the signal set process-wide [`kitty/main.py:513`] and delivering via `signalfd` [`kitty/loop-utils.c:42`] means a signal's *arrival time* never dictates *when* state changes — the IO loop chooses a safe point to `read_signals` and reap. That is the concrete meaning of "timing is decoupled from bookkeeping."
@@ -1220,7 +1407,7 @@ Mapped to the resolved default `(0.1, 0.5)` [`kitty/options/types.py:568`] and t
 
 ### Direct answer
 
-There are two liveness views — the UI thread's (`Boss.window_id_map` and `WindowList.all_windows[]`) and the IO thread's (`children[]` plus the staged add-queue, remove-queue, and `reaped_pids[]`). They can transiently disagree: the UI can issue a resize for an id the IO array has already removed, or the IO array can still be admitting new children the UI just created. The disagreement is bounded and reconciled by a single mutex, `children_lock`, under which each IO-loop iteration runs **removal before addition**. A resize that loses this race produces only the tolerated diagnostic (Q2); a death delivered twice is absorbed by the idempotent pop (Q2). The reconciliation is directly observable as the diagnostic firing on a stale id while the C `children count` is still *rising* as new windows drain in.
+There are two liveness views — the UI thread's (`Boss.window_id_map` and `WindowList.all_windows[]` [`kitty/window_list.py:147`]) and the IO thread's `children[]` array plus its staged **add-queue** and **remove-queue**. (The `reaped_pids[]` table is **not** part of this window-liveness view — it is a separate, monitored-background-pid channel described under *Two death routes* below.) They can transiently disagree: the UI can issue a resize for an id the IO array has already removed, or the IO array can still be admitting new children the UI just created. The disagreement is bounded and reconciled by a single mutex, `children_lock`, under which each IO-loop iteration runs **removal before addition**. A resize that loses this race produces only the tolerated diagnostic (Q2). A window death is delivered to Python **outside** the lock through the `death_notify` callback [`kitty/child-monitor.c:522`] → `Boss.on_child_death` [`kitty/boss.py:881`] → `tab.remove_window` [`kitty/boss.py:903`] → `WindowList.remove_window` [`kitty/window_list.py:373`], and that pop is idempotent [`kitty/boss.py:883-885`] so a doubled-death view cannot corrupt state (Q2). The reconciliation is directly observable as the diagnostic firing on a stale id while the C `children count` is still *rising* as new windows drain in.
 
 ### Mechanism — one lock, staged queues, remove-before-add
 
@@ -1240,6 +1427,48 @@ while (LIKELY(!self->shutting_down)) {
 **Staged-close takes one extra iteration (correcting "departing fully retired before any admitted").** `remove_children` [`kitty/child-monitor.c:1313`] scans **only** `children[]`. A child that was closed while still **staged** — flagged via `mark_child_for_close`'s add-queue branch [`kitty/child-monitor.c:554`] — is therefore **not** removed on the iteration it is admitted: `add_children` promotes it into `children[]` first, and it is removed on the **next** iteration. The "remove before add" ordering guarantees already-live departing children are retired before new ones are admitted, but a *staged-and-flagged* child is a one-iteration exception. **[INFERRED — source-only for the precise one-iteration lag; the tolerated end state (no corruption, no exception) is observed below.]**
 
 **Idempotent resolution of a doubled death view.** When both views briefly hold a dead window, the Python side resolves it by popping the id and early-returning if already gone [`kitty/boss.py:881-885`] — so a second delivery is a no-op.
+
+### Two death routes — ordinary window death vs. monitored background pids
+
+A distinction the reconciliation depends on: **`reaped_pids[]` is not on the window-death path.** kitty has *two* independent death channels, and only the first removes a window.
+
+**Route 1 — ordinary window death (the window-liveness path).** When a window's PTY reaches EOF or its fd yields `POLLNVAL`, or the user closes it, the child is flagged `needs_removal` and retired by `remove_children` [`kitty/child-monitor.c:1313`], which closes the fd and calls `hangup` [`kitty/child-monitor.c:1294`] to send `SIGHUP` to the child's process group, then pushes the departed child onto the **remove-queue**. `parse_input` [`kitty/child-monitor.c:451`] drains the remove-queue into `remove_notify[]` **under** `children_lock` [`:457-462`], then — deliberately **outside** the lock, because "the locks are non-recursive and the python function could call into other functions in this module" [`:518-519`] — invokes the `death_notify` callback [`:522`]. That callback is `Boss.on_child_death`, bound at construction (`ChildMonitor(self.on_child_death, …)` [`kitty/boss.py:370-371`]). `on_child_death` [`kitty/boss.py:881`] pops the id from `window_id_map` (early-returning if already gone [`:883-885`]), destroys the window, and calls `tab.remove_window(window)` [`kitty/boss.py:903`] → `WindowList.remove_window` [`kitty/window_list.py:373`], which does `all_windows.remove(q)` [`:377`], `id_map.pop` [`:380`], and drops the window from its group [`:382`]. **This** is what makes the UI-thread view catch up with the IO-thread view.
+
+**Route 2 — monitored background pids (a separate channel).** `reaped_pids[]` [`kitty/child-monitor.c:96-98`] is populated *only* by `mark_monitored_pids` [`kitty/child-monitor.c:1398`], which `reap_children` calls **unconditionally** on every reap [`:1423`] and which records a status **only** if the pid was registered via `monitor_pid` [`kitty/child-monitor.c:933`]. `report_reaped_pids` [`kitty/child-monitor.c:950`, called at `:1244`] then dispatches `Boss.on_monitored_pid_death` [`kitty/boss.py:2725`] — the background-process/update-check callback, which never touches `window_id_map` or `WindowList`. A reaped **window** child and a reaped **monitored** pid therefore travel completely different paths; conflating them (routing `reaped_pids[]` to `on_child_death`) would be incorrect.
+
+**Observed — the ordinary route, end to end (canonical `ctrl+shift+w`).** A two-window session (`q5close.session`) was closed one window at a time through the canonical close shortcut, with the `waitpid`/`ioctl` shim loaded and `--debug-rendering` on:
+
+```text
+$ SHIM_LOG=/tmp/q5c_shim.log LD_PRELOAD=/scripts/libshim.so \
+    ./kitty/launcher/kitty --config NONE --debug-rendering --session /scripts/q5close.session &
+$ python3 /scripts/xinject.py ctrl+shift+w    # close focused window (1 of 2)
+$ python3 /scripts/xinject.py ctrl+shift+w    # close the survivor (last window)
+$ grep -E "WIFSIGNALED=1" /tmp/q5c_shim.log
+1925488.918788 tid=8556 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 8557  (WIFEXITED=0 status=-1 WIFSIGNALED=1)
+1925504.684352 tid=8556 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = 8558  (WIFEXITED=0 status=-1 WIFSIGNALED=1)
+```
+
+Each observation maps to Route 1:
+
+- **`hangup` → reap on the IO thread.** Each close hung up the child (`SIGHUP`), so the reap shows `WIFSIGNALED=1`, and it happens on `comm=KittyChildMon` — the IO thread, i.e. `reap_children` [`kitty/child-monitor.c:1413`], not the UI thread.
+- **Survivor continuity after the first close.** Closing 1 of 2 did **not** end kitty; the survivor (window 2) reflowed to fill the freed space, emitting exactly one resize — which only happens if window 1 was removed from the layout/`WindowList` by Route 1:
+
+```text
+$ grep "SIGWINCH sent to child" /tmp/q5c_dbg.log
+[0.164] SIGWINCH sent to child in window: 1 with size: (20, 33, 297, 360)
+[21.330] SIGWINCH sent to child in window: 2 with size: (20, 66, 594, 360)
+```
+
+- **Last-window close → clean app exit.** After the second close the reap loop reached `ECHILD` and kitty exited (no live process remained), because `WindowList` was now empty → the tab and OS window were torn down. That end-state is the end-to-end proof that the death reached `WindowList.remove_window`:
+
+```text
+$ ps -eo pid,stat,comm | awk '/kitty/ && $2 !~ /Z/ {c++} END{print "live_kitty="c+0}'
+live_kitty=0
+$ tail -1 /tmp/q5c_shim.log            # the reap loop bottoms out at "no children at all"
+1925504.684371 tid=8556 comm=KittyChildMon waitpid(pid=-1, opts=WNOHANG|) = -1 ECHILD
+```
+
+No `Traceback`/`KeyError` appeared at any point in the close lifecycle.
 
 ### Observed output — divergence made visible (with producing commands)
 
@@ -1342,21 +1571,24 @@ graph TD
         RZ["Window.set_geometry -> resize_pty (window.py:850,863)"]
         MC["Boss.mark_window_for_close (boss.py:920)"]
         OCD["Boss.on_child_death idempotent pop (boss.py:881-885)"]
+        WLR["tab.remove_window -> WindowList.remove_window (boss.py:903, window_list.py:373)"]
+        OMPD["Boss.on_monitored_pid_death (boss.py:2725)"]
     end
 
     subgraph LOCK["Shared state — guarded by children_lock (child-monitor.c:87)"]
         AQ["add_queue (staged new children)"]
         CH["children[] array (live view)"]
         RQ["remove_queue (needs_removal set)"]
-        RP["reaped_pids[] (child-monitor.c:96-98)"]
+        RP["reaped_pids[] — monitored PIDs only (child-monitor.c:96-98)"]
     end
 
     subgraph IO["IO Thread — child-monitor io_loop, comm=KittyChildMon"]
-        REM["remove_children (child-monitor.c:1313)"]
+        REM["remove_children + hangup SIGHUP (child-monitor.c:1313,1294)"]
         ADD["add_children (child-monitor.c:1281)"]
         POLL["poll child fds: PTY EOF/POLLNVAL -> needs_removal (1535/1545)"]
         RESZ["resize_pty scans children[]+add_queue (child-monitor.c:592-611)"]
         REAP["reap_children waitpid(WNOHANG) (child-monitor.c:1413)"]
+        RRP["report_reaped_pids (child-monitor.c:950,1244)"]
     end
 
     SIG["POSIX signal (SIGCHLD, ...) -> signalfd (Linux, loop-utils.c:42) / self-pipe (fallback, loop-utils.c:15)"]
@@ -1371,7 +1603,9 @@ graph TD
     SIG --> REAP
     REAP --> RP
     REAP --> CH
-    RP --> OCD
+    RQ -->|parse_input drains, death_notify OUTSIDE lock: child-monitor.c:522| OCD
+    OCD --> WLR
+    RP --> RRP --> OMPD
     REM -->|remove before add each iteration| ADD
 ```
 
@@ -1404,12 +1638,12 @@ Diagnostic-count distribution over the 40 runs (this *is* the run-to-run inconsi
 
 Range **4–8**, mode **4** (35/40 ≈ 88 %). Aggregated over all 40 runs: `children count` at divergence ∈ `{15 ×4, 16 ×40, 17 ×55, 18 ×73}` (always `< 20`); `add queue` = `0` at every one of the **172** samples; stale ids seen = `{2 ×160, 3 ×9, 4 ×1, 5 ×2}`; exceptions = `0`. **The diagnostic count is therefore _not_ deterministic — it is the distribution tabulated above.** What *is* invariant across every run is the *safety envelope*: bounded diagnostics, `children count < 20`, `add queue == 0`, and zero exceptions. That invariant — not a fixed count — is the reconciliation guarantee the question is really about; the count, the specific stale ids, and the exact counts each diagnostic saw are precisely the run-to-run variation, reported rather than smoothed away.
 
-### Q4b coalescing — 2 runs of `q4b.session` (SHA-256 `cf8c289da8b819e278e7b0dba33d5b296d1f8bfdd69fc75f880ba530a5a30093`, a recorded instance — see corpus note; the gate path is volatile so this hash is not byte-reproducible)
+### Q4b coalescing — 2 runs of `q4b.session` (SHA-256 `cb89b619fc30a6277cb59cd0fed6e64dab463809483da572b80dd747a1a155e1`, a recorded instance — see corpus note; the gate path is volatile so this hash is not byte-reproducible)
 
 | run_id | signalfd read-calls | SIGCHLD records | reaps | coalescing (records ≪ reaps)? |
 |--------|---------------------|-----------------|-------|-------------------------------|
-| q4b_r1 | 2 | 3 | 16 | yes |
-| q4b_r2 | 2 | 2 | 16 | yes |
+| q4b_r1 | 2 | 2 | 16 | yes |
+| q4b_r2 | 2 | 3 | 16 | yes |
 
 Both runs: **records (2–3) ≪ reaps (16)** → coalescing confirmed and **stable across both runs**. The exact record count (2 vs 3) is the expected minor timing variation in how many `SIGCHLD` were already pending when the first `read` ran.
 
@@ -1432,13 +1666,14 @@ Everything below labeled **INFERRED** is read from source and was **not** direct
 | `EBADF`/`ENOTTY` swallowed by `pty_resize` | **Observed (errno) via isolated probe — non-canonical** | `pty_probe` A3=`EBADF(9)`, A4=`ENOTTY(25)` |
 | PTY master `read` = `EIO` requires slave with no holder | **Observed (isolated probe — non-canonical)** | `pty_probe` B1=`EIO(5)`, B2=data |
 | six `needs_removal` triggers | **Observed (2)** + source (all 6) | close-live & reap observed; POLLNVAL/EOF/staged-close/shutdown from source |
-| default `close_on_child_death=no` keeps window open | **Observed** | window held open, survivor wrote 127 lines, `close`-mentions=0 |
-| `close_on_child_death=yes` closes on child exit | **Observed** | `q3_yes` child launched, 0 exceptions |
+| default `close_on_child_death=no` keeps window open | **Observed** | window held open (still running at 8 s), survivor wrote to the bounded ceiling **80** (`keepalive_0…79`, `i<80`; the earlier "127" was un-cleared `>>` accumulation across runs), `close`-mentions=0 |
+| `close_on_child_death=yes` closes on child exit | **Observed** | same survivor session **self-exited in 0.81 s (status 0)** under `=yes` vs still-running/held-open under `=no` |
+| `launch --hold` holds the window + sets `KITTY_HOLD=1` | **Observed** | window still open 6 s after the cmd exited; held interactive shell env contained `KITTY_HOLD=1` (typed in via real X keys) |
 | `ESRCH` tolerance in `hangup` | **Observed** | `getpgid(...) = -1 ESRCH` + `killpg(...) = 0` |
 | signalfd created on main, read on IO; eventfd wakeup; no signal pipe on Linux | **Observed** | shim `signalfd`/`read`/`eventfd`/`pipe2` lines with tids |
 | two-level SIGCHLD coalescing | **Observed** | records 2–3 vs reaps 16 |
 | resize de-dup gate suppresses identical sizes | **Observed** | non-resize phase added 0 `ioctl`s |
-| Linux debounce uses `on_end=0.1` | **Observed platform** + source (`:1062`) | run on Linux/X11 else-branch |
+| Linux debounce `on_end = 0.1 s` | **Observed (measured)** + source (`:1062`) | collapse→distinct transition between 90 ms and 110 ms cadence; tail lag ~0.1 s, 2 stable runs (`q4_run.py`) |
 | macOS `from_os_notification` branch / `on_pause=0.5` | **INFERRED — source-only** | not the observation platform |
 | monitored-pid **notification callback** end-to-end | **INFERRED — source-only** | only reachable via `kitty @ run` (non-canonical) or update-check |
 | monitored-pid **reap-side** `mark_monitored_pids` on every reap | **Observed** | called on each window reap |
@@ -1488,12 +1723,12 @@ All line numbers are at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 
 **kitty source (REFERENCE — inspected, never modified):**
 
-- `kitty/child-monitor.c` — `needs_removal` decl `:67`; `children_mutex` macro `:76-77`; `children_lock` `:87`; `monitored_pids[256]`/`monitored_pids_count`/`reaped_pids[]` `:96-98`; `KITTY_HANDLED_SIGNALS` `:121`; `add_child` `:305`; `mark_child_for_close` `:541` (live `:546`, staged `:554`); `pty_resize` `:577` (EBADF/ENOTTY `:581`); `resize_pty` `:592` (diagnostic `:610`); `report_reaped_pids` `:950`; `process_pending_resizes` `:1043` (on_pause `:1055`, on_end `:1062`); `add_children` `:1281`; `hangup` `:1293`; `remove_children` `:1313`; `mark_child_for_removal`/reap-trigger `:1390`; `mark_monitored_pids` `:1398`; `reap_children` `:1413` (EINTR `:1420-1421`, gate `:1422`, always-monitored `:1423`); `SignalSet` `:1359`, callback `:1362`, `child_died=true` `:1371`; PTY EOF trigger `:1535`; POLLNVAL trigger `:1545`; shutdown sweep `:1574`; io_loop reconciliation `:1491-1495`; one-reap-per-iteration `:1526`; `process_global_state` declared `:1213`, timer-invoked `:1218`, defined `:1224`, registered via `run_main_loop` `:1262`.
+- `kitty/child-monitor.c` — `needs_removal` decl `:67`; `children_mutex` macro `:76-77`; `children_lock` `:87`; `monitored_pids[256]`/`monitored_pids_count`/`reaped_pids[]` `:96-98`; `KITTY_HANDLED_SIGNALS` `:121`; `add_child` `:305`; `death_notify` decl `:52` / `remove_notify[]` `:84`; `parse_input` `:451` (drain remove-queue under lock `:457-462`, death dispatch OUTSIDE lock `:517-522`); `mark_child_for_close` `:541` (live `:546`, staged `:554`); `pty_resize` `:577` (EBADF/ENOTTY `:581`); `resize_pty` `:592` (diagnostic `:610`); `monitor_pid` `:933`; `report_reaped_pids` `:950`; `process_pending_resizes` `:1043` (on_pause `:1055`, on_end `:1062`); `add_children` `:1281`; `hangup` `:1294`; `remove_children` `:1313`; `mark_child_for_removal`/reap-trigger `:1390`; `mark_monitored_pids` `:1398`; `reap_children` `:1413` (EINTR `:1420-1421`, gate `:1422`, always-monitored `:1423`); `SignalSet` `:1359`, callback `:1362`, `child_died=true` `:1371`; PTY EOF trigger `:1535`; POLLNVAL trigger `:1545`; shutdown sweep `:1574`; io_loop reconciliation `:1491-1495`; one-reap-per-iteration `:1526`; `process_global_state` declared `:1213`, timer-invoked `:1218`, defined `:1224`, registered via `run_main_loop` `:1262`.
 - `kitty/loop-utils.c` — non-`signalfd` `handle_signal` writer `:15`; signalfd creation `:42`; self-pipe (signal fallback) `:48`; `SA_SIGINFO|SA_RESTART` sigaction `:51`; eventfd wakeup `:70`; self-pipe (wakeup fallback) `:73`; `read_signals` `:131`.
 - `kitty/loop-utils.h` — `HAS_SIGNAL_FD` define `:16`; `self_pipe` `static inline` (all builds) `:51-52`.
-- `kitty/boss.py` — `monitor_pid` import `:98`; `add_child` `:585-587`; `on_child_death` idempotent pop `:881-885`; `mark_window_for_close` `:920`; `close_window` `:931`; `run_background_process(notify_on_death=…)` `:2358-2367`; `monitor_pid(p.pid)` `:2419`; `on_monitored_pid_death` `:2725`.
+- `kitty/boss.py` — `monitor_pid` import `:98`; `ChildMonitor(self.on_child_death, …)` death_notify binding `:370-371`; `add_child` `:585-587`; `on_child_death` idempotent pop `:881-885` → `tab.remove_window` `:903`; `mark_window_for_close` `:920`; `close_window` `:931`; `run_background_process(notify_on_death=…)` `:2358-2367`; `monitor_pid(p.pid)` `:2419`; `on_monitored_pid_death` `:2725`.
 - `kitty/tabs.py` — `new_window` `:504`; add-child-before-layout comment `:534` + call `:535`; `remove_window` `:580`.
-- `kitty/window_list.py` — `WindowList.all_windows[]` `:147`.
+- `kitty/window_list.py` — `WindowList.all_windows[]` `:147`; `group_for_window` `:264`; `add_window` `:329` (`all_windows.append` `:338`); `remove_window` `:373` (`all_windows.remove` `:377`, `id_map.pop` `:380`, `group.remove_window` `:382`).
 - `kitty/window.py` — `last_resized_at` `:562`; `child_is_launched` `:578`; `last_reported_pty_size` sentinel `:579`; `set_geometry` `:850`; resize gate `:861`; `resize_pty` call `:863`; `mark_terminal_ready`/launch transition `:865-867`; debug log lines `:871,873`; record size `:874`.
 - `kitty/child.py` — `Child.fork` `:276`; ready pipe `os.pipe()` `:283`; `spawn` `:333-335`; `mark_terminal_ready` `:362`.
 - `kitty/child.c` — `wait_for_terminal_ready` (blocks on ready pipe) `:71`; child branch close/wait/`execvp` `:151-160`.
@@ -1512,4 +1747,3 @@ All line numbers are at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 - Official kitty configuration reference: <https://sw.kovidgoyal.net/kitty/conf/>
 
 **Evidence artifacts (persisted under `/tmp/blitzy_obs_out` during the investigation):** `build.log`, `strace_fail.txt`, `defaults.txt`, `env_container_identity.txt`, `harness_manifest.txt`, `citation_reference.txt`, `harness/shim.c` (+ hashed helpers), `sessions/*.session` (hashed), `logs/*.log` (per-run debug + shim traces).
-
