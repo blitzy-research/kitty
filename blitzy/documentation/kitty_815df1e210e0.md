@@ -18,7 +18,7 @@ This document answers five questions about how the [kitty](https://sw.kovidgoyal
 
 ### 0.1 Method: run-first, observe-then-write
 
-Behavioral claims below are grounded **in directly observed runtime output** captured through the **real PTY path** — a genuine child process writing into a real pseudo-terminal that kitty reads — **wherever the behavior is reachable in this environment**. Where a specific mechanism cannot be surfaced here (for example, internal per-tick counters with no `strace`/`ptrace` access, or an idle-only code path that nothing in the canonical build triggers), the claim is **explicitly labeled *inferred / code-derived*** at the point it appears and is enumerated in the Appendix B coverage pass; that code-derived set is deliberately narrow (five items) and each carries its reason. Each *observed* claim sits **beside the exact command that produced it and that command's unedited output**, and each *structural* claim (how the code is wired) carries a `file:line` citation to the code that manifests it.
+Behavioral claims below are grounded **in directly observed runtime output** captured through the **real PTY path** — a genuine child process writing into a real pseudo-terminal that kitty reads — **wherever the behavior is reachable in this environment**. Where a specific mechanism cannot be surfaced here (for example, internal per-tick counters with no `strace`/`ptrace` access, or an idle-only code path that nothing in the canonical build triggers), the claim is **explicitly labeled *inferred / code-derived*** at the point it appears and is enumerated in the Appendix B coverage pass; that code-derived set is deliberately narrow (four items) and each carries its reason. Each *observed* claim sits **beside the exact command that produced it and that command's unedited output**, and each *structural* claim (how the code is wired) carries a `file:line` citation to the code that manifests it.
 
 **What is deliberately NOT used as evidence.** The C unit-test hook `test_parse_written_data` [kitty/screen.c:4771-4772] and the Python `parse_bytes` harness [kitty_tests/parser.py:20] both feed bytes straight to the parser worker and **bypass the PTY read path**. They are therefore **non-canonical** for these questions and are never used as primary evidence; where a contrast value from them would appear, it is explicitly labeled *non-canonical*.
 
@@ -703,7 +703,7 @@ That is the DCS `=1s` refusal report [kitty/vt-parser.c:640-641], fired because 
 
 ### 1.6 The input side of the boundary, and bracketed paste
 
-**Keystroke ingress — what `--debug-input` actually shows (honest).** `--debug-input` prints on **stderr**. With no injectable keypress, the only events it reports are windowing-layer *initialization*, not a key event:
+**Keystroke ingress — what `--debug-input` shows.** `--debug-input` prints on **stderr**. As a **baseline**, before any key is injected the only events it reports are windowing-layer *initialization*, not a key event:
 
 ```bash
 $ timeout 30 xvfb-run -a -s "-screen 0 1280x800x24" "$KITTY" --config NONE \
@@ -718,7 +718,87 @@ $ timeout 30 xvfb-run -a -s "-screen 0 1280x800x24" "$KITTY" --config NONE \
 [0.162] on_focus_change: window id: 0x1 focused: 1
 ```
 
-> **Honesty label — keyboard encoding is NOT observed here.** The lines above are XKB keymap load, modifier-index setup, an xvfb-generated pointer-enter, and focus initialization — **no key press**. No X-event-injection tool exists in this container: `xdotool`, `xte`, `wtype`, `ydotool` are all absent, and `import Xlib` fails in both the venv and system Python, so an XTEST-synthesized keypress is impossible. Therefore the `glfw → keys.c → key_encoding.c` key-to-escape **encoding stage is unobserved / code-derived**, not demonstrated. Remote-control `send-text` (below) exercises the *write transport* to the child, but by design it **bypasses** the glfw key-encoding stage, so it is not a substitute for a real keypress.
+The lines above are XKB keymap load, modifier-index setup, an xvfb-generated pointer-enter, and focus initialization — **no key press yet**. The dedicated X-event-injection *CLI* tools are indeed absent in this container (`xdotool`, `xte`, `wtype`, `ydotool` — all verified missing), but that is **not** the only way to synthesize a key: the **`python-xlib`** package that §1.4a and §5.2a already use for `XGetImage` on this host system-library build is present in *both* the venv and system Python (`python-xlib 0.33`), and it exposes the **XTEST** extension. So a *genuine* X `KeyPress`/`KeyRelease` can be delivered to kitty's focused window with `Xlib.ext.xtest.fake_input`, and the canonical `--debug-input` instrument then captures the full `glfw → keys.c → key_encoding.c` encoding stage **directly**. The block is self-contained — it starts its own `Xvfb :99`, writes both helper scripts, injects two ordinary text keys (`x`, `z`) and `Enter`, and cleans up its exact scratch dir:
+
+```bash
+source /tmp/kitty-venv/bin/activate
+export TMPDIR=/tmp/kitty-clean-tmp LANG=C.UTF-8 LC_ALL=C.UTF-8
+KITTY=./kitty/launcher/kitty
+
+d="$(mktemp -d "$TMPDIR/kitty_key.XXXXXX")"; chmod 0700 "$d"
+# child: raw-mode PTY slave; persist bytes as they arrive; exit once x, z and CR have arrived.
+cat > "$d/child_key.py" <<'PY'
+import os, sys, tty, select, time
+f = open(sys.argv[1], 'wb')
+try: tty.setraw(0)
+except Exception: pass
+data = b''; t0 = time.time()
+while time.time() - t0 < 6.0:
+    r, _, _ = select.select([0], [], [], 0.2)
+    if not r: continue
+    c = os.read(0, 4096)
+    if not c: break
+    data += c; f.write(c); f.flush()
+    if b'x' in data and b'z' in data and b'\r' in data: break
+f.close()
+PY
+# injector: synthesize genuine X KeyPress/KeyRelease via the XTEST extension (python-xlib).
+cat > "$d/inject_keys.py" <<'PY'
+import time
+from Xlib import display, X, XK
+from Xlib.ext import xtest
+disp = display.Display(':99')
+def tap(ks):
+    kc = disp.keysym_to_keycode(ks)
+    xtest.fake_input(disp, X.KeyPress, kc);   disp.sync(); time.sleep(0.03)
+    xtest.fake_input(disp, X.KeyRelease, kc); disp.sync(); time.sleep(0.25)
+time.sleep(0.2)
+tap(XK.XK_x); tap(XK.XK_z); tap(XK.XK_Return)   # two text keys, then Enter
+PY
+Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & xpid=$!
+trap 'kill "$kpid" "$xpid" 2>/dev/null; wait "$kpid" "$xpid" 2>/dev/null; rm -rf "$d"' EXIT
+sleep 1.5
+env DISPLAY=:99 "$KITTY" --config NONE -o close_on_child_death=yes --debug-input \
+    python3 "$d/child_key.py" "$d/recv.bin" >/dev/null 2>"$d/dbg.log" & kpid=$!
+for i in $(seq 1 50); do grep -q "focused: 1" "$d/dbg.log" 2>/dev/null && break; sleep 0.2; done
+sleep 0.5
+env DISPLAY=:99 python3 "$d/inject_keys.py"
+sleep 1.0
+kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+sed -E 's/\x1b\[[0-9;]*m//g' "$d/dbg.log" | grep -E 'Press|Release|on_key_input'   # ANSI color stripped
+echo "--- bytes received by the child on its PTY stdin ---"
+od -A d -t x1z "$d/recv.bin"
+kill "$xpid" 2>/dev/null; wait "$xpid" 2>/dev/null; rm -rf "$d"; trap - EXIT
+```
+
+Unedited `--debug-input` capture (stderr; ANSI color escapes stripped for readability — only `\x1b[..m` sequences removed, no content elided) — each key shown *press then release*:
+
+```
+[0.936] Press xkb_keycode: 0x35 clean_sym: x composed_sym: x text: x mods: none glfw_key: 120 (x) xkb_key: 120 (x)
+[0.936] on_key_input: glfw key: 0x78 native_code: 0x78 action: PRESS mods: none text: 'x' state: 0 sent key as text to child: x
+[0.961] Release xkb_keycode: 0x35 clean_sym: x mods: none glfw_key: 120 (x) xkb_key: 120 (x)
+[0.961] on_key_input: glfw key: 0x78 native_code: 0x78 action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.211] Press xkb_keycode: 0x34 clean_sym: z composed_sym: z text: z mods: none glfw_key: 122 (z) xkb_key: 122 (z)
+[1.211] on_key_input: glfw key: 0x7a native_code: 0x7a action: PRESS mods: none text: 'z' state: 0 sent key as text to child: z
+[1.241] Release xkb_keycode: 0x34 clean_sym: z mods: none glfw_key: 122 (z) xkb_key: 122 (z)
+[1.241] on_key_input: glfw key: 0x7a native_code: 0x7a action: RELEASE mods: none text: '' state: 0 ignoring as keyboard mode does not support encoding this event
+[1.492] Press xkb_keycode: 0x24 clean_sym: Return composed_sym: Return mods: none glfw_key: 57345 (ENTER) xkb_key: 65293 (Return)
+[1.492] on_key_input: glfw key: 0xe001 native_code: 0xff0d action: PRESS mods: none text: '' state: 0 sent encoded key to child: 0xd 
+```
+```
+--- bytes received by the child on its PTY stdin ---
+0000000 78 7a 0d                                         >xz.<
+0000003
+```
+
+**Cause → effect, traced to the code that manifests each hop** (byte-order stable across two runs; only the wall-clock timestamps differ):
+
+- The X server delivers the synthesized key to kitty's focused window; glfw's XKB layer decodes it in `glfw_xkb_handle_key_event()` [glfw/xkb_glfw.c:864], emitting the `Press xkb_keycode: … clean_sym: … glfw_key: …` line [glfw/xkb_glfw.c:875, :888, :926] and building a `GLFWkeyevent` that is dispatched to `on_key_input()` [kitty/glfw.c:439].
+- `on_key_input()` [kitty/keys.c:166] prints the `on_key_input: glfw key: …` line [kitty/keys.c:176] and calls `encode_glfw_key_event()` [kitty/key_encoding.c:414] to turn the event into bytes.
+- For the two ordinary text keys the encoder returns `SEND_TEXT_TO_CHILD` [kitty/key_encoding.c:437], so kitty writes the key's UTF-8 text and prints `sent key as text to child: x` / `… z` [kitty/keys.c:252-254]; for `Enter` the encoder instead returns the single-byte CR, so kitty writes `0x0d` and prints `sent encoded key to child: 0xd` [kitty/keys.c:255-261]. Both branches hand the bytes to `schedule_write_to_child()` [kitty/keys.c:253, :259], the same write transport used everywhere else on the input side.
+- The bytes crossed the **real PTY**: the child received exactly `78 7a 0d` = `x`, `z`, `CR` — precisely the bytes the encoding stage produced. (Each key *release* prints `ignoring as keyboard mode does not support encoding this event`: in the legacy keyboard mode releases are not encoded — itself directly observed.)
+
+So the `glfw → keys.c → key_encoding.c` key-to-escape **encoding stage is directly observed**, not code-derived. Remote-control `send-text` (below) exercises only the *write transport* to the child and by design **bypasses** this glfw key-encoding stage, so it remains a distinct, complementary experiment — not a substitute for a real keypress.
 
 **Bracketed paste through the real PTY (observed).** The paste convention wraps pasted text in `ESC[200~ … ESC[201~` so applications can tell pasted input from typed input. Kitty's constants are `BRACKETED_PASTE (2004 << 5)` [kitty/modes.h:81 — corrected from the plan's `:80`], with `BRACKETED_PASTE_START "200~"` [kitty/modes.h:82] and `BRACKETED_PASTE_END "201~"` [kitty/modes.h:83]. To prove the wrapper actually reaches the child, the child puts its PTY slave in raw mode and saves whatever bytes arrive on stdin; the paste is delivered with the supported flag `send-text --bracketed-paste=enable` (an explicitly *non-keyboard* paste path):
 
@@ -1740,7 +1820,7 @@ Every sub-question and every named item, with its concrete value, the evidence t
 - [x] **2000 ms default timeout** [kitty/screen.c:2521-2522]; `screen_check_pause_rendering` force-resume [:2489-2490] — *observed* boundary (1.5 s no-error vs 2.5 s timeout, ×2) (§1.5); **display-confirmed** force-resume at ~1962 ms with no ESU sent (pixel capture, §1.4a, ×2).
 - [x] **Before / during / after** — *observed at the command layer* (`screen_set_mode 2026 1` at line 1 → all 50 `draw SURGE line NN` commands parse in byte order during the pause → `screen_reset_mode 2026 1` at line 152 then `draw AFTER-ESU visible line` at line 153) **and at the display layer** via `XGetImage` pixel-hash (§1.4a): **0** display transitions during the pause, **exactly one** atomic transition on resume, and byte-identical before/during framebuffers. Code path [kitty/screen.c:2522-2543, :2737-2760, :2511].
 - [x] **Both refusal paths** (double-pause; late-resume) — *observed* error strings (§1.5).
-- [x] **Input side** `--debug-input` (glfw ingress) — *observed*; key-encoding stage labeled **inferred** (§1.6).
+- [x] **Input side** `--debug-input` — *observed*: glfw ingress **and** the full key-encoding stage `glfw`→`keys.c`→`key_encoding.c`, demonstrated with XTEST-synthesized keypresses (`x`, `z`, `Enter`); encoded bytes `78 7a 0d` confirmed on the child's PTY stdin (§1.6).
 - [x] **PTY fd origin** `openpty` [kitty/child.py:170], `Child.fork` [:276], `child_fd=master` [:338], `set_blocking(…,False)` [:345] — *code* (§1.2).
 - [x] **Bracketed paste 2004** [kitty/modes.h:81-83]; `paste_with_actions` [kitty/window.py:1643], `paste_bytes` [:1707], `paste_text` [:1713], `paste_()` [kitty/screen.c:4573], `in_bracketed_paste_mode` [:3854] — *observed* `screen_set/reset_mode 2004 1` (§1.6).
 
@@ -1780,7 +1860,7 @@ Every sub-question and every named item, with its concrete value, the evidence t
 - [x] **Actual output beside every claim; file:line for every structural claim** — throughout.
 - [x] **Timing rigor** — `input_delay` 3 ms, `repaint_delay` 10 ms, `resize_debounce_time` (0.1, 0.5) s, buffer 1 MiB, pause timeout 2000 ms; scale stated, stability confirmed across ≥ 2 runs (§Q1, §Q4, §Q5).
 - [x] **Corrected citations used** — `BRACKETED_PASTE` at [kitty/modes.h:81] (not :80); `test_parse_written_data` at [kitty/screen.c:4771-4772]; `add_child` at [kitty/boss.py:585]; `BUF_EXTRA` at [kitty/vt-parser.c:20] (not :19).
-- [x] **Code-derived (not directly observed) behavioral claims** — inferred from source and labeled inline where they appear. This set is **narrower than an earlier draft**: the software-GL framebuffer *is* captured directly with `XGetImage` (§1.4a, §5.2a), so the display-side pause/resume and the `input_delay` window are now **observed**, not inferred. (`EVDBG` per-tick tracing is still compile-gated out [kitty/child-monitor.c:29-33], and there is no `strace`; those limit only *internal* counters.) What remains code-derived, with the reason: (1) the key→escape **encoding** stage `glfw`→`keys.c`→`key_encoding.c` — only glfw ingress and an RC-injected bracketed paste were observed (§1.6); (2) **parser-buffer saturation gating** — `has_space_for_input`→false [kitty/vt-parser.c:1481] and POLLIN masking [kitty/child-monitor.c:1501] — only generic producer `write()` backpressure plus the teardown-race tail loss of §4.1a were observed (§4.1, §4.3); (3) `repaint_delay`'s **idle 10 ms cadence** — the throttle *bypass under load* is observed (§5.2a), but nothing in this build produces a non-input repaint to exercise the idle path, so that value stays code-derived [kitty/child-monitor.c:874-876]; (4) **live-drag resize coalescing** on the `on_end`/`on_pause` debounce — only the committed-resize→SIGWINCH hand-off was observed (§5.3), and the macOS `on_pause` branch cannot run on this Linux build; (5) the **network-fault SSH degradation** profile — there is no SSH server in the container, and the real attempt failed with exit 255 (§4.4). **Moved to directly observed (previously code-derived):** the display-side pause freeze, the single atomic on-resume frame, and the 2000 ms force-resume (pixel-hash + PNG, §1.4a); the `input_delay` coalescing latency (§5.2a). Everything else is either a direct runtime observation or a structural fact cited to file:line.
+- [x] **Code-derived (not directly observed) behavioral claims** — inferred from source and labeled inline where they appear. This set is **narrower than an earlier draft**: the software-GL framebuffer *is* captured directly with `XGetImage` (§1.4a, §5.2a), so the display-side pause/resume and the `input_delay` window are now **observed**, not inferred. (`EVDBG` per-tick tracing is still compile-gated out [kitty/child-monitor.c:29-33], and there is no `strace`; those limit only *internal* counters.) What remains code-derived, with the reason: (1) **parser-buffer saturation gating** — `has_space_for_input`→false [kitty/vt-parser.c:1481] and POLLIN masking [kitty/child-monitor.c:1501] — only generic producer `write()` backpressure plus the teardown-race tail loss of §4.1a were observed (§4.1, §4.3); (2) `repaint_delay`'s **idle 10 ms cadence** — the throttle *bypass under load* is observed (§5.2a), but nothing in this build produces a non-input repaint to exercise the idle path, so that value stays code-derived [kitty/child-monitor.c:874-876]; (3) **live-drag resize coalescing** on the `on_end`/`on_pause` debounce — only the committed-resize→SIGWINCH hand-off was observed (§5.3), and the macOS `on_pause` branch cannot run on this Linux build; (4) the **network-fault SSH degradation** profile — there is no SSH server in the container, and the real attempt failed with exit 255 (§4.4). **Moved to directly observed (previously code-derived):** the key→escape **encoding** stage `glfw`→`keys.c`→`key_encoding.c` — now demonstrated with XTEST-synthesized keypresses under `--debug-input`, with the encoded bytes (`78 7a 0d`) confirmed on the child's PTY stdin (§1.6); the display-side pause freeze, the single atomic on-resume frame, and the 2000 ms force-resume (pixel-hash + PNG, §1.4a); the `input_delay` coalescing latency (§5.2a). Everything else is either a direct runtime observation or a structural fact cited to file:line.
 - [x] **Build reconciled honestly** — `python3 setup.py develop` fails (`KeyError: 'DEVELOP_ROOT'` [setup.py:1255]); canonical `python3 setup.py` build used, producing `kitty/launcher/kitty` (kitty 0.35.2) (§0.2).
 
 *All temporary observation scripts and captures lived in private `mktemp -d` directories (mode 0700, outside the repository) removed by each block's `trap`/`rm -rf`; the only change to the destination repository is this document — verified directly in Appendix C below.*
