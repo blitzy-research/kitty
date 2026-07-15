@@ -1026,8 +1026,10 @@ static unsigned int modcode(const char*name){
 }
 static KeySym token_keysym(const char*t){
     if(!strcmp(t,"Return")||!strcmp(t,"enter")) return XK_Return;
-    if(!strcmp(t,"space")) return XK_space; if(!strcmp(t,"Tab")) return XK_Tab;
-    if(!strcmp(t,"BackSpace")) return XK_BackSpace; if(!strcmp(t,"Escape")) return XK_Escape;
+    if(!strcmp(t,"space")) return XK_space;
+    if(!strcmp(t,"Tab")) return XK_Tab;
+    if(!strcmp(t,"BackSpace")) return XK_BackSpace;
+    if(!strcmp(t,"Escape")) return XK_Escape;
     if(!strcmp(t,"Left")||!strcmp(t,"left")) return XK_Left;
     if(!strcmp(t,"Right")||!strcmp(t,"right")) return XK_Right;
     if(!strcmp(t,"Up")||!strcmp(t,"up")) return XK_Up;
@@ -1222,10 +1224,10 @@ exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
 cmd=$(tr "\0" " " < "/proc/$pid/cmdline" 2>/dev/null || true)
 echo "snap[$label]: pid=$pid"; echo "snap[$label]: exe=$exe"; echo "snap[$label]: cmdline=$cmd"
 case "$cmd" in *launcher/kitty*) : ;; *) echo "snap: REFUSING to attach - not launcher/kitty" >&2; exit 4;; esac
-echo "===== py-spy dump --native --pid $pid ====="; py-spy dump --native --pid "$pid" 2>&1
+echo "===== py-spy dump --native --pid $pid ====="; timeout 60 py-spy dump --native --pid "$pid" 2>&1
 echo "===== gdb -p $pid -batch thread apply all bt ====="
-gdb -p "$pid" -batch -ex "set debuginfod enabled off" -ex "thread apply all bt" 2>&1
-echo "===== eu-stack -p $pid ====="; eu-stack -p "$pid" 2>&1
+timeout 60 gdb -p "$pid" -batch -ex "set debuginfod enabled off" -ex "thread apply all bt" 2>&1
+echo "===== eu-stack -p $pid ====="; DEBUGINFOD_URLS= timeout 30 eu-stack -p "$pid" 2>&1
 ```
 
 (Three further single-purpose probes were used and are variants of the above: `ctrlc_signal.py` — enables `?19997`, reports termios `ISIG`/`VINTR` and a `SIGINT` handler (Q3.4 C2); `mouserep.py` — SGR mouse + `SIGWINCH` logger (S3); `scrollrep.py` — alt-screen scroll logger (S3b).)
