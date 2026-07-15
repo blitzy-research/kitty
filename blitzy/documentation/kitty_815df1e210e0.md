@@ -11,7 +11,7 @@ This document answers seven sub-questions (Q1–Q7) **from what was observed whi
 ## 0. Executive summary (direct answers, one line each)
 
 - **Q1 — Which window gets input?** The per-event target is the **active window of the OS-window that *received* the event** — not a scan of `is_focused`. The X server delivers the key event to the focused X11 top-level window; kitty's `key_callback` resolves *that* concrete `GLFWwindow*` to its `OSWindow` (`set_callback_window`, `kitty/glfw.c:196`), and `active_window()` indexes `callback_os_window->tabs[active_tab].windows[active_window]` (`kitty/keys.c:106`). `OSWindow.is_focused` + the MRU counter are mirrored global bookkeeping, **not** the per-key selector.
-- **Q2 — How does focus change propagate?** By **two distinct internal paths**, told apart at runtime by the presence/absence of the `on_focus_change` trace line. **Path A (OS-window focus):** GLFW `window_focus_callback` (`kitty/glfw.c:515`) → `is_focused`/MRU → `Boss.on_focus` (`kitty/boss.py:1651`) → `Window.focus_changed` → `Screen.focus_changed` (`kitty/screen.c:4604`). **Path B (internal window/tab switch):** Python-only via `WindowList` (`kitty/window_list.py:192`) / tab-index setter (`kitty/tabs.py:906`) with **no GLFW callback at all** — yet the child still gets its DECSET-1004 focus bytes.
+- **Q2 — How does focus change propagate?** By **two distinct internal paths**, told apart at runtime by the presence/absence of the `on_focus_change` trace line. **Path A (OS-window focus):** GLFW `window_focus_callback` (`kitty/glfw.c:515`) → `is_focused`/MRU → `Boss.on_focus` (`kitty/boss.py:1651`) → `Window.focus_changed` → `Screen.focus_changed` (`kitty/screen.c:4604`). **Path B (internal window/tab switch):** Python-only via `WindowList` (`kitty/window_list.py:192`) / tab-index setter (`kitty/tabs.py:892`) with **no GLFW callback at all** — yet the child still gets its DECSET-1004 focus bytes.
 - **Q3 — How is input routed to the child?** OS → external GLFW backend (+libxkbcommon) → C `key_callback` (`kitty/glfw.c:430`) → C `on_key_input` (`kitty/keys.c:166`) → Python shortcut test `dispatch_possible_special_key`; if not consumed, C `encode_glfw_key_event` (`kitty/key_encoding.c:414`) → **id-keyed** `schedule_write_to_child(w->id, …)` (`kitty/child-monitor.c:372`) → drained to the PTY by the `io_loop` thread. The id is the window resolved in Q1.
 - **Q4 — Stack snapshot.** A first attach was authentically **blocked** (EPERM, no `CAP_SYS_PTRACE`); after a container-scoped `--cap-add=SYS_PTRACE`, `py-spy dump --native` captured the main thread across all three layers, and a **deterministic `gdb` conditional breakpoint** captured the exact C→Python shortcut-dispatch frame; `gdb`/`eu-stack` enumerated the `KittyChildMon` `io_loop` thread. Frame-identical across 2 runs.
 - **Q5 — Input to an unfocused / just-closed window?** Input strictly **follows focus**; an unfocused window receives nothing (observed twice). Input generated right after closing the active window is **re-routed to the new active window**; the closed window's child is gone and its output file is frozen. Silent, no crash.
@@ -195,7 +195,7 @@ KeyPress matched action: previous_tab, handled as shortcut
 **Direct answer.** Focus changes propagate by **two distinct internal paths**, distinguishable at runtime by whether the first-party `on_focus_change` trace line fires:
 
 - **Path A — OS-window focus (driven by the external layer).** When the *OS-window* gains/loses focus, GLFW fires `window_focus_callback` (`kitty/glfw.c:515`), which emits the `on_focus_change` trace (`kitty/glfw.c:517`), sets `OSWindow.is_focused` (`kitty/glfw.c:527`), stamps the MRU counter `last_focused_counter = ++focus_counter` (`kitty/glfw.c:531`), then calls Python `Boss.on_focus` (`kitty/boss.py:1651`) → `Window.focus_changed` (`kitty/window.py:1123`) → `Screen.focus_changed` (`kitty/screen.c:4604`), which (if focus reporting is on) writes DECSET-1004 bytes `ESC[I`/`ESC[O` to the child (`kitty/screen.c:4611`).
-- **Path B — internal window/tab switch (Python-only, no GLFW callback).** When focus moves *within* one OS-window (switching splits or tabs), there is **no** OS focus change and **no** `window_focus_callback`. Python drives it directly: window switches via `WindowList.notify_on_active_window_change` (`kitty/window_list.py:192`), tab switches via the `active_tab_idx` setter (`kitty/tabs.py:906`), window removal via `Boss` (`kitty/boss.py:913`). These call `Window.focus_changed` directly, reaching the same `Screen.focus_changed` and the same DECSET bytes — **without any `on_focus_change` trace**.
+- **Path B — internal window/tab switch (Python-only, no GLFW callback).** When focus moves *within* one OS-window (switching splits or tabs), there is **no** OS focus change and **no** `window_focus_callback`. Python drives it directly: window switches via `WindowList.notify_on_active_window_change` (`kitty/window_list.py:192`), tab switches via the `active_tab_idx` setter (`kitty/tabs.py:892`), window removal via `Boss` (`kitty/boss.py:913`). These call `Window.focus_changed` directly, reaching the same `Screen.focus_changed` and the same DECSET bytes — **without any `on_focus_change` trace**.
 
 **Scenario S2a — Path A: two OS-windows, rapid focus switching.** A second OS-window is created (`ctrl+shift+n`) and focus is switched between the two X11 top-levels with `XSetInputFocus`, while a focus-reporting child (`focrep.py`, enables DECSET-1004) logs the bytes it receives. Exact result:
 
@@ -267,7 +267,7 @@ $ od -c /kqna/focrep_3.txt
 
 **Path B observations (the decisive contrast, directly observed).** Six internal focus switches produced **zero** additional `on_focus_change` lines (`on_focus_change count = 1`, the startup line only) — the GLFW `window_focus_callback` never fired. **Yet the children still received DECSET-1004 focus bytes** (`ESC[O`/`ESC[I` sequences in every `focrep_*` file). Therefore internal focus changes reach `Screen.focus_changed` (and its `ESC[I`/`ESC[O` output) **without** going through `window_focus_callback` — proving Path B is a separate, Python-driven route.
 
-**Source-assisted** (the Python call chain itself is not printed by `--debug-keyboard`): the specific functions `WindowList.notify_on_active_window_change` (`kitty/window_list.py:192`), the `active_tab_idx` setter (`kitty/tabs.py:906`), and `Boss` window removal (`kitty/boss.py:913`). The **observed discriminator** is unambiguous: Path A = (`on_focus_change` present + `is_focused`/MRU updated); Path B = (no `on_focus_change`, DECSET bytes still emitted). Registration of the callback is at `kitty/glfw.c:1281`.
+**Source-assisted** (the Python call chain itself is not printed by `--debug-keyboard`): the specific functions `WindowList.notify_on_active_window_change` (`kitty/window_list.py:192`), the `active_tab_idx` setter (`kitty/tabs.py:892`), and `Boss` window removal (`kitty/boss.py:913`). The **observed discriminator** is unambiguous: Path A = (`on_focus_change` present + `is_focused`/MRU updated); Path B = (no `on_focus_change`, DECSET bytes still emitted). Registration of the callback is at `kitty/glfw.c:1281`.
 
 ---
 
@@ -927,8 +927,8 @@ Creating three windows added **three child processes** and **zero** kitty thread
 **Direct answer.** kitty handles focused **input** synchronously on the **main/UI thread**, while a **separate `io_loop` thread (`KittyChildMon`)** drains child writes and *coalesces* child **output** processing. The single correctness-vs-responsiveness tradeoff observed: **kitty trades away background-output immediacy/throughput (throttling and coalescing a flooding child) to keep the focused input path responsive *and* per-child delivery complete, ordered, and isolated.**
 
 **How the mechanism actually works (source-verified; corrects a common misreading).** Outbound writes to a child are **not** gated by any delay: `schedule_write_to_child` (`kitty/child-monitor.c:372`) appends to that child's `write_buf` and wakes the loop immediately (`wakeup_io_loop`, `kitty/child-monitor.c:363`); the `io_loop` sets `POLLOUT` for a child **only** when it has pending bytes (`kitty/child-monitor.c:1503`) and drains them via `write_to_child` on `POLLOUT` (`kitty/child-monitor.c:1539`). The two delay options govern the **opposite** direction and rendering:
-- `input_delay` (`kitty/definition.py:878`, default 3 ms) = *"Delay before input from the program running in the terminal is processed"* → coalesces **child-output** parsing (`set_maximum_wait(OPT(input_delay) - …)`, `kitty/child-monitor.c:445`); it is *ignored when the input buffer is almost full*.
-- `repaint_delay` (`kitty/definition.py:866`, default 10 ms) = render coalescing (`kitty/child-monitor.c:874`); it is *ignored when there is pending input to be processed*.
+- `input_delay` (`kitty/options/definition.py:878`, default 3 ms) = *"Delay before input from the program running in the terminal is processed"* → coalesces **child-output** parsing (`set_maximum_wait(OPT(input_delay) - …)`, `kitty/child-monitor.c:445`); it is *ignored when the input buffer is almost full*.
+- `repaint_delay` (`kitty/options/definition.py:866`, default 10 ms) = render coalescing (`kitty/child-monitor.c:874`); it is *ignored when there is pending input to be processed*.
 
 **Scenario S4 — measure focused-input delivery under a background flood.** The focused window's child is a per-byte timestamp logger (`tslog.py`, clock = `time.monotonic`, resolution `1e-9 s`); a background window's child is a bounded producer (`flood.py`). An ordered 20-key burst `a…t` is injected to the **focused** window; `analyze_ts.py` reduces the log to string / count / ordering / first→last span / count of any foreign (non-burst) printable bytes.
 
@@ -985,7 +985,7 @@ span_ms=238.102  foreign_printable_bytes=0
 
 ## Appendix — Complete, validated harness scripts (auditability)
 
-All scripts lived in the container-only `/kqna` directory (outside the tracked tree) and were deleted afterward. They are bounded (no unbounded loops originate input; numeric args validated; no shell spawned by the injector). Full source is included here so the methodology is auditable and reproducible.
+All scripts lived in the container-only `/kqna` directory (outside the tracked tree) and were deleted afterward. They are bounded (no unbounded loops originate input; numeric args validated; no shell spawned by the injector). Full source is included here so the methodology is auditable and reproducible. Each Python child script below begins with a `#!/usr/bin/env python3` shebang and was made executable (`chmod +x`): this is **required** for the scripts kitty launches as `-o shell=` targets (`label.py`, `focrep.py`, `flood.py`), because kitty `execvp`s the `shell=` program directly — a target lacking a shebang + execute bit fails to exec and falls back to `kitten __hold_till_enter__`, producing no child output — and it is harmless for the ones launched via an explicit `python3 …` command (`tslog.py`, `analyze_ts.py`).
 
 **`xinj.c`** — minimal X11 XTEST injector (compiled `gcc -O2 -Wall -Werror -o xinj xinj.c -lX11 -l:libXtst.so.6`). It injects real events at the X server and touches no kitty internals:
 
@@ -1107,6 +1107,7 @@ int main(void){
 **`label.py`** — raw-mode byte logger (the Q1/Q3/Q5 child):
 
 ```python
+#!/usr/bin/env python3
 import os, sys, tty
 wid = os.environ.get('KITTY_WINDOW_ID', '?')
 tag = os.environ.get('WINTAG', '')
@@ -1125,6 +1126,7 @@ while True:
 **`focrep.py`** — like `label.py` but enables DECSET-1004 focus reporting (the Q2 child):
 
 ```python
+#!/usr/bin/env python3
 import os, tty
 wid = os.environ.get('KITTY_WINDOW_ID', '?')
 tag = os.environ.get('WINTAG', '')
@@ -1144,6 +1146,7 @@ while True:
 **`tslog.py`** — per-byte timestamp logger (the Q7 focused child):
 
 ```python
+#!/usr/bin/env python3
 import os, sys, tty, time
 wid = os.environ.get('KITTY_WINDOW_ID', '?')
 f = open('/kqna/ts_%s.txt' % wid, 'ab', buffering=0)
@@ -1163,6 +1166,7 @@ while True:
 **`flood.py`** — bounded high-volume output producer (the Q7 background child; no unbounded loop; writes a throughput side-channel):
 
 ```python
+#!/usr/bin/env python3
 import os, sys, time, signal
 tag = os.environ.get('FLOODTAG', 'A')
 prog = '/kqna/flood_progress_%s.txt' % tag
@@ -1183,6 +1187,7 @@ out.flush(); report()
 **`analyze_ts.py`** — reduces a `tslog.py` log to string / count / ordering / span / foreign-byte count (the Q7 reducer):
 
 ```python
+#!/usr/bin/env python3
 import sys
 path = sys.argv[1]; expected = sys.argv[2] if len(sys.argv) > 2 else ''
 letters = []; foreign = []; res = None
@@ -1245,12 +1250,12 @@ echo "===== eu-stack -p $pid ====="; DEBUGINFOD_URLS= timeout 30 eu-stack -p "$p
 ## Coverage pass (every sub-question answered with command + raw output + `file:line`)
 
 - **Q1** — Per-event selector = active window of the OS-window that received the event; `active_window()` (`kitty/keys.c:106`), `set_callback_window` (`kitty/glfw.c:196`); `is_focused`/MRU (`kitty/state.c:108`,`:120`) are bookkeeping. Evidence: S1 (window count 1→1; typed bytes land in the active tab's active window). ✔
-- **Q2** — Two paths: Path A GLFW `window_focus_callback` (`kitty/glfw.c:515`) → `Boss.on_focus` (`kitty/boss.py:1651`) → `Screen.focus_changed` (`kitty/screen.c:4604`); Path B Python-only (`kitty/window_list.py:192`, `kitty/tabs.py:906`, `kitty/boss.py:913`). Evidence: S2a (9 paired `on_focus_change`), S2b (0 additional callbacks yet DECSET bytes). ✔
+- **Q2** — Two paths: Path A GLFW `window_focus_callback` (`kitty/glfw.c:515`) → `Boss.on_focus` (`kitty/boss.py:1651`) → `Screen.focus_changed` (`kitty/screen.c:4604`); Path B Python-only (`kitty/window_list.py:192`, `kitty/tabs.py:892`, `kitty/boss.py:913`). Evidence: S2a (9 paired `on_focus_change`), S2b (0 additional callbacks yet DECSET bytes). ✔
 - **Q3** — `on_key_input` (`kitty/keys.c:166`) → dispatch → `encode_glfw_key_event` (`kitty/key_encoding.c:414`) → `schedule_write_to_child(id)` (`kitty/child-monitor.c:372`); signal branch (`kitty/keys.c:256` → `kitty/child.py:481`). Evidence: A1/A2/A3 branch matrix + child bytes, C1/C2 Ctrl+C, S3/S3b scroll+resize. ✔
 - **Q4** — Blocked (EPERM) then remediated (container-scoped `CAP_SYS_PTRACE`); `py-spy` MainThread stack (`main.py:234`), gdb dispatch breakpoint (three layers), `KittyChildMon` `io_loop`; 67-thread inventory bounded to the run; 2-run stable. ✔
 - **Q5** — Input follows focus (unfocused gets nothing); post-close reroute to survivor; low-level `found==false` drop (`kitty/child-monitor.c:369`) labelled inferred. Evidence: one continuous run, constant PIDs. ✔
 - **Q6** — Attribution table (external `glfw-x11.so`/xkb; C `fast_data_types.so`; Python `libpython`); refutations A/B/C with backtrace + before/after thread inventory (67→67, processes 1→4). ✔
-- **Q7** — Writes POLLOUT-driven (`kitty/child-monitor.c:1503`,`:1539`); `input_delay` = output coalescing (`kitty/definition.py:878`, `kitty/child-monitor.c:445`); `repaint_delay` = render coalescing (`kitty/definition.py:866`, `kitty/child-monitor.c:874`). Evidence: S4 quiet vs flood spans, throughput, isolation, producer backpressure; 2 runs. ✔
+- **Q7** — Writes POLLOUT-driven (`kitty/child-monitor.c:1503`,`:1539`); `input_delay` = output coalescing (`kitty/options/definition.py:878`, `kitty/child-monitor.c:445`); `repaint_delay` = render coalescing (`kitty/options/definition.py:866`, `kitty/child-monitor.c:874`). Evidence: S4 quiet vs flood spans, throughput, isolation, producer backpressure; 2 runs. ✔
 
 ## Inferred / source-assisted claim audit (claims not directly observed, labelled in-text)
 
