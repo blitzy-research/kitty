@@ -1150,7 +1150,7 @@ is **paced** (a 15 ms sleep every 500 lines) so the 0.25 s sampler resolves the 
 xvfb-run -a … python3 mem_run.py -1 200000 500 0.015 0.25 q1_ramp_A
 ```
 
-Run A — the **complete, unedited** staircase (61 samples: flat baseline during the 3 s start delay,
+Run A — the **complete, unedited** staircase (63 samples: flat baseline during the 3 s start delay,
 a straight-line ramp, then the post-`done` plateau) **[observed]**:
 
 ```text
@@ -2295,7 +2295,7 @@ Q1        default        ΔVmRSS 5,984 KiB  6,020 KiB       0.600 %   (|36|/6,00
 Q1        large-finite   ΔVmRSS 445,056    445,136 KiB     0.018 %   (|80|/445,096)
 Q1        ramp slope     2,276.1 B/line    (mid EXACT 2,276.0 = ABI) 0.021 % on ΔVmRSS
 Q3        default        0 steps           0 steps         identical (VmSize flat 5,134,460)
-Q3        large-finite   9 steps; VmSize 5,175,556  5,175,560   identical step count; ΔVmSize 4 B
+Q3        large-finite   9 steps; VmSize 5,175,556  5,175,560   identical step count; ΔVmSize 4 KiB
 Q3        infinite       6 steps; VmSize 5,161,900  5,161,900   identical (both fields)
 Q2        idle median    4.42 ms           4.00 ms         Δ 0.42 ms (0 timeouts each)
 Q2        load median    6.88 ms           6.90 ms         Δ 0.02 ms (0 timeouts; 1.14M/1.18M l/s)
