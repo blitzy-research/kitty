@@ -138,7 +138,7 @@ BARE BUILD EXIT = 1
 **(b) The canonical build** adds kitty's own officially-supported `--ignore-compiler-warnings`
 flag (which downgrades `-Werror` without editing any source) and sets `CI=true` to match kitty's
 CI convention. It completes successfully (exit 0). The command, the first three and last six lines
-of its 159-line log are shown; the middle is elided in this excerpt only (the full log is a build
+of its 158-line log are shown; the middle is elided in this excerpt only (the full log is a build
 artifact, not part of the repository):
 
 ```text
@@ -148,7 +148,8 @@ $ ( CI=true python3 setup.py --ignore-compiler-warnings ; echo "BUILD EXIT STATU
 [1/28] Generating wayland-xdg-shell-client-protocol.h ...
 [2/28] Generating wayland-xdg-shell-client-protocol.c ...
 [3/28] Generating wayland-viewporter-client-protocol.h ...
-   ...(151 intermediate compile/link lines elided in this excerpt)...
+   ...(149 intermediate generate/compile lines elided in this excerpt)...
+[1/5] Linking kitty/fast_data_types ...
 [2/5] Linking [x11] kitty/glfw-x11 ...
 [3/5] Linking [wayland] kitty/glfw-wayland ...
 [4/5] Linking kittens/transfer/rsync ...
@@ -181,7 +182,7 @@ tracer's session; the software-GL env vars select the `llvmpipe` path for the he
 ```text
 $ nohup setsid sudo -u ubuntu -H env DISPLAY=:99 \
       LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe HOME=/home/ubuntu \
-      ./kitty/launcher/kitty > kitty_run.log 2>&1 &
+      /tmp/blitzy/kitty/blitzy-81322a7e-8c21-4921-ab8a-068d5c584657_7749f6/kitty/launcher/kitty > kitty_run.log 2>&1 &
 $ pgrep -u ubuntu -x kitty        # -> the real kitty PID (KPID)
 199951
 ```
@@ -889,7 +890,7 @@ Xvfb :99 -screen 0 1280x1024x24 +extension GLX +render -noreset -ac &
 git clean -fdX                                   # remove ignored build artifacts
 CI=true python3 setup.py --ignore-compiler-warnings
 nohup setsid sudo -u ubuntu -H env DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 \
-      GALLIUM_DRIVER=llvmpipe HOME=/home/ubuntu ./kitty/launcher/kitty >kitty_run.log 2>&1 &
+      GALLIUM_DRIVER=llvmpipe HOME=/home/ubuntu /tmp/blitzy/kitty/blitzy-81322a7e-8c21-4921-ab8a-068d5c584657_7749f6/kitty/launcher/kitty >kitty_run.log 2>&1 &
 
 # 2. discover identifiers
 KPID=$(pgrep -u ubuntu -x kitty)
@@ -942,7 +943,7 @@ gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
 
 ```text
 branch: blitzy-81322a7e-8c21-4921-ab8a-068d5c584657
-HEAD:   dcddab9db8b74c896adc595f2dd0d6f5862521b5
+HEAD:   (current tip of this branch — a descendant of the baseline below whose only diff vs the baseline is this one document)
 baseline: 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 --- git status --porcelain (empty = clean) ---
 --- git diff --name-status vs baseline ---
