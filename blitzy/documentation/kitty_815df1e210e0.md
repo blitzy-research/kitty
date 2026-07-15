@@ -5,7 +5,7 @@
 - **HEAD:** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
 - **Deliverable authority:** SWE-AtlasQnA rule set (run-first, exhaustive, observed-output, grounded, read-only)
 
-> **How to read this document.** Every empirical claim is placed immediately next to the *exact, self-contained command* that produced it and that command's *full, unedited* output. Commands are copy-pasteable from the repository root and depend on no external helper files — they are `bash` heredocs that feed a script to `python3` on standard input (`python3 - <<'PYEOF' … PYEOF`) and, for child processes, use inline `python3 -c '…'`. Statements that are **not** direct runtime observations (source-derived facts, causal interpretation, environmental notes) are explicitly prefixed with **`Inferred:`**.
+> **How to read this document.** Every empirical claim is placed immediately next to the *exact, self-contained command* that produced it and that command's *full, unedited* output. Commands depend on no external helper files, but they **share one shell session**: the first `bash` block (§2.1) runs `export REPO=$(pwd)` from the repository root, and every later block reads `"$REPO"`. Of the ten `bash` blocks, **five are `python3` heredocs** (`python3 - <<'PYEOF' … PYEOF`) — the build block and the four investigation drivers — **one** runs plain `stat`/`test` plus an inline `python3 -c '…'` import check, and the **remaining four are plain `bash`** (the `REPO` export and the two Git-integrity blocks plus the cleanup block); the child processes inside the drivers are launched inline via `python3 -c '…'`. Statements that are **not** direct runtime observations (source-derived facts, causal interpretation, environmental notes) are explicitly prefixed with **`Inferred:`**.
 
 ---
 
@@ -58,9 +58,13 @@ export REPO="$(pwd)"
 
 Per AAP §0.3.1, the extension is built by calling the repository's **own** primitives **`setup.compile_c_extension('kitty/fast_data_types', …)`** and **`CompilationDatabase.build_all()`** directly. This deliberately does **not** call `setup.build()`, because `setup.build()` additionally invokes `compile_glfw` **and** `compile_kittens` (the latter would queue and link `kittens/transfer/rsync.so`). Building only the queued `fast_data_types` extension is what makes this a genuine fast-data-types-only build. No source file is modified; the produced `.so` is git-ignored.
 
-**Exact, self-contained build command** (the leading `rm` forces a genuine full recompile + relink so the transcript is complete):
+**Exact, self-contained build command.** A safety preamble (`set -euo pipefail` plus a `REPO`-identity check via `git -C "$REPO" rev-parse --show-toplevel`) guards the destructive `rm`; if `REPO` is unset, empty, or not this repository's worktree root, the block exits nonzero **before** removing anything. The leading `rm` then forces a genuine full recompile + relink so the transcript below is complete:
 
 ```bash
+set -euo pipefail
+: "${REPO:?set REPO to the repository root before running}"
+# Fail safely unless REPO is a real git worktree whose root is REPO itself (guards the rm below).
+[ "$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)" = "$REPO" ] || { echo "REPO is not the repo root: $REPO" >&2; exit 1; }
 cd "$REPO"
 rm -f kitty/fast_data_types.so kittens/transfer/rsync.so && rm -rf build   # git-ignored artifacts
 python3 - <<'PYEOF'
@@ -83,6 +87,7 @@ with setup.CompilationDatabase(args.incremental) as cdb:
     cdb.build_all()
 print("BUILD_SCRIPT_DONE")
 PYEOF
+echo "[[build exit $?]]"
 ```
 
 **Full, unedited build transcript** (exit status `0`):
@@ -155,6 +160,7 @@ action=build-fast-data-types-only incremental=True skip_code_generation=False ig
 [1/1] Linking kitty/fast_data_types ...
  done
 BUILD_SCRIPT_DONE
+[[build exit 0]]
 ```
 
 *Observed:* all 62 compiled units are under `kitty/` or the vendored `3rdparty/` (ringbuf, base64) that links **into** `fast_data_types`; there is **no** compile step under `glfw/` or `kittens/`, and the **single** link target is `kitty/fast_data_types`. *Inferred (source-derived):* `kitty/glfw.c`, `kitty/gl*.c`, and `kitty/glfw-wrapper.c` are kitty's own wrapper translation units compiled into `fast_data_types` — they are **not** the `glfw/` submodule that fails `-Werror=switch`. *Inferred:* `kitty/vt-parser.c` appears twice ([8/62], [9/62]) because kitty compiles it in more than one SIMD variant. The `incremental=True`/`ignore_compiler_warnings=False` header line shows the faithful `-pedantic-errors -Werror` build produced no warnings/errors.
@@ -163,17 +169,21 @@ BUILD_SCRIPT_DONE
 
 ```bash
 cd "$REPO"
-ls -la kitty/fast_data_types.so
-ls -la kittens/transfer/rsync.so   # must be ABSENT — setup.build() would have created it
+# Deterministic size+perms (no volatile mtime) so the output below is genuinely reproducible/unedited.
+stat -c '%A %U %G %s bytes %n' kitty/fast_data_types.so
+# rsync.so must be ABSENT — setup.build() (via compile_kittens) would have created it.
+test -e kittens/transfer/rsync.so && echo "PRESENT kittens/transfer/rsync.so" || echo "ABSENT kittens/transfer/rsync.so"
 python3 -c "import sys; sys.path.insert(0,'.'); import kitty.fast_data_types as f; print('IMPORT_OK Screen=', hasattr(f,'Screen'), 'monotonic=', hasattr(f,'monotonic'))"
+echo "[[proof exit $?]]"
 ```
 
 Full, unedited output:
 
 ```
--rwxr-xr-x 1 root root 1253792 … kitty/fast_data_types.so
-ls: cannot access 'kittens/transfer/rsync.so': No such file or directory
+-rwxr-xr-x root root 1253792 bytes kitty/fast_data_types.so
+ABSENT kittens/transfer/rsync.so
 IMPORT_OK Screen= True monotonic= True
+[[proof exit 0]]
 ```
 
 *Cause→effect (Inferred):* because the build queued only `compile_c_extension('kitty/fast_data_types', …)` and never `compile_kittens`, `kittens/transfer/rsync.so` is not produced — its absence is the positive proof that `setup.build()` was **not** used. The 1,253,792-byte `.so` imports and exposes `Screen`/`monotonic`, the primitives the Python layer needs.
@@ -186,37 +196,40 @@ The tracked source tree is **unmodified** before, during, and after the investig
 
 ```bash
 cd "$REPO"
+BASE=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1   # frozen source revision this task started from (AAP §0.2.1)
 git branch --show-current
-git rev-parse HEAD
 git status --porcelain ; echo "[[porcelain exit $?]]"
 git diff --stat ; echo "[[diff-stat end]]"
-git diff --name-status HEAD~1 HEAD
+git diff --name-status "$BASE" HEAD ; echo "[[base..HEAD name-status exit $?]]"
+git merge-base --is-ancestor "$BASE" HEAD && echo "[[base is ancestor of HEAD]]"
 ```
 
 Full, unedited output:
 
 ```
 blitzy-c95b69bb-fe12-46f0-ba32-022ad94c0d73
-ce48b584246792563da4c72ef5bbc0bea784eebf
 [[porcelain exit 0]]
 [[diff-stat end]]
 A	blitzy/documentation/kitty_815df1e210e0.md
+[[base..HEAD name-status exit 0]]
+[[base is ancestor of HEAD]]
 ```
 
-*Observed:* the working tree is clean (`git status --porcelain` is empty, exit 0; `git diff --stat` is empty), and the only change from the parent commit to HEAD is the **addition** of this one document (`A blitzy/documentation/kitty_815df1e210e0.md`).
+*Observed:* the working tree is clean (`git status --porcelain` is empty, exit 0; `git diff --stat` is empty), and the only change from the frozen source revision `815df1e2…` (the base this task started from, per AAP §0.2.1) to `HEAD` is the **addition** of this one document (`A blitzy/documentation/kitty_815df1e210e0.md`, exit 0); `git merge-base --is-ancestor` confirms that base is an ancestor of `HEAD`.
 
-*Inferred (necessarily so):* the `git rev-parse HEAD` value shown above is a **pre-commit snapshot** — it was captured before this document's own commit was finalized. Because a committed file cannot contain the hash of the very commit that adds it, this value necessarily **differs from the final deliverable-commit hash**; the deliverable commit is (re)created by amending onto the same parent, so `HEAD~1` remains the source revision `815df1e2…` and `git diff --name-status HEAD~1 HEAD` still shows only this one added file. The substantive read-only claims — empty `git status --porcelain`, empty `git diff --stat`, and a single added file versus the parent — are unaffected by the exact HEAD hash.
+*Inferred (necessarily so):* the integrity check is anchored on the **frozen source revision** `815df1e2…` rather than on a relative ref such as `HEAD~1`. The branch may carry more than one deliverable commit (an initial document add plus later documentation fixes), in which case `HEAD~1` points at an *intermediate* commit and `git diff --name-status HEAD~1 HEAD` reports a spurious `M` (modified) instead of the true `A` (added) relative to the source tree — so the stable base is used instead. The exact `git rev-parse HEAD` value is deliberately **not** pinned here: it is a moving fixed-point — a committed file cannot embed the hash of the commit that adds it, and the value changes whenever the deliverable commit is (re)created or amended. The substantive read-only claims — empty `git status --porcelain`, empty `git diff --stat`, and exactly **one added** file versus the frozen base — are invariant across any number of re-commits and are what the block above demonstrates.
 
 **Post-run** (captured after the build and every observation, then after cleanup):
 
 ```bash
 cd "$REPO"
+BASE=815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1
 git status --porcelain ; echo "[[porcelain exit $?]]"
 git diff --stat ; echo "[[diff-stat end]]"
-git diff --name-status HEAD~1 HEAD
+git diff --name-status "$BASE" HEAD ; echo "[[base..HEAD name-status exit $?]]"
 head -1 .gitignore
-git check-ignore kitty/fast_data_types.so
-ls kittens/transfer/rsync.so 2>&1
+git check-ignore kitty/fast_data_types.so ; echo "[[check-ignore exit $?]]"
+test -e kittens/transfer/rsync.so && echo "PRESENT kittens/transfer/rsync.so" || echo "ABSENT kittens/transfer/rsync.so"
 ```
 
 Full, unedited output:
@@ -225,9 +238,11 @@ Full, unedited output:
 [[porcelain exit 0]]
 [[diff-stat end]]
 A	blitzy/documentation/kitty_815df1e210e0.md
+[[base..HEAD name-status exit 0]]
 *.so
 kitty/fast_data_types.so
-ls: cannot access 'kittens/transfer/rsync.so': No such file or directory
+[[check-ignore exit 0]]
+ABSENT kittens/transfer/rsync.so
 ```
 
 *Observed:* after building and running everything, `git status --porcelain` is still empty (exit 0) and `git diff --stat` is still empty — the tracked tree never changed. The first line of `.gitignore` is `*.so`, and `git check-ignore` returns `kitty/fast_data_types.so`, so the compiled extension is ignored by design. *Inferred:* removing `rsync.so` and `build/` before the build left no tracked-file change precisely because both are git-ignored.
@@ -257,7 +272,7 @@ Every behavioral value was produced by exercising the **real terminal input path
 
 - **Raw-capture questions (Q1–Q4):** kitty's own **PTY harness** `kitty_tests.PTY` ([kitty_tests/\_\_init\_\_.py:277]) forks a **real child process** ([kitty_tests/\_\_init\_\_.py:291]) whose stdout is a pseudo-terminal ([kitty_tests/\_\_init\_\_.py:303,309]). The parent captures every byte **verbatim** into `received_bytes` ([kitty_tests/\_\_init\_\_.py:365]) while simultaneously feeding them to a **real `Screen`** via `parse_bytes` ([kitty_tests/\_\_init\_\_.py:366], [kitty_tests/\_\_init\_\_.py:30-36]). The child is an inline `python3 -c '…'` program (no external file) that writes the canonical stream to stdout and exits with the chosen code.
 - **Parsed-output questions (Q1/Q2):** the production wrapper `kitty.window.cmd_output` ([kitty/window.py:457]) is called on the same real `Screen`, in plain and `as_ansi=True` forms.
-- **Exit-code questions (Q5/Q6):** a **real** `kitty.window.Window` is used as the `Screen`'s callback object, so parsing the byte stream drives the genuine C→Python path `screen.c` → `CALLBACK` → `Window.cmd_output_marking` → `Window.handle_cmd_end`, with the production `int()` conversion and a **real** `on_cmd_startstop` watcher. Options are initialized with the same idiom kitty's own tests use (`set_options`, [kitty_tests/\_\_init\_\_.py:223-230]) so the full method body — including the post-watcher `get_options()` tail — runs cleanly.
+- **Exit-code questions (Q5/Q6):** a **real** `kitty.window.Window` is used as the `Screen`'s callback object, so parsing the byte stream drives the genuine C→Python path `screen.c` → `CALLBACK` → `Window.cmd_output_marking` → `Window.handle_cmd_end`, with the production `int()` conversion and a **real** `on_cmd_startstop` watcher — a callable appended to a genuine `kitty.window.Watchers` container and dispatched by the **inherited production** `Window.call_watchers` (no monkeypatched dispatch). Options are initialized with the same idiom kitty's own tests use (`set_options`, [kitty_tests/\_\_init\_\_.py:223-230]) so the full method body — including the post-watcher `get_options()` tail — runs cleanly.
 
 ### 2.5 Two-run stability and cleanup
 
@@ -267,7 +282,7 @@ Each observation was executed **twice** in the same invocation; every reported v
 
 ## 3. The Code Path
 
-The marker stream flows through a **two-layer pipeline**: a C parsing/screen layer and a Python window/callback layer. Every step is confirmed against source with a `file:line` citation; the runtime evidence that exercises each step is in §4–§8.
+The marker stream flows through a **two-layer pipeline**: a C parsing/screen layer and a Python window/callback layer. Every step is confirmed against source with a `file:line` citation; the runtime evidence that exercises each step is in §4–§7.
 
 ```mermaid
 flowchart TD
@@ -300,7 +315,7 @@ flowchart TD
    - **`case 'C':`** [kitty/screen.c:2340] — sets `prompt_kind = OUTPUT_START` [kitty/screen.c:2341]; if the payload begins with `;cmdline` (`strstr(buf + 1, ";cmdline") == buf + 1`, [kitty/screen.c:2343]) then `cmdline = buf + 2` [kitty/screen.c:2344]; decodes UTF-8 [kitty/screen.c:2346]; fires `CALLBACK("cmd_output_marking", "OO", Py_True, c)` [kitty/screen.c:2347].
    - **`case 'D':`** [kitty/screen.c:2350] — `const char *exit_status = buf[1] == ';' ? buf + 2 : "";` [kitty/screen.c:2351]; fires `CALLBACK("cmd_output_marking", "Os", Py_None, exit_status)` [kitty/screen.c:2352]. The switch closes at [kitty/screen.c:2354].
    - **There is no `case 'B'`.** The switch ([kitty/screen.c:2331-2354]) has cases for `A`, `C`, `D` only — `B` matches no case, so it produces **no callback** (a no-op; observed in §7.1).
-   - *Inferred (source-derived):* the `"Os"` format at [kitty/screen.c:2352] means the exit status crosses into Python as a **`str`** (format code `s`), not an int — the string→int boundary that governs Q5/Q6. This is confirmed at runtime in §6 Evidence 1 (`data_type = 'str'`).
+   - *Inferred (source-derived):* the `"Os"` format at [kitty/screen.c:2352] means the exit status crosses into Python as a **`str`** (format code `s`), not an int — the string→int boundary that governs Q5/Q6. This is confirmed at runtime in the Q5 answer (§4, evidence 1) and in §6.1, where the `D`-marker boundary call reports the exit status as a `str` — e.g. `(None, '99', 'str')`.
    - `PromptKind` values are at [kitty/data-types.h:230] (`UNKNOWN_PROMPT_KIND = 0, PROMPT_START = 1, SECONDARY_PROMPT = 2, OUTPUT_START = 3`); the handler is declared at [kitty/screen.h:231].
 3. **`kitty/window.py` → `Window.cmd_output_marking`** ([kitty/window.py:1453]): `if is_start:` ([kitty/window.py:1454]) runs the start branch ([kitty/window.py:1455-1459]); `else:` ([kitty/window.py:1460]) calls `self.handle_cmd_end(cmdline)` ([kitty/window.py:1461]). *Inferred (source-derived):* the `C` marker passes `Py_True` (start branch); both `A` (`Py_False`) and `D` (`Py_None`) are falsy and take the `else` branch — but for `A` the guard in `handle_cmd_end` early-returns (see §7.2), so only `D` records a value.
 4. **`kitty/window.py` → `Window.handle_cmd_end`** ([kitty/window.py:1408]): early-return guard `if self.last_cmd_output_start_time == 0.: return` ([kitty/window.py:1409-1410]); reset `self.last_cmd_output_start_time = 0.` ([kitty/window.py:1411]); then `try: self.last_cmd_exit_status = int(exit_status)` ([kitty/window.py:1412-1413]); `except Exception: self.last_cmd_exit_status = 0` ([kitty/window.py:1414-1415]); watcher dispatch `self.call_watchers(self.watchers.on_cmd_startstop, {` ([kitty/window.py:1419]) with the event dict whose `'exit_status'` key is on [kitty/window.py:1420]. *Inferred (source-derived):* `last_cmd_exit_status` is set and the watcher fires **before** the method's `get_options()` tail ([kitty/window.py:1422] onward), so the exit-code value is fully determined regardless of that tail.
@@ -331,7 +346,12 @@ from kitty_tests import PTY
 CHILD = r'''
 import os, sys
 mode = sys.argv[1]; payload = sys.argv[2]; ec = int(sys.argv[3])
-d = b"\x1b]133;D\x1b\\" if mode == "nosemi" else b"\x1b]133;D;" + payload.encode() + b"\x1b\\"
+if mode == "semi":
+    d = b"\x1b]133;D;" + payload.encode() + b"\x1b\\"
+elif mode == "nosemi":
+    d = b"\x1b]133;D\x1b\\"
+else:
+    raise SystemExit("unknown mode: " + repr(mode))
 data = (b"\x1b]133;A\x1b\\"
         b"\x1b]133;B\x1b\\"
         b"\x1b]133;C;cmdline=some_command\x1b\\"
@@ -492,7 +512,7 @@ Command: the **RAW-capture driver from Q1(a)** (it runs all conditions). Observe
 
 ### Q5 — With exit code `99`, what runtime evidence proves this specific value was processed through the entire code path?
 
-This is answered **self-contained** here. The command below drives the **real** C→Python path: a real `Screen` whose callback object is a **real `kitty.window.Window`** parses the `A/B/C/D;99` stream, so `screen.c` → `CALLBACK("Os", …)` → `Window.cmd_output_marking` → `Window.handle_cmd_end` all execute. It initializes options exactly as kitty's own tests do, sets a **sentinel** `last_cmd_exit_status = -12345`, installs a boundary observer and a **real** `on_cmd_startstop` watcher, and runs **twice**. (The same driver answers Q6 and §6.)
+This is answered **self-contained** here. The command below drives the **real** C→Python path: a real `Screen` whose callback object is a **real `kitty.window.Window`** parses the `A/B/C/D;99` stream, so `screen.c` → `CALLBACK("Os", …)` → `Window.cmd_output_marking` → `Window.handle_cmd_end` all execute. It initializes options exactly as kitty's own tests do, sets a **sentinel** `last_cmd_exit_status = -12345`, installs a boundary observer and a **real** `on_cmd_startstop` watcher — a callable appended to a genuine `kitty.window.Watchers` container, dispatched by the **inherited production** `Window.call_watchers` (no monkeypatched dispatch) — and runs **twice**. (The same driver answers Q6 and §6.)
 
 ```bash
 cd "$REPO"
@@ -504,7 +524,7 @@ from kitty.fast_data_types import Screen, set_options, get_options
 from kitty.config import finalize_keys, finalize_mouse_mappings
 from kitty.options.parse import merge_result_dicts
 from kitty.options.types import Options, defaults
-from kitty.window import Window
+from kitty.window import Window, Watchers
 # Initialize options exactly like kitty_tests.BaseTest.set_options so the real handle_cmd_end tail runs.
 opts = Options(merge_result_dicts(defaults._asdict(), {'scrollback_pager_history_size': 1024, 'click_interval': 0.5}))
 finalize_keys(opts, {}); finalize_mouse_mappings(opts, {}); set_options(opts)
@@ -519,9 +539,11 @@ def drive_real_window(stream):
     w = Window.__new__(Window)                 # real Window, no heavy __init__
     w.last_cmd_output_start_time = 0.; w.last_cmd_exit_status = -12345; w.last_cmd_cmdline = ''
     w.id = 0; w.last_resized_at = 0.
-    watch = type('W', (), {})(); watch.on_cmd_startstop = []; w.watchers = watch
+    w.watchers = Watchers()                    # a REAL Watchers container
     events = []
-    w.call_watchers = lambda watchers, data: events.append(dict(data))   # observe watcher boundary
+    def on_cmd_startstop(boss, window, data): events.append(dict(data))   # a REAL watcher callable
+    w.watchers.on_cmd_startstop.append(on_cmd_startstop)                   # appended to the real list
+    # NOTE: w.call_watchers is NOT overridden -> the inherited production Window.call_watchers dispatches.
     real = Window.cmd_output_marking.__get__(w, Window)
     spy = []
     def probe(is_start, cmdline=''):
@@ -534,13 +556,22 @@ def drive_real_window(stream):
     d_calls = [c for c in spy if c[0] is None]
     end_events = [e for e in events if e.get('is_start') is False]
     return dict(exit_status=w.last_cmd_exit_status, spy=spy, d_calls=d_calls, events=events,
-                end_events=end_events, err=err)
+                end_events=end_events, err=err,
+                watchers_type=type(w.watchers).__name__,
+                watcher_callables=len(w.watchers.on_cmd_startstop),
+                dispatch_is_production=('call_watchers' not in vars(w)))
 
 def drive_testdouble(stream):
     cb = Callbacks(); scr = Screen(cb, 25, 80, 100, 10, 20, 0, cb)
     try: parse_bytes(scr, stream); e = None
     except Exception as ex: e = repr(ex)
     return cb.last_cmd_exit_status, e
+
+# One-time watcher-provenance proof (real Watchers + inherited dispatch).
+_p = drive_real_window(make_stream("semi", "99"))
+print(f"watcher provenance: watchers_type={_p['watchers_type']} "
+      f"on_cmd_startstop_callables={_p['watcher_callables']} "
+      f"dispatch=inherited Window.call_watchers (not monkeypatched)={_p['dispatch_is_production']}")
 
 conds = [("D;99  (Q5)","semi","99"),("D;42","semi","42"),("D;0","semi","0"),("D;1","semi","1"),
          ("D;127","semi","127"),("D;not_a_number (Q6)","semi","not_a_number"),
@@ -554,7 +585,7 @@ for label, mode, payload in conds:
     print(f"=== [{label}] two_run_stable={stable} ===")
     print(f"  REAL last_cmd_exit_status={r1['exit_status']!r} (sentinel was -12345)")
     print(f"  D-marker boundary call (is_start, cmdline, type) = {r1['d_calls']!r}")
-    print(f"  on_cmd_startstop events = {[{k:e.get(k) for k in ('is_start','cmdline','exit_status')} for e in r1['events']]!r}")
+    print(f"  on_cmd_startstop events (recorded by the real watcher callable) = {[{k:e.get(k) for k in ('is_start','cmdline','exit_status')} for e in r1['events']]!r}")
     print(f"  handle_cmd_end tail err = {r1['err']!r}")
     print(f"  TEST-DOUBLE last_cmd_exit_status={td!r} (init sys.maxsize={sys.maxsize})")
 print("REAL_WINDOW_DRIVER_DONE")
@@ -565,10 +596,11 @@ Observed row for `D;99` (full transcript for all conditions is in §6; both runs
 
 ```
 notify_on_cmd_finish default = NotifyOnCmdFinish(when='never', duration=5.0, action='notify', cmdline=())
+watcher provenance: watchers_type=Watchers on_cmd_startstop_callables=1 dispatch=inherited Window.call_watchers (not monkeypatched)=True
 === [D;99  (Q5)] two_run_stable=True ===
   REAL last_cmd_exit_status=99 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '99', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 99}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 99}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=99 (init sys.maxsize=9223372036854775807)
 ```
@@ -577,7 +609,7 @@ notify_on_cmd_finish default = NotifyOnCmdFinish(when='never', duration=5.0, act
 
 1. **String at the C→Python boundary.** The `D`-marker boundary call is `(None, '99', 'str')` — `is_start` is `Py_None` and the exit status is the **`str`** `'99'`, confirming the `"Os"` format at [kitty/screen.c:2352] passes a Python string (not an int). *(Only the `A`, `C`, `D` markers call back — never `B`.)*
 2. **`int()` executed.** The **sentinel** `-12345` was overwritten to the **integer** `99` (`REAL last_cmd_exit_status=99`), proving `int('99')` ran at [kitty/window.py:1413] (a copied string would read `'99'`; the `except` branch would read `0`).
-3. **Real watcher received `99`.** The **end** event `{'is_start': False, 'cmdline': 'some_command', 'exit_status': 99}` came through a real `on_cmd_startstop` watcher — the event dict built inside `handle_cmd_end` at [kitty/window.py:1419-1420]. *(The start event's `exit_status` is the hardcoded `0` at [kitty/window.py:1459]. `handle_cmd_end tail err = None` shows the full method — including the post-watcher `get_options()` tail — ran cleanly, since `notify_on_cmd_finish` defaults to `when='never'`.)*
+3. **Real watcher received `99`.** The **end** event `{'is_start': False, 'cmdline': 'some_command', 'exit_status': 99}` was recorded by a **real watcher callable** appended to a genuine `kitty.window.Watchers` container's `on_cmd_startstop` list and dispatched by the **inherited production** `Window.call_watchers` — *not* a monkeypatched stand-in. The `watcher provenance:` line confirms this at runtime (`watchers_type=Watchers`, `on_cmd_startstop_callables=1`, `dispatch=inherited Window.call_watchers (not monkeypatched)=True`). The event dict itself is built inside `handle_cmd_end` at [kitty/window.py:1419-1420]. *(The start event's `exit_status` is the hardcoded `0` at [kitty/window.py:1459]. `handle_cmd_end tail err = None` shows the full method — including the post-watcher `get_options()` tail — ran cleanly, since `notify_on_cmd_finish` defaults to `when='never'`.)*
 
 **End-to-end corroboration (real child exiting `99`).** The RAW-capture driver's `D;99` row (§5) shows a real forked child that wrote `D;99` **and exited 99** (`require_exit_code=99` passed), producing `len=69`, `ESC]133;D`@57, number@65 — the same geometry the real-Window path consumed.
 
@@ -591,13 +623,13 @@ Answered **self-contained** using the **same real-Window driver shown in Q5** (i
 === [D;not_a_number (Q6)] two_run_stable=True ===
   REAL last_cmd_exit_status=0 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, 'not_a_number', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=9223372036854775807 (init sys.maxsize=9223372036854775807)
 === [D;(empty) (Q6)] two_run_stable=True ===
   REAL last_cmd_exit_status=0 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=9223372036854775807 (init sys.maxsize=9223372036854775807)
 ```
@@ -695,52 +727,53 @@ The full, unedited two-run transcript from the **real-Window driver of Q5** (eve
 
 ```
 notify_on_cmd_finish default = NotifyOnCmdFinish(when='never', duration=5.0, action='notify', cmdline=())
+watcher provenance: watchers_type=Watchers on_cmd_startstop_callables=1 dispatch=inherited Window.call_watchers (not monkeypatched)=True
 === [D;99  (Q5)] two_run_stable=True ===
   REAL last_cmd_exit_status=99 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '99', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 99}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 99}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=99 (init sys.maxsize=9223372036854775807)
 === [D;42] two_run_stable=True ===
   REAL last_cmd_exit_status=42 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '42', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 42}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 42}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=42 (init sys.maxsize=9223372036854775807)
 === [D;0] two_run_stable=True ===
   REAL last_cmd_exit_status=0 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '0', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=0 (init sys.maxsize=9223372036854775807)
 === [D;1] two_run_stable=True ===
   REAL last_cmd_exit_status=1 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '1', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 1}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 1}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=1 (init sys.maxsize=9223372036854775807)
 === [D;127] two_run_stable=True ===
   REAL last_cmd_exit_status=127 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '127', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 127}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 127}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=127 (init sys.maxsize=9223372036854775807)
 === [D;not_a_number (Q6)] two_run_stable=True ===
   REAL last_cmd_exit_status=0 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, 'not_a_number', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=9223372036854775807 (init sys.maxsize=9223372036854775807)
 === [D;(empty) (Q6)] two_run_stable=True ===
   REAL last_cmd_exit_status=0 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=9223372036854775807 (init sys.maxsize=9223372036854775807)
 === [D(no-semicolon)] two_run_stable=True ===
   REAL last_cmd_exit_status=0 (sentinel was -12345)
   D-marker boundary call (is_start, cmdline, type) = [(None, '', 'str')]
-  on_cmd_startstop events = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
+  on_cmd_startstop events (recorded by the real watcher callable) = [{'is_start': True, 'cmdline': 'some_command', 'exit_status': 0}, {'is_start': False, 'cmdline': 'some_command', 'exit_status': 0}]
   handle_cmd_end tail err = None
   TEST-DOUBLE last_cmd_exit_status=9223372036854775807 (init sys.maxsize=9223372036854775807)
 REAL_WINDOW_DRIVER_DONE
@@ -779,15 +812,18 @@ from kitty.fast_data_types import Screen, set_options
 from kitty.config import finalize_keys, finalize_mouse_mappings
 from kitty.options.parse import merge_result_dicts
 from kitty.options.types import Options, defaults
-from kitty.window import Window
+from kitty.window import Window, Watchers
 opts = Options(merge_result_dicts(defaults._asdict(), {'scrollback_pager_history_size': 1024, 'click_interval': 0.5}))
 finalize_keys(opts, {}); finalize_mouse_mappings(opts, {}); set_options(opts)
 def fresh():
     w = Window.__new__(Window)
     w.last_cmd_output_start_time = 0.; w.last_cmd_exit_status = -12345; w.last_cmd_cmdline = ''
     w.id = 0; w.last_resized_at = 0.
-    watch = type('W', (), {})(); watch.on_cmd_startstop = []; w.watchers = watch
-    ev = []; w.call_watchers = lambda ws, d: ev.append(dict(d))
+    w.watchers = Watchers()                                # a REAL Watchers container
+    ev = []
+    def on_cmd_startstop(boss, window, data): ev.append(dict(data))   # a REAL watcher callable
+    w.watchers.on_cmd_startstop.append(on_cmd_startstop)   # appended to the real list
+    # w.call_watchers is NOT overridden -> inherited production Window.call_watchers dispatches.
     real = Window.cmd_output_marking.__get__(w, Window); spy = []
     def probe(i, c=''):
         spy.append((i, c, type(c).__name__)); return real(i, c)
@@ -866,15 +902,15 @@ Every `file:line` used above, consolidated. All were independently confirmed aga
 
 | Rule (SWE-AtlasQnA) | How it is satisfied |
 |---------------------|---------------------|
-| **Rule 1 — Run-First Persistent Investigation** | The C extension `kitty/fast_data_types.so` was compiled via the repository's own `compile_c_extension` + `CompilationDatabase.build_all` (§2.2, full transcript + exit status shown), and every value was produced by exercising the **real** terminal input path — the `kitty_tests.PTY` harness (real forked child + verbatim `received_bytes`) and the **real** `kitty.window.Window` callbacks (§2.4, §4–§7). No remote-control/debug bypass or re-implementation was used. All commands are self-contained heredocs shown in full; every value was confirmed stable across **two** runs. |
+| **Rule 1 — Run-First Persistent Investigation** | The C extension `kitty/fast_data_types.so` was compiled via the repository's own `compile_c_extension` + `CompilationDatabase.build_all` (§2.2, full transcript + exit status shown), and every value was produced by exercising the **real** terminal input path — the `kitty_tests.PTY` harness (real forked child + verbatim `received_bytes`) and the **real** `kitty.window.Window` callbacks (§2.4, §4–§7). No remote-control/debug bypass or re-implementation was used. All commands are shown in full and run in one shared shell session (`REPO` exported once in §2.1, read thereafter); every value was confirmed stable across **two** runs. |
 | **Rule 2 — Exhaustive Condition & Evidence Coverage** | Every implied condition was exercised and reported with full, unedited two-run output: exit codes `0`, `1`, `42`, `99`, `127` (§4 Q4, §5, §6.1), malformed `not_a_number`, empty `D;`, and no-semicolon `D` (§5, §6.1, §7.3), the `B` no-op (§7.1) and `D`-without-`C` guard (§7.2), plus before/intermediate/after states (raw bytes → low-level chunks → `window.cmd_output`; sentinel `-12345` → result; test-double `init` → `after`). |
 | **Rule 3 — Faithful Instruction-Following & Observed-Output Discipline** | Observed output is shown next to every claim (§2–§7), and every non-observed/source-derived/causal/environmental statement is prefixed **`Inferred:`**. The runtime environment is reported as observed (Python 3.13.7, gcc 15.2.0; §2.1), including the note that these differ from the nominal prerequisite versions. The read-only and cleanup instructions were obeyed with separate pre/post evidence (§2.3). The one varying field (watcher `'time'`) is flagged (§2.5, §6). |
 | **Rule 4 — Complete, Precise, Grounded Answering** | Every sub-question Q1–Q6 is answered **self-contained** (§4) with exact values, `file:line` citations (§8), and cause→effect reasoning. Every named marker (`A`, `B`, `C`, `D`) is addressed — including that kitty **ignores `B`** and that the secondary prompt is `A;k=s` (§1, §3, §7.1) — and every named exit code (`0`, `1`, `42`, `99`, `127`, `not_a_number`, empty, no-semicolon) is covered. |
 | **Main Rule — Deliverable & Scope** | Exactly one file was created — `blitzy/documentation/kitty_815df1e210e0.md` (named for the source branch). No existing repository source file was modified, added to, or removed; separate pre-run and post-run `git status --porcelain` are both empty (exit 0) and the baseline-to-HEAD `git diff --name-status` shows only this document added (§2.3). The compiled `.so` is git-ignored (§2.2, §2.3). Temporary artifacts lived under `/tmp/osc133_investigation/` (outside the repo) and were removed after capture, with post-cleanup absence shown (§2.3). |
 
-### Reproduction inventory (all commands are self-contained; **no external script files**)
+### Reproduction inventory (**no external script files**; commands share one shell session via `$REPO`)
 
-Every command in this document is a `bash` heredoc that pipes a script to `python3` on stdin (`python3 - <<'PYEOF' … PYEOF`), with child processes launched inline via `python3 -c '…'`. Nothing depends on a saved helper file, so the investigation reproduces cleanly even after the temporary directory is deleted.
+The document contains **ten `bash` blocks**, all intended to run in the **same shell session**: the first (§2.1) runs `export REPO=$(pwd)` from the repository root, and every subsequent block reads `"$REPO"`. **Five** of the ten are `python3` heredocs that pipe a script to `python3` on stdin (`python3 - <<'PYEOF' … PYEOF`) — the build block (§2.2) and the four investigation drivers (Q1(a) raw/child, Q1(b) parsed, Q5/§6 real-`Window`, §7 edges). **One** (§2.2 proof) runs plain `stat`/`test` plus an inline `python3 -c '…'` import check. The **remaining four** are plain `bash`: the `REPO` export (§2.1) and the two Git-integrity blocks plus the cleanup block (§2.3). Child processes inside the drivers are launched inline via `python3 -c '…'` (no saved file), so the investigation reproduces cleanly even after the temporary directory is deleted.
 
 | Purpose | Location in this document |
 |---------|---------------------------|
@@ -886,4 +922,3 @@ Every command in this document is a `bash` heredoc that pipes a script to `pytho
 | Edge cases (`B` no-op, `D`-without-`C`) | §7 |
 
 *End of investigation.*
-
