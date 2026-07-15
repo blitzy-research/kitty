@@ -37,13 +37,13 @@ Every behavioral claim is placed **next to** the unedited output that demonstrat
 
 - **Q1 (create-then-use).** A new window is created on the **UI thread** by `Tab.new_window` [`kitty/tabs.py:504`], which constructs the `Window` (and its `Child`), then **registers the child before laying out** — the code comments *"Must add child before laying out so that resize_pty succeeds"* [`kitty/tabs.py:534-535`] — via `Boss.add_child` [`kitty/boss.py:585-587`] → C `add_child` [`kitty/child-monitor.c:305`], which **stages** the child in an add-queue (it does not enter the live `children[]` array yet). The child process is forked with a PTY by `Child.fork` (`kitty/child.py`), but its command only `execvp`s **after** kitty signals readiness by closing the child-ready pipe. The **first** PTY size is pushed on the first layout pass in `Window.set_geometry` [`kitty/window.py:850`], which — because `last_reported_pty_size` starts at the sentinel `(-1, -1, -1, -1)` [`kitty/window.py:579`] — always differs and therefore fires exactly one `ioctl(TIOCSWINSZ)`, flips `child_is_launched` to `True` [`kitty/window.py:865-867`], and records the size [`kitty/window.py:874`]. The `ioctl` is what makes the kernel deliver `SIGWINCH` **to the child**; kitty does not send `SIGWINCH` to the child itself. Observed: the child's shell only writes its `LAUNCHED_W1` marker after `Child launched` is logged, and a `trap ... WINCH` handler in the child fired (`WINCH_received`), proving real receipt.
 
-- **Q2 (already-gone window).** Stale window ids and file descriptors are **tolerated by design**. A resize aimed at a vanished window is handled by `resize_pty` [`kitty/child-monitor.c:592`], which scans **both** the live `children[]` **and** the not-yet-drained add-queue; if the id is in neither it logs a specific, non-fatal diagnostic — `Failed to send resize signal to child with id: … (children count: …) (add queue: …)` [`kitty/child-monitor.c:610`] — and returns. If the fd is found but already closed, `pty_resize` [`kitty/child-monitor.c:577`] swallows `EBADF`/`ENOTTY` [`kitty/child-monitor.c:581`]. A close request racing a still-staged child is caught because `mark_child_for_close` [`kitty/child-monitor.c:541`] also scans the add-queue. On the Python side, `Boss.on_child_death` [`kitty/boss.py:881`] pops the window id and **early-returns if it is already gone**, so a doubled death view is idempotent. Observed across 20 rapidly-dying windows: exactly **4** such diagnostics in the run, **20** successful reaps, and **zero** Python exceptions.
+- **Q2 (already-gone window).** Stale window ids and file descriptors are **tolerated by design**. A resize aimed at a vanished window is handled by `resize_pty` [`kitty/child-monitor.c:592`], which scans **both** the live `children[]` **and** the not-yet-drained add-queue; if the id is in neither it logs a specific, non-fatal diagnostic — `Failed to send resize signal to child with id: … (children count: …) (add queue: …)` [`kitty/child-monitor.c:610`] — and returns. If the fd is found but already closed, `pty_resize` [`kitty/child-monitor.c:577`] swallows `EBADF`/`ENOTTY` [`kitty/child-monitor.c:581`]. A close request racing a still-staged child is caught because `mark_child_for_close` [`kitty/child-monitor.c:541`] also scans the add-queue. On the Python side, `Boss.on_child_death` [`kitty/boss.py:881`] pops the window id and **early-returns if it is already gone**, so a doubled death view is idempotent. Observed across 20 rapidly-dying windows: such diagnostics do occur, but their *count* is **not** fixed — it varies run-to-run (observed **4–8**, modally **4**; full distribution in *Distribution of outcomes*). What is invariant in every run is the safety: all **20** children are successfully reaped and **zero** Python exceptions occur.
 
 - **Q3 (keep versus discard).** Discard is driven by a single per-child boolean, `needs_removal` [`kitty/child-monitor.c:67`], which is set at **six** distinct sites (a close request found in `children[]` or in the add-queue; a `POLLNVAL`/EOF on the child fd; a `close_on_child_death` reap; and a global shutdown sweep). Each IO-loop iteration `remove_children` [`kitty/child-monitor.c:1313`] drains everything flagged and hangs it up (SIGHUP to the process group, tolerating `ESRCH`). Whether a *dead child* also discards its *window* depends on the option `close_on_child_death`, whose default is **`no`** [`kitty/options/types.py:500`]: `reap_children` [`kitty/child-monitor.c:1413`] only force-marks the window for removal when the option is enabled. Observed at the default: a backgrounded survivor holding the slave keeps the window open even after the foreground child exits (window held open, `close`-mentions = 0); with `close_on_child_death=yes`, the window closes on child exit.
 
 - **Q4 (timing).** Asynchronous POSIX signals are **decoupled** from state mutation. On Linux (`HAS_SIGNAL_FD` defined), the handled signals (`INT HUP TERM CHLD USR1 USR2`) are **blocked** and routed to a **`signalfd`** created on the **main thread** [`kitty/loop-utils.c:42`]; the **IO thread** later `read`s that descriptor at a safe point in `read_signals` [`kitty/loop-utils.c:131`]. Cross-thread wakeups use an **`eventfd`** [`kitty/loop-utils.c:70`], not a pipe. (The classic self-pipe — `handle_signal` writing a byte [`kitty/loop-utils.c:15`] — is the `#ifndef HAS_SIGNAL_FD` **fallback** for platforms without `signalfd`; the `self_pipe` helper itself is `static inline` and compiled in *all* builds [`kitty/loop-utils.h:51-52`].) Coalescing happens at **two levels**: the kernel collapses many pending `SIGCHLD` into a few `signalfd_siginfo` records, and kitty then collapses *any* number of `SIGCHLD` records into a **single** `child_died` boolean [`kitty/child-monitor.c:1371`] that triggers **one** `reap_children` call per loop iteration [`kitty/child-monitor.c:1526`]. Rapid resizes are de-duplicated by the `last_reported_pty_size` gate [`kitty/window.py:861`] and debounced by `resize_debounce_time`; on Linux the `on_end = 0.1 s` number is used [`kitty/child-monitor.c:1062`]. Observed: 16 children dying together produced **2–3** signal records but **16** reaps; typing (non-resize) produced **0** extra `ioctl`s.
 
-- **Q5 (conflicting liveness views).** The UI thread's view (`WindowList.all_windows[]` [`kitty/window_list.py:147`], `Boss.window_id_map`) and the IO thread's view (`children[]` plus the staged add/remove queues and `reaped_pids[]`) can transiently disagree. All shared child state is mutated under one mutex, `children_lock` [`kitty/child-monitor.c:87`], via the `children_mutex(op)` macro [`kitty/child-monitor.c:76-77`]. Each IO-loop iteration reconciles by running **removal before addition** under that lock. The reconciliation is what lets a resize target an id the UI thinks is alive while the IO array is still catching up — observed as the diagnostic firing on `id: 2` while the C `children count` *rises* 16 → 17 → 18 in the same ~20 ms window (adds draining even as a stale reference is dropped). The Python-side idempotent pop [`kitty/boss.py:881`] resolves the doubled-death view. Observed across 6 runs: exactly **4** diagnostics each, `children count` in `{16, 17, 18}` (always `< 20`), add queue always `0`, and **zero** `KeyError`/tracebacks.
+- **Q5 (conflicting liveness views).** The UI thread's view (`WindowList.all_windows[]` [`kitty/window_list.py:147`], `Boss.window_id_map`) and the IO thread's view (`children[]` plus the staged add/remove queues and `reaped_pids[]`) can transiently disagree. All shared child state is mutated under one mutex, `children_lock` [`kitty/child-monitor.c:87`], via the `children_mutex(op)` macro [`kitty/child-monitor.c:76-77`]. Each IO-loop iteration reconciles by running **removal before addition** under that lock. The reconciliation is what lets a resize target an id the UI thinks is alive while the IO array is still catching up — observed as the diagnostic firing on a stale id (most often `id: 2`, but `id: 3`/`4`/`5` also appear) while the C `children count` *rises* through `{15, 16, 17, 18}` in the same ~20 ms window (adds draining even as a stale reference is dropped). The Python-side idempotent pop [`kitty/boss.py:881`] resolves the doubled-death view. Observed across **40** repeated runs of the same hashed input: the diagnostic count is **not** deterministic — it varies **4–8** (modally **4**, in 35/40 runs). What *is* invariant across every run is the safety envelope — `children count` always `< 20`, `add queue` always `0`, and **zero** `KeyError`/tracebacks (see *Distribution of outcomes*).
 
 ---
 
@@ -504,16 +504,20 @@ self.boss.add_child(window)
 4. The first PTY size is pushed by `Window.set_geometry` [`kitty/window.py:850`]. The gate compares the newly-computed size against the recorded one:
 
 ```python
-# kitty/window.py:861-874 (elided to the resize gate)
+# kitty/window.py:861-874 (verbatim; the first-resize gate)
 if current_pty_size != self.last_reported_pty_size:
-    ...
+    boss = get_boss()
+    boss.child_monitor.resize_pty(self.id, *current_pty_size)
     self.last_resized_at = monotonic()
     if not self.child_is_launched:
-        ...
+        self.child.mark_terminal_ready()
         self.child_is_launched = True
-        if is_debug_build:
+        update_ime_position = True
+        if boss.args.debug_rendering:
+            now = monotonic()
             print(f'[{now:.3f}] Child launched', file=sys.stderr)
-    print(f'[{monotonic():.3f}] SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}', file=sys.stderr)
+    elif boss.args.debug_rendering:
+        print(f'[{monotonic():.3f}] SIGWINCH sent to child in window: {self.id} with size: {current_pty_size}', file=sys.stderr)
     self.last_reported_pty_size = current_pty_size
 ```
 
@@ -521,7 +525,7 @@ Because `last_reported_pty_size` is initialized to the sentinel `(-1, -1, -1, -1
 
 ### Observed output (with producing commands)
 
-The debug build logs `Child launched` and `SIGWINCH sent to child` from `kitty/window.py:871,873`:
+With `--debug-rendering` enabled (the `boss.args.debug_rendering` gate at `kitty/window.py:869,872`), kitty logs `Child launched` and `SIGWINCH sent to child` from `kitty/window.py:871,873` — note the `if`/`elif` makes them **mutually exclusive** on any one resize (first push → `Child launched`; a later changed-size push → `SIGWINCH sent`):
 
 ```text
 $ grep -nE "Child launched|SIGWINCH sent to child" /obs_out/logs/q1_dbg.log
@@ -587,8 +591,9 @@ if (errno != EBADF && errno != ENOTTY) {
 4. `Boss.on_child_death` [`kitty/boss.py:881`] is idempotent — it pops the id and returns immediately if the window is already gone:
 
 ```python
-# kitty/boss.py:881-884
+# kitty/boss.py:881-885
 def on_child_death(self, window_id: int) -> None:
+    prev_active_window = self.active_window
     window = self.window_id_map.pop(window_id, None)
     if window is None:
         return
@@ -596,7 +601,7 @@ def on_child_death(self, window_id: int) -> None:
 
 ### Observed output (with producing commands)
 
-Driving 20 windows with **staggered** lifetimes (`q2.session`, SHA-256 `19cfee89…`) so the layout keeps resizing while windows die produced the exact diagnostic — **4** occurrences in this run (not a flood), each naming the stale id and the two collection sizes:
+Driving 20 windows with **staggered** lifetimes (`q2.session`, SHA-256 `19cfee89…` — the same fixed input as Q5) so the layout keeps resizing while windows die produced the exact diagnostic. Its *count* varies run-to-run (a **4–8** distribution, mode **4**; characterized in *Distribution of outcomes*); this representative run shows the modal **4** occurrences (not a flood), each naming the stale id and the two collection sizes:
 
 ```text
 $ grep -n "Failed to send resize signal" /obs_out/logs/q2_dbg.log
@@ -781,7 +786,7 @@ The same `reap_children` loop also serves **background** processes kitty is aske
 - On every reap, `mark_monitored_pids(pid, status)` [`kitty/child-monitor.c:1398`] is called **unconditionally** [`:1423`]; if the pid matches a monitored one it captures the status into `reaped_pids[]` [`kitty/child-monitor.c:98`].
 - `report_reaped_pids` [`kitty/child-monitor.c:950`] later delivers them to Python, dispatching `Boss.on_monitored_pid_death` [`kitty/boss.py:2725`].
 
-**Canonical-trigger note (honest scope).** An exhaustive grep for `notify_on_death` shows only **two** callers: `kitty/rc/run.py` (the `kitty @ run` **remote-control** command — a non-canonical bypass, excluded per the run-first rule) and `kitty/update_check.py` (a release-build/network-only path). Neither is reachable through the canonical session/keyboard path in this headless default build, so the monitored-pid **notification callback** was **not** driven end-to-end at runtime; the reap-side plumbing (`mark_monitored_pids` being called on every reap) **is** exercised by every window reap above. **[INFERRED — source-only for the Python-side `on_monitored_pid_death` dispatch; the C-side `mark_monitored_pids` call on each reap is observed.]**
+**Canonical-trigger note (honest scope).** An exhaustive grep for `notify_on_death` shows it is defined and used only in `kitty/boss.py` (parameter at `:2367`, applied at `:2417-2426`) and has a **single** caller passing it: `kitty/rc/run.py:130` (the `kitty @ run` **remote-control** path — a non-canonical bypass, excluded per the run-first rule). The monitored-pid machinery is otherwise reached by calling `monitor_pid` **directly**, bypassing `notify_on_death` — e.g. `kitty/update_check.py:122` (a release-build/network-only path). Neither is reachable through the canonical session/keyboard path in this headless default build, so the monitored-pid **notification callback** was **not** driven end-to-end at runtime; the reap-side plumbing (`mark_monitored_pids` being called on every reap) **is** exercised by every window reap above. **[INFERRED — source-only for the Python-side `on_monitored_pid_death` dispatch; the C-side `mark_monitored_pids` call on each reap is observed.]**
 
 ### Mechanism 4 — the `EINTR` retry (rare, labeled)
 
@@ -964,53 +969,71 @@ while (LIKELY(!self->shutting_down)) {
 
 **Staged-close takes one extra iteration (correcting "departing fully retired before any admitted").** `remove_children` [`kitty/child-monitor.c:1313`] scans **only** `children[]`. A child that was closed while still **staged** — flagged via `mark_child_for_close`'s add-queue branch [`kitty/child-monitor.c:554`] — is therefore **not** removed on the iteration it is admitted: `add_children` promotes it into `children[]` first, and it is removed on the **next** iteration. The "remove before add" ordering guarantees already-live departing children are retired before new ones are admitted, but a *staged-and-flagged* child is a one-iteration exception. **[INFERRED — source-only for the precise one-iteration lag; the tolerated end state (no corruption, no exception) is observed below.]**
 
-**Idempotent resolution of a doubled death view.** When both views briefly hold a dead window, the Python side resolves it by popping the id and early-returning if already gone [`kitty/boss.py:881-884`] — so a second delivery is a no-op.
+**Idempotent resolution of a doubled death view.** When both views briefly hold a dead window, the Python side resolves it by popping the id and early-returning if already gone [`kitty/boss.py:881-885`] — so a second delivery is a no-op.
 
 ### Observed output — divergence made visible (with producing commands)
 
-The Q5 experiment drives 20 windows with tightly staggered lifetimes (`q5.session`, SHA-256 `19cfee89…`) and repeats the **same** input 6 times. Each run produced exactly **4** resize-to-stale-id diagnostics and **zero** `KeyError`/traceback:
+The Q5 experiment drives 20 windows with tightly staggered lifetimes (`q5.session`, SHA-256 `19cfee89…`) and repeats the **same, byte-identical** input **40** times. The number of resize-to-stale-id diagnostics is **not** constant — it is the run-to-run **distribution** the question is really about. Over the 40 runs the count was **4** in 35 runs, **6** in 4 runs, and **8** in 1 run (range **4–8**, mode **4** at 35/40 ≈ 88 %); every run had **zero** `KeyError`/traceback:
 
 ```text
-$ for r in 1 2 3 4 5 6; do
-    d=$(grep -c "Failed to send resize signal" /obs_out/logs/q5_dbg_r$r.log)
-    k=$(grep -cE "Traceback|KeyError" /obs_out/logs/q5_dbg_r$r.log)
-    echo "run$r diagnostics=$d keyerror=$k"
-  done
-run1 diagnostics=4 keyerror=0
-run2 diagnostics=4 keyerror=0
-run3 diagnostics=4 keyerror=0
-run4 diagnostics=4 keyerror=0
-run5 diagnostics=4 keyerror=0
-run6 diagnostics=4 keyerror=0
+$ for r in $(seq 1 40); do
+    grep -c "Failed to send resize signal" "$WORK/logs/q5_dbg_r$r.log"
+  done | sort -n | uniq -c | awk '{printf "count=%s : %s runs\n",$2,$1}'
+count=4 : 35 runs
+count=6 : 4 runs
+count=8 : 1 runs
+$ # exceptions across all 40 runs (invariant, not the count):
+$ grep -hcE "Traceback|KeyError|Exception" "$WORK"/logs/q5_dbg_r*.log | awk '{s+=$1} END{print s}'
+0
 ```
 
-The reconciliation is visible in the raw diagnostics: all four target the **same** stale `id: 2` while the C `children count` is **rising** 16 → 17 → 18 over ~22 ms — i.e. `add_children` is still draining *new* windows into `children[]` at the very moment the UI holds a *stale* reference to the already-removed id 2:
+The divergence is visible in the raw diagnostics. In the **modal** case (count 4) the four diagnostics all name the same stale `id: 2` while the C `children count` climbs 16 → 17 → 18 over ~22 ms — i.e. `add_children` is still draining *new* windows into `children[]` at the very moment the UI holds a *stale* reference to the already-removed id 2:
 
 ```text
-$ grep "Failed to send resize signal" /obs_out/logs/q5_dbg_r1.log
-[0.304] Failed to send resize signal to child with id: 2 (children count: 16) (add queue: 0)
-[0.314] Failed to send resize signal to child with id: 2 (children count: 17) (add queue: 0)
-[0.322] Failed to send resize signal to child with id: 2 (children count: 18) (add queue: 0)
-[0.326] Failed to send resize signal to child with id: 2 (children count: 18) (add queue: 0)
+$ grep "Failed to send resize signal" "$WORK/logs/q5_dbg_r2.log"   # a modal count=4 run
+[0.292] Failed to send resize signal to child with id: 2 (children count: 16) (add queue: 0)
+[0.301] Failed to send resize signal to child with id: 2 (children count: 17) (add queue: 0)
+[0.310] Failed to send resize signal to child with id: 2 (children count: 18) (add queue: 0)
+[0.314] Failed to send resize signal to child with id: 2 (children count: 18) (add queue: 0)
 ```
 
-Across all 6 runs the `children count` at the moment of divergence is always in `{16, 17, 18}` (always `< 20`, because some windows have already been removed while others are still being admitted), and the add-queue is always `0` at the sample instants:
+In a **tail** run (count 8) the *same* mechanism produces *more* stale references and a *wider* range of count values — stale ids `2`, `3`, `4`, **and** `5` all fire, and `children count` dips to **15** — yet the outcome is identical: `add queue` stays `0` and **no** exception occurs. This is the run-to-run variation the question asks about, made concrete:
 
 ```text
-$ grep -ho "children count: [0-9]*" /obs_out/logs/q5_dbg_r*.log | sort | uniq -c
-      6 children count: 16
-      6 children count: 17
-     12 children count: 18
-$ grep -ho "add queue: [0-9]*" /obs_out/logs/q5_dbg_r*.log | sort | uniq -c
-     24 add queue: 0
+$ grep "Failed to send resize signal" "$WORK/logs/q5_dbg_r1.log"   # the count=8 tail run
+[0.414] Failed to send resize signal to child with id: 2 (children count: 16) (add queue: 0)
+[0.422] Failed to send resize signal to child with id: 2 (children count: 17) (add queue: 0)
+[0.431] Failed to send resize signal to child with id: 2 (children count: 18) (add queue: 0)
+[0.435] Failed to send resize signal to child with id: 2 (children count: 18) (add queue: 0)
+[0.438] Failed to send resize signal to child with id: 3 (children count: 17) (add queue: 0)
+[0.602] Failed to send resize signal to child with id: 4 (children count: 15) (add queue: 0)
+[0.602] Failed to send resize signal to child with id: 5 (children count: 15) (add queue: 0)
+[0.604] Failed to send resize signal to child with id: 5 (children count: 15) (add queue: 0)
 ```
 
-**Observed-vs-inferred discipline (Finding coverage).** What is **observed** here: (a) the divergence exists — a resize reaches an id absent from `children[]` while the count is mid-flux; (b) it is reconciled without corruption — 0 `KeyError`/tracebacks across 6× the burst. What is **not** provable from these logs alone and is therefore **[INFERRED — source-only]**: (c) that `add queue: 0` at the sample instant demonstrates the *ordering* (it shows the queue was drained by sample time, not the remove-before-add sequence itself — that is read from `kitty/child-monitor.c:1493-1494`); and (d) that the *duplicate-pop* branch [`kitty/boss.py:883`] actually executed (zero `KeyError` is consistent with, but does not prove, that branch firing — the branch is read from source).
+Aggregated over all 40 runs, the stale id is most often `2` but `3`/`4`/`5` also appear; the `children count` at the moment of divergence ranges over `{15, 16, 17, 18}` (always `< 20`, because some windows have already been removed while others are still being admitted); and the add-queue is `0` at **every** one of the 172 sample instants:
+
+```text
+$ grep -ho "children count: [0-9]*" "$WORK"/logs/q5_dbg_r*.log | sort -t: -k2 -n | uniq -c
+      4 children count: 15
+     40 children count: 16
+     55 children count: 17
+     73 children count: 18
+$ grep -ho "add queue: [0-9]*" "$WORK"/logs/q5_dbg_r*.log | sort | uniq -c
+    172 add queue: 0
+$ grep -ho "with id: [0-9]*" "$WORK"/logs/q5_dbg_r*.log | sort | uniq -c
+    160 with id: 2
+      9 with id: 3
+      1 with id: 4
+      2 with id: 5
+```
+
+**Observed-vs-inferred discipline (Finding coverage).** What is **observed** here: (a) the divergence exists — a resize reaches an id absent from `children[]` while the count is mid-flux; (b) it is reconciled without corruption — 0 `KeyError`/tracebacks across 40× the burst. What is **not** provable from these logs alone and is therefore **[INFERRED — source-only]**: (c) that `add queue: 0` at the sample instant demonstrates the *ordering* (it shows the queue was drained by sample time, not the remove-before-add sequence itself — that is read from `kitty/child-monitor.c:1493-1494`); and (d) that the *duplicate-pop* branch [`kitty/boss.py:883`] actually executed (zero `KeyError` is consistent with, but does not prove, that branch firing — the branch is read from source).
 
 ### What this proves (cause → effect)
 
 - The single `children_lock` [`:87`] with remove-before-add [`:1493-1494`] is the mechanism that bounds and resolves the disagreement: adds and removes never interleave mid-reconcile.
-- The UI-vs-IO divergence is real and routine under a rapid burst (observed: resize to a removed id while `children[]` is still growing), but it is **safe** — the worst outcome is the tolerated diagnostic, and the idempotent Python pop [`kitty/boss.py:881`] guarantees a doubled death view cannot corrupt state (observed: 0 exceptions across 6 runs).
+- The UI-vs-IO divergence is real and routine under a rapid burst (observed: resize to a removed id while `children[]` is still growing), but it is **safe** — the worst outcome is the tolerated diagnostic, and the idempotent Python pop [`kitty/boss.py:881`] guarantees a doubled death view cannot corrupt state (observed: 0 exceptions across 40 runs).
 
 
 ---
@@ -1048,7 +1071,7 @@ graph TD
         AC["Boss.add_child (boss.py:585-587)"]
         RZ["Window.set_geometry -> resize_pty (window.py:850,863)"]
         MC["Boss.mark_window_for_close (boss.py:920)"]
-        OCD["Boss.on_child_death idempotent pop (boss.py:881-884)"]
+        OCD["Boss.on_child_death idempotent pop (boss.py:881-885)"]
     end
 
     subgraph LOCK["Shared state — guarded by children_lock (child-monitor.c:87)"]
@@ -1090,27 +1113,26 @@ The lock guards the **structural** state (queues, `count`, `needs_removal`); Pyt
 
 Per the run-first rule, the timing-sensitive scenarios were run repeatedly with the **same, hashed** input; raw per-run results and the aggregation commands are given so each number is reproducible.
 
-### Q5 divergence — 6 runs of `q5.session` (SHA-256 `19cfee893e64542f7993c291c31c5cc085258f4a94c93f8c843e12f1677cd8c8`)
+### Q5 divergence — 40 runs of `q5.session` (SHA-256 `19cfee893e64542f7993c291c31c5cc085258f4a94c93f8c843e12f1677cd8c8`)
 
-Loop command:
+Loop command (no shim needed — the diagnostic is emitted by kitty itself at `kitty/child-monitor.c:610`):
 
 ```sh
-for r in 1 2 3 4 5 6; do
-  run_kitty "q5_r$r" 6 "$WORK/q5_shim_r$r" "$WORK/q5_dbg_r$r" -- \
+for r in $(seq 1 40); do
+  run_kitty "q5_r$r" 6 - "$WORK/q5_dbg_r$r" -- \
     --debug-rendering --session "$WORK/sessions/q5.session"
 done
 ```
 
-| run_id | diagnostics | KeyError/Traceback | children count values seen |
-|--------|-------------|--------------------|----------------------------|
-| q5_r1 | 4 | 0 | 16, 17, 18, 18 |
-| q5_r2 | 4 | 0 | 16, 17, 18, 18 |
-| q5_r3 | 4 | 0 | 16, 17, 18, 18 |
-| q5_r4 | 4 | 0 | 16, 17, 18, 18 |
-| q5_r5 | 4 | 0 | 16, 17, 18, 18 |
-| q5_r6 | 4 | 0 | 16, 17, 18, 18 |
+Diagnostic-count distribution over the 40 runs (this *is* the run-to-run inconsistency the question asks about — it is **not** a constant):
 
-Aggregation (all 6 runs): `children count` ∈ `{16 ×6, 17 ×6, 18 ×12}`, `add queue` = `0 ×24`, diagnostics = `4` per run, exceptions = `0`. **Stable across all 6 runs.** The *outcome* (safe reconciliation, bounded diagnostics) is deterministic; the *interleaving* (which count value each of the 4 diagnostics saw) is the run-to-run variation the question asks about, and it is reported rather than smoothed away.
+| diagnostics per run | number of runs |
+|---------------------|----------------|
+| 4 | 35 |
+| 6 | 4 |
+| 8 | 1 |
+
+Range **4–8**, mode **4** (35/40 ≈ 88 %). Aggregated over all 40 runs: `children count` at divergence ∈ `{15 ×4, 16 ×40, 17 ×55, 18 ×73}` (always `< 20`); `add queue` = `0` at every one of the **172** samples; stale ids seen = `{2 ×160, 3 ×9, 4 ×1, 5 ×2}`; exceptions = `0`. **The diagnostic count is therefore _not_ deterministic — it is the distribution tabulated above.** What *is* invariant across every run is the *safety envelope*: bounded diagnostics, `children count < 20`, `add queue == 0`, and zero exceptions. That invariant — not a fixed count — is the reconciliation guarantee the question is really about; the count, the specific stale ids, and the exact counts each diagnostic saw are precisely the run-to-run variation, reported rather than smoothed away.
 
 ### Q4b coalescing — 2 runs of `q4b.session` (SHA-256 `cf8c289da8b819e278e7b0dba33d5b296d1f8bfdd69fc75f880ba530a5a30093`)
 
@@ -1136,7 +1158,7 @@ Everything below labeled **INFERRED** is read from source and was **not** direct
 | create → add-before-layout → staged add → readiness pipe → first resize | **Observed** | `Child launched` log + `LAUNCHED_W1` marker ordering + `ioctl=0` |
 | child blocks on ready pipe until `mark_terminal_ready`, then `execvp` | **Observed (ordering)** + source (`kitty/child.c:71,151-160`, `kitty/child.py:283,362`) | marker appears only after `Child launched` |
 | real `SIGWINCH` receipt by the child | **Observed** | child `trap … WINCH` wrote `WINCH_received` |
-| resize to a vanished id → tolerated diagnostic | **Observed** | 4 diagnostics, 0 exceptions |
+| resize to a vanished id → tolerated diagnostic | **Observed** | 4–8 diagnostics/run (distribution over 40 runs), 0 exceptions |
 | `EBADF`/`ENOTTY` swallowed by `pty_resize` | **Observed (errno) via isolated probe — non-canonical** | `pty_probe` A3=`EBADF(9)`, A4=`ENOTTY(25)` |
 | PTY master `read` = `EIO` requires slave with no holder | **Observed (isolated probe — non-canonical)** | `pty_probe` B1=`EIO(5)`, B2=data |
 | six `needs_removal` triggers | **Observed (2)** + source (all 6) | close-live & reap observed; POLLNVAL/EOF/staged-close/shutdown from source |
@@ -1199,7 +1221,7 @@ All line numbers are at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
 - `kitty/child-monitor.c` — `needs_removal` decl `:67`; `children_mutex` macro `:76-77`; `children_lock` `:87`; `monitored_pids[256]`/`monitored_pids_count`/`reaped_pids[]` `:96-98`; `KITTY_HANDLED_SIGNALS` `:121`; `add_child` `:305`; `mark_child_for_close` `:541` (live `:546`, staged `:554`); `pty_resize` `:577` (EBADF/ENOTTY `:581`); `resize_pty` `:592` (diagnostic `:610`); `report_reaped_pids` `:950`; `process_pending_resizes` `:1043` (on_pause `:1055`, on_end `:1062`); `add_children` `:1281`; `hangup` `:1293`; `remove_children` `:1313`; `mark_child_for_removal`/reap-trigger `:1390`; `mark_monitored_pids` `:1398`; `reap_children` `:1413` (EINTR `:1420-1421`, gate `:1422`, always-monitored `:1423`); `SignalSet` `:1359`, callback `:1362`, `child_died=true` `:1371`; PTY EOF trigger `:1535`; POLLNVAL trigger `:1545`; shutdown sweep `:1574`; io_loop reconciliation `:1491-1495`; one-reap-per-iteration `:1526`; `process_global_state` declared `:1213`, timer-invoked `:1218`, defined `:1224`, registered via `run_main_loop` `:1262`.
 - `kitty/loop-utils.c` — non-`signalfd` `handle_signal` writer `:15`; signalfd creation `:42`; self-pipe (signal fallback) `:48`; `SA_SIGINFO|SA_RESTART` sigaction `:51`; eventfd wakeup `:70`; self-pipe (wakeup fallback) `:73`; `read_signals` `:131`.
 - `kitty/loop-utils.h` — `HAS_SIGNAL_FD` define `:16`; `self_pipe` `static inline` (all builds) `:51-52`.
-- `kitty/boss.py` — `monitor_pid` import `:98`; `add_child` `:585-587`; `on_child_death` idempotent pop `:881-884`; `mark_window_for_close` `:920`; `close_window` `:931`; `run_background_process(notify_on_death=…)` `:2358-2367`; `monitor_pid(p.pid)` `:2419`; `on_monitored_pid_death` `:2725`.
+- `kitty/boss.py` — `monitor_pid` import `:98`; `add_child` `:585-587`; `on_child_death` idempotent pop `:881-885`; `mark_window_for_close` `:920`; `close_window` `:931`; `run_background_process(notify_on_death=…)` `:2358-2367`; `monitor_pid(p.pid)` `:2419`; `on_monitored_pid_death` `:2725`.
 - `kitty/tabs.py` — `new_window` `:504`; add-child-before-layout comment `:534` + call `:535`; `remove_window` `:580`.
 - `kitty/window_list.py` — `WindowList.all_windows[]` `:147`.
 - `kitty/window.py` — `last_resized_at` `:562`; `child_is_launched` `:578`; `last_reported_pty_size` sentinel `:579`; `set_geometry` `:850`; resize gate `:861`; `resize_pty` call `:863`; `mark_terminal_ready`/launch transition `:865-867`; debug log lines `:871,873`; record size `:874`.
