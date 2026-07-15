@@ -14,12 +14,12 @@ The kitty `ssh` kitten is a thin **Go wrapper around the system `ssh` binary**. 
 2. **A remotely-executed bootstrap** — it generates a small POSIX-`sh` (or Python) script, encodes it so it survives an `ssh` command line, and runs it as the remote command. That bootstrap pulls a gzipped tar of kitty's shell-integration files + terminfo onto the remote host and then hands off to the user's real login shell [`kittens/ssh/main.go`:L422-L525; `shell-integration/ssh/bootstrap.sh`:L104-L164].
 3. **A shared-memory-backed data channel** — the tar archive plus a one-time data password are **always** written to a **POSIX shared-memory object** (`/dev/shm/kssh-*`, mode `0600`) — the only exception is the test-only `dont_create_shm` flag [`kittens/ssh/main.go`:L431-L459; `kittens/ssh/main_test.go`:L49-L54]. The archive is delivered over the terminal itself using a **DCS (Device Control String) handshake**, after kitty validates the request against the shm object.
 
-**The credential flow hinges on one decision — `request_data` — and the true behavior is the opposite of "credentials never touch the command line."** The two facts the rest of this document keeps carefully separate are **(a) whether the shm/tar channel exists** and **(b) who sends the request DCS**:
+**The credential flow hinges on one decision — `request_data` — which is *independent* of whether the transport is fresh or multiplexed.** The rest of this document keeps **two independent dimensions** separate:
 
-- **Fresh connection** (`request_data=true`; no live master): the request id, password-file name, and password are copied into the generated bootstrap [`kittens/ssh/main.go`:L475-L478], encoded into the remote command [`kittens/ssh/main.go`:L508], and **appended to the system-`ssh` argv** [`kittens/ssh/main.go`:L753-L754]. So on a fresh connection those credentials **are** present in the local process's argument list — a real process-list exposure, disclosed and demonstrated in §2.5 and §6. The **remote** bootstrap is then the party that sends the request DCS back to kitty.
-- **Reused connection** (`request_data=false`; a live master, isolated in this document with `askpass=ssh`): the very same placeholders are left **literal** in the argv, and the **local Go kitten itself** sends the request DCS to its controlling kitty terminal [`kittens/ssh/main.go`:L761-L769]. The shm/tar transfer still happens.
+- **Transport state:** *fresh* (no live master — a new TCP connection + authentication, and, with sharing on, a new `ControlMaster` socket) versus *multiplexed* (piggyback on a live, already-authenticated master). Decided by an `-O check` probe [`kittens/ssh/main.go`:L663-L665].
+- **Data-request mode (`request_data`):** this alone controls **(a)** whether the sensitive triple `{REQUEST_ID, PASSWORD_FILENAME, DATA_PASSWORD}` is baked into the generated bootstrap [`kittens/ssh/main.go`:L475-L478], encoded into the remote command [`kittens/ssh/main.go`:L508], and **appended to the local `ssh` argv** [`kittens/ssh/main.go`:L753-L754] — a real process-list exposure when `true` (§2.5, §6) — and **(b)** who sends the request DCS: the **remote** bootstrap when `true`, the **local Go kitten** when `false` [`kittens/ssh/main.go`:L761-L769]. The shm/tar object is built, and the tar transfer happens, **either way**.
 
-The whole thing is therefore driven off **two independent decisions**: whether an SSH master is already alive (reuse vs. fresh), and whether the data must be requested at all (`request_data`, which can also be flipped to `false` by the kitty-askpass path — deliberately isolated away here). Ten specific questions follow, each with a runtime demonstration.
+These two dimensions do **not** move together. `request_data` is set to `false` by **either** independent cause: the **kitty-askpass** path — the default `askpass=unless-set` with a new-enough OpenSSH clears it in `set_askpass()` [`kittens/ssh/main.go`:L648-L652], *before* any master check — **or** a **live master** [`kittens/ssh/main.go`:L663-L665]. So a **fresh** transport routinely runs with `request_data=false` (observed below as `sh_default_askpass_fresh_transport`: fresh socket, `request_data=0`, local sender, literal placeholders, and **no** `-O check` needed). To study the connection-sharing branch in isolation, this document forces `askpass=ssh` so that **only** a live master can flip `request_data`. Ten specific questions follow, each with a runtime demonstration.
 
 ---
 
@@ -32,7 +32,8 @@ All work was performed in the task's Linux container (`uname -srm` → `Linux 6.
 ```
 $ go version; python3 --version; ssh -V; zsh --version; fish --version; \
   bash --version | head -1; tar --version | head -1; \
-  base64 --version | head -1; tr --version | head -1
+  base64 --version | head -1; tr --version | head -1; \
+  readlink -f /bin/sh; dpkg-query -W -f='${Package} ${Version}\n' dash
 ```
 
 Observed (complete, verbatim):
@@ -47,7 +48,11 @@ GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
 tar (GNU tar) 1.35
 base64 (uutils coreutils) 0.2.2
 tr (uutils coreutils) 0.2.2
+/usr/bin/dash
+dash 0.5.12-12ubuntu2
 ```
+
+The last two lines matter because the kitten's default `interpreter` is the bare name `sh` [`kittens/ssh/main.py`:L87], and on this system `/bin/sh` is a symlink to **dash** — confirmed both statically (`readlink -f /bin/sh` → `/usr/bin/dash`) and at runtime (`/bin/sh -c 'ls -l /proc/$$/exe'` → `/proc/<pid>/exe -> /usr/bin/dash`). So every "sh" bootstrap in this document is actually executed by **dash 0.5.12-12ubuntu2**; the other named shells present are **bash 5.2.37**, **zsh 5.9**, and **fish 4.0.6**.
 
 Two honest deltas from the anchors quoted in the task brief, reported as observed:
 
@@ -210,7 +215,7 @@ Every behavioral result below comes from one of four **real** entry points — n
 | 3 | `kitty +launch test.py --module ssh` | the PTY round-trip suite `kitty_tests/ssh.py` (`check_bootstrap` [L227]) | [`kitty_tests/ssh.py`:L227-L271] |
 | 4 | system `ssh` invoked with the kitten's **own** six sharing args, against an isolated local `sshd` | the real OpenSSH ControlMaster lifecycle | [`kittens/ssh/main.go`:L121-L145] |
 
-Entry point #2 is the integration hook `TestEntryPoint`/`test_integration_with_python` [`kittens/ssh/main.go`:L847-L886]. It is worth stating precisely what it fixes, because it constrains every observation drawn from it: it sets `request_id="testing"`, `request_data=true`, `echo_on=true`, `username="testuser"`, `hostname_for_match="host.test"`, reads the config from stdin, calls the real `get_remote_command`, and marshals `{"cmd": cd.rcmd, "shm_name": cd.shm_name}` to stdout. Because it sets `request_data=true` it always exercises the **fresh** path, and because it does **not** set `dont_create_shm` it leaves the real shm object on disk for inspection.
+Entry point #2 is the integration hook `TestEntryPoint`/`test_integration_with_python` [`kittens/ssh/main.go`:L847-L886]. It is worth stating precisely what it fixes, because it constrains every observation drawn from it: it sets `request_id="testing"`, `request_data=true`, `echo_on=true`, `username="testuser"`, `hostname_for_match="host.test"`, reads the config from stdin, calls the real `get_remote_command`, and marshals `{"cmd": cd.rcmd, "shm_name": cd.shm_name}` to stdout. Because it sets `request_data=true` it always exercises the **credential-baking (`request_data=true`)** path — regardless of transport state, which this generate-only hook never establishes — and because it does **not** set `dont_create_shm` it leaves the real shm object on disk for inspection.
 
 **The only shim** used anywhere is a **record-only fake `ssh`** that appends its `argv` to a log and, for `-O check`, returns an exit code we control (`FAKE_SSH_OCHECK_RC`) so the kitten's *own* decision branch runs. It re-implements **no** kitten logic. Complete source (`/tmp/blitzy_ssh_obs/fakebin/ssh`, 637 bytes):
 
@@ -341,14 +346,15 @@ Several values are **freshly random every run**; they are shown at two values wh
 
 ### 0.7 Read-only guarantee and final proof
 
-The source tree is treated as strictly read-only — the only path that differs from `HEAD` is this document. Every artifact **this investigation created** is removed at the end: all observation scripts and logs, the isolated `sshd` together with its temporary host/client keys, `sshd_config`, and PidFile, and the record-only fake `ssh` shim — all of which lived under `/tmp/blitzy_ssh_obs/` — plus every `/dev/shm/kssh-*`/`ksse-*` object, any `/tmp/kssh-rdir-*` symlink, and every git-ignored build artifact (the `kitty`/`kitten` launchers, `fast_data_types.so`, `constants_generated.go`, `data_generated.bin`, and the `build/` tree). The isolated `sshd` is stopped by its **exact numeric PID** (`110125`, recorded in §0.4), never a pattern kill. The proof below is captured **after** cleanup and deliberately covers **all five surfaces** the work touched — the Git tree, running processes, the listening socket, POSIX shared memory, and the `/tmp` scratch area — rather than relying on `git status` alone:
+The source tree is treated as strictly read-only — the only path that differs from `HEAD` is this document. Every artifact **this investigation created** is removed at the end: all observation scripts and logs, the isolated `sshd` together with its temporary host/client keys, `sshd_config`, and PidFile, and the record-only fake `ssh` shim — all of which lived under `/tmp/blitzy_ssh_obs/` — plus every `/dev/shm/kssh-*`/`ksse-*` object, any `/tmp/kssh-rdir-*` symlink, and every git-ignored build artifact (the `kitty`/`kitten` launchers, `fast_data_types.so`, `constants_generated.go`, `data_generated.bin`, and the `build/` tree). The isolated `sshd` is stopped by its **exact numeric PID** (`110125`, recorded in §0.4), never a pattern kill. The proof below is captured **after cleanup and the final commit** and deliberately covers **all five surfaces** the work touched — the Git tree, running processes, the listening socket, POSIX shared memory, and the `/tmp` scratch area — rather than relying on `git status` alone:
 
 ```
-$ git status --porcelain -uall
- M blitzy/documentation/kitty_815df1e210e0.md
+$ git status --porcelain --untracked-files=all
+                                        # empty: the deliverable is committed; nothing else differs
 
-$ git status --porcelain -uall | grep -Ev 'blitzy/documentation/kitty_815df1e210e0\.md$' ; echo "other_paths_rc=$?"
-other_paths_rc=1                        # no other tracked/untracked path differs from HEAD
+$ git diff 815df1e21..HEAD --name-status
+A	blitzy/documentation/kitty_815df1e210e0.md
+                                        # the sole difference from the source branch is this added document
 
 $ kill -0 110125                        # the isolated sshd PID recorded in §0.4
 bash: kill: (110125) - No such process
@@ -357,8 +363,11 @@ kill0_rc=1                              # process is gone
 $ pgrep -af sshd | grep blitzy_ssh_obs ; echo "isolated_sshd_rc=$?"
 isolated_sshd_rc=1                      # no isolated sshd remains
 
-$ ss -ltn | grep ":2222" ; echo "port2222_rc=$?"
-port2222_rc=1                           # the listening socket is closed
+# iproute2 (`ss`) is not installed in this container (`command -v ss` → empty; `ss` → rc 127),
+# so the listening socket is probed with a real Python connect_ex instead:
+$ python3 -c 'import socket; s=socket.socket(); s.settimeout(1); \
+    rc=s.connect_ex(("127.0.0.1",2222)); s.close(); print("port2222_connect_ex=%d"%rc)'
+port2222_connect_ex=111                 # ECONNREFUSED: no listener remains on 2222
 
 $ ls -1 /dev/shm/ | grep -Ec 'kssh-|ksse-'
 0                                       # no shared-memory objects remain
@@ -428,10 +437,18 @@ The prefix is deliberately terse. The source comment at [`kittens/ssh/main.go`:L
 
 ### 1.3 The real ControlMaster lifecycle (against the isolated local `sshd`)
 
-Driving the system `ssh` with the kitten's exact six options against the isolated `sshd` (§0.4) on `127.0.0.1:2222`, with host verification retained. Complete transcript (`ControlPath=/root/.cache/kitty/run/kssh-77001-%C`):
+Driving the system `ssh` with the kitten's exact six options against the isolated `sshd` (§0.4) on `127.0.0.1:2222`, with host verification retained. The six sharing options and the two retained host-verification options are captured once as the shell variables `$OPTS` and `$VER` in step (0) below (so every subsequent command is directly executable); `$RD`, `$KEY`, and `$KNOWN` are likewise defined there and are consistent with `$SSHDIR` from §0.4. Complete transcript (`ControlPath=/root/.cache/kitty/run/kssh-77001-%C`):
 
 ```
 ### ControlMaster lifecycle — isolated sshd 127.0.0.1:2222, kitten's exact six -o options, host verification retained
+
+--- (0) reusable variables: the kitten's exact six sharing -o options + retained host verification ---
+$ SSHDIR=/tmp/blitzy_ssh_obs/sshd
+$ RD=/root/.cache/kitty/run
+$ KEY=$SSHDIR/client_ed25519
+$ KNOWN=$SSHDIR/known_hosts
+$ OPTS="-o ControlMaster=auto -o ControlPath=$RD/kssh-77001-%C -o ControlPersist=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=5 -o TCPKeepAlive=no"
+$ VER="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN"
 
 --- (1) first connection becomes the master ---
 $ ssh -o ControlMaster=auto -o ControlPath=$RD/kssh-77001-%C -o ControlPersist=yes \
@@ -446,12 +463,12 @@ $ ls -l $RD/kssh-77001-*
 srw------- 1 root root 0 Jul 14 23:50 /root/.cache/kitty/run/kssh-77001-de6224549bf17f660bd566abc77d74659f79d881
 
 --- (3) -O check reports the master alive (exit 0) ---
-$ ssh <six opts> <ver> -O check -p 2222 -i $KEY root@127.0.0.1 ; echo check_exit=$?
+$ ssh $OPTS $VER -O check -p 2222 -i $KEY root@127.0.0.1 ; echo check_exit=$?
 Master running (pid=116567)
 check_exit=0
 
 --- (4) second connection REUSES the master (multiplexed), timed with bash builtin ---
-$ time ssh <six opts> <ver> -p 2222 -i $KEY root@127.0.0.1 "echo REUSED_OK"
+$ time ssh $OPTS $VER -p 2222 -i $KEY root@127.0.0.1 "echo REUSED_OK"
 REUSED_OK
 
 real	0m0.006s
@@ -459,7 +476,7 @@ user	0m0.000s
 sys	0m0.004s
 
 --- (5) controlled NON-multiplexed baseline (fresh TCP+auth, NO ControlPath), timed ---
-$ time ssh -o ControlMaster=no -o ControlPath=none <ver> -p 2222 -i $KEY root@127.0.0.1 "echo BASELINE_OK"
+$ time ssh -o ControlMaster=no -o ControlPath=none $VER -p 2222 -i $KEY root@127.0.0.1 "echo BASELINE_OK"
 BASELINE_OK
 
 real	0m0.121s
@@ -467,7 +484,7 @@ user	0m0.008s
 sys	0m0.002s
 
 --- (6) -O exit tears down the master (ControlPersist=yes had kept it alive) ---
-$ ssh <six opts> <ver> -O exit -p 2222 -i $KEY root@127.0.0.1 ; echo exit_cmd_exit=$?
+$ ssh $OPTS $VER -O exit -p 2222 -i $KEY root@127.0.0.1 ; echo exit_cmd_exit=$?
 Exit request sent.
 exit_cmd_exit=0
 
@@ -514,15 +531,15 @@ Empirically, reuse is decided by the `-O check` probe against the pid-scoped, `%
 Making the boundary explicit (finding this under-specified was a review point):
 
 * **OpenSSH owns the session's security.** The encrypted transport, message integrity/authentication, the SSH key exchange and ciphers, **host authentication** (verifying the server's host key against `known_hosts`), and **user authentication** (public-key/password/etc.) are all performed by the system `ssh` the kitten shells out to [`kittens/ssh/utils.go`:L22-L24]. The kitten adds no crypto of its own to the wire.
-* **The kitten owns only the bootstrap-data channel.** Its security contribution is confined to (a) keeping the shell-integration payload + data password off the network entirely by placing them in a local `0600` shared-memory object, and (b) gating the release of that payload behind the six checks in §9. That channel rides *inside* the already-established, OpenSSH-encrypted PTY stream; the base64/DCS framing is **not** a cryptographic layer, only a transport-safe encoding.
-* **Consequence.** The kitten cannot make an insecure SSH configuration secure, and does not try to: if the user disables host checking, that is an OpenSSH-level decision. What the kitten *does* guarantee is that the data password is never sent over the network and that the tar payload is only handed to a requester that passes the §9 checks.
+* **The kitten owns only the bootstrap-data channel.** Its security contribution is confined to **local** staging and access control: it places the shell-integration payload + data password in an owner-only (`0600`) shared-memory object created race-free (`O_EXCL`) and made **single-use** (unlinked on read), and it gates release of that payload behind the six checks in §9. The payload does **not** stay off the network — the tar reply always crosses the connection to the remote (which needs it), and on the request_data route the credential triple crosses too (§2.5). Whatever crosses rides *inside* the already-established, OpenSSH-encrypted PTY stream; the base64/DCS framing is **not** a cryptographic layer, only a transport-safe encoding, and confidentiality/integrity on the wire are provided by OpenSSH, not by the kitten.
+* **Consequence.** The kitten cannot make an insecure SSH configuration secure, and does not try to: if the user disables host checking, that is an OpenSSH-level decision. What the kitten *does* guarantee is **local**: the tar and data password are staged in an owner-only, single-use object and released only to a requester that passes the §9 checks. Confidentiality and integrity of whatever then travels the wire — the tar reply always, and the credential request on the request_data route — are provided by the OpenSSH-encrypted transport.
 
 ---
 
 
 ## §2 How does it use shared memory to pass credentials securely?
 
-**Direct answer.** The kitten writes the entire bootstrap payload — the base64 gzipped tar **and** a one-time data password — into a **POSIX shared-memory object** at `/dev/shm/kssh-<pid>-<rand>`, created owner-only (`0600`) and exclusively (`O_EXCL`) by the **Go** side. This object is created **unconditionally** on every real run (the only suppressor is the test-only `dont_create_shm` flag). What differs between a fresh and a reused connection is **not** whether this object exists — it always does — but **who reads the password back to kitty** and, critically, **whether the credentials also end up in the local `ssh` process's argv** (they do, on a fresh connection). This section documents the object; §2.5 draws the fresh/reused distinction precisely.
+**Direct answer.** The kitten writes the entire bootstrap payload — the base64 gzipped tar **and** a one-time data password — into a **POSIX shared-memory object** at `/dev/shm/kssh-<pid>-<rand>`, created owner-only (`0600`) and exclusively (`O_EXCL`) by the **Go** side. This object is created **unconditionally** on every real run (the only suppressor is the test-only `dont_create_shm` flag). What differs between the two credential routes is **not** whether this object exists — it always does — but **who reads the password back to kitty** and, critically, **whether the credentials also end up in the local `ssh` process's argv** (they do when `request_data=true`). That switch is `request_data`, which is independent of transport state (fresh vs reused) — see §6.2 Outcome C. This section documents the object; §2.5 draws the `request_data` distinction precisely.
 
 ### 2.1 A live `/dev/shm/kssh-*` object
 
@@ -590,7 +607,7 @@ tarfile(b64)=31436  pw=64(hex)  hostname='host.test'  username='testuser'
 trailing slack bytes = 4
 ```
 
-So the payload is a JSON object with exactly four keys — **`tarfile`** (base64 of the gzipped tar), **`pw`** (the 64-hex one-time data password), **`hostname`**, and **`username`** — assembled at `kittens/ssh/main.go:L439-L443`. The password lives only here; it is never written to the network.
+So the payload is a JSON object with exactly four keys — **`tarfile`** (base64 of the gzipped tar), **`pw`** (the 64-hex one-time data password), **`hostname`**, and **`username`** — assembled at `kittens/ssh/main.go:L439-L443`. The password is staged **only** in this local shared-memory object; but on the request_data route the same value is additionally baked into the remote command and therefore traverses the OpenSSH-encrypted connection to the remote and back in the request (§2.5) — it is OpenSSH, not the shm object, that protects it on the wire.
 
 ### 2.4 Lifetime and cleanup
 
@@ -609,11 +626,11 @@ There are two readers, and correspondingly two cleanup paths — both of which u
 
 Either way the object does not outlive the connection setup; the probe object in §2.1/§2.3 was removed immediately after inspection (`rm -f /dev/shm/kssh-119853-AGNKC3OBSHAWO`; remaining `kssh-` objects: `0`).
 
-### 2.5 Fresh vs reused — where the credentials actually go (the corrected flow)
+### 2.5 The `request_data` route — where the credentials actually go (the corrected flow)
 
-This is the crux the earlier draft got backwards. The shm object exists in both cases; the difference is the **substitution of the sensitive values into the generated bootstrap** and therefore **into the `ssh` argv**:
+This is the crux the earlier draft got backwards. The shm object exists in both cases; the difference is gated on **`request_data`** (not transport state) — the **substitution of the sensitive values into the generated bootstrap** and therefore **into the `ssh` argv**:
 
-* On a **fresh** connection (`request_data=true`), the sensitive triple `{REQUEST_ID, DATA_PASSWORD, PASSWORD_FILENAME}` is merged into the script's substitution map [`kittens/ssh/main.go`:L476-L478], so the generated bootstrap's DCS line is filled with the **real** values, the script is encoded into `rcmd` [`kittens/ssh/main.go`:L508], and `rcmd` is **appended to the system-`ssh` argv** [`kittens/ssh/main.go`:L753-L754]. The password is therefore present in the local `ssh` process's arguments. Captured directly from the fresh-path fake-`ssh` argv log (`FAKE_SSH_OCHECK_RC=1`, master absent; password redacted here as a justified redaction — it is an ephemeral, already-unlinked 64-hex token):
+* When **`request_data=true`** (observed here on a fresh connection, isolated via `askpass=ssh` with the master absent), the sensitive triple `{REQUEST_ID, DATA_PASSWORD, PASSWORD_FILENAME}` is merged into the script's substitution map [`kittens/ssh/main.go`:L476-L478], so the generated bootstrap's DCS line is filled with the **real** values, the script is encoded into `rcmd` [`kittens/ssh/main.go`:L508], and `rcmd` is **appended to the system-`ssh` argv** [`kittens/ssh/main.go`:L753-L754]. The password is therefore present in the local `ssh` process's arguments. Captured directly from the `request_data=true` fake-`ssh` argv log (`FAKE_SSH_OCHECK_RC=1`, master absent; password redacted here as a justified redaction — it is an ephemeral, already-unlinked 64-hex token):
 
   ```
   # fakessh_fresh.log — the argc=19 real connection, argv[18] is the bootstrap script
@@ -625,9 +642,9 @@ This is the crux the earlier draft got backwards. The shm object exists in both 
   }
   ```
 
-  The `id`, `pwfile`, and `pw` are literally substituted into `argv[18]` — a real **process-list exposure** on the machine running the kitten. (It is *not* sent over the network on the command line: `ssh` runs it as the remote command, but any local user who can read this process's argv sees the password.)
+  The `id`, `pwfile`, and `pw` are literally substituted into `argv[18]` — a real **process-list exposure** on the machine running the kitten, **and** `ssh` transmits that remote command to the server, so the triple also **traverses the connection** (inside the OpenSSH-encrypted channel) and the remote echoes the password back to the terminal in its `@kitty-ssh` request. Two exposures, then: any local user who can read this process's argv sees the password, and on the wire the triple is protected by OpenSSH's encryption — **not** by the shm object.
 
-* On a **reused** connection (`request_data=false`; isolated here with `askpass=ssh` so only a live master can flip the decision), the sensitive values are **not** merged into the script map, so the same DCS line keeps its **literal placeholders**, and the local Go kitten sends the request itself (§6, §10). Captured from the reused-path log (`FAKE_SSH_OCHECK_RC=0`, master alive):
+* When **`request_data=false`** (isolated here with `askpass=ssh` so that *only* a live master can flip the decision — observed on a reused connection; but note the default kitty-askpass path reaches this same state on a **fresh** connection, §6.2 Outcome C), the sensitive values are **not** merged into the script map, so the same DCS line keeps its **literal placeholders**, and the local Go kitten sends the request itself (§6, §10). Captured from the `request_data=false` log (`FAKE_SSH_OCHECK_RC=0`, master alive):
 
   ```
   # fakessh_reused.log — argv[18], same position, placeholders NOT substituted
@@ -641,7 +658,7 @@ This is the crux the earlier draft got backwards. The shm object exists in both 
 
   Here `request_data="0"`, the guarded block never runs on the remote, and the credentials never enter this argv. (They are instead sent locally by the Go kitten to its own kitty terminal — §6.3, §10.4.)
 
-So "shared memory to pass credentials securely" is accurate about the **network** (the password never traverses it), but on a **fresh** connection the password does appear in the **local** process table for the lifetime of the `ssh` process. The rest of the security story — how the reader validates a request before releasing the tar — is §9.
+So "shared memory to pass credentials securely" is really about **local** staging and access control — an owner-only, single-use object read and validated locally — **not** about keeping data off the network. The tar reply always crosses the connection, and on the `request_data=true` route the credential triple crosses too; what protects those bytes on the wire is **OpenSSH's encryption**, while what the shm object adds is that the payload is released only to a validated local requester (§9) and only once. When `request_data=true` the password additionally appears in the **local** process table for the lifetime of the `ssh` process. The rest of the security story — how the reader validates a request before releasing the tar — is §9.
 
 ---
 
@@ -660,7 +677,7 @@ So "shared memory to pass credentials securely" is accurate about the **network*
 | Substitute | `prepare_script(cd.bootstrap_script, sd)` [`kittens/ssh/main.go`:L482] | Replaces every `PLACEHOLDER` token with its value |
 | Encode + wrap | `wrap_bootstrap_script(cd)` [`kittens/ssh/main.go`:L523] → [L486-L509] | Encodes (§7) and builds `cd.rcmd` [`kittens/ssh/main.go`:L508] |
 
-### 3.2 The substitution map — and where the fresh/reused split happens
+### 3.2 The substitution map — and where the `request_data` split happens
 
 Two maps are built in `bootstrap_script`:
 
@@ -677,7 +694,7 @@ if cd.request_data {                // L476
 ```
 [`kittens/ssh/main.go`:L475-L478]
 
-`sd` is the map actually applied to the template ([`kittens/ssh/main.go`:L482]). So on a **fresh** connection (`request_data == true`) the real `id`/`pwfile`/`pw` are **baked into the script text**; on a **reused** connection (`request_data == false`) the three secret tokens are left as the **literal strings** `REQUEST_ID` / `PASSWORD_FILENAME` / `DATA_PASSWORD`. This is the same fresh/reused split proven with captured `ssh` argv in §2.5 and §6.2, seen here at its source. (The `maps.Copy(replacements, sensitive_data)` at [`kittens/ssh/main.go`:L479] populates the *separate* `cd.replacements` used for local DCS on the reused path — it does not affect the script `sd`.)
+`sd` is the map actually applied to the template ([`kittens/ssh/main.go`:L482]). The merge is gated on **`cd.request_data`**, *not* on transport state: when `request_data == true` the real `id`/`pwfile`/`pw` are **baked into the script text**; when `request_data == false` the three secret tokens are left as the **literal strings** `REQUEST_ID` / `PASSWORD_FILENAME` / `DATA_PASSWORD`. This is the same `request_data` split proven with captured `ssh` argv in §2.5 and §6.2, seen here at its source. Because `request_data` can be `false` on a **fresh** transport (the default kitty-askpass path — §6.2 Outcome C), the literal-placeholder branch here is **not** synonymous with "reused connection." (The `maps.Copy(replacements, sensitive_data)` at [`kittens/ssh/main.go`:L479] populates the *separate* `cd.replacements` used for the local DCS the kitten sends when `request_data == false` — it does not affect the script `sd`.)
 
 Placeholders substituted into the template:
 
@@ -1305,7 +1322,7 @@ The two bootstrap templates extract the same tar but with their native tools:
 | 3 | `hostname_for_match string` | arg / hook `"host.test"` | host used for config + env matching | `make_tarfile`; written to shm `data["hostname"]` [L442] | whole run |
 | 4 | `username string` | arg / hook `"testuser"` | remote user | written to shm `data["username"]` [L442] | whole run |
 | 5 | `echo_on bool` | `term.WasEchoOnOriginally()` [L722] | was the tty echoing | `ECHO_ON` substitution [L474] | whole run |
-| 6 | `request_data bool` | `= need_to_request_data` [L724] | **the fresh/reused decision** | gates sensitive merge [L476-L478] and who sends the DCS [L761] | whole run |
+| 6 | `request_data bool` | `= need_to_request_data` [L724] | **the credential-request decision** (independent of transport state — §6.2) | gates sensitive merge [L476-L478] and who sends the DCS [L761] | whole run |
 | 7 | `literal_env map[string]string` | config env directives [L723] | env to force on the remote | `serialize_env` → env records | whole run |
 | 8 | `listen_on string` | `"tcp:localhost:<port>"` [L716], only under `forward_remote_control` | remote-control forwarding target | `KITTY_LISTEN_ON` env [L249-L250] | whole run |
 | 9 | `test_script string` | hook arg `"echo UNTAR_DONE"` / passed command | script to run after bootstrap | `TEST_SCRIPT` substitution [L464] | whole run |
@@ -1370,7 +1387,7 @@ master_is_functional := func() bool {
 
 This is exactly the `argc=16` probe captured in §1.1 (`-O check … -- host.test`). Against the real isolated `sshd` (§1.3 step 3) it prints `Master running (pid=…)` and exits `0`.
 
-### 6.2 Isolating the branch, and observing BOTH outcomes
+### 6.2 Isolating the branch, and observing all three outcomes
 
 A second mechanism can independently set `need_to_request_data=false`: the kitty-askpass path [`kittens/ssh/main.go`:L648-L652] (`use_kitty_askpass` is true when `askpass` is `native`, or `unless-set` with `SSH_ASKPASS` empty). To observe the **connection-sharing** branch cleanly, the runs below force **`askpass=ssh`**, which makes `use_kitty_askpass=false`, so the *only* thing that can flip the decision is a live master. The record-only fake `ssh` returns a controlled `-O check` exit code so the kitten's own branch runs.
 
@@ -1414,19 +1431,34 @@ argv[18]='#/bin/sh ... request_data="0" ...
 
 `request_data="0"`, the placeholders stay **literal**, and — because the remote will not ask — the local Go kitten sends the request DCS itself (§6.3, §10.4).
 
+**Outcome C — DEFAULT `askpass` (`unless-set`), master ABSENT → a *fresh* transport that nonetheless has `request_data=0`.** This is the case the fresh/reused binary misses. With no `askpass=ssh` override, `use_kitty_askpass` is true, so `set_askpass()` clears `need_to_request_data` at [`kittens/ssh/main.go`:L648-L652] — *before* the master branch — and the `-O check` probe is **never reached** (the `need_to_request_data &&` short-circuit at [`kittens/ssh/main.go`:L663]). The transport is still fresh (a new `ControlMaster=auto` connection), but `request_data=0`, the placeholders stay literal, and the **local** kitten sends the request. Captured from the default run (`harness_fakessh.py default`, invoked as `kitten ssh root@localhost echo UNTAR_DONE` — **no** overrides):
+
+```
+request_id = 507065-1
+local @kitty-ssh payload (sent by the LOCAL kitten) = id=507065-1:pwfile=kssh-507066-EZ6KF6GLGHNJC:pw=<64-hex-REDACTED>
+fake-ssh -O check invocations: IS_O_CHECK=True count = 0        # the -O check is never reached
+# the real connection still carries the six sharing options (fresh master would be created):
+CALL argc=19: -o ControlMaster=auto -o ControlPath=/root/.cache/kitty/run/kssh-507065-%C -o ControlPersist=yes \
+              -o ServerAliveInterval=60 -o ServerAliveCountMax=5 -o TCPKeepAlive=no -- root@localhost exec sh -c <unwrap> <encoded>
+argv[18] (remote bootstrap): request_data="0"
+                             dcs_to_kitty "ssh" "id="REQUEST_ID":pwfile="PASSWORD_FILENAME":pw="DATA_PASSWORD""   # LITERAL — not substituted
+```
+
+So a **fresh** transport runs with `request_data=0`, proving the two dimensions are independent: a live master is only **one** of the two ways `request_data` becomes false; the default kitty-askpass path is the other, and it does so on a fresh connection **without ever probing the master** (see §8, §10.2).
+
 ### 6.3 Cause → effect summary (corrected)
 
-The two outcomes differ in exactly three observable ways; the shm/tar channel exists in **both**:
+The observable behaviour is keyed on **`request_data`**, *not* on transport state; the shm/tar channel exists in **both** columns. The columns below therefore track `request_data` (the variable actually consulted at [`kittens/ssh/main.go`:L475-L478, L508, L761-L769]); the transport-state row records which transport was observed in each isolated run, and the note beneath explains why they are independent:
 
-| Aspect | Fresh (`request_data=true`, master absent) | Reused (`request_data=false`, master alive) |
-|--------|--------------------------------------------|---------------------------------------------|
+| Aspect | `request_data=true` (observed: Outcome A — askpass=ssh, master absent) | `request_data=false` (observed: Outcome B — askpass=ssh, master alive; **and** Outcome C — default askpass, master absent) |
+|--------|-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
 | shm object created? | **Yes** [L445] | **Yes** [L445] — identical |
 | Sensitive triple merged into the script? | Yes [L476-L478] | No (placeholders stay literal) |
 | Credentials in the local `ssh` argv? | **Yes** — `argv[18]` carries `id/pwfile/pw` (process-list exposure) | **No** — placeholders only |
 | Who sends the request DCS? | the **remote** bootstrap, over the tty [`shell-integration/ssh/bootstrap.sh`:L92-L95] | the **local Go kitten**, to its own kitty terminal [`kittens/ssh/main.go`:L761-L769] |
-| Extra TCP+auth handshake? | Yes (new connection) | No (multiplexed; §1.3 shows 0.006 s vs 0.121 s) |
+| Transport observed in the isolated run | fresh (new connection) | Outcome B: reused/multiplexed (§1.3 shows 0.006 s vs 0.121 s); Outcome C: **fresh** (new connection, yet still `request_data=false`) |
 
-The earlier draft had the credential columns inverted (claiming fresh keeps creds off the argv and reused opens no channel). The captured argv logs above show the opposite, and the timing in §1.3 confirms the reuse itself.
+**Independence of the two dimensions.** The `request_data=false` column above is reached by **two independent causes**, and only one of them is "master alive": the **kitty-askpass** path clears `need_to_request_data` at [`kittens/ssh/main.go`:L648-L652] *before* the master is probed, so **Outcome C** lands in the right-hand column on a **fresh** transport with **zero** `-O check` calls (§6.2). Transport state (fresh vs multiplexed) is decided separately by `-O check` at [`kittens/ssh/main.go`:L663-L665]. Do **not** read the header labels as "fresh ⇔ request_data=true / reused ⇔ request_data=false": that binary is exactly the conflation Outcome C disproves. The earlier draft additionally had the credential columns inverted (claiming fresh keeps creds off the argv and a reused connection opens no channel); the captured argv logs above show the opposite, and the timing in §1.3 confirms the reuse itself.
 
 ---
 
@@ -1467,11 +1499,11 @@ cd.rcmd = []string{"exec", cd.host_opts.Interpreter, "-c", unwrap_script, encode
 
 ### 7.3 Byte-accurate round-trip proof
 
-Reversed through the **real system `tr`** (uutils coreutils 0.2.2) using the same map as the emitted unwrap, then re-encoded and compared byte-for-byte:
+Reversed through the **real system `tr`** (uutils coreutils 0.2.2) using the same map as the emitted unwrap, then **re-encoded through the real `tr` with the inverse map** (the exact byte-for-byte equivalent of the `main.go`:L505 `strings.NewReplacer`), and compared byte-for-byte. Both directions are executable commands (no synthetic re-encode step):
 
 ```
-$ tr '\013\014\015\010' '\047\134\012\041' < S_sub.bin > B_rev.sh      # reverse the 4 subs
-$ # re-apply the main.go:L505 Replacer to B_rev.sh -> S_roundtrip.bin
+$ tr '\013\014\015\010' '\047\134\012\041' < S_sub.bin > B_rev.sh        # reverse the 4 subs (the remote's tr map)
+$ tr '\047\134\012\041' '\013\014\015\010' < B_rev.sh  > S_roundtrip.bin # re-apply main.go:L505 subs (inverse map, same real tr)
 $ cmp S_sub.bin S_roundtrip.bin && echo IDENTICAL
 === emitted encoded script (cmd[4]) ===
 length (bytes): 5278
@@ -1489,7 +1521,7 @@ re-encoded S_roundtrip.bin bytes: 5276
 cmp: IDENTICAL (exit 0)
 ```
 
-The histogram shows the substitution actually occurred (164 newlines became `0x0d`, 10 single-quotes became `0x0b`, 25 backslashes became `0x0c`, 3 bangs became `0x08`) and that **no literal newline (`0x0a`) survives** in the wire form; the `cmp` proves the transform is exactly invertible.
+The histogram shows the substitution actually occurred (164 newlines became `0x0d`, 10 single-quotes became `0x0b`, 25 backslashes became `0x0c`, 3 bangs became `0x08`) and that **no literal newline (`0x0a`) survives** in the wire form; because the re-encode is performed by an explicit `tr '\047\134\012\041' '\013\014\015\010'` (the inverse of the remote's reverse map), the `cmp` returning `IDENTICAL` proves the transform is exactly invertible end-to-end, not merely that the reverse was self-consistent.
 
 ### 7.4 Python scheme: base64 decode-equality
 
@@ -1550,7 +1582,7 @@ The `interpreter` (`sh`/`python3`) decides **which bootstrap template and which 
 
 ## §8 Full trace: from the user starting an SSH session to the bootstrap executing remotely
 
-**Direct answer.** The kitten runs entirely locally in Go until it hands a crafted remote command to the system `ssh`; the remote then unwraps and runs the bootstrap, which pulls its data back over the tty and hands off to the login shell. The exact local order is fixed in `run_ssh` [`kittens/ssh/main.go`:L597-L800]. The **two routes differ only in who sends the credential request** (§6, §10): on a **fresh** connection the credentials are already baked into the remote command and the **remote** bootstrap asks for the data; on a **reused** connection the **local** kitten sends the request itself.
+**Direct answer.** The kitten runs entirely locally in Go until it hands a crafted remote command to the system `ssh`; the remote then unwraps and runs the bootstrap, which pulls its data back over the tty and hands off to the login shell. The exact local order is fixed in `run_ssh` [`kittens/ssh/main.go`:L597-L800]. The **two routes differ only in who sends the credential request** (§6, §10), and that split is governed by **`request_data`**, *not* by transport state: when `request_data=true` the credentials are already baked into the remote command and the **remote** bootstrap asks for the data; when `request_data=false` the **local** kitten sends the request itself. Because `request_data` can be false on a *fresh* transport (the default kitty-askpass path — §6.2 Outcome C), "who sends the request" is decided by `request_data`, not by whether a master exists.
 
 ### 8.1 The exact local startup order (`run_ssh`)
 
@@ -1565,22 +1597,22 @@ The `interpreter` (`sh`/`python3`) decides **which bootstrap template and which 
 | 7 | **Finalize `request_data`** | `cd.request_data = need_to_request_data` [`kittens/ssh/main.go`:L724] |
 | 8 | Save current DEC private modes + set `HANDLE_TERMIOS_SIGNALS` (mode 19997); prepare restore | [`kittens/ssh/main.go`:L728, L733] |
 | 9 | **Build the remote command and create the shm object** | `get_remote_command(&cd)` [`kittens/ssh/main.go`:L749]; shm created at [L446] |
-| 10 | **Append the remote command to the `ssh` argv** (fresh: credentials are now in the argv) | `cmd = append(cmd, cd.rcmd...)` [`kittens/ssh/main.go`:L753] |
+| 10 | **Append the remote command to the `ssh` argv** (when `request_data=true` the credentials are now in the argv; when `false` the argv carries literal placeholders) | `cmd = append(cmd, cd.rcmd...)` [`kittens/ssh/main.go`:L753] |
 | 11 | **Start `ssh`** — the remote runs `exec <interp> -c <unwrap> <encoded>` | `c.Start()` [`kittens/ssh/main.go`:L756] |
-| 12 | *(reused only)* local kitten sends the `@kitty-ssh` request over the tty | `if !cd.request_data { ... DCSToKitty("ssh", rq) ... term.WriteAllString(dcs) }` [`kittens/ssh/main.go`:L761-L768] |
+| 12 | *(only when `request_data=false`)* local kitten sends the `@kitty-ssh` request over the tty | `if !cd.request_data { ... DCSToKitty("ssh", rq) ... term.WriteAllString(dcs) }` [`kittens/ssh/main.go`:L761-L768] |
 | 13 | Wait for `ssh`; then drain the tty with an `@kitty-echo` canary | `c.Wait()` [`kittens/ssh/main.go`:L782]; `drain_potential_tty_garbage` [L783] → `DCSToKitty("echo", canary)` [L539] |
 
 ### 8.2 The remote side (after `ssh` connects)
 
 `ssh` executes `exec <interp> -c <unwrap_script> <encoded_script>` (§3, §7). The unwrap restores the original bootstrap text and runs it:
 
-1. **Fresh only** — the bootstrap sends the credential request itself: `[ "$request_data" = "1" ] && dcs_to_kitty "ssh" "id=...:pwfile=...:pw=..."` [`shell-integration/ssh/bootstrap.sh`:L92-L95], or in Python `if request_data: ... send_data_request()` [`shell-integration/ssh/bootstrap.py`:L292-L294].
+1. **Only when `request_data=1`** — the bootstrap sends the credential request itself: `[ "$request_data" = "1" ] && dcs_to_kitty "ssh" "id=...:pwfile=...:pw=..."` [`shell-integration/ssh/bootstrap.sh`:L92-L95], or in Python `if request_data: ... send_data_request()` [`shell-integration/ssh/bootstrap.py`:L292-L294]. (The remote's `request_data` is the literal `0`/`1` baked into `argv[18]`; on the default kitty-askpass fresh path it is `0`, so the remote stays silent and the **local** kitten sends the DCS — §6.2 Outcome C.)
 2. **Both routes** — the bootstrap then reads the reply unconditionally: `get_data` [`shell-integration/ssh/bootstrap.sh`:L155] / [`shell-integration/ssh/bootstrap.py`:L295]. It waits for `OK`, captures the base64 after `KITTY_DATA_START` until `KITTY_DATA_END`, untars into a temp dir, sources `data.sh`, and finally `exec`s the login shell ([`shell-integration/ssh/bootstrap.sh`:L164]; [`shell-integration/ssh/bootstrap.py`:L243/L253/L315]).
 3. **Terminal side** — kitty receives the `@kitty-ssh` DCS and dispatches it: `handle_remote_ssh` → `get_ssh_data(msg, f'{os.getpid()}-{self.id}')` [`kitty/window.py`:L1289-L1291], which validates the request (§9) and streams the tar back (§4.5, §10).
 
-### 8.3 Observed end-to-end round trip (canonical PTY harness)
+### 8.3 Observed bootstrap execution — canonical PTY suite (LOCAL, no `ssh`/sshd)
 
-The full round trip — local kitten → real `ssh`/PTY → remote bootstrap → DCS request → terminal data server → untar → login shell — is exactly what kitty's own PTY test module drives. Run through the built launcher:
+kitty's own PTY test module exercises the bootstrap **execution and data round trip locally** — it does **not** invoke the system `ssh`, stand up an sshd, or open a network socket. `check_bootstrap` in [`kitty_tests/ssh.py`:L227-L272] generates the remote command with `subprocess.run([kitten_exe(), '__pytest__', 'ssh', test_script], ...)` [L241] (the `__pytest__` hook hardcodes `request_data:true`) and then runs that command through a **local** PTY, `self.create_pty([launcher, '-c', ' '.join(self.rdata['cmd'])], ...)` [L251] — where `launcher` is one of `sh`/`dash`/`bash`/`zsh`/`python`. There is no `/usr/bin/ssh`, no sshd, and no TCP connection in this path; the "remote" and "terminal" sides are the same local process pair joined by the PTY. Run through the built launcher:
 
 ```
 $ ./kitty/launcher/kitty +launch test.py --module ssh
@@ -1591,13 +1623,60 @@ Ran 8 tests in 9.907s
 OK
 ```
 
-All 8 tests pass (repeated twice, §0.5). The per-route specifics (fresh bakes credentials into `argv[18]`; reused leaves placeholders and the local kitten sends the DCS) are the captured `ssh` argv logs in §6.2 and the captured DCS wire in §10.2.
+All 8 tests pass (repeated twice, §0.5). This suite is the authoritative check that the *bootstrap script itself* (DCS request framing, untar, `data.sh` sourcing, login-shell handoff) works for every launcher; because it is local, it does **not** demonstrate that the payload traverses a network. The genuine over-the-wire round trip is captured separately in §8.4.
+
+### 8.4 Observed end-to-end round trip over a real `ssh` connection (`/usr/bin/ssh` → local sshd)
+
+To observe the payload actually crossing a network connection, a separate harness drives the real system `ssh` against an isolated local sshd (§0.4). The harness imports the real terminal-side `get_ssh_data` [`kittens/ssh/utils.py`:L115-L148], forks a PTY child that `exec`s the built `kitten ssh` against `/usr/bin/ssh`, detects the remote's `@kitty-ssh` DCS request, writes the reply back over the tty, and reads `/proc/net/tcp` to confirm an established TCP endpoint (port `0x08AE` = 2222). Invocation and captured output:
+
+```
+$ ./kitty/launcher/kitten ssh -p 2222 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/tmp/kssh_qa_work/sshd/known_hosts -o IdentitiesOnly=yes \
+    -i /tmp/kssh_qa_work/sshd/client_ed25519 -o BatchMode=yes -o RequestTTY=force \
+    --kitten askpass=ssh --kitten share_connections=no \
+    --kitten env=HOME=/tmp/kssh_qa_work/remote_home root@localhost echo UNTAR_DONE
+
+request_id: 509290-1
+GOT UNTAR_DONE marker: True
+answered remote DCS request: True
+num remote @kitty-ssh DCS requests: 1
+remote DCS request payload (decoded): id=509290-1:pwfile=kssh-509291-YNCFR4PCG6BP2:pw=<64-hex-REDACTED>
+established TCP at first request: ['127.0.0.1:56860 -> 127.0.0.1:2222 ESTABLISHED',
+                                   '127.0.0.1:2222 -> 127.0.0.1:56860 ESTABLISHED']
+reply size bytes: 31721
+reply KITTY_DATA_START: True
+reply OK\n: True
+reply KITTY_DATA_END: True
+reply has ESC-P DCS prefix (expect False): False
+reply has '@kitty-' (expect False): False
+```
+
+The connection reaches `UNTAR_DONE`, an established TCP endpoint (`127.0.0.1:56860 ↔ 127.0.0.1:2222`) is confirmed in both directions, and the remote side untars **13 files** into the isolated `HOME`:
+
+```
+$ find /tmp/kssh_qa_work/remote_home -type f | sort
+.local/share/kitty-ssh-kitten/kitty/bin/kitten
+.local/share/kitty-ssh-kitten/kitty/bin/kitty
+.local/share/kitty-ssh-kitten/kitty/version
+.local/share/kitty-ssh-kitten/shell-integration/bash/kitty.bash
+.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/clone-in-kitty.fish
+.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/kitten.fish
+.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_completions.d/kitty.fish
+.local/share/kitty-ssh-kitten/shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish
+.local/share/kitty-ssh-kitten/shell-integration/zsh/.zshenv
+.local/share/kitty-ssh-kitten/shell-integration/zsh/completions/_kitty
+.local/share/kitty-ssh-kitten/shell-integration/zsh/kitty-integration
+.terminfo/kitty.terminfo
+.terminfo/x/xterm-kitty
+```
+
+This is the genuine local-kitten → `/usr/bin/ssh` → TCP → sshd → remote-bootstrap → DCS-request → terminal-data-server → untar → login-shell round trip. The per-route specifics — when `request_data=true` the credentials are baked into `argv[18]`; when `request_data=false` the argv keeps literal placeholders and the local kitten sends the DCS — are the captured `ssh` argv logs in §6.2 (all three outcomes) and the captured DCS wire in §10.2. Note the run above uses `--kitten askpass=ssh` to isolate the `request_data=true` route; the reply-framing lines (`ESC-P` prefix and `@kitty-` both **False**) additionally re-confirm the §10.3 asymmetry over a real connection.
 
 ---
 
 ## §9 How does shared memory keep things secure?
 
-**Direct answer.** The credential channel is a POSIX shared-memory object whose security rests on layered, **locally**-enforced guarantees (the password never crosses the network): it is **created race-free** (`O_EXCL`, mode `0600`, owner = the kitty process) and is **single-use** (unlinked the instant it is read); and every read is gated by **five validations** — the request must **parse**; the object must have the correct **owner** and, as a separate check, the correct **permissions** (`0o600`); and the request must present the correct **password** and the correct **request-id**. (Those five validations, together with the always-emitted `KITTY_DATA_START` marker that leads every reply, are the six ordered checks tabulated in §9.2 — the "six checks" referred to in §1.6.) Any failure yields an error line and logs a traceback; the tar is released only when all pass. The one caveat the design does *not* hide is that on a **fresh** connection the password is also in the local `ssh` argv (§2.5) — shared memory secures the *network* path, not the local process table.
+**Direct answer.** The credential channel is a POSIX shared-memory object whose security rests on layered, **locally**-enforced guarantees (the object itself never leaves the machine — it is read and validated locally): it is **created race-free** (`O_EXCL`, mode `0600`, owner = the kitty process) and is **single-use** (unlinked the instant it is read); and every read is gated by **five validations** — the request must **parse**; the object must have the correct **owner** and, as a separate check, the correct **permissions** (`0o600`); and the request must present the correct **password** and the correct **request-id**. (Those five validations, together with the always-emitted `KITTY_DATA_START` marker that leads every reply, are the six ordered checks tabulated in §9.2 — the "six checks" referred to in §1.6.) Any failure yields an error line and logs a traceback; the tar is released only when all pass. Two things this does **not** cover, by design: the **network** — on the request_data route the credential triple is baked into the remote command and travels the OpenSSH-encrypted connection, and the tar reply always does, so wire confidentiality/integrity are **OpenSSH's** job, not the shm object's (§2.5); and the **local process table** — on a **fresh** connection the password is also in the local `ssh` argv (§2.5). Shared memory secures **local object access and single-use release**, nothing more.
 
 ### 9.1 The producer (Go) — created race-free
 
@@ -1709,18 +1788,18 @@ Case 7 above: the first read returns `OK`+data and the object is already gone (`
 
 ### 9.6 Threat model — what it does and does **not** protect against
 
-- **Protects:** the password never traverses the network (it lives in local `/dev/shm` and is matched locally); other-UID processes cannot read it (`0600` + owner check); a captured request cannot be replayed (single-use unlink); a request aimed at the wrong window is refused (request-id); an attacker cannot pre-create or leave behind a poisoned object (`O_EXCL` + unlink-before-validate).
-- **Does not protect against:** a process running as the **same UID** (or **root**) on the local machine — it can read `/dev/shm` directly, though `O_EXCL`, `0600`, and single-use unlink make the window small; a descriptor already `open`ed before unlink; and — on a **fresh** connection — the password is additionally present in the local `ssh` **argv** (visible in `/proc/<pid>/cmdline` to same-UID/root) for the lifetime of the `ssh` process (§2.5). The payload is base64, **not** encryption; the base64 tar is not secret (it is shell-integration files), only the `pw`/`pwfile`/`id` triple is sensitive.
+- **Protects:** local access to the staged object — other-UID processes cannot read it (`0600` + owner check); a captured request cannot be replayed (single-use unlink); a request aimed at the wrong window is refused (request-id); an attacker cannot pre-create or leave behind a poisoned object (`O_EXCL` + unlink-before-validate).
+- **Does not protect against:** the **network** — the shm object does **not** keep the payload off the wire: the tar reply always crosses the connection, and on the request_data route the credential triple crosses too, so wire confidentiality/integrity are provided by **OpenSSH's** encrypted transport, not by the shm object (§2.5); a process running as the **same UID** (or **root**) on the local machine — it can read `/dev/shm` directly, though `O_EXCL`, `0600`, and single-use unlink make the window small; a descriptor already `open`ed before unlink; and — on a **fresh** connection — the password is additionally present in the local `ssh` **argv** (visible in `/proc/<pid>/cmdline` to same-UID/root) for the lifetime of the `ssh` process (§2.5). The payload is base64, **not** encryption; the base64 tar is not secret (it is shell-integration files), only the `pw`/`pwfile`/`id` triple is sensitive.
 
 ---
 
 ## §10 How does the terminal communicate back and forth with the remote shell during setup?
 
-**Direct answer.** All setup traffic rides the **tty** as **DCS (Device Control String) escape sequences** of the form `ESC P @kitty-<type> | <base64-payload> ESC \`. The remote→terminal direction carries the credential **request** (`@kitty-ssh`) and debug (`@kitty-print`); the terminal→remote direction carries the framed **reply** (`KITTY_DATA_START` / `OK` / 254-byte base64 / `KITTY_DATA_END`). The **request is sent by different senders depending on the route**: the remote bootstrap on a fresh connection, the local kitten on a reused one. Locally injected DCS is wrapped in a save/set/restore of DEC private mode **19997** (`HANDLE_TERMIOS_SIGNALS`).
+**Direct answer.** Setup traffic uses **two different framings, one per direction — they are not the same**. The **request** (the credential request `@kitty-ssh` and debug `@kitty-print`) rides the **tty** as **DCS (Device Control String) escape sequences** of the form `ESC P @kitty-<type> | <base64-payload> ESC \`. The **reply** (terminal→remote) is **not** DCS at all: it is **ordinary newline-framed text** written to the remote's tty — `KITTY_DATA_START` / `OK` / ≤254-byte base64 lines / `KITTY_DATA_END`, carrying **zero** `ESC P`/`@kitty-` prefixes (captured in §10.3 and byte-checked below). The **request is sent by different senders depending on the route**: the remote bootstrap on a fresh connection, the local kitten on a reused one. Locally injected DCS is wrapped in a save/set/restore of DEC private mode **19997** (`HANDLE_TERMIOS_SIGNALS`).
 
-### 10.1 The DCS frame (identical in both directions)
+### 10.1 The DCS request frame (the reply uses different, non-DCS framing — §10.3)
 
-Producer of the frame on the remote side: `dcs_to_kitty() { printf "\033P@kitty-$1|%s\033\134" "$(printf "%s" "$2" | base64_encode)" > /dev/tty; }` [`shell-integration/ssh/bootstrap.sh`:L75] (Python equivalent [`shell-integration/ssh/bootstrap.py`:L73-L77]). `\033P` is `ESC P` (DCS), `\033\134` is `ESC \` (ST, string terminator). Captured **verbatim** from a real PTY run (`od -c` of the local kitten's tty output on the fresh route):
+Producer of the frame on the remote side: `dcs_to_kitty() { printf "\033P@kitty-$1|%s\033\134" "$(printf "%s" "$2" | base64_encode)" > /dev/tty; }` [`shell-integration/ssh/bootstrap.sh`:L75] (Python equivalent [`shell-integration/ssh/bootstrap.py`:L73-L77]). `\033P` is `ESC P` (DCS), `\033\134` is `ESC \` (ST, string terminator). Captured **verbatim** from a real PTY run (`od -c` of the local kitten's tty output — here the `request_data=true` capture, which shows the always-emitted `@kitty-echo` drain canary; the frame format is identical for `@kitty-ssh`):
 
 ```
 0000000 033   [   ?   s 033   [   ?   1   9   9   9   7   h 033   P   @
@@ -1737,23 +1816,23 @@ Producer of the frame on the remote side: `dcs_to_kitty() { printf "\033P@kitty-
 
 Read left to right: `ESC [ ? s` (save private modes) · `ESC [ ? 1 9 9 9 7 h` (set `HANDLE_TERMIOS_SIGNALS`, mode 19997) · `ESC P @ k i t t y - e c h o | <base64> ESC \` (the DCS) · `ESC [ ? r` (restore) · `ESC [ ? 1 9 9 9 7 l` (reset). Mode 19997 is defined at [`kitty/modes.h`:L89] (`#define HANDLE_TERMIOS_SIGNALS (19997 << 5)`) and [`kittens/tui/operations.py`:L48].
 
-### 10.2 Who sends the request — the directional split (observed)
+### 10.2 Who sends the request — the directional split is governed by `request_data` (observed)
 
-Decoding every `@kitty-*` frame from the two captured PTY outputs (password redacted):
+The **sender** of the `@kitty-ssh` request is decided by `request_data`, *not* by transport state (§6.2): when `request_data=true` the **remote** bootstrap sends it; when `request_data=false` the **local** Go kitten sends it. Decoding every `@kitty-*` frame from two captured PTY outputs — the first with `request_data=true` (isolated via `askpass=ssh`, master absent — Outcome A), the second with `request_data=false` (isolated via `askpass=ssh`, master alive — Outcome B) — with password redacted:
 
 ```
-pty_out_fresh.bin (130 bytes): 1 @kitty DCS frame(s)
+pty_out_reqdata_true.bin (130 bytes): 1 @kitty DCS frame(s)
   @kitty-echo|  ->  <64-hex drain-canary nonce>
 
-pty_out_reused.bin (293 bytes): 2 @kitty DCS frame(s)
+pty_out_reqdata_false.bin (293 bytes): 2 @kitty DCS frame(s)
   @kitty-ssh|  ->  id=55002-7:pwfile=kssh-109709-QSDOU7G3YYGPU:pw=<64-hex-REDACTED>
   @kitty-echo|  ->  <64-hex drain-canary nonce>
 ```
 
-- **Fresh** (`pty_out_fresh.bin`, 130 B): the local kitten emits **only** an `@kitty-echo` drain canary; it sends **no** `@kitty-ssh` — the **remote** bootstrap sends the request over `/dev/tty` [`shell-integration/ssh/bootstrap.sh`:L92-L95].
-- **Reused** (`pty_out_reused.bin`, 293 B): the **local Go kitten** sends the `@kitty-ssh` request carrying the real `id`/`pwfile`/`pw` [`kittens/ssh/main.go`:L761-L768], plus the same `@kitty-echo` canary.
+- **`request_data=true`** (`pty_out_reqdata_true.bin`, 130 B): the local kitten emits **only** an `@kitty-echo` drain canary; it sends **no** `@kitty-ssh` — the **remote** bootstrap sends the request over `/dev/tty` [`shell-integration/ssh/bootstrap.sh`:L92-L95].
+- **`request_data=false`** (`pty_out_reqdata_false.bin`, 293 B): the **local Go kitten** sends the `@kitty-ssh` request carrying the real `id`/`pwfile`/`pw` [`kittens/ssh/main.go`:L761-L768], plus the same `@kitty-echo` canary.
 
-This is the definitive evidence for the fresh/reused split (§6): the credential request exists on **both** routes, but the **sender** differs.
+This is the definitive evidence for the **directional** split (§6): the credential request exists on **both** routes, but the **sender** differs — and the switch is `request_data`. Because `request_data` can be false on a **fresh** transport (the default kitty-askpass path — §6.2 Outcome C, where the **local** kitten sends the DCS even though no master exists), the sender is **not** a proxy for "fresh vs reused." The two isolated captures above happen to pair `request_data=true` with a fresh transport and `request_data=false` with a reused one only because `askpass=ssh` was used to hold the askpass dimension fixed; Outcome C breaks that pairing.
 
 ### 10.3 The reply (terminal → remote)
 
@@ -1770,7 +1849,7 @@ kitty receives the `@kitty-ssh` DCS and dispatches it to the data server: `handl
 
 ## Architecture at a glance
 
-The diagram below reflects the **corrected** flow (shm built unconditionally; fresh bakes credentials into the `ssh` argv and the **remote** sends the request; reused leaves placeholders and the **local** kitten sends the request). All arrows are directional. Note in particular the two **distinct local channels**: the `/dev/shm/kssh-*` credential object is read by the **terminal-side** `get_ssh_data` [`kittens/ssh/utils.py`:L100-L148] — which then replies over the tty — whereas `system ssh` only carries the `argv` and multiplexes the transport and **never opens the shared-memory object** (verified at runtime in §9.3, and confirmed by source: the only Go-side shm reads, `main.go`:L72 and `askpass.go`:L76, are unrelated features).
+The diagram below reflects the **corrected** flow, keyed on **`request_data`** rather than transport state (shm built unconditionally; when `request_data=true` the credentials are baked into the `ssh` argv and the **remote** sends the request; when `request_data=false` the argv keeps placeholders and the **local** kitten sends the request). `request_data` and transport state (fresh vs multiplexed) are **independent** — the default kitty-askpass path yields `request_data=false` on a *fresh* transport (§6.2 Outcome C). All arrows are directional. Note in particular the two **distinct local channels**: the `/dev/shm/kssh-*` credential object is read by the **terminal-side** `get_ssh_data` [`kittens/ssh/utils.py`:L100-L148] — which then replies over the tty — whereas `system ssh` only carries the `argv` and multiplexes the transport and **never opens the shared-memory object** (verified at runtime in §9.3, and confirmed by source: the only Go-side shm reads, `main.go`:L72 and `askpass.go`:L76, are unrelated features).
 
 ```
         LOCAL HOST                                          |        REMOTE HOST
@@ -1784,19 +1863,21 @@ The diagram below reflects the **corrected** flow (shm built unconditionally; fr
  |   +----------^-------------------------+----------+      |
  |              |                         |                 |
  |    reply over tty:             reads @kitty-ssh          |
- |    START/OK/<=254B b64/END     request (from remote      |
- |              |                 on FRESH, from local Go   |
- |              |                 on REUSED)                |
+ |    START/OK/<=254B b64/END     request (from remote when |
+ |              |                 request_data=1; from local |
+ |              |                 Go kitten when =0)          |
  |   +----------+-------------------------v----------+      |
  |   | kitten ssh (Go)  run_ssh [kittens/ssh/main.go:L597]  |
  |   |  1 build pw + tar + shm  UNCONDITIONALLY [L431-L446] |
- |   |  2 decide fresh/reused                   [L663-L664] |
+ |   |  2 set request_data (askpass L648-652;              |
+ |   |                      master   L663-L664)            |
  |   |  3 get_remote_command -> rcmd            [L749]      |
  |   |  4 append rcmd to ssh argv               [L753]      |
  |   |  5 exec ssh                              [L756]      |
- |   |  6 REUSED only: send @kitty-ssh itself   [L761-L768] |
+ |   |  6 request_data=0 only: send @kitty-ssh  [L761-L768] |
  |   +----+--------------------------+----------------+     |
- |        | create (write)           | ssh argv (FRESH: pw) |
+ |        | create (write)           | ssh argv (req_data=1:|
+ |        |                          |            pw baked) |
  |        v                          v                      |
  |   /dev/shm/kssh-<pid>-*     +-------------+              |
  |   0600, O_EXCL              | system ssh  |==== ssh =======> sshd
@@ -1806,7 +1887,7 @@ The diagram below reflects the **corrected** flow (shm built unconditionally; fr
  +--------+  read by get_ssh_data (terminal side, up the    |     |
             tty; system ssh never opens the shm object)     |     v
             [kittens/ssh/utils.py:L100-L148]                |  bootstrap.sh / bootstrap.py
-                                                            |   - FRESH: send @kitty-ssh [bootstrap.sh:L92-L95]
+                                                            |   - req_data=1: send @kitty-ssh [bootstrap.sh:L92-L95]
                                                             |   - BOTH : get_data -> untar -> source data.sh
                                                             |   - exec login shell       [bootstrap.sh:L164]
 ```
@@ -1824,11 +1905,11 @@ Each row lists the question, the section that answers it, the canonical command 
 | 3 | Bootstrap-script generation | §3 | `printf '' \| kitten __pytest__ ssh ...` (sh) and `printf 'interpreter python3\n' \| ...` (py) | full 164-line sh + 318-line Python bootstrap decoded from `cmd[4]` |
 | 4 | Archive build + transport | §4 | `tar -tvf archive.tar`; live shm framing measurement | 15 members (0644 data, 0755 launcher stubs); 254-byte tty lines (127 lines, 32088 b64) |
 | 5 | Per-connection state | §5 | source read of `connection_data` + observed field values | 16-field table; `dont_create_shm` is TEST-only [`kittens/ssh/main_test.go`:L53] |
-| 6 | Fresh vs reused decision | §6 | record-only fake `ssh` + `--kitten askpass=ssh`, `-O check` RC 1 vs 0 | FRESH `argv[18]` carries `id/pwfile/pw`; REUSED leaves literal placeholders |
+| 6 | Fresh vs reused decision (+ independent `request_data`) | §6 | record-only fake `ssh` + `--kitten askpass=ssh`, `-O check` RC 1 vs 0; **and** default-askpass run (`kitten ssh ... echo UNTAR_DONE`, 0 `-O check`) | `request_data=1` → `argv[18]` carries `id/pwfile/pw`; `request_data=0` → literal placeholders. Outcome C: default askpass gives `request_data=0` on a **fresh** transport (0 `-O check`) — the two dimensions are independent |
 | 7 | Bootstrap encoding per shell | §7 | reverse via real `tr '\013\014\015\010' '\047\134\012\041'`; `cmp` | round-trip byte-`IDENTICAL`; fish driven explicitly -> `REALLYFISH=4.0.6`, beam cursor |
-| 8 | Full end-to-end trace | §8 | `./kitty/launcher/kitty +launch test.py --module ssh` | 8/8 tests pass; 13-step local order L718 -> L724 -> L749 -> L753 -> L756 |
+| 8 | Full end-to-end trace | §8 | LOCAL bootstrap suite `./kitty/launcher/kitty +launch test.py --module ssh` (§8.3); **and** real `/usr/bin/ssh`→sshd round trip (§8.4) | 8/8 local tests pass; 13-step local order L718 -> L724 -> L749 -> L753 -> L756; real ssh: established TCP `127.0.0.1:56860 ↔ :2222`, reached `UNTAR_DONE`, 13 files untarred remotely |
 | 9 | Shared-memory security | §9 | real `get_ssh_data` via `kitty +launch`, 7 branches | happy + 4 rejections + invalid + single-use; tampered objects still unlinked |
-| 10 | Terminal <-> remote comms | §10 | `od -c` of captured PTY output; decode `@kitty-*` frames | DCS `ESC P @kitty-<type> \| <b64> ESC \`; FRESH: only `@kitty-echo`; REUSED: `@kitty-ssh` (local) |
+| 10 | Terminal <-> remote comms | §10 | `od -c` of captured PTY output; decode `@kitty-*` frames | request is DCS `ESC P @kitty-<type> \| <b64> ESC \`, reply is newline-framed (zero DCS, §10.3); sender keyed on `request_data`: `=1` → only `@kitty-echo` locally (remote sent request); `=0` → `@kitty-ssh` from local kitten |
 
 ---
 
@@ -1849,12 +1930,13 @@ All evidence was produced from the built launcher (`./kitty/launcher/{kitty,kitt
 |----------|---------|
 | Build + artifacts + versions | `python3 setup.py build --debug --ignore-compiler-warnings --skip-building-kitten` then `... --skip-code-generation` |
 | Go unit tests (7/7) | `go test ./kittens/ssh/...` |
-| PTY suite (8/8) | `./kitty/launcher/kitty +launch test.py --module ssh` |
+| LOCAL bootstrap suite (8/8) — no `ssh`/sshd (§8.3) | `./kitty/launcher/kitty +launch test.py --module ssh` |
+| Real `ssh`→sshd round trip (§8.4) | `./kitty/launcher/kitten ssh -p 2222 ... --kitten askpass=ssh --kitten share_connections=no --kitten env=HOME=<tmp> root@localhost echo UNTAR_DONE` against the isolated `sshd`, terminal side driven by real `get_ssh_data` |
 | sh / py generation | `printf '' \| ./kitty/launcher/kitten __pytest__ ssh 'echo UNTAR_DONE'` (and `printf 'interpreter python3\n' \| ...`) |
-| Fresh vs reused argv | record-only fake `ssh` on `PATH` + `kitten ssh --kitten askpass=ssh -- host.test echo hello`, `-O check` RC 1 / 0 |
+| `request_data` argv split (+ Outcome C independence) | record-only fake `ssh` on `PATH` + `kitten ssh --kitten askpass=ssh -- host.test echo hello` (`-O check` RC 1 / 0); **and** default-askpass `kitten ssh ... echo UNTAR_DONE` (0 `-O check`, fresh transport, `request_data=0`) |
 | ControlMaster lifecycle | isolated `sshd` on `127.0.0.1:2222` (dedicated keys, `PidFile`, seeded `known_hosts`, `StrictHostKeyChecking=yes`) |
 | Shared-memory security | real `get_ssh_data` driven via `./kitty/launcher/kitty +launch <probe>.py` |
-| DCS wire | `od -c` of the kitten's captured tty output (fresh / reused) |
+| DCS wire | `od -c` of the kitten's captured tty output (`request_data=1` / `request_data=0` captures) |
 | fish login shell | `check_bootstrap('sh', tdir, login_shell='fish')` via `kitty +launch` |
 
-All temporary scripts, logs, the isolated `sshd` and its keys, the fake `ssh` shim, every `/dev/shm/kssh-*` object, and all build artifacts are removed at the end of the investigation; `git status --porcelain` then lists only this document (§0.7).
+All temporary scripts, logs, the isolated `sshd` and its keys, the fake `ssh` shim, every `/dev/shm/kssh-*` object, and all build artifacts are removed at the end of the investigation; `git status --porcelain` is then **empty** (this document is committed) and `git diff 815df1e21..HEAD --name-status` lists exactly one added path — this document (`A blitzy/documentation/kitty_815df1e210e0.md`, §0.7).
