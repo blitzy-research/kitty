@@ -4,7 +4,7 @@ This document answers, from **observed runtime behavior** rather than code readi
 happens inside kitty's history/scrollback subsystem when a command "pours out an enormous amount
 of text in a very short time." Every behavioral claim below is paired with the exact command that
 produced it and the actual, unedited output, plus a `file:line` citation into the source. The
-question decomposes into six named things, each answered explicitly:
+question decomposes into five named things, each answered explicitly:
 
 1. **Fill / stretch / carve** — what unfolds inside the `HistoryBuf` as it fills toward capacity and
    "carves out new segments" (§4).
@@ -51,18 +51,40 @@ the subsystem.
 
 ### 2.1 Reported versions
 
+Every command below was run from the repository root (shown by `pwd`); each `$`-prefixed line is the
+exact command and the line(s) beneath it are its complete, unedited output:
+
 ```text
+$ pwd
+/tmp/blitzy/kitty/blitzy-37fb2915-992a-43f5-a568-f9834bbb3df4_a66137
+
 $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
 
 $ ./kitty/launcher/kitty +runpy 'import sys; print(sys.version)'
-3.14.6 (main, Jun 23 2026, ...) [GCC 11.4.0]
+3.14.6 (main, Jun 23 2026, 03:01:40) [GCC 11.4.0]
+
+$ go version
+go version go1.22.12 linux/amd64
+
+$ gcc --version | head -1
+gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+
+$ valgrind --version
+valgrind-3.25.1
 ```
 
-The runnable launcher embeds its **own** Python interpreter (**3.14.6**) alongside the compiled
-`fast_data_types` C extension; that embedded interpreter — not the system Python — runs every
-observation script below via `kitty +launch`. Toolchain: Go 1.22.12, gcc 15.2.0, Valgrind 3.25.1.
-All observations reflect the checked-out commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`.
+The runnable launcher embeds its **own** Python interpreter (**3.14.6**, full build string above)
+alongside the compiled `fast_data_types` C extension; that embedded interpreter — not the system
+Python — runs every observation script below via `kitty +launch`.
+
+**Source commit.** These observations characterize the history/scrollback subsystem at the required
+source commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` (branch `kitty_815df1e210e0`). The acceptance
+checkout reports `git rev-parse HEAD` = `e6486adb6975d2c063659f6a17d6068bc55a157d`; the required commit
+is an **ancestor** of that HEAD, and the two trees are **byte-identical across the entire product**
+(`git diff 815df1e2..HEAD -- . ':(exclude)blitzy/**'` is empty — the only difference is this
+deliverable under `blitzy/`). Every cited `file:line` and every observed value therefore applies
+unchanged. The exact verification is shown in §12.
 
 ### 2.2 Canonical build (and an unrelated build-warning caveat)
 
@@ -74,7 +96,10 @@ adds enum values the vendored Wayland backend's `switch` does not list, and the 
 
 ```text
 $ ./dev.sh build
-...
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[118 further "[N/122] Compiling <file>" progress lines omitted for length — all succeeded]
 [122/122] Compiling kitty/gl-wrapper.c ...
 glfw/wl_window.c: In function 'xdgToplevelHandleConfigure':
 glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT' not handled in switch [-Werror=switch]
@@ -84,7 +109,7 @@ glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED
 glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_TOP' not handled in switch [-Werror=switch]
 glfw/wl_window.c:668:9: error: enumeration value 'XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM' not handled in switch [-Werror=switch]
 cc1: all warnings being treated as errors
-The following build command failed: .../python setup.py develop
+The following build command failed: /tmp/blitzy/kitty/blitzy-37fb2915-992a-43f5-a568-f9834bbb3df4_a66137/dependencies/linux-amd64/bin/python setup.py develop
 exit status 1
 ```
 
@@ -94,29 +119,62 @@ before it. kitty ships an official flag for exactly this situation, so the canon
 
 ```text
 $ ./dev.sh build --ignore-compiler-warnings
-...
+[1/122] Compiling kitty/screen.c ...
+[2/122] Compiling kitty/unicode-data.c ...
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+[118 further "[N/122] Compiling <file>" progress lines omitted for length — all succeeded]
+[122/122] Compiling kitty/gl-wrapper.c ...
+ done
+[1/5] Linking kitty/fast_data_types ...
+[2/5] Linking [x11] kitty/glfw-x11 ...
+[3/5] Linking [wayland] kitty/glfw-wayland ...
+[4/5] Linking kittens/transfer/rsync ...
+[5/5] Linking launcher ...
+ done
 Build successful. Run kitty as: kitty/launcher/kitty
 ```
 
 This changes no runtime behavior of the subsystem under study; it only relaxes `-Werror` for the
 unrelated Wayland enum-skew. (A separate `--debug` profiling build is described in §8.4.)
 
+**Supply-chain caveat (build provenance).** On a fresh, cacheless checkout, `./dev.sh build`
+(`dev.sh:9` → `bypy/devenv.go`) first fetches a *prebuilt* dependency bundle: `devenv.go` extracts
+`BUNDLE_URL` from `ci.py` (`bypy/devenv.go:257`) and downloads the archive with `cached_download`
+(`bypy/devenv.go:150-186`). That function validates only the HTTP status and an `ETag` used for
+caching — there is **no repository-pinned cryptographic digest or signature check** of the downloaded
+archive (a full-file scan of `devenv.go` finds zero `sha256`/`checksum`/`digest`/`signature`
+verification). The archive is then `tar xf`-extracted (`bypy/devenv.go:286-291`) and *its* bundled
+Python runs `setup.py develop` to build the extension — i.e. downloaded code is executed locally. Bundle
+integrity therefore rests on TLS and the upstream host, not on an in-repo pin, so a substituted or
+tampered bundle would not be detected by the build itself. **Mitigation:** build inside a
+digest-pinned container image, or from a pre-provisioned and independently verified dependency bundle,
+and/or record an approved archive digest and verify it before extraction. **No fetch occurred during
+this investigation:** the container ships the dependency bundle pre-provisioned (the §2.1 toolchain was
+already present), so the build reused that existing cache and made no network download while observing;
+the release artifacts were additionally `sha256`-verified before and after the profiling build (§12),
+so the measurements reported here are unaffected by this caveat.
+
 ### 2.3 Canonical ingest path
 
 A child's output bytes traverse: PTY byte stream → VT parser (`kitty/vt-parser.c`) → screen
 operations (`kitty/screen.c`) → line-buffer update → the scroll decision → the history buffer
-(`kitty/history.c`). The single production writer into scrollback is `historybuf_add_line`
-(`kitty/history.c:286-291`), reached only through the `INDEX_UP` macro in `kitty/screen.c:1552-1567`
-(which calls `historybuf_add_line` at `screen.c:1558` and bumps `history_line_added_count` at
-`screen.c:1559`), gated by `add_to_history` at `screen.c:1574-1575`. Every script below reproduces the
-"enormous output, very short time" command by feeding a large, fast block of newline-terminated lines
-into a real `Screen` via `parse_bytes` (`kitty_tests/__init__.py:30-36`), which routes the bytes
-through that exact parser.
+(`kitty/history.c`). For **live child output** — the path this investigation exercises — the writer
+into scrollback is `historybuf_add_line` (`kitty/history.c:286-291`), and on that canonical ingest
+path it is reached *only* through the `INDEX_UP` macro in `kitty/screen.c:1552-1567` (which calls
+`historybuf_add_line` at `screen.c:1558` and bumps `history_line_added_count` at `screen.c:1559`),
+gated by `add_to_history` at `screen.c:1574-1575`. `historybuf_add_line` does have two other callers,
+neither of which is a live-ingest path: the Python `HistoryBuf.push` method (`kitty/history.c:342`),
+a *non-canonical* scripting entry used here only as an explicitly labelled cross-check, and the
+rewrap/resize path (`kitty/rewrap.h:32`), which *re-flows existing* history lines on a size change
+rather than ingesting new bytes. Every script below reproduces the "enormous output, very short time"
+command by feeding a large, fast block of newline-terminated lines into a real `Screen` via
+`parse_bytes` (`kitty_tests/__init__.py:30-36`), which routes the bytes through that exact parser and
+therefore through `INDEX_UP`.
 
 ### 2.4 Observation harness and a disclosed default-option override
 
 Scripts use two in-process primitives from kitty's own test harness:
-`create_screen(cols, lines, scrollback, options=...)` (`kitty_tests/__init__.py:237-241`) and
+`create_screen(cols, lines, scrollback, options=<mapping>)` (`kitty_tests/__init__.py:237-241`) and
 `parse_bytes(screen, data)` (`kitty_tests/__init__.py:30-36`).
 
 **Disclosed override (important).** `BaseTest.set_options` seeds a default option dictionary that
@@ -141,12 +199,47 @@ Pager size is read exactly via `pagerhist_as_bytes()`/`pagerhist_as_text()`
 (`kitty/history.c:460-494`). For §7, `Screen.scrolled_by` is read-only (`kitty/screen.c:4903`) and
 `Screen.history_line_added_count` is readable (`kitty/screen.c:4908`).
 
+**Interpreter optimization level (why the scripts use `print`, not `assert`).** The interpreter behind
+`kitty +launch` runs **optimized** — `sys.flags.optimize == 2`, so `__debug__` is `False` and every
+bare `assert` is *stripped at compile time* and can never fire:
+
+```text
+$ ./kitty/launcher/kitty +runpy 'import sys; print("__debug__ =", __debug__, "; optimize =", sys.flags.optimize)'
+__debug__ = False ; optimize = 2
+```
+
+Consequently the observation scripts below **do not use `assert`** for any verification; they check by
+printing the actual values (and, where a mismatch must fail loudly, by an explicit `if …: raise`). Every
+`True`/"confirmed" in the captured output is therefore a real computed comparison that survived
+optimization, not an assertion that could have been silently elided.
+
 ### 2.6 Temporary workspace and cleanup
 
-All scripts and profiler outputs were created in a private directory made with
-`mktemp -d` and `chmod 700` (not a predictable `/tmp/obs_*.py` name), and removed afterward; the
-repository tree is left untouched. The exact create/verify/cleanup commands and the final clean-tree
-check are in §12.
+All observation scripts and profiler outputs live in a **private** directory made with `mktemp -d`
+and locked to the owner with `chmod 700` (an unpredictable name, not a guessable `/tmp/obs_*.py`), and
+removed afterward; the repository tree is left untouched. The workspace `$WORK` is created **before any
+script is written or run** — every `$WORK/<file>` path in the sections that follow refers to it. Because
+one profiling detour (§8.4) rebuilds the C extension as a debug variant, the release artifacts are
+**backed up into `$WORK` first** so they can be restored bit-for-bit afterward:
+
+```text
+$ WORK=$(mktemp -d /tmp/kitty_obs.XXXXXX); chmod 700 "$WORK"; stat -c '%A %n' "$WORK"
+drwx--S--- /tmp/kitty_obs.iPXoYt
+
+$ mkdir -p "$WORK/release_backup/launcher"
+$ cp kitty/fast_data_types.so "$WORK/release_backup/"
+$ cp kitty/launcher/kitty kitty/launcher/kitten "$WORK/release_backup/launcher/"
+$ sha256sum kitty/fast_data_types.so kitty/launcher/kitty kitty/launcher/kitten
+c314243b974fc0d132cf55e8d7362f013c74e964935dd0d07e6b277c31d67888  kitty/fast_data_types.so
+05fc54d4e44f1615b61f00970ed2b30fcf32eb628d6feeba64978455e4c3da12  kitty/launcher/kitty
+93f3eaae4f1f4a61d6b254f2c024a0b37574b188cb4dcec9c30dd6f714febde4  kitty/launcher/kitten
+```
+
+Owner-only `rwx` (group/other have no access). Every scenario script
+(`scenarioA.py` … `scenarioF.py`, `units.py`, `mallocinfo.py`, `massif_target.py`) and the
+`sizeof_probe.c` helper (§3.1), plus all captured outputs, were written under `$WORK`, never inside the
+repository. The `mktemp` suffix is random by design, so its exact value differs run to run; the full
+restore/verify and final clean-tree check are in §12.
 
 ---
 
@@ -159,7 +252,7 @@ Under stress, exactly **two** memory structures inside `HistoryBuf` participate
   segment holding `SEGMENT_SIZE = 2048` lines (`kitty/history.c:15`). Lines occupy a **circular** slot
   space indexed `(start_of_data + i) % ynum`; the physical backing is grown one segment at a time by
   `add_segment` (`kitty/history.c:17-29`), which `realloc`s the segment pointer array
-  (`kitty/history.c:19`) and `calloc`s a fresh per-segment block (`kitty/history.c:25`). Segments are
+  (`kitty/history.c:20`) and `calloc`s a fresh per-segment block (`kitty/history.c:25`). Segments are
   added lazily, only when a line index demands one, by `segment_for` (`kitty/history.c:36-42`, growth
   condition at `history.c:39`).
 - **The pager ring** — an optional `PagerHistoryBuf` (`kitty/data-types.h:268-272`) wrapping the
@@ -176,12 +269,57 @@ The per-segment allocation size matters throughout, so it is pinned down exactly
 `xnum * 2048 * sizeof(CPUCell)  +  xnum * 2048 * sizeof(GPUCell)  +  2048 * sizeof(LineAttrs)`.
 The cell sizes are pinned by `static_assert`: `sizeof(GPUCell) == 20` (`kitty/data-types.h:221`) and
 `sizeof(CPUCell) == 12` (`kitty/data-types.h:228`). `LineAttrs` has **no** `static_assert`, and it is
-**not** one byte: it is a union whose bitfield is declared with the `PromptKind` **enum** type
-(`kitty/data-types.h:231-239`), which forces 4-byte storage:
+**not** one byte: it is a union (`kitty/data-types.h:231-239`) whose bitfield is declared with the
+`PromptKind` **enum** type (`kitty/data-types.h:230`), which forces 4-byte storage for the whole union.
+The self-contained probe below copies those two declarations **verbatim** from the header, so it builds
+with a plain C11 toolchain (no kitty headers) and isolates the one non-obvious size. It is created in
+`$WORK` (created in §2.6) with a heredoc, `cat > "$WORK/sizeof_probe.c" << 'EOF' … EOF`:
+
+```c
+/* sizeof_probe.c — self-contained probe reproducing the ONE non-obvious size in
+ * kitty/data-types.h: sizeof(LineAttrs) is 4, not 1. The GPUCell (20) and CPUCell
+ * (12) sizes are pinned by static_assert in the real header (data-types.h:221,228)
+ * and are cited directly; this probe isolates LineAttrs, whose bitfield is declared
+ * with the PromptKind *enum* type (data-types.h:230), forcing int-width (4-byte)
+ * storage for the whole union. Definitions copied verbatim from
+ * kitty/data-types.h:230-239 so the probe compiles with a plain C11 toolchain. */
+#include <stdio.h>
+#include <stdint.h>
+
+typedef enum { UNKNOWN_PROMPT_KIND = 0, PROMPT_START = 1, SECONDARY_PROMPT = 2, OUTPUT_START = 3 } PromptKind;
+typedef union LineAttrs {
+    struct {
+        uint8_t is_continued : 1;
+        uint8_t has_dirty_text : 1;
+        uint8_t has_image_placeholders : 1;
+        PromptKind prompt_kind : 2;
+    };
+    uint8_t val;
+} LineAttrs;
+
+int main(void) {
+    printf("sizeof(LineAttrs)=%zu  sizeof(PromptKind)=%zu\n",
+           sizeof(LineAttrs), sizeof(PromptKind));
+    return 0;
+}
+```
 
 ```text
-$ gcc -std=c11 -O2 sizeof_probe.c -o sizeof_probe && ./sizeof_probe
+$ gcc -std=c11 -O2 "$WORK/sizeof_probe.c" -o "$WORK/sizeof_probe" && "$WORK/sizeof_probe"
 sizeof(LineAttrs)=4  sizeof(PromptKind)=4
+```
+
+As a cross-check, a second probe that `#include`s the **real** `kitty/data-types.h` (using the embedded
+interpreter's own include path) confirms all four sizes at once — `LineAttrs` is indeed 4, and
+`GPUCell`/`CPUCell` match their `static_assert`s:
+
+```text
+$ PYINC=$(./kitty/launcher/kitty +runpy 'import sysconfig;print(sysconfig.get_path("include"))')
+$ printf '%s\n' '#include "kitty/data-types.h"' '#include <stdio.h>' \
+    'int main(void){printf("LineAttrs=%zu GPUCell=%zu CPUCell=%zu PromptKind=%zu\n",' \
+    'sizeof(LineAttrs),sizeof(GPUCell),sizeof(CPUCell),sizeof(PromptKind));return 0;}' > "$WORK/sizeof_real.c"
+$ gcc -std=c11 -I. -I"$PYINC" "$WORK/sizeof_real.c" -o "$WORK/sizeof_real" && "$WORK/sizeof_real"
+LineAttrs=4 GPUCell=20 CPUCell=12 PromptKind=4
 ```
 
 So at `xnum = 80` the per-segment request is exactly:
@@ -206,7 +344,7 @@ This 5,251,072-byte figure is confirmed independently by Valgrind Massif in §8.
 calls `init_line` on it, and increments `count` (`kitty/history.c:282`). `init_line` reaches the slot
 through `segment_for` (`kitty/history.c:36-42`), which — when the requested line lands in a segment
 that does not physically exist yet — calls `add_segment` (growth condition at `kitty/history.c:39`).
-`add_segment` `realloc`s the segment pointer array (`kitty/history.c:19`) and `calloc`s a new
+`add_segment` `realloc`s the segment pointer array (`kitty/history.c:20`) and `calloc`s a new
 5,251,072-byte block (`kitty/history.c:25`). That is the literal "carving out of a new segment":
 one fresh 2048-line block appears each time `count` crosses a 2048 multiple. Once `count == ynum`
 the store is full and `historybuf_push` stops growing (the `count++` branch is no longer taken);
@@ -304,14 +442,21 @@ count==ynum ? True ; count never exceeded ynum ? True ; pager_bytes=0
   construction, `create_historybuf` → `add_segment`, `kitty/history.c:127`, but holds no lines yet).
 - *During (stretch/carve):* as the burst crosses each 2048 multiple, `count` tracks the fed line count
   and the derived segment count steps `1 → 2 → 3 → … → 10`. RSS climbs in near-constant steps —
-  `dRSS_kB` = 5604, 10736, 15868, 21000, … , 50596 — i.e. a stable **5132 kB per new segment** (the
-  gap between every consecutive boundary is exactly 5132 kB in both runs), matching the 5,251,072-byte
-  (5128 KiB) per-segment `calloc` above (the small excess is page-table and first-touch overhead). The
-  **per-segment increment (5132 kB) and every structural value** (`count`, the `1 → 2 → … → 10` segment
-  progression, `count == ynum`, `pager_bytes = 0`) were **byte-identical across both runs**; the
-  *absolute* `dRSS` differed by only ≈4 kB (one page) run-to-run — RUN 2's first step read 5608 vs
-  RUN 1's 5604 — reflecting ordinary first-touch / baseline-RSS noise, not any change in allocation
-  behaviour.
+  `dRSS_kB` = 5604, 10736, 15868, 21000, 26136, …, 50596 — i.e. **≈5132 kB per new segment**. The
+  increment is *not* perfectly uniform: reading the `dRSS_kB` column as consecutive differences gives
+  the gap sequence `5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` — eight full-segment gaps of
+  5132 kB, a **single 5136 kB step into the `count = 10240` boundary** (a one-page, ≈4 kB, first-touch
+  jitter, visible directly in the `dRSS_kB` column: `26136 − 21000 = 5136`), and a smaller **3932 kB
+  final step** because the tenth segment is only partially faulted (`20000 − 18432 = 1568` of its 2048
+  rows). The ≈5132 kB step matches the 5,251,072-byte (5128 KiB) per-segment `calloc` above (the small
+  excess is page-table and first-touch overhead). Every **structural value** (`count`, the
+  `1 → 2 → … → 10` segment progression, `count == ynum`, `pager_bytes = 0`) was **byte-identical across
+  both runs**, and so was the *gap sequence* above — including the 5136 kB outlier, which reproduced at
+  the same `count = 10240` boundary in both runs; what drifted was only the *absolute* `dRSS`, by ≈4 kB
+  (one page) run-to-run (RUN 2's first step read 5608 vs RUN 1's 5604), reflecting ordinary first-touch
+  / baseline-RSS noise, not any change in allocation behaviour. RSS is a process-wide figure and is
+  used here as corroboration of the segmented store's growth, not as its exclusive measure (§8.4/§8.5
+  give allocator-level attribution).
 - *After (saturate):* requesting 80,000 more lines pins `count` at `ynum = 20000` with `segments = 10`;
   `count == ynum` is `True` and `count` never exceeds `ynum`. `pager_bytes = 0` throughout, confirming
   the pager truly stayed disabled.
@@ -335,7 +480,7 @@ carriage return (`history.c:269`), and a newline **only if the line did not wrap
 The segmented store is thus the bounded "live" window; the pager ring is the optional overflow that
 catches what the window drops.
 
-**Units caveat (raw bytes here, megabytes in config).** Through `create_screen(options=...)` the value
+**Units caveat (raw bytes here, megabytes in config).** Through `create_screen(options=<mapping>)` the value
 is a **raw byte count**. This is verified directly — a tiny cap truncates the ring to that many bytes,
 a large cap leaves the same 6800 serialized bytes (400 records × 17 B) untouched:
 
@@ -493,11 +638,16 @@ exit=0
   never exists.
 
 **Initial ring capacity vs. used bytes (Part 0).** Constructing a screen with a 16 MiB pager costs
-**≈1216 kB more RSS** than constructing with the pager disabled, *while `pager_bytes` is still 0*. That
-is the ring's **initial capacity** — `MIN(1 MiB, configured)` (`kitty/history.c:66-67`), here 1 MiB —
-allocated up front by `ringbuf_new` (`kitty/history.c:76`) even though nothing has been serialized yet.
-In other words, enabling the pager reserves ~1 MiB immediately; "used" bytes (`pager_bytes`) only grow
-later, once eviction begins. This up-front reservation was byte-stable (1216 kB) across both runs.
+**≈1220 kB more RSS** than constructing with the pager disabled, *while `pager_bytes` is still 0*.
+*Per source*, the ring's **initial capacity** is `MIN(1 MiB, configured)` (`kitty/history.c:66-67`),
+here 1 MiB, allocated up front by `ringbuf_new` (`kitty/history.c:76`) even though nothing has been
+serialized yet — and `pagerhist_as_bytes()` only ever reports *used* bytes (here 0), never that
+allocated capacity (§2.5). The ≈1220 kB construction-time RSS delta therefore *corroborates* that
+source-specified ~1 MiB reservation rather than measuring it directly: enabling the pager reserves the
+capacity immediately, while "used" bytes (`pager_bytes`) only grow later, once eviction begins. This
+up-front reservation read 1220 kB in both runs; as an RSS-derived delta it carries the ~one-page wobble
+noted in §9, so it is treated as corroboration of — not an exact measurement of — the ~1 MiB initial
+capacity (the capacity value itself is the source constant, not a directly read runtime quantity).
 
 **How the relationship holds up under pressure.** Steady and simple: the segmented store's size is
 fixed at saturation, and each additional evicted line adds one serialized record to the ring — a bounded
@@ -516,7 +666,7 @@ attributes to the harness rather than the subsystem.
 
 **Claim.** The hesitation is not *at* the 2048 multiple but on the **very next line** (`count = 2048k+1`),
 which is the first push that needs a not-yet-existing segment and therefore triggers `segment_for` →
-`add_segment` (pointer-array `realloc` at `kitty/history.c:19` + 5,251,072-byte `calloc` at
+`add_segment` (pointer-array `realloc` at `kitty/history.c:20` + 5,251,072-byte `calloc` at
 `kitty/history.c:25`). **Scenario C** times every single line, isolates the C cost by toggling Python's
 cyclic GC, checks reproducibility over 5 fresh trials, and directly tests whether the *large* pauses are
 GC:
@@ -955,13 +1105,143 @@ exit=0
 
 **Before / during / after (GC-OFF, the clean C-level view).**
 - *Before any extend:* per-line cost is ~2–5 µs (median 4.27–4.77 µs).
-- *During each extend:* the three slowest lines land **exactly** at the ring-growth points, at
-  byte positions that are **identical across all runs** — `pager_bytes = 1048586` (1.000 MiB),
-  `2097186` (2.000 MiB), `3145730` (3.000 MiB) — and the cost **grows with ring size copied**:
-  ≈583–692 µs (copy ~1 MiB) → ≈1101–1211 µs (~2 MiB) → ≈1588–1992 µs (~3 MiB). The per-band maxima
-  confirm this: the only bands with large maxima are `[1.00-1.25)`, `[2.00-2.25)`, `[3.00-3.25) MiB`.
+- *During each extend:* the three slowest lines land **exactly** where the *used* byte count
+  (`pager_bytes` — the only pager quantity Python exposes, §2.5) crosses each ~1 MiB mark, at positions
+  **identical across all runs** — `pager_bytes = 1048586` (1.000 MiB), `2097186` (2.000 MiB),
+  `3145730` (3.000 MiB). These positions mark the ring's *capacity* extends (`pagerhist_extend`,
+  `history.c:89-101` — the capacity growth itself is *inferred* from source, since only used bytes are
+  observable), and the cost **grows with ring size copied**: ≈583–692 µs (copy ~1 MiB) → ≈1101–1211 µs
+  (~2 MiB) → ≈1588–1992 µs (~3 MiB). The per-band maxima confirm this: the only bands with large maxima
+  are `[1.00-1.25)`, `[2.00-2.25)`, `[3.00-3.25) MiB`.
 - *After the cap:* beyond 3 MiB the ring is at its 4 MiB cap; the `[4.00-4.25 MiB)` band holds ~25,010
   samples with a maximum of only ~40–53 µs — steady **overwrite-oldest** with no further growth.
+
+**Direct content evidence — the plateau really is overwrite-oldest (Scenario F).** The timing plateau
+above shows the ring *stops growing*, but not that its *oldest bytes are discarded*. Scenario F proves
+the latter directly: it sets a tiny **4096-byte** pager cap and feeds **unique, fixed-width** tokens
+(`T000000`, `T000001`, … — each a 12-byte pager record: `ESC[m` + 7 chars + `CRLF`) through the same
+canonical `parse_bytes` path, then reads `pagerhist_as_bytes()` before the cap, at the cap, and well
+past it. Because every token is distinct, a specific record's disappearance is unambiguous. With a
+4096-byte configured size the ring is at its cap from construction (`MIN(1 MiB, 4096) = 4096`,
+`kitty/history.c:66-67`), so `pagerhist_extend` refuses to grow from the first eviction
+(`kitty/history.c:92`) and every push overwrites:
+
+```python
+# scenarioF.py — REQ-2/3/5 DIRECT runtime evidence of pager-ring overwrite-oldest at
+# the cap. A small 4096-byte pager cap plus unique fixed-width tokens lets us watch
+# specific records survive, then disappear as the full ring overwrites its oldest bytes.
+# Canonical ingest only: create_screen + parse_bytes (real VT parser -> screen -> history).
+import re
+from kitty_tests import BaseTest, parse_bytes
+
+CAP = 4096                      # pager cap in BYTES (raw harness units, see doc s2.4)
+COLS, LINES, YNUM = 80, 24, 100
+
+def feed_tokens(s, first, n):
+    # token 'T%06d' -> a 7-char history line; serialized pager record =
+    # ESC[m (3) + 'T000000' (7) + CRLF (2) = 12 bytes
+    parse_bytes(s, ("".join(f"T{first+i:06d}\r\n" for i in range(n))).encode())
+
+def token_range(b):
+    toks = sorted(int(m) for m in re.findall(rb'T(\d{6})', b))
+    return (toks[0], toks[-1], len(toks)) if toks else (None, None, 0)
+
+class T(BaseTest):
+    def run(self):
+        s = self.create_screen(COLS, LINES, YNUM,
+                               options={'scrollback_pager_history_size': CAP})
+        hb = s.historybuf
+        # ---- saturate the segmented store so the NEXT pushed line begins evicting ----
+        feed_tokens(s, 0, YNUM + (LINES - 1))     # first LINES-1 fill screen; YNUM -> history
+        fed = YNUM + (LINES - 1)
+        FIRST = 0                                 # T000000 is the oldest line, first to be evicted
+        print(f"config: pager cap={CAP} B  ynum={hb.ynum}  xnum={hb.xnum}")
+        print(f"after fill: count={hb.count} (==ynum? {hb.count==hb.ynum})  "
+              f"pager_bytes={len(hb.pagerhist_as_bytes())}  (no eviction yet)")
+
+        def snap(label):
+            b = hb.pagerhist_as_bytes()
+            lo, hi, n = token_range(b)
+            print(f"  [{label}] pager_bytes={len(b):>5}  intact_records={n:>4}  "
+                  f"oldest_intact=T{lo:06d}  newest=T{hi:06d}  "
+                  f"first-evicted T{FIRST:06d} present? {(f'T{FIRST:06d}'.encode() in b)}")
+            print(f"       head 40B = {b[:40]!r}")
+            print(f"       tail 40B = {b[-40:]!r}")
+
+        # ---- PRE-CAP: evict ~200 records; 200*12=2400 B < 4096 so nothing overwritten ----
+        feed_tokens(s, fed, 200); fed += 200
+        snap("PRE-CAP ")
+        # ---- AT-CAP: evict one-at-a-time until used bytes reach the ring capacity ----
+        while len(hb.pagerhist_as_bytes()) < CAP - 12:
+            feed_tokens(s, fed, 1); fed += 1
+        snap("AT-CAP  ")
+        # ---- POST-CAP: keep evicting far past the cap ----
+        feed_tokens(s, fed, 600); fed += 600
+        snap("POST-CAP")
+
+        b = hb.pagerhist_as_bytes()
+        print(f"  RESULT: first-ever-evicted token T{FIRST:06d} still present? "
+              f"{(f'T{FIRST:06d}'.encode() in b)}  (expect False: overwritten)")
+        print(f"  RESULT: pager plateaued at {len(b)} B (never exceeds the {CAP} B cap)")
+        print(f"  RESULT: head begins MID-record (no leading ESC[m SGR reset): first3={b[:3]!r} "
+              f"(an intact record starts with b'\\x1b[m')")
+
+T().run()
+```
+
+```text
+$ for r in 1 2; do echo "================= RUN $r ================="; \
+    ./kitty/launcher/kitty +launch "$WORK/scenarioF.py"; echo "exit=$?"; done
+================= RUN 1 =================
+config: pager cap=4096 B  ynum=100  xnum=80
+after fill: count=100 (==ynum? True)  pager_bytes=0  (no eviction yet)
+  [PRE-CAP ] pager_bytes= 2400  intact_records= 200  oldest_intact=T000000  newest=T000199  first-evicted T000000 present? True
+       head 40B = b'\x1b[mT000000\r\n\x1b[mT000001\r\n\x1b[mT000002\r\n\x1b[mT'
+       tail 40B = b'96\r\n\x1b[mT000197\r\n\x1b[mT000198\r\n\x1b[mT000199\r\n'
+  [AT-CAP  ] pager_bytes= 4092  intact_records= 341  oldest_intact=T000000  newest=T000340  first-evicted T000000 present? True
+       head 40B = b'\x1b[mT000000\r\n\x1b[mT000001\r\n\x1b[mT000002\r\n\x1b[mT'
+       tail 40B = b'37\r\n\x1b[mT000338\r\n\x1b[mT000339\r\n\x1b[mT000340\r\n'
+  [POST-CAP] pager_bytes= 4096  intact_records= 341  oldest_intact=T000600  newest=T000940  first-evicted T000000 present? False
+       head 40B = b'99\r\n\x1b[mT000600\r\n\x1b[mT000601\r\n\x1b[mT000602\r\n'
+       tail 40B = b'37\r\n\x1b[mT000938\r\n\x1b[mT000939\r\n\x1b[mT000940\r\n'
+  RESULT: first-ever-evicted token T000000 still present? False  (expect False: overwritten)
+  RESULT: pager plateaued at 4096 B (never exceeds the 4096 B cap)
+  RESULT: head begins MID-record (no leading ESC[m SGR reset): first3=b'99\r' (an intact record starts with b'\x1b[m')
+exit=0
+================= RUN 2 =================
+config: pager cap=4096 B  ynum=100  xnum=80
+after fill: count=100 (==ynum? True)  pager_bytes=0  (no eviction yet)
+  [PRE-CAP ] pager_bytes= 2400  intact_records= 200  oldest_intact=T000000  newest=T000199  first-evicted T000000 present? True
+       head 40B = b'\x1b[mT000000\r\n\x1b[mT000001\r\n\x1b[mT000002\r\n\x1b[mT'
+       tail 40B = b'96\r\n\x1b[mT000197\r\n\x1b[mT000198\r\n\x1b[mT000199\r\n'
+  [AT-CAP  ] pager_bytes= 4092  intact_records= 341  oldest_intact=T000000  newest=T000340  first-evicted T000000 present? True
+       head 40B = b'\x1b[mT000000\r\n\x1b[mT000001\r\n\x1b[mT000002\r\n\x1b[mT'
+       tail 40B = b'37\r\n\x1b[mT000338\r\n\x1b[mT000339\r\n\x1b[mT000340\r\n'
+  [POST-CAP] pager_bytes= 4096  intact_records= 341  oldest_intact=T000600  newest=T000940  first-evicted T000000 present? False
+       head 40B = b'99\r\n\x1b[mT000600\r\n\x1b[mT000601\r\n\x1b[mT000602\r\n'
+       tail 40B = b'37\r\n\x1b[mT000938\r\n\x1b[mT000939\r\n\x1b[mT000940\r\n'
+  RESULT: first-ever-evicted token T000000 still present? False  (expect False: overwritten)
+  RESULT: pager plateaued at 4096 B (never exceeds the 4096 B cap)
+  RESULT: head begins MID-record (no leading ESC[m SGR reset): first3=b'99\r' (an intact record starts with b'\x1b[m')
+exit=0
+```
+
+**Before / during / after (content).**
+- *Before the cap* (`[PRE-CAP]`, 2400 B < 4096): 200 intact records; `oldest_intact = T000000` — the
+  first-ever-evicted token — is **present**, and the head is a clean full record
+  (`b'\x1b[mT000000\r\n…'`). Nothing discarded yet.
+- *At the cap* (`[AT-CAP]`, 4092 B ≈ 4096): 341 records; `oldest_intact` is **still** `T000000` — the
+  ring is full but the oldest survivor has not yet been overwritten.
+- *After the cap* (`[POST-CAP]`, exactly 4096 B): the ring **plateaus at the 4096-byte cap and never
+  exceeds it**; `oldest_intact` jumps forward to `T000600` and `T000000` is **gone** (`present? False`).
+  The head now begins **mid-record** — `b'99\r\n\x1b[mT000600…'`, the trailing `99\r\n` of a
+  half-overwritten token rather than a leading `ESC[m` — the signature of a **byte-level** overwrite
+  (`ringbuf_memcpy_into` advancing the tail into the middle of the oldest record,
+  `3rdparty/ringbuf/ringbuf.c:233`), not a line-atomic drop.
+
+Both runs are byte-identical, so the disappearance of `T000000` and the mid-record head are stable, not
+sampling artifacts. This is the **direct** confirmation of the overwrite-oldest behavior that the timing
+plateau only implied.
 
 Each run prints `CONSISTENCY CHECK: max(all band maxima) == overall max -> True`, i.e. the reported
 per-band maxima are internally consistent with the overall maximum (they are computed from the same
@@ -1151,6 +1431,9 @@ before/during/after with logical-line grouping, and a retention contrast (pager 
 # scenarioE.py — REQ-5: allocation, wrapping, retention (before/during/after).
 from kitty_tests import BaseTest, parse_bytes
 
+LINES = 24                         # screen rows; first (LINES-1) fed lines fill the screen
+                                   # before INDEX_UP begins pushing lines into history
+
 def rss_kb():
     with open("/proc/self/status") as f:
         for ln in f:
@@ -1170,16 +1453,18 @@ class T(BaseTest):
         YNUM = 20000
         print("########## PART 1: FOOTPRINT = segmented store + pager ring, as pressure builds ##########")
         print(f"(scrollback={YNUM}, pager cap=64 MiB so it never caps during this run)")
-        s = self.create_screen(80, 24, YNUM, options={'scrollback_pager_history_size': 64 * 1024 * 1024})
+        s = self.create_screen(80, LINES, YNUM, options={'scrollback_pager_history_size': 64 * 1024 * 1024})
         hb = s.historybuf
         base = rss_kb()
         print(f"  {'lines_fed':>10} {'count':>6} {'segments':>8} {'pager_bytes':>12} {'RSS_kB':>9} {'dRSS_kB':>9}")
         fed = 0
-        # fill phase: cross several 2048 segment boundaries up to saturation
+        # fill phase: drive `count` to each round target exactly by compensating for the
+        # (LINES-1) lines that fill the screen before any line is pushed into history.
         for target in (2048, 4096, 8192, 16384, YNUM):
-            feed(s, target - fed); fed = target
+            need = (target + (LINES - 1)) - fed
+            feed(s, need); fed += need
             print(f"  {fed:>10} {hb.count:>6} {segs(hb.count,YNUM):>8} {len(hb.pagerhist_as_bytes()):>12} {rss_kb():>9} {rss_kb()-base:>9}")
-        print("  -- saturation reached (count==ynum, segment count fixed); now ONLY the pager grows --")
+        print(f"  -- saturation reached (count==ynum? {hb.count==hb.ynum}; segment count fixed); now ONLY the pager grows --")
         for extra in (10000, 20000, 40000):
             feed(s, extra)
             fed += extra
@@ -1234,15 +1519,15 @@ $ for r in 1 2; do echo "================= RUN $r ================="; \
 ########## PART 1: FOOTPRINT = segmented store + pager ring, as pressure builds ##########
 (scrollback=20000, pager cap=64 MiB so it never caps during this run)
    lines_fed  count segments  pager_bytes    RSS_kB   dRSS_kB
-        2048   2025        1            0     31656      5544
-        4096   4073        2            0     36788     10676
-        8192   8169        4            0     47272     21160
-       16384  16361        8            0     68296     42184
-       20000  19977       10            0     77360     51248
-  -- saturation reached (count==ynum, segment count fixed); now ONLY the pager grows --
-       30000  20000       10       139678     77760     51648
-       50000  20000       10       419678     79168     53056
-       90000  20000       10       979678     81020     54908
+        2071   2048        1            0     31760      5604
+        4119   4096        2            0     36892     10736
+        8215   8192        4            0     47372     21216
+       16407  16384        8            0     68396     42240
+       20023  20000       10            0     77460     51304
+  -- saturation reached (count==ynum? True; segment count fixed); now ONLY the pager grows --
+       30023  20000       10       140000     77800     51644
+       50023  20000       10       420000     79200     53044
+       90023  20000       10       980000     81076     54920
   NOTE: RSS is a process-wide figure (interpreter + arenas + buffers); it corroborates,
         but does not exclusively measure, the two HistoryBuf structures.
 
@@ -1269,15 +1554,15 @@ exit=0
 ########## PART 1: FOOTPRINT = segmented store + pager ring, as pressure builds ##########
 (scrollback=20000, pager cap=64 MiB so it never caps during this run)
    lines_fed  count segments  pager_bytes    RSS_kB   dRSS_kB
-        2048   2025        1            0     31828      5544
-        4096   4073        2            0     36960     10676
-        8192   8169        4            0     47444     21160
-       16384  16361        8            0     68468     42184
-       20000  19977       10            0     77532     51248
-  -- saturation reached (count==ynum, segment count fixed); now ONLY the pager grows --
-       30000  20000       10       139678     77928     51644
-       50000  20000       10       419678     79336     53052
-       90000  20000       10       979678     81208     54924
+        2071   2048        1            0     31548      5604
+        4119   4096        2            0     36680     10736
+        8215   8192        4            0     47160     21216
+       16407  16384        8            0     68184     42240
+       20023  20000       10            0     77248     51304
+  -- saturation reached (count==ynum? True; segment count fixed); now ONLY the pager grows --
+       30023  20000       10       140000     77588     51644
+       50023  20000       10       420000     78992     53048
+       90023  20000       10       980000     80852     54908
   NOTE: RSS is a process-wide figure (interpreter + arenas + buffers); it corroborates,
         but does not exclusively measure, the two HistoryBuf structures.
 
@@ -1305,15 +1590,15 @@ exit=0
 ### 8.1 Allocation footprint — two regimes
 
 - *During fill:* segment count steps `1 → 2 → 4 → 8 → 10` as `count` crosses 2048 multiples, and RSS
-  rises in matching steps: `dRSS` = 5544, 10676, 21160, 42184, 51248 kB. The increment per 2048-line
+  rises in matching steps: `dRSS` = 5604, 10736, 21216, 42240, 51304 kB. The increment per 2048-line
   segment is ≈5132–5256 kB, corroborating the 5,251,072-byte (5128 KiB) per-segment `calloc` of §3.1.
 - *After saturation:* once `count == ynum = 20000` (segments fixed at 10), the segmented store stops
   growing; feeding tens of thousands more lines leaves segments at 10 and moves RSS only slightly, while
-  `pager_bytes` climbs 139678 → 419678 → 979678. So under sustained pressure the footprint evolves in
+  `pager_bytes` climbs 140000 → 420000 → 980000. So under sustained pressure the footprint evolves in
   two phases: **segment carving during fill, then pager-ring growth after saturation**. The fill-phase
-  `dRSS` steps (5544, 10676, 21160, 42184, 51248) were byte-identical across both runs; the
-  post-saturation (pager-phase) `dRSS` carried a few-kB run-to-run wobble (RUN 1: 51648, 53056, 54908 vs
-  RUN 2: 51644, 53052, 54924), while the *structural* `pager_bytes` figures (139678 → 419678 → 979678)
+  `dRSS` steps (5604, 10736, 21216, 42240, 51304) were byte-identical across both runs; the
+  post-saturation (pager-phase) `dRSS` carried a few-kB run-to-run wobble (RUN 1: 51644, 53044, 54920 vs
+  RUN 2: 51644, 53048, 54908), while the *structural* `pager_bytes` figures (140000 → 420000 → 980000)
   were byte-identical. (RSS is a process-wide figure — interpreter, arenas, and buffers included — so it
   corroborates rather than exclusively measures the two structures; §8.4/§8.5 give allocator-level
   attribution.)
@@ -1351,7 +1636,10 @@ on-screen rows before `INDEX_UP` begins pushing any line into history (`kitty/sc
 `start_of_data`, `kitty/history.c:281`). With the pager **disabled** that oldest line is simply lost;
 with the pager **enabled** it is first serialized into the ring (`pagerhist_push`,
 `kitty/history.c:280`) and retained until the ring reaches its cap, after which the ring's own
-oldest bytes are overwritten.
+oldest bytes are overwritten. That final overwrite-at-cap step is demonstrated **directly** in §6.2
+(Scenario F): with a tiny 4096-byte cap and unique tokens, the earliest-evicted token `T000000`
+disappears once the ring is full while newer tokens survive, and the buffer is left beginning
+mid-record — so this is **observed**, not merely inferred from the source.
 
 **Observed contrast (Part 3, `scrollback=2000`, 4000 lines fed).**
 - *Pager off:* `count=2000`, `pager_bytes=0`; the oldest **retained** line is `L00001977` — lines
@@ -1464,7 +1752,8 @@ purely a profiler-decoding limitation, not a defect. (`ulimit -c 0` suppressed t
 extension without AVX-512 (`-mno-avx512f`), which kitty appends *after* `-march=native` via
 `--python-compiler-flags`. But `get_python_flags` uses an if/else: when `--python-compiler-flags` is
 supplied it uses those flags **instead of** the auto-added Python include paths (`setup.py`,
-`get_python_flags`). So the naive command drops `-I.../include/python3.14` and fails:
+`get_python_flags`). So the naive command drops the auto-added Python include path (`-I$PYINC`, shown
+resolved in the next block) and fails:
 
 ```text
 $ ./dev.sh build --debug --ignore-compiler-warnings --python-compiler-flags="-mno-avx512f"
@@ -1474,7 +1763,7 @@ In file included from kitty/state.h:8,
 kitty/data-types.h:11:10: fatal error: Python.h: No such file or directory
    11 | #include <Python.h>
       |          ^~~~~~~~~~
-The following build command failed: .../python setup.py develop --debug --ignore-compiler-warnings --python-compiler-flags=-mno-avx512f
+The following build command failed: /tmp/blitzy/kitty/blitzy-37fb2915-992a-43f5-a568-f9834bbb3df4_a66137/dependencies/linux-amd64/bin/python setup.py develop --debug --ignore-compiler-warnings --python-compiler-flags=-mno-avx512f
 exit status 1
 ```
 
@@ -1484,17 +1773,21 @@ The correct profiling build therefore **re-adds** the Python include path alongs
 ```text
 $ PYINC=$(./kitty/launcher/kitty +runpy 'import sysconfig;print(sysconfig.get_path("include"))')
 $ ./dev.sh build --debug --ignore-compiler-warnings --python-compiler-flags="-I$PYINC -mno-avx512f"
-...
+[1/65] Compiling kitty/screen.c ...
+[64 further "[N/65] Compiling …" / "[N/M] Linking …" progress lines omitted for length — all succeeded]
 Build successful. Run kitty as: kitty/launcher/kitty
 ```
 
-The debug build carries `-g3 -Og -DKITTY_DEBUG_BUILD -fno-omit-frame-pointer -march=native ...
--mno-avx512f` (the exact compile line, echoed by the failing attempt above, differs only by the added
-`-I.../python3.14`). After profiling, the release artifacts are restored from a backup and verified
-(§12).
+The debug build carries `-g3 -Og -DKITTY_DEBUG_BUILD -fno-omit-frame-pointer -march=native` (plus the
+usual `-march=native`-derived ISA flags) and `-mno-avx512f`; the exact compile line, echoed by the
+failing attempt above, differs only by the added `-I$PYINC` Python include path. After profiling, the
+release artifacts are restored from a backup and verified (§12).
 
 The Massif **target script** feeds the same canonical `parse_bytes` burst used throughout, filling
-the segmented store past ten 2048-line boundaries with the pager explicitly disabled so the profile
+the segmented store to **ten segments** — one allocated at construction (`create_historybuf` →
+`add_segment`, `history.c:127`) and nine more carved lazily as `count` crosses the nine 2048-line
+allocation boundaries (rows 2049, 4097, …, 18433; the eleventh boundary at row 20481 is never reached,
+since `count` saturates at `ynum = 20000`) — with the pager explicitly disabled so the profile
 isolates segment growth (it is created in `$WORK` with `cat > "$WORK/massif_target.py"` like the
 others):
 
@@ -1656,6 +1949,8 @@ T().run()
 ```
 
 ```text
+$ for r in 1 2; do echo "================= RUN $r ================="; \
+    ./kitty/launcher/kitty +launch "$WORK/mallocinfo.py"; echo "exit=$?"; done
 ================= RUN 1 =================
 per-segment allocation request (arithmetic) = 5251072 B = 5128.0 KiB
 
@@ -1723,17 +2018,19 @@ stable and where variance appeared and why.
 *character-for-character identical* between run 1 and run 2:
 - `units.py` — the raw-bytes-vs-MiB semantics (§5).
 - Scenario A — the saturation triple `count=20000, segments=10, pager_bytes=0`, the `1 → 2 → … → 10`
-  segment progression, and the **per-segment RSS increment of 5132 kB** between every consecutive
-  2048-line boundary (§4). *(The absolute `dRSS` values are not bit-identical run-to-run — see the
-  RSS-noise note below.)*
-- Scenario B — the eviction hand-off byte counts `17/187/1887/18887` and the initial ring capacity
-  (§5).
-- Scenario C2 — the three extend points `1,048,586 / 2,097,186 / 3,145,730 B` and
-  `CONSISTENCY CHECK = True` in **both** runs (§6.2).
+  segment progression, and the per-segment RSS increment *sequence*
+  `5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` kB — ≈5132 kB per full segment, with one
+  reproducible 5136 kB step into the `count=10240` boundary and a partial 3932 kB final step — which
+  was itself byte-identical across both runs (§4). *(Only the absolute `dRSS` values, not this gap
+  sequence, drift run-to-run — see the RSS-noise note below.)*
+- Scenario B — the eviction hand-off byte counts `17/187/1887/18887` and the ~1220 kB
+  construction-time RSS delta that corroborates the ~1 MiB initial ring reservation (§5).
+- Scenario C2 — the three *used*-byte thresholds at which the extend-cost spikes land,
+  `1,048,586 / 2,097,186 / 3,145,730 B`, and `CONSISTENCY CHECK = True` in **both** runs (§6.2).
 - Scenario D — the anchor/clamp/frozen-view values `500→1500`, clamp at `2000`, `1100` (§7).
-- Scenario E — the **fill-phase** `dRSS` steps `5544 / 10676 / 21160 / 42184 / 51248`, the 3-row wrap,
+- Scenario E — the **fill-phase** `dRSS` steps `5604 / 10736 / 21216 / 42240 / 51304`, the 3-row wrap,
   and the retention contrast (§8.1–8.3). *(The post-saturation pager-phase `dRSS` carries a few-kB
-  wobble; the structural `pager_bytes` figures `139678 → 419678 → 979678` do not — see the RSS-noise
+  wobble; the structural `pager_bytes` figures `140000 → 420000 → 980000` do not — see the RSS-noise
   note below.)*
 - `mallocinfo.py` — the segment and pager deltas (§8.5).
 - Massif — identical profiles, peak snapshot **#76** with useful heap `58,858,788 B` in both runs
@@ -1744,29 +2041,39 @@ Scenario C/C2 are wall-clock and therefore not bit-identical run to run, but the
 fully reproducible and was confirmed so:
 - Segment-boundary spikes (Scenario C) land on the `+1` line past each 2048 multiple
   (`count = 2049, 4097, 6145, 8193`) in **every** trial; only the absolute microseconds drift, and
-  they grow monotonically with heap pressure — reproduced across five back-to-back trials (§6.1).
+  they tend to grow with accumulated heap pressure within a process — though not strictly monotonically
+  (e.g. `count=2049 → [51.4, 438.0, 433.5, 410.0, 455.0] µs` rises, then wobbles) — reproduced across
+  five back-to-back trials (§6.1).
 - The one off-boundary `count=1918` anomaly the earlier document flagged was **not** reproducible as a
   spike: re-running the exact input put that line at `1.26–2.16 µs` (ordinary), so it was a one-off
   scheduling blip, not a buffer event (§6.1, Part C).
 - The large *off-edge* timing spikes in the GC-on parts of Scenario C/C2 are reproducible **as GC
   events**: disabling the cyclic collector removes them entirely and leaves only the true
-  segment/pager edges, and the spike coincides with a jump in `gc_collections` every time (§6.1
-  Part D, §6.2). This is the "reproduce it with the same input" discipline in action — the variance
-  had a definite, demonstrable cause (Python's cyclic GC), not the history buffer.
+  segment/pager edges. The evidence is at the aggregate level — with GC **on**, Part D counts many
+  collections (`gc_collections = 21`) alongside millisecond off-boundary maxima; with GC **off**, the
+  same burst records `gc_collections = 0` and no such maxima (§6.1 Part D, §6.2). (This is an
+  aggregate correlation across the run — GC-on has both collections and large maxima, GC-off has
+  neither — not a per-line proof that each individual spike is a collection event.) This is the
+  "reproduce it with the same input" discipline in action — the variance had a definite, demonstrable
+  cause (Python's cyclic GC), not the history buffer.
 
-**Reproducible increment, noisy absolute (process RSS).** `RSS`/`dRSS` are process-wide figures, so
-their *absolute* values carry a small run-to-run wobble (typically one page, ≈4 kB) from baseline
-drift and first-touch page accounting. This showed up concretely in Scenario A, where run 1's first
-fill step read `5604 kB` and run 2's read `5608 kB`; in Scenario E's post-saturation steps
-(`51648/53056/54908` vs `51644/53052/54924`); and in Scenario B's Part 0 construction cost
-(`1308/1304 kB`). What is stable is the *increment*: the per-segment step held at exactly `5132 kB`
-across both runs of Scenario A, and the structural quantities layered on top of RSS (`count`,
-`segments`, `pager_bytes`) were byte-identical throughout. RSS is therefore used as corroboration of
-the two structures' growth, never as their exclusive measure — §8.4/§8.5 give the allocator-level
-attribution that does not depend on RSS.
+**Reproducible increment sequence, noisy absolute (process RSS).** `RSS`/`dRSS` are process-wide
+figures, so their *absolute* values carry a small run-to-run wobble (typically one page, ≈4 kB) from
+baseline drift and first-touch page accounting. This showed up concretely in Scenario A, where run 1's
+first fill step read `5604 kB` and run 2's read `5608 kB`; in Scenario E's post-saturation steps
+(`51644/53044/54920` vs `51644/53048/54908`); and in Scenario B's Part 0 construction cost
+(`1308/1304 kB`). What is stable is the *increment sequence*, not a single uniform number: across
+Scenario A's nine full-segment boundaries the per-segment step was `5132 kB` at eight of them, with a
+single `5136 kB` step into `count=10240` and a partial `3932 kB` final step, and that whole sequence
+`5132, 5132, 5132, 5136, 5132, 5132, 5132, 5132, 3932` was byte-identical across both runs — the lone
+5136 outlier is a one-page first-touch jitter that reproduced, not evidence of uniform behaviour. The
+structural quantities layered on top of RSS (`count`, `segments`, `pager_bytes`) were byte-identical
+throughout. RSS is therefore used as corroboration of the two structures' growth, never as their
+exclusive measure — §8.4/§8.5 give the allocator-level attribution that does not depend on RSS.
 
 In short: every **structural** quantity (counts, segment totals, byte sizes, extend points, heap peak,
-and the per-segment RSS *increment*) is exactly reproducible. Two things vary run-to-run, both
+and the per-segment RSS *increment sequence* — including its lone 5136 kB outlier) is exactly
+reproducible. Two things vary run-to-run, both
 benignly: raw microsecond timings (whose *shape* is reproducible and whose outliers were traced to a
 specific, demonstrable cause — Python's cyclic GC), and the *absolute* process-RSS figures (which wobble
 by about one page for the ordinary reasons above).
@@ -1790,13 +2097,17 @@ such, with the reason it could not be observed directly and any indirect corrobo
   `parse_worker → screen_index → historybuf_add_line → historybuf_push → segment_for` stack (§8.4).
 - **Eviction hand-off to the pager (REQ-2).** Bytes appearing in `pagerhist_as_bytes()` only after
   saturation, `17 B` per evicted line — Scenario B; and *no* pager bytes when the pager is disabled.
-- **Initial ring capacity `MIN(1 MiB, cap)` before any content.** Scenario B, Part 0.
-- **Pager extend points and step size (REQ-3b).** Ring capacity crossing at
-  `1,048,586 / 2,097,186 / 3,145,730 B`, i.e. ≥1 MiB steps — Scenario C2.
+- **Overwrite-oldest at the pager cap (REQ-2/3b/5).** Once the ring is full its oldest bytes are
+  overwritten as the tail advances (`ringbuf_memcpy_into`, `3rdparty/ringbuf/ringbuf.c:233`): with a
+  4096-byte cap and unique tokens, the earliest-evicted `T000000` disappears while newer tokens remain
+  and the buffer is left beginning **mid-record** — Scenario F (§6.2), byte-identical across runs.
 - **Segment-boundary timing edge (REQ-3a).** The per-line cost spike on the line just past each 2048
   multiple — Scenario C, reproduced across five trials.
 - **The GC provenance of off-edge spikes.** Disabling the cyclic collector removes the large off-edge
-  spikes, and each spike coincides with a `gc_collections` increment — Scenario C Part D, Scenario C2.
+  spikes: with GC on, Part D records many collections (`gc_collections = 21`) alongside the
+  millisecond off-boundary maxima; with GC off, the same burst records `gc_collections = 0` and no such
+  maxima — Scenario C Part D, Scenario C2. *(Aggregate correlation across the run, not a per-line
+  attribution of each individual spike.)*
 - **Concurrent scroll anchoring and clamp (REQ-4).** `scrolled_by` frozen during ingest then advanced,
   and clamped to `count` — Scenario D (`500→1500`, clamp at `2000`, `1100`).
 - **Wrapping (REQ-5).** A 200-column logical line occupying 3 physical rows, with the wrapped-flag set
@@ -1814,25 +2125,34 @@ Each item below is derived from reading the code because the relevant internal i
 Python** (§2.5) or is **below the profiler's measurement threshold**. Where possible, an *indirect*
 runtime corroboration is noted.
 
+- **Initial pager-ring *capacity* `MIN(1 MiB, cap)`.** The ring's *allocated capacity* is fixed at
+  construction by `alloc_pagerhist` (`history.c:66–67`, via `ringbuf_new`). This is *inferred* from
+  source because `pagerhist_as_bytes()` exposes only the *used* byte count, never the allocated
+  capacity (§2.5). *Corroboration:* with the pager enabled but still empty, Scenario B Part 0 shows a
+  one-time construction cost in process memory (RSS/`malloc_info`) consistent with a ~1 MiB allocation
+  standing ready before any line is evicted.
+- **Pager *capacity* extends in ≥1 MiB steps (REQ-3b).** That the ring grows its *allocated capacity*
+  in ≥1 MiB increments (`pagerhist_extend`, `history.c:89–101`) is *inferred* from source, since the
+  capacity itself is hidden. *Corroboration:* Scenario C2 directly *observes* per-line cost spikes as
+  the *used* byte count (`pagerhist_as_bytes()`) passes the thresholds
+  `1,048,586 / 2,097,186 / 3,145,730 B` — i.e. each time usage crosses a ~1 MiB mark — and the §8.4
+  total-footprint delta (grown capacity necessarily ≥ serialized content) is consistent with a
+  capacity that steps ahead of usage in ≥1 MiB blocks.
 - **Circular-slot indexing and the `start_of_data` advance.** That live lines occupy slots
   `(start_of_data + count) % ynum` and that eviction advances `start_of_data` (`history.c:277–282`)
   is *inferred*: `start_of_data` is not exposed. *Corroboration:* the observed strict oldest-first
   eviction order (Scenario E retention) is exactly what an advancing ring start produces.
 - **The eviction gate `count == ynum`.** The specific condition in `historybuf_push`
-  (`history.c:277`) is *inferred* from code. *Corroboration:* pager bytes begin to accrue at precisely
+  (`history.c:279`) is *inferred* from code. *Corroboration:* pager bytes begin to accrue at precisely
   the observed saturation point and not before (Scenario B).
 - **The per-record byte *composition* in the pager.** The `17 B` record *size* is observed
   (Scenario B); its composition — SGR reset `"\x1b[m"` (3) + cell bytes (12) + `\r` + `\n`-unless-the
   line-wrapped (`history.c:266–270`) — is *inferred* from code (the size, not the byte layout, is what
   the runtime exposed).
 - **The segment *pointer-array* `realloc`.** `add_segment` first `realloc`s the array of segment
-  pointers (`history.c:19`) before `calloc`-ing the new block. The `realloc` is *inferred* — it is a
+  pointers (`history.c:20`) before `calloc`-ing the new block. The `realloc` is *inferred* — it is a
   few tens of bytes and stays below Massif's 1% threshold; only the per-segment `calloc`
   (`history.c:25`) is large enough to be observed.
-- **Overwrite-oldest at the pager cap.** That `ringbuf_memcpy_into` advances the tail and overwrites
-  the oldest bytes once the ring is full (`ringbuf.c:216–234`) is *inferred*. *Corroboration:* the ring
-  is observed to stop growing at its cap (the Scenario C2 plateau band), which is the precondition for
-  the overwrite path; the byte-level overwrite itself was not separately dumped.
 - **`DECAWM` on by default.** That auto-wrap is enabled by default (`screen.c:33`) is *inferred* from
   code; the *effect* (a 200-column line wrapping to 3 rows) is observed (Scenario E).
 - **The exact anchoring source line.** The formula
@@ -1843,17 +2163,18 @@ runtime corroboration is noted.
 ## 11. Citation appendix
 
 Every `file:line` below was read in the checked-out tree at commit
-`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. Line numbers are exact.
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. The specific behavioral lines cited inline are exact; the
+accompanying function and block ranges bracket the named construct.
 
 **`kitty/history.c` — segmented store + pager ring**
 - `SEGMENT_SIZE` (2048) — `history.c:15`
-- `add_segment` (pointer-array `realloc` L19, per-segment `calloc` L25) — `history.c:17–29`
+- `add_segment` (pointer-array `realloc` L20, per-segment `calloc` L25) — `history.c:17–29`
 - `segment_for` (lazy-allocate condition L39) — `history.c:36–42`
 - `cpu_lineptr` — `history.c:52`
 - initial pager ring size `MIN(1 MiB, sz)` — `history.c:66–67`
 - `alloc_pagerhist` (returns NULL when size 0, L72; `ringbuf_new` L76; `maximum_size` L78) — `history.c:69–80`
 - `pagerhist_extend` (`≥ maximum_size` guard L92; grow L93–94; copy L97) — `history.c:89–101`
-- `create_historybuf` (construction `add_segment` L127; `alloc_pagerhist` L131) — `history.c:109–133`
+- `create_historybuf` (construction `add_segment` L127; `alloc_pagerhist` L130) — `history.c:116–133`
 - `init_line` — `history.c:164`
 - `pagerhist_push` (SGR reset `"\x1b[m"` L266; `\r` L269; `\n` unless wrapped L270) — `history.c:258–273`
 - `historybuf_push` (slot index L277; `pagerhist_push` L280; `start_of_data` advance L281; `count++` L282) — `history.c:275–284`
@@ -1878,7 +2199,7 @@ Every `file:line` below was read in the checked-out tree at commit
 - `screen_index` / `INDEX_UP` (add line L1558, counter++ L1559; gate L1574, INDEX_UP L1575) — `screen.c:1552–1575`
 - `screen_linefeed` — `screen.c:1645`
 - `screen_reset_dirty` (resets `history_line_added_count`, L2600) — `screen.c:2598–2600`
-- `screen_update_only_line_graphics_data` (capture L2714; anchor `scrolled_by=MIN(...)` L2716; reset L2717) — `screen.c:2713–2717`
+- `screen_update_only_line_graphics_data` (capture L2714; anchor `scrolled_by = MIN(scrolled_by + history_line_added_count, count)` L2716; reset L2717) — `screen.c:2713–2717`
 - `screen_update_cell_data` (anchor L2761) — `screen.c:2756–2761`
 - `screen_history_scroll` (`new_scroll = MIN(scrolled_by+amt, count)` L4111) — `screen.c:4091–4111`
 - `test_parse_written_data` (used by `parse_bytes`) — `screen.c:4776`
@@ -1898,7 +2219,7 @@ Every `file:line` below was read in the checked-out tree at commit
 **Configuration**
 - `scrollback_lines` default `2000` — `kitty/options/definition.py:372–373`
 - `scrollback_pager_history_size` default `0` (disabled) — `kitty/options/definition.py:406–407`
-- MB→bytes conversion for the pager option — `kitty/utils.py:564–566`
+- MB→bytes conversion for the pager option — `kitty/options/utils.py:564–566`
 
 **Observation harness (canonical entry point)**
 - `parse_bytes` — `kitty_tests/__init__.py:30–36`
@@ -1910,7 +2231,7 @@ Every `file:line` below was read in the checked-out tree at commit
 **Build / toolchain**
 - `dev.sh` entry — `dev.sh:9`
 - build / launcher / `--debug` / `--sanitize` — `docs/build.rst:19, 22, 54, 58`
-- `get_python_include_paths` L325; `get_python_flags` if/else L337+; `env_cflags` L515; `-march=native` L585; `--debug` (optimize L477/484, no-LTO L523, `-DKITTY_DEBUG_BUILD` L529, `-fno-omit-frame-pointer` L537); `-Werror` L490 — `setup.py`
+- `get_python_include_paths` L325; `get_python_flags` if/else L337+; `env_cflags` L515; `-march=native` L585; `--debug` (optimize L479/482, no-LTO L523, `-DKITTY_DEBUG_BUILD` L529, `-fno-omit-frame-pointer` L537); `-Werror` L491 — `setup.py`
 - Go toolchain `1.22` — `go.mod:3`
 - Python floor `>=3.8` — `pyproject.toml:2`
 - CI Python matrix `3.8` (L26), `3.9` (L34), `3.10` (L30), highest `"3.11"` (L85) — `.github/workflows/ci.yml`
@@ -1921,29 +2242,40 @@ This investigation is read-only on the source repository. Every temporary artifa
 the repository tree, in a private workspace, and the release build was restored bit-for-bit after the
 one profiling detour that required a debug build.
 
-**Private workspace (addresses predictable-name concerns).** The scripts and profiler outputs were
-created in a directory made with `mktemp -d` (unpredictable name) and locked to the owner with
-`chmod 700` — not a guessable `/tmp/obs_*.py`:
-
-```text
-$ WORK=$(mktemp -d /tmp/kitty_obs.XXXXXX); chmod 700 "$WORK"; stat -c '%A %n' "$WORK"
-drwx--S--- /tmp/kitty_obs.iPXoYt
-```
-
-Owner-only `rwx`; group and other have no access. All scenario scripts (`scenarioA.py` … `scenarioE.py`,
-`units.py`, `mallocinfo.py`, `massif_target.py`) and all captured outputs (`out_*.txt`, `massif.out.*`,
+**Private workspace (addresses predictable-name concerns).** The workspace `$WORK` was created with
+`mktemp -d` + `chmod 700` (unpredictable name, owner-only `rwx`) **before** any script ran, and the
+release artifacts were backed up into it — both commands, with their real output, appear in §2.6. All
+scenario scripts (`scenarioA.py` … `scenarioF.py`, `units.py`, `mallocinfo.py`, `massif_target.py`),
+the `sizeof_probe.c` helper (§3.1), and all captured outputs (`out_*.txt`, `massif.out.*`,
 `msprint.*`) were written under `$WORK`, never inside the repository.
 
 **Release build preserved across the profiling detour.** Before building the debug variant for Massif
-(§8.4), the release artifacts were backed up; afterward they were restored and verified identical:
+(§8.4), the release artifacts were backed up (§2.6); afterward they were restored and verified
+bit-for-bit identical to that backup, and the launcher still reports the same version:
 
 ```text
-$ cmp kitty/fast_data_types.so "$WORK/release_backup/fast_data_types.so" && echo IDENTICAL
+$ cmp kitty/fast_data_types.so "$WORK/release_backup/fast_data_types.so"  && echo IDENTICAL
 IDENTICAL
-$ cmp kitty/launcher/kitty      "$WORK/release_backup/launcher/kitty"    && echo IDENTICAL
+$ cmp kitty/launcher/kitty      "$WORK/release_backup/launcher/kitty"     && echo IDENTICAL
+IDENTICAL
+$ cmp kitty/launcher/kitten     "$WORK/release_backup/launcher/kitten"    && echo IDENTICAL
 IDENTICAL
 $ ./kitty/launcher/kitty --version
 kitty 0.35.2 created by Kovid Goyal
+```
+
+**Commit provenance (acceptance checkout).** The observations characterize the required source commit
+`815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`. The acceptance checkout's `HEAD` is a **descendant** of it,
+and the product tree is **byte-identical** between the two (the only difference is this deliverable
+under `blitzy/`), so every cited `file:line` and observed value applies without change:
+
+```text
+$ git merge-base --is-ancestor 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD && echo "REQ is an ancestor of HEAD"
+REQ is an ancestor of HEAD
+$ git rev-parse HEAD
+e6486adb6975d2c063659f6a17d6068bc55a157d
+$ git diff --name-only 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 HEAD -- . ':(exclude)blitzy/**'
+$ # (no output above — product tree byte-identical outside blitzy/)
 ```
 
 **Final cleanup and clean-tree check.** After authoring, the entire private workspace is removed and
