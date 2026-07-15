@@ -83,13 +83,26 @@ $ glxinfo -l | grep -iE 'GL_MAX_TEXTURE_SIZE|GL_MAX_ARRAY_TEXTURE_LAYERS' | sort
     GL_MAX_TEXTURE_SIZE = 16384
 ```
 
-These `glxinfo` numbers are the exact limits `alloc_sprite_map` reads via `glGetIntegerv` [kitty/shaders.c:L52-L53] and are corroborated at runtime by kitty's own GL startup log (§6.2). The display geometry/DPI — which feeds the cell metrics in §5 — was read with `xdpyinfo`:
+These `glxinfo` numbers are the exact limits `alloc_sprite_map` reads via `glGetIntegerv` [kitty/shaders.c:L52-L53] and are corroborated at runtime by kitty's own GL startup log (§6.2). The display's **physical** geometry/DPI was read with `xdpyinfo`:
 
 ```text
 $ xdpyinfo | grep -E 'dimensions|resolution'
   dimensions:    1920x1080 pixels (488x274 millimeters)
   resolution:    100x100 dots per inch
 ```
+
+**Important — this physical `xdpyinfo` DPI (100) is *not* what kitty uses to size cells.** kitty derives a **logical DPI** from the X11 *content scale*, **not** from the screen's physical millimetre dimensions. On X11, GLFW's `_glfwGetSystemContentScaleX11` starts from a hard‑coded default of **96 DPI** and only overrides it if the `Xft.dpi` X resource is present [glfw/x11_init.c:L467], returning `scale = xdpi / 96` [glfw/x11_init.c:L505]. This headless Xvfb has **no `Xft.dpi` resource** (`xrdb -query` is empty), so the content scale is `96/96 = 1.0`, and kitty's `dpi_from_scale` (non‑Apple `factor = 96`) computes `logical_dpi = 1.0 × 96 = ` **96.0** [kitty/glfw.c:L812-L820]. The 100‑DPI physical figure never enters font sizing.
+
+This is confirmed **at runtime, from the live process** (not merely inferred): the actual cell pixel size kitty computed is reported through the child PTY's window size (`ws_xpixel`/`ws_ypixel` ÷ columns/rows via `TIOCGWINSZ`). Running the real launcher with a child that reads its own terminal winsize (`--config NONE`, no `Xft.dpi`), observed **identically across two runs**:
+
+```text
+$ ./kitty/launcher/kitty --config NONE sh -c 'python3 -c "import fcntl,termios,struct;\
+    r,c,xp,yp=struct.unpack(\"HHHH\",fcntl.ioctl(1,termios.TIOCGWINSZ,b\"\\0\"*8));\
+    open(__import__(\"os\").environ[\"WSZ\"],\"w\").write(f\"cols={c} rows={r} xpix={xp} ypix={yp} cell={xp/c:g}x{yp/r:g}\")"'
+cols=100 rows=31 xpix=900 ypix=558 cell=9x18
+```
+
+So the **live** cell is `900/100 × 558/31 = ` **9×18 px**, i.e. the logical‑DPI‑96 result — this is the authoritative live value used throughout §5 and §6. (The metrics probe in §5.1 additionally forces DPI 100 purely for comparison, producing 9×19; that 9×19 is a *forced‑DPI* row, **not** what the live window renders.)
 
 ### 2.4 Transient verbose diagnostics (CLI only — no config edits)
 
@@ -102,25 +115,42 @@ Three debug flags were enabled **only on the command line**; no config file was 
 
 ### 2.5 Exact run invocations (safe, reproducible harness)
 
-All runs are driven by a single self‑contained script. It uses a **private evidence directory** (`mktemp -d`, mode `700`), a **dynamically‑chosen free display** (no fixed `:101`), and starts Xvfb with its **PID captured** so a `trap` cleans it up on exit. kitty runs in the **foreground under `timeout`** — it exits by itself when its child process exits — and each run's **exit code is recorded**. There is no `nohup`/`setsid`‑without‑supervision, no fixed shared path, and — importantly — **no window‑resize helper**: feeding the child a `cat` of the mixed text is enough to drive `shape_run → load_fallback_font` and emit the fallback log.
+All runs are driven by a single self‑contained script that is **`shellcheck`‑clean** and fails loudly rather than masking errors. It sets **`set -euo pipefail`**; resolves the repository root with **`git rev-parse --show-toplevel`** (no hard‑coded machine path) and **checks the `cd`**; uses a **private evidence directory** (`mktemp -d`, mode `700`); picks a **dynamically‑chosen free display** (no fixed `:101`) and starts Xvfb with its **PID captured** in a `trap` that both **kills Xvfb and removes the evidence directory** on exit (set `KEEP_WORK=1` to preserve it for inspecting the `$WORK/<tag>_stderr.txt` excerpts quoted in §4/§6). It performs an **active Xvfb readiness check** (polling `xdpyinfo`, not a blind `sleep`) and a **feeder completion sentinel** (`[ -s mixed.txt ]`), and in `run_kitty` it **captures and returns the child's exit code** (not the status of a trailing `echo`) so a failed run makes the harness non‑zero. kitty runs in the **foreground under `timeout`** — it exits by itself when its child process exits — and each run's **exit code is recorded**. There is no `nohup`/`setsid`‑without‑supervision, no fixed shared path, and — importantly — **no window‑resize helper**: feeding the child a `cat` of the mixed text is enough to drive `shape_run → load_fallback_font` and emit the fallback log.
 
 ```bash
 #!/usr/bin/env bash
-set -u
-REPO="…/blitzy-c01f4720-…_7415ed"; cd "$REPO"
+set -euo pipefail
+
+# resolve the repo root portably (no machine-specific hard-coded path) and check the cd
+REPO="$(git rev-parse --show-toplevel)"; cd "$REPO" || exit 1
 KITTY="$REPO/kitty/launcher/kitty"
 
 # private evidence dir (mode 700) — not a fixed/root-owned shared path
 WORK="$(mktemp -d -p /tmp kitty-investigation.XXXXXX)"; chmod 700 "$WORK"
 
+# start Xvfb, then clean up on exit: always kill Xvfb; remove the evidence dir
+# unless KEEP_WORK is set (the §4/§6 excerpts read $WORK/<tag>_stderr.txt, so
+# re-run with KEEP_WORK=1 when you want to inspect those files afterwards).
+XVFB_PID=""
+cleanup(){
+  if [ -n "$XVFB_PID" ]; then
+    kill "$XVFB_PID" 2>/dev/null || true
+    wait "$XVFB_PID" 2>/dev/null || true
+  fi
+  [ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
+
 # pick a free X display dynamically (avoid collisions)
-pick_display(){ for n in $(seq 80 120); do [ ! -e "/tmp/.X11-unix/X${n}" ] && { echo ":${n}"; return; }; done; }
+pick_display(){ for n in $(seq 80 120); do [ ! -e "/tmp/.X11-unix/X${n}" ] && { echo ":${n}"; return 0; }; done; return 1; }
 DISP="$(pick_display)"
 Xvfb "$DISP" -screen 0 1920x1080x24 +extension GLX +render -noreset > "$WORK/xvfb.log" 2>&1 &
 XVFB_PID=$!
-cleanup(){ kill "$XVFB_PID" 2>/dev/null; wait "$XVFB_PID" 2>/dev/null; }
-trap cleanup EXIT
-sleep 2; export DISPLAY="$DISP"
+export DISPLAY="$DISP"
+
+# ACTIVE readiness check (not a blind sleep): poll until Xvfb answers, else fail loudly
+for _ in $(seq 1 50); do xdpyinfo -display "$DISP" >/dev/null 2>&1 && break; sleep 0.2; done
+xdpyinfo -display "$DISP" >/dev/null 2>&1 || { echo "FATAL: Xvfb $DISP did not become ready" >&2; exit 1; }
 
 # mixed input as real UTF-8 (Arabic RTL + English LTR + combining + CJK + emoji)
 python3 - "$WORK/mixed.txt" <<'PY'
@@ -133,17 +163,22 @@ lines=[
 ]
 open(sys.argv[1],"w",encoding="utf-8").write("\n".join(lines)+"\n")
 PY
+# feeder completion sentinel: input file must exist and be non-empty before any run
+[ -s "$WORK/mixed.txt" ] || { echo "FATAL: feeder did not write mixed.txt" >&2; exit 1; }
 
-# run helper: foreground, timeout-bounded, stdout/stderr split, exit code saved.
+# run helper: foreground, timeout-bounded, stdout/stderr split.
+# The child's exit code is CAPTURED and RETURNED (not masked by a trailing echo);
 # stdout and stderr are separated because the GL line goes to STDOUT while the
 # font diagnostics go to STDERR (verified in §4/§6).
 run_kitty(){ # $1=tag ; $2.. = extra kitty opts placed before the child command
   local tag="$1"; shift
+  local rc=0
   timeout 30 "$KITTY" --config NONE -o sync_to_monitor=no "$@" \
     --debug-font-fallback --debug-rendering --debug-gl \
     sh -c 'sleep 0.6; cat '"$WORK"'/mixed.txt; sleep 1.5' \
-    > "$WORK/${tag}_stdout.txt" 2> "$WORK/${tag}_stderr.txt"
-  echo "$?" > "$WORK/${tag}_exit.txt"
+    > "$WORK/${tag}_stdout.txt" 2> "$WORK/${tag}_stderr.txt" || rc=$?
+  echo "$rc" > "$WORK/${tag}_exit.txt"
+  return "$rc"
 }
 
 run_kitty canonical_run1                                   # default monospace
@@ -173,20 +208,50 @@ $ fc-match monospace
 DejaVuSansMono.ttf: "DejaVu Sans Mono" "Book"
 ```
 
-The reason is simply that DejaVu Sans Mono **covers** the exercised Arabic letters and combining marks. Both coverage authorities agree — FreeType (which kitty's coverage test `has_cell_text` [kitty/fonts.c:L435-L453] consults) and FontConfig's cached charset. The FontConfig charset was checked directly with `fc-query` for the exact file `fc-match` resolves to (the booleans are a membership test computed from the `%{charset}` ranges):
+The reason is simply that DejaVu Sans Mono **covers** the exercised Arabic letters and combining marks. Both coverage authorities agree — FreeType (which kitty's coverage test `has_cell_text` [kitty/fonts.c:L435-L453] consults) and FontConfig's cached charset. Note that `fc-query --format='%{charset}\n'` does **not** print per‑codepoint booleans; it prints the font's coverage as a whitespace‑separated list of hex **ranges** (`lo-hi`, or a bare `cp` for a singleton codepoint). For the exact file `fc-match` resolves to, the **actual, complete** raw output is:
 
 ```text
-$ fc-query --format='%{charset}\n' /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf   # -> membership test
-    U+0300 combining grave  in FontConfig charset: True
-    U+0301 combining acute  in FontConfig charset: True
-    U+064E Arabic fatha     in FontConfig charset: True
-    U+0621 Arabic hamza     in FontConfig charset: True
-    U+0627 Arabic alef      in FontConfig charset: True
-    U+0628 Arabic beh       in FontConfig charset: True
-    U+0631 Arabic reh       in FontConfig charset: True
-    U+0644 Arabic lam       in FontConfig charset: True
-    U+0645 Arabic meem      in FontConfig charset: True
-    U+4E2D CJK 中            in FontConfig charset: False
+$ fc-query --format='%{charset}\n' /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+20-7e a0-1c3 1cd-1e3 1e6-1f0 1f4-1f6 1f8-1f9 1fc-221 224-241 243-245 24c-24d 250-2b9 2bb-2c1 2c6-2c9 2cc-2d3 2d6-2de 2e0-2e9 2ee 2f3 300-33f 343 358 361 374-377 37a-37f 384-38a 38c 38e-3a1 3a3-3ce 3d0-3e1 3f0-45f 462-463 472-473 490-49b 4a2-4a5 4aa-4b3 4ba-4bb 4c0-4c4 4c7-4c8 4cb-4cc 4cf-4f9 510-511 51a-51d 531-556 559-55f 561-587 589-58a 606-607 609-60a 60c 615 61b 61f 621-63a 640-655 65a 660-66d 674 679-67b 67e-680 683-684 686-687 691 698 6a4 6a9 6af 6be 6cc 6f0-6f9 e3f e81-e82 e84 e87-e88 e8a e8d e94-e97 e99-e9f ea1-ea3 ea5 ea7 eaa-eab ead-eb9 ebb-ebc ec8-ecd 10d0-10fc 1d02 1d08-1d09 1d14 1d16-1d17 1d1d-1d1f 1d2c-1d2e 1d30-1d3c 1d3e-1d5b 1d62-1d65 1d77-1d78 1d7b 1d85 1d9b-1db7 1db9-1dbf 1e00-1e13 1e18-1e2d 1e30-1e4d 1e54-1e63 1e68-1e79 1e7c-1e99 1e9b 1e9f-1ea1 1eac-1ead 1eb0-1eb1 1eb6-1eb9 1ebc-1ebd 1ec6-1ec7 1eca-1ecd 1ed8-1edd 1ee0-1ee5 1ee8-1eeb 1eee-1ef5 1ef8-1ef9 1f00-1f15 1f18-1f1d 1f20-1f45 1f48-1f4d 1f50-1f57 1f59 1f5b 1f5d 1f5f-1f7d 1f80-1fb4 1fb6-1fc4 1fc6-1fd3 1fd6-1fdb 1fdd-1fef 1ff2-1ff4 1ff6-1ffe 2000-200a 2010-2023 2026 202f-2037 2039-203a 203c-203f 2045-2049 204b 205f 2070-2071 2074-208e 2090-209c 20a0-20b5 20b8-20ba 20bd 2102 2105 210d-210f 2115-2117 2119-211a 211d 2122 2124 2126 212a-212b 212e 2148 2150-2151 2153-215f 2189 2190-2213 2215 2217-2220 2223 2227-222d 2234-223d 2241-2269 226d-228b 228d-22a5 22b2-22b5 22b8 22c2-22c6 22cd-22d1 22da-22e9 22ef 2300-2306 2308-2315 2318-2319 231c-2321 2325-2328 232b 2335-237a 237d 2380-2383 2388-238b 2395 239b-23ae 23ce-23cf 2423 2500-262f 2638-268b 2690-269c 26a0-26a1 26b0-26b1 2701-2704 2706-2709 270c-2727 2729-274b 274d 274f-2752 2756 2758-275e 2761-2775 2794 2798-27af 27b1-27be 27c2 27c5-27c6 27dc 27e0 27e6-27eb 27f5-27f7 2987-2988 2997-2998 29eb 29fa-29fb 2a00 2a2f 2a6a-2a6b 2b05-2b0d 2b12-2b1a 2c64 2c6d-2c70 2c75-2c77 2c79-2c7a 2c7c-2c7f 2e18 2e1f 2e22-2e25 2e2e a708-a716 a71b-a71f a722-a727 a789-a78e a790-a791 a7aa a7f8-a7f9 f6c5 fb01-fb02 fb52-fb81 fb8a-fb95 fb9e-fb9f fbaa-fbad fbe8-fbe9 fbfc-fbff fe70-fe74 fe76-fefc feff fff9-fffd 1d55a 1d670-1d6a3 1d7f6-1d7ff
+```
+
+The per‑codepoint membership rows shown below are **computed** from those ranges by a small transform (`charset_check.py`) — the step the raw `%{charset}` output does not perform itself:
+
+```python
+# charset_check.py — parse fc-query's %{charset} hex ranges and test membership.
+# Run with:  python3 charset_check.py /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+import subprocess, sys
+path = sys.argv[1]
+cps = [(0x0300, "U+0300 combining grave"), (0x0301, "U+0301 combining acute"),
+       (0x064E, "U+064E Arabic fatha"),    (0x0621, "U+0621 Arabic hamza"),
+       (0x0627, "U+0627 Arabic alef"),     (0x0628, "U+0628 Arabic beh"),
+       (0x0631, "U+0631 Arabic reh"),      (0x0644, "U+0644 Arabic lam"),
+       (0x0645, "U+0645 Arabic meem"),     (0x4E2D, "U+4E2D CJK 中")]
+raw = subprocess.check_output(['fc-query', '--format=%{charset}', path]).decode()
+ranges = []
+for tok in raw.split():
+    a, _, b = tok.partition('-')
+    lo = int(a, 16); hi = int(b, 16) if b else lo
+    ranges.append((lo, hi))
+def member(cp): return any(lo <= cp <= hi for lo, hi in ranges)
+for cp, label in cps:
+    print(f"    {label:<24} in FontConfig charset: {member(cp)}")
+```
+
+Its output (byte‑identical across two runs) — `U+0300` falls in range `300-33f`, `U+064E`/`U+0645` in `640-655`, the remaining Arabic letters in `621-63a`, and `U+4E2D` in **no** range:
+
+```text
+$ python3 charset_check.py /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+    U+0300 combining grave   in FontConfig charset: True
+    U+0301 combining acute   in FontConfig charset: True
+    U+064E Arabic fatha      in FontConfig charset: True
+    U+0621 Arabic hamza      in FontConfig charset: True
+    U+0627 Arabic alef       in FontConfig charset: True
+    U+0628 Arabic beh        in FontConfig charset: True
+    U+0631 Arabic reh        in FontConfig charset: True
+    U+0644 Arabic lam        in FontConfig charset: True
+    U+0645 Arabic meem       in FontConfig charset: True
+    U+4E2D CJK 中             in FontConfig charset: False
 ```
 
 So there is **no** FreeType‑vs‑FontConfig divergence for these codepoints: DejaVu genuinely **contains** the Arabic set (both authorities report it present) and genuinely **lacks** the CJK ideograph `U+4E2D` (both report it absent — which is exactly why CJK falls back to Noto in §4.3). The same membership check on the other installed DejaVu copy (`/root/.local/share/fonts/DejaVuSansMono.ttf`) gives identical results. To actually exercise the **Arabic fallback tier** (Rule 2 requires both primary and fallback), the primary must therefore be a monospace family that lacks Arabic — **Liberation Mono** — which forces `U+0645`, `U+0631`, … onto the DejaVu fallback face (§4.4). The canonical `monospace` run still exercises the fallback tier via CJK + emoji.
@@ -367,10 +432,10 @@ When the primary face lacks a glyph for a **terminal cell**, kitty asks the plat
 
 **Two same‑named functions — do not conflate them.** There is a *separate* `fallback_font` at [kitty/fontconfig.c:L444] with signature `fallback_font(char_type ch, const char *family, …)`; it serves **UI text** (window titles, notification bodies, etc.) via `freetype_render_ui_text.c` and is **not** on the terminal‑cell path. The terminal path uses the `fonts.c` overload shown above.
 
-The number of distinct fallback faces per group is capped at 100 (a boundary, **not** exercised destructively):
+The guard on the number of distinct fallback faces per group is checked at the **top** of `load_fallback_font` — **before** the new face is created and inserted — so up to **101** fallback faces can actually be loaded per group. At a pre‑insertion count of 100 the test `100 > 100` is **false**, so that 101st face is still created and inserted (raising the count to 101); rejection begins only on the *next* request, when the pre‑count is 101 (`101 > 100` is true). This is a boundary, **not** exercised destructively, and its exact pre‑count/off‑by‑one behavior is a source‑only reading of the guard **`(inferred)`**:
 
 ```c
-// kitty/fonts.c:482 (inside load_fallback_font)
+// kitty/fonts.c:482 (first statement inside load_fallback_font, before create_fallback_face + insertion)
     if (fg->fallback_fonts_count > 100) { log_error("Too many fallback fonts"); return MISSING_FONT; }
 ```
 
@@ -464,10 +529,10 @@ The line `[0.777] U+645 U+64e using previous fallback font at index: 0` is the *
 
 ### 4.5 Both scripts, both tiers reached — screen‑buffer proof (logical order)
 
-To confirm Arabic (RTL) **and** English (LTR) **and** the combining sequences actually reached the grid (not merely the fallback log), the live screen buffer was dumped over kitty's own remote‑control channel. This required launching the run with remote control enabled (transient CLI flags only, no config edits): `-o allow_remote_control=yes --listen-on "$RC"` where `$RC="unix:${WORK}/rc"`. The dump command and its result (**exit 0**):
+To confirm Arabic (RTL) **and** English (LTR) **and** the combining sequences actually reached the grid (not merely the fallback log), the live screen buffer was dumped over kitty's own remote‑control channel. This required launching the run with remote control enabled (transient CLI flags only, no config edits): `-o allow_remote_control=yes --listen-on "$RC"` where `$RC="unix:${WORK}/rc"`. The remote‑control client is the **in‑tree `kitten` launcher** built alongside `kitty` (`$REPO/kitty/launcher/kitten`, where `REPO="$(git rev-parse --show-toplevel)"` as in §2.5); it is invoked by its explicit path because it is **not on `PATH`** in this from‑source environment. The dump command and its result (**exit 0**):
 
 ```console
-$ kitten @ --to "$RC" get-text --extent=all
+$ "$REPO/kitty/launcher/kitten" @ --to "$RC" get-text --extent=all
 مرحبا بالعالم Hello World
 é à مَر combining-diacritics
 CJK 中文 日本語
@@ -514,7 +579,33 @@ The **only** effective difference between the two runs is `font_family`; every o
 
 ### 5.1 Driver and observed values
 
-Cell metrics are computed by `calc_cell_metrics` [kitty/fonts.c:L373], which calls `cell_metrics(...)` on the **medium (Normal) face** [kitty/fonts.c:L375] and then applies any `modify_font` adjustments. The values were captured with a transient probe (`metrics_probe.py`) that drives kitty's **real** `calc_cell_metrics` → `cell_metrics` path through the `kitty.fonts.render` test harness `setup_for_testing`, which runs `set_font_family` → `create_test_font_group` (no GL required — it swaps `send_sprite_to_gpu` for a Python dict) and wraps the module‑global `prerender_function` [kitty/fonts/render.py:L364] to observe the exact metrics that `send_prerendered_sprites` passes it [kitty/fonts.c:L1458]. Both the default `monospace` and the `Liberation Mono` faces were probed at two DPIs. Exact command and **complete** output (**exit 0**; byte‑identical across two runs):
+Cell metrics are computed by `calc_cell_metrics` [kitty/fonts.c:L373], which calls `cell_metrics(...)` on the **medium (Normal) face** [kitty/fonts.c:L375] and then applies any `modify_font` adjustments. The values were captured with a transient probe (`metrics_probe.py`) that drives kitty's **real** `calc_cell_metrics` → `cell_metrics` path through the `kitty.fonts.render` test harness `setup_for_testing`, which runs `set_font_family` → `create_test_font_group` (no GL required — it swaps `send_sprite_to_gpu` for a Python dict) and wraps the module‑global `prerender_function` [kitty/fonts/render.py:L364] to observe the exact metrics that `send_prerendered_sprites` passes it [kitty/fonts.c:L1458]. Both the default `monospace` and the `Liberation Mono` faces were probed at two DPIs. The probe script (`metrics_probe.py`) is fully self‑contained — the `+runpy` argument is `exec`'d inside a function scope, so the wrapper re‑imports the module by name rather than relying on a module‑global closure:
+
+```python
+# metrics_probe.py — drives kitty's real calc_cell_metrics -> cell_metrics path via
+# setup_for_testing, wrapping prerender_function to capture the exact metric values
+# that fonts.c passes to it. Run with:  ./kitty/launcher/kitty +runpy "$(cat metrics_probe.py)"
+import kitty.fonts.render as R
+R._orig_prerender = R.prerender_function
+def wrapper(cw, ch, baseline, up, ut, sp, st, *rest):
+    import kitty.fonts.render as _R
+    _R._cap = dict(cell_width=cw, cell_height=ch, baseline=baseline, underline_position=up,
+                   underline_thickness=ut, strikethrough_position=sp, strikethrough_thickness=st)
+    return _R._orig_prerender(cw, ch, baseline, up, ut, sp, st, *rest)
+R.prerender_function = wrapper
+for family in ('monospace', 'Liberation Mono'):
+    for dpi in (96.0, 100.0):
+        with R.setup_for_testing(family, 11.0, dpi) as (sprites, cw, ch):
+            n = len(sprites)
+        c = R._cap
+        print(f"family={family!r} size=11.0 dpi={dpi}: "
+              f"cell_width={cw} cell_height={ch} baseline={c['baseline']} "
+              f"underline_position={c['underline_position']} underline_thickness={c['underline_thickness']} "
+              f"strikethrough_position={c['strikethrough_position']} strikethrough_thickness={c['strikethrough_thickness']} "
+              f"prerendered_special_sprites={n}")
+```
+
+Exact command and **complete** output (**exit 0**; byte‑identical across two runs):
 
 ```console
 $ ./kitty/launcher/kitty +runpy "$(cat metrics_probe.py)"
@@ -526,7 +617,7 @@ family='Liberation Mono' size=11.0 dpi=100.0: cell_width=9 cell_height=18 baseli
 
 For the **default `monospace`** face (the canonical run of §4.2), the observed values are therefore:
 
-| Metric | DPI 96 (harness default) | DPI 100 (live Xvfb DPI, §2.3) |
+| Metric | DPI 96 (live logical DPI, §2.3) | DPI 100 (forced comparison) |
 |---|---|---|
 | `cell_width` | **9** | **9** |
 | `cell_height` | **18** | **19** |
@@ -537,7 +628,7 @@ For the **default `monospace`** face (the canonical run of §4.2), the observed 
 | `strikethrough_thickness` | **1** | **1** |
 | `prerendered_special_sprites` | **11** | **11** |
 
-Both DPIs are reported so the DPI dependence is explicit: the live headless run renders at **9×19** (DPI 100, per `xdpyinfo` in §2.3); the DPI‑96 column is the harness default. `cell_width` is 9 at both DPIs; `cell_height`, `baseline`, and `strikethrough_position` each grow by one pixel from DPI 96 → 100. The `prerendered_special_sprites=11` value is the atlas seed count analysed in §6.5. (The `Liberation Mono` rows are the primary used to force Arabic fallback in §4.4; they are shown here for completeness and reused in §6.)
+Both DPIs are reported so the DPI dependence is explicit. The **live** headless run renders at **9×18** — the **DPI‑96 column is authoritative**, because kitty's logical DPI on this headless Xvfb is **96.0** (derived in §2.3: no `Xft.dpi` resource ⇒ GLFW content scale `96/96 = 1.0` ⇒ logical DPI `1.0 × 96 = 96.0`), which is confirmed independently by the live `TIOCGWINSZ` winsize proof in §2.3 (`xpix=900 cols=100 ⇒ cell_width=9`; `ypix=558 rows=31 ⇒ cell_height=18`). The **DPI‑100 column is a forced‑DPI comparison** only: 100 is the display's *physical* `xdpyinfo` DPI (§2.3), which kitty does **not** use for cell sizing; that column is retained solely to show the metric's DPI sensitivity. `cell_width` is 9 at both DPIs; `cell_height`, `baseline`, and `strikethrough_position` each grow by one pixel from DPI 96 → 100. The `prerendered_special_sprites=11` value is the atlas seed count analysed in §6.5. (The `Liberation Mono` rows are the primary used to force Arabic fallback in §4.4; they are shown here for completeness and reused in §6.)
 
 ### 5.2 Exact formulas (cause → effect)
 
@@ -577,7 +668,7 @@ if (self->strikethrough_thickness > 0) {
 2. **Invalid `modify_font` adjustment → log‑and‑ignore (retain previous value), NOT abort.** `modify_font` is applied by `adjust_metric` to working copies `cw`/`ch` [kitty/fonts.c:L379-L380]. The adjusted value is accepted **only if in range**: `if (cw >= MIN_WIDTH && cw <= MAX_DIM) cell_width = cw; else log_error("Cell width invalid after adjustment, ignoring modify_font cell_width");` [kitty/fonts.c:L384-L385], and the identical pattern for height [kitty/fonts.c:L386-L387]. So an out‑of‑range `modify_font` adjustment is **logged and discarded**, and the pre‑adjustment metric is **retained** — it does not abort.
 3. **Retained value globally out of range → abort.** Only *after* that, `fatal(...)` fires if the value actually in effect is itself out of bounds: `if (cell_height < MIN_HEIGHT) fatal("Line height too small: %u", …)`, `> MAX_DIM` too large, and the two symmetric width checks [kitty/fonts.c:L389-L392]. Because guard 2 retains a valid pre‑adjustment metric, this abort is normally reachable only if the font's own computed metric were degenerate.
 
-Separately, the underline position is clamped to `MIN(cell_height - 1, underline_position)` [kitty/fonts.c:L409] (directly in source — **not** an inferred claim) so a decoration never falls outside the cell. The observed metrics (9×18 / 9×19) sit comfortably inside all these bounds, and with the effective `modify_font = {}` (§7) no adjustment was applied, so none of the guards fired.
+Separately, the underline position is clamped to `MIN(cell_height - 1, underline_position)` [kitty/fonts.c:L409] (directly in source — **not** an inferred claim) so a decoration never falls outside the cell. The observed metrics (9×18 / 9×19) sit comfortably inside all these bounds, and with the effective `modify_font = {}` (§7) no adjustment was applied, so none of the guards fired. Because none of these three guards were triggered at runtime, the described branch behaviors (which value aborts, which is logged‑and‑discarded, which is retained) are a source‑only reading of the code **`(inferred)`**; only the in‑range metrics of §5.1 and the empty `modify_font` of §7 are directly observed.
 
 ### 5.4 Overline — explicitly addressed (grep‑evidenced absence, not inference)
 
@@ -603,7 +694,7 @@ Connecting §3.1/§3.4 to the metrics above — and stated carefully to avoid th
 
 Before the numbers, a critical disclosure that shapes how this section is evidenced. The GPU atlas code in `kitty/shaders.c` contains **no** `debug`/`debug_rendering` logging: `alloc_sprite_map` [kitty/shaders.c:L51], `realloc_sprite_texture` [kitty/shaders.c:L108], `ensure_sprite_map` [kitty/shaders.c:L137], and `send_sprite_to_gpu` [kitty/shaders.c:L147] print nothing, even with `--debug-rendering`/`--debug-gl`. (The only `log_error` anywhere in the file is a conditional `glCopyImageSubData` fallback warning [kitty/shaders.c:L90], which did **not** fire in our runs; the only other match is an unrelated window‑title `snprintf` [kitty/shaders.c:L688].)
 
-**When the atlas is created.** The atlas is *not* allocated lazily on the first user glyph — it is created during **OS‑window creation**. `send_prerendered_sprites_for_window(OSWindow *w)` [kitty/fonts.c:L1521-L1526] is called from the window‑creation path at [kitty/glfw.c:L1273] (and also [kitty/state.c:L1038]); on first call, when `fg->sprite_map` is still null, it runs `fg->sprite_map = alloc_sprite_map(cell_width, cell_height)` [kitty/fonts.c:L1524] and immediately `send_prerendered_sprites(fg)` [kitty/fonts.c:L1525]. So by the time the window is shown and the render loop begins, the CPU sprite tracker is laid out and the atlas has already been seeded with kitty's special sprites (§6.5). This timing is established from source (the path is silent, so it cannot be logged) and is consistent with the observed `prerendered_special_sprites=11` seed count from the §5.1 probe.
+**When the atlas is created.** The atlas is *not* allocated lazily on the first user glyph — it is created during **OS‑window creation**. `send_prerendered_sprites_for_window(OSWindow *w)` [kitty/fonts.c:L1521-L1526] is called from the window‑creation path at [kitty/glfw.c:L1273] (and also [kitty/state.c:L1038]); on first call, when `fg->sprite_map` is still null, it runs `fg->sprite_map = alloc_sprite_map(cell_width, cell_height)` [kitty/fonts.c:L1524] and immediately `send_prerendered_sprites(fg)` [kitty/fonts.c:L1525]. So by the time the window is shown and the render loop begins, the CPU sprite tracker is laid out and the atlas has already been seeded with kitty's special sprites (§6.5). This timing — that the atlas is created at OS‑window creation rather than lazily on the first user glyph — is established from source **`(inferred)`** (the path is silent, so it cannot be logged) and is consistent with the observed `prerendered_special_sprites=11` seed count from the §5.1 probe.
 
 Consequently:
 - The **only directly‑observed** GL/atlas startup log is the `GL version string:` line from `gl_init` (§6.2). That, plus the **absence of GL errors** (which `--debug-gl` enables checking for), is what "verifies the atlas subsystem is ready" at this revision — there is no atlas‑specific log line, and none is invented here.
@@ -658,15 +749,15 @@ sprite_tracker->x = 0; sprite_tracker->y = 0; sprite_tracker->z = 0;
 
 Computed from the observed limit (16384) and the observed cell metrics (§5.1):
 
-| Quantity | Formula [kitty/fonts.c] | DPI 100 (cell 9×19, live run) | DPI 96 (cell 9×18) |
+| Quantity | Formula [kitty/fonts.c] | DPI 96 (cell 9×18, live run) | DPI 100 (cell 9×19, forced comparison) |
 |---|---|---|---|
 | `xnum` (sprites/row) | `MIN(MAX(1, 16384/cell_width), 65535)` [L277] | `16384/9` → **1820** | `16384/9` → **1820** |
-| `max_y` (max rows/layer) | `MIN(MAX(1, 16384/cell_height), 65535)` [L278] | `16384/19` → **862** | `16384/18` → **910** |
+| `max_y` (max rows/layer) | `MIN(MAX(1, 16384/cell_height), 65535)` [L278] | `16384/18` → **910** | `16384/19` → **862** |
 | `ynum` (initial rows) | set to `1` [L279] | **1** | **1** |
 | `x,y,z` (initial cursor) | set to `0` [L280] | **0,0,0** | **0,0,0** |
 | layer cap | `MIN(0xfff, 2048)` [L239] | **2048** | **2048** |
 
-So one atlas **layer** can hold up to `xnum × max_y` cells (≈ 1820 × 862 ≈ 1.57 million glyph cells per layer at the live DPI), the atlas starts with a single row (`ynum=1`) and grows, and up to **2048** array layers are available before the cap.
+The **DPI‑96 column is the live run** (kitty's logical DPI on this headless Xvfb is 96.0, §2.3); the DPI‑100 column is the forced‑DPI comparison only. So one atlas **layer** can hold up to `xnum × max_y` cells (`1820 × 910 = 1,656,200` glyph cells per layer at the live DPI), the atlas starts with a single row (`ynum=1`) and grows, and up to **2048** array layers are available before the cap.
 
 ### 6.5 Immutable texture allocation — the "before" vs "during/after" states
 
@@ -689,12 +780,12 @@ if (sprite_map->texture_id) {           // growth: copy the old atlas into the l
 The three states, **in the order they actually occur** (recall from §6.1 that allocation happens at OS‑window creation, and the whole path is silent, so these are source‑derived):
 
 - **Before the first sprite upload (a transient instant during window creation):** immediately after `alloc_sprite_map` [kitty/fonts.c:L1524] the `SpriteMap` exists but `texture_id == 0` — there is **no** GL texture object yet. This state lasts only until the first prerendered sprite is sent a few statements later in `send_prerendered_sprites`.
-- **First upload → immutable allocation:** `send_prerendered_sprites` [kitty/fonts.c:L1450] sends the **blank cell first** [kitty/fonts.c:L1453-L1456]. That first `send_sprite_to_gpu` allocates the texture, because `last_num_of_layers` starts at 0 so its growth test fires [kitty/shaders.c:L151] (equivalently `ensure_sprite_map` allocates whenever `!texture_id` [kitty/shaders.c:L139]); `realloc_sprite_texture` then calls `glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_SRGB8_ALPHA8, width, height, znum)` [kitty/shaders.c:L123] — one mip level, internal format `GL_SRGB8_ALPHA8`, `GL_NEAREST` filtering and `GL_CLAMP_TO_EDGE` wrapping [kitty/shaders.c:L114-L117].
+- **First upload → immutable allocation:** `send_prerendered_sprites` [kitty/fonts.c:L1450] sends the **blank cell first** [kitty/fonts.c:L1453-L1456]. That first `send_sprite_to_gpu` allocates the texture. The sprite map begins in the `NEW_SPRITE_MAP` state, which initializes `last_num_of_layers = 1` and `last_ynum = -1` (**not** `0`) [kitty/shaders.c:L31], and the growth predicate `(int)znum >= last_num_of_layers || (znum == 0 && (int)ynum > last_ynum)` [kitty/shaders.c:L151] fires on its **second** clause at this first upload — with `znum = 0` and `ynum = 1`, `0 >= 1` is false but `0 == 0 && 1 > -1` is true. Independently of the predicate, `ensure_sprite_map` calls `realloc_sprite_texture` whenever `!sprite_map->texture_id` [kitty/shaders.c:L137-L139], which by itself guarantees this first allocation. (This trigger/ordering reasoning is a source‑only reading **`(inferred)`**, since the atlas path is silent — §6.1.) `realloc_sprite_texture` then calls `glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_SRGB8_ALPHA8, width, height, znum)` [kitty/shaders.c:L123] — one mip level, internal format `GL_SRGB8_ALPHA8`, `GL_NEAREST` filtering and `GL_CLAMP_TO_EDGE` wrapping [kitty/shaders.c:L114-L117].
 - **After window creation → seeded atlas:** the remaining 10 special sprites returned by `prerender_function` [kitty/fonts/render.py:L364] are then uploaded [kitty/fonts.c:L1461-L1470], giving the **11**‑sprite seed observed by the probe (`prerendered_special_sprites=11`, §5.1). That 11 decomposes exactly as: blank (1) [kitty/fonts.c:L1453-L1456] + underline styles (`NUM_UNDERLINE_STYLES` = **5** [kitty/data-types.h:L213]) + strikethrough (1) + missing‑glyph (1) + cursor (3) [kitty/fonts/render.py:L391-L394]. All 11 fit in row 0 — `send_prerendered_sprites` aborts with `"Too many pre-rendered sprites…"` if `y > 0` [kitty/fonts.c:L1463], which never triggers here since `xnum ≈ 1820 ≫ 11`. The primary‑ and fallback‑face glyphs from §4 are uploaded **later**, on first draw, through the same `send_sprite_to_gpu` path; the texture already exists, so no re‑allocation occurs unless the atlas must grow.
 
 **Growth order — rows/height before layers.** As sprites accumulate, `do_increment` [kitty/fonts.c:L243-L253] advances `x` across a row; when a row fills it increments `y` and grows `ynum` up to `max_y` [kitty/fonts.c:L247]; only when the rows are exhausted (`y >= max_y`) does it start a new **layer** (`z++`) [kitty/fonts.c:L248-L249]. Correspondingly, `send_sprite_to_gpu` re‑allocates when either more layers are needed **or** more rows are needed in layer 0 [kitty/shaders.c:L151], and `realloc_sprite_texture` copies the existing atlas into the larger texture via `copy_image_sub_data` before deleting the old one [kitty/shaders.c:L124-L128]. So the atlas grows in **rows/height first, then layers** — never the reverse.
 
-At the live DPI (cell 9×19), the first immutable allocation is therefore `width = xnum × cell_width = 1820 × 9 = 16380`, `height = ynum × cell_height = 1 × 19 = 19`, `znum = 1` layer, `GL_SRGB8_ALPHA8`. **`(inferred)`** — computed from the observed layout (§6.4) and observed metrics (§5.1); the exact allocation call is not logged because the atlas path is silent (§6.1).
+At the live DPI (cell 9×18, §5.1), the first immutable allocation is therefore `width = xnum × cell_width = 1820 × 9 = 16380`, `height = ynum × cell_height = 1 × 18 = 18`, `znum = 1` layer, `GL_SRGB8_ALPHA8` — i.e. a **16380×18×1** texture. **`(inferred)`** — computed from the observed layout (§6.4) and observed metrics (§5.1); the exact allocation call is not logged because the atlas path is silent (§6.1).
 
 ### 6.6 CPU‑side complement
 
@@ -705,11 +796,62 @@ The GPU atlas position for a glyph is paired with a CPU‑side hash cache in `ki
 
 ## 7. Runtime configuration snapshot (values confirming the selections before first render)
 
-These are the **effective, parsed runtime** font/shaping option values under `--config NONE` — **not** raw table defaults. They were captured by replaying kitty's own argument path, `parse_args(args=argv, result_class=CLIOptions)` → `create_opts(cli_opts)` (the same calls `kitty.main` makes at [kitty/main.py:L464] and [kitty/main.py:L494]), under `kitty +runpy`, for **both** the canonical argv and the Liberation‑Mono argv. `set_options` installs these values before `set_font_family` [kitty/main.py:L249-L251] and before the render loop starts [kitty/main.py:L252]. Exact command and **complete, unedited** output (**exit 0**; byte‑identical across two runs):
+These are the **effective, parsed runtime** font/shaping option values under `--config NONE` — **not** raw table defaults. They were captured by replaying kitty's own argument path, `parse_args(args=argv, result_class=CLIOptions)` → `create_opts(cli_opts)` (the same calls `kitty.main` makes at [kitty/main.py:L464] and [kitty/main.py:L494]), under `kitty +runpy`. `set_options` installs these values before `set_font_family` [kitty/main.py:L249-L251] and before the render loop starts [kitty/main.py:L252].
+
+To make the argv explicit and to prove the snapshot does **not** depend on the debug flags or the child command, the probe replays **two argv per family**: (1) the **complete, real launch argv** used by the §2.5 harness — including `-o sync_to_monitor=no`, the three `--debug-*` flags, and the real `sh -c '…cat "$WORK/mixed.txt"…'` child — and (2) a **simplified, options‑only equivalent** (`sh -c true`). Both resolve to **identical** font/shaping options (see the output below), which is precisely why the simplified argv is a faithful stand‑in for reading the effective configuration. The probe script (`opts_probe.py`):
+
+```python
+# opts_probe.py — replays kitty's own argument path parse_args(result_class=CLIOptions) ->
+# create_opts (the same calls kitty.main makes at main.py:464 and main.py:494) to print the
+# EFFECTIVE, parsed font/shaping option values under --config NONE. No GL/window needed.
+# Run with:  ./kitty/launcher/kitty +runpy "$(cat opts_probe.py)"
+from kitty.cli import parse_args, create_opts
+from kitty.cli_stub import CLIOptions
+KEYS = ('font_family','bold_font','italic_font','bold_italic_font','font_size','force_ltr',
+        'disable_ligatures','font_features','text_composition_strategy','symbol_map',
+        'narrow_symbols','modify_font')
+CHILD = ['sh','-c','sleep 0.6; cat "$WORK/mixed.txt"; sleep 1.5']
+SETS = [
+  ('canonical REAL launch argv',
+     ['--config','NONE','-o','sync_to_monitor=no','--debug-font-fallback','--debug-rendering','--debug-gl'] + CHILD),
+  ('canonical SIMPLIFIED (options-only equivalent)',
+     ['--config','NONE','sh','-c','true']),
+  ('liberation REAL launch argv',
+     ['--config','NONE','-o','sync_to_monitor=no','-o','font_family=Liberation Mono','--debug-font-fallback','--debug-rendering','--debug-gl'] + CHILD),
+  ('liberation SIMPLIFIED (options-only equivalent)',
+     ['--config','NONE','-o','font_family=Liberation Mono','sh','-c','true']),
+]
+for label, argv in SETS:
+    cli_opts, rest = parse_args(args=list(argv), result_class=CLIOptions)
+    cli_opts.args = rest
+    opts = create_opts(cli_opts)
+    print(f"#### {label}")
+    print(f"#### argv = {argv!r}")
+    for k in KEYS:
+        print(f"    {k} = {getattr(opts, k)!r}")
+    print()
+```
+
+Exact command and **complete, unedited** output (**exit 0**; byte‑identical across two runs). The `REAL launch argv` blocks show the full argv actually used by the harness; the `SIMPLIFIED` blocks confirm the options are unchanged when the debug flags and child command are dropped:
 
 ```console
 $ ./kitty/launcher/kitty +runpy "$(cat opts_probe.py)"
-#### effective options for: canonical (default monospace)
+#### canonical REAL launch argv
+#### argv = ['--config', 'NONE', '-o', 'sync_to_monitor=no', '--debug-font-fallback', '--debug-rendering', '--debug-gl', 'sh', '-c', 'sleep 0.6; cat "$WORK/mixed.txt"; sleep 1.5']
+    font_family = FontSpec(family='', style='', postscript_name='', full_name='', system='monospace', axes=(), variable_name='', created_from_string='')
+    bold_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+    italic_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+    bold_italic_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+    font_size = 11.0
+    force_ltr = False
+    disable_ligatures = 0
+    font_features = {}
+    text_composition_strategy = 'platform'
+    symbol_map = {}
+    narrow_symbols = {}
+    modify_font = {}
+
+#### canonical SIMPLIFIED (options-only equivalent)
 #### argv = ['--config', 'NONE', 'sh', '-c', 'true']
     font_family = FontSpec(family='', style='', postscript_name='', full_name='', system='monospace', axes=(), variable_name='', created_from_string='')
     bold_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
@@ -724,7 +866,22 @@ $ ./kitty/launcher/kitty +runpy "$(cat opts_probe.py)"
     narrow_symbols = {}
     modify_font = {}
 
-#### effective options for: liberation (-o font_family=Liberation Mono)
+#### liberation REAL launch argv
+#### argv = ['--config', 'NONE', '-o', 'sync_to_monitor=no', '-o', 'font_family=Liberation Mono', '--debug-font-fallback', '--debug-rendering', '--debug-gl', 'sh', '-c', 'sleep 0.6; cat "$WORK/mixed.txt"; sleep 1.5']
+    font_family = FontSpec(family='', style='', postscript_name='', full_name='', system='Liberation Mono', axes=(), variable_name='', created_from_string='Liberation Mono')
+    bold_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+    italic_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+    bold_italic_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
+    font_size = 11.0
+    force_ltr = False
+    disable_ligatures = 0
+    font_features = {}
+    text_composition_strategy = 'platform'
+    symbol_map = {}
+    narrow_symbols = {}
+    modify_font = {}
+
+#### liberation SIMPLIFIED (options-only equivalent)
 #### argv = ['--config', 'NONE', '-o', 'font_family=Liberation Mono', 'sh', '-c', 'true']
     font_family = FontSpec(family='', style='', postscript_name='', full_name='', system='Liberation Mono', axes=(), variable_name='', created_from_string='Liberation Mono')
     bold_font = FontSpec(family='', style='', postscript_name='', full_name='', system='auto', axes=(), variable_name='', created_from_string='')
@@ -740,13 +897,13 @@ $ ./kitty/launcher/kitty +runpy "$(cat opts_probe.py)"
     modify_font = {}
 ```
 
-The **only** effective difference between the two runs is `font_family` — canonical resolves to `system='monospace'`, the Liberation run to `system='Liberation Mono'` (with `created_from_string='Liberation Mono'`). Every other shaping‑relevant option is identical. The following table interprets each **canonical** value, its definition site, and its effect (the Liberation run differs only in the `font_family` row):
+Within each family the **REAL launch argv and the SIMPLIFIED equivalent produce byte‑identical option values**, confirming that the debug flags, `-o sync_to_monitor=no`, and the child command do not affect the font/shaping snapshot. Across families, the **only** effective difference is `font_family` — canonical resolves to `system='monospace'`, the Liberation run to `system='Liberation Mono'` (with `created_from_string='Liberation Mono'`); every other shaping‑relevant option is identical. The following table interprets each **canonical** value, its definition site, and its effect (the Liberation run differs only in the `font_family` row):
 
 | Option | Effective value (canonical) | Definition | Effect on the observed behavior |
 |---|---|---|---|
 | `font_family` | `system='monospace'` (Liberation run: `system='Liberation Mono'`) | [kitty/options/definition.py:L35] | Resolves to the DejaVu Sans Mono banner faces (§4.2); Liberation Mono in the fallback‑forcing run (§4.4) |
 | `bold_font` / `italic_font` / `bold_italic_font` | `system='auto'` | [kitty/options/definition.py:L53], [L55], [L57] | Auto‑derives the Bold/Italic/Bold‑Italic faces shown in the banner |
-| `font_size` | `11.0` | [kitty/options/definition.py:L59] | With the run DPI (100) yields the 9×19 cell metrics (§5.1) |
+| `font_size` | `11.0` | [kitty/options/definition.py:L59] | At the live logical DPI (96, §2.3) yields the 9×18 cell metrics (§5.1) |
 | `force_ltr` | `False` | [kitty/options/definition.py:L64] | Arabic runs auto‑detected RTL per run (§3.3); no LTR override applied |
 | `disable_ligatures` | `0` (never) | [kitty/options/definition.py:L115] | Ligature suppression inactive, so shaping drops the trailing `-calt` (§3.2) |
 | `font_features` | `{}` (none) | [kitty/options/definition.py:L135-L136] | No per‑font OpenType feature overrides at startup (§3.2) |
@@ -781,15 +938,15 @@ Every named item from the four‑part question, with its observed evidence and c
 | font fallback | §3.5, §4.3–§4.4 | CJK→Noto CJK, emoji→Noto Emoji, Arabic→DejaVu | [kitty/fontconfig.c:L444], [kitty/fontconfig.c:L463], [kitty/fonts.c:L482] |
 | Arabic (RTL) **and** English (LTR) | §4.4–§4.5 | Arabic fallback chain + `Hello World` on primary + hex dump | [kitty/fonts.c:L687], [kitty/fonts.c:L457-L467] |
 | primary **and** fallback tiers | §4.2 + §4.3/§4.4 | `Text fonts:` banner **and** per‑codepoint fallback lines | [kitty/fonts/render.py:L161-L165], [kitty/fonts.c:L457-L467] |
-| cell metrics | §5.1 | 9×18 (DPI 96) / 9×19 (DPI 100), stable ×2 | [kitty/fonts.c:L373-L375], [kitty/freetype.c:L387-L390] |
-| baseline | §5.1–§5.2 | 14 px (DPI 96) / 15 px (DPI 100) | [kitty/freetype.c:L391] |
+| cell metrics | §5.1 | **9×18 (live, DPI 96)** / 9×19 (forced DPI 100), stable ×2 | [kitty/fonts.c:L373-L375], [kitty/freetype.c:L387-L390] |
+| baseline | §5.1–§5.2 | **14 px (live, DPI 96)** / 15 px (forced DPI 100) | [kitty/freetype.c:L391] |
 | underline **and** overline | §5.2, §5.4 | underline 15/1 px; overline = **grep‑evidenced absent** | [kitty/freetype.c:L392-L393], grep (0 matches), [kitty/cell_fragment.glsl:L129] |
-| strikethrough | §5.2 | 10/1 px (DPI 96), 11/1 px (DPI 100); font‑provided branch | [kitty/freetype.c:L396-L403] |
+| strikethrough | §5.2 | **10/1 px (live, DPI 96)**, 11/1 px (forced DPI 100); font‑provided branch | [kitty/freetype.c:L396-L403] |
 | grapheme clusters | §3.1, §5.5 | base+marks stored in one **CPUCell** (not merged into one HB cluster); monotone‑**character** level = char granularity | [kitty/fonts.c:L679-L685], [kitty/fonts.c:L1749] |
-| atlas page layout | §6.4 | xnum 1820, max_y 862 (DPI 100)/910 (DPI 96), ynum 1, x/y/z 0 | [kitty/fonts.c:L276-L280] |
+| atlas page layout | §6.4 | xnum 1820, **max_y 910 (live, DPI 96)** / 862 (forced DPI 100), ynum 1, x/y/z 0 | [kitty/fonts.c:L276-L280] |
 | atlas sizing | §6.3, §6.5 | GL_MAX 16384 / 2048 (llvmpipe); `glTexStorage3D` SRGB8_ALPHA8 | [kitty/shaders.c:L53-L54], [kitty/shaders.c:L123] |
 | atlas capacity | §6.3 | layer cap `MIN(0xfff, 2048)` = 2048 | [kitty/fonts.c:L239] |
 | readiness logs | §6.1–§6.2 | `GL version string:` line (stdout) + no GL errors + clean child exit 0; atlas alloc **silent**; 11‑sprite seed at window creation (§6.5) | [kitty/gl.c:L72], [kitty/shaders.c:L108-L147], [kitty/fonts.c:L1521-L1526] |
 | runtime config snapshot | §7 | effective `--config NONE` option values | [kitty/options/definition.py] |
 
-**Discipline confirmations:** every behavioral claim above pairs observed output with a `file:line` citation; code‑only conclusions (silent‑atlas empty state, RTL cluster‑number internals, CPU sprite cache, macOS contrast) are labeled `(inferred)`; two‑run stability is stated (§2.7); the software renderer (Mesa llvmpipe) is disclosed (§2.3, §6.2); and the read‑only/restore posture with a clean `git status` is confirmed (§2.8).
+**Discipline confirmations:** every behavioral claim above pairs observed output with a `file:line` citation; code‑only conclusions — including the fallback‑cap off‑by‑one boundary (§3.5), the RTL direction selection (§3.3), the unexercised cell‑metric guards (§5.3), the silent atlas creation timing (§6.1) and the first‑allocation growth trigger (§6.5), plus the RTL cluster‑number internals, the CPU sprite cache, and the macOS contrast — are each labeled `(inferred)`; two‑run stability is stated (§2.7); the software renderer (Mesa llvmpipe) is disclosed (§2.3, §6.2); and the read‑only/restore posture with a clean `git status` is confirmed (§2.8).
