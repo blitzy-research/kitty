@@ -382,7 +382,7 @@ No existing source file was modified and no product code was added; the sole tra
 
 ### 1.1 The six options, captured verbatim
 
-Captured from a real `kitten ssh` run driven through a PTY with the record-only fake `ssh` (`KITTY_PID=55002`, `KITTY_WINDOW_ID=7`, `--kitten askpass=ssh` to isolate the sharing branch). This is the `-O check` probe the kitten emitted first, reproduced exactly (the full argv log):
+Captured from a real `kitten ssh` run driven through a PTY with the record-only fake `ssh` (`KITTY_PID=55002`, `KITTY_WINDOW_ID=7`, `--kitten askpass=ssh` to isolate the sharing branch). One detail to state up front: the kitten's *very first* `ssh` invocation is not the one shown here. It first runs a deterministic **options-discovery probe** — the `ssh` binary with **no arguments at all** (`argc=0`) — so that `SSHOptions` can parse OpenSSH's own usage text and learn which flags take a value [`kittens/ssh/utils.go`:L40, consumed by `GetSSHCLI` L91 during `ParseSSHArgs` L134]; that probe carries **none** of the sharing options. The dump below is therefore the **first *options-bearing* invocation** — the `-O check` master probe (`argc=16`) — reproduced exactly (the full argv log):
 
 ```
 $ # fake-ssh argv log from: kitten ssh --kitten askpass=ssh -- host.test echo hello
@@ -478,7 +478,7 @@ ls: cannot access '/root/.cache/kitty/run/kssh-77001-*': No such file or directo
 
 Reading the evidence, effect by cause:
 
-* **(2)** proves the master socket is a UNIX-domain socket (`s`), mode `0600` (owner-only), and that OpenSSH appended a 40-hex `%C` hash (`de62245…8f30`) exactly as §1.2 predicts.
+* **(2)** proves the master socket is a UNIX-domain socket (`s`), mode `0600` (owner-only), and that OpenSSH appended a 40-hex `%C` hash (`de62245…d881`, the abbreviation of the full `de6224549bf17f660bd566abc77d74659f79d881` shown on the `ls -l` line above) exactly as §1.2 predicts.
 * **(3)** the kitten's own reuse decision is exactly this `-O check` probe; here it reports `Master running (pid=…)` and exits `0`.
 * **(4) vs (5)** is the controlled timing baseline the reuse claim needs: reusing the master takes **0.006 s**, whereas a **non-multiplexed** connection to the *same* server (identical auth, `ControlMaster=no ControlPath=none`) takes **0.121 s** — a ~20× difference that is entirely the TCP + key-exchange + authentication a reused connection skips.
 * **(6)/(7)** `ControlPersist=yes` kept the master alive across (2)–(5); `-O exit` tears it down and the socket disappears.
@@ -1597,7 +1597,7 @@ All 8 tests pass (repeated twice, §0.5). The per-route specifics (fresh bakes c
 
 ## §9 How does shared memory keep things secure?
 
-**Direct answer.** The credential channel is a POSIX shared-memory object whose security rests on **five independent guarantees**, all enforced **locally** (the password never crosses the network): it is **created race-free** (`O_EXCL`, mode `0600`, owner = the kitty process); it is **single-use** (unlinked the instant it is read); and every read is gated by **four validations** — the request must **parse**, the object must have the right **owner** and **permissions**, and the request must present the correct **password** and **request-id**. Any failure yields an error line and logs a traceback; the tar is released only when all pass. The one caveat the design does *not* hide is that on a **fresh** connection the password is also in the local `ssh` argv (§2.5) — shared memory secures the *network* path, not the local process table.
+**Direct answer.** The credential channel is a POSIX shared-memory object whose security rests on layered, **locally**-enforced guarantees (the password never crosses the network): it is **created race-free** (`O_EXCL`, mode `0600`, owner = the kitty process) and is **single-use** (unlinked the instant it is read); and every read is gated by **five validations** — the request must **parse**; the object must have the correct **owner** and, as a separate check, the correct **permissions** (`0o600`); and the request must present the correct **password** and the correct **request-id**. (Those five validations, together with the always-emitted `KITTY_DATA_START` marker that leads every reply, are the six ordered checks tabulated in §9.2 — the "six checks" referred to in §1.6.) Any failure yields an error line and logs a traceback; the tar is released only when all pass. The one caveat the design does *not* hide is that on a **fresh** connection the password is also in the local `ssh` argv (§2.5) — shared memory secures the *network* path, not the local process table.
 
 ### 9.1 The producer (Go) — created race-free
 
@@ -1770,47 +1770,45 @@ kitty receives the `@kitty-ssh` DCS and dispatches it to the data server: `handl
 
 ## Architecture at a glance
 
-The diagram below reflects the **corrected** flow (shm built unconditionally; fresh bakes credentials into the `ssh` argv and the **remote** sends the request; reused leaves placeholders and the **local** kitten sends the request). All arrows are directional.
+The diagram below reflects the **corrected** flow (shm built unconditionally; fresh bakes credentials into the `ssh` argv and the **remote** sends the request; reused leaves placeholders and the **local** kitten sends the request). All arrows are directional. Note in particular the two **distinct local channels**: the `/dev/shm/kssh-*` credential object is read by the **terminal-side** `get_ssh_data` [`kittens/ssh/utils.py`:L100-L148] — which then replies over the tty — whereas `system ssh` only carries the `argv` and multiplexes the transport and **never opens the shared-memory object** (verified at runtime in §9.3, and confirmed by source: the only Go-side shm reads, `main.go`:L72 and `askpass.go`:L76, are unrelated features).
 
 ```
-        LOCAL HOST                                            |        REMOTE HOST
-                                                              |
-  +------------------------------------------------+          |
-  | kitty terminal  (pid P, window id W)           |          |
-  |   DCS dispatch : handle_remote_ssh             |          |
-  |                  [kitty/window.py:L1289-L1291] |          |
-  |   data server  : get_ssh_data                  |          |
-  |                  [kittens/ssh/utils.py:L115]   |          |
-  +----------^--------------------------+----------+          |
-             |                          |                     |
-   reply over tty:              reads @kitty-ssh              |
-   START / OK / <=254B b64 / END   request  (from remote      |
-             |                    on FRESH, from local Go     |
-             |                    on REUSED)                  |
-  +----------+--------------------------v----------+          |
-  | kitten ssh (Go)  run_ssh [kittens/ssh/main.go:L597]       |
-  |  1 build pw + tar + shm  UNCONDITIONALLY [L431-L446]      |
-  |  2 decide fresh/reused                   [L663-L664]      |
-  |  3 get_remote_command -> rcmd            [L749]           |
-  |  4 append rcmd to ssh argv               [L753]           |
-  |  5 exec ssh                              [L756]           |
-  |  6 REUSED only: send @kitty-ssh itself   [L761-L768]      |
-  +----+---------------------------+-----------------+        |
-       |                           |                          |
-  /dev/shm/kssh-<pid>-*       ssh argv (FRESH: pw here)        |
-  0600, O_EXCL                     |                          |
-  [tools/utils/shm/                v                          |
-   shm_syscall.go:L162]     +-------------+                   |
-       |                    | system ssh  |===== ssh =============> sshd
-       +------ read ------->| +ControlMstr|                   |     |
-                            +-------------+                   |     v
-                                                              |  exec <interp> -c <unwrap> <encoded>
-                                                              |     |
-                                                              |     v
-                                                              |  bootstrap.sh / bootstrap.py
-                                                              |   - FRESH: send @kitty-ssh  [bootstrap.sh:L92-L95]
-                                                              |   - BOTH : get_data -> untar -> source data.sh
-                                                              |   - exec login shell        [bootstrap.sh:L164]
+        LOCAL HOST                                          |        REMOTE HOST
+                                                            |
+     +-----------------------------------------------+      |
+     | kitty terminal  (pid P, window id W)          |      |
+     |   DCS dispatch : handle_remote_ssh            |      |
+     |                  [kitty/window.py:L1289-L1291]|      |
+ +-->|   data server  : get_ssh_data                 |      |
+ |   |                  [kittens/ssh/utils.py:L115]  |      |
+ |   +----------^-------------------------+----------+      |
+ |              |                         |                 |
+ |    reply over tty:             reads @kitty-ssh          |
+ |    START/OK/<=254B b64/END     request (from remote      |
+ |              |                 on FRESH, from local Go   |
+ |              |                 on REUSED)                |
+ |   +----------+-------------------------v----------+      |
+ |   | kitten ssh (Go)  run_ssh [kittens/ssh/main.go:L597]  |
+ |   |  1 build pw + tar + shm  UNCONDITIONALLY [L431-L446] |
+ |   |  2 decide fresh/reused                   [L663-L664] |
+ |   |  3 get_remote_command -> rcmd            [L749]      |
+ |   |  4 append rcmd to ssh argv               [L753]      |
+ |   |  5 exec ssh                              [L756]      |
+ |   |  6 REUSED only: send @kitty-ssh itself   [L761-L768] |
+ |   +----+--------------------------+----------------+     |
+ |        | create (write)           | ssh argv (FRESH: pw) |
+ |        v                          v                      |
+ |   /dev/shm/kssh-<pid>-*     +-------------+              |
+ |   0600, O_EXCL              | system ssh  |==== ssh =======> sshd
+ |   [tools/utils/shm/         | +ControlMstr|              |     |
+ |    shm_syscall.go:L162]     +-------------+              |     v
+ |        |                                                 |  exec <interp> -c <unwrap> <encoded>
+ +--------+  read by get_ssh_data (terminal side, up the    |     |
+            tty; system ssh never opens the shm object)     |     v
+            [kittens/ssh/utils.py:L100-L148]                |  bootstrap.sh / bootstrap.py
+                                                            |   - FRESH: send @kitty-ssh [bootstrap.sh:L92-L95]
+                                                            |   - BOTH : get_data -> untar -> source data.sh
+                                                            |   - exec login shell       [bootstrap.sh:L164]
 ```
 
 ---
