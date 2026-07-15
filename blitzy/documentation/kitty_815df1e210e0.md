@@ -1063,7 +1063,7 @@ shell_prompt_marking(Screen *self, char *buf) {
 
 Two facts follow directly from this source:
 
-1. **`A` and `C` set a per-line `prompt_kind`** — `PROMPT_START`/`SECONDARY_PROMPT` and `OUTPUT_START` respectively, on `line_attrs[cursor->y]` [:2337, :2341]; **`D` sets none** — it only fires the `cmd_output_marking(None, exit_status)` callback [:2352]. So the notion that "`D` closes the output range" in the grid is wrong: `D` carries the exit status to Python (`Window.cmd_output_marking` → `handle_cmd_end` [kitty/window.py:1453]) but tags no line.
+1. **`A` and `C` set a per-line `prompt_kind`** — `PROMPT_START`/`SECONDARY_PROMPT` and `OUTPUT_START` respectively, on `line_attrs[cursor->y]` [:2337, :2341]; **`D` sets none** — it only fires the `cmd_output_marking(None, exit_status)` callback [:2352]. So the notion that "`D` closes the output range" in the grid is wrong: `D` carries the exit status to Python (`Window.cmd_output_marking` [kitty/window.py:1453] → `handle_cmd_end` [kitty/window.py:1408]) but tags no line.
 2. The **command-output range** (what `get-text --extent=last_cmd_output` returns, §3.4) is computed by `find_cmd_output` [kitty/screen.c:3527] purely from the per-line tags: it starts at the `OUTPUT_START` line and **ends at the next `PROMPT_START`** [kitty/screen.c:3539] (or a screen/history boundary), not wherever `D` arrived.
 
 `parse_prompt_mark` [kitty/screen.c:2316] decodes sub-tokens; `k=s` sets `SECONDARY_PROMPT` [kitty/screen.c:2321].
