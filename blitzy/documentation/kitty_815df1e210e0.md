@@ -1,17 +1,17 @@
-# kitty Terminal Reflow (Rewrap) Subsystem — End‑to‑End Trace and Edge‑Case Characterization
+# kitty Terminal Reflow (Rewrap) Subsystem — End-to-End Trace and Edge-Case Characterization
 
 **Repository:** `kovidgoyal/kitty`
 **Commit (frozen for every citation below):** `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1`
 **Source branch this document is named after:** `kitty_815df1e210e0`
-**Deliverable:** this single markdown file. **No kitty source, test, build, or docs file was created, modified, or deleted** — this is a read‑only investigation. The candidate defect described in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6) is **characterized, not fixed** (a repair is explicitly out of scope).
+**Deliverable:** this single markdown file. **No kitty source, test, build, or docs file was created, modified, or deleted** — this is a read-only investigation. The candidate defect described in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6) is **characterized, not fixed** (a repair is explicitly out of scope).
 
 ---
 
 ## How to read this document
 
 - Every **behavioral** claim is labeled **`(observed)`** — it is backed by the actual, complete, unedited runtime output block that immediately follows it — or **`(inferred)`** — derived only from reading the code, with a `file:line` citation.
-- Every **code** fact is grounded in a `file:line` reference at commit `815df1e210e0…`. All citations were independently re‑verified against the checked‑out source during this investigation (see [§7.4](#74-citation-verification)).
-- Runtime output was captured **first‑hand** through the **real, canonical entry point** — `Screen.draw()` then `Screen.resize()` on a real `Screen` built from the compiled extension `kitty/fast_data_types.so`. No remote‑control hook, debug bypass, fallback, or synthetic stand‑in was used.
+- Every **code** fact is grounded in a `file:line` reference at commit `815df1e210e0…`. All citations were independently re-verified against the checked-out source during this investigation (see [§7.4](#74-citation-verification)).
+- Runtime output was captured **first-hand** through the **real, canonical entry point** — `Screen.draw()` then `Screen.resize()` on a real `Screen` built from the compiled extension `kitty/fast_data_types.so`. No remote-control hook, debug bypass, fallback, or synthetic stand-in was used. **One deliberate, clearly-labeled exception** exists: a single *supplementary* block ([§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)) additionally drives the real `historybuf_rewrap` primitive directly through `HistoryBuf.rewrap` — on scrollback that was itself produced canonically — to isolate Pass 1 with no visible buffer present. It is marked `(observed — supplementary)` where it appears and is corroborated by the canonical, end-to-end Scenario A ([§6.2](#62-observed-scenario-a--the-defect)), which remains the primary evidence for that behavior.
 - Quoted C is quoted **verbatim** (real lines only — no `// ...` elision).
 
 ### The question, decomposed
@@ -21,23 +21,25 @@
 | **R1** | Trace the rewrap implementation in the C code | [§2](#2--rewrap-c-code-trace-r1) |
 | **R2** | Explain reflow across new dimensions, maintaining line continuations *and* cursor positions | [§3](#3--reflow-across-new-dimensions-continuation--cursor-r2) |
 | **R3** | Explain the LineBuf (visible) ↔ HistoryBuf (scrollback) interaction during resize | [§4](#4--linebuf--historybuf-interaction-during-resize-r3) |
-| **R4** | Identify potential issues with line‑continuation state propagation between the two buffers | [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6) |
+| **R4** | Identify potential issues with line-continuation state propagation between the two buffers | [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6) |
 | **R5** | Describe the complete data flow from the resize entry point through the rewrap logic | [§5](#5--complete-data-flow-from-resize-trigger-to-cell-copy-r5) |
 | **R6** | Reproduce and explain the observed edge cases where reflow does not preserve logical line boundaries | [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6) |
 
-### One‑paragraph finding
+### One-paragraph finding
 
-kitty reflows text with a single shared algorithm, `rewrap_inner()` in `kitty/rewrap.h`, compiled twice by macro specialization — once for the visible buffer (`kitty/line-buf.c`) and once for the scrollback (`kitty/history.c`). On resize, `screen_resize()` runs it in **two independent passes**: scrollback first, then the visible buffer. The two passes read from **disjoint source buffers** — Pass 1 rewraps only the old scrollback ring (source rows addressed circularly by `map_src_index`, `kitty/history.c:L584`), Pass 2 rewraps only the old visible buffer — so a single logical line that *straddles* the scrollback↔screen boundary is **not rejoined** on widening: the scrollback segment is rewrapped alone, loses its soft‑wrap continuation bit, and the visible segment reflows in isolation. (The scrollback call is `rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf)` at `kitty/history.c:L611`; its first `NULL` is the *unused* `historybuf` parameter — the signature marks it `HistoryBuf UNUSED *historybuf` at `kitty/rewrap.h:L57` — and its second `NULL` merely disables cursor tracking via `kitty/rewrap.h:L61`. Neither `NULL` is the cause; the cause is that the two buffers are never presented to one `rewrap_inner` call as a single continued run.) The characters survive but the **logical line boundary is not preserved**. This is proven by contrasting Scenario A (straddling the boundary — wrong) against Scenario A2 (identical text wholly inside one buffer — correct).
+*(This paragraph **summarizes** the investigation. Its **behavioral** claims are `(observed)` — each is proven by a complete, unedited runtime output block in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6); the intervening mechanism steps are `(inferred)` from the cited `file:line`s. No claim here rests on this summary alone.)*
+
+kitty reflows text with a single shared algorithm, `rewrap_inner()` in `kitty/rewrap.h`, compiled twice by macro specialization — once for the visible buffer (`kitty/line-buf.c`) and once for the scrollback (`kitty/history.c`). On resize, `screen_resize()` runs it in **two independent passes**: scrollback first, then the visible buffer. The two passes read from **disjoint source buffers** — Pass 1 rewraps only the old scrollback ring (source rows addressed circularly by `map_src_index`, `kitty/history.c:L584`), Pass 2 rewraps only the old visible buffer — so a single logical line that *straddles* the scrollback↔screen boundary is **not rejoined** on widening: the scrollback segment is rewrapped alone, loses its soft-wrap continuation bit, and the visible segment reflows in isolation. (The scrollback call is `rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf)` at `kitty/history.c:L611`; its first `NULL` is the *unused* `historybuf` parameter — the signature marks it `HistoryBuf UNUSED *historybuf` at `kitty/rewrap.h:L57` — and its second `NULL` merely disables cursor tracking via `kitty/rewrap.h:L61`. Neither `NULL` is the cause; the cause is that the two buffers are never presented to one `rewrap_inner` call as a single continued run.) The characters survive but the **logical line boundary is not preserved**. This is proven by contrasting Scenario A ([§6.2](#62-observed-scenario-a--the-defect), straddling the boundary — wrong) against Scenario A2 ([§6.3](#63-observed-scenario-a2--the-control-that-isolates-the-cause), identical text wholly inside one buffer — correct).
 
 ### Table of contents
 
 1. [Build & run methodology](#1--build--run-methodology)
-2. [Rewrap C‑code trace (R1)](#2--rewrap-c-code-trace-r1)
+2. [Rewrap C-code trace (R1)](#2--rewrap-c-code-trace-r1)
 3. [Reflow across new dimensions: continuation & cursor (R2)](#3--reflow-across-new-dimensions-continuation--cursor-r2)
 4. [LineBuf ↔ HistoryBuf interaction during resize (R3)](#4--linebuf--historybuf-interaction-during-resize-r3)
 5. [Complete data flow from resize trigger to cell copy (R5)](#5--complete-data-flow-from-resize-trigger-to-cell-copy-r5)
-6. [Reproduced edge case & root‑cause analysis (R4 + R6)](#6--reproduced-edge-case--root-cause-analysis-r4--r6)
-7. [Observed‑vs‑inferred summary & R1–R6 coverage pass](#7--observed-vs-inferred-summary--r1r6-coverage-pass)
+6. [Reproduced edge case & root-cause analysis (R4 + R6)](#6--reproduced-edge-case--root-cause-analysis-r4--r6)
+7. [Observed-vs-inferred summary & R1–R6 coverage pass](#7--observed-vs-inferred-summary--r1r6-coverage-pass)
 
 ---
 
@@ -49,7 +51,8 @@ The reflow logic lives inside a **compiled C extension**, `kitty/fast_data_types
 
 | Item | Value in this environment `(observed)` | Notes |
 |------|----------------------------------------|-------|
-| Repo commit | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` | `git rev-parse HEAD` |
+| Source commit (all `file:line` citations resolve here) | `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` | the **frozen source baseline**; the entire kitty source tree is pinned to it and is byte-for-byte unchanged (see [§7.4](#74-citation-verification)). This is *not* the working `HEAD` — it is the ancestor the answer branch descends from. |
+| Answer-branch `HEAD` | a **docs-only descendant** of the source commit above (its hash advances with each commit, so it is deliberately **not** hardcoded here) | `git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1..HEAD` touches **only** this deliverable — no `.c`/`.h`/`.py`/`.rst`/build file differs `(observed)` |
 | Python | **3.13.7** | project requires `>= 3.8` — `pyproject.toml:L2` (`requires-python = ">=3.8"`) |
 | C compiler | **gcc 15.2.0** | compiles all `kitty/*.c` |
 | Go | 1.24.4 | needed only for the standalone `kitten` CLI, **not** for reflow |
@@ -185,18 +188,18 @@ A checkpoint narrative anticipated a *different* sequence — a plain-build fail
 
 #### 1.2.1 On `-Werror` and `--ignore-compiler-warnings`
 
-By default the build treats warnings as errors: `werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'` at `setup.py:L491`. The command‑line switch that flips this is registered at `setup.py:L2003-2004` (`--ignore-compiler-warnings`, `action='store_true'`).
+By default the build treats warnings as errors: `werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'` at `setup.py:L491`. The command-line switch that flips this is registered at `setup.py:L2003-2004` (`--ignore-compiler-warnings`, `action='store_true'`).
 
-- `(observed)` In **this** environment the canonical command needed **no** such flag — the build was clean (exit 0). Because the Wayland backend was disabled (§1.2), the GUI file `glfw/wl_window.c` was **never compiled**, so no GUI‑backend warning could be promoted to an error.
+- `(observed)` In **this** environment the canonical command needed **no** such flag — the build was clean (exit 0). Because the Wayland backend was disabled (§1.2), the GUI file `glfw/wl_window.c` was **never compiled**, so no GUI-backend warning could be promoted to an error.
 - `(inferred, from setup.py:L491 + standard compiler behavior)` On a host where the Wayland backend *is* built against a newer `wayland-protocols`, `glfw/wl_window.c` can fail under the default `-Werror` on an unhandled `switch` case for the newer `XDG_TOPLEVEL_STATE_CONSTRAINED_{LEFT,RIGHT,TOP,BOTTOM}` enumerators. In that case `CI=true python3 setup.py build --ignore-compiler-warnings` sets `werror = ''` (`setup.py:L491`) and the build proceeds. This flag only changes *warning* handling; it **does not alter the reflow codegen** in `fast_data_types.so` — warning flags never change C semantics. This contingency is documented for completeness; it did **not** occur here.
 
 The standalone Go `kitten` CLI is unrelated to reflow and out of scope; here Go 1.24.4 is present, so it did not error either.
 
-**Source tree stays pristine `(observed)`:** the build changes **no tracked source file** — its only outputs, `*.so` and `/build/`, are git‑ignored (`.gitignore:L1` (`*.so`), `.gitignore:L14` (`/build/`)); `git check-ignore kitty/fast_data_types.so` confirms the extension is ignored. The sole tracked file that ever differs from the source baseline is the answer document itself (see the precise four‑way distinction in the [Appendix](#appendix--scope--fidelity-attestation)).
+**Source tree stays pristine `(observed)`:** the build changes **no tracked source file** — its outputs — the compiled extension `*.so`, the `/build/` tree, and the launcher binaries `kitty/launcher/kitt*` (namely `kitty` and `kitten`) — are all git-ignored (`.gitignore:L1` (`*.so`), `.gitignore:L14` (`/build/`), `.gitignore:L18` (`/kitty/launcher/kitt*`)); `git check-ignore kitty/fast_data_types.so kitty/launcher/kitty` confirms both the extension and the launcher binaries are ignored. The sole tracked file that ever differs from the source baseline is the answer document itself (see the precise four-way distinction in the [Appendix](#appendix--scope--fidelity-attestation)).
 
 ### 1.3 Headless run harness — the real, canonical entry point
 
-Observations were driven through kitty's headless test harness, which constructs a genuine `Screen` backed by the compiled extension (no GPU, no GUI). A **temporary** probe script — `/tmp/kitty_reflow_probe/probe.py` — was placed **outside** the repository so the source tree stays byte-for-byte unchanged. It **instantiates** `kitty_tests.BaseTest` (`kitty_tests/__init__.py:L208`) directly and calls its `create_screen(...)` factory (`kitty_tests/__init__.py:L237-L241`), then drives the real API `Screen.draw(text)` → `Screen.resize(lines, columns)`. The **complete probe source** and the **exact invocation** are given verbatim in [§1.3.1](#131-complete-probe-source-and-exact-invocation) below.
+Observations were driven through kitty's headless test harness, which constructs a genuine `Screen` backed by the compiled extension (no GPU, no GUI). A **temporary** probe script — written into a unique scratch directory created with `mktemp -d "${TMPDIR:-/tmp}/kitty_reflow_probe.XXXXXX"` and removed automatically by a `trap 'rm -rf "$tmpdir"' EXIT` handler, always **outside** the repository so the source tree stays byte-for-byte unchanged — was used. It **instantiates** `kitty_tests.BaseTest` (`kitty_tests/__init__.py:L208`) directly and calls its `create_screen(...)` factory (`kitty_tests/__init__.py:L237-L241`), then drives the real API `Screen.draw(text)` → `Screen.resize(lines, columns)`. The **complete probe source** and the **exact invocation** are given verbatim in [§1.3.1](#131-complete-probe-source-and-exact-invocation) below.
 
 The factory and the underlying constructor:
 
@@ -209,11 +212,11 @@ def create_screen(self, cols=5, lines=5, scrollback=5, cell_width=10, cell_heigh
 ```
 — `kitty_tests/__init__.py:L237-L241`. `Screen`, `HistoryBuf`, and `LineBuf` are imported from `kitty.fast_data_types` at `kitty_tests/__init__.py:L22`.
 
-State was inspected only through public accessors: `str(s.line(y))` (visible row text, trailing blanks trimmed), `s.linebuf.is_continued(y)` (visible row's soft‑wrap flag), `s.historybuf.count`, `str(s.historybuf.line(i))` (scrollback row text), `Line.last_char_has_wrapped_flag()` — the Python getter defined at `kitty/line.c:L427`, which returns whether `gpu_cells[xnum-1].attrs.next_char_was_wrapped` is set (`kitty/line.c:L429`) — and `s.cursor.x` / `s.cursor.y`.
+State was inspected only through public accessors: `str(s.line(y))` (visible row text, trailing blanks trimmed), `s.linebuf.is_continued(y)` (visible row's soft-wrap flag), `s.historybuf.count`, `str(s.historybuf.line(i))` (scrollback row text), `Line.last_char_has_wrapped_flag()` — the Python getter defined at `kitty/line.c:L427`, which returns whether `gpu_cells[xnum-1].attrs.next_char_was_wrapped` is set (`kitty/line.c:L429`) — and `s.cursor.x` / `s.cursor.y`.
 
 ### 1.3.1 Complete probe source and exact invocation
 
-The single probe script used for **every** `(observed)` block in this document is reproduced here in full, exactly as executed — no elisions, no `# ...` placeholders:
+The single probe script used for **every** `(observed)` block in this document is reproduced here in full, exactly as executed — no elisions, no `# ...` placeholders. Every block is captured through the canonical `Screen.draw` → `Screen.resize` entry point, with a **single exception the script itself labels `SUPPLEMENTARY`**: the Pass-1-in-isolation block calls the real `historybuf_rewrap` primitive directly via `HistoryBuf.rewrap` (its output is tagged `(observed — supplementary)` in [§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)):
 
 ```python
 #!/usr/bin/env python3
@@ -284,6 +287,15 @@ sB.resize(5, 2)
 dump(sB, "B.AFTER  resize(5,2) narrow to 2 cols (10 rows total; bottom 5 visible, top 5 in scrollback):")
 
 # ----------------------------------------------------------------------------
+hr("SCENARIO B8 - REQUIRED deep narrowing: 25-char single logical line, 5->2 cols (eight scrollback rows)")
+print("setup: create_screen(cols=5, lines=5, scrollback=100); draw(25 chars '0000011111222223333344444'); then resize(5, 2)  # narrow cols 5->2")
+sB8 = bt.create_screen(cols=5, lines=5, scrollback=100)
+sB8.draw('0000011111222223333344444')
+dump(sB8, "B8.BEFORE (5 cols x 5 lines; single 25-char logical line across all 5 rows):")
+sB8.resize(5, 2)
+dump(sB8, "B8.AFTER  resize(5,2) narrow to 2 cols (13 rows total; bottom 5 visible, top 8 in scrollback):")
+
+# ----------------------------------------------------------------------------
 hr("SCENARIO C - NARROWING with cursor on unaffected content (this is the doc's original 'Scenario C'; it is NARROWING, not widening)")
 print("setup: create_screen(cols=5, lines=5); draw('ABCDEFG'); then resize(5, 3)  # (lines, columns) -> narrow cols 5->3")
 sC = bt.create_screen(cols=5, lines=5, scrollback=100)
@@ -311,6 +323,24 @@ sC2.resize(3, 4)
 dump(sC2, "C2.AFTER  resize(3,4) narrow to 4 cols ('ABCD'/'EFG'); cursor remapped to x=3,y=1:")
 
 # ----------------------------------------------------------------------------
+hr("SCENARIO C_req - REQUIRED short-content cursor invariance: draw 'ab', narrow 5->3, cursor (2,0)->(2,0)")
+print("setup: create_screen(cols=5, lines=5, scrollback=100); draw('ab'); then resize(5, 3)  # narrow cols 5->3")
+sCr = bt.create_screen(cols=5, lines=5, scrollback=100)
+sCr.draw('ab')
+dump(sCr, "C_req.BEFORE (5 cols x 5 lines; 'ab' on one row, cursor after 'b' at x=2,y=0):")
+sCr.resize(5, 3)
+dump(sCr, "C_req.AFTER  resize(5,3) narrow to 3 cols ('ab' still fits one row); cursor unchanged at x=2,y=0:")
+
+# ----------------------------------------------------------------------------
+hr("SCENARIO C2_req - REQUIRED wrapped-cursor remap: '12345'x3, narrow 5->2, cursor (5,2)->(1,4)")
+print("setup: create_screen(cols=5, lines=5, scrollback=100); draw('123451234512345'); then resize(5, 2)  # narrow cols 5->2")
+sC2r = bt.create_screen(cols=5, lines=5, scrollback=100)
+sC2r.draw('123451234512345')
+dump(sC2r, "C2_req.BEFORE (5 cols x 5 lines; three wrapped rows '12345', cursor after last '5' at x=5,y=2):")
+sC2r.resize(5, 2)
+dump(sC2r, "C2_req.AFTER  resize(5,2) narrow to 2 cols; cursor remapped to x=1,y=4:")
+
+# ----------------------------------------------------------------------------
 hr("SCENARIO D - FAST PATH: resize to identical dimensions (no reflow; memcpy short-circuit)")
 print("setup: create_screen(cols=5, lines=5); draw('ABCDEFGHIJKLMNO'); then resize(5, 5)  # same dims")
 sD = bt.create_screen(cols=5, lines=5, scrollback=100)
@@ -328,6 +358,15 @@ print(f"D.cursor-before={before_cur} cursor-after={after_cur} cursor-identical={
 print("D.NOTE: buffer rows are unchanged (fast-path memcpy); cursor x re-clamped by screen_resize S() macro from pending-wrap col 5 to last col 4.")
 
 # ----------------------------------------------------------------------------
+hr("SCENARIO SW - SAME-WIDTH control: cols unchanged (5), rows 5->2; reflow path RUNS (overflow to scrollback), NOT the memcpy fast path")
+print("setup: create_screen(cols=5, lines=5, scrollback=100); draw('AAAAABBBBBCCCCC'); then resize(2, 5)  # (lines, columns) SAME width 5, rows 5->2")
+sSW = bt.create_screen(cols=5, lines=5, scrollback=100)
+sSW.draw('AAAAABBBBBCCCCC')
+dump(sSW, "SW.BEFORE (5 cols x 5 lines; 15-char logical line across 3 rows 'AAAAA'/'BBBBB'/'CCCCC'):")
+sSW.resize(2, 5)
+dump(sSW, "SW.AFTER  resize(2,5) SAME width (5), rows 5->2 (top row 'AAAAA' overflows into scrollback):")
+
+# ----------------------------------------------------------------------------
 hr("SCENARIO PROMPT - prompt preservation on widening (OSC 133;A) vs no-marker control")
 print("WITH marker: parse_bytes(s, OSC 133;A) to set redraws_prompts_at_all, draw('PROMPT12') (wraps 'PROM'/'PT12'), then resize(5,6) widen 4->6")
 sP = bt.create_screen(cols=4, lines=5, scrollback=100)
@@ -335,7 +374,7 @@ parse_bytes(sP, b'\033]133;A\007')
 sP.draw('PROMPT12')
 dump(sP, "PROMPT.WITH.BEFORE (4 cols x 5 lines; marked prompt 'PROM'/'PT12'):")
 sP.resize(5, 6)
-dump(sP, "PROMPT.WITH.AFTER  resize(5,6) widen to 6 cols (prompt lines blanked+restored verbatim, NOT reflowed):")
+dump(sP, "PROMPT.WITH.AFTER  resize(5,6) widen to 6 cols (prompt lines blanked+copied back without normal reflow):")
 
 print()
 print("WITHOUT marker (control): same draw('PROMPT12'), no OSC 133;A, then resize(5,6) widen 4->6 (reflows normally)")
@@ -344,6 +383,24 @@ sPn.draw('PROMPT12')
 dump(sPn, "PROMPT.NOMARK.BEFORE (4 cols x 5 lines; unmarked 'PROM'/'PT12'):")
 sPn.resize(5, 6)
 dump(sPn, "PROMPT.NOMARK.AFTER  resize(5,6) widen to 6 cols (reflows to 'PROMPT'/'12'):")
+
+# ----------------------------------------------------------------------------
+hr("SCENARIO PROMPT_MARKER - REQUIRED: OSC 133;A prompt marker SURVIVES the resize (ANSI serialization)")
+print("serialize via Screen.as_text_non_visual(callback, as_ansi=True); OSC 133;A written with parse_bytes(s, b'\\033]133;A\\007')")
+def _serialize_ansi(s):
+    acc = []
+    s.as_text_non_visual(acc.append, True)   # as_ansi=True -> emit control sequences incl. OSC 133;A
+    return ''.join(acc)
+sPM = bt.create_screen(cols=4, lines=5, scrollback=100)
+parse_bytes(sPM, b'\033]133;A\007')
+sPM.draw('PROMPT12')
+print("PROMPT_MARKER.BEFORE serialize (as_ansi=True):")
+print("    " + repr(_serialize_ansi(sPM)))
+print(f"    cursor: x={sPM.cursor.x} y={sPM.cursor.y}  line0={str(sPM.line(0))!r} line1={str(sPM.line(1))!r} is_continued(0)={sPM.linebuf.is_continued(0)}")
+sPM.resize(5, 6)
+print("PROMPT_MARKER.AFTER  resize(5,6) widen 4->6 serialize (as_ansi=True):")
+print("    " + repr(_serialize_ansi(sPM)))
+print(f"    cursor: x={sPM.cursor.x} y={sPM.cursor.y}  line0={str(sPM.line(0))!r} line1={str(sPM.line(1))!r} is_continued(0)={sPM.linebuf.is_continued(0)}")
 
 # ----------------------------------------------------------------------------
 hr("SCENARIO DETERMINISM - repeat Scenario A five times; assert identical AFTER-state each run")
@@ -390,7 +447,10 @@ print("\nPROBE-COMPLETE exit=0")
 ```
 $ cd /tmp/blitzy/kitty/blitzy-6b19442c-e748-44df-bb65-0b73df51c799_c4fe10   # repository root
 $ source /opt/kitty-venv/bin/activate
-$ PYTHONPATH=. python3 /tmp/kitty_reflow_probe/probe.py
+$ tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/kitty_reflow_probe.XXXXXX")"   # unique scratch dir OUTSIDE the repo
+$ trap 'rm -rf "$tmpdir"' EXIT                                        # cleanup guaranteed on shell exit (even on error)
+$ cat > "$tmpdir/probe.py"                                           # paste the complete §1.3.1 probe source, then Ctrl-D
+$ PYTHONPATH=. python3 "$tmpdir/probe.py"
 ```
 
 The script exits **0** and prints `PROBE-COMPLETE exit=0` as its final line. Rather than repeat its full output as one monolithic block, each scenario's complete, unedited output is shown verbatim next to the corresponding behavioral claim in the sections that follow (§§3–6).
@@ -403,32 +463,32 @@ $ git status --porcelain | wc -l
 0
 ```
 
-At the end of the investigation the scratch directory is removed (`rm -rf /tmp/kitty_reflow_probe`) and the tree re-verified once more. Being precise about "clean": the tracked **source** tree is byte-for-byte unchanged, and the **only** tracked file that ever differs from the source baseline is this answer document — which shows as the single modified/added entry while it is being written and disappears from `git status` once committed. The built extension `kitty/fast_data_types.so` and `/build/` are git-ignored (`.gitignore:L1`, `.gitignore:L14`), so they never appear in `git status` either.
+At the end of the investigation the `mktemp -d` scratch directory is removed automatically by the `trap 'rm -rf "$tmpdir"' EXIT` handler shown above (so cleanup runs even if the probe errors), and the tree re-verified once more. Being precise about "clean": the tracked **source** tree is byte-for-byte unchanged, and the **only** tracked file that ever differs from the source baseline is this answer document — which shows as the single modified/added entry while it is being written and disappears from `git status` once committed. The built extension `kitty/fast_data_types.so` and `/build/` are git-ignored (`.gitignore:L1`, `.gitignore:L14`), so they never appear in `git status` either.
 
-### 1.4 Critical argument‑order facts (a common source of confusion)
+### 1.4 Critical argument-order facts (a common source of confusion)
 
-- **`Screen.resize(lines, columns)` takes LINES FIRST, COLUMNS SECOND.** The Python caller passes `ynum` (lines) first: `self.screen.resize(max(0, new_geometry.ynum), max(0, new_geometry.xnum))` at `kitty/window.py:L854`. The C binding parses `"|II"` into `(a, b)` and calls `screen_resize(self, a, b)` at `kitty/screen.c:L3932`, where `a` = lines, `b` = columns. `(observed)` confirmed empirically: `resize(2, 6)` applied to a 4‑column screen produced a **6‑column** result (columns became the *second* argument).
-- **The harness factory has the OPPOSITE order:** `create_screen(cols=5, lines=5, …)` takes **cols first**, then internally constructs `Screen(c, lines, cols, …)` — i.e. the `Screen` constructor itself is `(callbacks, lines, columns, …)` (`kitty_tests/__init__.py:L237-L241`). Throughout this document, `create_screen(cols=C, lines=L, …)` is written cols‑first, while `resize(L, C)` is written lines‑first. Both match the real code.
+- **`Screen.resize(lines, columns)` takes LINES FIRST, COLUMNS SECOND.** The Python caller passes `ynum` (lines) first: `self.screen.resize(max(0, new_geometry.ynum), max(0, new_geometry.xnum))` at `kitty/window.py:L854`. The C binding parses `"|II"` into `(a, b)` and calls `screen_resize(self, a, b)` at `kitty/screen.c:L3932`, where `a` = lines, `b` = columns. `(observed)` confirmed empirically: `resize(2, 6)` applied to a 4-column screen produced a **6-column** result (columns became the *second* argument).
+- **The harness factory has the OPPOSITE order:** `create_screen(cols=5, lines=5, …)` takes **cols first**, then internally constructs `Screen(c, lines, cols, …)` — i.e. the `Screen` constructor itself is `(callbacks, lines, columns, …)` (`kitty_tests/__init__.py:L237-L241`). Throughout this document, `create_screen(cols=C, lines=L, …)` is written cols-first, while `resize(L, C)` is written lines-first. Both match the real code.
 
 ### 1.5 Cleanup
 
-All temporary probe scripts live outside the repository and are deleted after use (`rm -rf /tmp/kitty_reflow_probe`); the probe therefore changes **no tracked file**. The only tracked change from the entire investigation is the single answer document in `blitzy/documentation/`; the tracked source tree is left byte‑for‑byte unchanged (the built `*.so`/`/build/` outputs are git‑ignored and never appear in `git status`).
+All temporary probe scripts live in a `mktemp -d` scratch directory outside the repository and are deleted after use by a `trap 'rm -rf "$tmpdir"' EXIT` handler (guaranteed even if the probe errors); the probe therefore changes **no tracked file**. The only tracked change from the entire investigation is the single answer document in `blitzy/documentation/`; the tracked source tree is left byte-for-byte unchanged (the built `*.so`/`/build/` outputs are git-ignored and never appear in `git status`).
 
 ### 1.6 HistoryBuf index convention used in every output block
 
-For scrollback dumps, `s.historybuf.line(0)` is the **newest** scrollback row (the one immediately above the visible area); higher indices are **older**. To read like a real terminal (oldest at the top), the blocks below print scrollback **highest‑index‑first**, so e.g. in Scenario B (five scrollback rows) `HIST[4]` is the oldest/top row and `HIST[0]` is the newest/just‑above‑visible row.
+For scrollback dumps, `s.historybuf.line(0)` is the **newest** scrollback row (the one immediately above the visible area); higher indices are **older**. To read like a real terminal (oldest at the top), the blocks below print scrollback **highest-index-first**, so e.g. in Scenario B (five scrollback rows) `HIST[4]` is the oldest/top row and `HIST[0]` is the newest/just-above-visible row.
 
 ---
 
-## 2 — Rewrap C‑code trace (R1)
+## 2 — Rewrap C-code trace (R1)
 
-**R1 asks:** *trace the rewrap implementation in the C code.* kitty implements reflow with a **single algorithm written once** — the template `rewrap_inner()` in `kitty/rewrap.h` — and **compiled twice** via macro specialization: once for the visible buffer in `kitty/line-buf.c` (with the file's *default* macros) and once for the scrollback in `kitty/history.c` (with *overridden* macros). This is a deliberate single‑source‑of‑truth pattern, and it is *why one algorithm produces two subtly different behaviors*.
+**R1 asks:** *trace the rewrap implementation in the C code.* kitty implements reflow with a **single algorithm written once** — the template `rewrap_inner()` in `kitty/rewrap.h` — and **compiled twice** via macro specialization: once for the visible buffer in `kitty/line-buf.c` (with the file's *default* macros) and once for the scrollback in `kitty/history.c` (with *overridden* macros). This is a deliberate single-source-of-truth pattern, and it is *why one algorithm produces two subtly different behaviors*.
 
 ### 2.1 The shared template — `kitty/rewrap.h`
 
-`kitty/rewrap.h` is 96 lines. It begins by declaring macros with `#ifndef` guards so a translation unit can override any of them *before* `#include`‑ing the header; when a macro is not overridden, the default applies.
+`kitty/rewrap.h` is 96 lines. It begins by declaring macros with `#ifndef` guards so a translation unit can override any of them *before* `#include`-ing the header; when a macro is not overridden, the default applies.
 
-**Default buffer type and the per‑line helpers** (`kitty/rewrap.h:L10-L42`):
+**Default buffer type and the per-line helpers** (`kitty/rewrap.h:L10-L42`):
 
 ```c
 #ifndef BufType
@@ -466,13 +526,13 @@ For scrollback dumps, `s.historybuf.line(0)` is the **newest** scrollback row (t
 #endif
 ```
 
-Three things in this block are load‑bearing for the whole subsystem:
+Three things in this block are load-bearing for the whole subsystem:
 
-1. **`is_src_line_continued()` (`kitty/rewrap.h:L40-L42`, read at L41)** is *the* soft‑wrap continuation test: it reads the `next_char_was_wrapped` bit of the **last cell** of the source row (`gpu_cells[src->xnum-1]`). That bit is the per‑row "this line is soft‑wrapped into the next" marker (see [§3.1](#31-a-the-continuation-marker-next_char_was_wrapped)).
-2. **`next_dest_line(continued)` (`kitty/rewrap.h:L24-L38`)** finishes the current destination row and starts a new one. It first stamps the just‑finished row's continuation flag via `linebuf_set_last_char_as_continuation(dest, dest_y, continued)` (**L26**). If the destination is already on its last row (`dest_y >= dest->ynum - 1`), it scrolls that row off the top and — **only if `historybuf != NULL`** (**L29-L33**) — pushes it into scrollback via `historybuf_add_line(historybuf, dest->line, as_ansi_buf)` (**L32**). This `historybuf != NULL` guard is the hinge the whole cross‑buffer story turns on.
+1. **`is_src_line_continued()` (`kitty/rewrap.h:L40-L42`, read at L41)** is *the* soft-wrap continuation test: it reads the `next_char_was_wrapped` bit of the **last cell** of the source row (`gpu_cells[src->xnum-1]`). That bit is the per-row "this line is soft-wrapped into the next" marker (see [§3.1](#31-a-the-continuation-marker-next_char_was_wrapped)).
+2. **`next_dest_line(continued)` (`kitty/rewrap.h:L24-L38`)** finishes the current destination row and starts a new one. It first stamps the just-finished row's continuation flag via `linebuf_set_last_char_as_continuation(dest, dest_y, continued)` (**L26**). If the destination is already on its last row (`dest_y >= dest->ynum - 1`), it scrolls that row off the top and — **only if `historybuf != NULL`** (**L29-L33**) — pushes it into scrollback via `historybuf_add_line(historybuf, dest->line, as_ansi_buf)` (**L32**). This `historybuf != NULL` guard is the hinge the whole cross-buffer story turns on.
 3. **`set_dest_line_attrs` (`kitty/rewrap.h:L18`)** copies the source row's line attributes onto the destination row and resets the source's `prompt_kind`.
 
-**Low‑level cell copy and the cursor tracker** (`kitty/rewrap.h:L44-L53`):
+**Low-level cell copy and the cursor tracker** (`kitty/rewrap.h:L44-L53`):
 
 ```c
 static inline void
@@ -535,17 +595,17 @@ rewrap_inner(BufType *src, BufType *dest, const index_type src_limit, HistoryBuf
 }
 ```
 
-Walking it as cause → effect:
+Walking it as cause → effect — **`(inferred)`**, a read-through of the source quoted directly above (every step cites its `kitty/rewrap.h` line); the **`(observed)`** runtime footprint of these steps appears in [§3](#3--reflow-across-new-dimensions-continuation--cursor-r2), [§4](#4--linebuf--historybuf-interaction-during-resize-r3), and [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6):
 
 - **Per source row**, it reads the continuation bit into `src_line_is_continued` (**L66**).
-- **If the row is *not* continued** (a hard line break ends it), it **trims trailing blank cells** by shrinking `src_x_limit` while the last cell is `BLANK_CHAR` (**L68-L70**). This is why hard‑ended lines do not carry their padding into the reflowed result.
-- **If the row *is* continued**, it **clears the source's terminal wrapped bit**: `src->line->gpu_cells[src->xnum-1].attrs.next_char_was_wrapped = false;` (**L71-L73**, the clear at **L72**). The bit is about to be re‑derived by the copy loop, so the source copy is normalized first.
+- **If the row is *not* continued** (a hard line break ends it), it **trims trailing blank cells** by shrinking `src_x_limit` while the last cell is `BLANK_CHAR` (**L68-L70**). This is why hard-ended lines do not carry their padding into the reflowed result.
+- **If the row *is* continued**, it **clears the source's terminal wrapped bit**: `src->line->gpu_cells[src->xnum-1].attrs.next_char_was_wrapped = false;` (**L71-L73**, the clear at **L72**). The bit is about to be re-derived by the copy loop, so the source copy is normalized first.
 - It clamps any tracked cursor whose `x` is past the trimmed limit (**L74-L76**), and on the very first source row opens the first destination row via `first_dest_line` (**L77-L79**).
-- The **copy loop** (**L80-L91**) fills destination rows `dest->xnum` cells at a time. Whenever the destination row is full (`dest_x >= dest->xnum`), it calls **`next_dest_line(true)`** (**L81**) — the `true` marks the row it just finished as *soft‑wrapped* (continued). Each chunk is a `copy_range(...)` (**L83**), and the tracked cursor is remapped to its new `(dest_y, dest_x)` position (**L84-L89**).
-- After a *non‑continued* source row (and if more source remains), it emits a **hard break** with **`next_dest_line(false)`** (**L93**) — the `false` leaves the finished row *not* continued.
+- The **copy loop** (**L80-L91**) fills destination rows `dest->xnum` cells at a time. Whenever the destination row is full (`dest_x >= dest->xnum`), it calls **`next_dest_line(true)`** (**L81**) — the `true` marks the row it just finished as *soft-wrapped* (continued). Each chunk is a `copy_range(...)` (**L83**), and the tracked cursor is remapped to its new `(dest_y, dest_x)` position (**L84-L89**).
+- After a *non-continued* source row (and if more source remains), it emits a **hard break** with **`next_dest_line(false)`** (**L93**) — the `false` leaves the finished row *not* continued.
 - Finally it records the number of destination rows produced: `dest->line->ynum = dest_y;` (**L95**).
 
-The crucial asymmetry to keep in mind for R4/R6: the destination row's continuation bit is (re)written **only** by a `next_dest_line(...)` call. `next_dest_line(true)` happens **only when a destination row fills** (L81). So if a continued source row's content **fits without filling** the destination row, `next_dest_line(true)` is never called for it, and the continuation bit is **not re‑applied** — it stays cleared by L72.
+The crucial asymmetry to keep in mind for R4/R6: the destination row's continuation bit is (re)written **only** by a `next_dest_line(...)` call. `next_dest_line(true)` happens **only when a destination row fills** (L81). So if a continued source row's content **fits without filling** the destination row, `next_dest_line(true)` is never called for it, and the continuation bit is **not re-applied** — it stays cleared by L72. This mechanism is `(inferred)` from the code above; its `(observed)` footprint — the `True → False` continuation-bit loss on a straddling line — is captured in [§6.2](#62-observed-scenario-a--the-defect).
 
 ### 2.2 Specialization #1 — the visible buffer, `kitty/line-buf.c` (default macros)
 
@@ -556,7 +616,7 @@ The crucial asymmetry to keep in mind for R4/R6: the destination row's continuat
 ```
 — `kitty/line-buf.c:L583`.
 
-The visible‑buffer entry point is `linebuf_rewrap()` (`kitty/line-buf.c:L585-L622`), quoted in full:
+The visible-buffer entry point is `linebuf_rewrap()` (`kitty/line-buf.c:L585-L622`), quoted in full:
 
 ```c
 void
@@ -616,7 +676,7 @@ linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool continue
 ```
 — it writes `next_char_was_wrapped = continued` on the last cell of row `y` (**L196**).
 
-### 2.3 Specialization #2 — the scrollback, `kitty/history.c` (overridden macros) — the root‑cause file
+### 2.3 Specialization #2 — the scrollback, `kitty/history.c` (overridden macros) — the root-cause file
 
 `kitty/history.c` **redefines** the template macros *before* including it, then includes it (`kitty/history.c:L582-L592`):
 
@@ -666,8 +726,8 @@ historybuf_rewrap(HistoryBuf *self, HistoryBuf *other, ANSIBuf *as_ansi_buf) {
 }
 ```
 
-- **Fast path** at **`kitty/history.c:L597-L606`** (same‑geometry `memcpy`).
-- The reflow call is **`rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf)` at `kitty/history.c:L611`**. The two `NULL`s are **not symmetric**: the **first** is the `historybuf` parameter, which is **genuinely unused** for this specialization — the signature even marks it `HistoryBuf UNUSED *historybuf` (`kitty/rewrap.h:L57`) — because the only code that would read it (the overflow branch `kitty/rewrap.h:L29-L33`) is **not compiled** once `history.c:L588` overrides `next_dest_line` (see above). Passing a non‑`NULL` value there would have **no effect**. The **second** `NULL` is the `TrackCursor *track`; it **is** consumed, at `kitty/rewrap.h:L61` (`if (!track) track = &tc_end;`), and `NULL` correctly means *track no cursor* — the cursor lives in the visible buffer, not in scrollback. What makes this pass unable to rejoin a straddling line is therefore **not** either `NULL` but its **source domain**: it reads rows **only** from `self` (the old scrollback ring, via the circular `map_src_index` at `kitty/history.c:L584`) and never sees the visible buffer at all.
+- **Fast path** at **`kitty/history.c:L597-L606`** (same-geometry `memcpy`).
+- The reflow call is **`rewrap_inner(self, other, self->count, NULL, NULL, as_ansi_buf)` at `kitty/history.c:L611`**. The two `NULL`s are **not symmetric**: the **first** is the `historybuf` parameter, which is **genuinely unused** for this specialization — the signature even marks it `HistoryBuf UNUSED *historybuf` (`kitty/rewrap.h:L57`) — because the only code that would read it (the overflow branch `kitty/rewrap.h:L29-L33`) is **not compiled** once `history.c:L588` overrides `next_dest_line` (see above). Passing a non-`NULL` value there would have **no effect**. The **second** `NULL` is the `TrackCursor *track`; it **is** consumed, at `kitty/rewrap.h:L61` (`if (!track) track = &tc_end;`), and `NULL` correctly means *track no cursor* — the cursor lives in the visible buffer, not in scrollback. What makes this pass unable to rejoin a straddling line is therefore **not** either `NULL` but its **source domain**: it reads rows **only** from `self` (the old scrollback ring, via the circular `map_src_index` at `kitty/history.c:L584`) and never sees the visible buffer at all.
 
 The continuation setter for scrollback is `history_buf_set_last_char_as_continuation()` (`kitty/history.c:L302-L307`):
 
@@ -691,7 +751,7 @@ history_buf_set_last_char_as_continuation(HistoryBuf *self, index_type y, bool w
 | Overflow of the top row | default `next_dest_line` pushes it into scrollback via `historybuf_add_line` (`rewrap.h:L29-L33`) | overflow branch **not compiled** — `history.c:L588` overrides `next_dest_line`; new rows pushed via `historybuf_push` (`history.c:L588`); scrollback *is* the sink |
 | Cursor tracking | yes | no |
 
-The identical inner algorithm therefore does two different jobs depending purely on the **macro environment** (which `next_dest_line`/`init_src_line`/`BufType` are in force) and on **which buffer supplies the source rows** — linear `LineBuf` vs. the circular `HistoryBuf` ring (`history.c:L584`). That per‑buffer source isolation — not the `NULL` arguments at `history.c:L611` — is what produces the boundary defect in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6).
+The identical inner algorithm therefore does two different jobs depending purely on the **macro environment** (which `next_dest_line`/`init_src_line`/`BufType` are in force) and on **which buffer supplies the source rows** — linear `LineBuf` vs. the circular `HistoryBuf` ring (`history.c:L584`). That per-buffer source isolation — not the `NULL` arguments at `history.c:L611` — is what produces the boundary defect in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6).
 
 ---
 
@@ -701,22 +761,22 @@ The identical inner algorithm therefore does two different jobs depending purely
 
 ### 3.1 (a) The continuation marker `next_char_was_wrapped`
 
-kitty distinguishes **soft wraps** (a logical line too wide for the grid, which *should* be rejoined and reflowed on resize) from **hard wraps** (an explicit newline, a logical boundary that *must* be preserved). The distinction is carried by a **single bit on the last cell of each row**: `next_char_was_wrapped`, a 1‑bit field of the `CellAttrs` union (`kitty/data-types.h:L206`):
+kitty distinguishes **soft wraps** (a logical line too wide for the grid, which *should* be rejoined and reflowed on resize) from **hard wraps** (an explicit newline, a logical boundary that *must* be preserved). The distinction is carried by a **single bit on the last cell of each row**: `next_char_was_wrapped`, a 1-bit field of the `CellAttrs` union (`kitty/data-types.h:L206`):
 
 ```c
 uint16_t next_char_was_wrapped : 1;
 ```
 
-(The same field appears in the `SGR_MASK` definition at `kitty/data-types.h:L214`.) When the last cell of a row has this bit set, the row is *soft‑wrapped* — its logical line continues on the next row.
+(The same field appears in the `SGR_MASK` definition at `kitty/data-types.h:L214`.) When the last cell of a row has this bit set, the row is *soft-wrapped* — its logical line continues on the next row.
 
 How reflow reads and rewrites the bit, as cause → effect (all in `rewrap_inner`, [§2.1](#21-the-shared-template--kittyrewraph)):
 
 1. **Read.** `is_src_line_continued()` reads `gpu_cells[src->xnum-1].attrs.next_char_was_wrapped` (`kitty/rewrap.h:L41`), consumed at `kitty/rewrap.h:L66`.
 2. **Not continued → trim + hard break.** Trailing blanks are trimmed (`kitty/rewrap.h:L68-L70`) and, once the row is copied, `next_dest_line(false)` emits a hard break (`kitty/rewrap.h:L93`) — the finished destination row is left *not* continued.
 3. **Continued → clear source bit, flow through.** The source's terminal bit is cleared (`kitty/rewrap.h:L72`) and the characters flow straight into the next destination row without a boundary.
-4. **Re‑stamp on fill.** When a destination row fills mid‑logical‑line, `next_dest_line(true)` (`kitty/rewrap.h:L81`) sets the just‑finished destination row's continuation bit via the buffer's setter (`linebuf_set_last_char_as_continuation`, `kitty/line-buf.c:L196`; or `history_buf_set_last_char_as_continuation`, `kitty/history.c:L305`).
+4. **Re-stamp on fill.** When a destination row fills mid-logical-line, `next_dest_line(true)` (`kitty/rewrap.h:L81`) sets the just-finished destination row's continuation bit via the buffer's setter (`linebuf_set_last_char_as_continuation`, `kitty/line-buf.c:L196`; or `history_buf_set_last_char_as_continuation`, `kitty/history.c:L305`).
 
-`(observed)` The end‑to‑end effect on **widening** — a single 12‑char logical line drawn into a 4‑wide grid, then widened to 6 — is visible in Scenario A2, where the whole line lives inside the visible buffer. Before, the logical line occupies three soft‑wrapped 4‑wide rows; after, it occupies two soft‑wrapped 6‑wide rows, and the continuation bits track the new boundaries exactly:
+`(observed)` The end-to-end effect on **widening** — a single 12-char logical line drawn into a 4-wide grid, then widened to 6 — is visible in Scenario A2, where the whole line lives inside the visible buffer. Before, the logical line occupies three soft-wrapped 4-wide rows; after, it occupies two soft-wrapped 6-wide rows, and the continuation bits track the new boundaries exactly:
 
 ```
 A2.BEFORE (4 cols x 4 lines; whole logical line in visible buffer, scrollback empty):
@@ -739,13 +799,13 @@ A2.AFTER  resize(4,6) widen to 6 cols:
       (scrollback empty)
 ```
 
-Note the reading convention: `is_continued=True` on a row means that row is the *continuation of* the previous one (kitty's per‑row "is this line continued from above" query), while `last_char_wrapped=True` means the row's last cell has `next_char_was_wrapped` set (it wraps *into* the next). Row `VIS[0] 'ABCDEF'` has `last_char_wrapped=True` (it wraps into `GHIJKL`), and `VIS[1] 'GHIJKL'` has `is_continued=True` (it continues `ABCDEF`) — the logical line `ABCDEFGHIJKL` is preserved as one soft‑wrapped unit.
+Note the reading convention: `is_continued=True` on a row means that row is the *continuation of* the previous one (kitty's per-row "is this line continued from above" query), while `last_char_wrapped=True` means the row's last cell has `next_char_was_wrapped` set (it wraps *into* the next). Row `VIS[0] 'ABCDEF'` has `last_char_wrapped=True` (it wraps into `GHIJKL`), and `VIS[1] 'GHIJKL'` has `is_continued=True` (it continues `ABCDEF`) — the logical line `ABCDEFGHIJKL` is preserved as one soft-wrapped unit.
 
-`(observed)` The effect on **narrowing** is Scenario B ([§4.3](#43-observed-narrowing-pushes-overflow-into-scrollback-scenario-b)): each wide row is split into several narrow rows, with continuation bits set on every non‑final piece.
+`(observed)` The effect on **narrowing** is Scenario B ([§4.3](#43-observed-narrowing-pushes-overflow-into-scrollback-scenario-b)): each wide row is split into several narrow rows, with continuation bits set on every non-final piece.
 
 ### 3.2 (b) Cursor preservation: the `TrackCursor` machinery (R2)
 
-The cursor (and the saved‑cursor savepoints) are carried through the transformation so they still point at the same logical character afterwards. The mechanism is the `TrackCursor` struct (`kitty/rewrap.h:L50-L53`):
+The cursor (and the saved-cursor savepoints) are carried through the transformation so they still point at the same logical character afterwards. The mechanism is the `TrackCursor` struct (`kitty/rewrap.h:L50-L53`):
 
 - `linebuf_rewrap` seeds a real `TrackCursor tcarr[3]` with the current and saved cursor coordinates (`kitty/line-buf.c:L616`) and passes it into `rewrap_inner` (`kitty/line-buf.c:L617`).
 - Inside `rewrap_inner`, for each source row the tracker's `is_tracked_line` flag is set when `src_y` matches the tracked `y` (`kitty/rewrap.h:L64`); during the copy loop, when the tracked `x` falls inside the copied chunk, the tracker is remapped to its new grid position (`kitty/rewrap.h:L84-L89`):
@@ -782,9 +842,9 @@ Note (contrast with [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-o
 
 ### 3.3 Widen, narrow, and the fast path
 
-Four `(observed)` cursor scenarios exercise the `TrackCursor` machinery end‑to‑end — a **genuine widening** (C_widen), **two narrowings** (C, C2), and the **same‑dimensions fast path** (D). In C_widen/C/C2 the cursor sits on the tail character `G`, and the tracker follows that same logical character to its new grid position as the content is rejoined or split.
+Several `(observed)` cursor scenarios exercise the `TrackCursor` machinery end-to-end — a **genuine widening** (C_widen), **narrowings** (C, C2, plus the required `C_req`/`C2_req` below), and the **same-dimensions fast path** (D). In C_widen/C/C2 the cursor sits on the tail character `G`, and the tracker follows that same logical character to its new grid position as the content is rejoined or split.
 
-**Scenario C_widen — genuine WIDENING, cursor remapped.** A 7‑character line `ABCDEFG` drawn into a 4‑wide grid occupies two soft‑wrapped rows `ABCD`/`EFG`; widening to 8 columns **rejoins** them into a single row `ABCDEFG`, and the cursor on `G` moves from `(x=3, y=1)` to `(x=7, y=0)`:
+**Scenario C_widen — genuine WIDENING, cursor remapped.** A 7-character line `ABCDEFG` drawn into a 4-wide grid occupies two soft-wrapped rows `ABCD`/`EFG`; widening to 8 columns **rejoins** them into a single row `ABCDEFG`, and the cursor on `G` moves from `(x=3, y=1)` to `(x=7, y=0)`:
 
 Command: `create_screen(cols=4, lines=3, scrollback=100)` → `draw('ABCDEFG')` → `resize(3, 8)` (lines=3, columns=8 — **widen** 4→8).
 ```
@@ -806,7 +866,7 @@ C_widen.AFTER  resize(3,8) widen to 8 cols (rejoined to 'ABCDEFG'); cursor remap
       (scrollback empty)
 ```
 
-**Scenario C — NARROWING (this is the document's original "Scenario C", corrected).** `resize(5, 3)` **narrows** the column count 5→3 (the second argument is columns) — it does *not* widen. `ABCDEFG` in a 5‑wide grid is `ABCDE`/`FG`; narrowing to 3 columns reflows it to `ABC`/`DEF`/`G`, and the cursor on `G` remaps from `(x=2, y=1)` to `(x=1, y=2)`:
+**Scenario C — NARROWING (this is the document's original "Scenario C", corrected).** `resize(5, 3)` **narrows** the column count 5→3 (the second argument is columns) — it does *not* widen. `ABCDEFG` in a 5-wide grid is `ABCDE`/`FG`; narrowing to 3 columns reflows it to `ABC`/`DEF`/`G`, and the cursor on `G` remaps from `(x=2, y=1)` to `(x=1, y=2)`:
 
 Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('ABCDEFG')` → `resize(5, 3)` (lines=5, columns=3 — **narrow** 5→3).
 ```
@@ -832,7 +892,7 @@ C.AFTER  resize(5,3) narrow to 3 cols ('ABC'/'DEF'/'G'); cursor remapped to the 
       (scrollback empty)
 ```
 
-**Scenario C2 — NARROWING, cursor row splits.** The same `ABCDEFG` drawn into an 8‑wide grid is a single row; narrowing to 4 columns splits it to `ABCD`/`EFG`, and the cursor on `G` remaps from `(x=7, y=0)` to `(x=3, y=1)`:
+**Scenario C2 — NARROWING, cursor row splits.** The same `ABCDEFG` drawn into an 8-wide grid is a single row; narrowing to 4 columns splits it to `ABCD`/`EFG`, and the cursor on `G` remaps from `(x=7, y=0)` to `(x=3, y=1)`:
 
 Command: `create_screen(cols=8, lines=3, scrollback=100)` → `draw('ABCDEFG')` → `resize(3, 4)` (lines=3, columns=4 — **narrow** 8→4).
 ```
@@ -856,7 +916,63 @@ C2.AFTER  resize(3,4) narrow to 4 cols ('ABCD'/'EFG'); cursor remapped to x=3,y=
 
 Together C_widen, C and C2 show the `TrackCursor` machinery (`kitty/rewrap.h:L50-L53,L84-L89`; `kitty/screen.c:L419-L423`) doing its job: the cursor **follows the same logical character** to its new grid coordinate whether the content is **rejoined on widening** (C_widen) or **split on narrowing** (C, C2) `(observed)`.
 
-**Scenario D — the fast path (no reflow).** When *neither* columns nor lines change, both `linebuf_rewrap` (`kitty/line-buf.c:L591-L598`) and `historybuf_rewrap` (`kitty/history.c:L597-L606`) take the `memcpy` fast path and perform **no reflow**. Every rendered row is identical afterwards; the only change is that the cursor `x` is re‑clamped from 5 to 4 by the `S()` macro (`kitty/screen.c:L419`) because a pending‑wrap `x=5` is beyond the last valid column index of a 5‑wide grid:
+**Required cursor scenarios (`C_req`, `C2_req`) `(observed)`.** Two further cursor cases were captured through the same `Screen.resize` entry point to pin the `TrackCursor` machinery at both extremes — a short line that never reflows (the cursor must stay put) and a fully wrapped line that both re-splits and overflows into scrollback (the cursor must be remapped across the split).
+
+*`C_req` — short content, cursor invariant.* Drawing just `ab` into a 5x5 grid leaves the cursor at `x=2,y=0`; narrowing to 3 columns keeps `ab` on a single row, so the cursor is **unchanged** at `(2,0)` — a genuine no-op remap. Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('ab')` → `resize(5, 3)` (lines=5, columns=3 — narrow 5→3).
+
+```
+C_req.BEFORE (5 cols x 5 lines; 'ab' on one row, cursor after 'b' at x=2,y=0):
+    cursor: x=2 y=0
+    visible linebuf: lines(ynum)=5 cols(xnum)=5
+      VIS[0] text='ab'           is_continued=False last_char_wrapped=False
+      VIS[1] text=''             is_continued=False last_char_wrapped=False
+      VIS[2] text=''             is_continued=False last_char_wrapped=False
+      VIS[3] text=''             is_continued=False last_char_wrapped=False
+      VIS[4] text=''             is_continued=False last_char_wrapped=False
+    scrollback historybuf: count=0 lines(ynum)=100 cols(xnum)=5  [printed oldest-first]
+      (scrollback empty)
+C_req.AFTER  resize(5,3) narrow to 3 cols ('ab' still fits one row); cursor unchanged at x=2,y=0:
+    cursor: x=2 y=0
+    visible linebuf: lines(ynum)=5 cols(xnum)=3
+      VIS[0] text='ab'           is_continued=False last_char_wrapped=False
+      VIS[1] text=''             is_continued=False last_char_wrapped=False
+      VIS[2] text=''             is_continued=False last_char_wrapped=False
+      VIS[3] text=''             is_continued=False last_char_wrapped=False
+      VIS[4] text=''             is_continued=False last_char_wrapped=False
+    scrollback historybuf: count=0 lines(ynum)=100 cols(xnum)=3  [printed oldest-first]
+      (scrollback empty)
+```
+
+*`C2_req` — fully wrapped line, cursor remapped across a split.* Drawing `123451234512345` (15 chars) fills three wrapped rows with the cursor at the pending-wrap position `x=5,y=2`; narrowing to 2 columns re-splits the line into eight 2-wide pieces, pushes the top three into scrollback, and remaps the cursor to `x=1,y=4`. Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('123451234512345')` → `resize(5, 2)` (lines=5, columns=2 — narrow 5→2).
+
+```
+C2_req.BEFORE (5 cols x 5 lines; three wrapped rows '12345', cursor after last '5' at x=5,y=2):
+    cursor: x=5 y=2
+    visible linebuf: lines(ynum)=5 cols(xnum)=5
+      VIS[0] text='12345'        is_continued=False last_char_wrapped=True
+      VIS[1] text='12345'        is_continued=True  last_char_wrapped=True
+      VIS[2] text='12345'        is_continued=True  last_char_wrapped=False
+      VIS[3] text=''             is_continued=False last_char_wrapped=False
+      VIS[4] text=''             is_continued=False last_char_wrapped=False
+    scrollback historybuf: count=0 lines(ynum)=100 cols(xnum)=5  [printed oldest-first]
+      (scrollback empty)
+C2_req.AFTER  resize(5,2) narrow to 2 cols; cursor remapped to x=1,y=4:
+    cursor: x=1 y=4
+    visible linebuf: lines(ynum)=5 cols(xnum)=2
+      VIS[0] text='23'           is_continued=False last_char_wrapped=True
+      VIS[1] text='45'           is_continued=True  last_char_wrapped=True
+      VIS[2] text='12'           is_continued=True  last_char_wrapped=True
+      VIS[3] text='34'           is_continued=True  last_char_wrapped=True
+      VIS[4] text='5'            is_continued=True  last_char_wrapped=False
+    scrollback historybuf: count=3 lines(ynum)=100 cols(xnum)=2  [printed oldest-first]
+      HIST[2] text='12'           last_char_wrapped=True
+      HIST[1] text='34'           last_char_wrapped=True
+      HIST[0] text='51'           last_char_wrapped=True
+```
+
+Together, `C_req` and `C2_req` bracket the tracker's range `(observed)`: the cursor is **not** moved when no reflow touches its row (`C_req`, `(2,0)`→`(2,0)`), and it is **correctly remapped** when its row is both re-split and displaced into scrollback (`C2_req`, `(5,2)`→`(1,4)`).
+
+**Scenario D — the fast path (no reflow).** When *neither* columns nor lines change, both `linebuf_rewrap` (`kitty/line-buf.c:L591-L598`) and `historybuf_rewrap` (`kitty/history.c:L597-L606`) take the `memcpy` fast path and perform **no reflow**. Every rendered row is identical afterwards; the only change is that the cursor `x` is re-clamped from 5 to 4 by the `S()` macro (`kitty/screen.c:L419`) because a pending-wrap `x=5` is beyond the last valid column index of a 5-wide grid:
 
 Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('ABCDEFGHIJKLMNO')` → `resize(5, 5)` (identical dimensions).
 ```
@@ -885,15 +1001,39 @@ D.cursor-before=(5, 2) cursor-after=(4, 2) cursor-identical=False
 D.NOTE: buffer rows are unchanged (fast-path memcpy); cursor x re-clamped by screen_resize S() macro from pending-wrap col 5 to last col 4.
 ```
 
-The comparison is explicit in the final two lines of that output: **rendered row content (text + `is_continued` + `last_char_wrapped`) is identical (`True`)**, while the **cursor is *not* identical** (`(5, 2)` → `(4, 2)`). That is why the correct claim is "rendered line content identical," **not** "byte‑identical": the buffer rows match, but the cursor coordinate changes via the `S()` clamp. This `(observed)` block distinguishes "no reflow needed" (fast path) from "reflow performed" (Scenarios A/A2/B/C/C2/C_widen).
+The comparison is explicit in the final two lines of that output: **rendered row content (text + `is_continued` + `last_char_wrapped`) is identical (`True`)**, while the **cursor is *not* identical** (`(5, 2)` → `(4, 2)`). That is why the correct claim is "rendered line content identical," **not** "byte-identical": the buffer rows match, but the cursor coordinate changes via the `S()` clamp. This `(observed)` block distinguishes "no reflow needed" (fast path) from "reflow performed" (Scenarios A/A2/B/C/C2/C_widen).
+
+**Same-width control (`SW`) `(observed)` — reflow still runs when only the row count changes.** Scenario D above is the *fast path*, which fires only when **both** dimensions are unchanged. The complementary case keeps the **column count** fixed but changes the **row count**: this does **not** take the `memcpy` short-circuit; the full `rewrap_inner` path runs and top rows overflow into scrollback. Drawing the 15-char line `AAAAABBBBBCCCCC` into a 5x5 grid (three wrapped rows) and resizing to the same 5 columns but only 2 rows pushes the top row into scrollback. Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('AAAAABBBBBCCCCC')` → `resize(2, 5)` (lines=2, columns=5 — **same width**, fewer rows).
+
+```
+SW.BEFORE (5 cols x 5 lines; 15-char logical line across 3 rows 'AAAAA'/'BBBBB'/'CCCCC'):
+    cursor: x=5 y=2
+    visible linebuf: lines(ynum)=5 cols(xnum)=5
+      VIS[0] text='AAAAA'        is_continued=False last_char_wrapped=True
+      VIS[1] text='BBBBB'        is_continued=True  last_char_wrapped=True
+      VIS[2] text='CCCCC'        is_continued=True  last_char_wrapped=False
+      VIS[3] text=''             is_continued=False last_char_wrapped=False
+      VIS[4] text=''             is_continued=False last_char_wrapped=False
+    scrollback historybuf: count=0 lines(ynum)=100 cols(xnum)=5  [printed oldest-first]
+      (scrollback empty)
+SW.AFTER  resize(2,5) SAME width (5), rows 5->2 (top row 'AAAAA' overflows into scrollback):
+    cursor: x=4 y=1
+    visible linebuf: lines(ynum)=2 cols(xnum)=5
+      VIS[0] text='BBBBB'        is_continued=False last_char_wrapped=True
+      VIS[1] text='CCCCC'        is_continued=True  last_char_wrapped=False
+    scrollback historybuf: count=1 lines(ynum)=100 cols(xnum)=5  [printed oldest-first]
+      HIST[0] text='AAAAA'        last_char_wrapped=True
+```
+
+The width is unchanged (`cols(xnum)=5` before and after) yet `ynum` drops from 5 to 2 and `hist.count` rises from **0 to 1** `(observed)`: the top row `AAAAA` overflowed into scrollback (still `last_char_wrapped=True`) while `BBBBB`/`CCCCC` stayed visible, and the cursor moved `(5,2)` → `(4,1)`. This is the direct contrast to Scenario D: an unchanged width **alone** is not sufficient for the fast path — `linebuf_rewrap` takes the `memcpy` short-circuit only when *both* `xnum` **and** `ynum` are unchanged (`kitty/line-buf.c:L591-L598`), so a row-count change still routes through the reflow-and-overflow logic.
 
 ### 3.4 (observed) Prompt preservation on resize (OSC 133)
 
-When the shell marks its prompt with the OSC 133 protocol, kitty deliberately **does not reflow** the current prompt across a resize: it snapshots the prompt rows, lets the grid reflow, then writes the saved rows **back verbatim** so the shell can redraw without flicker. The marking sets `self->prompt_settings.redraws_prompts_at_all = 1` (`kitty/screen.c:L2334`); on resize, `screen_resize` calls **`prevent_current_prompt_from_rewrapping()`** (`kitty/screen.c:L302-L343`, invoked at `kitty/screen.c:L382`), which returns early unless that flag is set (`kitty/screen.c:L305`), snapshots the prompt lines from the cursor upward into a scratch `prompt_copy`, and after the two reflow passes copies them straight back with `linebuf_copy_line_to` (`kitty/screen.c:L444-L461`; the in‑source comment at `kitty/screen.c:L445-L448` states the anti‑flicker intent).
+When the shell marks its prompt with the OSC 133 protocol, kitty deliberately **does not reflow** the current prompt across a resize: it snapshots the prompt rows, lets the grid reflow, then copies the saved rows **back into the resized grid without running them through the normal reflow** so the shell can redraw without flicker. The marking sets `self->prompt_settings.redraws_prompts_at_all = 1` (`kitty/screen.c:L2334`); on resize, `screen_resize` calls **`prevent_current_prompt_from_rewrapping()`** (`kitty/screen.c:L302-L343`, invoked at `kitty/screen.c:L382`), which returns early unless that flag is set (`kitty/screen.c:L305`), snapshots the prompt lines from the cursor upward into a scratch `prompt_copy`, and after the two reflow passes copies them straight back with `linebuf_copy_line_to` (`kitty/screen.c:L444-L461`; the in-source comment at `kitty/screen.c:L445-L448` states the anti-flicker intent).
 
 This was exercised at runtime two ways — **with** an OSC 133;A prompt mark and, as a control, **without** it — drawing the same `PROMPT12` (which wraps to `PROM`/`PT12` at 4 columns) and widening to 6 columns.
 
-**With the OSC 133;A marker `(observed)`** — the prompt is snapshotted during reflow and restored **verbatim**, *not* reflowed; note that both after‑rows are `is_continued=False last_char_wrapped=False` (the soft‑wrap link is gone, because the rows were written back as‑is rather than reflowed into a `PROMPT`/`12` pair):
+**With the OSC 133;A marker `(observed)`** — the prompt rows are snapshotted before reflow and **copied back without the normal reflow**, so the two-row `PROM`/`PT12` text split is preserved rather than rejoined into a `PROMPT`/`12` pair. This is *not* a byte-for-byte identical restore: the rows are re-emitted into the widened 6-column buffer (their trailing padding grows from 4 to 6 columns), and — as the output below shows — the row-0 soft-wrap marker **clears from `True` to `False`** (`VIS[0]` goes from `last_char_wrapped=True` to `False`, and `VIS[1]` from `is_continued=True` to `False`), so the soft-wrap link between the two rows is dropped. The OSC 133;A marker itself is preserved across the resize (confirmed by the `PROMPT_MARKER` serialization below):
 
 Command: `parse_bytes(s, b'\033]133;A\007')` → `draw('PROMPT12')` → `resize(5, 6)` (widen 4→6).
 ```
@@ -907,7 +1047,7 @@ PROMPT.WITH.BEFORE (4 cols x 5 lines; marked prompt 'PROM'/'PT12'):
       VIS[4] text=''             is_continued=False last_char_wrapped=False
     scrollback historybuf: count=0 lines(ynum)=100 cols(xnum)=4  [printed oldest-first]
       (scrollback empty)
-PROMPT.WITH.AFTER  resize(5,6) widen to 6 cols (prompt lines blanked+restored verbatim, NOT reflowed):
+PROMPT.WITH.AFTER  resize(5,6) widen to 6 cols (prompt lines blanked+copied back without normal reflow):
     cursor: x=0 y=1
     visible linebuf: lines(ynum)=5 cols(xnum)=6
       VIS[0] text='PROM'         is_continued=False last_char_wrapped=False
@@ -945,7 +1085,20 @@ PROMPT.NOMARK.AFTER  resize(5,6) widen to 6 cols (reflows to 'PROMPT'/'12'):
       (scrollback empty)
 ```
 
-**Cause → effect, and before/intermediate/after.** The only difference between the two runs is the OSC 133;A mark. *Before:* both runs start from the identical `PROM`/`PT12` state (shown above). *Intermediate `(inferred)`:* with the mark set, `screen_resize` copies the prompt rows into the scratch `prompt_copy` and clears them before reflow, then copies them back at `kitty/screen.c:L444-L461`; this internal snapshot is not exposed at the Python boundary, so it is labeled inferred from the code. *After `(observed)`:* the marked run keeps the original `PROM`/`PT12` split with the continuation bit **cleared** (rows written back as‑is), whereas the control run's guard at `kitty/screen.c:L305` returns immediately and its prompt reflows through the normal `rewrap_inner` path to `PROMPT`/`12`. The observed contrast between the two after‑states is the direct footprint of the preservation branch.
+**Cause → effect, and before/intermediate/after.** The only difference between the two runs is the OSC 133;A mark. *Before:* both runs start from the identical `PROM`/`PT12` state (shown above). *Intermediate `(inferred)`:* with the mark set, `screen_resize` copies the prompt rows into the scratch `prompt_copy` and clears them before reflow, then copies them back at `kitty/screen.c:L444-L461`; this internal snapshot is not exposed at the Python boundary, so it is labeled inferred from the code. *After `(observed)`:* the marked run keeps the original `PROM`/`PT12` split with the continuation bit **cleared** (rows written back as-is), whereas the control run's guard at `kitty/screen.c:L305` returns immediately and its prompt reflows through the normal `rewrap_inner` path to `PROMPT`/`12`. The observed contrast between the two after-states is the direct footprint of the preservation branch.
+
+**Prompt-marker serialization (`PROMPT_MARKER`) `(observed)` — the OSC 133;A marker survives the resize.** The buffer-row view above shows the prompt *text* is preserved; this scenario additionally confirms that the **OSC 133 prompt marker itself** survives, by serializing the screen with `Screen.as_text_non_visual(callback, as_ansi=True)` before and after the resize. The marker is written with `parse_bytes(s, b'\033]133;A\007')`, the same `PROMPT12` is drawn (wrapping to `PROM`/`PT12` at 4 columns), and the grid is then widened to 6 columns.
+
+```
+PROMPT_MARKER.BEFORE serialize (as_ansi=True):
+    '\x1b[m\x1b]133;A\x1b\\PROM\x1b[mPT12\n\n\n'
+    cursor: x=4 y=1  line0='PROM' line1='PT12' is_continued(0)=False
+PROMPT_MARKER.AFTER  resize(5,6) widen 4->6 serialize (as_ansi=True):
+    '\x1b[m\x1b]133;A\x1b\\PROM\n\x1b[mPT12\n\n\n'
+    cursor: x=0 y=1  line0='PROM' line1='PT12' is_continued(0)=False
+```
+
+In **both** the before and after serializations the marker appears as the escape sequence `\x1b]133;A\x1b\\` immediately preceding `PROM` `(observed)` — i.e. the `A` (prompt-start) mark is re-emitted attached to the prompt's first row after the resize, so it is **not** lost by reflow. The only difference between the two serializations is a single `\n` that appears between `PROM` and `PT12` after widening: before, the two rows are emitted as one soft-wrapped run (`PROM` directly followed by `PT12`); after, they are emitted as two hard lines (`PROM\n...PT12`). `is_continued(0)` is `False` in both (row 0 is the prompt start, never itself a continuation). This is consistent with §3.4's buffer-level finding that the marked prompt rows are copied back without being reflowed and with the soft-wrap continuation bit cleared; the marker's survival keeps the shell's prompt tracking valid across the resize.
 
 ---
 
@@ -980,7 +1133,7 @@ It is invoked from `screen_resize` at **`kitty/screen.c:L375`**:
 
 `historybuf_rewrap` (the actual reflow) is called from `realloc_hb` at **`kitty/screen.c:L221`**, and — as established in [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file) — it internally calls `rewrap_inner(self, other, self->count, NULL, NULL, …)` at `kitty/history.c:L611`. Its source rows come **only** from the old scrollback ring (via the circular `map_src_index`, `kitty/history.c:L584`); the first `NULL` is the *unused* `historybuf` parameter (`kitty/rewrap.h:L57`, whose overflow branch `kitty/rewrap.h:L29-L33` is **not compiled** for this specialization — see [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file)), and the second disables cursor tracking (`kitty/rewrap.h:L61`).
 
-To confirm this pass is genuinely buffer‑local, `historybuf_rewrap` was driven **in isolation** on the real scrollback produced by Scenario A (the single `'ABCD'` row), rewrapping it from 4 to 6 columns with **no `LineBuf` involved** `(observed)`:
+To confirm this pass is genuinely buffer-local, `historybuf_rewrap` was driven **in isolation** on the real scrollback produced by Scenario A (the single `'ABCD'` row), rewrapping it from 4 to 6 columns with **no `LineBuf` involved**. This is a **supplementary** observation `(observed — supplementary)`: unlike every other runtime block in this document it does **not** flow through the canonical `Screen.resize` entry point — it calls the real `historybuf_rewrap` primitive directly via `HistoryBuf.rewrap` (the same function `screen_resize` invokes through `realloc_hb`, `kitty/screen.c:L221`), on scrollback that was itself produced canonically by `Screen.draw`. It isolates Pass 1; the primary, end-to-end evidence for the same flip is the canonical Scenario A ([§6.2](#62-observed-scenario-a--the-defect)):
 
 ```
 PASS1.BEFORE (real scrollback from Scenario A, 4-wide):
@@ -991,9 +1144,9 @@ PASS1.AFTER  rewrap to 6-wide (historybuf_rewrap alone, no LineBuf):
     HIST[0] 'ABCD' last_char_wrapped=False
 ```
 
-The lone scrollback row keeps its text `'ABCD'` but its continuation bit flips **`True → False`** even though no other buffer participates — proving Pass 1 neither pulls characters up nor preserves the soft‑wrap link across a boundary it cannot see. This is the same flip later observed end‑to‑end in Scenario A ([§6.2](#62-observed-scenario-a--the-defect)).
+The lone scrollback row keeps its text `'ABCD'` but its continuation bit flips **`True → False`** even though no other buffer participates — proving Pass 1 neither pulls characters up nor preserves the soft-wrap link across a boundary it cannot see. This is the same flip later observed end-to-end in Scenario A ([§6.2](#62-observed-scenario-a--the-defect)).
 
-**Pass 2 — the visible buffer.** `realloc_lb()` allocates a new `LineBuf` and rewraps the old visible buffer into it, **passing the already‑rewrapped `historybuf` as the overflow target** (`kitty/screen.c:L234-L242`):
+**Pass 2 — the visible buffer.** `realloc_lb()` allocates a new `LineBuf` and rewraps the old visible buffer into it, **passing the already-rewrapped `historybuf` as the overflow target** (`kitty/screen.c:L234-L242`):
 
 ```c
 static LineBuf*
@@ -1021,9 +1174,9 @@ The **alternate** screen is realloc'd with a **`NULL`** overflow target at **`ki
     n = realloc_lb(self->alt_linebuf, lines, columns, &num_content_lines_before, &num_content_lines_after, NULL, &cursor, &alt_saved_cursor, &self->as_ansi_buf);
 ```
 
-Between the two passes, on the main screen kitty also snapshots the current prompt so the shell can redraw it without flicker — `prevent_current_prompt_from_rewrapping()` (`kitty/screen.c:L302-L343`) is called at **`kitty/screen.c:L382`**, and the saved prompt lines are copied back after reflow at `kitty/screen.c:L444-L461`. This is orthogonal to the continuation‑bit story but is part of the same function.
+Between the two passes, on the main screen kitty also snapshots the current prompt so the shell can redraw it without flicker — `prevent_current_prompt_from_rewrapping()` (`kitty/screen.c:L302-L343`) is called at **`kitty/screen.c:L382`**, and the saved prompt lines are copied back after reflow at `kitty/screen.c:L444-L461`. This is orthogonal to the continuation-bit story but is part of the same function.
 
-### 4.2 How top‑overflow rows are pushed into scrollback
+### 4.2 How top-overflow rows are pushed into scrollback
 
 During Pass 2, when `rewrap_inner` fills the **last** destination row of the visible buffer and needs another, the template's `next_dest_line` (`kitty/rewrap.h:L24-L38`) scrolls the top row off and pushes it into scrollback — **but only because `historybuf != NULL`** on this pass (`kitty/rewrap.h:L29-L33`):
 
@@ -1050,13 +1203,13 @@ historybuf_add_line(HistoryBuf *self, const Line *line, ANSIBuf *as_ansi_buf) {
 }
 ```
 
-— it advances the ring with `historybuf_push()` (`kitty/history.c:L275-L284`, push at L288), then `copy_line(line, self->line)` (`kitty/history.c:L289`) copies **all** cells (including the last cell's continuation bit), then stores the line attributes (`kitty/history.c:L290`). `copy_line` is declared in `kitty/lineops.h:L25`; `linebuf_copy_line_to` at `kitty/lineops.h:L112` is the sibling primitive used by the prompt copy‑back. The reverse operation, `historybuf_pop_line()` (`kitty/history.c:L293-L300`), is used by the enlarged‑window scrollback‑fill path (`kitty/screen.c:L428-L438`).
+— it advances the ring with `historybuf_push()` (`kitty/history.c:L275-L284`, push at L288), then `copy_line(line, self->line)` (`kitty/history.c:L289`) copies **all** cells (including the last cell's continuation bit), then stores the line attributes (`kitty/history.c:L290`). `copy_line` is declared in `kitty/lineops.h:L25`; `linebuf_copy_line_to` at `kitty/lineops.h:L112` is the sibling primitive used by the prompt copy-back. The reverse operation, `historybuf_pop_line()` (`kitty/history.c:L293-L300`), is used by the enlarged-window scrollback-fill path (`kitty/screen.c:L428-L438`).
 
-The important asymmetry, restated for R3: **the visible‑buffer pass has a downstream sink for its overflow (scrollback); the scrollback pass is the bottom of the stack and has none.** This is **not** because of the `NULL` argument at `kitty/history.c:L611` (that parameter is unused here — [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file)) but because the `HistoryBuf` specialization's `next_dest_line` (`history.c:L588`) pushes new rows *within* scrollback rather than spilling elsewhere. Overflow therefore flows **only one way — down from the visible buffer into scrollback — never up**.
+The important asymmetry, restated for R3: **the visible-buffer pass has a downstream sink for its overflow (scrollback); the scrollback pass is the bottom of the stack and has none.** This is **not** because of the `NULL` argument at `kitty/history.c:L611` (that parameter is unused here — [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file)) but because the `HistoryBuf` specialization's `next_dest_line` (`history.c:L588`) pushes new rows *within* scrollback rather than spilling elsewhere. Overflow therefore flows **only one way — down from the visible buffer into scrollback — never up**.
 
 ### 4.3 (observed) Narrowing pushes overflow into scrollback (Scenario B)
 
-Drawing the 20‑character line `ABCDEFGHIJKLMNOPQRST` into a 5×5 grid occupies four rows (`ABCDE`/`FGHIJ`/`KLMNO`/`PQRST`) as one logical line — the first three carry the soft‑wrap continuation bit (`last_char_wrapped=True`) and `PQRST` is the terminus (`last_char_wrapped=False`). Narrowing to 2 columns splits the line into ten 2‑wide pieces (`AB CD EF GH IJ KL MN OP QR ST`); the visible buffer holds only the bottom 5 rows, so the top **5 rows overflow into scrollback**, each with its continuation bit preserved:
+Drawing the 20-character line `ABCDEFGHIJKLMNOPQRST` into a 5×5 grid occupies four rows (`ABCDE`/`FGHIJ`/`KLMNO`/`PQRST`) as one logical line — the first three carry the soft-wrap continuation bit (`last_char_wrapped=True`) and `PQRST` is the terminus (`last_char_wrapped=False`). Narrowing to 2 columns splits the line into ten 2-wide pieces (`AB CD EF GH IJ KL MN OP QR ST`); the visible buffer holds only the bottom 5 rows, so the top **5 rows overflow into scrollback**, each with its continuation bit preserved:
 
 Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('ABCDEFGHIJKLMNOPQRST')` → `resize(5, 2)` (lines=5, columns=2 — **narrow** 5→2).
 ```
@@ -1086,13 +1239,47 @@ B.AFTER  resize(5,2) narrow to 2 cols (10 rows total; bottom 5 visible, top 5 in
       HIST[0] text='IJ'           last_char_wrapped=True
 ```
 
-(As per [§1.6](#16-historybuf-index-convention-used-in-every-output-block), `HIST[4]` is the oldest/top scrollback row and `HIST[0]` the newest/just‑above‑visible.) `hist.count` went from **0 to 5** `(observed)`, proving the overflow push: the top five 2‑wide pieces `AB`/`CD`/`EF`/`GH`/`IJ` moved into scrollback while `KL`/`MN`/`OP`/`QR`/`ST` stayed visible. Every scrollback row and every visible row except the last carries `last_char_wrapped=True`, so the single logical line `ABCDEFGHIJKLMNOPQRST` is preserved end‑to‑end across the boundary — because **all of the content originated in the visible buffer and was handled by Pass 2 with a live overflow target**. This is the well‑behaved counterpart to the defect in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6), where content that was *already split across the two buffers before the resize* is not rejoined.
+(As per [§1.6](#16-historybuf-index-convention-used-in-every-output-block), `HIST[4]` is the oldest/top scrollback row and `HIST[0]` the newest/just-above-visible.) `hist.count` went from **0 to 5** `(observed)`, proving the overflow push: the top five 2-wide pieces `AB`/`CD`/`EF`/`GH`/`IJ` moved into scrollback while `KL`/`MN`/`OP`/`QR`/`ST` stayed visible. Every scrollback row and every visible row except the last carries `last_char_wrapped=True`, so the single logical line `ABCDEFGHIJKLMNOPQRST` is preserved end-to-end across the boundary — because **all of the content originated in the visible buffer and was handled by Pass 2 with a live overflow target**. This is the well-behaved counterpart to the defect in [§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6), where content that was *already split across the two buffers before the resize* is not rejoined.
+
+**Required deep-narrowing scenario (`B8`) `(observed)` — a 25-char line splits into eight scrollback rows.** Scenario B narrowed a 20-char line to 2 columns and pushed five rows into scrollback; the mandated `B8` case drives the split deeper to confirm the overflow count scales. Drawing the 25-char single logical line `0000011111222223333344444` into a 5x5 grid fills all five rows as one soft-wrapped run, then narrowing to 2 columns re-splits it into thirteen 2-wide pieces. Command: `create_screen(cols=5, lines=5, scrollback=100)` → `draw('0000011111222223333344444')` → `resize(5, 2)` (lines=5, columns=2 — narrow 5→2).
+
+```
+B8.BEFORE (5 cols x 5 lines; single 25-char logical line across all 5 rows):
+    cursor: x=5 y=4
+    visible linebuf: lines(ynum)=5 cols(xnum)=5
+      VIS[0] text='00000'        is_continued=False last_char_wrapped=True
+      VIS[1] text='11111'        is_continued=True  last_char_wrapped=True
+      VIS[2] text='22222'        is_continued=True  last_char_wrapped=True
+      VIS[3] text='33333'        is_continued=True  last_char_wrapped=True
+      VIS[4] text='44444'        is_continued=True  last_char_wrapped=False
+    scrollback historybuf: count=0 lines(ynum)=100 cols(xnum)=5  [printed oldest-first]
+      (scrollback empty)
+B8.AFTER  resize(5,2) narrow to 2 cols (13 rows total; bottom 5 visible, top 8 in scrollback):
+    cursor: x=1 y=4
+    visible linebuf: lines(ynum)=5 cols(xnum)=2
+      VIS[0] text='33'           is_continued=False last_char_wrapped=True
+      VIS[1] text='33'           is_continued=True  last_char_wrapped=True
+      VIS[2] text='44'           is_continued=True  last_char_wrapped=True
+      VIS[3] text='44'           is_continued=True  last_char_wrapped=True
+      VIS[4] text='4'            is_continued=True  last_char_wrapped=False
+    scrollback historybuf: count=8 lines(ynum)=100 cols(xnum)=2  [printed oldest-first]
+      HIST[7] text='00'           last_char_wrapped=True
+      HIST[6] text='00'           last_char_wrapped=True
+      HIST[5] text='01'           last_char_wrapped=True
+      HIST[4] text='11'           last_char_wrapped=True
+      HIST[3] text='11'           last_char_wrapped=True
+      HIST[2] text='22'           last_char_wrapped=True
+      HIST[1] text='22'           last_char_wrapped=True
+      HIST[0] text='23'           last_char_wrapped=True
+```
+
+`hist.count` went from **0 to 8** `(observed)`: the 25-char line becomes thirteen 2-wide rows (`00 00 01 11 11 22 22 23 33 33 44 44 4`), of which the bottom five stay visible (`33`/`33`/`44`/`44`/`4`) and the **top eight overflow into scrollback** (`00`/`00`/`01`/`11`/`11`/`22`/`22`/`23`, printed oldest-first as `HIST[7]`..`HIST[0]`). Every scrollback row and every visible row except the terminal `4` carries `last_char_wrapped=True`, so the single logical line is preserved end-to-end across the boundary — the same well-behaved overflow as Scenario B, at greater depth, because all content originated in the visible buffer and was handled by Pass 2 with a live overflow target. The cursor tracks from `(5,4)` to `(1,4)`.
 
 ---
 
 ## 5 — Complete data flow from resize trigger to cell copy (R5)
 
-**R5 asks:** *describe the complete data flow from the resize entry point through the rewrap logic — the full call chain down to the low‑level cell copying.*
+**R5 asks:** *describe the complete data flow from the resize entry point through the rewrap logic — the full call chain down to the low-level cell copying.*
 
 ### 5.1 The full chain
 
@@ -1130,7 +1317,7 @@ flowchart TD
 
 Step by step, top to bottom:
 
-1. **Upstream Python propagation `(inferred — static call‑graph trace; every edge is grounded in source, but the chain was not driven through a live GUI resize)`.** An OS‑window resize enters at **`Boss.on_window_resize()`** (`kitty/boss.py:L1206`), which calls **`tm.resize()`** (`kitty/boss.py:L1212`). **`TabManager.resize()`** (`kitty/tabs.py:L963`) relayouts every tab via **`tab.relayout()`** (`kitty/tabs.py:L969`). **`Tab.relayout()`** (`kitty/tabs.py:L298`) invokes the active layout as a callable — **`self.current_layout(self.windows)`** (`kitty/tabs.py:L300`) — landing in **`Layout.__call__()`** (`kitty/layout/base.py:L329`), whose body calls **`self.do_layout()`** (`kitty/layout/base.py:L333`). The concrete layout's **`do_layout()`** (for the default stack layout, `kitty/layout/stack.py:L16`) calls **`layout_single_window_group()`** (`kitty/layout/stack.py:L19`); **`Layout.layout_single_window_group()`** (`kitty/layout/base.py:L335`) computes the geometry and calls **`wg.set_geometry(geom)`** (`kitty/layout/base.py:L346`). **`WindowGroup.set_geometry()`** (`kitty/window_list.py:L118`) fans out to each window with **`w.set_geometry(geom)`** (`kitty/window_list.py:L120`), reaching `Window.set_geometry` (below). **Sibling, *not* part of this chain:** the same `TabManager.resize()` also calls **`self.tab_bar.layout()`** (`kitty/tabs.py:L966`), and **`TabBar.layout()`** (`kitty/tab_bar.py:L617`) resizes the **tab bar's own single‑row screen** with **`s.resize(1, ncells)`** (`kitty/tab_bar.py:L625`) — a distinct `Screen` object, *not* the window's grid, so it never touches the window reflow this question concerns.
+1. **Upstream Python propagation `(inferred — static call-graph trace; every edge is grounded in source, but the chain was not driven through a live GUI resize)`.** An OS-window resize enters at **`Boss.on_window_resize()`** (`kitty/boss.py:L1206`), which calls **`tm.resize()`** (`kitty/boss.py:L1212`). **`TabManager.resize()`** (`kitty/tabs.py:L963`) relayouts every tab via **`tab.relayout()`** (`kitty/tabs.py:L969`). **`Tab.relayout()`** (`kitty/tabs.py:L298`) invokes the active layout as a callable — **`self.current_layout(self.windows)`** (`kitty/tabs.py:L300`) — landing in **`Layout.__call__()`** (`kitty/layout/base.py:L329`), whose body calls **`self.do_layout()`** (`kitty/layout/base.py:L333`). The concrete layout's **`do_layout()`** (for the default stack layout, `kitty/layout/stack.py:L16`) calls **`layout_single_window_group()`** (`kitty/layout/stack.py:L19`); **`Layout.layout_single_window_group()`** (`kitty/layout/base.py:L335`) computes the geometry and calls **`wg.set_geometry(geom)`** (`kitty/layout/base.py:L346`). **`WindowGroup.set_geometry()`** (`kitty/window_list.py:L118`) fans out to each window with **`w.set_geometry(geom)`** (`kitty/window_list.py:L120`), reaching `Window.set_geometry` (below). **Sibling, *not* part of this chain:** the same `TabManager.resize()` also calls **`self.tab_bar.layout()`** (`kitty/tabs.py:L966`), and **`TabBar.layout()`** (`kitty/tab_bar.py:L617`) resizes the **tab bar's own single-row screen** with **`s.resize(1, ncells)`** (`kitty/tab_bar.py:L625`) — a distinct `Screen` object, *not* the window's grid, so it never touches the window reflow this question concerns.
 2. **`Window.set_geometry()`** (`kitty/window.py:L850-L856`). After a guard that skips work when nothing changed (`kitty/window.py:L853`), it calls into the screen and then notifies `on_resize` watchers (`kitty/window.py:L856`):
 
    ```python
@@ -1156,13 +1343,13 @@ Step by step, top to bottom:
    }
    ```
    parses `"|II"` into `(a, b)` and calls **`screen_resize(self, a, b)` at `kitty/screen.c:L3932`** (`a` = lines, `b` = columns). The method is registered as `MND(resize, METH_VARARGS)` at `kitty/screen.c:L4842`.
-4. **`screen_resize()`** (`kitty/screen.c:L345-L463`) clamps `lines`/`columns` to at least 1 (`kitty/screen.c:L348`), then runs **Pass 1** (`realloc_hb`, `kitty/screen.c:L375`) and **Pass 2** (`realloc_lb`, `kitty/screen.c:L384`) as detailed in [§4](#4--linebuf--historybuf-interaction-during-resize-r3), plus cursor remap/clamp (`kitty/screen.c:L419-L427`), optional scrollback‑fill of an enlarged window (`kitty/screen.c:L428-L438`), and prompt copy‑back (`kitty/screen.c:L444-L461`).
+4. **`screen_resize()`** (`kitty/screen.c:L345-L463`) clamps `lines`/`columns` to at least 1 (`kitty/screen.c:L348`), then runs **Pass 1** (`realloc_hb`, `kitty/screen.c:L375`) and **Pass 2** (`realloc_lb`, `kitty/screen.c:L384`) as detailed in [§4](#4--linebuf--historybuf-interaction-during-resize-r3), plus cursor remap/clamp (`kitty/screen.c:L419-L427`), optional scrollback-fill of an enlarged window (`kitty/screen.c:L428-L438`), and prompt copy-back (`kitty/screen.c:L444-L461`).
 5. **`historybuf_rewrap()`** (`kitty/history.c:L594-L614`) and **`linebuf_rewrap()`** (`kitty/line-buf.c:L585-L622`) each dispatch to the shared **`rewrap_inner()`** (`kitty/rewrap.h:L56-L96`) — history with `NULL, NULL` (`kitty/history.c:L611`), visible with a real overflow target and tracker (`kitty/line-buf.c:L617`).
-6. **Low‑level cell copy.** `rewrap_inner` moves characters with **`copy_range()`** — two `memcpy`s of the CPU and GPU cell arrays (`kitty/rewrap.h:L44-L48`). Top‑overflow rows are copied into scrollback by **`historybuf_add_line()` → `copy_line()`** (`kitty/history.c:L286-L291`, `copy_line` declared at `kitty/lineops.h:L25`). These are the leaves of the call tree — the actual bytes being redistributed.
+6. **Low-level cell copy.** `rewrap_inner` moves characters with **`copy_range()`** — two `memcpy`s of the CPU and GPU cell arrays (`kitty/rewrap.h:L44-L48`). Top-overflow rows are copied into scrollback by **`historybuf_add_line()` → `copy_line()`** (`kitty/history.c:L286-L291`, `copy_line` declared at `kitty/lineops.h:L25`). These are the leaves of the call tree — the actual bytes being redistributed.
 
 ### 5.2 Contrast: the PTY winsize path is NOT buffer reflow
 
-A resize also has to tell the child process about the new size. **`Window.set_geometry()` triggers this only *after* the buffer reflow:** once `self.screen.resize(...)` (`kitty/window.py:L854`) has returned, the same method recomputes the PTY size and — if it changed (`kitty/window.py:L861`) — calls **`boss.child_monitor.resize_pty(self.id, *current_pty_size)`** at **`kitty/window.py:L863`**. That crosses into a **completely separate** path in `kitty/child-monitor.c` and must not be conflated with the in‑memory reflow above. `pty_resize()` issues the `TIOCSWINSZ` ioctl (`kitty/child-monitor.c:L577-L589`):
+A resize also has to tell the child process about the new size. **`Window.set_geometry()` triggers this only *after* the buffer reflow:** once `self.screen.resize(...)` (`kitty/window.py:L854`) has returned, the same method recomputes the PTY size and — if it changed (`kitty/window.py:L861`) — calls **`boss.child_monitor.resize_pty(self.id, *current_pty_size)`** at **`kitty/window.py:L863`**. That crosses into a **completely separate** path in `kitty/child-monitor.c` and must not be conflated with the in-memory reflow above. `pty_resize()` issues the `TIOCSWINSZ` ioctl (`kitty/child-monitor.c:L577-L589`):
 
 ```c
 static bool
@@ -1181,19 +1368,19 @@ pty_resize(int fd, struct winsize *dim) {
 }
 ```
 
-The Python‑facing `resize_pty()` (`kitty/child-monitor.c:L592`, registered as `METHOD(resize_pty, METH_VARARGS)` at `kitty/child-monitor.c:L1922`) looks up the child fd and calls `pty_resize(fd, &dim)` at `kitty/child-monitor.c:L609`. This path merely sends the new window dimensions to the child (which the kernel turns into a `SIGWINCH`); it performs **no `rewrap_inner`, no `LineBuf`/`HistoryBuf` reflow, and touches no continuation bit**. In short: `screen.c` reflows kitty's *own* in‑memory grid; `child-monitor.c` tells the *child program* the terminal got bigger/smaller. R5's data flow concerns only the former.
+The Python-facing `resize_pty()` (`kitty/child-monitor.c:L592`, registered as `METHOD(resize_pty, METH_VARARGS)` at `kitty/child-monitor.c:L1922`) looks up the child fd and calls `pty_resize(fd, &dim)` at `kitty/child-monitor.c:L609`. This path merely sends the new window dimensions to the child (which the kernel turns into a `SIGWINCH`); it performs **no `rewrap_inner`, no `LineBuf`/`HistoryBuf` reflow, and touches no continuation bit**. In short: `screen.c` reflows kitty's *own* in-memory grid; `child-monitor.c` tells the *child program* the terminal got bigger/smaller. R5's data flow concerns only the former.
 
 ---
 
-## 6 — Reproduced edge case & root‑cause analysis (R4 + R6)
+## 6 — Reproduced edge case & root-cause analysis (R4 + R6)
 
-**R4 asks:** *identify potential issues with line‑continuation state propagation between the two buffers.* **R6 asks:** *reproduce and explain the observed edge cases where reflow does not preserve logical line boundaries.* They share one answer, so they are answered together.
+**R4 asks:** *identify potential issues with line-continuation state propagation between the two buffers.* **R6 asks:** *reproduce and explain the observed edge cases where reflow does not preserve logical line boundaries.* They share one answer, so they are answered together.
 
-> **Scope reminder.** The behavior below is **characterized, not fixed**. This is a read‑only investigation; proposing or applying a patch to the reflow logic is explicitly out of scope. The purpose here is to *surface and explain* the defect with observed evidence, not to repair it.
+> **Scope reminder.** The behavior below is **characterized, not fixed**. This is a read-only investigation; proposing or applying a patch to the reflow logic is explicitly out of scope. The purpose here is to *surface and explain* the defect with observed evidence, not to repair it.
 
-### 6.1 The reproduction (investigator‑constructed, not a user example)
+### 6.1 The reproduction (investigator-constructed, not a user example)
 
-The scenario used to trigger the defect was **constructed by this investigation** — the user supplied no examples. It places a single 12‑character logical line `ABCDEFGHIJKL` so that it **straddles the scrollback↔screen boundary**: with a 4‑column, 2‑row screen, drawing 12 characters fills both visible rows and scrolls the first wrapped piece (`ABCD`) into scrollback, leaving `EFGH`/`IJKL` visible. Then the screen is **widened** to 6 columns.
+The scenario used to trigger the defect was **constructed by this investigation** — the user supplied no examples. It places a single 12-character logical line `ABCDEFGHIJKL` so that it **straddles the scrollback↔screen boundary**: with a 4-column, 2-row screen, drawing 12 characters fills both visible rows and scrolls the first wrapped piece (`ABCD`) into scrollback, leaving `EFGH`/`IJKL` visible. Then the screen is **widened** to 6 columns.
 
 Command: `create_screen(cols=4, lines=2, scrollback=100)` → `draw('ABCDEFGHIJKL')` → `resize(2, 6)` (lines=2, columns=6).
 
@@ -1217,16 +1404,16 @@ A.AFTER  resize(2,6) widen to 6 cols:
 A.EXPECT-IF-REJOINED: one logical line ABCDEFGHIJKL at 6 cols would be 'ABCDEF' + 'GHIJKL'.
 ```
 
-**What this proves `(observed)`:** Before the resize the logical line is `ABCD`(soft‑wrapped, in scrollback) + `EFGH`(soft‑wrapped) + `IJKL`, i.e. `HIST[0]` has `last_char_wrapped=True`. After widening to 6 columns, the *correct* result would rejoin the line and back‑fill scrollback to `ABCDEF` (pulling `EF` up out of the visible buffer), with `HIST[0].last_char_wrapped` remaining `True`. Instead:
+**What this proves `(observed)`:** Before the resize the logical line is `ABCD`(soft-wrapped, in scrollback) + `EFGH`(soft-wrapped) + `IJKL`, i.e. `HIST[0]` has `last_char_wrapped=True`. After widening to 6 columns, the *correct* result would rejoin the line and back-fill scrollback to `ABCDEF` (pulling `EF` up out of the visible buffer), with `HIST[0].last_char_wrapped` remaining `True`. Instead:
 
-- `HIST[0]` stays `'ABCD'` and its continuation bit **flips `True → False`** — the soft‑wrap link is **lost**.
+- `HIST[0]` stays `'ABCD'` and its continuation bit **flips `True → False`** — the soft-wrap link is **lost**.
 - the visible buffer reflows **in isolation** to `'EFGHIJ'`/`'KL'`.
 
-No characters are lost — concatenating the shown rows gives `HIST[0]='ABCD'` + `VIS[0]='EFGHIJ'` + `VIS[1]='KL'` = `ABCDEFGHIJKL` — but the **logical line boundary is not preserved**: what was one logical line is now two logical segments — `ABCD` (now hard‑ended) and `EFGHIJKL` (soft‑wrapped).
+No characters are lost — concatenating the shown rows gives `HIST[0]='ABCD'` + `VIS[0]='EFGHIJ'` + `VIS[1]='KL'` = `ABCDEFGHIJKL` — but the **logical line boundary is not preserved**: what was one logical line is now two logical segments — `ABCD` (now hard-ended) and `EFGHIJKL` (soft-wrapped).
 
 ### 6.3 (observed) Scenario A2 — the control that isolates the cause
 
-The identical logical content, drawn so that it lives **entirely inside the visible buffer** (a 4‑column, 4‑row screen, so nothing spills into scrollback), reflows **correctly** on the same widening:
+The identical logical content, drawn so that it lives **entirely inside the visible buffer** (a 4-column, 4-row screen, so nothing spills into scrollback), reflows **correctly** on the same widening:
 
 Command: `create_screen(cols=4, lines=4, scrollback=100)` → `draw('ABCDEFGHIJKL')` → `resize(4, 6)`.
 ```
@@ -1250,23 +1437,23 @@ A2.AFTER  resize(4,6) widen to 6 cols:
       (scrollback empty)
 ```
 
-**What this proves `(observed)`:** with the whole line inside **one** buffer, `rewrap_inner` rejoins and re‑splits it correctly to `ABCDEF`/`GHIJKL`, continuation bits intact. So **for this scenario** — one continued logical line reflowed within a single buffer — the inner algorithm behaves correctly, and the **A‑vs‑A2 difference isolates the observed defect to the cross‑buffer (Pass 1 / Pass 2) seam** rather than to `rewrap_inner` itself. (This is a targeted control, not a proof of `rewrap_inner`'s correctness over all possible inputs; it establishes only that the *same text* reflows correctly when it does **not** straddle the boundary.) This contrast is the definitive evidence for R6.
+**What this proves `(observed)`:** with the whole line inside **one** buffer, `rewrap_inner` rejoins and re-splits it correctly to `ABCDEF`/`GHIJKL`, continuation bits intact. So **for this scenario** — one continued logical line reflowed within a single buffer — the inner algorithm behaves correctly, and the **A-vs-A2 difference isolates the observed defect to the cross-buffer (Pass 1 / Pass 2) seam** rather than to `rewrap_inner` itself. (This is a targeted control, not a proof of `rewrap_inner`'s correctness over all possible inputs; it establishes only that the *same text* reflows correctly when it does **not** straddle the boundary.) This contrast is the definitive evidence for R6.
 
 ### 6.4 Root cause, as a cause → effect chain (R4)
 
-The behavior follows directly from the code traced in [§2](#2--rewrap-c-code-trace-r1) and [§4](#4--linebuf--historybuf-interaction-during-resize-r3). The root cause is that the two reflow passes operate on **disjoint source buffers** and are never handed the straddling line as a single continued run: Pass 1 (`historybuf_rewrap`) reads its source rows **only** from the old scrollback ring (circular `map_src_index`, `kitty/history.c:L584`) and Pass 2 (`linebuf_rewrap`) reads **only** from the old visible buffer, with Pass 1 fully completing before Pass 2 starts. Neither call sees the other buffer's cells. (The `NULL`s at `kitty/history.c:L611` are a *consequence* of this design, not the cause — the first is the unused `historybuf` parameter whose overflow branch is not compiled for `HistoryBuf` ([§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file)); the second merely disables cursor tracking, `kitty/rewrap.h:L61`.) Walking the straddling line `ABCD`(scrollback) + `EFGH`/`IJKL`(visible) on widening to 6:
+The behavior follows directly from the code traced in [§2](#2--rewrap-c-code-trace-r1) and [§4](#4--linebuf--historybuf-interaction-during-resize-r3). The root cause is that the two reflow passes operate on **disjoint source buffers** and are never handed the straddling line as a single continued run: Pass 1 (`historybuf_rewrap`) reads its source rows **only** from the old scrollback ring (circular `map_src_index`, `kitty/history.c:L584`) and Pass 2 (`linebuf_rewrap`) reads **only** from the old visible buffer, with Pass 1 fully completing before Pass 2 starts. Neither call sees the other buffer's cells. (The `NULL`s at `kitty/history.c:L611` are a *consequence* of this design, not the cause — the first is the unused `historybuf` parameter whose overflow branch is not compiled for `HistoryBuf` ([§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file)); the second merely disables cursor tracking, `kitty/rewrap.h:L61`.) Walking the straddling line `ABCD`(scrollback) + `EFGH`/`IJKL`(visible) on widening to 6 — the three mechanism steps below are **`(inferred)`** from the code cited in [§2](#2--rewrap-c-code-trace-r1)/[§4](#4--linebuf--historybuf-interaction-during-resize-r3), and each names the `(observed)` output that confirms it:
 
-1. **Pass 1 rewraps scrollback alone.** For source row `ABCD`, `is_src_line_continued()` reads its wrapped bit = `True` (`kitty/rewrap.h:L66`), so `rewrap_inner` **clears** the source's terminal wrapped bit (`kitty/rewrap.h:L72`) and copies `ABCD` into a fresh 6‑wide destination row.
-2. **The continuation bit is never re‑applied.** `ABCD` is only 4 chars, so it **fits in the 6‑wide row without filling it**. The copy loop's fill branch never triggers, so **`next_dest_line(true)` (`kitty/rewrap.h:L81`) is never called** for this row, so the destination row's continuation bit is **never re‑set**. Net: scrollback row `ABCD` ends with `next_char_was_wrapped = False` — exactly the `True → False` flip seen in the [§6.2](#62-observed-scenario-a--the-defect) output (and reproduced in isolation in [§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)). And because Pass 1's source domain is **only** the scrollback ring, there is no `EF` available to pull up out of the visible buffer to make `ABCDEF` — those cells live in a buffer this pass never reads.
+1. **Pass 1 rewraps scrollback alone.** For source row `ABCD`, `is_src_line_continued()` reads its wrapped bit = `True` (`kitty/rewrap.h:L66`), so `rewrap_inner` **clears** the source's terminal wrapped bit (`kitty/rewrap.h:L72`) and copies `ABCD` into a fresh 6-wide destination row.
+2. **The continuation bit is never re-applied.** `ABCD` is only 4 chars, so it **fits in the 6-wide row without filling it**. The copy loop's fill branch never triggers, so **`next_dest_line(true)` (`kitty/rewrap.h:L81`) is never called** for this row, so the destination row's continuation bit is **never re-set**. Net: scrollback row `ABCD` ends with `next_char_was_wrapped = False` — exactly the `True → False` flip seen in the [§6.2](#62-observed-scenario-a--the-defect) output (and reproduced in isolation in [§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)). And because Pass 1's source domain is **only** the scrollback ring, there is no `EF` available to pull up out of the visible buffer to make `ABCDEF` — those cells live in a buffer this pass never reads.
 3. **Pass 2 rewraps the visible buffer independently.** `linebuf_rewrap` starts fresh at `EFGH` with **no knowledge** that it continues `ABCD`, and reflows `EFGH`+`IJKL` to `EFGHIJ`/`KL` on its own.
 
-**Net effect (R4):** the continuation (wrapped) state does **not** propagate across the scrollback↔screen boundary in the widening direction. The two independent passes each do a locally‑correct job, but neither is responsible for the *seam* between them: Pass 1 finishes before Pass 2 begins and reads only scrollback rows, and Pass 2 reads only visible rows and has no back‑reference to the tail of scrollback. The `True → False` flip on `HIST[0]` is the concrete, observable footprint of that missing propagation.
+**Net effect (R4):** the continuation (wrapped) state does **not** propagate across the scrollback↔screen boundary in the widening direction. The two independent passes each do a locally-correct job, but neither is responsible for the *seam* between them: Pass 1 finishes before Pass 2 begins and reads only scrollback rows, and Pass 2 reads only visible rows and has no back-reference to the tail of scrollback. The `True → False` flip on `HIST[0]` is the concrete `(observed)` footprint of that missing propagation (captured in the [§6.2](#62-observed-scenario-a--the-defect) output).
 
 Why the narrowing case (Scenario B, [§4.3](#43-observed-narrowing-pushes-overflow-into-scrollback-scenario-b)) is *not* affected: there, the entire logical line originates in the **visible** buffer and is handled by **Pass 2**, which *does* have a live overflow target (`self->historybuf`), so overflow flows correctly **down** into scrollback with continuation bits preserved. The defect is specific to content that is **already split** across the boundary *before* the resize and would have to be rejoined **upward** — a direction no single pass covers, because Pass 1 reads only scrollback and Pass 2 reads only the visible buffer.
 
 ### 6.5 Determinism
 
-The reproduction is fully deterministic. Scenario A was executed five times and every run produced byte‑identical buffer state and cursor coordinates `(observed)`:
+The reproduction is fully deterministic. Scenario A was executed five times and every run produced byte-identical buffer state and cursor coordinates `(observed)`:
 
 ```
 DETERMINISM.all-5-runs-identical: True
@@ -1279,28 +1466,28 @@ DETERMINISM.canonical AFTER-state (run 0):
       HIST[0] text='ABCD'         last_char_wrapped=False
 ```
 
-The canonical after‑state above is identical to Scenario A's after‑state ([§6.2](#62-observed-scenario-a--the-defect)) — same rows `EFGHIJ`/`KL`, same cursor `(2,1)`, and the same defect footprint `HIST[0] 'ABCD' last_char_wrapped=False` — so the boundary defect reproduces bit‑for‑bit on every run. (There is no canonical hash: any digest would be over an investigator‑chosen serialization string and is therefore format‑dependent. The canonical, reproducible fact is that all five runs are identical.)
+The canonical after-state above is identical to Scenario A's after-state ([§6.2](#62-observed-scenario-a--the-defect)) — same rows `EFGHIJ`/`KL`, same cursor `(2,1)`, and the same defect footprint `HIST[0] 'ABCD' last_char_wrapped=False` — so the boundary defect reproduces bit-for-bit on every run. (There is no canonical hash: any digest would be over an investigator-chosen serialization string and is therefore format-dependent. The canonical, reproducible fact is that all five runs are identical.)
 
 ### 6.6 What would need to change (characterization only — not a fix)
 
-For completeness, and strictly as characterization: a corrective design would have to make the two passes aware of the **seam** between the buffers — for example, presenting the concatenation of the scrollback tail and the visible head to `rewrap_inner` as one continued run before splitting, or reflowing across both buffers in a single traversal so a straddling logical line is rejoined before it is re‑split. (Note that merely passing a non‑`NULL` `historybuf` argument at `kitty/history.c:L611` would **not** help: that parameter is unused for the `HistoryBuf` specialization because its overflow branch is not compiled — see [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file) — and in any case the missing data flows *upward*, from the visible buffer into scrollback, which no overflow sink provides.) **No such change is made here** — this remains a read‑only investigation and the defect is left exactly as observed.
+For completeness, and strictly as characterization: a corrective design would have to make the two passes aware of the **seam** between the buffers — for example, presenting the concatenation of the scrollback tail and the visible head to `rewrap_inner` as one continued run before splitting, or reflowing across both buffers in a single traversal so a straddling logical line is rejoined before it is re-split. (Note that merely passing a non-`NULL` `historybuf` argument at `kitty/history.c:L611` would **not** help: that parameter is unused for the `HistoryBuf` specialization because its overflow branch is not compiled — see [§2.3](#23-specialization-2--the-scrollback-kittyhistoryc-overridden-macros--the-root-cause-file) — and in any case the missing data flows *upward*, from the visible buffer into scrollback, which no overflow sink provides.) **No such change is made here** — this remains a read-only investigation and the defect is left exactly as observed.
 
 ---
 
-## 7 — Observed‑vs‑inferred summary & R1–R6 coverage pass
+## 7 — Observed-vs-inferred summary & R1–R6 coverage pass
 
 ### 7.1 R1–R6 coverage table
 
 | Req | Answered in | Primary evidence | Kind | Rationale (why this answers it) |
 |-----|-------------|------------------|------|----------------------------------|
 | **R1** — Trace the rewrap C code | [§2](#2--rewrap-c-code-trace-r1) | `rewrap_inner` verbatim (`rewrap.h:L56-L96`); `linebuf_rewrap` (`line-buf.c:L585-L622`); `historybuf_rewrap` (`history.c:L594-L614`); macro overrides (`history.c:L582-L592`) | `(inferred)` code trace, `(observed)` behavior in §3/§4/§6 | One template compiled twice via macro specialization; both specializations quoted in full and their two call sites contrasted (`line-buf.c:L617` vs `history.c:L611`). |
-| **R2** — Reflow + continuation + cursor | [§3](#3--reflow-across-new-dimensions-continuation--cursor-r2) | continuation bit (`data-types.h:L206`) read (`rewrap.h:L41,L66`)/cleared (`L72`)/re‑stamped (`L81`,`L93`); `TrackCursor` (`rewrap.h:L50-L53,L84-L89`); `S()` clamp (`screen.c:L419-L423`); Scenarios A2, B, **C_widen**, **C**, **C2**, **D** | `(observed)` C_widen/C/C2/D/A2/B + `(inferred)` code | Shows the exact read/rewrite of the soft‑wrap bit and the cursor remap: the cursor follows the tail character as rows are **rejoined on widening** (C_widen: `(3,1)→(7,0)`) or **split on narrowing** (C: `(2,1)→(1,2)`; C2: `(7,0)→(3,1)`), and is re‑clamped by `S()` on the fast path (D: `(5,2)→(4,2)`). |
-| **R3** — LineBuf ↔ HistoryBuf interaction | [§4](#4--linebuf--historybuf-interaction-during-resize-r3) | order Pass 1 `realloc_hb` (`screen.c:L375`) then Pass 2 `realloc_lb` (`screen.c:L384`); overflow `next_dest_line`→`historybuf_add_line` (`rewrap.h:L29-L33`; `history.c:L286-L291`); Scenario **B** | `(observed)` B + `(inferred)` code | History rewrapped first, visible second; overflow pushed down into scrollback (hist.count 0→5). |
-| **R4** — Continuation‑state propagation issue | [§6.4](#64-root-cause-as-a-cause--effect-chain-r4) | disjoint per‑buffer source domains (Pass 1 reads only scrollback via `map_src_index` `history.c:L584`; Pass 2 reads only the visible buffer); missing `next_dest_line(true)` re‑stamp (`rewrap.h:L81`); Scenario **A** `True→False` flip; Pass‑1‑isolation ([§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)) | `(observed)` A + isolation + `(inferred)` cause chain | The wrapped bit is not propagated across the boundary upward; the flip on `HIST[0]` is the observable footprint. |
-| **R5** — Complete data flow | [§5](#5--complete-data-flow-from-resize-trigger-to-cell-copy-r5) | `Boss.on_window_resize` (`boss.py:L1206`) → `TabManager.resize` (`tabs.py:L963`) → `Tab.relayout` (`tabs.py:L298`) → `Layout.__call__` (`layout/base.py:L329`) → `do_layout` (`layout/stack.py:L16`) → `layout_single_window_group` (`layout/base.py:L335`) → `WindowGroup.set_geometry` (`window_list.py:L118`) → `Window.set_geometry` (`window.py:L854`) → binding (`screen.c:L3929-L3935`) → `screen_resize` (`screen.c:L345-L463`) → `rewrap_inner` → `copy_range`/`copy_line`; tab‑bar sibling (`tab_bar.py:L625`); PTY contrast (`window.py:L863` → `child-monitor.c:L577-L609`) | `(inferred)` chain, `(observed)` LINES‑first | Full call chain to the cell‑copy leaves, with the tab‑bar sibling and the PTY path explicitly separated. |
-| **R6** — Reproduce edge cases | [§6.2](#62-observed-scenario-a--the-defect)/[§6.3](#63-observed-scenario-a2--the-control-that-isolates-the-cause); full condition suite in [§3.3](#33-widen-narrow-and-the-fast-path)/[§3.4](#34-observed-prompt-preservation-on-resize-osc-133)/[§4.3](#43-observed-narrowing-pushes-overflow-into-scrollback-scenario-b)/[§6.5](#65-determinism) | Primary: Scenario **A** (cross‑buffer defect) vs **A2** (in‑buffer control). Plus **B** (narrow→scrollback overflow), **C_widen** (widen cursor remap), **C**/**C2** (narrow cursor remap), **D** (fast path), prompt preservation (OSC 133, with/without marker), determinism (5×) | `(observed)` — all nine scenarios with complete before/after output | The defect is isolated by contrasting identical text straddling the boundary (breaks) against wholly‑in‑one‑buffer (works); every surrounding condition — overflow, cursor remap on both widen and narrow, fast path, prompt preservation, and repeat‑run determinism — is separately reproduced next to its captured output. |
+| **R2** — Reflow + continuation + cursor | [§3](#3--reflow-across-new-dimensions-continuation--cursor-r2) | continuation bit (`data-types.h:L206`) read (`rewrap.h:L41,L66`)/cleared (`L72`)/re-stamped (`L81`,`L93`); `TrackCursor` (`rewrap.h:L50-L53,L84-L89`); `S()` clamp (`screen.c:L419-L423`); Scenarios A2, B, **C_widen**, **C**, **C2**, **C_req**, **C2_req**, **D** | `(observed)` C_widen/C/C2/C_req/C2_req/D/A2/B + `(inferred)` code | Shows the exact read/rewrite of the soft-wrap bit and the cursor remap: the cursor follows the tail character as rows are **rejoined on widening** (C_widen: `(3,1)→(7,0)`) or **split on narrowing** (C: `(2,1)→(1,2)`; C2: `(7,0)→(3,1)`), and is re-clamped by `S()` on the fast path (D: `(5,2)→(4,2)`); the required `C_req` is the no-op case (`(2,0)→(2,0)`, cursor invariant) and `C2_req` a wrapped narrow remap (`(5,2)→(1,4)`). |
+| **R3** — LineBuf ↔ HistoryBuf interaction | [§4](#4--linebuf--historybuf-interaction-during-resize-r3) | order Pass 1 `realloc_hb` (`screen.c:L375`) then Pass 2 `realloc_lb` (`screen.c:L384`); overflow `next_dest_line`→`historybuf_add_line` (`rewrap.h:L29-L33`; `history.c:L286-L291`); Scenarios **B**, **B8** (deep overflow), **SW** (same-width, rows only) | `(observed)` B/B8/SW + `(inferred)` code | History rewrapped first, visible second; overflow pushed down into scrollback (hist.count 0→5; B8 0→8; SW 0→1 with the column width held fixed). |
+| **R4** — Continuation-state propagation issue | [§6.4](#64-root-cause-as-a-cause--effect-chain-r4) | disjoint per-buffer source domains (Pass 1 reads only scrollback via `map_src_index` `history.c:L584`; Pass 2 reads only the visible buffer); missing `next_dest_line(true)` re-stamp (`rewrap.h:L81`); Scenario **A** `True→False` flip; Pass-1-isolation (supplementary) ([§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)) | `(observed)` A (canonical) + supplementary Pass-1 isolation + `(inferred)` cause chain | The wrapped bit is not propagated across the boundary upward; the flip on `HIST[0]` is the observable footprint. |
+| **R5** — Complete data flow | [§5](#5--complete-data-flow-from-resize-trigger-to-cell-copy-r5) | `Boss.on_window_resize` (`boss.py:L1206`) → `TabManager.resize` (`tabs.py:L963`) → `Tab.relayout` (`tabs.py:L298`) → `Layout.__call__` (`layout/base.py:L329`) → `do_layout` (`layout/stack.py:L16`) → `layout_single_window_group` (`layout/base.py:L335`) → `WindowGroup.set_geometry` (`window_list.py:L118`) → `Window.set_geometry` (`window.py:L854`) → binding (`screen.c:L3929-L3935`) → `screen_resize` (`screen.c:L345-L463`) → `rewrap_inner` → `copy_range`/`copy_line`; tab-bar sibling (`tab_bar.py:L625`); PTY contrast (`window.py:L863` → `child-monitor.c:L577-L609`) | `(inferred)` chain, `(observed)` LINES-first | Full call chain to the cell-copy leaves, with the tab-bar sibling and the PTY path explicitly separated. |
+| **R6** — Reproduce edge cases | [§6.2](#62-observed-scenario-a--the-defect)/[§6.3](#63-observed-scenario-a2--the-control-that-isolates-the-cause); full condition suite in [§3.3](#33-widen-narrow-and-the-fast-path)/[§3.4](#34-observed-prompt-preservation-on-resize-osc-133)/[§4.3](#43-observed-narrowing-pushes-overflow-into-scrollback-scenario-b)/[§6.5](#65-determinism) | Primary: Scenario **A** (cross-buffer defect) vs **A2** (in-buffer control). Plus **B**/**B8** (narrow→scrollback overflow, standard and deep), **SW** (same-width, rows-only reflow), **C_widen** (widen cursor remap), **C**/**C2**/**C_req**/**C2_req** (narrow cursor remap, incl. the required no-op and wrapped cases), **D** (fast path), prompt preservation (OSC 133, with/without marker) and **PROMPT_MARKER** (marker survives serialization), determinism (5×) | `(observed)` — every scenario with complete before/after output | The defect is isolated by contrasting identical text straddling the boundary (breaks) against wholly-in-one-buffer (works); every surrounding condition — overflow, cursor remap on both widen and narrow, fast path, prompt preservation, and repeat-run determinism — is separately reproduced next to its captured output. |
 
-### 7.2 Named‑entity checklist (every named item addressed)
+### 7.2 Named-entity checklist (every named item addressed)
 
 | Entity | Where | `file:line` |
 |--------|-------|-------------|
@@ -1322,7 +1509,7 @@ For completeness, and strictly as characterization: a corrective design would ha
 | `S()` clamp | §3.2 | `screen.c:L419-L423` |
 | `is_beyond_content` | §3.2 | `screen.c:L424-L427` |
 | `Boss.on_window_resize` | §5.1 | `boss.py:L1206` (`tm.resize()` `L1212`) |
-| `TabManager.resize` | §5.1 | `tabs.py:L963` (`tab.relayout()` `L969`; tab‑bar sibling `self.tab_bar.layout()` `L966`) |
+| `TabManager.resize` | §5.1 | `tabs.py:L963` (`tab.relayout()` `L969`; tab-bar sibling `self.tab_bar.layout()` `L966`) |
 | `Tab.relayout` | §5.1 | `tabs.py:L298` (`self.current_layout(self.windows)` `L300`) |
 | `Layout.__call__` | §5.1 | `layout/base.py:L329` (`self.do_layout()` `L333`) |
 | `Layout.do_layout` (concrete, Stack) | §5.1 | `layout/stack.py:L16` (`layout_single_window_group()` `L19`) |
@@ -1341,24 +1528,29 @@ For completeness, and strictly as characterization: a corrective design would ha
 
 | Condition | Scenario(s) | Before → After | Result |
 |-----------|-------------|----------------|--------|
-| **Widen (in‑buffer)** | A2 | 4×4 → 6 cols; `ABCDEFGHIJKL` wholly in the visible buffer | correct reflow; continuation bits track the new 6‑wide boundaries `(observed)` |
-| **Widen (cross‑buffer)** | A | 4×2 → 6 cols; `ABCDEFGHIJKL` straddling the seam | continuation lost across the seam (`HIST[0]` `True→False`) `(observed, defect)` |
+| **Widen (in-buffer)** | A2 | 4×4 → 6 cols; `ABCDEFGHIJKL` wholly in the visible buffer | correct reflow; continuation bits track the new 6-wide boundaries `(observed)` |
+| **Widen (cross-buffer)** | A | 4×2 → 6 cols; `ABCDEFGHIJKL` straddling the seam | continuation lost across the seam (`HIST[0]` `True→False`) `(observed, defect)` |
 | **Narrow** | B, C, C2 | B: 5×5 → 2 cols (20 chars); C: 5→3 cols; C2: 8→4 cols | overflow pushed to scrollback (B: `count 0→5`); rows split correctly `(observed)` |
-| **Cross‑buffer boundary** | A vs A2 | straddling vs wholly‑in‑buffer | isolates the defect to the seam `(observed)` |
+| **Narrow (deep, 25→2)** | B8 | 5×5 → 2 cols (25 chars) | thirteen 2-wide rows; **eight** overflow to scrollback (`count 0→8`) `(observed)` |
+| **Same width, fewer rows** | SW | 5×5 → 5×2 (columns held at 5) | reflow runs (**not** the fast path); top row overflows (`count 0→1`), cursor `(5,2)→(4,1)` `(observed)` |
+| **Cross-buffer boundary** | A vs A2 | straddling vs wholly-in-buffer | isolates the defect to the seam `(observed)` |
 | **Cursor — widen remap** | C_widen | `(3,1) → (7,0)` | cursor follows `G` as `ABCD`/`EFG` rejoin to `ABCDEFG` `(observed)` |
 | **Cursor — narrow remap** | C, C2 | C: `(2,1) → (1,2)`; C2: `(7,0) → (3,1)` | cursor follows `G` as rows split `(observed)` |
-| **Fast path (no reflow)** | D | 5×5 → 5×5 | rendered line content identical; cursor `x` re‑clamped `(5,2)→(4,2)` `(observed)` |
-| **Prompt preservation (OSC 133)** | PROMPT WITH vs NOMARK | 4×5 → 6 cols; `PROMPT12` | marked: restored verbatim (`PROM`/`PT12`, continuation bits cleared); control: reflows to `PROMPT`/`12` `(observed)` |
-| **Determinism** | A ×5 | same input repeated 5× | all 5 AFTER‑states identical `(observed)` |
+| **Cursor — short-content invariant** | C_req | `(2,0) → (2,0)` | cursor unchanged when no reflow touches its row `(observed)` |
+| **Cursor — wrapped narrow remap** | C2_req | `(5,2) → (1,4)` | cursor remapped across split + scrollback overflow `(observed)` |
+| **Fast path (no reflow)** | D | 5×5 → 5×5 | rendered line content identical; cursor `x` re-clamped `(5,2)→(4,2)` `(observed)` |
+| **Prompt preservation (OSC 133)** | PROMPT WITH vs NOMARK | 4×5 → 6 cols; `PROMPT12` | marked: copied back without normal reflow (`PROM`/`PT12` split kept, width 4→6, continuation bits cleared `True`→`False`, OSC 133 marker preserved); control: reflows to `PROMPT`/`12` `(observed)` |
+| **Prompt marker serialization (OSC 133;A)** | PROMPT_MARKER | 4×5 → 6 cols; `as_text_non_visual(as_ansi=True)` | marker `\x1b]133;A\x1b\\` survives, re-emitted before `PROM` in before **and** after `(observed)` |
+| **Determinism** | A ×5 | same input repeated 5× | all 5 AFTER-states identical `(observed)` |
 
 ### 7.4 Citation verification
 
-Every `file:line` reference in this document was independently re‑verified against the checked‑out source at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` during this investigation; all were exact. One note carried from the plan: `screen_resize`'s body spans `kitty/screen.c:L345-L463` (its closing brace is at L463; some summaries round the end to L465). The described symbols and behaviors are unaffected.
+Every `file:line` reference in this document was independently re-verified against the checked-out source at commit `815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1` during this investigation; all were exact. One note carried from the plan: `screen_resize`'s body spans `kitty/screen.c:L345-L463` (its closing brace is at L463; some summaries round the end to L465). The described symbols and behaviors are unaffected.
 
 ### 7.5 Observed vs. inferred — the short version
 
-- **Observed (runtime‑confirmed, with output blocks):** the two‑pass ordering's effect on state (A, A2, B); continuation‑bit read/rewrite outcomes (A, A2, B); cursor remap on **widening** (C_widen: `(3,1)→(7,0)`) and on **narrowing** (C: `(2,1)→(1,2)`; C2: `(7,0)→(3,1)`); the fast path (D: rendered line content identical, cursor re‑clamped `(5,2)→(4,2)`); **prompt preservation** on resize (OSC 133 with‑marker vs no‑marker control); the cross‑buffer continuation loss and its `True → False` footprint (A); determinism (5× identical); the LINES‑first argument order (empirically, `resize(2,6)` → 6 columns); and the **build outcome in this environment** (`CI=true python3 setup.py build` → exit 0, `.so` = 1,253,792 bytes, tracked source tree pristine).
-- **Inferred (code‑reading only, labeled inline):** the exact upstream `boss.py`/`tabs.py`/`tab_bar.py` propagation into `set_geometry`; that warning flags never change C semantics; and the cross‑environment `-Werror`/`wl_window.c` contingency that the `--ignore-compiler-warnings` flag would neutralize (it did **not** occur here because the Wayland backend was disabled).
+- **Observed (runtime-confirmed, with output blocks):** the two-pass ordering's effect on state (A, A2, B); continuation-bit read/rewrite outcomes (A, A2, B); cursor remap on **widening** (C_widen: `(3,1)→(7,0)`) and on **narrowing** (C: `(2,1)→(1,2)`; C2: `(7,0)→(3,1)`); the fast path (D: rendered line content identical, cursor re-clamped `(5,2)→(4,2)`); **prompt preservation** on resize (OSC 133 with-marker vs no-marker control); the cross-buffer continuation loss and its `True → False` footprint (A); determinism (5× identical); the LINES-first argument order (empirically, `resize(2,6)` → 6 columns); and the **build outcome in this environment** (`CI=true python3 setup.py build` → exit 0, `.so` = 1,253,792 bytes, tracked source tree pristine).
+- **Inferred (code-reading only, labeled inline):** the exact upstream `boss.py`/`tabs.py`/`tab_bar.py` propagation into `set_geometry`; that warning flags never change C semantics; and the cross-environment `-Werror`/`wl_window.c` contingency that the `--ignore-compiler-warnings` flag would neutralize (it did **not** occur here because the Wayland backend was disabled).
 
 ---
 
@@ -1366,9 +1558,9 @@ Every `file:line` reference in this document was independently re‑verified aga
 
 - Exactly **one** file was produced: this document (`blitzy/documentation/kitty_815df1e210e0.md`). To be precise about what "clean" means, four distinct notions are separated here:
   - **Tracked source cleanliness** — no kitty `.c`/`.h`/`.py`/`.rst`/build file was created, modified, or deleted. `git diff 815df1e210e0a9ab4622f5c7f2d6891d7dbeddf1 -- . ':(exclude)blitzy/documentation/*'` is empty.
-  - **Baseline‑to‑HEAD diff** — exactly one file differs from the source baseline `815df1e210e0…`: this deliverable.
-  - **Working‑tree status** — `git status --porcelain` shows only this one document (as a modified/added entry while it is being written, and nothing at all once it is committed). It is *not* literally empty while the document is uncommitted; the single entry is the intended deliverable.
-  - **Ignored build artifacts** — `kitty/fast_data_types.so` and `/build/` are git‑ignored (`.gitignore:L1`, `.gitignore:L14`) and never appear in `git status`.
-- Temporary probe scripts lived outside the repository (`/tmp/kitty_reflow_probe/`) and were removed after use.
+  - **Baseline-to-HEAD diff** — exactly one file differs from the source baseline `815df1e210e0…`: this deliverable.
+  - **Working-tree status** — `git status --porcelain` shows only this one document (as a modified/added entry while it is being written, and nothing at all once it is committed). It is *not* literally empty while the document is uncommitted; the single entry is the intended deliverable.
+  - **Ignored build artifacts** — `kitty/fast_data_types.so` and `/build/` are git-ignored (`.gitignore:L1`, `.gitignore:L14`) and never appear in `git status`.
+- Temporary probe scripts lived in a `mktemp -d` scratch directory outside the repository (`"${TMPDIR:-/tmp}/kitty_reflow_probe.XXXXXX"`) and were removed after use by a `trap 'rm -rf "$tmpdir"' EXIT` handler.
 - The candidate defect ([§6](#6--reproduced-edge-case--root-cause-analysis-r4--r6)) is **characterized, not fixed**; no patch is proposed as the answer.
-- All runtime evidence came from the **real** `Screen.draw` / `Screen.resize` entry point via the headless `kitty_tests.BaseTest.create_screen` harness — no remote‑control/debug bypass, no fallback or synthetic values.
+- All runtime evidence came from the **real** `Screen.draw` / `Screen.resize` entry point via the headless `kitty_tests.BaseTest.create_screen` harness — no remote-control/debug bypass, no fallback or synthetic values. The **one** supplementary block ([§4.1](#41-the-order-history-first-then-the-visible-buffer--two-independent-passes)) additionally drives the real `historybuf_rewrap` primitive directly (`HistoryBuf.rewrap`) to isolate Pass 1; it is labeled `(observed — supplementary)` and its scrollback input was produced canonically. The canonical end-to-end evidence for the same `True → False` flip is Scenario A ([§6.2](#62-observed-scenario-a--the-defect)).
