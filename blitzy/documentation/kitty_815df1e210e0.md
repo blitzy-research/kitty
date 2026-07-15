@@ -1,8 +1,8 @@
 # kitty — Compiled C Extensions and the Test Suite: An Evidence-Grounded Analysis
 
 > **Source branch investigated:** `kitty_815df1e210e0` · **kitty version (built):** `0.35.2`
-> **Task type:** read-only, run-first investigation. The only file written by this task is this document; no file in the kitty source tree was created, modified, or deleted (see *Read-only verification*).
-> **Methodology (SWE-AtlasQnA):** every behavioral claim below is placed next to the **actual, complete, unedited output** that produced it, together with the exact command and its exit code. Long outputs are shown in full (not truncated); where a short excerpt is highlighted for the reader it is explicitly labelled *(excerpt)* and the complete raw log is shown adjacent. Every structural claim carries a `file:line` citation and names the function/method that performs the work. Anything not directly observed at runtime is prefixed exactly **`Inferred:`**. All magnitude figures (test counts, failure counts, load sets) were confirmed **stable across two runs**. The canonical entry point (`./kitty/launcher/kitty +launch test.py`) was used throughout — no mocks, no debug hooks, no bypasses.
+> **Task type:** read-only, run-first investigation. The only file written by this task is this document; no **tracked** file in the kitty source tree was created, modified, or deleted. The only on-disk changes made while building and observing were **git-ignored** build outputs and the object cache — the four `.so` extensions, the `kitty`/`kitten` binaries, and the `build/` directory (all matched by `[.gitignore:L1-L20]`) — which the build produces and which are removed again, leaving tracked version-control state unchanged (verified in *Read-only verification*).
+> **Methodology (SWE-AtlasQnA):** every behavioral claim below is placed next to the **actual, complete, unedited output** that produced it, together with the exact command and its exit code. For each condition the **primary run (RUN #1) is shown complete and unedited**. **Stability across two runs** is then demonstrated according to the size of the output: for the short import-cascade conditions (Q4 Tier 1 and Tier 2) the *entire* second log is compared against the first with an actual `diff` whose output is shown — empty for Tier 1, and reducing to zero once the single legitimately-varying line is accounted for in Tier 2 (see below); for the long full-suite conditions (Q1.c, Q4 Tier 3 and Tier 4) RUN #1 is complete and **RUN #2 is a clearly-labelled excerpt** reproducing the terminal counts, the exact failing test IDs, the during-state, and any new tracebacks, with the 145 per-test progress lines — byte-identical *in kind* to RUN #1 — collapsed behind an explicit bracketed elision marker (a labelled elision, never a silent truncation). Values that legitimately vary run-to-run are identified and **excluded** from the stability comparison: **wall-clock time**, the **`Go packages being tested:` order** (a Python `set` iteration order — see Q1.b), and the **ctypes pointer/hex addresses** in the Tier 3 variable dumps. Any other short excerpt highlighted for the reader is labelled *(excerpt)* with the complete raw log shown adjacent. Every structural claim carries a `file:line` citation and names the function/method that performs the work. Anything not directly observed at runtime is prefixed exactly **`Inferred:`**. The canonical entry point (`./kitty/launcher/kitty +launch test.py`) was used throughout for all behavioral results; the two targeted probes that read internal state directly (the Q1.b hash-seed probe and the Q3 load-set probe) invoke the real, unmodified functions but bypass the full `test.py` → `main()` flow and are therefore explicitly labelled **non-canonical** — no mocks, no debug hooks, no synthetic stand-ins are used anywhere.
 
 ---
 
@@ -95,7 +95,14 @@ Summarised (each value backed by the raw output above):
 
 Although the questions concern *C* extensions, the canonical entry point has three prerequisite classes; each is enumerated below with its citation and the observed (or, where noted, `Inferred:`) consequence when absent.
 
-1. **Go toolchain (required by the canonical entry).** The runner enumerates Go packages before running Python tests: `reduce_go_pkgs()` at `[kitty_tests/main.py:L196]` calls `go_exe()` and, when `go` is absent, raises `SystemExit('go executable not found, current path: ' + repr(os.environ.get('PATH', '')))` at `[kitty_tests/main.py:L198]`. It is invoked from `run_tests()` at `[kitty_tests/main.py:L267]`. `[go.mod:L3]` mandates `go 1.22`. **Observed:** Go **1.22.12** on `PATH`; the baseline banner reports `Go executable: /usr/local/bin/go` and the run ends with `All Go tests succeeded` (see Q1.c). **`Inferred:`** (from the code path at `[kitty_tests/main.py:L196-L198]`; not separately reproduced by removing `go`) — with `go` off `PATH` the run would raise that `SystemExit` in `reduce_go_pkgs()` before any Python test executes.
+1. **Go toolchain (required by the canonical entry).** The runner enumerates Go packages before running Python tests: `reduce_go_pkgs()` at `[kitty_tests/main.py:L196]` calls `go_exe()` and, when `go` is absent, raises `SystemExit('go executable not found, current path: ' + repr(os.environ.get('PATH', '')))` at `[kitty_tests/main.py:L198]`. It is invoked from `run_tests()` at `[kitty_tests/main.py:L267]`. `[go.mod:L3]` mandates `go 1.22`. **Observed:** Go **1.22.12** on `PATH`; the baseline banner reports `Go executable: /usr/local/bin/go` and the run ends with `All Go tests succeeded` (see Q1.c). **Observed** (reproduced by invoking the canonical entry point with `go` removed from `PATH`): the run raises that `SystemExit` in `reduce_go_pkgs()` (`[kitty_tests/main.py:L196-L198]`, reached from `run_tests()` at `[kitty_tests/main.py:L267]`) **before any Python test executes** — the banner never prints and **0 tests run**. Command and complete, unedited output:
+
+```text
+$ env -i CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 HOME="$HOME" PATH=/usr/bin:/bin ./kitty/launcher/kitty +launch test.py
+go executable not found, current path: '/usr/bin:/bin'
+# exit code: 1
+```
+
 2. **Fontconfig + ≥1 font family.** `env_for_python_tests()` at `[kitty_tests/main.py:L297]` eagerly loads the system font DB — `from kitty.fonts.common import all_fonts_map` `[kitty_tests/main.py:L313]` then `all_fonts_map(True)` `[kitty_tests/main.py:L314]`. **Observed:** fontconfig 2.15.0 with 267 unique families (511 face rows) present, so env setup proceeds. The absence of one *specific* family ("Source Code Pro", grep count 0 above) produces the `test_font_selection` baseline artifact (below); it does **not** block env setup.
 3. **Native libraries** per `[docs/build.rst:L76]` (§Dependencies): run-time `harfbuzz >= 2.2.0` `[docs/build.rst:L84]`, `libpng` `[docs/build.rst:L86]`, `liblcms2` `[docs/build.rst:L87]`, `libxxhash` `[docs/build.rst:L88]`, `openssl` `[docs/build.rst:L89]`, `freetype` `[docs/build.rst:L90]`, `fontconfig` `[docs/build.rst:L91]`; plus the build-time `-dev` packages `[docs/build.rst:L107-L120]`, a C compiler, and `pkg-config`; plus OpenGL, xkbcommon, wayland, x11, dbus for the GLFW backends. **Observed:** all present at the versions in the table above; the fallback build (Q1.a) links every artifact.
 
@@ -106,13 +113,13 @@ Although the questions concern *C* extensions, the canonical entry point has thr
 
 The default build action is `build` (`[setup.py:L175]` `action: str = 'build'`; the argparse positional `action` at `[setup.py:L1827]` has `nargs='?'` `[setup.py:L1828]` and `default=Options.action` `[setup.py:L1829]`), and `make all` maps to it (`[Makefile:L12-L13]` `all:` → `python3 setup.py $(VVAL)`). So the canonical build command is `python3 setup.py`.
 
-**Step 1 — clear the git-ignored object cache first.** kitty caches compiled `.o` files under `build/` (git-ignored at `[.gitignore:L14]` `/build/`). Without clearing it, an incremental rebuild skips the already-compiled `wl_window.c` and the default-build failure would not reproduce. The clean-cache action, captured with its command and exit code:
+**Step 1 — (optional) clear the git-ignored object cache for a from-scratch compile.** kitty caches compiled `.o` files under `build/` (git-ignored at `[.gitignore:L14]` `/build/`). Clearing it forces a full, first-principles recompile so the output below is the complete 122-unit build rather than an incremental subset. Clearing is **not** what makes the failure reproduce, however: the *populated-cache variant* observed after Step 2 shows that `wl_window.c` is recompiled and the abort re-triggered **even against a fully populated cache**. The clean-cache action, captured with its command and exit code:
 
 ```text
 $ ls -d build 2>/dev/null && echo "build/ object cache present"
 build
 build/ object cache present
-$ rm -rf build   # git-ignored C-object cache (.gitignore:L14 "/build/"); forces full recompile so the Wayland -Werror abort actually reproduces instead of being skipped by cached .o files
+$ rm -rf build   # git-ignored C-object cache (.gitignore:L14 "/build/"); optional — yields a from-scratch compile (the -Werror abort also reproduces on a populated cache; see the populated-cache variant below)
 # exit code: 0
 $ ls -d build 2>&1
 ls: cannot access 'build': No such file or directory
@@ -259,6 +266,19 @@ gcc -MMD -DNDEBUG -D_GLFW_WAYLAND -D_GLFW_BUILD_DLL -DHAS_MEMFD_CREATE -Wextra -
 ```
 
 > **This is an ENVIRONMENT-VERSION ARTIFACT, not a defect in the C extensions under investigation, and it is deliberately NOT patched** (the source tree is read-only per MainRule). The last output line above is the exact failing compile command; note `-pedantic-errors -Werror` applied by the default build. The switch at `[glfw/wl_window.c:L668]` handles `XDG_TOPLEVEL_STATE_{RESIZING,MAXIMIZED,FULLSCREEN,ACTIVATED,TILED_*}` (and `SUSPENDED` under an `#ifdef`) but not the newer `CONSTRAINED_*` values shipped by `wayland-protocols 1.45`.
+
+**Populated-cache variant (observed) — the abort does not depend on clearing `build/`.** To confirm the default-build failure is a property of the build *configuration* (not an artifact of starting from an empty cache), the default build was re-run inside a throwaway copy of the tree whose `build/` had first been **fully populated** by a successful `--ignore-compiler-warnings` build (122 cached `.o` files, including `build/glfw-wayland-glfw-wl_window.c.o` at 342048 bytes). With that cache present and **not cleared**, `python3 setup.py` **still aborts (exit 1)**: it recompiles `wl_window.c` (unit `[3/122]`) and re-emits the identical four `-Werror=switch` errors. **Cause → effect:** setup.py rebuilds any translation unit whose compile command changed — the incremental guard at `[setup.py:L117]` consults `cmd_changed()` (`[setup.py:L134-L136]`: `return bool(self.db.get(key) != cmd)`), which compares the command recorded in the compilation database against the current one. Dropping `--ignore-compiler-warnings` re-adds `-pedantic-errors -Werror` to the `wl_window.c` command (the `werror` gate at `[setup.py:L491]`), so `cmd_changed()` returns `True` and the unit is rebuilt with `-Werror` regardless of the cached object — which is why deleting `build/` is a convenience for a clean full log, not a precondition for the failure. Command and key output (excerpt — the full 122-line compile sequence and the failing `gcc` command are byte-identical to Step 2 above):
+
+```text
+$ python3 setup.py                # build/ fully populated by a prior --ignore-compiler-warnings build; NOT cleared
+[3/122] Compiling [wayland] glfw/wl_window.c ...
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_LEFT’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_RIGHT’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_TOP’ not handled in switch [-Werror=switch]
+glfw/wl_window.c:668:9: error: enumeration value ‘XDG_TOPLEVEL_STATE_CONSTRAINED_BOTTOM’ not handled in switch [-Werror=switch]
+cc1: all warnings being treated as errors
+# exit code: 1
+```
 
 **Step 3 — run the documented fallback.** The project ships a flag to drop `-Werror` for exactly this situation: `--ignore-compiler-warnings` (`[setup.py:L2003]`, `action='store_true'` at `[setup.py:L2004]`), which flips the same `werror` gate at `[setup.py:L491]` (and the launcher's gate at `[setup.py:L1231]`) to the empty string. **Observed: `python3 setup.py --ignore-compiler-warnings` completes with exit 0**, links all five artifact groups, then builds the Go `kitten`. Complete, unedited output with command and exit code:
 
@@ -469,7 +489,30 @@ Go executable: /usr/local/bin/go
 Go packages being tested: tools/tui/shell_integration tools/utils/shlex tools/utils/humanize kittens/hints kittens/transfer tools/utils/shm tools/cli tools/tui/sgr kittens/ssh kittens/hyperlinked_grep tools/cmd/at tools/config tools/rsync tools/tui tools/tui/readline tools/unicode_names tools/utils/style tools/utils tools/themes tools/tui/loop tools/simdstring tools/wcswidth tools/tui/graphics tools/tui/subseq tools/utils/base85 kittens/diff
 ```
 
-> **`Inferred:`** the `Go packages being tested:` list is enumerated in a **non-deterministic order** — it differs run-to-run (compare the banner above with Tier 2 in Q4). The *set* of packages is identical across runs; only the ordering varies. (Basis: the two baseline runs and the Tier-2 run below show the same 26-package set in different orders; this is expected from Go's map/goroutine iteration and does not affect results.)
+**Observed — the `Go packages being tested:` order is produced by Python, not Go.** The list is enumerated in a **non-deterministic order** that differs run-to-run (compare the banner above with Tier 2 in Q4), while the *set* of packages is identical (26 packages) across runs. The order originates in a **Python `set`**: `find_testable_go_packages()` accumulates packages into `ans = set()` (`[kitty_tests/main.py:L129]`), adds each discovered directory with `ans.add(q)` (`[kitty_tests/main.py:L136]`), and returns it as `Set[str]` (`[kitty_tests/main.py:L141]`); `reduce_go_pkgs()` obtains that set at `[kitty_tests/main.py:L199]` and returns it (possibly filtered, still a set) at `[kitty_tests/main.py:L207]`; and `run_tests()` prints it **unsorted** via `print('Go packages being tested:', ' '.join(go_pkgs))` at `[kitty_tests/main.py:L277]`. Because CPython randomizes `str` hashing per process, the iteration order of that set of strings — and therefore the joined banner order — is fixed by `PYTHONHASHSEED`. Driving the *real* `find_testable_go_packages()` through the launcher under fixed seeds isolates the cause. *(This probe invokes the real, unmodified function but is **non-canonical**: it bypasses the full `test.py` → `main()` flow to print the set directly.)* A given seed reproduces the same order, a different seed reorders the list, and the *sorted* set is identical every time — complete, unedited output:
+
+```text
+$ cat /tmp/hashseed_probe.py
+import os
+from kitty_tests.main import find_testable_go_packages
+pkgs, _ = find_testable_go_packages()
+seed = os.environ.get("PYTHONHASHSEED")
+print("SEED=" + str(seed) + " n=" + str(len(pkgs)))
+print("ITER: " + " ".join(pkgs))
+print("SORTED: " + " ".join(sorted(pkgs)))
+$ for s in 1 2 1; do CI=true LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONHASHSEED=$s PATH="$PATH:/usr/local/go/bin" ./kitty/launcher/kitty +launch /tmp/hashseed_probe.py; done
+SEED=1 n=26
+ITER: tools/simdstring tools/tui/sgr tools/tui/shell_integration tools/unicode_names tools/themes tools/utils/base85 tools/wcswidth tools/rsync tools/cmd/at tools/tui/loop tools/utils/shlex kittens/hyperlinked_grep tools/tui/graphics tools/config tools/utils/shm tools/utils kittens/transfer tools/cli tools/utils/humanize tools/tui/subseq kittens/diff kittens/ssh tools/tui/readline tools/utils/style tools/tui kittens/hints
+SORTED: kittens/diff kittens/hints kittens/hyperlinked_grep kittens/ssh kittens/transfer tools/cli tools/cmd/at tools/config tools/rsync tools/simdstring tools/themes tools/tui tools/tui/graphics tools/tui/loop tools/tui/readline tools/tui/sgr tools/tui/shell_integration tools/tui/subseq tools/unicode_names tools/utils tools/utils/base85 tools/utils/humanize tools/utils/shlex tools/utils/shm tools/utils/style tools/wcswidth
+SEED=2 n=26
+ITER: kittens/ssh kittens/transfer kittens/hints tools/wcswidth tools/cmd/at tools/simdstring tools/utils tools/rsync kittens/hyperlinked_grep tools/utils/shlex tools/config tools/tui/graphics tools/tui/shell_integration tools/tui/readline tools/unicode_names tools/utils/humanize tools/themes tools/utils/style tools/tui/sgr tools/utils/base85 tools/tui/loop tools/tui tools/tui/subseq tools/cli kittens/diff tools/utils/shm
+SORTED: kittens/diff kittens/hints kittens/hyperlinked_grep kittens/ssh kittens/transfer tools/cli tools/cmd/at tools/config tools/rsync tools/simdstring tools/themes tools/tui tools/tui/graphics tools/tui/loop tools/tui/readline tools/tui/sgr tools/tui/shell_integration tools/tui/subseq tools/unicode_names tools/utils tools/utils/base85 tools/utils/humanize tools/utils/shlex tools/utils/shm tools/utils/style tools/wcswidth
+SEED=1 n=26
+ITER: tools/simdstring tools/tui/sgr tools/tui/shell_integration tools/unicode_names tools/themes tools/utils/base85 tools/wcswidth tools/rsync tools/cmd/at tools/tui/loop tools/utils/shlex kittens/hyperlinked_grep tools/tui/graphics tools/config tools/utils/shm tools/utils kittens/transfer tools/cli tools/utils/humanize tools/tui/subseq kittens/diff kittens/ssh tools/tui/readline tools/utils/style tools/tui kittens/hints
+SORTED: kittens/diff kittens/hints kittens/hyperlinked_grep kittens/ssh kittens/transfer tools/cli tools/cmd/at tools/config tools/rsync tools/simdstring tools/themes tools/tui tools/tui/graphics tools/tui/loop tools/tui/readline tools/tui/sgr tools/tui/shell_integration tools/tui/subseq tools/unicode_names tools/utils tools/utils/base85 tools/utils/humanize tools/utils/shlex tools/utils/shm tools/utils/style tools/wcswidth
+```
+
+The two `SEED=1` runs are **byte-identical** while `SEED=2` differs, and `SORTED` matches across all three — so the ordering is **Python set-iteration order (hash-seed dependent)**, not Go's doing; `go test` receives the same 26-package set regardless of the printed order. **Correction:** an earlier draft attributed this variation to "Go's map/goroutine iteration"; that is incorrect — the order is produced entirely on the Python side at `[kitty_tests/main.py:L277]` (`' '.join()` over a Python `set`) *before* any package name is handed to `go test` by `run_go()` at `[kitty_tests/main.py:L270]`.
 
 ### Q1.c — Two independent runs, complete output, and stability
 
@@ -1184,7 +1227,7 @@ Verbatim runtime traceback that establishes Chain 1 *(excerpt — kitty-relevant
 ModuleNotFoundError: No module named 'kitty.fast_data_types'
 ```
 
-**Chain 2 — `rsync` (at collection time).** Synthesized diagram (note each `main.py` hop is a distinct `file:line`):
+**Chain 2 — `rsync` (at collection time).** Synthesized diagram (note each `kitty_tests/main.py` hop is a distinct `file:line`):
 
 ```text
 kitty_tests/main.py:L338  main() → run_tests()
@@ -1539,7 +1582,13 @@ $ ls -l "$SB/kitty/fast_data_types.so"                       # AFTER (restored)
 -rwxr-xr-x 1 root root 1253792 Jul 14 20:38 /tmp/kitty_qa_sandbox.To8dsh/kitty/fast_data_types.so
 ```
 
-**Repeat (RUN #2):** identical — `diff` of the two logs (ignoring the `RUN 1`/`RUN 2` header) is empty, and both exit **1**. The banner is absent in both; **0 tests execute**.
+**Repeat (RUN #2).** Both runs are byte-identical. Each complete log is a 43-line pure `ModuleNotFoundError` traceback — no banner, no timing, no pointer/hex addresses — so a direct `diff` of the two full logs (captured with the `RUN 1`/`RUN 2` header line excluded) produces **no output**, and both processes exit **1**. The banner is absent in both; **0 tests execute**:
+
+```text
+$ diff tier1_run1.log tier1_run2.log            # no output => the two complete logs are identical
+$ echo "diff exit=$?  run1 exit=1  run2 exit=1"
+diff exit=0  run1 exit=1  run2 exit=1
+```
 
 ### Tier 2 — `rsync.so` missing → CRITICAL, fatal at collection
 
@@ -1613,14 +1662,35 @@ $ ls -l "$SB/kittens/transfer/rsync.so"                       # AFTER (restored)
 -rwxr-xr-x 1 root root 42824 Jul 14 20:38 /tmp/kitty_qa_sandbox.To8dsh/kittens/transfer/rsync.so
 ```
 
-**Repeat (RUN #2):** the `ModuleNotFoundError: No module named 'kittens.transfer.rsync'` line is byte-identical across both runs, both exit **1**, and the enumerated Go-package *set* is identical (26 packages; only the ordering differs run-to-run, as noted in Q1.b). **0 Python tests execute** in either run.
+**Repeat (RUN #2).** `main()` runs in both, so each complete 52-line log contains the environment banner. A raw `diff` of the two full logs shows **exactly one** differing line — the non-deterministic `Go packages being tested:` order (per Q1.b) — and nothing else. Excluding that single line the logs are byte-identical; the enumerated Go-package *set* is identical (26 packages, only the order varies); the `ModuleNotFoundError: No module named 'kittens.transfer.rsync'` line is byte-identical; and both exit **1**. **0 Python tests execute** in either run:
+
+```text
+$ diff tier2_run1.log tier2_run2.log
+6c6
+< Go packages being tested: tools/utils/base85 tools/config tools/cli tools/tui/loop tools/tui/readline tools/rsync kittens/transfer kittens/hyperlinked_grep tools/utils/style tools/wcswidth tools/tui/graphics tools/themes tools/unicode_names tools/tui/shell_integration kittens/hints tools/utils/humanize tools/utils tools/cmd/at tools/utils/shlex kittens/diff tools/utils/shm tools/tui/sgr tools/tui/subseq tools/tui kittens/ssh tools/simdstring
+---
+> Go packages being tested: kittens/hyperlinked_grep tools/utils tools/tui/shell_integration tools/tui/loop tools/config tools/wcswidth tools/tui/subseq kittens/transfer tools/utils/humanize tools/tui/sgr tools/simdstring tools/utils/base85 tools/tui tools/utils/style tools/cmd/at tools/utils/shlex kittens/hints tools/tui/graphics tools/rsync tools/tui/readline kittens/ssh tools/cli tools/unicode_names kittens/diff tools/utils/shm tools/themes
+
+$ diff <(grep -v 'Go packages being tested:' tier2_run1.log) <(grep -v 'Go packages being tested:' tier2_run2.log)   # every line except the Go-order line
+$ echo "non-Go diff exit=$?"
+non-Go diff exit=0
+
+$ diff <(grep 'Go packages being tested:' tier2_run1.log | sed 's/^.*being tested: //' | tr ' ' '\n' | sort) \
+       <(grep 'Go packages being tested:' tier2_run2.log | sed 's/^.*being tested: //' | tr ' ' '\n' | sort)   # the Go-package SET (order-normalized)
+$ echo "Go-set diff exit=$?  set size=26"
+Go-set diff exit=0  set size=26
+
+$ grep ModuleNotFoundError tier2_run1.log ; grep ModuleNotFoundError tier2_run2.log
+ModuleNotFoundError: No module named 'kittens.transfer.rsync'
+ModuleNotFoundError: No module named 'kittens.transfer.rsync'
+```
 
 ### Tier 3 — `glfw-x11.so` missing → OPTIONAL, localized
 
 **Cause → effect.** The GLFW backend is **not** a Python module (Q3 showed no GLFW `.so` in `sys.modules`); it is consumed on demand by exactly two tests. When `glfw-x11.so` is absent (with `glfw-wayland.so` left in place), collection completes and **all 145 tests still run**; only the two GLFW consumers fail:
 
 - `test_utf_8_strndup` ERRORs — `kitty_tests/glfw.py:L50` calls `ctypes.CDLL(backend_utils)` where `backend_utils` is the `glfw-x11.so` path; the missing file yields `OSError: … cannot open shared object file`.
-- `test_glfw_modules` FAILs — `kitty_tests/check_build.py:L46` asserts `os.path.isfile(path)`. Under CI, `check_build.py:L40-L42` sets `linux_backends = ['x11']` (wayland is appended only `if not self.is_ci`), so only the x11 path is checked, and the assertion fails with `AssertionError: … is not a file`.
+- `test_glfw_modules` FAILs — `kitty_tests/check_build.py:L46` asserts `os.path.isfile(path)`. Under CI, `kitty_tests/check_build.py:L40-L42` sets `linux_backends = ['x11']` (wayland is appended only `if not self.is_ci`), so only the x11 path is checked, and the assertion fails with `AssertionError: … is not a file`.
 
 The total is therefore **`failures=4, errors=1`** = the **3 pre-existing baseline failures** (`test_font_selection`, `test_transfer_send`, `test_transfer_receive` — see the Environment-artifact section) **+ 1 new GLFW FAIL** (`test_glfw_modules`) **+ 1 new GLFW ERROR** (`test_utf_8_strndup`). The GLFW-specific delta caused by removing the extension is exactly **1 FAIL + 1 ERROR**. Complete, unedited RUN #1 (all 365 lines: before/during/the full 145-test run/summary/exit code/restore/after):
 
@@ -1997,7 +2067,7 @@ $ ls -l "$SB/kitty/glfw-x11.so"                       # AFTER (restored)
 ```text
 $ ls -l "$SB/kitty/glfw-x11.so" 2>&1                  # DURING (absent; glfw-wayland.so left in place)
 ls: cannot access '/tmp/kitty_qa_sandbox.To8dsh/kitty/glfw-x11.so': No such file or directory
-... [145 test progress lines identical in kind to RUN #1] ...
+[[ labelled elision — 145 per-test progress lines omitted here; byte-identical in kind to RUN #1, which is shown complete above ]]
 
 ERROR: test_utf_8_strndup (kitty_tests.glfw.TestGLFW.test_utf_8_strndup)
 ----------------------------------------------------------------------
@@ -2048,10 +2118,10 @@ FAILED (failures=4, errors=1, skipped=4)
 
 ### Sandbox teardown
 
-After the three tiers, the temporary copy was deleted and its removal verified; the source repository was untouched throughout:
+After the three tiers, the temporary copy was deleted and its removal verified; the source repository was untouched throughout. The residue check uses `find` (which recurses to any depth), **not** a `"$SB"/**/*.qabak` glob: under bash's default `globstar=off`, `**` behaves like a single `*`, so `"$SB"/**/*.qabak` expands like `"$SB"/*/*.qabak` and would silently **miss** a depth-2 residue such as `kittens/transfer/rsync.so.qabak` — precisely the file Tier 2 moves aside. The teardown check therefore reports absence soundly:
 
 ```text
-$ ls -1 "$SB"/**/*.qabak 2>/dev/null | wc -l    # confirm no leftover moved-aside files before teardown
+$ find "$SB" -type f -name '*.qabak' -print | wc -l    # recursively confirm no leftover moved-aside files at ANY depth
 0
 $ rm -rf "$SB"; echo "rm_exit=$?"
 rm_exit=0
@@ -2059,9 +2129,25 @@ $ ls -d "$SB" 2>&1                              # confirm sandbox gone
 ls: cannot access '/tmp/kitty_qa_sandbox.To8dsh': No such file or directory
 ```
 
+*Why `find` and not the glob (observed).* Planting one depth-1 residue (`kitty/glfw-x11.so.qabak`) and one depth-2 residue (`kittens/transfer/rsync.so.qabak`) in a scratch tree and running both checks with `globstar` off (the default) shows the glob under-counts while `find` catches every depth:
+
+```text
+$ shopt globstar
+globstar       	off
+$ ls -1 "$SB"/**/*.qabak 2>/dev/null            # BUGGY: non-recursive under globstar=off — sees only depth-1
+$SB/kitty/glfw-x11.so.qabak
+$ ls -1 "$SB"/**/*.qabak 2>/dev/null | wc -l
+1
+$ find "$SB" -type f -name '*.qabak' -print     # CORRECT: recurses to any depth
+$SB/kittens/transfer/rsync.so.qabak
+$SB/kitty/glfw-x11.so.qabak
+$ find "$SB" -type f -name '*.qabak' -print | wc -l
+2
+```
+
 ### Tier 4 — `glfw-wayland.so` missing → OPTIONAL, and unexercised under canonical CI
 
-The fourth kitty-authored artifact, `glfw-wayland.so`, is exercised **separately** from `glfw-x11.so`. The only reference to a wayland backend anywhere under `kitty_tests/` is `check_build.py:L42` (`linux_backends.append('wayland')`), which runs **only** `if not self.is_ci` (`check_build.py:L40-L42`); the ctypes probe in `glfw.py:L49` hardcodes `glfw_path('x11')` (with `ctypes.CDLL` at `glfw.py:L50`). Prediction from those code paths: under canonical CI (`CI=true`), removing `glfw-wayland.so` has **no effect**. This was confirmed by direct observation — a fresh temporary copy, with `glfw-wayland.so` moved aside and `glfw-x11.so` left in place, run twice under CI. Fresh sandbox creation:
+The fourth kitty-authored artifact, `glfw-wayland.so`, is exercised **separately** from `glfw-x11.so`. The only reference to a wayland backend anywhere under `kitty_tests/` is `kitty_tests/check_build.py:L42` (`linux_backends.append('wayland')`), which runs **only** `if not self.is_ci` (`kitty_tests/check_build.py:L40-L42`); the ctypes probe in `kitty_tests/glfw.py:L49` hardcodes `glfw_path('x11')` (with `ctypes.CDLL` at `kitty_tests/glfw.py:L50`). Prediction from those code paths: under canonical CI (`CI=true`), removing `glfw-wayland.so` has **no effect**. This was confirmed by direct observation — a fresh temporary copy, with `glfw-wayland.so` moved aside and `glfw-x11.so` left in place, run twice under CI. Fresh sandbox creation:
 
 ```text
 $ SB="$(mktemp -d /tmp/kitty_qa_sandbox.XXXXXX)"   # -> /tmp/kitty_qa_sandbox.qLOYON
@@ -2413,7 +2499,7 @@ $ ls -l "$SB/kitty/glfw-wayland.so" 2>&1              # DURING (absent; glfw-x11
 ls: cannot access '/tmp/kitty_qa_sandbox.qLOYON/kitty/glfw-wayland.so': No such file or directory
 $ ls -l "$SB/kitty/glfw-x11.so"                       # DURING (glfw-x11.so present)
 -rwxr-xr-x 1 root root 373896 Jul 14 20:38 /tmp/kitty_qa_sandbox.qLOYON/kitty/glfw-x11.so
-... [145 test progress lines identical in kind to RUN #1; no GLFW FAIL or ERROR] ...
+[[ labelled elision — 145 per-test progress lines omitted here; byte-identical in kind to RUN #1 (shown complete above), with no GLFW FAIL or ERROR ]]
 
 Ran 145 tests in 22.022s
 
@@ -2426,7 +2512,7 @@ All Go tests succeeded, ran in 22.1 seconds
 This is **identical to the happy-path baseline** (Q1.b: `Ran 145 tests`, `FAILED (failures=3, skipped=4)`), which is the observed proof that `glfw-wayland.so` is not consumed at all by the suite under canonical CI. Sandbox teardown for Tier 4:
 
 ```text
-$ ls -1 "$SB"/**/*.qabak 2>/dev/null | wc -l
+$ find "$SB" -type f -name '*.qabak' -print | wc -l    # recursive residue check (see the Tier 3 teardown note on why not a **/*.qabak glob)
 0
 $ rm -rf "$SB"; echo rm_exit=$?
 rm_exit=0
@@ -2441,11 +2527,11 @@ The classification below is grounded in the four experiments above; every row wa
 | Extension `.so` | Classification | Observed effect when missing (canonical CI) | Tests that run | Fatal point (cause) |
 |---|---|---|---|---|
 | `kitty/fast_data_types.so` | **CRITICAL** | `ModuleNotFoundError: No module named 'kitty.fast_data_types'` while importing `kitty_tests.main`; banner never prints | **0** | Harness import — top-level import in `BaseTest` module chain (`kitty_tests/__init__.py:L21` → `kitty/config.py:L10` → `kitty/conf/utils.py:L27`, plus direct `kitty_tests/__init__.py:L22`) |
-| `kittens/transfer/rsync.so` | **CRITICAL** | Banner prints and Go pkgs enumerate, then `ModuleNotFoundError: No module named 'kittens.transfer.rsync'` at collection | **0 Python** | Collection — `find_all_tests()` direct `importlib.import_module()` at `kitty_tests/main.py:L64` importing `file_transmission.py:L13` |
-| `kitty/glfw-x11.so` | **OPTIONAL** (localized) | `Ran 145 tests … FAILED (failures=4, errors=1)`; delta vs baseline = **1 FAIL + 1 ERROR** | **145** | Not fatal — on-demand `ctypes.CDLL` at `glfw.py:L50` (ERROR) and `os.path.isfile` at `check_build.py:L46` (FAIL) |
-| `kitty/glfw-wayland.so` | **OPTIONAL** (unexercised under CI) | `Ran 145 tests … FAILED (failures=3, skipped=4)` — **identical to baseline**, delta = **0** | **145** | Never referenced under CI — the only reference (`check_build.py:L42`) is gated by `if not self.is_ci` |
+| `kittens/transfer/rsync.so` | **CRITICAL** | Banner prints and Go pkgs enumerate, then `ModuleNotFoundError: No module named 'kittens.transfer.rsync'` at collection | **0 Python** | Collection — `find_all_tests()` direct `importlib.import_module()` at `kitty_tests/main.py:L64` importing `kitty_tests/file_transmission.py:L13` |
+| `kitty/glfw-x11.so` | **OPTIONAL** (localized) | `Ran 145 tests … FAILED (failures=4, errors=1)`; delta vs baseline = **1 FAIL + 1 ERROR** | **145** | Not fatal — on-demand `ctypes.CDLL` at `kitty_tests/glfw.py:L50` (ERROR) and `os.path.isfile` at `kitty_tests/check_build.py:L46` (FAIL) |
+| `kitty/glfw-wayland.so` | **OPTIONAL** (unexercised under CI) | `Ran 145 tests … FAILED (failures=3, skipped=4)` — **identical to baseline**, delta = **0** | **145** | Never referenced under CI — the only reference (`kitty_tests/check_build.py:L42`) is gated by `if not self.is_ci` |
 
-**Why the two critical extensions differ in *where* they are fatal (cause → effect).** `fast_data_types` is fatal *earlier* — at **harness import time** — because it is imported at the top level of the `BaseTest` module, which `test.py:L8` pulls in while importing `kitty_tests.main`; the failure precedes `main()`, so the banner from `env_for_python_tests()` (`kitty_tests/main.py:L305`) never prints. `rsync` is fatal *later* — at **collection time** — because it is imported at the top level of a single test module (`file_transmission.py:L13`) that `find_all_tests()` imports directly at `kitty_tests/main.py:L64`; by then `main()` has already printed the banner and enumerated Go packages. Both are suite-fatal (0 tests / 0 Python tests), but at different stages, which is exactly what the tier-1 vs tier-2 logs show.
+**Why the two critical extensions differ in *where* they are fatal (cause → effect).** `fast_data_types` is fatal *earlier* — at **harness import time** — because it is imported at the top level of the `BaseTest` module, which `test.py:L8` pulls in while importing `kitty_tests.main`; the failure precedes `main()`, so the banner from `env_for_python_tests()` (`kitty_tests/main.py:L305`) never prints. `rsync` is fatal *later* — at **collection time** — because it is imported at the top level of a single test module (`kitty_tests/file_transmission.py:L13`) that `find_all_tests()` imports directly at `kitty_tests/main.py:L64`; by then `main()` has already printed the banner and enumerated Go packages. Both are suite-fatal (0 tests / 0 Python tests), but at different stages, which is exactly what the tier-1 vs tier-2 logs show.
 
 **Why the two GLFW backends are optional.** Neither backend is imported as a Python module (Q3: no GLFW `.so` in `sys.modules`). `glfw-x11.so` is consumed only on demand by two tests, so its absence is localized to those two. `glfw-wayland.so` is not consumed at all under CI, so its absence is invisible. In both cases collection completes and all 145 tests run.
 
@@ -2455,9 +2541,9 @@ The observed load set (Q3), the three-tier cascade (Q4), and the enumerated impo
 
 **Level 0 — `fast_data_types.so` is the universal root (single point of failure).** It is loaded **eagerly**, at module-import time, before any test runs. `kitty_tests/__init__.py` — the module that defines the `BaseTest` superclass every test class extends — imports it *twice* at the top level: first **transitively** at `kitty_tests/__init__.py:L21` (`from kitty.config import …` → `kitty/config.py:L10` → `kitty/conf/utils.py:L27` `from ..fast_data_types import Color`), then **directly** at `kitty_tests/__init__.py:L22` (`from kitty.fast_data_types import Cursor, HistoryBuf, LineBuf, Screen, get_options, monotonic, set_options`). Because *every* test class subclasses `BaseTest`, **all 22 test categories depend on `fast_data_types`** whether or not they name it themselves. This is what the Q3 probe observed (it appears in `sys.modules` immediately after importing `kitty_tests.main`) and what Q4 Tier 1 confirmed by removal (its absence is fatal at *harness import*, before the banner, 0 tests run). *This is the reason `fast_data_types` is the central single-point-of-failure: it sits at the root of the import graph via `BaseTest`.*
 
-**Level 1 — `rsync.so` is a secondary hard dependency of exactly one collected module.** It is loaded at **collection time** (not before), because it is imported at the top level of a single test module, `kitty_tests/file_transmission.py:L13` (`from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc`). The Q3 probe observed it entering `sys.modules` only during `find_all_tests()` (the collection step), and Q4 Tier 2 confirmed its absence is fatal at *collection* (after the banner, 0 Python tests). A **second, lazy** consumer exists — `kitty_tests/check_build.py:L30` (`from kittens.transfer import rsync`, inside the `test_loading_extensions()` method at `check_build.py:L28`) — but because it is inside a method body it is not evaluated at collection time, so it does not participate in the collection-time cascade; it would only be exercised when that one test runs. (This corrects any notion that "only one module needs rsync": **two** modules reference it — one hard/top-level, one lazy/in-test.)
+**Level 1 — `rsync.so` is a secondary hard dependency of exactly one collected module.** It is loaded at **collection time** (not before), because it is imported at the top level of a single test module, `kitty_tests/file_transmission.py:L13` (`from kittens.transfer.rsync import Differ, Hasher, Patcher, parse_ftc`). The Q3 probe observed it entering `sys.modules` only during `find_all_tests()` (the collection step), and Q4 Tier 2 confirmed its absence is fatal at *collection* (after the banner, 0 Python tests). A **second, lazy** consumer exists — `kitty_tests/check_build.py:L30` (`from kittens.transfer import rsync`, inside the `test_loading_extensions()` method at `kitty_tests/check_build.py:L28`) — but because it is inside a method body it is not evaluated at collection time, so it does not participate in the collection-time cascade; it would only be exercised when that one test runs. (This corrects any notion that "only one module needs rsync": **two** modules reference it — one hard/top-level, one lazy/in-test.)
 
-**Level 2 — the GLFW backends are leaves, loaded on demand, x11-only under CI.** `glfw-x11.so` and `glfw-wayland.so` are **never imported as Python modules** (the Q3 probe found no GLFW `.so` in `sys.modules`). They are consumed only on demand, by path, in exactly two modules: `kitty_tests/glfw.py:L50` (`ctypes.CDLL(glfw_path('x11'))`) and `kitty_tests/check_build.py:L46` (`os.path.isfile(glfw_path(name))`). Under `CI=true`, `check_build.py:L40-L42` restricts the checked backends to `['x11']` and `glfw.py:L49` hardcodes `glfw_path('x11')`, so **only `glfw-x11.so` is touched**; `glfw-wayland.so` is not referenced at all (Q4 Tier 4 observed zero effect on its removal). Their absence is therefore *localized* (Q4 Tier 3: 145 tests still run; only 1 FAIL + 1 ERROR).
+**Level 2 — the GLFW backends are leaves, loaded on demand, x11-only under CI.** `glfw-x11.so` and `glfw-wayland.so` are **never imported as Python modules** (the Q3 probe found no GLFW `.so` in `sys.modules`). They are consumed only on demand, by path, in exactly two modules: `kitty_tests/glfw.py:L50` (`ctypes.CDLL(glfw_path('x11'))`) and `kitty_tests/check_build.py:L46` (`os.path.isfile(glfw_path(name))`). Under `CI=true`, `kitty_tests/check_build.py:L40-L42` restricts the checked backends to `['x11']` and `kitty_tests/glfw.py:L49` hardcodes `glfw_path('x11')`, so **only `glfw-x11.so` is touched**; `glfw-wayland.so` is not referenced at all (Q4 Tier 4 observed zero effect on its removal). Their absence is therefore *localized* (Q4 Tier 3: 145 tests still run; only 1 FAIL + 1 ERROR).
 
 **What the structure implies (cause → effect).** The test output reveals a dependency *tree* rooted at `fast_data_types` (every test transitively needs it), with `rsync` as a single hard branch (one collected module) and the GLFW backends as optional leaves (two tests, on demand). This is precisely why the failure severity is tiered: removing the root aborts everything before it starts; removing the single-branch dependency aborts collection; removing a leaf degrades only the two tests that reach for it. The observed load order in Q3 (`fast_data_types` at import, `rsync` at collection, GLFW never) is the runtime signature of exactly this hierarchy.
 
@@ -2526,20 +2612,23 @@ kitty_tests/check_build.py:45:            path = glfw_path(name)
 
 **Classification of the 23 modules by how they reach `fast_data_types`:**
 
-- **15 modules import it directly** (a `kitty.fast_data_types` statement appears in their own source): the `__init__` base module plus 14 categories — `check_build`, `crypto`, `datatypes`, `fonts`, `graphics`, `keys`, `mouse`, `options`, `parser`, `screen`, `shell_integration`, `shm`, `ssh`, `utmp`. (The grep above also lists `main`, but `main` is one of the two excluded modules, so it is **not** among the 23 discovered modules.) Of these 15, **13 import at module top level** and **2 import lazily inside a method** — `check_build.py:L29` (inside `test_loading_extensions()`) and `crypto.py:L28`.
-- **8 categories depend on it only transitively**, via the `BaseTest` superclass in `__init__.py` — `clipboard`, `completion`, **`file_transmission`**, `glfw`, `layout`, `open_actions`, `search_query_parser`, `tui`. (`file_transmission` belongs here: it has **no** direct `fast_data_types` import; its only compiled-extension import is `rsync`.)
+- **15 modules import it directly** (a `kitty.fast_data_types` statement appears in their own source): the `__init__` base module plus 14 categories — `check_build`, `crypto`, `datatypes`, `fonts`, `graphics`, `keys`, `mouse`, `options`, `parser`, `screen`, `shell_integration`, `shm`, `ssh`, `utmp`. (The grep above also lists `main`, but `main` is one of the two excluded modules, so it is **not** among the 23 discovered modules.) Of these 15, **13 import at module top level** and **2 import lazily inside a method** — `kitty_tests/check_build.py:L29` (inside `test_loading_extensions()`) and `kitty_tests/crypto.py:L28`.
+- **8 categories depend on it only transitively**, via the `BaseTest` superclass in `kitty_tests/__init__.py` — `clipboard`, `completion`, **`file_transmission`**, `glfw`, `layout`, `open_actions`, `search_query_parser`, `tui`. (`file_transmission` belongs here: it has **no** direct `fast_data_types` import; its only compiled-extension import is `rsync`.)
 
-**15 direct + 8 transitive-only = 23.** Every one of the 22 test categories ultimately depends on `fast_data_types` (directly or via `BaseTest`); `datatypes` is notable for having **three** distinct import sites — two top level (`datatypes.py:L9` for `Color, ColorProfile, HistoryBuf, LineBuf, …` and `datatypes.py:L22` for `Cursor as C`) and one lazy (`datatypes.py:L578` for `GLFW_MOD_KITTY, GLFW_MOD_SHIFT, SingleKey`, inside `test_single_key()`).
+**15 direct + 8 transitive-only = 23.** Every one of the 22 test categories ultimately depends on `fast_data_types` (directly or via `BaseTest`); `datatypes` is notable for having **three** distinct import sites — two top level (`kitty_tests/datatypes.py:L9` for `Color, ColorProfile, HistoryBuf, LineBuf, …` and `kitty_tests/datatypes.py:L22` for `Cursor as C`) and one lazy (`kitty_tests/datatypes.py:L578` for `GLFW_MOD_KITTY, GLFW_MOD_SHIFT, SingleKey`, inside `test_single_key()`).
 
 **`rsync` connects to exactly two categories, and the GLFW backends to exactly two categories:**
 
-- `rsync.so`: `file_transmission.py:L13` (top-level — the sole *hard*/collection-time consumer) and `check_build.py:L30` (lazy, inside `test_loading_extensions()` — a second in-test consumer).
-- `glfw-x11.so`: `glfw.py:L50` (`ctypes.CDLL`, in `test_utf_8_strndup`) and `check_build.py:L46` (`os.path.isfile`, in `test_glfw_modules`). `glfw-wayland.so` is referenced by **no** category under CI (its only would-be reference, `check_build.py:L42`, is gated by `if not self.is_ci`).
+- `rsync.so`: `kitty_tests/file_transmission.py:L13` (top-level — the sole *hard*/collection-time consumer) and `kitty_tests/check_build.py:L30` (lazy, inside `test_loading_extensions()` — a second in-test consumer).
+- `glfw-x11.so`: `kitty_tests/glfw.py:L50` (`ctypes.CDLL`, in `test_utf_8_strndup`) and `kitty_tests/check_build.py:L46` (`os.path.isfile`, in `test_glfw_modules`). `glfw-wayland.so` is referenced by **no** category under CI (its only would-be reference, `kitty_tests/check_build.py:L42`, is gated by `if not self.is_ci`).
 
-### Category → extension dependency table (all 22 test categories)
+### Category → extension dependency table (all 23 discovered modules: 22 test categories + the `__init__` base module)
 
-| Test category module | `fast_data_types` | `rsync` | GLFW backend |
+The first row is the `__init__` base module (which defines `BaseTest`); the remaining 22 rows are the test categories. All line numbers in a cell are scoped to that row's module (`kitty_tests/<module>.py`).
+
+| Discovered module | `fast_data_types` | `rsync` | GLFW backend |
 |---|---|---|---|
+| `__init__` (base module) | direct `L22` + transitive `L21` | — | — |
 | `check_build` | direct, lazy `L29` | **yes** — lazy `L30` | x11 — `L45`/`L46` (`os.path.isfile`, CI: x11 only) |
 | `clipboard` | transitive (via `BaseTest`) | — | — |
 | `completion` | transitive (via `BaseTest`) | — | — |
@@ -2563,7 +2652,7 @@ kitty_tests/check_build.py:45:            path = glfw_path(name)
 | `tui` | transitive (via `BaseTest`) | — | — |
 | `utmp` | direct `L3` | — | — |
 
-Base module (not a category, but imported by discovery and the source of the transitive dependency): `kitty_tests/__init__.py` — `fast_data_types` direct `L22` + transitive `L21`. Counting it, **15** modules contain a direct `fast_data_types` import; the **8** transitive-only categories bring the total imported by `find_all_tests()` to **23**.
+The first row, `__init__`, is the `BaseTest`-defining base module — not itself a test category, but imported by `find_all_tests()` alongside the 22 categories, for **23** discovered modules in total. Counting `__init__`, **15** modules contain a direct `fast_data_types` import (`__init__` plus 14 categories) and the remaining **8** categories reach it transitive-only via `BaseTest` (15 + 8 = 23).
 
 ## Environment-artifact baseline failures (distinct from extension-load failures)
 
@@ -2608,7 +2697,7 @@ Traceback (most recent call last):
 AssertionError: The family: Source Code Pro is not available
 ```
 
-The assertion is raised at `kitty_tests/fonts.py:L54` (`raise AssertionError(f'The family: {family} is not available')`), reached from `fonts.py:L58` and the call at `fonts.py:L64` (`t('Source Code Pro', …)`). "Source Code Pro" is absent from the observed `names` set (which contains `dejavu sans mono`, `liberation mono`, `noto mono`, etc.). *Cause: the font is not installed in the environment; not an extension problem.*
+The assertion is raised at `kitty_tests/fonts.py:L54` (`raise AssertionError(f'The family: {family} is not available')`), reached from `kitty_tests/fonts.py:L58` and the call at `kitty_tests/fonts.py:L64` (`t('Source Code Pro', …)`). "Source Code Pro" is absent from the observed `names` set (which contains `dejavu sans mono`, `liberation mono`, `noto mono`, etc.). *Cause: the font is not installed in the environment; not an extension problem.*
 
 **(2) `test_transfer_send` — a directory setgid-bit mismatch (filesystem artifact).** The assertion at `kitty_tests/file_transmission.py:L432` (`self.assertEqual(expected, actual)`, via `L443` and `L507`) compares directory-entry metadata. The only difference is the **setgid bit** on the two directory entries `empty` and `sub`: one side reports `mode='0o42755'` (the setgid bit `0o2000` **set**) and the other `mode='0o40755'` (setgid **clear**):
 
@@ -2712,7 +2801,7 @@ ext2/ext3
 /dev/nvme0n1p1 on /tmp type ext4 (rw,relatime,commit=30)
 ```
 
-*Observed:* the mismatch is exactly `0o42755` vs `0o40755` (the setgid bit on newly-created directories under the test's `/tmp` scratch dir). The setgid bit is visible in full in the `expected=` and `actual=` local-variable dumps above; the complete element-by-element unittest diff (the native `-`/`+`/`?` marker lines that point at the differing `4`↔`0` character) appears verbatim in the Q1.b baseline output — the `[497 chars]` notation in the one-line `AssertionError` summary is Python's own `safe_repr` truncation of the dict repr, not an edit of this document. *Inferred:* the root cause is directory setgid-bit inheritance behavior of the mount (a new directory inherits the parent's setgid bit), which differs from what the test hard-codes as expected; this is a property of the container's filesystem/mount, not of the compiled extensions. Both transfer tests ran to completion (reaching `file_transmission.py:L432`), which again confirms `rsync` and `fast_data_types` loaded.
+*Observed:* the mismatch is exactly `0o42755` vs `0o40755` (the setgid bit on newly-created directories under the test's `/tmp` scratch dir). The setgid bit is visible in full in the `expected=` and `actual=` local-variable dumps above; the complete element-by-element unittest diff (the native `-`/`+`/`?` marker lines that point at the differing `4`↔`0` character) appears verbatim in the Q1.b baseline output — the `[497 chars]` notation in the one-line `AssertionError` summary is Python's own `safe_repr` truncation of the dict repr, not an edit of this document. *Inferred:* the root cause is directory setgid-bit inheritance behavior of the mount (a new directory inherits the parent's setgid bit), which differs from what the test hard-codes as expected; this is a property of the container's filesystem/mount, not of the compiled extensions. Both transfer tests ran to completion (reaching `kitty_tests/file_transmission.py:L432`), which again confirms `rsync` and `fast_data_types` loaded.
 
 **Bottom line:** these three failures are orthogonal to the extension-load question. They are stable across both runs (same three IDs), they occur *after* the extensions load, and none of them is an import/collection error. They are explicitly **out of scope** for the extension-cascade analysis and are reported here only to account for every line of the observed test output.
 
@@ -2773,6 +2862,6 @@ A	blitzy/documentation/kitty_815df1e210e0.md
 | **Q5** | What the output reveals about the dependency structure | §Q5 | A three-level tree: `fast_data_types` universal root (every `BaseTest` subclass), `rsync` a single hard branch (one collected module), the GLFW backends optional leaves (two tests, x11-only under CI). |
 | **Q6** | How the extensions connect to the test categories | §Q6 | Of 23 discovered modules, **15 import `fast_data_types` directly** + **8 transitive-only** (incl. `file_transmission`) = 23; `rsync` → 2 categories (`file_transmission` hard `L13`, `check_build` lazy `L30`); GLFW → 2 categories (`glfw` `L50`, `check_build` `L46`), x11-only under CI. |
 | **Q7** | Which extensions are critical vs optional | §Q4/Q7 | **Critical:** `fast_data_types.so`, `rsync.so` (both suite-fatal, at different stages). **Optional:** `glfw-x11.so` (localized), `glfw-wayland.so` (unexercised under CI). All four **observed**. |
-| **Q8** | The actual import chains established during the run | §Q8 | Tier-1 chain `test.py:L8` → `__init__.py:L21` → `config.py:L10` → `conf/utils.py:L27` → `fast_data_types`; Tier-2 chain `main.py:L64` → `file_transmission.py:L13` → `rsync`; Tier-3 on-demand `glfw.py:L50` / `check_build.py:L46` → `glfw-x11.so`. Each shown as a diagram **and** its verbatim traceback. |
+| **Q8** | The actual import chains established during the run | §Q8 | Tier-1 chain `test.py:L8` → `kitty_tests/__init__.py:L21` → `kitty/config.py:L10` → `kitty/conf/utils.py:L27` → `fast_data_types`; Tier-2 chain `kitty_tests/main.py:L64` → `kitty_tests/file_transmission.py:L13` → `rsync`; Tier-3 on-demand `kitty_tests/glfw.py:L50` / `kitty_tests/check_build.py:L46` → `glfw-x11.so`. Each shown as a diagram **and** its verbatim traceback. |
 
 **Corrected-fact ledger (relative to the AAP's pre-run expectations):** (1) the `kitten` binary is a **dynamically-linked** Go executable in the normal build (static linking `CGO_ENABLED=0` applies only to cross-platform release builds); (2) `rsync` has **two** consumers (hard + lazy), not one; (3) the category split is **15 + 8 = 23**, not 15 + 7 = 22, and `file_transmission` is transitive-only; (4) the Tier-3 delta is **+1 FAIL +1 ERROR** on top of the 3 baseline failures (totalling `failures=4, errors=1`); (5) `glfw-wayland.so` is **unexercised under CI** (observed, not inferred); (6) `_json` is a **builtin**, not a `.so`; (7) `/tmp` is **ext4**, not `tmpfs`; (8) the font count is **511 faces / 267 families**. Every one of these is grounded in an embedded command-and-output block above.
