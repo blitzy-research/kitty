@@ -168,23 +168,26 @@ $ docker run --rm --net=host --hostname kitty-mandated-container \
 
 ### 1.6 OpenGL context actually obtained (observed)
 
-kitty requires an OpenGL **>= 3.3** context or `gl_init()` aborts with `fatal("OpenGL version is %d.%d, version >= %d.%d required for kitty")` `[kitty/gl.c:74]`. The container's Mesa supplies a software one. Two independent commands confirm it:
+kitty requires an OpenGL **>= 3.3** context or `gl_init()` aborts with `fatal("OpenGL version is %d.%d, version >= %d.%d required for kitty")` `[kitty/gl.c:74]`. The container's Mesa supplies a software one. Two independent commands — both fully reproducible inside the pinned container with no extra packages installed — confirm it. First, the container's GL stack is Mesa built against LLVM, with the software DRI rasterizer present on disk:
 
 ```text
-$ glxinfo -B | grep -E "OpenGL (vendor|renderer|core profile version) string"
-OpenGL vendor string: Mesa
-OpenGL renderer string: llvmpipe (LLVM 19.1.1, 256 bits)
-OpenGL core profile version string: 4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1
+$ dpkg-query -W -f='${Package} ${Version}\n' libgl1-mesa-dri libllvm19
+libgl1-mesa-dri 24.2.8-1ubuntu1~24.04.1
+libllvm19 1:19.1.1-1ubuntu1~24.04.2
+$ ls /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so
+/usr/lib/x86_64-linux-gnu/dri/swrast_dri.so
 ```
+
+Second, kitty's own `--debug-rendering` reports the exact context it acquired at runtime:
 
 ```text
 $ ./kitty/launcher/kitty --debug-rendering -o confirm_os_window_close=0 sh -c "true" 2>&1 | grep "GL version string"
 [0.185] GL version string: '4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1' Detected version: 4.5
 ```
 
-**Source authority.** kitty's line is emitted by `if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", ...)` `[kitty/gl.c:72]`, whose string is built by `gl_version_string()` `[kitty/gl.c:42-49]` wrapping `glGetString(GL_VERSION)`.
+**Source authority.** kitty's line is emitted by `if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", ...)` `[kitty/gl.c:72]`, whose string is built by `gl_version_string()` `[kitty/gl.c:42-49]` wrapping `glGetString(GL_VERSION)` — note it reports the GL **version** only, never the renderer name.
 
-**Interpretation.** The context is Mesa's **`llvmpipe` software renderer**, `4.5 (Core Profile) Mesa 24.2.8` (forced software by `LIBGL_ALWAYS_SOFTWARE=1`), comfortably above kitty's 3.3 floor. This is the container's own Mesa 24.2.8 (the host's Mesa is a different version and is not what kitty links against here).
+**Interpretation.** The context is **`4.5 (Core Profile) Mesa 24.2.8`** — the container's own Mesa 24.2.8 (the host's Mesa is a different version and is not what kitty links against here), comfortably above kitty's 3.3 floor. Because the launch forces software rendering with `LIBGL_ALWAYS_SOFTWARE=1`, Mesa loads the software DRI driver `swrast_dri.so` shown above; being built against `libllvm19` (LLVM 19.1.1), that software rasterizer is Mesa's **`llvmpipe`**. **(inferred)** The renderer's specific identity as `llvmpipe` is deduced from this forced-software stack (`LIBGL_ALWAYS_SOFTWARE=1` + `swrast_dri.so` + `libllvm19`), not from a captured renderer string, because kitty prints only the GL version string and the third-party `glxinfo` probe (from `mesa-utils`) is not installed in the pinned container.
 
 ---
 
@@ -963,7 +966,7 @@ OpenGL: '4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1' Detected version: 4.5
 **Interpretation.** **(observed)** The repository contains **13** GLSL sources; the
 cell-drawing shaders among them are `cell_vertex.glsl`, `cell_fragment.glsl` and the
 shared `cell_defines.glsl`. **(observed)** A real OpenGL **4.5 Core** context was
-obtained from Mesa's software renderer (LLVMpipe) under Xvfb — this satisfies kitty's
+obtained from Mesa's software renderer under Xvfb (that software renderer being LLVMpipe — **inferred**, see §1.6) — this satisfies kitty's
 GL ≥ 3.3 requirement without a GPU. **(inferred, then confirmed)** The `.glsl`
 enumeration alone is *static* evidence and does not by itself prove the shaders
 compiled or a frame was presented; the proof that they did is the durable rendered
@@ -1170,8 +1173,8 @@ built-in defaults** — the genuine first-launch condition Question 2 asks about
 
 ### 7.1 Software OpenGL (LLVMpipe), not a discrete GPU (observed)
 
-The GL context is `4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1`, renderer
-LLVMpipe (§3.3, §5.3). This is Mesa's **software** rasterizer under Xvfb. It satisfies
+The GL context is `4.5 (Core Profile) Mesa 24.2.8-1ubuntu1~24.04.1` and is Mesa's
+**software** rasterizer under Xvfb — LLVMpipe (**inferred** from the forced-software GL stack, see §1.6). It satisfies
 kitty's GL ≥ 3.3 requirement and exercises the *same* shader/render code path a
 hardware GPU would; the only difference is that rasterization runs on the CPU.
 **(inferred)** Pixel output is therefore representative of the real render pipeline;
@@ -1309,7 +1312,7 @@ always confirmed by an adjacent observed signal where one exists.
 | 8 | systemd op is post-fork child-scope; NotImplementedError swallowed | Inferred | source `kitty/child.py:346-353`, `kitty/systemd.c:87,185-188` |
 | 9 | Config precedence: defaults → SYSTEM_CONF → defconf|`-c` (replace) → `-o` (last); `NONE` suppresses | Observed | §3.2, §3.4 |
 | 10 | First launch used only built-in defaults (`defconf exists: False`, empty diff) | Observed | §3.1, §3.3, §6.6 |
-| 11 | GL context `4.5 (Core Profile) Mesa 24.2.8` (LLVMpipe, software) | Observed | §3.3, §5.3, §7.1 |
+| 11 | GL context `4.5 (Core Profile) Mesa 24.2.8`, software rendering (renderer LLVMpipe — inferred) | Observed | §1.6, §3.3, §5.3, §7.1 |
 | 12 | `--debug-config` is not a valid flag (`EXIT=1`) | Observed | §3.6, §6.2 |
 | 13 | PTY allocated via `openpty()`; child forked; controlling TTY set; `execvp` shell | Observed+Inferred | §4.1, source `kitty/child.py:170`, `kitty/child.c:97-159` |
 | 14 | `Child launched` = terminal-ready release (after geometry + `mark_terminal_ready`) | Observed+Inferred | §4.2, source `kitty/window.py:861-871`, `kitty/child.py:362-364` |
